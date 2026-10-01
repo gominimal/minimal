@@ -380,16 +380,17 @@ impl Network for OwnIpNetwork {
     }
 
     /// Give the lease back; the sandbox layer runs this on every path out of a
-    /// launch that does not reach `attach`.
+    /// launch that does not reach `attach`. The detach releases the handed
+    /// lease with the count (T66), so an abandoned launch does not leave the
+    /// box's address spent behind a lease nothing holds.
     fn abandon(&self) -> AbandonFuture<'_> {
         Box::pin(async move {
-            let reserved = self.reserved.lock().unwrap().take();
-            if reserved.is_none() {
+            let Some(reserved) = self.reserved.lock().unwrap().take() else {
                 // The plan failed or an attach took it; detaching anyway would
                 // decrement the switch's count below the truth.
                 return;
-            }
-            if let Err(e) = self.switch.lock().await.detach().await {
+            };
+            if let Err(e) = self.switch.lock().await.detach(reserved.lease.ip).await {
                 tracing::warn!(error = %e, "detaching OwnIp PTask after an abandoned launch");
             }
         })

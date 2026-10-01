@@ -30,10 +30,12 @@ use crate::net::switch::SwitchRelay;
 /// down explicitly via [`NetGuard::teardown`] at the end of the sandbox's life.
 ///
 /// Teardown removes this PTask's ingress forwards then detaches it from the
-/// switch (decrementing the switch refcount, which stops gvproxy once the last
-/// `OwnIp` PTask leaves). It is **explicit** — driven on a live runtime by the
-/// owner — rather than a `Drop` schedule, so it cannot be lost to a stopped
-/// runtime. Dropping the held [`SwitchRelay`] aborts the frame relay either way.
+/// switch (decrementing the switch refcount — which stops gvproxy once the last
+/// `OwnIp` PTask leaves — and releasing the handed lease with the count, so
+/// the same box's re-attach re-hands it, T66). It is **explicit** — driven on a
+/// live runtime by the owner — rather than a `Drop` schedule, so it cannot be
+/// lost to a stopped runtime. Dropping the held [`SwitchRelay`] aborts the
+/// frame relay either way.
 pub(crate) struct OwnIpGuard {
     /// Held for its `Drop`, which aborts the relay tasks; never read.
     _relay: SwitchRelay,
@@ -45,6 +47,9 @@ pub(crate) struct OwnIpGuard {
     /// The static ingress forwards exposed for this PTask (R2.3), removed on
     /// teardown. Empty when no ingress was configured.
     exposed: Vec<ExposedMapping>,
+    /// The lease ip this guard's attach holds, passed to `detach` so the
+    /// handed lease among them is released with the count (T66).
+    lease_ip: Ipv4Addr,
 }
 
 impl NetGuard for OwnIpGuard {
@@ -56,7 +61,7 @@ impl NetGuard for OwnIpGuard {
             if !self.exposed.is_empty() {
                 crate::net::policy::remove_ingress(&self.control, &self.exposed).await;
             }
-            if let Err(e) = self.switch.lock().await.detach().await {
+            if let Err(e) = self.switch.lock().await.detach(self.lease_ip).await {
                 tracing::warn!(error = %e, "detaching OwnIp PTask from switch on session end");
             }
             // `_relay` drops here, aborting the relay tasks.
@@ -266,6 +271,7 @@ async fn finish_own_ip_attach(
         switch: Arc::clone(switch),
         control,
         exposed,
+        lease_ip,
     })
 }
 
@@ -491,14 +497,17 @@ mod tests {
     /// daemon handed its registration attaches **at the handed address** —
     /// the address the host-side table's row is keyed by — and **selects
     /// none**: the allocator's run shows exactly the handed lease, no
-    /// self-allocation spent beside it. The next unregistered box
-    /// self-allocates from the daemon's reserve — the plan run's lower half,
-    /// disjoint from the hand-out run the handed address came from — so the
-    /// two allocators cannot meet and the handed address is never drawn.
-    /// And the attach names the handed address in one debug line, with the
-    /// handed/self-drawn distinction a log tail reads. A handed address the
-    /// daemon already spends is refused at the attach path rather than
-    /// shared with it — a reserve address, and a lease's own address alike.
+    /// self-allocation spent beside it. The lease releases with its attach,
+    /// so the same box re-attaching — the re-attach an in-process host
+    /// rebuild produces, where this allocator survives the rebuild — re-hands
+    /// its own address, and the next unregistered box self-allocates from
+    /// the daemon's reserve: the plan run's lower half, disjoint from the
+    /// hand-out run the handed address came from, so the two allocators
+    /// cannot meet. The attach names the handed address in one debug line,
+    /// with the handed/self-drawn distinction a log tail reads. A handed
+    /// address that would put a second tap beside a live one is refused at
+    /// the attach path rather than shared with it — a reserve address, and
+    /// an attach's own address alike.
     #[tokio::test]
     async fn own_ip_attach_uses_handed_address() {
         let switch = vm_host_switch();
@@ -538,13 +547,24 @@ mod tests {
         );
         let _ = plan; // the plan's resolver/tap carry the same lease; asserted above
 
-        // Releasing it detaches like any other, and the next box — one the
-        // activating client did not register — self-allocates from the
-        // daemon's reserve: the plan run's lower half, a sub-run disjoint
-        // from the hand-out run the handed address came from, so the two
-        // allocators cannot meet.
+        // Releasing it detaches like any other — and the handed lease goes
+        // with the count: the address is the registered box's, keyed by the
+        // host-side row, so once its attach ends the same box re-attaching
+        // re-hands it instead of meeting the collision refusal. That is the
+        // re-attach an in-process host rebuild produces, where this
+        // allocator survives the rebuild.
         net.abandon().await;
         assert_eq!(switch.lock().await.attached(), 0, "the abandon detaches");
+        assert!(
+            switch.lock().await.leases().is_empty(),
+            "the abandon releases the handed lease with the count"
+        );
+
+        // The next box — one the activating client did not register —
+        // self-allocates from the daemon's reserve: the plan run's lower
+        // half, a sub-run disjoint from the hand-out run the handed address
+        // came from, so the two allocators cannot meet and the handed
+        // address is never drawn.
         let unregistered = network_for(
             sessions::NetworkMode::OwnIp,
             &switch,
@@ -560,24 +580,25 @@ mod tests {
         let leases = switch.lock().await.leases().to_vec();
         assert_eq!(
             leases.len(),
-            2,
-            "one handed lease, one self-allocated: the handed attach spent no \
-             allocation, got {leases:?}"
+            1,
+            "the released handed lease is out of the table; one draw beside \
+             it: {leases:?}"
         );
+        let drawn = *leases
+            .first()
+            .expect("the assert above pinned exactly one lease in the table");
         assert_eq!(
-            leases[1].ip,
+            drawn.ip,
             Ipv4Addr::new(100, 64, 0, 2),
             "the self-allocation draws the reserve's first address — the \
              sub-run is disjoint from the hand-out run, so the handed \
              address is never drawn, got {leases:?}"
         );
 
-        // And a handed address this daemon already spends is refused at the
-        // attach path, never shared. Two shapes, both refused: the task
-        // sandbox's just-drawn reserve address — the shape a host that
-        // hands from the run's start would produce — and the box's own
-        // handed address, whose lease is still recorded. The refusals spend
-        // nothing: no lease joins the table, no attach is counted.
+        // A handed address inside the reserve is refused at the attach path
+        // — the shape a host that hands from the run's start would produce —
+        // and the refusal spends nothing: no lease joins the table, no
+        // attach is counted.
         let colliding_reserve = network_for(
             sessions::NetworkMode::OwnIp,
             &switch,
@@ -585,7 +606,7 @@ mod tests {
             None,
             None,
             Some(BoxAddresses {
-                switch_address: leases[1].ip,
+                switch_address: drawn.ip,
                 loopback_address: Ipv4Addr::LOCALHOST,
             }),
         );
@@ -599,7 +620,7 @@ mod tests {
         );
         assert_eq!(
             switch.lock().await.leases().len(),
-            2,
+            1,
             "the refusal added no lease to the table"
         );
         assert_eq!(
@@ -607,21 +628,66 @@ mod tests {
             1,
             "only the self-allocated attach counts; the refused one never did"
         );
-        let colliding_held = network_for(
+
+        // The same box re-attaching re-hands its own address: the lease its
+        // previous attach released is back in the table, and the
+        // select-none half of the promise holds on the re-attach too — the
+        // table holds exactly the drawn lease and the handed one, nothing
+        // drawn beside it, and the attach counts like any other.
+        let reattached = network_for(
+            sessions::NetworkMode::OwnIp,
+            &switch,
+            "web",
+            None,
+            None,
+            Some(BoxAddresses {
+                switch_address: handed_switch,
+                loopback_address: handed_loopback,
+            }),
+        );
+        let _ = reattached
+            .plan()
+            .await
+            .expect("the same box re-attaching re-hands its own address");
+        let leases = switch.lock().await.leases().to_vec();
+        assert_eq!(
+            leases.len(),
+            2,
+            "the re-hand records the handed lease beside the drawn one: \
+             {leases:?}"
+        );
+        assert!(
+            leases.contains(&PtaskLease {
+                ip: handed_switch,
+                mac: MacAddr::for_switch_ip(handed_switch),
+            }),
+            "the re-hand carries the same lease the first attach recorded: \
+             {leases:?}"
+        );
+        assert_eq!(
+            switch.lock().await.attached(),
+            2,
+            "the re-hand counts like any attach"
+        );
+
+        // While that attach is live, handing its address again is refused —
+        // two taps on one address would key one PTask's frames to the
+        // other's host-side row. The refusal spends nothing.
+        let colliding_live = network_for(
             sessions::NetworkMode::OwnIp,
             &switch,
             "fourth",
             None,
             None,
             Some(BoxAddresses {
-                switch_address: leases[0].ip,
+                switch_address: handed_switch,
                 loopback_address: Ipv4Addr::LOCALHOST,
             }),
         );
-        let err = colliding_held
+        let err = colliding_live
             .plan()
             .await
-            .expect_err("a handed address a lease holds refuses");
+            .expect_err("a handed address a live attach holds refuses");
         assert!(
             err.to_string().contains("already held by a lease"),
             "the refusal names the held lease: {err}"
@@ -633,8 +699,8 @@ mod tests {
         );
         assert_eq!(
             switch.lock().await.attached(),
-            1,
-            "only the self-allocated attach counts; the refused one never did"
+            2,
+            "the refused hand never counted"
         );
 
         // The attach's one debug line names the address the box carries and
