@@ -45,6 +45,11 @@ minimald-rpc.workspace = true
 mlog.workspace = true
 # Shared gvproxy-switch primitives (subnet/MAC/`-config` rendering) used by `net`.
 switch.workspace = true
+# The userspace TCP/IP stack the Box Egress Proxy's host leg runs over
+# (`net::bep_host`): the leg terminates box connections on the switch subnet
+# in-process, so the proxy's listener address never needs a host-kernel
+# interface.
+smoltcp.workspace = true
 # Async gvproxy switch supervision in `net`: the background exit-detection task
 # and the async `stop()` teardown run on the tokio runtime the networking layer
 # mandates (no blocking I/O in async context).
