@@ -941,8 +941,24 @@ pub async fn cmd_session_policy(
 
     match resp {
         minimald_rpc::Errorable::Ok(policy) => {
+            // The fabric the display builds the baseline set from: the
+            // microVM backend's run path builds its registry and the
+            // helper's enumeration from the default plan, so that is the
+            // plan the display can name for it. Keyed on the backend this
+            // command actually talks to — `client_provider_kind`, the same
+            // key `resolve_socket_path` turns on — not on `use_minvmd()`,
+            // which is true only under an explicit `--provider
+            // local-minvmd`: on macOS that kind is `Minvmd` without the
+            // flag, minvmd being the only backend there. The native
+            // daemon's own per-daemon switch is a plan the reply does not
+            // carry — and it has no host-side gate the set would describe —
+            // so that arm passes `None` and the block is left out rather
+            // than printed from a plan the session does not attach to.
+            let fabric = (client::client_provider_kind(global.use_minvmd())
+                == paths::ProviderKind::Minvmd)
+                .then_some(switch::SwitchSubnet::default());
             let mut out = std::io::stdout();
-            format_policy(&mut out, &policy, record.network)?;
+            format_policy(&mut out, &policy, record.network, fabric)?;
             out.flush().context("Failed to write policy")?;
             Ok(())
         }
@@ -980,20 +996,38 @@ pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'
 /// resolved to its list or its default (`allow all`; `deny subnets` reads
 /// `(none)` when nothing is denied), or, for a box that declared no egress
 /// at all, the default its daemon resolved to (`deny all` once the deny-all
-/// default is in force; `allow all` behind the opt-out or before it) — and
-/// the ingress mappings spelled out.
-/// `network` is the session's network mode, and the modes without a surface
-/// to describe are held to the TUI's detail pane: a none box has no network
-/// at all, so it prints the pane's one-line note in place of both blocks
-/// (`allow all` egress would claim a reach a box with no network does not
-/// have), and a host-address session shares its host's namespace, so it has
-/// no per-session ingress policy to show and the block is omitted entirely.
+/// default is in force; `allow all` behind the opt-out or before it) — the
+/// node-plane baseline set the helper enumerates beside it (NET-130: the
+/// categories the in-VM daemon's own registry and cache fetches are to
+/// reach, one row a category's subnets, headed by the posture the
+/// host-side gate decides those fetches under — announced, the shipped
+/// posture, the run path's allow-all interim node row still decides them
+/// and the set binds nothing yet; in force, the set decides them whatever
+/// the box's own declaration resolves to, so it is what a deny-all box
+/// reads beside), and the ingress mappings spelled out.
+/// `network` is the session's network mode. `fabric` is the switch plan the
+/// session's own-address surface leaves its frames on — the plan the
+/// host-side helper builds this enumeration from, named where the CLI knows
+/// it: the microVM backend's run path builds its registry and this set from
+/// the default plan, so the command passes that. A backend with no helper
+/// beside its switch — the native daemon's own per-daemon switch, whose
+/// plan the reply does not carry and which has no host-side gate the set
+/// would describe — passes `None`, and the block is omitted there rather
+/// than printed from a plan the session does not attach to. The modes
+/// without a surface to describe are held to the TUI's detail pane: a none
+/// box has no network at all, so it prints the pane's one-line note in
+/// place of both blocks (`allow all` egress would claim a reach a box with
+/// no network does not have), and a host-address session shares its host's
+/// namespace, so it has no per-session ingress policy — the block is
+/// omitted entirely, and with it the baseline set, which is a
+/// switch-fabric surface and has nothing to describe there either.
 /// Shared by `min session policy`'s printer and the integration
 /// tests that pin the rendering (NET-061, NET-075).
 pub fn format_policy(
     out: &mut impl std::io::Write,
     effective: &sessions::EffectiveSessionPolicy,
     network: sessions::NetworkMode,
+    fabric: Option<switch::SwitchSubnet>,
 ) -> Result<(), anyhow::Error> {
     // A none box has no network, so it can carry no egress or ingress
     // declaration at all — nothing the blocks print would describe anything
@@ -1027,6 +1061,36 @@ pub fn format_policy(
                 )?,
             }
             write_rules(out, "deny subnets", egress.deny_subnets.as_ref(), "(none)")?;
+        }
+    }
+    // The node-plane baseline set, beside the box's rules (NET-130): the
+    // helper's built-in enumeration of the categories the in-VM daemon's own
+    // traffic may reach, one row per category under its name. A
+    // switch-fabric surface, so it is the own-address modes that carry it —
+    // and only where a fabric the helper gates is named: the enumeration is
+    // built the way the host-side gate builds it, from the fabric's own
+    // address plan, and no fabric named means no set to show. The posture
+    // the gate decides the daemon's own fetches under is spelled beside the
+    // set, the way the daemon's start-up line spells it: announced — the
+    // shipped posture — the run path's allow-all interim node row still
+    // decides those fetches, so the rows name what the set will bound, not
+    // what bounds them today.
+    if network == sessions::NetworkMode::OwnIp
+        && let Some(fabric) = fabric
+    {
+        let baseline = minvmd::net::NodePlaneBaseline::built_in(fabric);
+        writeln!(
+            out,
+            "node-plane baseline set (helper enumeration) — {}",
+            baseline.phase().as_str()
+        )?;
+        for entry in baseline.entries() {
+            writeln!(
+                out,
+                "  {}  {}",
+                entry.category().as_str(),
+                entry.endpoints().join(", ")
+            )?;
         }
     }
     // Ingress is an own-address surface: the switch's static forwarder is the
@@ -1740,7 +1804,7 @@ mod tests {
             }),
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  dynamic ingress  allow"),
@@ -1767,7 +1831,7 @@ mod tests {
             }),
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  tcp  :8080 → :80"),
@@ -1790,7 +1854,7 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains("egress\n"), "{rendered}");
         assert!(rendered.contains("  allow all\n"), "{rendered}");
@@ -1808,7 +1872,7 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &deny_all, NetworkMode::OwnIp).unwrap();
+        format_policy(&mut out, &deny_all, NetworkMode::OwnIp, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("egress\n  deny all\n"),
@@ -1825,7 +1889,7 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &allow_all, NetworkMode::OwnIp).unwrap();
+        format_policy(&mut out, &allow_all, NetworkMode::OwnIp, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("egress\n  allow all\n"),

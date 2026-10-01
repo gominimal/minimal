@@ -107,6 +107,8 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::box_registry::BoxTable;
 use crate::net::bep_leg::BepDivert;
 
+use super::baseline::{NodeBaselinePhase, NodePlaneBaseline};
+
 /// The HTTP request that upgrades a control-socket connection into a raw
 /// frame stream. The guest shuttle writes this head before its first frame;
 /// gvproxy hijacks the connection and writes no response. The gate forwards
@@ -526,12 +528,14 @@ impl EgressGate {
         gate_sock: PathBuf,
         switch_sock: PathBuf,
         table: BoxTable,
+        baseline: NodePlaneBaseline,
         bep: Option<BepDivert>,
     ) -> io::Result<Self> {
         Self::spawn_with_phase(
             gate_sock,
             switch_sock,
             table,
+            baseline,
             UNREGISTERED_SOURCE_PHASE,
             bep,
         )
@@ -552,6 +556,7 @@ impl EgressGate {
         gate_sock: PathBuf,
         switch_sock: PathBuf,
         table: BoxTable,
+        baseline: NodePlaneBaseline,
         phase: UnregisteredSourcePhase,
         bep: Option<BepDivert>,
     ) -> io::Result<Self> {
@@ -566,6 +571,17 @@ impl EgressGate {
             unregistered_in_plan_sources = phase.as_str(),
             "host-side egress gate listening",
         );
+        // The node-plane baseline set the gate decides the in-VM daemon's own
+        // frames by, named at VM start with each entry's category: the line a
+        // bundle's daemon log tail holds to see which categories the node
+        // plane may reach and under which posture the gate decides them
+        // (NET-130).
+        tracing::info!(
+            baseline = %baseline.render(),
+            node_addr = %Ipv4Addr::from(baseline.node_addr()),
+            node_baseline_phase = baseline.phase().as_str(),
+            "node-plane baseline set at the gate",
+        );
         // One limiter for the whole gate: a guest that reconnects must not
         // reset the rate window its drops are counted in.
         let limiter = Arc::new(DropLimiter::new());
@@ -574,6 +590,7 @@ impl EgressGate {
                 listener,
                 switch_sock,
                 table,
+                baseline,
                 limiter,
                 phase,
                 bep,
@@ -680,6 +697,7 @@ async fn accept_loop<A: GuestSource>(
     mut source: A,
     switch_sock: PathBuf,
     table: BoxTable,
+    baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
     phase: UnregisteredSourcePhase,
     bep: Option<BepDivert>,
@@ -743,6 +761,7 @@ async fn accept_loop<A: GuestSource>(
             guest,
             switch_sock.clone(),
             table.clone(),
+            baseline.clone(),
             Arc::clone(&limiter),
             HANDSHAKE_TIMEOUT,
             phase,
@@ -763,10 +782,18 @@ async fn accept_loop<A: GuestSource>(
 /// It is a parameter only so a test can shrink it; every caller outside this
 /// module's tests reaches a connection through [`accept_loop`], which passes
 /// [`HANDSHAKE_TIMEOUT`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one connection's inputs, one each: the guest end, the switch it \
+              dials, the deciding table and the node-plane baseline set, the \
+              limiter, the handshake bound, the phase, and the leg divert — \
+              bundling them would hide one of them"
+)]
 async fn serve_connection(
     mut guest: UnixStream,
     switch_sock: PathBuf,
     table: BoxTable,
+    baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
     handshake_timeout: Duration,
     phase: UnregisteredSourcePhase,
@@ -900,6 +927,7 @@ async fn serve_connection(
                 leg_rx,
                 bep,
                 table,
+                baseline,
                 limiter,
                 phase,
             )
@@ -944,7 +972,9 @@ fn refuse_head(limiter: &DropLimiter, refused: &RefusedHead) {
 /// guest where its declarations are enforced.
 #[expect(
     clippy::too_many_arguments,
-    reason = "one relay's inputs: the two ends it copies and the leg divert beside them"
+    reason = "one relay's inputs: both directions' halves, the leg divert beside \
+              them, the deciding table and the node-plane baseline set, the \
+              limiter, and the phase — splitting it would hide one of them"
 )]
 async fn relay_frames(
     guest: Prefixed<OwnedReadHalf>,
@@ -955,13 +985,22 @@ async fn relay_frames(
     leg_rx: Option<OwnedReadHalf>,
     bep: Option<BepDivert>,
     table: BoxTable,
+    baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
     phase: UnregisteredSourcePhase,
 ) {
     let mut ingress = tokio::spawn(copy_switch_to_guest(switch_rx, leg_rx, guest_tx));
     let bep_address = bep.as_ref().map(|bep| bep.address);
-    let egress =
-        relay_guest_to_switch(guest, switch_tx, leg_tx, bep_address, table, limiter, phase);
+    let egress = relay_guest_to_switch(
+        guest,
+        switch_tx,
+        leg_tx,
+        bep_address,
+        table,
+        baseline,
+        limiter,
+        phase,
+    );
     tokio::pin!(egress);
     // The two legs race, because neither can see the other's end. The egress
     // leg blocks on the guest, which has no reason to speak while it is idle,
@@ -1298,12 +1337,20 @@ async fn copy_switch_to_guest(
     clippy::indexing_slicing,
     reason = "every `frame[..n]` is bounded by the `n > frame.len()` rejection above"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the egress relay's full state in one place: the guest's read half, \
+              both send ends, the leg divert beside them, the deciding table \
+              and the node-plane baseline set, the limiter, and the phase — \
+              splitting it would hide one of them"
+)]
 async fn relay_guest_to_switch(
     mut guest: Prefixed<OwnedReadHalf>,
     mut switch: OwnedWriteHalf,
     mut leg: Option<OwnedWriteHalf>,
     bep_address: Option<Ipv4Addr>,
     table: BoxTable,
+    baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
     phase: UnregisteredSourcePhase,
 ) -> io::Result<()> {
@@ -1337,7 +1384,7 @@ async fn relay_guest_to_switch(
         }
         guest.read_exact(&mut frame[..n]).await?;
         let summary = egress::summarize(&frame[..n]);
-        let admitted = match gate_verdict(&summary, &table, phase) {
+        let admitted = match gate_verdict(&summary, &table, &baseline, phase) {
             Ok(admitted) => admitted,
             Err(dropped) => {
                 limiter.emit(summary.source(), dropped.rule());
@@ -1465,13 +1512,19 @@ impl UnregisteredSourcePhase {
 pub(crate) const UNREGISTERED_SOURCE_PHASE: UnregisteredSourcePhase =
     UnregisteredSourcePhase::Announced;
 
-/// What the gate decided one frame's admission by: which of the two ways in —
-/// a published namespace's own rules, or the announced interim's default for
-/// a source the plan could have leased but no row holds. The relay that feeds
-/// on this distinguishes the two for the one thing only the interim's admit
-/// needs: a line that says it happened.
+/// What the gate decided one frame's admission by: which of the three ways in —
+/// the node-plane baseline set, a published namespace's own rules, or the
+/// announced interim's default for a source the plan could have leased but no
+/// row holds. The relay that feeds on this distinguishes the interim's admit
+/// for the one thing only it needs: a line that says it happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateAdmit {
+    /// The node-plane baseline's compiled set admitted the frame: its source
+    /// is the in-VM daemon's own address and the destination is inside the
+    /// helper's enumeration of the categories the node plane may reach
+    /// (NET-130) — the decision the boxes' rows cannot make for it, and the
+    /// one a deny-all box's row must not override.
+    Baseline,
     /// A published namespace's row admitted the frame under its own rules —
     /// the same decision the in-guest relay makes, now made outside.
     Row,
@@ -1487,24 +1540,42 @@ enum GateAdmit {
 
 /// The gate's admit-or-drop decision for one frame summary against the
 /// host-side table (NET-081): pure — a function of the summary, the table,
-/// and the phase, nothing else — and deliberately separate from the relay
-/// loop that applies it, the same discipline the shared verdict keeps.
+/// the baseline set, and the phase, nothing else — and deliberately separate
+/// from the relay loop that applies it, the same discipline the shared
+/// verdict keeps.
 ///
-/// The frame's source address is the whole of the routing: the published
-/// namespace that holds it supplies the rules its frames are decided by, and
-/// an address no namespace holds is the phase's to decide —
-/// [`UnregisteredSourcePhase`] carries what that means and why. Families that
-/// carry no readable source address (IPv6, undeclared ethertypes, truncated
-/// frames) never reach the table: the shared verdict's own family drops
-/// decide them, under any rules, fail-closed.
+/// The frame's source address is the whole of the routing: the node plane's
+/// own address is decided by the baseline set ([`NodePlaneBaseline`], the
+/// helper's enumeration of the categories the in-VM daemon's traffic may
+/// reach, NET-130), the published namespace that holds any other source
+/// supplies the rules its frames are decided by, and an address neither
+/// covers is the phase's to decide — [`UnregisteredSourcePhase`] carries what
+/// that means and why. The node plane is decided before the table because the
+/// run path's row for the daemon's address is the allow-all interim the
+/// enumeration replaces: consulted first, it would make the enumeration
+/// decorative. Families that carry no readable source address (IPv6,
+/// undeclared ethertypes, truncated frames) never reach the table: the shared
+/// verdict's own family drops decide them, under any rules, fail-closed.
 fn gate_verdict(
     summary: &FrameSummary,
     table: &BoxTable,
+    baseline: &NodePlaneBaseline,
     phase: UnregisteredSourcePhase,
 ) -> Result<GateAdmit, GateDrop> {
     let Some(src) = summary.source() else {
         return Err(GateDrop::Verdict(family_drop(summary.family())));
     };
+    // The node plane's own frames, when the baseline is in force: the shared
+    // verdict against the enumeration's compiled set — the lease it is keyed
+    // to is the daemon's own address, so the check above and the lease agree
+    // on who may wear it. Announced, the interim node row keeps deciding the
+    // node plane, and the fall-through reaches it below.
+    if baseline.phase() == NodeBaselinePhase::InForce && src == baseline.node_addr() {
+        return match egress::verdict(summary, baseline.rules()) {
+            FrameVerdict::Admit => Ok(GateAdmit::Baseline),
+            FrameVerdict::Drop(reason) => Err(GateDrop::Verdict(reason)),
+        };
+    }
     // The namespace that holds the source decides its frames by its own
     // compiled rules — the shared verdict, unchanged, now made outside where
     // nothing inside can change it.
@@ -1835,6 +1906,7 @@ pub(crate) mod test_support {
 
     use super::{CONNECT_REQUEST, EgressGate, UnregisteredSourcePhase};
     use crate::box_registry::BoxRegistry;
+    use crate::net::baseline::NodePlaneBaseline;
 
     /// How long the harness waits for a frame or a log line before calling
     /// the test failed: far past any healthy gate decision on a local socket,
@@ -1960,6 +2032,20 @@ pub(crate) mod test_support {
         registry: BoxRegistry,
         phase: UnregisteredSourcePhase,
     ) -> GateHarness {
+        let baseline = crate::net::baseline::NodePlaneBaseline::built_in(registry.subnet());
+        gate_connected_with_node_baseline(registry, phase, baseline).await
+    }
+
+    /// [`gate_connected_with_phase`] with the node-plane baseline set named:
+    /// the harness the baseline's other arm ([`NodeBaselinePhase::InForce`],
+    /// built with [`NodePlaneBaseline::in_force`]) is pinned at relay level
+    /// through, so the node plane's own admissions are watched on a live gate,
+    /// not only through the pure decision.
+    pub(crate) async fn gate_connected_with_node_baseline(
+        registry: BoxRegistry,
+        phase: UnregisteredSourcePhase,
+        baseline: NodePlaneBaseline,
+    ) -> GateHarness {
         let dir = TempDir::new().expect("a tempdir is creatable");
         let switch_sock = dir.path().join("gvproxy-switch.sock");
         let gate_sock = dir.path().join("gvproxy-gate.sock");
@@ -1978,6 +2064,7 @@ pub(crate) mod test_support {
             gate_sock.clone(),
             switch_sock.clone(),
             registry.table(),
+            baseline,
             phase,
             None,
         )
@@ -2039,6 +2126,7 @@ pub(crate) mod test_support {
             gate_sock.clone(),
             switch_sock.clone(),
             registry.table(),
+            NodePlaneBaseline::built_in(registry.subnet()),
             Some(crate::net::bep_leg::BepDivert {
                 address: bep_address,
                 handoff_sock: crate::net::bep_leg::bep_sock_beside(&switch_sock),
@@ -2089,15 +2177,30 @@ pub(crate) mod test_support {
         registry: BoxRegistry,
         phase: UnregisteredSourcePhase,
     ) -> GateHarness {
-        let mut harness = gate_connected_with_phase(registry, phase).await;
-        // The guest's first write — the upgrade head, alone.
+        forward_upgrade_head(gate_connected_with_phase(registry, phase).await).await
+    }
+
+    /// [`gate_over_with_phase`] with the node-plane baseline set named: the
+    /// upgrade-completed harness the baseline's in-force arm's relay-level
+    /// pins run through.
+    pub(crate) async fn gate_over_with_node_baseline(
+        registry: BoxRegistry,
+        phase: UnregisteredSourcePhase,
+        baseline: NodePlaneBaseline,
+    ) -> GateHarness {
+        forward_upgrade_head(gate_connected_with_node_baseline(registry, phase, baseline).await)
+            .await
+    }
+
+    /// [`gate_over`]'s handshake completion: the guest's first write — the
+    /// upgrade head, alone — and the head forwarded verbatim and read back off
+    /// the switch end, so the frame stream begins at a known point.
+    async fn forward_upgrade_head(mut harness: GateHarness) -> GateHarness {
         harness
             .guest
             .write_all(CONNECT_REQUEST)
             .await
             .expect("writing the guest's first bytes");
-        // The upgrade head, forwarded verbatim and read back off the switch
-        // end, so the frame stream begins at a known point.
         let mut head = vec![0u8; CONNECT_REQUEST.len()];
         harness
             .switch
@@ -2359,8 +2462,8 @@ mod tests {
     use super::test_support::{
         CaptureWriter, DEADLINE, arp_frame, capture_log, connect_over, expect_frame,
         expect_silence, expect_teardown, gate_connected, gate_over, gate_over_control,
-        gate_over_with, gate_over_with_bep, gate_over_with_phase, ipv4_frame, ipv6_frame,
-        read_within, send_frame, wait_for_log,
+        gate_over_with, gate_over_with_bep, gate_over_with_node_baseline, gate_over_with_phase,
+        ipv4_frame, ipv6_frame, read_within, send_frame, wait_for_log,
     };
     use super::{
         AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, DROP_WARN_MAX_TRACKED_PAIRS,
@@ -2370,6 +2473,7 @@ mod tests {
         accept_loop, gate_verdict, max_frame, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry};
+    use crate::net::baseline::{BaselineCategory, NodeBaselinePhase, NodePlaneBaseline};
 
     /// The default switch subnet, the plan every registry below is built for.
     const SUBNET: SwitchSubnet = switch::DEFAULT_SUBNET;
@@ -3352,6 +3456,7 @@ mod tests {
             gate_sock.clone(),
             switch_sock.clone(),
             registry.table(),
+            NodePlaneBaseline::built_in(SUBNET),
             None,
         )
         .expect("spawning the egress gate");
@@ -3595,6 +3700,7 @@ mod tests {
             gate_end,
             switch_sock.clone(),
             table,
+            NodePlaneBaseline::built_in(SUBNET),
             Arc::new(DropLimiter::new()),
             bound,
             UNREGISTERED_SOURCE_PHASE,
@@ -3675,6 +3781,7 @@ mod tests {
             gate_end,
             switch_sock.clone(),
             table,
+            NodePlaneBaseline::built_in(SUBNET),
             Arc::new(DropLimiter::new()),
             bound,
             UNREGISTERED_SOURCE_PHASE,
@@ -3754,6 +3861,7 @@ mod tests {
                 gate_end,
                 switch_sock.clone(),
                 table.clone(),
+                NodePlaneBaseline::built_in(SUBNET),
                 Arc::new(DropLimiter::new()),
                 bound,
                 UNREGISTERED_SOURCE_PHASE,
@@ -3831,6 +3939,7 @@ mod tests {
             ScriptedGuests(script),
             switch_sock.to_path_buf(),
             table.clone(),
+            NodePlaneBaseline::built_in(SUBNET),
             Arc::new(DropLimiter::new()),
             UNREGISTERED_SOURCE_PHASE,
             None,
@@ -4110,19 +4219,24 @@ mod tests {
     /// decided by its namespace's own rules, the shared verdict unchanged,
     /// and a source no row holds is the phase's to decide, both of the
     /// phase's arms pinned here so T66's flip of the constant is the whole
-    /// cutover.
+    /// cutover. The node plane's own address is the baseline set's to decide
+    /// beside the rows: its shipped arm is pinned by
+    /// [`node_plane_source_decided_by_the_node_row_while_announced`], its
+    /// in-force arm at relay level by
+    /// [`unenrolled_baseline_set_from_helper_enumeration`].
     #[test]
     fn gate_verdict_decides_by_source_and_rules() {
         let registry = BoxRegistry::new(SUBNET);
         tcp_lan_box(&registry, LEASE);
         let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
         let summarize = sessions::core::egress::summarize;
 
         // A held source is decided by its rules: the same frame that the
         // relay test watches pass and drop, decided here with no sockets.
         let declared = summarize(&ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80));
         assert!(matches!(
-            gate_verdict(&declared, &table, UNREGISTERED_SOURCE_PHASE),
+            gate_verdict(&declared, &table, &baseline, UNREGISTERED_SOURCE_PHASE),
             Ok(GateAdmit::Row)
         ));
         let rules = table
@@ -4139,7 +4253,7 @@ mod tests {
         );
         let undeclared = summarize(&ipv4_frame(LEASE, 6, [203, 0, 113, 7], 443));
         assert_eq!(
-            gate_verdict(&undeclared, &table, UNREGISTERED_SOURCE_PHASE),
+            gate_verdict(&undeclared, &table, &baseline, UNREGISTERED_SOURCE_PHASE),
             Err(GateDrop::Verdict(DropReason::UndeclaredSubnet {
                 dst: [203, 0, 113, 7],
                 proto: 6,
@@ -4153,13 +4267,23 @@ mod tests {
         // the interim, the arm T66 (#1711) flips the constant onto.
         let unknown = summarize(&ipv4_frame([100, 64, 0, 99], 6, [10, 1, 2, 3], 80));
         assert_eq!(
-            gate_verdict(&unknown, &table, UnregisteredSourcePhase::Announced),
+            gate_verdict(
+                &unknown,
+                &table,
+                &baseline,
+                UnregisteredSourcePhase::Announced
+            ),
             Ok(GateAdmit::Unregistered {
                 src: [100, 64, 0, 99]
             })
         );
         assert_eq!(
-            gate_verdict(&unknown, &table, UnregisteredSourcePhase::InForce),
+            gate_verdict(
+                &unknown,
+                &table,
+                &baseline,
+                UnregisteredSourcePhase::InForce
+            ),
             Err(GateDrop::UnknownSource {
                 src: [100, 64, 0, 99]
             })
@@ -4177,14 +4301,24 @@ mod tests {
             80,
         ));
         assert_eq!(
-            gate_verdict(&gateway, &table, UnregisteredSourcePhase::Announced),
+            gate_verdict(
+                &gateway,
+                &table,
+                &baseline,
+                UnregisteredSourcePhase::Announced
+            ),
             Err(GateDrop::UnknownSource {
                 src: SUBNET.dns_server().octets()
             })
         );
         let foreign_arp = summarize(&arp_frame([203, 0, 113, 7]));
         assert_eq!(
-            gate_verdict(&foreign_arp, &table, UnregisteredSourcePhase::Announced),
+            gate_verdict(
+                &foreign_arp,
+                &table,
+                &baseline,
+                UnregisteredSourcePhase::Announced
+            ),
             Err(GateDrop::UnknownSource {
                 src: [203, 0, 113, 7]
             })
@@ -4196,17 +4330,158 @@ mod tests {
         assert!(empty.is_empty());
         let v6 = summarize(&ipv6_frame());
         assert_eq!(
-            gate_verdict(&v6, &empty, UNREGISTERED_SOURCE_PHASE),
+            gate_verdict(&v6, &empty, &baseline, UNREGISTERED_SOURCE_PHASE),
             Err(GateDrop::Verdict(DropReason::Ipv6))
         );
         let truncated = summarize(&[0u8; 13]);
         assert_eq!(
-            gate_verdict(&truncated, &table, UNREGISTERED_SOURCE_PHASE),
+            gate_verdict(&truncated, &table, &baseline, UNREGISTERED_SOURCE_PHASE),
             Err(GateDrop::Verdict(DropReason::Truncated))
         );
         // The summaries agree with the families the frames were built as.
         assert_eq!(v6.family(), FrameFamily::Ipv6);
         assert_eq!(truncated.family(), FrameFamily::Truncated);
+    }
+
+    /// The shipped arm of the node-plane decision: the phase this build
+    /// ships is announced, and a frame wearing the in-VM daemon's own
+    /// address is decided by the run path's allow-all interim node row —
+    /// the row [`BoxRegistry::register_node_namespace`] publishes, the way
+    /// the run path registers it at boot — yielding [`GateAdmit::Row`] from
+    /// that row, never [`GateAdmit::Baseline`]. The baseline set's arm is
+    /// the store-surface configuration's to switch on (#1786), and the
+    /// in-force arm's proof is
+    /// [`unenrolled_baseline_set_from_helper_enumeration`]'s.
+    #[test]
+    fn node_plane_source_decided_by_the_node_row_while_announced() {
+        let registry = BoxRegistry::new(SUBNET);
+        // The run path's own registration: the allow-all interim node row at
+        // the daemon's address, registered at VM boot (cmd/run.rs).
+        registry.register_node_namespace();
+        let table = registry.table();
+        // Built without [`NodePlaneBaseline::in_force`], so this is the
+        // phase the build ships.
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        assert_eq!(
+            baseline.phase(),
+            NodeBaselinePhase::Announced,
+            "the shipped posture is announced, the arm this test pins"
+        );
+
+        // A node-plane frame to a destination no category of the enumeration
+        // names — the public store the shipped cache URL resolves to. The
+        // interim node row decides it, and the row allows all, so the frame
+        // is admitted by [`GateAdmit::Row`]: the enumeration's compiled set,
+        // which admits no such destination, decided nothing here.
+        let summarize = sessions::core::egress::summarize;
+        let node_frame = summarize(&ipv4_frame(
+            SUBNET.daemon_ip().octets(),
+            6,
+            [8, 8, 8, 8],
+            443,
+        ));
+        assert_eq!(
+            gate_verdict(&node_frame, &table, &baseline, UNREGISTERED_SOURCE_PHASE),
+            Ok(GateAdmit::Row),
+            "announced, the interim node row decides the node plane's frames — \
+             never the baseline set"
+        );
+    }
+
+    /// NET-130, un-enrolled, at the gate: the node-plane baseline set comes
+    /// from the helper's enumeration, and the gate decides the daemon's own
+    /// frames by it **beside** the boxes' rows — a deny-all box's row does not
+    /// clip the daemon's own registry and cache fetches (NET-080), decided
+    /// before the table is consulted — and a destination the enumeration does
+    /// not name is dropped: the gap the announced phase covers until the
+    /// node plane's store surfaces are configured (`NodeBaselinePhase`).
+    #[tokio::test]
+    async fn unenrolled_baseline_set_from_helper_enumeration() {
+        let registry = BoxRegistry::new(SUBNET);
+        // A deny-all box: no declared subnets, so nothing but the resolver
+        // carve-out passes its row — the box the node plane's own fetches
+        // must not be bound by.
+        registry.register(
+            BoxRegistration::new("locked", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: None,
+                    allow_subnets: Some(vec![]),
+                    allow_dns_hosts: None,
+                    deny_subnets: None,
+                }),
+        );
+        let baseline = NodePlaneBaseline::built_in(SUBNET).in_force();
+        let node_addr = baseline.node_addr();
+        let registry_endpoint = baseline
+            .entries()
+            .iter()
+            .find(|entry| entry.category() == BaselineCategory::Registry)
+            .expect("the enumeration carries the registry")
+            .endpoints()
+            .first()
+            .expect("the registry carries an endpoint")
+            .split_once('/')
+            .expect("an endpoint is spelled `a.b.c.d/n`")
+            .0
+            .parse::<Ipv4Addr>()
+            .expect("an endpoint's address parses")
+            .octets();
+        let mut h =
+            gate_over_with_node_baseline(registry, UNREGISTERED_SOURCE_PHASE, baseline).await;
+
+        // VM start says what the node plane may reach, one term per category:
+        // the line a diagnostic bundle's daemon log tail carries.
+        wait_for_log(&h.log, "node-plane baseline set").await;
+        let logged = h.log.contents();
+        for category in ["registry=", "cache="] {
+            assert!(
+                logged.contains(category),
+                "the start-up line names the baseline entries by category, got: {logged}"
+            );
+        }
+        assert!(
+            logged.contains("node_addr=100.64.255.253"),
+            "the start-up line names the in-VM daemon's own address, got: {logged}"
+        );
+
+        // The box's own frame, to somewhere its deny-all declaration does not
+        // name: dropped, where it stands. The marker behind it is the one
+        // frame a deny-all row admits — the resolver carve-out — so the
+        // arrival of the marker is the proof the drop happened.
+        let undeclared = ipv4_frame(LEASE, 6, [1, 2, 3, 4], 80);
+        let marker = ipv4_frame(LEASE, 17, SUBNET.dns_server().octets(), 53);
+        send_frame(&mut h.guest, &undeclared).await;
+        send_frame(&mut h.guest, &marker).await;
+        let seen = expect_frame(&mut h.switch).await;
+        assert_eq!(
+            seen, marker,
+            "the deny-all box's undeclared frame never reached the switch; the marker did"
+        );
+
+        // The node plane's own frame, to the enumeration's registry endpoint:
+        // decided by the baseline set beside the box's row — admitted, and
+        // the switch sees it exactly as it was sent.
+        let node_frame = ipv4_frame(node_addr, 6, registry_endpoint, 443);
+        send_frame(&mut h.guest, &node_frame).await;
+        let seen = expect_frame(&mut h.switch).await;
+        assert_eq!(
+            seen, node_frame,
+            "the daemon's own fetch reaches the switch as it was sent"
+        );
+
+        // To an address no category names — the public store the guest
+        // daemon's shipped cache URL resolves to, whose serving addresses no
+        // subnet list this tree can name — the set says no.
+        let out_of_set = ipv4_frame(node_addr, 6, [8, 8, 8, 8], 443);
+        let node_marker = ipv4_frame(node_addr, 6, registry_endpoint, 444);
+        send_frame(&mut h.guest, &out_of_set).await;
+        send_frame(&mut h.guest, &node_marker).await;
+        let seen = expect_frame(&mut h.switch).await;
+        assert_eq!(
+            seen, node_marker,
+            "the daemon's out-of-set frame never reached the switch; the marker did"
+        );
+        expect_silence(&mut h.switch).await;
     }
 
     /// One drop line per source address per rule per interval: the first
