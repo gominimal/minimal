@@ -445,7 +445,19 @@ fn run_foreground() -> Result<()> {
     // diagnostic bundle's daemon log tail shows a host running it.
     // `UNREGISTERED_SOURCE_PHASE` (egress_gate) is the constant T66 flips.
     let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
-    boxes.register_node_namespace();
+    // The node's own ports are assigned before the VM boots (default-first, so
+    // a VM sharing a host with a native daemon still lands on the default proxy
+    // port when it is free), handed to the guest through the VMM child's env
+    // onto the kernel command line, and declared as the node row's own
+    // publishes — the two publishes the daemon's setup performs at its address
+    // (NET-025).
+    let node_ports =
+        assign_node_ports().context("assigning the node's proxy and answerer ports")?;
+    boxes.register_node_namespace(node_ports.proxy_port(), node_ports.answerer_port());
+    // A box's row goes with its shuttle connection: the gate reports which
+    // addresses each relay carried at the relay's end, and this drainer thread
+    // applies the reports for the life of the process (NET-133).
+    boxes.spawn_withdrawal_drainer();
 
     // Spawn + supervise the host gvproxy switch before the VMM child boots, so
     // its `-listen` switch socket exists when the gate relays into it for the
@@ -539,6 +551,18 @@ fn run_foreground() -> Result<()> {
     alive_lock.inherit_into(&mut cmd);
     let mut child = cmd
         .env(MARKER_SOCK_ENV, &marker_sock_path)
+        // The node ports travel to the guest through the VMM child's env: the
+        // child is a separate process (like the marker socket path), and its
+        // backend appends them to the kernel command line, where the kernel
+        // hands unrecognized `KEY=VALUE` tokens to init as env vars.
+        .env(
+            crate::vm::NODE_PROXY_PORT_ENV,
+            node_ports.proxy_port().to_string(),
+        )
+        .env(
+            crate::vm::NODE_ANSWERER_PORT_ENV,
+            node_ports.answerer_port().to_string(),
+        )
         .spawn()
         .with_context(|| format!("spawning VMM child: {}", exe.display()))?;
 
@@ -704,6 +728,68 @@ fn run_foreground() -> Result<()> {
     Ok(())
 }
 
+/// The node's proxy and answerer ports, assigned by the VM host before the VM
+/// boots: default-first, so a VM sharing a host with a native daemon still
+/// lands on the defaults when they are free and only falls to OS-assigned
+/// ports when the defaults are actually held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NodePorts {
+    proxy: u16,
+    answerer: u16,
+}
+
+impl NodePorts {
+    /// The hostname proxy's TCP port the guest daemon binds as handed (NET-025).
+    pub(crate) fn proxy_port(&self) -> u16 {
+        self.proxy
+    }
+
+    /// The zone answerer's UDP port the guest daemon binds as handed (NET-025).
+    pub(crate) fn answerer_port(&self) -> u16 {
+        self.answerer
+    }
+}
+
+/// The defaults the assignment probes first. They mirror the native daemon's
+/// own defaults (`DEFAULT_EGRESS_PROXY_PORT` in minimald's `net/proxy.rs`,
+/// `ANSWERER_PORT` in its `net/answerer.rs`): `minvmd` does not depend on the
+/// daemon, so the values are pinned here beside the constants they mirror.
+const NODE_DEFAULT_PROXY_PORT: u16 = 7654;
+const NODE_DEFAULT_ANSWERER_PORT: u16 = 7656;
+
+/// Assigns both node ports: TCP for the proxy, UDP for the answerer.
+fn assign_node_ports() -> Result<NodePorts> {
+    let proxy = assign_node_port(NODE_DEFAULT_PROXY_PORT, false)?;
+    let answerer = assign_node_port(NODE_DEFAULT_ANSWERER_PORT, true)?;
+    Ok(NodePorts { proxy, answerer })
+}
+
+/// Assigns one node port by probing: bind the preferred port to check the
+/// host has it free, release the probe again, and let the OS pick when the
+/// preferred port is already held. The probe releases its socket, so between
+/// the assignment and the guest's bind inside the VM the port could still be
+/// taken by another process — a lost race the guest's own log tail shows
+/// (a handed port never silently moves, NET-024).
+fn assign_node_port(preferred: u16, udp: bool) -> Result<u16> {
+    use anyhow::Context as _;
+    let probe = |port: u16| -> std::io::Result<u16> {
+        if udp {
+            let socket = std::net::UdpSocket::bind(("0.0.0.0", port))?;
+            Ok(socket.local_addr()?.port())
+        } else {
+            let listener = std::net::TcpListener::bind(("0.0.0.0", port))?;
+            Ok(listener.local_addr()?.port())
+        }
+    };
+    match probe(preferred) {
+        Ok(assigned) => Ok(assigned),
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            probe(0).context("the node's default port is held and no OS-assigned port is available")
+        }
+        Err(error) => Err(error).context("probing the node's default port"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(not(minvmd_libkrun))]
@@ -806,5 +892,48 @@ mod tests {
             super::classify_detach_poll(false, Some(exited(1)), true, Some(i32::MAX as u32), false),
             super::DetachPoll::Keep
         ));
+    }
+
+    #[test]
+    fn node_port_assigned_on_host_and_handed_to_daemon() {
+        // A port the test holds is busy: the assignment falls through to an
+        // OS-assigned port rather than failing the boot over a shared-host
+        // conflict — the case of a native daemon and a VM on one host.
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let busy = held.local_addr().unwrap().port();
+        let assigned = super::assign_node_port(busy, false).unwrap();
+        assert_ne!(assigned, busy, "a held port is not assigned as-is");
+        assert!(assigned != 0, "the fallback is a real port");
+
+        // A port the test just released is free again: the default-first
+        // probe assigns it as asked — the case the session e2e's hardcoded
+        // default proxy port depends on.
+        let freed = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let free = freed.local_addr().unwrap().port();
+        drop(freed);
+        assert_eq!(
+            super::assign_node_port(free, false).unwrap(),
+            free,
+            "a free port is assigned as asked"
+        );
+
+        // The answerer's probe is the same default-first over UDP.
+        let held_udp = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let busy_udp = held_udp.local_addr().unwrap().port();
+        let assigned_udp = super::assign_node_port(busy_udp, true).unwrap();
+        assert_ne!(
+            assigned_udp, busy_udp,
+            "a held UDP port is not assigned as-is"
+        );
+
+        // The supervisor assigns both ports as a pair and hands them to the
+        // guest: whatever the host picked, each is a real port the guest can
+        // bind as handed (the cmdline and bind halves are the vm.rs and
+        // minimald tests of the same name).
+        let ports = super::assign_node_ports().unwrap();
+        assert!(
+            ports.proxy_port() != 0 && ports.answerer_port() != 0,
+            "both node ports are assigned"
+        );
     }
 }
