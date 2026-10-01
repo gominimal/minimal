@@ -4269,64 +4269,73 @@ mod tests {
             }
         }
 
-        // The strong half, pinned per pair: the decision is the spoofed
+        // The strong half, pinned per attempt: the decision is the spoofed
         // box's own rules, never the union. A row-held spoof reaches the
         // row's declared subnet and the resolver carve-out and nothing else —
         // dropped where only another box declares, dropped on the protocol
-        // dimension, and the deny-all row unsealing nothing.
-        let verdict_of = |phase, src, proto, dst| {
+        // dimension, and the deny-all row unsealing nothing. The lookup keys
+        // the whole record — phase, source, protocol, destination, and port —
+        // so a later attempt sharing any prefix cannot answer for another's
+        // verdict.
+        let verdict_of = |phase, src, proto, dst, port| {
             attempts
                 .iter()
-                .find(|a| a.phase == phase && a.src == src && a.proto == proto && a.dst == dst)
+                .find(|a| {
+                    a.phase == phase
+                        && a.src == src
+                        && a.proto == proto
+                        && a.dst == dst
+                        && a.port == port
+                })
                 .expect("every pinned attempt is in the record")
                 .verdict
         };
         assert_eq!(
-            verdict_of(shipped, LEASE, 6, web_only),
+            verdict_of(shipped, LEASE, 6, web_only, 80),
             Verdict::AdmittedByRow
         );
         assert_eq!(
-            verdict_of(shipped, LEASE, 17, web_only),
+            verdict_of(shipped, LEASE, 17, web_only, 80),
             Verdict::Dropped("egress-undeclared-protocol"),
         );
         assert_eq!(
-            verdict_of(shipped, LEASE, 6, db_only),
+            verdict_of(shipped, LEASE, 6, db_only, 5432),
             Verdict::Dropped("egress-undeclared-subnet"),
         );
         assert_eq!(
-            verdict_of(shipped, LEASE, 6, outside),
+            verdict_of(shipped, LEASE, 6, outside, 443),
             Verdict::Dropped("egress-undeclared-subnet"),
         );
         assert_eq!(
-            verdict_of(shipped, LEASE, 17, resolver),
+            verdict_of(shipped, LEASE, 17, resolver, 53),
             Verdict::AdmittedByRow
         );
         assert_eq!(
-            verdict_of(shipped, [100, 64, 0, 10], 6, db_only),
+            verdict_of(shipped, [100, 64, 0, 10], 6, db_only, 5432),
             Verdict::AdmittedByRow,
         );
         assert_eq!(
-            verdict_of(shipped, [100, 64, 0, 10], 6, web_only),
+            verdict_of(shipped, [100, 64, 0, 10], 6, web_only, 80),
             Verdict::Dropped("egress-undeclared-subnet"),
         );
         assert_eq!(
-            verdict_of(shipped, [100, 64, 0, 10], 6, outside),
+            verdict_of(shipped, [100, 64, 0, 10], 6, outside, 443),
             Verdict::Dropped("egress-undeclared-subnet"),
         );
         assert_eq!(
-            verdict_of(shipped, [100, 64, 0, 10], 17, resolver),
+            verdict_of(shipped, [100, 64, 0, 10], 17, resolver, 53),
             Verdict::AdmittedByRow,
         );
         assert_eq!(
-            verdict_of(shipped, [100, 64, 0, 11], 6, web_only),
+            verdict_of(shipped, [100, 64, 0, 11], 6, web_only, 80),
             Verdict::Dropped("egress-undeclared-subnet"),
         );
         assert_eq!(
-            verdict_of(shipped, [100, 64, 0, 11], 17, resolver),
+            verdict_of(shipped, [100, 64, 0, 11], 17, resolver, 53),
             Verdict::AdmittedByRow,
         );
         assert_eq!(
-            verdict_of(shipped, [100, 64, 0, 11], 6, resolver),
+            verdict_of(shipped, [100, 64, 0, 11], 6, resolver, 53),
             Verdict::Dropped("egress-undeclared-subnet"),
         );
 
@@ -4334,15 +4343,21 @@ mod tests {
         // enumeration's endpoint admitted, everything else dropped — the
         // bound a spoof of the daemon's address buys, beside the boxes' rows.
         assert_eq!(
-            verdict_of(UnregisteredSourcePhase::InForce, node, 6, baseline_endpoint),
+            verdict_of(
+                UnregisteredSourcePhase::InForce,
+                node,
+                6,
+                baseline_endpoint,
+                443
+            ),
             Verdict::AdmittedByBaseline,
         );
         assert_eq!(
-            verdict_of(UnregisteredSourcePhase::InForce, node, 6, web_only),
+            verdict_of(UnregisteredSourcePhase::InForce, node, 6, web_only, 80),
             Verdict::Dropped("egress-undeclared-subnet"),
         );
         assert_eq!(
-            verdict_of(UnregisteredSourcePhase::InForce, node, 6, outside),
+            verdict_of(UnregisteredSourcePhase::InForce, node, 6, outside, 443),
             Verdict::Dropped("egress-undeclared-subnet"),
         );
 
@@ -4354,23 +4369,29 @@ mod tests {
         // it. The out-of-plan source is refused under both phases, so the
         // interim can never borrow the plan's infrastructure as a source.
         assert_eq!(
-            verdict_of(shipped, node, 6, outside),
+            verdict_of(shipped, node, 6, outside, 443),
             Verdict::AdmittedByNodeRow,
         );
         assert_eq!(
-            verdict_of(shipped, stray, 6, web_only),
+            verdict_of(shipped, stray, 6, web_only, 80),
             Verdict::AdmittedByInterim,
         );
         assert_eq!(
-            verdict_of(UnregisteredSourcePhase::InForce, stray, 6, web_only),
+            verdict_of(UnregisteredSourcePhase::InForce, stray, 6, web_only, 80),
             Verdict::Dropped("egress-unknown-source"),
         );
         assert_eq!(
-            verdict_of(shipped, out_of_plan, 6, web_only),
+            verdict_of(shipped, out_of_plan, 6, web_only, 80),
             Verdict::Dropped("egress-unknown-source"),
         );
         assert_eq!(
-            verdict_of(UnregisteredSourcePhase::InForce, out_of_plan, 6, web_only),
+            verdict_of(
+                UnregisteredSourcePhase::InForce,
+                out_of_plan,
+                6,
+                web_only,
+                80
+            ),
             Verdict::Dropped("egress-unknown-source"),
         );
 

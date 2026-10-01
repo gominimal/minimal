@@ -91,7 +91,13 @@ fn minvmd_bin() -> std::ffi::OsString {
     std::env::var_os("MINVMD_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_minvmd").into())
 }
 
-const BOOT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long the harness waits for the `vm-up` (READY) line. The line comes
+/// only after `minvmd boot`'s own READY wait completes — 60 s by default, 150
+/// s under `just`, which exports `MINVMD_READY_TIMEOUT_SECS=150` for every
+/// recipe because a cold multi-GiB VM can run 40–70 s before pid-1 starts
+/// (the AGENTS.md boot footgun). This harness drives `boot --foreground` and
+/// must absorb that cold boot on its own, so it waits the justfile's 150 s.
+const BOOT_TIMEOUT: Duration = Duration::from_secs(150);
 /// How long one spoofed flow may take to produce its verdict: the ARP claim,
 /// the SYN, and the handshake across the real switch and the host listener.
 const FLOW_DEADLINE: Duration = Duration::from_secs(10);
@@ -341,9 +347,20 @@ impl BoxSession {
 
             let mut policy = sessions::SessionPolicy::default();
             policy.egress = Some(egress);
+            // Unique per invocation — minimald dedups sessions by name and
+            // rejects a duplicate CreateSession (`AlreadyExists`), and a
+            // record persists once created even when a later step of this
+            // open fails, so the outer retry loop in `open_box` would
+            // otherwise collide on a fixed name after any prior attempt got
+            // as far as CreateSession. Matches the convention in
+            // `crates/minvmd/tests/minimald_session_integration.rs`.
+            let uniq = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
             let req = CreateSessionRequest {
                 config: minimald_rpc::SessionConfig {
-                    name: Some(format!("vm-escape-{label}")),
+                    name: Some(format!("vm-escape-{label}-{uniq:x}")),
                     project_path: paths::HostAbsPath::try_new("/tmp")
                         .map_err(|e| format!("project_path: {e}"))?,
                     network,
