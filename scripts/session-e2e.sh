@@ -6262,8 +6262,8 @@ STUB
 # host or CI that exports it would land the guest images in a different
 # prefix from the $home/.local/share/minimal the caller asserts, for the
 # install check below and the start-line values alike. A genuinely fresh
-# install has it unset, so drop it (this subshell only, like the PATH change
-# the drive helper below scopes).
+# install has it unset, so drop it (this subshell only, like the
+# installed-pair env swap the drive helper's callers scope before the call).
 run_mock_bucket_install() {
   local rmi_home="$1" rmi_bucket_host="$2" rmi_stubbin="$3" rmi_out="$4" rmi_label="$5"
   unset XDG_DATA_HOME
@@ -6280,15 +6280,17 @@ run_mock_bucket_install() {
     }
 }
 
-# Drive the INSTALLED pair: swap HOME/MINIMAL_BIN/PATH to the installed
-# prefixes and drop every MINVMD_* override, so image and switch resolution
-# must come from the installed prefixes alone; stop any daemon under the
-# harness's state base; then activate a VM box and check the outcome: the
-# CLI's last stdout line is the new session's UUID, and `min ls --raw` lists
-# it. Prints the UUID on stdout — every diagnostic goes to STDERR, so the
-# capture keeps only the id. Returns nonzero on any failure; the caller (in
-# its install-proof subshell) unwinds with `exit 1`, printing any extra
-# diagnostics of its own first.
+# Drive the INSTALLED pair. The caller's install-proof subshell has already
+# swapped HOME/MINIMAL_BIN/PATH to the installed prefixes and dropped every
+# MINVMD_* override — a swap the CALLER must make, because one made in here
+# would die with this helper's command-substitution subshell — so image and
+# switch resolution must come from the installed prefixes alone. Stops any
+# daemon under the harness's state base; then activates a VM box and checks
+# the outcome: the CLI's last stdout line is the new session's UUID, and
+# `min ls --raw` lists it. Prints the UUID on stdout — every diagnostic goes
+# to STDERR, so the capture keeps only the id. Returns nonzero on any
+# failure; the caller (in its install-proof subshell) unwinds with
+# `exit 1`, printing any extra diagnostics of its own first.
 #
 # The RUST_LOG filter rides on the ONE activate that autospawns the daemon:
 # the 'starting VM' record the start-record helper asserts on is INFO, and a
@@ -6299,13 +6301,9 @@ run_mock_bucket_install() {
 # is the daemon's crate, so the CLI's own stdout stays quiet and the
 # last-line UUID extraction keeps working.
 drive_installed_vm_pair() {
-  local dvp_home="$1" dvp_seed="$2" dvp_name="$3" dvp_err="$4"
-  local dvp_activate_label="$5" dvp_ls_label="$6"
+  local dvp_seed="$1" dvp_name="$2" dvp_err="$3"
+  local dvp_activate_label="$4" dvp_ls_label="$5"
   local dvp_sid
-  # Env swap is scoped to the caller's subshell (SC2030/SC2031).
-  # shellcheck disable=SC2030,SC2031
-  export HOME="$dvp_home" MINIMAL_BIN="$dvp_home/.local/bin" PATH="$dvp_home/.local/bin:$PATH"
-  unset MINVMD_KERNEL_PATH MINVMD_ROOTFS_PATH MINVMD_INITRAMFS MINVMD_GVPROXY_BIN
   mnl stop --force >/dev/null 2>&1 || true
   dvp_sid="$(cd "$dvp_seed" && RUST_LOG="warn,minvmd=info" mnl session activate . --no-prompt --name "$dvp_name" 2>"$dvp_err")" || {
     echo "::error::$dvp_activate_label" >&2
@@ -6430,8 +6428,16 @@ proof_fresh_kvm_activate_local_minvmd_for_arch() {
     # resolved — from the installed prefix, with no MINVMD_* override
     # anywhere (the assertion lives in the shared helper, which names where
     # the record is searched and why).
+    #
+    # The installed-pair env swap is scoped to this subshell (SC2030/SC2031)
+    # and lives HERE, in the caller: a swap the driver made inside itself
+    # would die with its command-substitution subshell, and the destroy/stop
+    # below would run on the lane's pair.
+    # shellcheck disable=SC2030,SC2031
+    export HOME="$fk_home" MINIMAL_BIN="$fk_home/.local/bin" PATH="$fk_home/.local/bin:$PATH"
+    unset MINVMD_KERNEL_PATH MINVMD_ROOTFS_PATH MINVMD_INITRAMFS MINVMD_GVPROXY_BIN
     fk_sid="$(drive_installed_vm_pair \
-      "$fk_home" "$fk_seed" "e2e-fresh-kvm-$target_arch" "$fk_root/activate.err" \
+      "$fk_seed" "e2e-fresh-kvm-$target_arch" "$fk_root/activate.err" \
       "the installed pair failed to activate a session with local-minvmd and no image overrides" \
       "the fresh-install KVM session")" || exit 1
 
@@ -6630,8 +6636,17 @@ proof_linux_stock_install_runs_vm_boxes() {
 
     # Activate, list: the shared driver, whose UUID the whole path below is
     # driven by.
+    #
+    # The installed-pair env swap is scoped to this subshell (SC2030/SC2031)
+    # and lives HERE, in the caller: a swap the driver made inside itself
+    # would die with its command-substitution subshell, and the exec,
+    # destroy, ls and stop below would run on the lane's pair, not the
+    # installed one.
+    # shellcheck disable=SC2030,SC2031
+    export HOME="$sb_home" MINIMAL_BIN="$sb_home/.local/bin" PATH="$sb_home/.local/bin:$PATH"
+    unset MINVMD_KERNEL_PATH MINVMD_ROOTFS_PATH MINVMD_INITRAMFS MINVMD_GVPROXY_BIN
     sb_sid="$(drive_installed_vm_pair \
-      "$sb_home" "$sb_seed" "$sb_name" "$sb_root/activate.err" \
+      "$sb_seed" "$sb_name" "$sb_root/activate.err" \
       "the stock-installed pair failed to activate a VM box" \
       "the stock-installed VM session")" || {
       sb_print_installed_components
