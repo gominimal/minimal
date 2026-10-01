@@ -699,12 +699,7 @@ pub(crate) fn arm_activation_interrupt(
                 .oneshot_rpc::<AbortSession>(AbortSessionRequest { id: session_id })
                 .await;
             if let Some(record) = row {
-                withdraw_box_row(
-                    control_sock,
-                    record.name.as_deref(),
-                    record.box_addresses,
-                )
-                .await;
+                withdraw_box_row(control_sock, record.name.as_deref(), record.box_addresses).await;
             }
         }
         std::process::exit(130);

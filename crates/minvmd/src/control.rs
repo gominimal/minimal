@@ -41,7 +41,9 @@ use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use minimald_rpc::{BoxAddresses, BoxControlReply, BoxControlRequest, RegisterBoxRequest, WithdrawBoxRequest};
+use minimald_rpc::{
+    BoxAddresses, BoxControlReply, BoxControlRequest, RegisterBoxRequest, WithdrawBoxRequest,
+};
 
 use crate::box_registry::{BoxRegistry, ClientBoxSpec};
 
@@ -298,7 +300,9 @@ mod tests {
     use std::sync::OnceLock;
     use std::time::Duration;
 
-    use minimald_rpc::{BoxControlReply, BoxControlRequest, RegisterBoxRequest, WithdrawBoxRequest};
+    use minimald_rpc::{
+        BoxControlReply, BoxControlRequest, RegisterBoxRequest, WithdrawBoxRequest,
+    };
     use switch::SwitchSubnet;
 
     use crate::box_registry::AllocationError;
@@ -699,16 +703,8 @@ mod tests {
             .expect("the marker box is registered"),
         );
         for (name, loopback, needle) in [
-            (
-                "web",
-                db.loopback_address,
-                "held by box",
-            ),
-            (
-                "db",
-                Ipv4Addr::LOCALHOST,
-                "carries loopback address",
-            ),
+            ("web", db.loopback_address, "held by box"),
+            ("db", Ipv4Addr::LOCALHOST, "carries loopback address"),
         ] {
             let refused = control(
                 &sock_path,
@@ -776,7 +772,10 @@ mod tests {
             "an unknown verb is refused, got {refused:?}"
         );
         assert!(
-            registry.table().by_source(db.switch_address.octets()).is_some(),
+            registry
+                .table()
+                .by_source(db.switch_address.octets())
+                .is_some(),
             "a refused line publishes nothing and removes nothing"
         );
 
@@ -815,11 +814,9 @@ mod tests {
 
         // And the in-force arm drops the same frame — the per-box default
         // the flip puts in force — while the marker still passes.
-        let mut h = test_support::gate_over_with_phase(
-            registry.clone(),
-            UnregisteredSourcePhase::InForce,
-        )
-        .await;
+        let mut h =
+            test_support::gate_over_with_phase(registry.clone(), UnregisteredSourcePhase::InForce)
+                .await;
         test_support::send_frame(&mut h.guest, &from_withdrawn).await;
         test_support::send_frame(&mut h.guest, &marker).await;
         let seen = test_support::expect_frame(&mut h.switch).await;

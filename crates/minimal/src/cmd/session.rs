@@ -78,7 +78,9 @@ async fn control_request_with_vm_host(
         );
     }
     let reply: minimald_rpc::BoxControlReply = serde_json_lenient::from_str(reply.trim())
-        .with_context(|| format!("the VM host daemon's box control reply did not parse: {reply}"))?;
+        .with_context(|| {
+            format!("the VM host daemon's box control reply did not parse: {reply}")
+        })?;
     Ok(reply)
 }
 
@@ -140,7 +142,9 @@ pub(crate) async fn withdraw_box_row(
     box_addresses: Option<sessions::BoxAddresses>,
 ) {
     let Some(name) = name else { return };
-    let Some(addresses) = box_addresses else { return };
+    let Some(addresses) = box_addresses else {
+        return;
+    };
     let Some(sock_path) = control_sock else {
         tracing::warn!(
             box = %name,
@@ -546,7 +550,10 @@ pub(crate) async fn activate_session(
     config.box_addresses = register_box_for_activation(
         global,
         config.network,
-        config.name.as_deref().expect("the session name is minted before the create"),
+        config
+            .name
+            .as_deref()
+            .expect("the session name is minted before the create"),
         &config.policy,
     )
     .await;
@@ -577,7 +584,12 @@ pub(crate) async fn activate_session(
             // registration bought: the create never happened, so no session
             // holds the pair (T66).
             Err(error) => {
-                withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+                withdraw_box_row(
+                    control_sock.clone(),
+                    config.name.as_deref(),
+                    config.box_addresses,
+                )
+                .await;
                 return Err(error.context("CreateSession RPC failed"));
             }
         };
@@ -590,7 +602,12 @@ pub(crate) async fn activate_session(
                     // leave behind: its creator withdraws it before
                     // re-registering under the re-minted name (T66) — it was
                     // bought for a session this create never made.
-                    withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+                    withdraw_box_row(
+                        control_sock.clone(),
+                        config.name.as_deref(),
+                        config.box_addresses,
+                    )
+                    .await;
                     config.name = Some(autogen_session_name(&utf8_path, &random_hex4()));
                     // A registered box's row carries the name it was
                     // registered under (T66), so the re-mint re-registers;
@@ -609,7 +626,12 @@ pub(crate) async fn activate_session(
                 }
                 // A create failure that is not a retryable autogen collision
                 // abandons the activation and its row the same way.
-                withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+                withdraw_box_row(
+                    control_sock.clone(),
+                    config.name.as_deref(),
+                    config.box_addresses,
+                )
+                .await;
                 bail!("CreateSession failed: {error}");
             }
         }
@@ -623,7 +645,12 @@ pub(crate) async fn activate_session(
     if let Err(error) = ensure_version_reported(created.daemon_version.as_deref()) {
         // A skewed daemon's refusal abandons the unfinalized session and its
         // row; the withdrawal rides out with the error (T66).
-        withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+        withdraw_box_row(
+            control_sock.clone(),
+            config.name.as_deref(),
+            config.box_addresses,
+        )
+        .await;
         return Err(error);
     }
     warn_if_hostname_routing_down(
@@ -755,7 +782,12 @@ pub(crate) async fn activate_session(
                 if let Err(error) = uploaded {
                     // The upload failed: the activation is abandoned, and the
                     // row its registration bought goes with it (T66).
-                    withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+                    withdraw_box_row(
+                        control_sock.clone(),
+                        config.name.as_deref(),
+                        config.box_addresses,
+                    )
+                    .await;
                     return Err(error.context("Failed to upload project files"));
                 }
             } else if !headless {
@@ -798,7 +830,12 @@ pub(crate) async fn activate_session(
     let configured = match configured {
         // A transport failure abandons the activation and its row (T66).
         Err(error) => {
-            withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+            withdraw_box_row(
+                control_sock.clone(),
+                config.name.as_deref(),
+                config.box_addresses,
+            )
+            .await;
             return Err(error.context("ConfigureLoadout RPC failed"));
         }
         Ok(configured) => configured,
@@ -809,7 +846,12 @@ pub(crate) async fn activate_session(
         // compose never puts an id on stdout for a script to capture.
         minimald_rpc::Errorable::Err { error } => {
             // The session cannot compose and is abandoned with its row (T66).
-            withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+            withdraw_box_row(
+                control_sock.clone(),
+                config.name.as_deref(),
+                config.box_addresses,
+            )
+            .await;
             bail!(composition_failure_message(&utf8_path, &error));
         }
     };
@@ -843,7 +885,12 @@ pub(crate) async fn activate_session(
                     send_abort(&mut client, session_id).await;
                     // The session is aborted and its row withdrawn (T66):
                     // the path failed after registering.
-                    withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+                    withdraw_box_row(
+                        control_sock.clone(),
+                        config.name.as_deref(),
+                        config.box_addresses,
+                    )
+                    .await;
                     // The route an activation actually reaches today: the
                     // daemon routes project config back for gating, so a
                     // project it cannot compose surfaces here rather than as
@@ -856,7 +903,12 @@ pub(crate) async fn activate_session(
                 send_abort(&mut client, session_id).await;
                 // The session is aborted and its row withdrawn (T66): the
                 // path failed after registering.
-                withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+                withdraw_box_row(
+                    control_sock.clone(),
+                    config.name.as_deref(),
+                    config.box_addresses,
+                )
+                .await;
                 let count = summary.count();
                 let snippet = summary.as_toml_snippet();
                 bail!(
@@ -873,7 +925,12 @@ pub(crate) async fn activate_session(
             if let Err(error) = submitted {
                 // The verdict never landed: the activation is abandoned with
                 // its row (T66).
-                withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+                withdraw_box_row(
+                    control_sock.clone(),
+                    config.name.as_deref(),
+                    config.box_addresses,
+                )
+                .await;
                 return Err(error);
             }
         } else {
@@ -916,7 +973,12 @@ pub(crate) async fn activate_session(
             if result.is_err() {
                 // The activation failed after registering: its row is
                 // withdrawn with it (T66).
-                withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+                withdraw_box_row(
+                    control_sock.clone(),
+                    config.name.as_deref(),
+                    config.box_addresses,
+                )
+                .await;
             }
             result?;
         }
@@ -950,7 +1012,12 @@ pub(crate) async fn activate_session(
         // `min ls` doesn't fill with half-finalized sessions, and
         // withdraw the row the registration bought with it (T66).
         best_effort_destroy(&mut client, id).await;
-        withdraw_box_row(control_sock.clone(), config.name.as_deref(), config.box_addresses).await;
+        withdraw_box_row(
+            control_sock.clone(),
+            config.name.as_deref(),
+            config.box_addresses,
+        )
+        .await;
         return Err(e);
     }
 
@@ -1970,9 +2037,14 @@ pub(crate) async fn destroy_all_sessions(
             .ok()
             .and_then(|resp| resp.record)
             .and_then(|record| record.box_addresses);
-        if let Err(error) =
-            destroy_session(client, global, session.id, session.name.as_deref(), box_addresses)
-                .await
+        if let Err(error) = destroy_session(
+            client,
+            global,
+            session.id,
+            session.name.as_deref(),
+            box_addresses,
+        )
+        .await
         {
             failures += 1;
             eprintln!(
