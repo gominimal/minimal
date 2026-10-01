@@ -2399,7 +2399,9 @@ mod tests {
         assert_eq!(guest::handed_answerer_port(), Some(answerer_port));
 
         let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None).await.unwrap();
+        let state = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
 
         // The VM startup shape: bind UNSPECIFIED, publish behind the
         // host-loopback gate, record the bound port. The compressed backoff
@@ -2472,7 +2474,9 @@ mod tests {
         let held = probe.local_addr().unwrap().port();
         unsafe { std::env::set_var(guest::HANDED_PROXY_PORT_TOKEN, held.to_string()) };
         let dir = TempDir::new().unwrap();
-        let state = ServerStateHandle::new(test_config(&dir), None).await.unwrap();
+        let state = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
         let drive = tokio::spawn(drive_proxy_until_serving(
             state.clone(),
             HostProxyStartup::Egress {
