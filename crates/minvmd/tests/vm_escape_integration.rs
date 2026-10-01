@@ -382,6 +382,9 @@ impl BoxSession {
                         .map_err(|e| format!("project_path: {e}"))?,
                     network,
                     policy,
+                    // No registration happened on this path: the box attaches
+                    // as an unregistered one always has.
+                    box_addresses: None,
                     // The serde default, and what every non-`--no-hooks`
                     // activation sends. This session only runs execs, so it
                     // declares no hooks either way.
