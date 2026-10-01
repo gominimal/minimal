@@ -114,7 +114,7 @@ impl BaselineEntry {
 /// unregistered-source cutover carries
 /// ([`crate::net::egress_gate::UNREGISTERED_SOURCE_PHASE`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NodeBaselinePhase {
+pub enum NodeBaselinePhase {
     /// The enumeration is carried, logged at VM start, and shown beside the
     /// box's rules; the node plane's frames are still decided by the interim
     /// node row.
@@ -130,10 +130,12 @@ pub(crate) enum NodeBaselinePhase {
 }
 
 impl NodeBaselinePhase {
-    /// The phase as the value the gate's start-up line logs: a host reads
-    /// its own posture off the one line every boot writes, so a host running
-    /// the announced interim can tell it is.
-    pub(crate) fn as_str(self) -> &'static str {
+    /// The phase as the value the gate's start-up line logs and the policy
+    /// display spells beside the set: one spelling for the posture, so a
+    /// host reading its policy output reads the same terms its daemon log
+    /// wrote at VM start, and a host running the announced interim can tell
+    /// it is.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Announced => "announced (node row's allow-all interim)",
             Self::InForce => "in force (decided by the baseline set)",
@@ -240,9 +242,11 @@ impl NodePlaneBaseline {
         &self.rules
     }
 
-    /// The posture the gate decides the set under.
+    /// The posture the gate decides the set under — announced, the shipped
+    /// posture, the run path's allow-all interim node row still decides the
+    /// node plane's frames; in force, the compiled set does.
     #[must_use]
-    pub(crate) fn phase(&self) -> NodeBaselinePhase {
+    pub fn phase(&self) -> NodeBaselinePhase {
         self.phase
     }
 

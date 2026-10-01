@@ -1050,9 +1050,11 @@ async fn policy_shows_deny_all_default() {
 /// `min session policy` shows the node-plane baseline set beside the box's
 /// rules (NET-130): the helper's built-in enumeration of the categories the
 /// in-VM daemon's own traffic may reach, one row per category, on an
-/// own-address box — where the host-side gate decides the daemon's own
-/// fetches by it, whatever the box's own declaration resolves to, so a
-/// deny-all box still reads beside the reach its daemon keeps. A
+/// own-address box, headed by the posture the host-side gate decides the
+/// daemon's own fetches under — announced, the shipped posture, the run
+/// path's allow-all interim node row still decides those fetches, so the
+/// rows are what the set will bound, not what bounds them today; in force,
+/// it decides them whatever the box's own declaration resolves to. A
 /// host-address box shares its host's namespace, so it has no switch fabric
 /// and the baseline set has nothing to describe there.
 #[test]
@@ -1076,13 +1078,23 @@ fn policy_shows_baseline_set() {
         text.contains("egress\n  deny all\n"),
         "the box's own rules are shown:\n{text}"
     );
+    // The posture is spelled beside the set, the way the daemon's start-up
+    // line spells it. The shipped posture is announced — the run path's
+    // allow-all interim node row still decides the daemon's own fetches — so
+    // the display must not present the rows as what bounds them. The flip of
+    // `NODE_BASELINE_PHASE` updates this assertion with the rest of the
+    // cutover.
     assert!(
-        text.contains("node-plane baseline set (helper enumeration)"),
-        "the helper's baseline set is shown beside the box's rules:\n{text}"
+        text.contains(
+            "node-plane baseline set (helper enumeration) — announced (node row's allow-all interim)"
+        ),
+        "the helper's baseline set is shown beside the box's rules, headed by the \
+         gate's announced posture:\n{text}"
     );
 
     // The rows are the enumeration the helper carries, one per category —
-    // the same set the host-side gate decides the daemon's own frames by.
+    // the set the host-side gate decides the daemon's own frames by once the
+    // baseline is in force.
     let baseline = minvmd::net::NodePlaneBaseline::built_in(switch::SwitchSubnet::default());
     let rendered_baseline = baseline
         .entries()

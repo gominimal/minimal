@@ -982,10 +982,13 @@ pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'
 /// at all, the default its daemon resolved to (`deny all` once the deny-all
 /// default is in force; `allow all` behind the opt-out or before it) — the
 /// node-plane baseline set the helper enumerates beside it (NET-130: the
-/// in-VM daemon's own registry and cache fetches are decided by that set at
-/// the host-side gate, whatever the box's own declaration resolves to, so
-/// the set is what a deny-all box reads beside), and the ingress mappings
-/// spelled out.
+/// categories the in-VM daemon's own registry and cache fetches are to
+/// reach, one row a category's subnets, headed by the posture the
+/// host-side gate decides those fetches under — announced, the shipped
+/// posture, the run path's allow-all interim node row still decides them
+/// and the set binds nothing yet; in force, the set decides them whatever
+/// the box's own declaration resolves to, so it is what a deny-all box
+/// reads beside), and the ingress mappings spelled out.
 /// `network` is the session's network mode, and the modes without a surface
 /// to describe are held to the TUI's detail pane: a none box has no network
 /// at all, so it prints the pane's one-line note in place of both blocks
@@ -1040,10 +1043,19 @@ pub fn format_policy(
     // traffic may reach, one row per category under its name. A
     // switch-fabric surface, so it is the own-address modes that carry it —
     // the enumeration is built the way the host-side gate builds it, from
-    // the fabric's own address plan.
+    // the fabric's own address plan. The posture the gate decides the
+    // daemon's own fetches under is spelled beside the set, the way the
+    // daemon's start-up line spells it: announced — the shipped posture —
+    // the run path's allow-all interim node row still decides those
+    // fetches, so the rows name what the set will bound, not what bounds
+    // them today.
     if network == sessions::NetworkMode::OwnIp {
         let baseline = minvmd::net::NodePlaneBaseline::built_in(switch::SwitchSubnet::default());
-        writeln!(out, "node-plane baseline set (helper enumeration)")?;
+        writeln!(
+            out,
+            "node-plane baseline set (helper enumeration) — {}",
+            baseline.phase().as_str()
+        )?;
         for entry in baseline.entries() {
             writeln!(
                 out,
