@@ -100,10 +100,11 @@ async fn register_box_with_vm_host(
 ///
 /// A registration that cannot be made — no control socket (a supervisor
 /// predating it), a refusal, the deadline — degrades to a warning and
-/// `None`, never to a failed activation: the box still creates, attaching
-/// under the egress gate's announced interim the same way a pre-T66 box
-/// does. Its egress is then what the interim admits until the daemon-side
-/// default flips, not what this activation declared — the warning says so.
+/// `None`, never to a failed activation: the box still creates, but
+/// unregistered. No host-side row holds it, so its frames run unattributed
+/// — the egress gate's announced interim admits what it admits — until the
+/// gate's per-box default is in force, which then fails closed for the box
+/// (#1790). The warning says so.
 async fn register_box_for_activation(
     global: &GlobalArgs,
     network: sessions::NetworkMode,
@@ -122,9 +123,10 @@ async fn register_box_for_activation(
         Err(error) => {
             tracing::warn!(
                 %error,
-                "cannot resolve the VM host provider dir; the box will not be \
-                 registered with the VM host daemon (its declared egress is not \
-                 enforced host-side)"
+                "cannot resolve the VM host provider dir; the box registration \
+                 is skipped and the box runs unregistered — its frames \
+                 unattributed — until the egress gate's per-box default is in \
+                 force (fail-closed then; #1790)"
             );
             return None;
         }
@@ -134,9 +136,10 @@ async fn register_box_for_activation(
         .map(|dir| dir.join(minvmd::control::CONTROL_SOCK_FILE))
     else {
         tracing::warn!(
-            "no provider dir resolved for the ssh socket; the box will not be \
-             registered with the VM host daemon (its declared egress is not \
-             enforced host-side)"
+            "no provider dir resolved for the ssh socket; the box registration \
+             is skipped and the box runs unregistered — its frames \
+             unattributed — until the egress gate's per-box default is in \
+             force (fail-closed then; #1790)"
         );
         return None;
     };
@@ -176,8 +179,9 @@ async fn register_box_for_activation(
         Ok(Err(error)) => {
             tracing::warn!(
                 %error,
-                "the box will not be registered with the VM host daemon; its \
-                 declared egress is not enforced host-side"
+                "the box registration failed; the box runs unregistered — its \
+                 frames unattributed — until the egress gate's per-box default \
+                 is in force (fail-closed then; #1790)"
             );
             None
         }
@@ -185,8 +189,9 @@ async fn register_box_for_activation(
             tracing::warn!(
                 after = ?BOX_REGISTRATION_TIMEOUT,
                 "the VM host daemon did not answer the box registration in time; \
-                 the box will not be registered (its declared egress is not \
-                 enforced host-side)"
+                 the box runs unregistered — its frames unattributed — until \
+                 the egress gate's per-box default is in force (fail-closed \
+                 then; #1790)"
             );
             None
         }
