@@ -698,7 +698,10 @@ impl HostGvproxy {
     /// so the guest that boots next meets a listening gate, never an open
     /// switch; a gate that cannot bind its socket is a host that cannot
     /// enforce egress, so the bring-up fails rather than booting wide open.
-    /// Blocks only until gvproxy is spawned
+    /// The switch's host-side stack peer for the box-egress-proxy address
+    /// ([`bep_host::run_stack_peer`], NET-132) is started with it, after the
+    /// switch socket is up, and stopped with the switch. Blocks only until
+    /// gvproxy is spawned
     /// and its PID known; supervision continues on the background runtime.
     ///
     /// # Errors
@@ -727,6 +730,11 @@ impl HostGvproxy {
         // the allow-all interim node row still does, and the gate's
         // start-up line names the posture deciding.
         let baseline = NodePlaneBaseline::built_in(registry.subnet());
+        // The proxy's stack peer lives on this same address plan: it answers
+        // for the plan's box-egress-proxy address (NET-132), which is why the
+        // subnet is captured here, from the registry the switch is configured
+        // with, and not re-derived anywhere else.
+        let peer_subnet = registry.subnet();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<u32>>();
 
@@ -789,8 +797,17 @@ impl HostGvproxy {
                         drop(ready_tx.send(Err(e)));
                         return;
                     }
+                    // The box-egress-proxy stack peer (NET-132) beside the
+                    // switch: a host-side stack peer of the switch that dials
+                    // the switch socket itself and answers for the proxy's
+                    // address on the plan. Started after the switch socket is
+                    // up — the dial needs a listener — and stopped with the
+                    // switch, in both teardown paths below.
+                    let peer = tokio::spawn(bep_host::run_stack_peer(sock.clone(), peer_subnet));
                     if ready_tx.send(Ok(pid)).is_err() {
                         // Caller went away before learning the PID; tear down.
+                        peer.abort();
+                        tracing::debug!("box-egress-proxy stack peer stopped with the switch");
                         switch.stop().await;
                         return;
                     }
@@ -798,9 +815,13 @@ impl HostGvproxy {
                     // exit, then tear down cleanly.
                     tokio::select! {
                         _ = stop_rx => {
+                            peer.abort();
+                            tracing::debug!("box-egress-proxy stack peer stopped with the switch");
                             switch.stop().await;
                         }
                         status = exit.recv() => {
+                            peer.abort();
+                            tracing::debug!("box-egress-proxy stack peer stopped with the switch");
                             tracing::error!(
                                 pid,
                                 code = status.and_then(|s| s.code()),
@@ -934,8 +955,15 @@ impl VmEgressPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smoltcp::wire::{ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame};
     use std::sync::Mutex;
+    use tokio::io::AsyncReadExt;
     use tracing_subscriber::fmt::MakeWriter;
+
+    /// The connect upgrade the proxy's stack peer speaks on the switch socket
+    /// — the same head the egress gate relays for the guest. Pinned here so
+    /// the test's assertion is explicit about what the dial carries.
+    const CONNECT_REQUEST: &[u8] = b"POST /connect HTTP/1.0\r\nHost: localhost\r\n\r\n";
 
     fn spawn_sleep() -> Child {
         // A long-lived child to stand in for gvproxy in supervision tests.
@@ -1423,6 +1451,109 @@ mod tests {
             "the switch serves the registry's subnet, not a default one, got: {yaml}"
         );
         gvproxy.stop();
+    }
+
+    /// NET-132: the switch runtime starts the proxy's stack peer after the
+    /// switch socket is up and stops it with the switch. The peer dials the
+    /// switch socket itself — once — with the connect upgrade, then announces
+    /// the proxy's address and MAC at attach; while the switch runs, its
+    /// connection stays open and the leg speaks nothing on its own; when the
+    /// switch stops, the leg's connection closes with it.
+    ///
+    /// A stand-in listener stands in for gvproxy's `-listen` socket: what the
+    /// test reads back is exactly what the peer dialed and announced with.
+    #[tokio::test]
+    async fn stack_peer_stops_with_the_switch() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let sock = dir.path().join("gvproxy-switch.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind stand-in switch socket");
+
+        let gvproxy = HostGvproxy::spawn(
+            stayalive_gvproxy(dir.path()),
+            sock.clone(),
+            DEFAULT_DATAPATH_CHECK_INTERVAL,
+            &empty_box_registry(),
+        )
+        .expect("spawn host gvproxy");
+
+        // The peer dials once, with the connect upgrade. The readiness probe
+        // wait_for_switch_socket makes also lands on this listener — an
+        // empty, immediately closed connection — so the peer's is picked out
+        // by the head it speaks.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut peer_conn = loop {
+            let (mut conn, _) = tokio::time::timeout_at(deadline, listener.accept())
+                .await
+                .expect("the stack peer dialed the switch socket")
+                .expect("accept");
+            let mut head = [0u8; CONNECT_REQUEST.len()];
+            match tokio::time::timeout_at(deadline, conn.read_exact(&mut head)).await {
+                Ok(Ok(_)) if head == CONNECT_REQUEST => break conn,
+                _ => continue, // the readiness probe's connection: empty
+            }
+        };
+        // One dial only: a second connection to the switch socket never
+        // comes.
+        let second = tokio::time::timeout(Duration::from_millis(400), listener.accept()).await;
+        assert!(
+            second.is_err(),
+            "the stack peer dials the switch socket once, got a second dial"
+        );
+
+        // At attach the leg announces the proxy's address and MAC: one
+        // length-framed broadcast ARP frame, 2 + 42 bytes, after the upgrade
+        // and its pace.
+        let mut announced = vec![0u8; 2 + 42];
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            peer_conn.read_exact(&mut announced),
+        )
+        .await
+        .expect("the attach announcement arrives")
+        .expect("read the announcement");
+        assert_eq!(&announced[..2], &42u16.to_le_bytes());
+        let frame = EthernetFrame::new_checked(&announced[2..]).expect("the announcement is Ethernet");
+        let bep = SwitchSubnet::default().box_egress_proxy_address();
+        let bep_mac = EthernetAddress(MacAddr::for_switch_ip(bep).0);
+        assert_eq!(frame.dst_addr(), EthernetAddress::BROADCAST);
+        assert_eq!(frame.src_addr(), bep_mac);
+        let arp = ArpPacket::new_checked(frame.payload()).expect("the announcement carries ARP");
+        assert_eq!(
+            ArpRepr::parse(&arp).expect("the announcement parses as ARP"),
+            ArpRepr::EthernetIpv4 {
+                operation: ArpOperation::Request,
+                source_hardware_addr: bep_mac,
+                source_protocol_addr: bep,
+                target_hardware_addr: bep_mac,
+                target_protocol_addr: bep,
+            }
+        );
+
+        // The leg speaks nothing on its own: nothing further arrives while
+        // the switch runs.
+        let mut quiet = [0u8; 1];
+        let spoken = tokio::time::timeout(Duration::from_millis(400), peer_conn.read(&mut quiet))
+            .await
+            .map(|read| read.expect("read"))
+            .unwrap_or(usize::MAX);
+        assert_eq!(
+            spoken,
+            usize::MAX,
+            "the leg originates nothing on its own after the announcement"
+        );
+
+        // Stopping the switch stops the peer with it: the leg's connection
+        // closes.
+        gvproxy.stop();
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), peer_conn.read(&mut buf))
+            .await
+            .expect("the peer's connection ends once the switch stops")
+            .expect("read");
+        assert_eq!(
+            read, 0,
+            "the stack peer's connection closed with the switch"
+        );
     }
 
     #[test]
