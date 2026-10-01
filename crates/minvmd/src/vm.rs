@@ -268,7 +268,7 @@ impl VmConfig {
         // `kernel_cmdline`). Bound to a local so the &str handed to `set_kernel`
         // outlives the call.
         let rust_log = std::env::var(GUEST_LOG_ENV).ok();
-        let node_ports = node_ports_from_env();
+        let node_ports = node_ports_from_env()?;
         let cmdline = kernel_cmdline(rust_log.as_deref(), node_ports);
         // The boot line at info, not debug: the kernel echoes it back as
         // `Kernel command line: …` only once its console is up, and this is
@@ -454,27 +454,69 @@ fn kernel_cmdline(rust_log: Option<&str>, node_ports: Option<(u16, u16)>) -> Cow
 }
 
 /// Reads the node ports the supervisor handed the VMM child in its env (see
-/// [`NODE_PROXY_PORT_ENV`]). `None` when the boot does not run under the
-/// supervisor — the guest daemon then selects its own ports, the pre-handoff
-/// behaviour. A value that does not parse warns and is treated as absent.
+/// [`NODE_PROXY_PORT_ENV`]). Transport decoding only — the supervisor
+/// resolves the pair once (override or selection, `cmd/run.rs`) and hands
+/// the one resolution down, so anything this decode cannot accept is a boot
+/// error naming the variable and the value, never a silent fallback that
+/// would let the guest select ports different from the ones the node row
+/// registered. `Ok(None)` when both variables are absent — the boot does
+/// not run under the supervisor, and the guest daemon then selects its own
+/// ports, the pre-handoff behaviour. A `0` passes through: the guest's own
+/// handed-port policy reads it as "select one yourself".
 // Only `apply` calls this; see `kernel_cmdline` for the cfg note.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn node_ports_from_env() -> Option<(u16, u16)> {
-    let parse = |name: &str| -> Option<u16> {
-        let raw = std::env::var(name).ok()?;
-        raw.parse()
-            .inspect_err(|_| {
-                tracing::warn!(
-                    env = name,
-                    value = %raw,
-                    "unparseable node port; the guest daemon selects its own"
-                )
-            })
-            .ok()
+fn node_ports_from_env() -> Result<Option<(u16, u16)>, crate::error::VmError> {
+    let proxy = std::env::var(NODE_PROXY_PORT_ENV).ok();
+    let answerer = std::env::var(NODE_ANSWERER_PORT_ENV).ok();
+    node_ports_from_raw(proxy.as_deref(), answerer.as_deref())
+}
+
+/// Decodes a handed node-port pair from its raw env values. `Ok(None)` only
+/// when both are absent; the handoff is both-or-neither, so a half-pair, and
+/// a value that does not decode, each fail the boot.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn node_ports_from_raw(
+    proxy: Option<&str>,
+    answerer: Option<&str>,
+) -> Result<Option<(u16, u16)>, crate::error::VmError> {
+    let decode = |name: &str, raw: Option<&str>| -> Result<Option<u16>, crate::error::VmError> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        match raw.trim().parse::<u16>() {
+            Ok(port) => Ok(Some(port)),
+            Err(_) => Err(crate::error::VmError::Io {
+                source: std::io::Error::other(format!(
+                    "environment variable {name} carries {raw:?}, which is not a port"
+                )),
+            }),
+        }
     };
-    let proxy = parse(NODE_PROXY_PORT_ENV)?;
-    let answerer = parse(NODE_ANSWERER_PORT_ENV)?;
-    Some((proxy, answerer))
+    let proxy = decode(NODE_PROXY_PORT_ENV, proxy)?;
+    let answerer = decode(NODE_ANSWERER_PORT_ENV, answerer)?;
+    match (proxy, answerer) {
+        (None, None) => Ok(None),
+        (Some(proxy), Some(answerer)) => Ok(Some((proxy, answerer))),
+        (Some(_), None) | (None, Some(_)) => {
+            let proxy_set = proxy.is_some();
+            Err(crate::error::VmError::Io {
+                source: std::io::Error::other(format!(
+                    "the node port handoff is half-set: {} is set and {} is absent; \
+                     the handoff is both-or-neither",
+                    if proxy_set {
+                        NODE_PROXY_PORT_ENV
+                    } else {
+                        NODE_ANSWERER_PORT_ENV
+                    },
+                    if proxy_set {
+                        NODE_ANSWERER_PORT_ENV
+                    } else {
+                        NODE_PROXY_PORT_ENV
+                    }
+                )),
+            })
+        }
+    }
 }
 
 /// Resolve the data-volume `(direct_io, sync_mode)` from the R1.9 environment
@@ -642,6 +684,32 @@ mod tests {
             kernel_cmdline(Some(&oversized), Some((7654, 7656))),
             ports_only,
             "an oversized filter is skipped; the handed ports still boot"
+        );
+
+        // The handoff decode is strict, because the supervisor resolves the
+        // pair once and anything undecodable here would boot the guest onto
+        // ports different from the ones the node row registered: both
+        // variables absent is the pre-handoff boot (no tokens), a complete
+        // pair decodes, and a half-pair or a value that is not a port is a
+        // surfaced error naming the variable and the value.
+        assert_eq!(node_ports_from_raw(None, None).unwrap(), None);
+        assert_eq!(
+            node_ports_from_raw(Some("7654"), Some("7656")).unwrap(),
+            Some((7654, 7656))
+        );
+        let half = node_ports_from_raw(Some("7654"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            half.contains("half-set") && half.contains(NODE_PROXY_PORT_ENV),
+            "a half-pair names the handoff's shape, got: {half}"
+        );
+        let garbage = node_ports_from_raw(None, Some("no-port-here"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            garbage.contains(NODE_ANSWERER_PORT_ENV) && garbage.contains("no-port-here"),
+            "an undecodable value names the variable and the value, got: {garbage}"
         );
     }
 
