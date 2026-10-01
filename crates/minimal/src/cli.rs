@@ -552,6 +552,20 @@ pub struct ActivateArgs {
     pub attach: bool,
 }
 
+/// Transport `min mcp` serves the Model Context Protocol over.
+///
+/// `stdio` is the default: the JSON-RPC channel is the process's stdout, and
+/// only the process that spawned `min mcp` can reach it. `http` instead
+/// listens on `--bind` and speaks the MCP streamable-HTTP transport, so a
+/// client connects over the network rather than inheriting the pipes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum McpTransport {
+    /// JSON-RPC over stdin/stdout (the default).
+    Stdio,
+    /// MCP streamable HTTP, listening on `--bind`.
+    Http,
+}
+
 /// Flags for `min mcp`.
 ///
 /// The global flags (`--provider`, `--vm`, `--minimal-dir`) choose which
@@ -559,6 +573,16 @@ pub struct ActivateArgs {
 /// sessions it creates from them.
 #[derive(Debug, Args)]
 pub struct McpArgs {
+    /// Transport the server listens on.
+    #[arg(long, value_enum, default_value_t = McpTransport::Stdio)]
+    pub transport: McpTransport,
+    /// Address the HTTP transport listens on. Ignored by `stdio`.
+    ///
+    /// Defaults to loopback because the server exposes unrestricted shell
+    /// execution in the sandboxes it creates: anything that can reach a
+    /// non-loopback address can run commands there.
+    #[arg(long, value_name = "ADDR:PORT", default_value = "127.0.0.1:3000")]
+    pub bind: std::net::SocketAddr,
     /// Directory uploaded into the lazily-created default session. Used for
     /// the first `exec`/file call that names no session; without it that call
     /// uses the current directory.

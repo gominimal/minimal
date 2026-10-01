@@ -1,10 +1,10 @@
 //! `min mcp` — a Model Context Protocol server over the minimal session plane.
 //!
-//! Speaks MCP over stdio and exposes the session infrastructure as a
-//! shell-execution surface for an agent harness. Each tool delegates to the
-//! existing client layer: session creation goes through the shared activation
-//! core, exec through [`minimal_client::Client::exec_collect`], and file I/O
-//! through SFTP.
+//! Speaks MCP over stdio (the default) or streamable HTTP (`--transport http`)
+//! and exposes the session infrastructure as a shell-execution surface for an
+//! agent harness. Each tool delegates to the existing client layer: session
+//! creation goes through the shared activation core, exec through
+//! [`minimal_client::Client::exec_collect`], and file I/O through SFTP.
 //!
 //! ## The usage contract
 //!
@@ -18,14 +18,17 @@
 //!
 //! ## stdout is the protocol
 //!
-//! The JSON-RPC channel is stdout. Logging is routed to stderr
+//! Over stdio the JSON-RPC channel is stdout. Logging is routed to stderr
 //! (`stdout_is_data_contract` in `main.rs`), and the activation core's uploads
-//! are quiet — nothing here may print to stdout except the transport.
+//! are quiet — nothing here may print to stdout except the transport. Over
+//! HTTP stdout carries nothing at all; the bound address is announced on
+//! stderr.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
@@ -38,7 +41,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::GlobalArgs;
-use crate::{CliNetworkMode, McpArgs, SyncMode, parse_network_mode};
+use crate::{CliNetworkMode, McpArgs, McpTransport, SyncMode, parse_network_mode};
 use sessions::SessionId;
 
 /// The MCP `instructions` field: the contract a model needs before it uses any
@@ -108,6 +111,59 @@ impl McpServer {
     pub async fn serve_stdio(global: GlobalArgs, args: McpArgs) -> Result<(), anyhow::Error> {
         let service = McpServer::new(global, args).serve(stdio()).await?;
         service.waiting().await?;
+        Ok(())
+    }
+
+    /// Serve the MCP streamable-HTTP transport on `args.bind` until the
+    /// process is stopped.
+    ///
+    /// stdout is not the protocol here, so the address actually bound is
+    /// announced on stderr: with `--bind ...:0` that is the only way a caller
+    /// learns the port. One server is built and cloned per HTTP session by the
+    /// factory, so sessions share the lazily-created default sandbox exactly as
+    /// they do over stdio.
+    pub async fn serve_http(global: GlobalArgs, args: McpArgs) -> Result<(), anyhow::Error> {
+        use rmcp::transport::streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        };
+
+        let bind = args.bind;
+        let listener = tokio::net::TcpListener::bind(bind)
+            .await
+            .with_context(|| format!("binding {bind}"))?;
+        let addr = listener
+            .local_addr()
+            .with_context(|| format!("reading the address bound for {bind}"))?;
+
+        // rmcp validates the Host header to blunt DNS-rebinding attacks, and
+        // its default allowlist is loopback-only. That is exactly right for a
+        // loopback bind. A non-loopback bind is a deliberate exposure — the
+        // server runs unrestricted shell commands in the sandboxes it creates —
+        // and the operator's hostnames are unknowable, so validation is handed
+        // to them along with a warning.
+        let config = if addr.ip().is_loopback() {
+            StreamableHttpServerConfig::default()
+        } else {
+            eprintln!(
+                "min mcp: {addr} has no authentication; anyone who can reach it \
+                 can run commands in your sandboxes"
+            );
+            StreamableHttpServerConfig::default().disable_allowed_hosts()
+        };
+
+        let server = McpServer::new(global, args);
+        let service: StreamableHttpService<McpServer, LocalSessionManager> =
+            StreamableHttpService::new(
+                move || Ok(server.clone()),
+                Arc::new(LocalSessionManager::default()),
+                config,
+            );
+
+        eprintln!("min mcp: serving streamable HTTP at http://{addr}/mcp");
+        let router = axum::Router::new().nest_service("/mcp", service);
+        axum::serve(listener, router)
+            .await
+            .context("serving MCP over HTTP")?;
         Ok(())
     }
 
@@ -666,7 +722,10 @@ impl ServerHandler for McpServer {
 
 /// Entry point for `min mcp`.
 pub async fn cmd_mcp(global: &GlobalArgs, args: McpArgs) -> Result<(), anyhow::Error> {
-    McpServer::serve_stdio(global.clone(), args).await
+    match args.transport {
+        McpTransport::Stdio => McpServer::serve_stdio(global.clone(), args).await,
+        McpTransport::Http => McpServer::serve_http(global.clone(), args).await,
+    }
 }
 
 #[cfg(test)]
