@@ -193,18 +193,15 @@ pub(crate) fn task_network(
         // session box's address would key its frames to the session's row.
         // A task's sandbox self-allocates, as it always has.
         //
-        // What the interim costs, stated: the host's registration cursor and
-        // this daemon's allocation cursor draw from the same address run
-        // without seeing each other's takes, so the host can hand a box an
-        // address a task's sandbox has just drawn. Task sandboxes keep
-        // self-allocating from that shared run until the host hands them
-        // addresses too, and a collision is refused daemon-side rather than
-        // shared — `IpAllocator::hand` errors on a handed address a locally
-        // drawn lease holds, so the box's attach fails instead of a second
-        // tap landing on the task's address. Reserving a disjoint sub-run
-        // for daemon self-allocation would close the window instead; that
-        // shape is still being decided, so the refusal is this build's
-        // guard.
+        // The interim, stated plainly: task sandboxes self-allocate from the
+        // daemon's reserve — the plan run's lower half
+        // (`crate::net::self_allocation_run`) — until the task registering
+        // every live box host-side (NET-138) retires self-allocation, after
+        // which no daemon-side draw happens once a control socket exists.
+        // The VM host daemon hands registered boxes only from the run above
+        // the reserve, so the two allocators cannot meet; the daemon-side
+        // refusals (`IpAllocator::hand`) stay the guard against a pair that
+        // disagrees about the split.
         None,
     )
 }

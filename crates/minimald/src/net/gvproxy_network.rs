@@ -491,16 +491,21 @@ mod tests {
     /// daemon handed its registration attaches **at the handed address** —
     /// the address the host-side table's row is keyed by — and **selects
     /// none**: the allocator's run shows exactly the handed lease, no
-    /// self-allocation spent beside it, and the next unregistered box still
-    /// draws sequentially from the run, never re-issuing the handed one.
+    /// self-allocation spent beside it. The next unregistered box
+    /// self-allocates from the daemon's reserve — the plan run's lower half,
+    /// disjoint from the hand-out run the handed address came from — so the
+    /// two allocators cannot meet and the handed address is never drawn.
     /// And the attach names the handed address in one debug line, with the
-    /// handed/self-drawn distinction a log tail reads. A handed address a
-    /// locally-drawn lease already holds is refused at the attach path
-    /// rather than shared with it.
+    /// handed/self-drawn distinction a log tail reads. A handed address the
+    /// daemon already spends is refused at the attach path rather than
+    /// shared with it — a reserve address, and a lease's own address alike.
     #[tokio::test]
     async fn own_ip_attach_uses_handed_address() {
         let switch = vm_host_switch();
-        let handed_switch = Ipv4Addr::new(100, 64, 0, 9);
+        // The handed address comes from the hand-out run — the plan run's
+        // upper half, above the daemon's self-allocation reserve, which is
+        // where a real host's registrations hand from.
+        let handed_switch = Ipv4Addr::new(100, 64, 128, 9);
         let handed_loopback = Ipv4Addr::new(127, 0, 64, 9);
         let net = network_for(
             sessions::NetworkMode::OwnIp,
@@ -534,8 +539,10 @@ mod tests {
         let _ = plan; // the plan's resolver/tap carry the same lease; asserted above
 
         // Releasing it detaches like any other, and the next box — one the
-        // activating client did not register — draws sequentially from the
-        // run, past the handed address, never re-issuing it.
+        // activating client did not register — self-allocates from the
+        // daemon's reserve: the plan run's lower half, a sub-run disjoint
+        // from the hand-out run the handed address came from, so the two
+        // allocators cannot meet.
         net.abandon().await;
         assert_eq!(switch.lock().await.attached(), 0, "the abandon detaches");
         let unregistered = network_for(
@@ -559,18 +566,19 @@ mod tests {
         );
         assert_eq!(
             leases[1].ip,
-            Ipv4Addr::from(u32::from(Ipv4Addr::new(100, 64, 0, 9)) + 1),
-            "the self-allocation draws past the handed address — the run never \
-             re-issues it, got {leases:?}"
+            Ipv4Addr::new(100, 64, 0, 2),
+            "the self-allocation draws the reserve's first address — the \
+             sub-run is disjoint from the hand-out run, so the handed \
+             address is never drawn, got {leases:?}"
         );
 
-        // And the collision is refused at the attach path, never shared: the
-        // host's registration cursor and this daemon's allocation cursor run
-        // over the same address run without seeing each other's takes — the
-        // task sandbox above just drew .10 — so a box handed that address
-        // must fail its plan rather than put a second tap on it. The refusal
-        // spends nothing: no lease joins the table, no attach is counted.
-        let colliding = network_for(
+        // And a handed address this daemon already spends is refused at the
+        // attach path, never shared. Two shapes, both refused: the task
+        // sandbox's just-drawn reserve address — the shape a host that
+        // hands from the run's start would produce — and the box's own
+        // handed address, whose lease is still recorded. The refusals spend
+        // nothing: no lease joins the table, no attach is counted.
+        let colliding_reserve = network_for(
             sessions::NetworkMode::OwnIp,
             &switch,
             "third",
@@ -581,14 +589,42 @@ mod tests {
                 loopback_address: Ipv4Addr::LOCALHOST,
             }),
         );
-        let err = colliding
+        let err = colliding_reserve
             .plan()
             .await
-            .expect_err("a handed address a locally-drawn lease holds refuses");
+            .expect_err("a handed address inside the reserve refuses");
         assert!(
-            err.to_string()
-                .contains("already held by a locally-drawn lease"),
-            "the refusal names the locally-drawn holder: {err}"
+            err.to_string().contains("self-allocation reserve"),
+            "the refusal names the reserve: {err}"
+        );
+        assert_eq!(
+            switch.lock().await.leases().len(),
+            2,
+            "the refusal added no lease to the table"
+        );
+        assert_eq!(
+            switch.lock().await.attached(),
+            1,
+            "only the self-allocated attach counts; the refused one never did"
+        );
+        let colliding_held = network_for(
+            sessions::NetworkMode::OwnIp,
+            &switch,
+            "fourth",
+            None,
+            None,
+            Some(BoxAddresses {
+                switch_address: leases[0].ip,
+                loopback_address: Ipv4Addr::LOCALHOST,
+            }),
+        );
+        let err = colliding_held
+            .plan()
+            .await
+            .expect_err("a handed address a lease holds refuses");
+        assert!(
+            err.to_string().contains("already held by a lease"),
+            "the refusal names the held lease: {err}"
         );
         assert_eq!(
             switch.lock().await.leases().len(),

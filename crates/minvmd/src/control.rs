@@ -21,6 +21,12 @@
 //! keeps serving, and a client that never reaches the socket (a supervisor
 //! predating this module) still activates, handed no addresses, under the
 //! egress gate's announced interim.
+//!
+//! The v1 posture, stated: the trust is the socket itself — the same-uid
+//! 0600 the bind enforces, with no peer-credential check on a connection —
+//! and requests are served serially, one connection at a time, each read
+//! bounded by a 30-second timeout. That is what v1 ships, not a design
+//! endpoint.
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -309,8 +315,10 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let (sock_path, _server) = spawn_server(dir.path()).expect("server binds");
 
-        // The first registration is handed the plan's first lease address
-        // and the first published loopback address.
+        // The first registration is handed the hand-out run's first switch
+        // address — the plan's PTask run above the daemon's self-allocation
+        // reserve, mirrored from `minimald::net::self_allocation_run` — and
+        // the first published loopback address.
         let web = handed(
             register(
                 &sock_path,
@@ -329,8 +337,9 @@ mod tests {
         );
         assert_eq!(
             web.switch_address,
-            Ipv4Addr::from(SUBNET.first_ptask()),
-            "the first box takes the plan's first lease address"
+            Ipv4Addr::new(100, 64, 127, 255),
+            "the first box takes the hand-out run's first address, above the \
+             daemon's reserve"
         );
         assert_eq!(
             web.loopback_address,
@@ -370,8 +379,8 @@ mod tests {
         );
         assert_eq!(
             db.switch_address,
-            Ipv4Addr::from(SUBNET.first_ptask() + 1),
-            "the second box takes the plan's next lease address, never the first again"
+            Ipv4Addr::new(100, 64, 128, 0),
+            "the second box takes the hand-out run's next address, never the first again"
         );
         assert_eq!(
             db.loopback_address,
