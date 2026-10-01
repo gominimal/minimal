@@ -105,6 +105,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::box_registry::BoxTable;
+use crate::net::bep_leg::BepDivert;
 
 /// The HTTP request that upgrades a control-socket connection into a raw
 /// frame stream. The guest shuttle writes this head before its first frame;
@@ -298,6 +299,15 @@ const CONNECTION_CAP_RULE: &str = "egress-connection-cap";
 /// but it names what a drop line names: what the host refused and why, once
 /// per interval, for as long as the condition lasts.
 const ACCEPT_RETRY_RULE: &str = "egress-accept-failed";
+
+/// The rule name for a frame addressed to the Box Egress Proxy's address on
+/// the switch that the gate could not hand to the delivery leg — the leg not
+/// started, gone, or dead mid-relay. The frames the proxy's address earns are
+/// never written on to the switch (that is the whole point of the divert:
+/// gvproxy would lose the box's source, and NET-132 is the source), so a leg
+/// that is not there means these frames drop, at the frame drops' cadence:
+/// a box can attempt a connection as cheaply as it can send a frame.
+const BEP_LEG_DOWN_RULE: &str = "egress-bep-leg-down";
 
 /// What the guest's first request head says it came for: gvproxy's switch
 /// socket speaks two protocols on one listener, and the head's request line
@@ -512,8 +522,19 @@ impl EgressGate {
     /// # Errors
     ///
     /// Returns the I/O error if the gate socket cannot be bound.
-    pub fn spawn(gate_sock: PathBuf, switch_sock: PathBuf, table: BoxTable) -> io::Result<Self> {
-        Self::spawn_with_phase(gate_sock, switch_sock, table, UNREGISTERED_SOURCE_PHASE)
+    pub(crate) fn spawn(
+        gate_sock: PathBuf,
+        switch_sock: PathBuf,
+        table: BoxTable,
+        bep: Option<BepDivert>,
+    ) -> io::Result<Self> {
+        Self::spawn_with_phase(
+            gate_sock,
+            switch_sock,
+            table,
+            UNREGISTERED_SOURCE_PHASE,
+            bep,
+        )
     }
 
     /// [`spawn`](Self::spawn) with the unregistered-source phase named: the
@@ -532,6 +553,7 @@ impl EgressGate {
         switch_sock: PathBuf,
         table: BoxTable,
         phase: UnregisteredSourcePhase,
+        bep: Option<BepDivert>,
     ) -> io::Result<Self> {
         let listener = UnixListener::bind(&gate_sock)?;
         // The posture for in-plan sources no row holds, stated at the moment
@@ -548,7 +570,14 @@ impl EgressGate {
         // reset the rate window its drops are counted in.
         let limiter = Arc::new(DropLimiter::new());
         Ok(Self {
-            accept: tokio::spawn(accept_loop(listener, switch_sock, table, limiter, phase)),
+            accept: tokio::spawn(accept_loop(
+                listener,
+                switch_sock,
+                table,
+                limiter,
+                phase,
+                bep,
+            )),
         })
     }
 }
@@ -653,6 +682,7 @@ async fn accept_loop<A: GuestSource>(
     table: BoxTable,
     limiter: Arc<DropLimiter>,
     phase: UnregisteredSourcePhase,
+    bep: Option<BepDivert>,
 ) {
     let mut relays = JoinSet::new();
     loop {
@@ -716,6 +746,7 @@ async fn accept_loop<A: GuestSource>(
             Arc::clone(&limiter),
             HANDSHAKE_TIMEOUT,
             phase,
+            bep.clone(),
         ));
     }
 }
@@ -739,6 +770,7 @@ async fn serve_connection(
     limiter: Arc<DropLimiter>,
     handshake_timeout: Duration,
     phase: UnregisteredSourcePhase,
+    bep: Option<BepDivert>,
 ) {
     // The handshake is bounded front to back: the guest is the untrusted side
     // here, so a peer that connects and then sends nothing — or a head it
@@ -803,11 +835,70 @@ async fn serve_connection(
     let (guest_rx, guest_tx) = guest.into_split();
     match speak {
         GuestSpeak::Frames => {
+            // The proxy's delivery leg, dialed once for this relay: its write
+            // half takes the frames the egress leg diverts to the proxy's
+            // address, its read half feeds the ingress leg. A leg that cannot
+            // be dialed leaves both ends `None`, and the divert degrades to
+            // dropping those frames — at the frame drops' cadence, named by
+            // its rule — while every other frame's path is untouched.
+            let leg = match bep.as_ref() {
+                Some(bep) => {
+                    match tokio::time::timeout(
+                        handshake_timeout,
+                        UnixStream::connect(&bep.handoff_sock),
+                    )
+                    .await
+                    {
+                        Ok(Ok(sock)) => Some(sock.into_split()),
+                        Ok(Err(error)) => {
+                            if limiter.should_warn_at(None, BEP_LEG_DOWN_RULE, Instant::now())
+                                != WarnDecision::Silent
+                            {
+                                tracing::warn!(
+                                    %error,
+                                    handoff_socket = %bep.handoff_sock.display(),
+                                    rule_matched = BEP_LEG_DOWN_RULE,
+                                    "the box egress proxy's delivery leg is not reachable; \
+                                     frames addressed to the proxy's address drop at the gate",
+                                );
+                            }
+                            None
+                        }
+                        Err(_) => {
+                            // The dial itself hung past the bound: the same
+                            // posture, with no error to name.
+                            if limiter.should_warn_at(None, BEP_LEG_DOWN_RULE, Instant::now())
+                                != WarnDecision::Silent
+                            {
+                                tracing::warn!(
+                                    handoff_socket = %bep.handoff_sock.display(),
+                                    dial_timeout = ?handshake_timeout,
+                                    rule_matched = BEP_LEG_DOWN_RULE,
+                                    "the box egress proxy's delivery leg did not answer its \
+                                     dial; frames addressed to the proxy's address drop at the \
+                                     gate",
+                                );
+                            }
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            // `into_split` yields the read half first: name the halves by
+            // what they are, not by the order they arrive in.
+            let (leg_rx, leg_tx) = match leg {
+                Some((rx, tx)) => (Some(rx), Some(tx)),
+                None => (None, None),
+            };
             relay_frames(
                 Prefixed::new(carry, guest_rx),
                 switch_tx,
                 switch_rx,
                 guest_tx,
+                leg_tx,
+                leg_rx,
+                bep,
                 table,
                 limiter,
                 phase,
@@ -845,21 +936,32 @@ fn refuse_head(limiter: &DropLimiter, refused: &RefusedHead) {
 }
 
 /// guest ↔ switch on an upgraded connection: egress (guest → switch) through
-/// the frame verdict, per source address; ingress (switch → guest) untouched
-/// and un-parsed — the gate's job is the egress direction, and what a box may
-/// receive is the target's ingress policy, decided in the guest where its
-/// declarations are enforced.
+/// the frame verdict, per source address — with the frames addressed to the
+/// Box Egress Proxy's address diverted to the delivery leg instead of the
+/// switch ([`relay_guest_to_switch`]); ingress (switch → guest, and leg →
+/// guest) untouched and un-parsed — the gate's job is the egress direction,
+/// and what a box may receive is the target's ingress policy, decided in the
+/// guest where its declarations are enforced.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one relay's inputs: the two ends it copies and the leg divert beside them"
+)]
 async fn relay_frames(
     guest: Prefixed<OwnedReadHalf>,
     switch_tx: OwnedWriteHalf,
     switch_rx: OwnedReadHalf,
     guest_tx: OwnedWriteHalf,
+    leg_tx: Option<OwnedWriteHalf>,
+    leg_rx: Option<OwnedReadHalf>,
+    bep: Option<BepDivert>,
     table: BoxTable,
     limiter: Arc<DropLimiter>,
     phase: UnregisteredSourcePhase,
 ) {
-    let mut ingress = tokio::spawn(copy_switch_to_guest(switch_rx, guest_tx));
-    let egress = relay_guest_to_switch(guest, switch_tx, table, limiter, phase);
+    let mut ingress = tokio::spawn(copy_switch_to_guest(switch_rx, leg_rx, guest_tx));
+    let bep_address = bep.as_ref().map(|bep| bep.address);
+    let egress =
+        relay_guest_to_switch(guest, switch_tx, leg_tx, bep_address, table, limiter, phase);
     tokio::pin!(egress);
     // The two legs race, because neither can see the other's end. The egress
     // leg blocks on the guest, which has no reason to speak while it is idle,
@@ -948,7 +1050,7 @@ async fn relay_control(
     limiter: Arc<DropLimiter>,
     drain_timeout: Duration,
 ) {
-    let mut response = tokio::spawn(copy_switch_to_guest(switch_rx, guest_tx));
+    let mut response = tokio::spawn(copy_switch_to_guest(switch_rx, None, guest_tx));
     let splice = splice_control(guest, switch, body, drain_timeout);
     tokio::pin!(splice);
     tokio::select! {
@@ -1124,12 +1226,65 @@ async fn splice_control(
 }
 
 /// switch → guest, untouched. The gate applies no ingress policy and parses
-/// nothing on this leg — bytes flow as they came, frames included.
+/// nothing on this leg — bytes flow as they came, frames included. The
+/// delivery leg's socket, when one was dialed for this relay, is a second
+/// source of the same shape: the leg's frames are copied to the guest
+/// verbatim beside the switch's, and the leg's own death takes nothing with
+/// it but its own reads — the switch's side of the relay keeps running, so a
+/// dead delivery leg costs only the frames it was delivering.
 async fn copy_switch_to_guest(
     mut switch: OwnedReadHalf,
+    leg: Option<OwnedReadHalf>,
     mut guest: OwnedWriteHalf,
 ) -> io::Result<()> {
-    tokio::io::copy(&mut switch, &mut guest).await.map(|_| ())
+    let Some(mut leg) = leg else {
+        return tokio::io::copy(&mut switch, &mut guest).await.map(|_| ());
+    };
+    /// One read that raced the other: which source it came from, and what it
+    /// read. The source matters at EOF only — the switch's end is the relay's
+    /// own, the leg's end is one source going away.
+    enum Read {
+        Switch(io::Result<usize>),
+        Leg(io::Result<usize>),
+    }
+    // Two sources, one guest: reads from either are written on whole — never
+    // interleaved mid-frame — so the length-framing each source carries
+    // survives the copy intact. Each source keeps its own read buffer: a
+    // `select!` polls both at once, so one buffer could not serve them.
+    let mut switch_buf = vec![0u8; 16 * 1024];
+    let mut leg_buf = vec![0u8; 16 * 1024];
+    let mut leg_alive = true;
+    loop {
+        let read = if leg_alive {
+            tokio::select! {
+                read = switch.read(&mut switch_buf) => Read::Switch(read),
+                read = leg.read(&mut leg_buf) => Read::Leg(read),
+            }
+        } else {
+            Read::Switch(switch.read(&mut switch_buf).await)
+        };
+        let (switch_end, n) = match read {
+            Read::Switch(Ok(n)) => (true, n),
+            Read::Leg(Ok(n)) => (false, n),
+            Read::Switch(Err(error)) | Read::Leg(Err(error)) => return Err(error),
+        };
+        // The switch's side is the relay's: its end takes the ingress leg
+        // down with it, as it did before the delivery leg joined. The leg's
+        // own end only takes its own reads away.
+        if n == 0 {
+            if switch_end {
+                return Ok(());
+            }
+            leg_alive = false;
+            continue;
+        }
+        let buffer = if switch_end {
+            &switch_buf[..]
+        } else {
+            &leg_buf[..]
+        };
+        guest.write_all(&buffer[..n]).await?;
+    }
 }
 
 /// guest → switch: read one length-framed Ethernet frame, decide it against
@@ -1146,6 +1301,8 @@ async fn copy_switch_to_guest(
 async fn relay_guest_to_switch(
     mut guest: Prefixed<OwnedReadHalf>,
     mut switch: OwnedWriteHalf,
+    mut leg: Option<OwnedWriteHalf>,
+    bep_address: Option<Ipv4Addr>,
     table: BoxTable,
     limiter: Arc<DropLimiter>,
     phase: UnregisteredSourcePhase,
@@ -1197,6 +1354,34 @@ async fn relay_guest_to_switch(
         let mut framed = Vec::with_capacity(2 + n);
         framed.extend_from_slice(&(n as u16).to_le_bytes());
         framed.extend_from_slice(&frame[..n]);
+        // A frame addressed to the Box Egress Proxy's address never reaches
+        // the switch: gvproxy terminates the traffic it receives, which is
+        // where a box's source would be lost, and NET-132 is the source. It
+        // goes to the delivery leg instead — the leg terminates the box's
+        // TCP and delivers the connection with its source carried on it —
+        // and a leg that is not there means the frame drops at its rule.
+        if bep_address.is_some_and(|address| summary.destination() == Some(address.octets())) {
+            let Some(leg_tx) = leg.as_mut() else {
+                limiter.emit(summary.source(), BEP_LEG_DOWN_RULE);
+                continue;
+            };
+            if leg_tx.write_all(&framed).await.is_err() {
+                // The leg went away mid-relay: the frames it carried drop at
+                // its rule from here on, and plain egress is untouched.
+                leg = None;
+                if limiter.should_warn_at(None, BEP_LEG_DOWN_RULE, Instant::now())
+                    != WarnDecision::Silent
+                {
+                    tracing::warn!(
+                        rule_matched = BEP_LEG_DOWN_RULE,
+                        "the box egress proxy's delivery leg went away mid-relay; frames \
+                         addressed to the proxy's address drop at the gate",
+                    );
+                }
+                continue;
+            }
+            continue;
+        }
         switch.write_all(&framed).await?;
     }
 }
@@ -1639,6 +1824,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for Prefixed<R> {
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::io;
+    use std::net::Ipv4Addr;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1738,6 +1924,11 @@ pub(crate) mod test_support {
         /// ([`connect_over`]). Held for its lifetime, not read: a listener is
         /// accepted *from*.
         pub(crate) switch_listener: UnixListener,
+        /// The delivery leg the gate diverts to, when the harness built one
+        /// ([`gate_over_with_bep`]). Declared before the sockets' directory
+        /// below it, so the leg drops — its sockets with it — before the
+        /// directory goes away.
+        pub(crate) bep_leg: Option<crate::net::bep_leg::BepLeg>,
         /// Keeps the sockets' directory alive for the gate's lifetime.
         /// Underscore-named: held for its `Drop`, never read.
         pub(crate) _dir: TempDir,
@@ -1788,6 +1979,7 @@ pub(crate) mod test_support {
             switch_sock.clone(),
             registry.table(),
             phase,
+            None,
         )
         .expect("spawning the egress gate");
 
@@ -1808,6 +2000,77 @@ pub(crate) mod test_support {
             table: registry.table(),
             gate_sock,
             switch_listener: listener,
+            bep_leg: None,
+            _dir: dir,
+            _guard,
+        }
+    }
+
+    /// [`gate_over`] with the gate built to divert frames addressed to the
+    /// Box Egress Proxy's address on the switch: a delivery leg is bound
+    /// beside the stand-in switch socket — the handoff socket
+    /// [`crate::net::bep_leg::bep_sock_beside`] names, a stub listener on an
+    /// ephemeral port standing in for the proxy's — and the gate is spawned
+    /// with the divert to it, so the frames a test sends for the proxy's
+    /// address reach the leg and the stub behind it, never the switch.
+    pub(crate) async fn gate_over_with_bep(
+        registry: BoxRegistry,
+        bep_address: Ipv4Addr,
+    ) -> GateHarness {
+        let dir = TempDir::new().expect("a tempdir is creatable");
+        let switch_sock = dir.path().join("gvproxy-switch.sock");
+        let gate_sock = dir.path().join("gvproxy-gate.sock");
+        let listener = UnixListener::bind(&switch_sock).expect("binding the stand-in switch");
+        let (log, _guard) = capture_log();
+        // The delivery leg the gate diverts to, beside the stand-in switch
+        // socket and before the gate is up: a stub listener on an ephemeral
+        // port standing in for the proxy's, delivery to itself.
+        let stub =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("binding the stub listener");
+        let delivery = stub.local_addr().expect("the stub listener's address");
+        let bep_leg = crate::net::bep_leg::BepLeg::bind(
+            crate::net::bep_leg::bep_sock_beside(&switch_sock),
+            stub,
+            delivery,
+            bep_address,
+        )
+        .expect("binding the delivery leg");
+        let gate = EgressGate::spawn(
+            gate_sock.clone(),
+            switch_sock.clone(),
+            registry.table(),
+            Some(crate::net::bep_leg::BepDivert {
+                address: bep_address,
+                handoff_sock: crate::net::bep_leg::bep_sock_beside(&switch_sock),
+            }),
+        )
+        .expect("spawning the egress gate");
+        let mut guest = UnixStream::connect(&gate_sock)
+            .await
+            .expect("connecting the guest end");
+        let (mut switch, _) = listener.accept().await.expect("accepting the gate's dial");
+        // The guest's first write — the upgrade head, alone.
+        guest
+            .write_all(CONNECT_REQUEST)
+            .await
+            .expect("writing the guest's first bytes");
+        // The upgrade head, forwarded verbatim and read back off the switch
+        // end, so the frame stream begins at a known point.
+        let mut head = vec![0u8; CONNECT_REQUEST.len()];
+        read_within(&mut switch, &mut head).await;
+        assert_eq!(
+            head, CONNECT_REQUEST,
+            "the gate forwards the switch upgrade head verbatim"
+        );
+        GateHarness {
+            _gate: gate,
+            guest,
+            switch,
+            log,
+            table: registry.table(),
+            gate_sock,
+            switch_listener: listener,
+            bep_leg: Some(bep_leg),
             _dir: dir,
             _guard,
         }
@@ -2096,8 +2359,8 @@ mod tests {
     use super::test_support::{
         CaptureWriter, DEADLINE, arp_frame, capture_log, connect_over, expect_frame,
         expect_silence, expect_teardown, gate_connected, gate_over, gate_over_control,
-        gate_over_with, gate_over_with_phase, ipv4_frame, ipv6_frame, read_within, send_frame,
-        wait_for_log,
+        gate_over_with, gate_over_with_bep, gate_over_with_phase, ipv4_frame, ipv6_frame,
+        read_within, send_frame, wait_for_log,
     };
     use super::{
         AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, DROP_WARN_MAX_TRACKED_PAIRS,
@@ -2196,6 +2459,114 @@ mod tests {
             "one drop line per source address per rule per interval, got: {}",
             h.log.contents()
         );
+    }
+
+    /// NET-132: the frames addressed to the Box Egress Proxy's address are
+    /// handed to the delivery leg, never to the switch — gvproxy terminates
+    /// what it receives, which is where a box's source would be lost, and a
+    /// box's connection to the proxy must arrive at its listener from its own
+    /// switch address. The leg behind the harness's divert terminates the
+    /// frame's TCP, so the handshake comes back to the guest with the
+    /// stand-in listener's answer naming the box's lease — the whole chain,
+    /// observed from the guest end, with the switch end silent throughout.
+    #[tokio::test]
+    async fn frames_for_the_box_egress_proxys_address_are_handed_to_the_leg() {
+        use crate::net::bep_leg::test_frames::{TCP_ACK, TCP_PSH, TCP_SYN, read_back, tcp_frame};
+
+        let bep_address = SUBNET.box_egress_proxy_address();
+        let registry = BoxRegistry::new(SUBNET);
+        // The box declares the CGNAT block: TCP to the proxy's address is
+        // admitted by the verdict, which is what the divert sits behind.
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    allow_subnets: Some(vec!["100.64.0.0/16".to_string()]),
+                    allow_dns_hosts: None,
+                    deny_subnets: None,
+                }),
+        );
+        let mut h = gate_over_with_bep(registry, bep_address).await;
+        // The leg the harness carried is up: its handoff socket exists beside
+        // the switch socket it was bound next to, before any frame is sent.
+        let leg_sock = h
+            .bep_leg
+            .as_ref()
+            .expect("the bep harness carries its delivery leg")
+            .handoff_sock()
+            .to_path_buf();
+        assert!(leg_sock.exists(), "the leg bound its handoff socket");
+
+        // A box's SYN to the proxy's address: diverted at the gate, never
+        // written on to the switch.
+        let syn = tcp_frame(
+            Ipv4Addr::from(LEASE),
+            bep_address,
+            44444,
+            80,
+            1000,
+            0,
+            TCP_SYN,
+            &[],
+        );
+        send_frame(&mut h.guest, &syn).await;
+        // The leg's SYN-ACK comes back through the gate's ingress, from the
+        // proxy's address to the box's lease.
+        let synack = expect_frame(&mut h.guest).await;
+        let segment = read_back(&synack).expect("the leg sent a well-formed TCP frame");
+        assert_eq!(
+            segment.src_ip, bep_address,
+            "the reply comes from the proxy's address"
+        );
+        assert_eq!(segment.dst_ip, Ipv4Addr::from(LEASE));
+        assert_eq!(segment.flags & TCP_SYN, TCP_SYN, "the leg answers the SYN");
+        assert_eq!(segment.ack, 1001, "the box's SYN is acknowledged");
+        let isn = segment.seq;
+
+        // The box's ACK, then its data, then the stub's answer read back from
+        // the guest end: the listener saw the connection from the box's lease,
+        // the source the whole chain carried.
+        let ack_of_synack = tcp_frame(
+            Ipv4Addr::from(LEASE),
+            bep_address,
+            44444,
+            80,
+            1001,
+            isn.wrapping_add(1),
+            TCP_ACK,
+            &[],
+        );
+        let data = tcp_frame(
+            Ipv4Addr::from(LEASE),
+            bep_address,
+            44444,
+            80,
+            1001,
+            isn.wrapping_add(1),
+            TCP_ACK | TCP_PSH,
+            b"whoami\n",
+        );
+        send_frame(&mut h.guest, &ack_of_synack).await;
+        send_frame(&mut h.guest, &data).await;
+        // The stub's answer as a data segment, beside the ACK the data earns.
+        let mut answer = None;
+        for _ in 0..3 {
+            let frame = expect_frame(&mut h.guest).await;
+            let segment = read_back(&frame).expect("a well-formed frame came back to the guest");
+            if !segment.payload.is_empty() {
+                answer = Some(segment.payload);
+                break;
+            }
+        }
+        assert_eq!(
+            answer.expect("the stand-in listener's answer arrived"),
+            format!("source {}\n", Ipv4Addr::from(LEASE)).as_bytes(),
+            "the listener saw the connection from the box's own switch address"
+        );
+
+        // And the switch end stayed silent throughout: nothing addressed to
+        // the proxy's address ever reached it.
+        expect_silence(&mut h.switch).await;
     }
 
     /// NET-081's failure case, as the phase this build ships holds it: a frame
@@ -2977,8 +3348,13 @@ mod tests {
             .with_ansi(false)
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
-        let _gate = EgressGate::spawn(gate_sock.clone(), switch_sock.clone(), registry.table())
-            .expect("spawning the egress gate");
+        let _gate = EgressGate::spawn(
+            gate_sock.clone(),
+            switch_sock.clone(),
+            registry.table(),
+            None,
+        )
+        .expect("spawning the egress gate");
 
         // Two connections, each refused on its head — the guest's own
         // client's shape: connect, speak a head the gate does not relay, and
@@ -3222,6 +3598,7 @@ mod tests {
             Arc::new(DropLimiter::new()),
             bound,
             UNREGISTERED_SOURCE_PHASE,
+            None,
         ));
         // One control request, spoken whole, answered by nothing.
         let request =
@@ -3301,6 +3678,7 @@ mod tests {
             Arc::new(DropLimiter::new()),
             bound,
             UNREGISTERED_SOURCE_PHASE,
+            None,
         ));
         // One control request, spoken whole, and then the guest stays on the
         // connection: no close, nothing more to say — the posture it waits
@@ -3379,6 +3757,7 @@ mod tests {
                 Arc::new(DropLimiter::new()),
                 bound,
                 UNREGISTERED_SOURCE_PHASE,
+                None,
             ));
             if !first_write.is_empty() {
                 guest
@@ -3454,6 +3833,7 @@ mod tests {
             table.clone(),
             Arc::new(DropLimiter::new()),
             UNREGISTERED_SOURCE_PHASE,
+            None,
         ));
         (feed, accept, log, guard)
     }

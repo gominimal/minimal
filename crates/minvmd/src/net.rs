@@ -72,6 +72,12 @@ use tokio::sync::oneshot;
 
 pub(crate) mod egress_gate;
 pub use egress_gate::EgressGate;
+// Everything in the leg is wired from the boot path under `minvmd_libkrun`;
+// on a host without libkrun (this crate's plain build) the module has no
+// caller, so its items read as dead. Same posture as the gated fns in
+// `cmd::run`.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) mod bep_leg;
 mod shuttle;
 pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_gate_sock, resolve_switch_sock};
 
@@ -704,6 +710,9 @@ impl HostGvproxy {
             // frame's source by is one the switch actually routes.
             .with_subnet(registry.subnet());
         let table = registry.table();
+        // The proxy's address on the switch, carved from the same subnet the
+        // gate's rows were compiled against (NET-132).
+        let subnet = registry.subnet();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<u32>>();
 
@@ -739,10 +748,23 @@ impl HostGvproxy {
                     // dies with the switch runtime, and dropping it stops the
                     // gate and every live relay.
                     let sock = switch.switch_socket().to_path_buf();
+                    // The divert to the proxy's delivery leg (NET-132): the
+                    // gate hands the frames addressed to the proxy's address
+                    // to the leg — which the caller starts beside this
+                    // switch, on [`bep_leg::bep_sock_beside`] — before the
+                    // switch sees them, which is what keeps each box's own
+                    // source on its delivered connection. A leg that is not
+                    // running only drops these frames at the gate; plain
+                    // egress is untouched either way.
+                    let bep = Some(bep_leg::BepDivert {
+                        address: subnet.box_egress_proxy_address(),
+                        handoff_sock: bep_leg::bep_sock_beside(&sock),
+                    });
                     let _gate = match EgressGate::spawn(
                         shuttle::gate_sock_beside(&sock),
                         sock.clone(),
                         table,
+                        bep,
                     ) {
                         Ok(gate) => gate,
                         Err(e) => {

@@ -463,7 +463,7 @@ fn run_foreground() -> Result<()> {
     // lanes that exercise only the vsock bridge) we warn and boot without
     // egress rather than failing the VM — the daemon then has no network, the
     // pre-existing behaviour.
-    let _gvproxy = match crate::image::resolve_gvproxy_path() {
+    let network = match crate::image::resolve_gvproxy_path() {
         binary if binary.exists() => {
             let switch_sock =
                 crate::net::resolve_switch_sock().context("resolving switch socket")?;
@@ -477,6 +477,12 @@ fn run_foreground() -> Result<()> {
                 crate::net::resolve_gate_sock().context("resolving egress gate socket")?;
             crate::sock::remove_stale_socket(&gate_sock)
                 .context("removing stale egress gate socket")?;
+            // The delivery leg binds the socket beside the gate's, so a stale
+            // file from a prior run must go or the bind fails EEXIST — the
+            // same discipline the switch and gate sockets get.
+            let bep_sock = crate::net::bep_leg::bep_sock_beside(&switch_sock);
+            crate::sock::remove_stale_socket(&bep_sock)
+                .context("removing stale box egress proxy leg socket")?;
             match crate::net::HostGvproxy::spawn(
                 binary,
                 switch_sock,
@@ -485,7 +491,33 @@ fn run_foreground() -> Result<()> {
             ) {
                 Ok(gvproxy) => {
                     tracing::info!(pid = gvproxy.pid(), "host gvproxy switch up");
-                    Some(gvproxy)
+                    // The proxy's delivery leg, beside the switch (NET-132):
+                    // binds the handoff socket the gate diverts the frames for
+                    // the proxy's address through, and the stub listener the
+                    // leg delivers to — the stand-in that runs until the proxy
+                    // lands and takes both the address and the port over. Best
+                    // effort: a leg that cannot bind (its port taken, say) is
+                    // a warn, and boxes' connections to the proxy's address
+                    // drop at the gate while every other frame's path is
+                    // untouched.
+                    match crate::net::bep_leg::BepLeg::bind_beside(&switch_sock, boxes.subnet()) {
+                        Ok(leg) => {
+                            tracing::info!(
+                                listener = %crate::net::bep_leg::DEFAULT_BEP_DELIVERY_ADDR,
+                                handoff_socket = %leg.handoff_sock().display(),
+                                "box egress proxy delivery leg up beside the switch"
+                            );
+                            Some((gvproxy, Some(leg)))
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "failed to start the box egress proxy's delivery leg; \
+                                 boxes' connections to the proxy's address drop at the gate"
+                            );
+                            Some((gvproxy, None))
+                        }
+                    }
                 }
                 // An own-IP VM cannot work without the switch: fail loudly. A
                 // non-own-IP boot tolerates it (same as a missing binary below).
@@ -522,6 +554,8 @@ fn run_foreground() -> Result<()> {
             None
         }
     };
+    let _gvproxy = network.map(|(gvproxy, _leg)| gvproxy);
+    let _bep_leg = network.and_then(|(_, leg)| leg);
 
     // R2.5: record whether the data volume image pre-exists this boot, before
     // the VMM child provisions it — a later boot failure is fatal for a
