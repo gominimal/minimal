@@ -4795,7 +4795,7 @@ mod tests {
         // The deny-all box: no declared subnets, so its row admits nothing
         // but the resolver carve-out — the box a spoof must not unseal.
         tcp_box(&registry, "locked", [100, 64, 0, 11], vec![]);
-        registry.register_node_namespace();
+        registry.register_node_namespace(7654, 7656);
         let table = registry.table();
         let baseline = NodePlaneBaseline::built_in(SUBNET);
         let node = baseline.node_addr();
