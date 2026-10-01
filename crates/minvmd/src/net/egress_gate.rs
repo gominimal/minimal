@@ -2185,7 +2185,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use sessions::EgressPolicy;
-    use sessions::core::egress::{DropReason, FrameFamily, FrameVerdict};
+    use sessions::core::egress::{DropReason, FrameFamily, FrameVerdict, Ipv4Cidr};
     use switch::SwitchSubnet;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2205,7 +2205,7 @@ mod tests {
         UNREGISTERED_SOURCE_PHASE, UNREGISTERED_SOURCE_RULE, UnregisteredSourcePhase, WarnDecision,
         accept_loop, gate_verdict, max_frame, serve_connection,
     };
-    use crate::box_registry::{BoxRegistration, BoxRegistry};
+    use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
     use crate::net::baseline::{BaselineCategory, NodeBaselinePhase, NodePlaneBaseline};
 
     /// The default switch subnet, the plan every registry below is built for.
@@ -3961,6 +3961,429 @@ mod tests {
         // The summaries agree with the families the frames were built as.
         assert_eq!(v6.family(), FrameFamily::Ipv6);
         assert_eq!(truncated.family(), FrameFamily::Truncated);
+    }
+
+    /// NET-085's bound at the decision that makes it: a root process inside
+    /// the VM spoofs another resident box's address, and the gate decides the
+    /// spoofed frame by the row that holds the spoofed source — that box's
+    /// own declaration, never the union — so what a spoof buys is the
+    /// spoofed box's reach, and every destination still reachable through it
+    /// is inside the union the resident rows and the node plane's baseline
+    /// set spell together (design §5.1).
+    ///
+    /// The table is the union's membership as T66 (#1711) will publish it:
+    /// `web` and `db` with disjoint declared subnets, `locked` declaring
+    /// nothing, and the run path's own node row. Every spoofed attempt is
+    /// recorded — source, destination, protocol, port, the phase, and the
+    /// verdict — and the record is printed one line per attempt, grouped by
+    /// spoofed source, in the gate's drop-line shape, so the bound a spoof
+    /// bought can be read straight off the output.
+    ///
+    /// Where the shipped posture differs from the bound's shape the test
+    /// pins both arms, the way the relay tests do: while announced the node
+    /// row is allow-all and an in-plan source no row holds is admitted with
+    /// no rules at all — the gaps the baseline phase's flip (#1786) and
+    /// T66's flip (#1711) close, and the comments below name the in-force
+    /// arm each such admit becomes.
+    #[test]
+    fn spoofed_source_bounded_to_resident_union() {
+        /// One spoofed attempt as the record holds it: the frame wore, and
+        /// what the gate decided, tagged by the decision's own source — a
+        /// box's row, the node row, the baseline set, the announced interim,
+        /// or a drop's rule.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        struct Attempt {
+            src: [u8; 4],
+            dst: [u8; 4],
+            proto: u8,
+            port: u16,
+            phase: UnregisteredSourcePhase,
+            verdict: Verdict,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Verdict {
+            /// A resident box's row admitted the frame under its own rules.
+            AdmittedByRow,
+            /// The run path's allow-all interim node row admitted the frame:
+            /// the shipped arm, unbounded until the baseline phase's flip
+            /// (#1786).
+            AdmittedByNodeRow,
+            /// The node-plane baseline set admitted the frame, decided
+            /// beside the boxes' rows.
+            AdmittedByBaseline,
+            /// The announced interim admitted the frame without consulting
+            /// any rules: the shipped arm, until T66's flip (#1711).
+            AdmittedByInterim,
+            /// The gate dropped the frame, by the rule whose name the drop
+            /// warning carries.
+            Dropped(&'static str),
+        }
+
+        /// A resident box whose declaration admits the given subnets over
+        /// TCP and nothing else.
+        fn tcp_box(registry: &BoxRegistry, name: &str, lease: [u8; 4], subnets: Vec<String>) {
+            registry.register(
+                BoxRegistration::new(name, Ipv4Addr::from(lease), Ipv4Addr::LOCALHOST)
+                    .with_egress_policy(EgressPolicy {
+                        allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                        allow_subnets: Some(subnets),
+                        allow_dns_hosts: None,
+                        deny_subnets: None,
+                    }),
+            );
+        }
+
+        fn proto_of(proto: u8) -> &'static str {
+            if proto == 6 { "tcp" } else { "udp" }
+        }
+
+        /// One spoofed attempt: summarizes the frame exactly as the gate's
+        /// relay would hand it over, decides it with [`gate_verdict`], and
+        /// records the verdict under the decision's own name.
+        fn decide(
+            table: &BoxTable,
+            baseline: &NodePlaneBaseline,
+            phase: UnregisteredSourcePhase,
+            src: [u8; 4],
+            proto: u8,
+            dst: [u8; 4],
+            port: u16,
+        ) -> Attempt {
+            let frame = sessions::core::egress::summarize(&ipv4_frame(src, proto, dst, port));
+            let verdict = match gate_verdict(&frame, table, baseline, phase) {
+                Ok(GateAdmit::Baseline) => Verdict::AdmittedByBaseline,
+                Ok(GateAdmit::Row) if src == baseline.node_addr() => Verdict::AdmittedByNodeRow,
+                Ok(GateAdmit::Row) => Verdict::AdmittedByRow,
+                Ok(GateAdmit::Unregistered { .. }) => Verdict::AdmittedByInterim,
+                Err(drop) => Verdict::Dropped(drop.rule()),
+            };
+            Attempt {
+                src,
+                dst,
+                proto,
+                port,
+                phase,
+                verdict,
+            }
+        }
+
+        // The union's membership: three resident boxes plus the node row, as
+        // the run path registers the node and T66 will register the boxes.
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_box(&registry, "web", LEASE, vec!["10.0.0.0/8".to_string()]);
+        tcp_box(
+            &registry,
+            "db",
+            [100, 64, 0, 10],
+            vec!["192.168.0.0/16".to_string()],
+        );
+        // The deny-all box: no declared subnets, so its row admits nothing
+        // but the resolver carve-out — the box a spoof must not unseal.
+        tcp_box(&registry, "locked", [100, 64, 0, 11], vec![]);
+        registry.register_node_namespace();
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let node = baseline.node_addr();
+        let shipped = UNREGISTERED_SOURCE_PHASE;
+        let resolver = SUBNET.dns_server().octets();
+        let web_only = [10, 1, 2, 3];
+        let db_only = [192, 168, 4, 5];
+        let outside = [203, 0, 113, 7];
+        let stray = [100, 64, 0, 99];
+        let out_of_plan = [203, 0, 113, 7];
+        // The node plane's own endpoint, read off the enumeration the way the
+        // helper spells it (`a.b.c.d/n`), not hardcoded: the in-force bound's
+        // admitted destination is the set's, not this test's.
+        let baseline_endpoint = baseline
+            .entries()
+            .iter()
+            .find(|entry| entry.category() == BaselineCategory::Registry)
+            .expect("the enumeration carries the registry")
+            .endpoints()
+            .first()
+            .expect("the registry carries an endpoint")
+            .split_once('/')
+            .expect("an endpoint is spelled `a.b.c.d/n`")
+            .0
+            .parse::<Ipv4Addr>()
+            .expect("an endpoint's address parses")
+            .octets();
+
+        // Every spoofed attempt, decided and recorded: the tuples are
+        // (phase, source, protocol, destination, port), and each is
+        // summarized, decided by [`gate_verdict`], and recorded exactly as
+        // the gate's relay would hand the frame over. The in-force world is
+        // the one both flips create — the compiled baseline set binding
+        // beside the per-box default — built here so the in-force arms have
+        // their proof before the flips land.
+        let baseline_in_force = baseline.clone().in_force();
+        let shipped_attempts: Vec<Attempt> = [
+            // web's address, spoofed: decided by web's own row — the lab
+            // subnet over TCP, the resolver carve-out — and nowhere else, not
+            // even where only another box declares. The protocol dimension
+            // binds the same way, and the carve-out needs UDP: TCP to the
+            // resolver is as undeclared as anywhere else.
+            (shipped, LEASE, 6, web_only, 80),
+            (shipped, LEASE, 17, web_only, 80),
+            (shipped, LEASE, 6, db_only, 5432),
+            (shipped, LEASE, 6, outside, 443),
+            (shipped, LEASE, 17, resolver, 53),
+            // db's address, spoofed: db's own subnet is admitted — the
+            // flip-stable arm, the one a spoofer keeps after the flips — and
+            // web's is not, though the union contains it.
+            (shipped, [100, 64, 0, 10], 6, db_only, 5432),
+            (shipped, [100, 64, 0, 10], 6, web_only, 80),
+            (shipped, [100, 64, 0, 10], 6, outside, 443),
+            (shipped, [100, 64, 0, 10], 17, resolver, 53),
+            // locked's address, spoofed: the deny-all box's row admits
+            // nothing but the carve-out, so a spoof of it unseals nothing.
+            (shipped, [100, 64, 0, 11], 6, web_only, 80),
+            (shipped, [100, 64, 0, 11], 17, resolver, 53),
+            (shipped, [100, 64, 0, 11], 6, resolver, 53),
+            // The node plane's own address, shipped: the allow-all interim
+            // node row admits even the outside destination — the gap the
+            // baseline phase's flip (#1786) closes, into the in-force arm
+            // the in-force list pins.
+            (shipped, node, 6, outside, 443),
+            // An in-plan address no row holds: announced, admitted with no
+            // rules at all — the gap T66's flip (#1711) closes, into the
+            // unknown-source drop the in-force list pins. An address outside
+            // the plan's lease block is refused under both phases: outside
+            // the plan there is no lease to spoof.
+            (shipped, stray, 6, web_only, 80),
+            (shipped, out_of_plan, 6, web_only, 80),
+        ]
+        .into_iter()
+        .map(|(phase, src, proto, dst, port)| {
+            decide(&table, &baseline, phase, src, proto, dst, port)
+        })
+        .collect();
+        let in_force_attempts: Vec<Attempt> = [
+            // The node plane's own address, under the in-force baseline set:
+            // bounded by the enumeration, decided beside the boxes' rows, and
+            // so a spoof of the daemon's address buys the set, not a box's
+            // row.
+            (
+                UnregisteredSourcePhase::InForce,
+                node,
+                6,
+                baseline_endpoint,
+                443,
+            ),
+            (UnregisteredSourcePhase::InForce, node, 6, web_only, 80),
+            (UnregisteredSourcePhase::InForce, node, 6, outside, 443),
+            // The unrowed in-plan source under the per-box default: dropped
+            // as an unknown source, whatever the plan could have done with
+            // its address.
+            (UnregisteredSourcePhase::InForce, stray, 6, web_only, 80),
+            (
+                UnregisteredSourcePhase::InForce,
+                out_of_plan,
+                6,
+                web_only,
+                80,
+            ),
+        ]
+        .into_iter()
+        .map(|(phase, src, proto, dst, port)| {
+            decide(&table, &baseline_in_force, phase, src, proto, dst, port)
+        })
+        .collect();
+        let attempts: Vec<Attempt> = shipped_attempts
+            .into_iter()
+            .chain(in_force_attempts)
+            .collect();
+
+        // The record, one line per attempt, grouped by spoofed source, in
+        // the gate's drop-line shape: what the frame wore, where it was
+        // headed, and what the gate decided. `cargo nextest run --no-capture`
+        // spells the whole bound out.
+        let mut groups: Vec<([u8; 4], Vec<&Attempt>)> = Vec::new();
+        for attempt in &attempts {
+            match groups.iter_mut().find(|(src, _)| *src == attempt.src) {
+                Some((_, group)) => group.push(attempt),
+                None => groups.push((attempt.src, vec![attempt])),
+            }
+        }
+        for (src, group) in &groups {
+            println!("source={}", Ipv4Addr::from(*src));
+            for attempt in group {
+                match attempt.verdict {
+                    Verdict::Dropped(rule) => println!(
+                        "  destination={}:{}({}) phase={} action=drop rule_matched=\"{rule}\"",
+                        Ipv4Addr::from(attempt.dst),
+                        attempt.port,
+                        proto_of(attempt.proto),
+                        attempt.phase.as_str(),
+                    ),
+                    verdict => println!(
+                        "  destination={}:{}({}) phase={} action=admit decision={verdict:?}",
+                        Ipv4Addr::from(attempt.dst),
+                        attempt.port,
+                        proto_of(attempt.proto),
+                        attempt.phase.as_str(),
+                    ),
+                }
+            }
+        }
+
+        // The bound, read off the record: every admit a box's row gave a
+        // spoofed frame lands inside the union — a resident box's declared
+        // subnet over its declared protocol, or the resolver carve-out every
+        // row and the baseline set share — and the baseline set's admit is
+        // inside the enumeration's endpoints (or the same carve-out). The
+        // two interim arms are the documented gaps, asserted as such below,
+        // so they are not bound here but named.
+        let in_union = |dst: [u8; 4], proto: u8, port: u16| {
+            let web = Ipv4Cidr::parse("10.0.0.0/8").expect("web's subnet parses");
+            let db = Ipv4Cidr::parse("192.168.0.0/16").expect("db's subnet parses");
+            (proto == 6 && (web.contains(dst) || db.contains(dst)))
+                || (proto == 17 && dst == resolver && port == 53)
+        };
+        let baseline_set: Vec<Ipv4Cidr> = baseline
+            .entries()
+            .iter()
+            .flat_map(|entry| entry.endpoints().iter())
+            .map(|endpoint| Ipv4Cidr::parse(endpoint).expect("a baseline endpoint parses"))
+            .collect();
+        for attempt in &attempts {
+            match attempt.verdict {
+                Verdict::AdmittedByRow => assert!(
+                    in_union(attempt.dst, attempt.proto, attempt.port),
+                    "a spoof wearing {} reached {}:{} outside the union",
+                    Ipv4Addr::from(attempt.src),
+                    Ipv4Addr::from(attempt.dst),
+                    attempt.port,
+                ),
+                Verdict::AdmittedByBaseline => assert!(
+                    baseline_set.iter().any(|cidr| cidr.contains(attempt.dst))
+                        || (attempt.proto == 17 && attempt.dst == resolver && attempt.port == 53),
+                    "a spoof wearing the node's address reached {}:{} outside the baseline set",
+                    Ipv4Addr::from(attempt.dst),
+                    attempt.port,
+                ),
+                // The shipped interim's admits are the gaps, each pinned to
+                // its in-force replacement by the verdict lookups below.
+                Verdict::AdmittedByNodeRow | Verdict::AdmittedByInterim | Verdict::Dropped(_) => {}
+            }
+        }
+
+        // The strong half, pinned per pair: the decision is the spoofed
+        // box's own rules, never the union. A row-held spoof reaches the
+        // row's declared subnet and the resolver carve-out and nothing else —
+        // dropped where only another box declares, dropped on the protocol
+        // dimension, and the deny-all row unsealing nothing.
+        let verdict_of = |phase, src, proto, dst| {
+            attempts
+                .iter()
+                .find(|a| a.phase == phase && a.src == src && a.proto == proto && a.dst == dst)
+                .expect("every pinned attempt is in the record")
+                .verdict
+        };
+        assert_eq!(
+            verdict_of(shipped, LEASE, 6, web_only),
+            Verdict::AdmittedByRow
+        );
+        assert_eq!(
+            verdict_of(shipped, LEASE, 17, web_only),
+            Verdict::Dropped("egress-undeclared-protocol"),
+        );
+        assert_eq!(
+            verdict_of(shipped, LEASE, 6, db_only),
+            Verdict::Dropped("egress-undeclared-subnet"),
+        );
+        assert_eq!(
+            verdict_of(shipped, LEASE, 6, outside),
+            Verdict::Dropped("egress-undeclared-subnet"),
+        );
+        assert_eq!(
+            verdict_of(shipped, LEASE, 17, resolver),
+            Verdict::AdmittedByRow
+        );
+        assert_eq!(
+            verdict_of(shipped, [100, 64, 0, 10], 6, db_only),
+            Verdict::AdmittedByRow,
+        );
+        assert_eq!(
+            verdict_of(shipped, [100, 64, 0, 10], 6, web_only),
+            Verdict::Dropped("egress-undeclared-subnet"),
+        );
+        assert_eq!(
+            verdict_of(shipped, [100, 64, 0, 10], 6, outside),
+            Verdict::Dropped("egress-undeclared-subnet"),
+        );
+        assert_eq!(
+            verdict_of(shipped, [100, 64, 0, 10], 17, resolver),
+            Verdict::AdmittedByRow,
+        );
+        assert_eq!(
+            verdict_of(shipped, [100, 64, 0, 11], 6, web_only),
+            Verdict::Dropped("egress-undeclared-subnet"),
+        );
+        assert_eq!(
+            verdict_of(shipped, [100, 64, 0, 11], 17, resolver),
+            Verdict::AdmittedByRow,
+        );
+        assert_eq!(
+            verdict_of(shipped, [100, 64, 0, 11], 6, resolver),
+            Verdict::Dropped("egress-undeclared-subnet"),
+        );
+
+        // The node plane's own address, under the in-force set: the
+        // enumeration's endpoint admitted, everything else dropped — the
+        // bound a spoof of the daemon's address buys, beside the boxes' rows.
+        assert_eq!(
+            verdict_of(UnregisteredSourcePhase::InForce, node, 6, baseline_endpoint),
+            Verdict::AdmittedByBaseline,
+        );
+        assert_eq!(
+            verdict_of(UnregisteredSourcePhase::InForce, node, 6, web_only),
+            Verdict::Dropped("egress-undeclared-subnet"),
+        );
+        assert_eq!(
+            verdict_of(UnregisteredSourcePhase::InForce, node, 6, outside),
+            Verdict::Dropped("egress-undeclared-subnet"),
+        );
+
+        // The shipped interim's arms, with the in-force arms they become:
+        // the allow-all node row admits the outside destination today, and
+        // the baseline phase's flip (#1786) turns it into the drop above;
+        // the unrowed in-plan source is admitted with no rules today, and
+        // T66's flip (#1711) turns it into the unknown-source drop beside
+        // it. The out-of-plan source is refused under both phases, so the
+        // interim can never borrow the plan's infrastructure as a source.
+        assert_eq!(
+            verdict_of(shipped, node, 6, outside),
+            Verdict::AdmittedByNodeRow,
+        );
+        assert_eq!(
+            verdict_of(shipped, stray, 6, web_only),
+            Verdict::AdmittedByInterim,
+        );
+        assert_eq!(
+            verdict_of(UnregisteredSourcePhase::InForce, stray, 6, web_only),
+            Verdict::Dropped("egress-unknown-source"),
+        );
+        assert_eq!(
+            verdict_of(shipped, out_of_plan, 6, web_only),
+            Verdict::Dropped("egress-unknown-source"),
+        );
+        assert_eq!(
+            verdict_of(UnregisteredSourcePhase::InForce, out_of_plan, 6, web_only),
+            Verdict::Dropped("egress-unknown-source"),
+        );
+
+        // ARP is a declared path for every box, decided per frame with no
+        // destination to bound: a spoofed announcement wearing web's address
+        // is admitted by web's row the same as any resolution web's own
+        // traffic would carry. It buys no reach — the flow frames behind it
+        // are what the rows bound, each on its own.
+        let spoofed_arp = sessions::core::egress::summarize(&arp_frame(LEASE));
+        assert!(matches!(
+            gate_verdict(&spoofed_arp, &table, &baseline, shipped),
+            Ok(GateAdmit::Row)
+        ));
     }
 
     /// The shipped arm of the node-plane decision: the phase this build
