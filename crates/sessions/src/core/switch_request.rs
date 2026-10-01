@@ -296,6 +296,15 @@ impl std::fmt::Display for Refusal {
 /// ([`EgressDefaultPhase`] carries what that means and why). A retraction
 /// carries no address, so its decision is table-wide: some row must hold
 /// the record it names, or the phase's interim applies it.
+///
+/// # Errors
+///
+/// Returns [`Refusal::UnknownAddress`] when a publish names an address no
+/// row of the table holds and the phase grants it no interim, and
+/// [`Refusal::Undeclared`] when the row that holds the address does not
+/// admit the port or name the request publishes. A retraction is refused
+/// with [`Refusal::Unheld`] when no published namespace holds the record it
+/// names.
 pub fn applied(
     request: &SwitchRequest,
     table: &SwitchTable,
