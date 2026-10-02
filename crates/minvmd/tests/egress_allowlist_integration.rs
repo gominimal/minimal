@@ -8,6 +8,12 @@
 //! VM boundary. Every one of the four operations must exit 0 for the test to
 //! pass.
 //!
+//! The `apt` leg the requirement text named before gominimal/minimal#1707 is
+//! deliberately absent: the composed base at `gominimal/pkgs@f4de33d0` is not
+//! a Debian userland and no package upstream carries apt, so an apt leg could
+//! never exit 0 here. The spec change that trims NET-068 to these four tools
+//! is the owner decision this test supplies the facts for.
+//!
 //! The VM is brought up through the supervisor path (`minvmd run --detach`,
 //! then `status --json` until Running, `stop` on drop), like the sibling
 //! harnesses: only `run` stands up the host gvproxy switch before the VMM
