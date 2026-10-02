@@ -465,7 +465,45 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
             }
         }
     }
-    format_ls_across_vms(&mut std::io::stdout(), &args, &listings)?;
+
+    // NET-018's verdict — which surface a box name resolves through on
+    // this host — from the one function both verbs share (`resolver`), one
+    // verdict per VM. The verdict is the VM's, not the host's alone: each
+    // VM's daemon publishes its answerer on a host port of its own
+    // (NET-059), and the host's resolver hook routes the zone to one
+    // answerer, so the VM it routes to answers natively while a sibling
+    // VM's names answer through its proxy. The three facts each verdict
+    // reads are this host's resolver hook (with the stub-bypass blocker
+    // that says whether host lookups consult what the hook configures),
+    // that VM's answerer-bound report, and the reserved range on this
+    // host's own loopback; native DNS is live only when all three hold.
+    // Nothing prints when a VM's daemon reports its answerer not bound —
+    // the port lines below already tell that story. The detection runs
+    // only in the modes that can print the verdict: `--json` and `--raw`
+    // are machine-readable-only and never carry the line, so they pay no
+    // resolver read. The answerer is bound on every current daemon, so
+    // every human-mode list does read the host — the line is this verb's
+    // status, so it stays where the user looks for it — but at the list's
+    // own deadline, not the session start's: the read runs under the same
+    // one-second deadline this list's own host-side subprocess probes
+    // carry (the git probes above), paid once for every VM's verdict
+    // together, so a wedged systemd-resolved costs `min ls` that one
+    // second — never the ten its queries could add, and never one per
+    // VM — and the verdict a slow read loses is the proxy's, the arm
+    // that cannot strand the user (NET-019 keeps the proxy serving). The
+    // daemon's own view of this host's resolver is not a thing that
+    // exists, so the host's half is the host's to read.
+    let surfaces = if args.json || args.raw {
+        Vec::new()
+    } else {
+        crate::resolver::live_name_surfaces(
+            listings
+                .iter()
+                .map(|listing| (listing.resp.zone_answerer_port, listing.resp.answerer_bound)),
+        )
+        .await
+    };
+    format_ls_across_vms(&mut std::io::stdout(), &args, &listings, &surfaces)?;
     Ok(())
 }
 
@@ -551,10 +589,16 @@ pub fn hostname_proxy_start_vm(global: &GlobalArgs) -> Option<&'static str> {
 /// Format the session list for the given output mode. Split from
 /// [`cmd_ls`] so integration tests can capture output into a buffer
 /// instead of stdout.
+///
+/// `surface` is NET-018's verdict — which surface a box name resolves
+/// through on this host, as [`cmd_ls`] computed it from the one function
+/// both verbs share — printed on the `NAME SURFACE` line when the daemon's
+/// answerer is bound at all.
 pub fn format_ls(
     out: &mut impl std::io::Write,
     args: &LsArgs,
     resp: &minimald_rpc::ListSessionsResponse,
+    surface: Option<crate::resolver::LiveSurface>,
 ) -> Result<(), anyhow::Error> {
     if args.json {
         let json = serde_json_lenient::to_string_pretty(resp)
@@ -605,6 +649,20 @@ pub fn format_ls(
             writeln!(
                 out,
                 "ZONE ANSWERER:   listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal"
+            )?;
+        }
+        // NET-018: say which of the two surfaces is live — the one verdict
+        // both verbs share ([`resolver::live_name_surfaces`]). `None` — the
+        // daemon's answerer not bound — prints nothing: the two port lines
+        // above already tell that story, and the advisory the activation
+        // path prints (NET-122) says how to get from one surface to the
+        // other. `--raw` and `--json` stay machine-readable-only, as for
+        // the ports.
+        if let Some(surface) = surface {
+            writeln!(
+                out,
+                "NAME SURFACE:    {}",
+                crate::resolver::name_surface_line(surface, resp.hostname_proxy_port)
             )?;
         }
         if resp.hostname_proxy_port.is_some() || resp.zone_answerer_port.is_some() {
@@ -693,18 +751,29 @@ const VM_COLUMN_WIDTH: usize = 8;
 /// Format the listing across every VM [`ls_listings`] gathered (NET-057).
 ///
 /// One VM listed is [`format_ls`] verbatim — the output every consumer of
-/// `min ls` has always read, `--json` included. More than one adds the VM per
-/// box: a VM column in the table, the VM inside each `--json` session entry,
-/// and each VM's routing facts (NET-026's discovery lines) prefixed with the
-/// VM they belong to, because on a two-VM host each VM's proxy publishes on a
-/// host port of its own (NET-059).
+/// `min ls` has always read, `--json` included, with NET-018's name-surface
+/// verdict on the line `format_ls` prints when that VM's daemon reports its
+/// answerer bound (`surfaces` carries one verdict per listing, as
+/// [`cmd_ls`] computed them). More than one adds the VM per box: a VM
+/// column in the table, the VM inside each `--json` session entry, and
+/// each VM's routing facts (NET-026's discovery lines) prefixed with the
+/// VM they belong to, because on a two-VM host each VM's proxy publishes
+/// on a host port of its own (NET-059) — NET-018's verdict included, per
+/// VM: the host's resolver hook routes the zone to one VM's answerer, so
+/// each VM's line says which of the two surfaces its own names answer
+/// through.
 pub fn format_ls_across_vms(
     out: &mut impl std::io::Write,
     args: &LsArgs,
     listings: &[VmListing],
+    surfaces: &[Option<crate::resolver::LiveSurface>],
 ) -> Result<(), anyhow::Error> {
+    // The verdict of the listing at `index`, `None` when the caller passed
+    // none for it — a machine mode never prints the line, and a direct
+    // caller may have computed nothing.
+    let surface_at = |index: usize| surfaces.get(index).copied().flatten();
     if let [only] = listings {
-        return format_ls(out, args, &only.resp);
+        return format_ls(out, args, &only.resp, surface_at(0));
     }
     if listings.is_empty() {
         // `cmd_ls` always lists the selected VM, so this is only reachable
@@ -719,7 +788,9 @@ pub fn format_ls_across_vms(
                 hostname_routing_unavailable: None,
                 hostname_proxy_port: None,
                 zone_answerer_port: None,
+                answerer_bound: false,
             },
+            None,
         );
     }
 
@@ -773,7 +844,7 @@ pub fn format_ls_across_vms(
         // Each VM's own facts, one line each, named by the VM they belong
         // to — the same words the single-VM listing prints for them.
         let mut facts = 0;
-        for listing in listings {
+        for (index, listing) in listings.iter().enumerate() {
             if let Some(pool) = &listing.resp.resource_pool {
                 let session_count = listing.resp.sessions.len();
                 let core_label = if pool.cpu_cores == 1 { "core" } else { "cores" };
@@ -806,6 +877,24 @@ pub fn format_ls_across_vms(
                 writeln!(
                     out,
                     "ZONE ANSWERER:   {vm:<width$} listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal",
+                    vm = listing.vm,
+                    width = VM_COLUMN_WIDTH,
+                )?;
+                facts += 1;
+            }
+            // NET-018: say which of the two surfaces is live for this VM —
+            // the one verdict both verbs share, this VM's own, as `cmd_ls`
+            // computed it. `None` — this VM's daemon reporting its answerer
+            // not bound, or a caller that computed nothing — prints
+            // nothing: the port lines above already tell that story, and
+            // the advisory the activation path prints (NET-122) says how to
+            // get from one surface to the other. `--raw` and `--json` stay
+            // machine-readable-only, as for the ports.
+            if let Some(surface) = surface_at(index) {
+                writeln!(
+                    out,
+                    "NAME SURFACE:    {vm:<width$} {}",
+                    crate::resolver::name_surface_line(surface, listing.resp.hostname_proxy_port),
                     vm = listing.vm,
                     width = VM_COLUMN_WIDTH,
                 )?;

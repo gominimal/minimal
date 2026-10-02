@@ -1851,7 +1851,17 @@ async fn ls_shows_vm_per_box() {
     assert_eq!(listed_names(&listings[0]), ["api"], "the default VM's box");
     assert_eq!(listed_names(&listings[1]), ["web"], "the named VM's box");
 
-    // The VM is a column, and each box's row carries its own.
+    // The VM is a column, and each box's row carries its own. NET-018's
+    // verdict is per VM for the same reason: the host's resolver hook
+    // routes the zone to one VM's answerer (NET-059), so each VM's fact
+    // line says which surface its own names answer through — here fed
+    // straight to the formatter, the way the verdict a configured host's
+    // reads decide arrives at it, with the host daemon answering through
+    // its proxy and the named VM through native DNS.
+    let surfaces = vec![
+        Some(crate::resolver::LiveSurface::Proxy),
+        Some(crate::resolver::LiveSurface::Native),
+    ];
     let mut out = Vec::new();
     format_ls_across_vms(
         &mut out,
@@ -1860,6 +1870,7 @@ async fn ls_shows_vm_per_box() {
             json: false,
         },
         &listings,
+        &surfaces,
     )
     .expect("rendering the two-VM listing");
     let table = String::from_utf8(out).expect("the listing is UTF-8");
@@ -1876,9 +1887,25 @@ async fn ls_shows_vm_per_box() {
     );
     assert!(row_of(&api).starts_with("default "), "got:\n{table}");
     assert!(row_of(&web).starts_with("alpha "), "got:\n{table}");
+    let surface_line_of = |vm: &str| {
+        table
+            .lines()
+            .find(|l| l.starts_with("NAME SURFACE:") && l.contains(vm))
+            .unwrap_or_else(|| panic!("a NAME SURFACE line for {vm} in:\n{table}"))
+            .to_string()
+    };
+    assert!(
+        surface_line_of("default").contains("the hostname proxy is the live name surface"),
+        "the VM the hook does not route to keeps its proxy line:\n{table}"
+    );
+    assert!(
+        surface_line_of("alpha").contains("native DNS is the live name surface"),
+        "the VM the hook routes to is named native:\n{table}"
+    );
 
     // One VM listed renders exactly the single-VM listing `min ls` has always
-    // printed: the column is a fact about a multi-VM host, not a new format.
+    // printed — the surface line included, verdict and all: the column is a
+    // fact about a multi-VM host, not a new format.
     let single = &listings[1..];
     let mut delegated = Vec::new();
     format_ls_across_vms(
@@ -1888,6 +1915,7 @@ async fn ls_shows_vm_per_box() {
             json: false,
         },
         single,
+        &surfaces[1..],
     )
     .expect("rendering the single-VM listing");
     let mut direct = Vec::new();
@@ -1898,6 +1926,7 @@ async fn ls_shows_vm_per_box() {
             json: false,
         },
         &single[0].resp,
+        surfaces[1],
     )
     .expect("format_ls on the same listing");
     assert_eq!(
@@ -1909,7 +1938,8 @@ async fn ls_shows_vm_per_box() {
     // `--json` stays one object on a multi-VM host — the shape every
     // consumer of `min ls --json` parses — with the VM inside each entry of
     // the one `sessions` array, where a pipeline reads it: `.sessions` keeps
-    // working across VMs instead of breaking on a per-VM array.
+    // working across VMs instead of breaking on a per-VM array. The
+    // machine modes never print the verdict, so they carry none.
     let mut out = Vec::new();
     format_ls_across_vms(
         &mut out,
@@ -1918,6 +1948,7 @@ async fn ls_shows_vm_per_box() {
             json: true,
         },
         &listings,
+        &[],
     )
     .expect("rendering the two-VM listing as JSON");
     let listing: serde_json_lenient::Value =
@@ -2411,7 +2442,8 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
     ];
 
     // `min ls`: alpha's routing line names alpha and the port the host
-    // reaches it on — the real port, not the one the recipes assume.
+    // reaches it on — the real port, not the one the recipes assume. The
+    // surface verdict is not this test's fact, so none is fed.
     let mut out = Vec::new();
     format_ls_across_vms(
         &mut out,
@@ -2420,6 +2452,7 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
             json: false,
         },
         &listings,
+        &[],
     )
     .expect("rendering the two-VM listing");
     let ls = String::from_utf8(out).expect("the listing is UTF-8");
@@ -2498,6 +2531,7 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
             json: false,
         },
         &native_resp,
+        None,
     )
     .expect("rendering the single-VM listing");
     let single = String::from_utf8(single).expect("the listing is UTF-8");
