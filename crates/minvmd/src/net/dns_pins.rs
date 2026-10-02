@@ -86,7 +86,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, MessageType};
 use hickory_proto::rr::RData;
@@ -125,6 +125,19 @@ const MAX_DATAGRAM: usize = 4096;
 /// that stopped resolving: `admit` already releases a name's own expired
 /// entries when it counts that name's cap.
 const ADMISSION_SWEEP_AT: usize = 4096;
+/// The least time between two sweeps of one box's flow table at its cap:
+/// the sweep walks every entry the table holds, and at the shared cap's size
+/// that costs tens of microseconds, so it runs at most once per second per
+/// box, never once per frame — under attack the table is full of live flows
+/// and every sweep reclaims nothing, so the frames between two sweeps are
+/// saved the walk without the bound narrowing.
+const FLOW_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+/// The least time between two at-cap `info` lines for one box: the line
+/// names the box, the cap and how many frames the cap has admitted without
+/// retention, and while the cap holds it says so at most once per minute —
+/// minvmd's default filter is `info`, so the state reads in a bundle's log
+/// tail without a line per frame spending the log on one hostile box.
+const AT_CAP_LINE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The L4 addressing of a TCP/UDP-over-IPv4 frame, as extracted by
 /// [`parse_ipv4_l4`] — the one read the shared frame summary does not carry
@@ -272,6 +285,68 @@ struct FlowKey {
     dst_port: u16,
 }
 
+/// The box's flow table: the flows its pins established beside the two
+/// instants their bounds spend — the sweep's and the at-cap line's, both
+/// rate limiters on work the cap would otherwise redo per frame. One
+/// mutex's worth of state, so the insert path reads and spends them under
+/// the lock it already holds ([`BoxPins::flows`]).
+#[derive(Default)]
+struct FlowTable {
+    /// The flows the box opened through a pin — established while the window
+    /// held, retained past it until the flow ends — each with the instant its
+    /// last frame rode it (the idle bound's clock).
+    flows: HashMap<FlowKey, Instant>,
+    /// The instant of the last sweep, `None` before the first: a sweep runs
+    /// at most once per [`FLOW_SWEEP_INTERVAL`] per box, never once per
+    /// frame.
+    last_sweep: Option<Instant>,
+    /// The instant of the last at-cap `info` line, `None` before the first:
+    /// the line is written at most once per [`AT_CAP_LINE_INTERVAL`] per box.
+    last_at_cap_line: Option<Instant>,
+}
+
+impl FlowTable {
+    /// An empty table, before any flow was opened through a pin.
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the cap's sweep may run at `now`: at most once per second per
+    /// box, never once per frame — the sweep walks every entry the table
+    /// holds, and at the shared cap's size that costs tens of microseconds a
+    /// frame would otherwise pay to reclaim nothing, since under attack the
+    /// table is full of live flows.
+    fn sweep_due(&self, now: Instant) -> bool {
+        self.last_sweep
+            .is_none_or(|at| now.duration_since(at) >= FLOW_SWEEP_INTERVAL)
+    }
+
+    /// Reclaims the flows idle past the shared idle cap — the entries no
+    /// frame has come back to look up, so the cap is spent on live flows —
+    /// and records the instant, which is what holds the sweep to once per
+    /// second per box.
+    fn sweep(&mut self, now: Instant) {
+        self.flows
+            .retain(|_, seen| now.duration_since(*seen) < DNS_FLOW_IDLE_CAP);
+        self.last_sweep = Some(now);
+    }
+
+    /// Claims the at-cap `info` line for `now`: `true` exactly when no line
+    /// was written inside the last [`AT_CAP_LINE_INTERVAL`], recording this
+    /// instant either way — the check-and-spend happens under the flow
+    /// table's lock, so two frames racing at the cap still write at most one
+    /// line per box per interval.
+    fn claim_at_cap_line(&mut self, now: Instant) -> bool {
+        let due = self
+            .last_at_cap_line
+            .is_none_or(|at| now.duration_since(at) >= AT_CAP_LINE_INTERVAL);
+        if due {
+            self.last_at_cap_line = Some(now);
+        }
+        due
+    }
+}
+
 /// The identity of one of the box's outstanding DNS queries — the three
 /// things a reply must answer to pin: the transaction id of the exchange, the
 /// port the query left from (which the reply's destination port must name),
@@ -327,14 +402,29 @@ struct BoxPins {
     /// admitted it — the per-name cap counts by owner — and the instant its
     /// window ends.
     admitted: Mutex<HashMap<[u8; 4], Admission>>,
-    /// The flows the box opened through a pin — established while the window
-    /// held, retained past it until the flow ends — each with the instant
-    /// its last frame rode it (the idle bound's clock). Bounded by the
-    /// shared per-box cap: a new flow that finds the table full is admitted
-    /// by the window alone and not retained, fail closed at the window's
-    /// edge, so a hostile relay holding one pin cannot grow the host
-    /// daemon's memory one flow at a time.
-    flows: Mutex<HashMap<FlowKey, Instant>>,
+    /// The box's flow table: the flows it opened through a pin — established
+    /// while the window held, retained past it until the flow ends, each
+    /// with the instant its last frame rode it (the idle bound's clock) —
+    /// beside the sweep's and the at-cap line's rate-limit instants
+    /// ([`FlowTable`]), so the cap's work is bounded per second and per
+    /// minute, never per frame. Bounded by the shared per-box cap: a new
+    /// flow that finds the table full is admitted by the window alone and
+    /// not retained, fail closed at the window's edge, so a hostile relay
+    /// holding one pin cannot grow the host daemon's memory one flow at a
+    /// time.
+    flows: Mutex<FlowTable>,
+    /// How many frames the cap admitted by the window alone, without
+    /// retention (the at-cap state's counter: the number the box's at-cap
+    /// `info` line carries, the state a status surface would read once a
+    /// control verb exists — a follow-up). An `AtomicU64` for the same
+    /// reason every counter below is one: the entry is shared behind an
+    /// `Arc` and `admits` takes `&self`.
+    at_cap_admitted: AtomicU64,
+    /// How many sweeps the flow table's cap has run. Test-facing, like the
+    /// table's own counters: maintained at the sweep in every build, and the
+    /// reader exists so a test can assert the cap sweeps at most once per
+    /// second per box, never once per frame.
+    sweeps: AtomicU64,
     /// Whether the box's first-pin line has been written: the one `info`
     /// line per box the diagnostics read a DNS box's host-side decision by,
     /// at the first answer that landed, never again. An `AtomicBool` because
@@ -371,7 +461,9 @@ impl BoxPins {
             ),
             outstanding: Mutex::new(HashMap::new()),
             admitted: Mutex::new(HashMap::new()),
-            flows: Mutex::new(HashMap::new()),
+            flows: Mutex::new(FlowTable::new()),
+            at_cap_admitted: AtomicU64::new(0),
+            sweeps: AtomicU64::new(0),
             logged_first_pin: AtomicBool::new(false),
         }
     }
@@ -716,12 +808,18 @@ impl BoxPins {
     /// the window can admit it.
     ///
     /// The flows a box holds are bounded by the shared per-box cap: at it,
-    /// the entries idle past the shared idle cap are swept, and a new flow
-    /// that still finds the table full is admitted by the window its first
-    /// frame is inside and not retained — fail closed at the window's edge,
-    /// the only place the refusal bites — so a hostile relay holding one pin
-    /// cannot grow the host daemon's memory one flow at a time, while every
-    /// flow already recorded keeps its retention.
+    /// the entries idle past the shared idle cap are swept — at most once
+    /// per second per box, never once per frame ([`FlowTable::sweep_due`]),
+    /// so a hostile relay holding one pin cannot buy the sweep's walk with
+    /// every frame it sends — and a new flow that still finds the table
+    /// full is admitted by the window its first frame is inside and not
+    /// retained — fail closed at the window's edge, the only place the
+    /// refusal bites — so a hostile relay holding one pin cannot grow the
+    /// host daemon's memory one flow at a time, while every flow already
+    /// recorded keeps its retention. The at-cap state is visible rather
+    /// than silent, and bounded rather than per frame: the box's counter of
+    /// unretained admissions and one `info` line per box per minute while
+    /// the cap holds, so a box whose table is full reads so in a bundle.
     fn admits(&self, dst: [u8; 4], pkt: Option<&L4Packet>, now: Instant) -> bool {
         let Some(pkt) = pkt else {
             return self.admits_destination(dst, now);
@@ -737,18 +835,18 @@ impl BoxPins {
         // be signalled.
         let ends = pkt.tcp_flags & (TCP_FIN | TCP_RST) != 0;
         {
-            let mut flows = self
+            let mut table = self
                 .flows
                 .lock()
                 .expect("the DNS flow table's lock is held only across this lookup");
-            match flows.get(&key).copied() {
+            match table.flows.get(&key).copied() {
                 // A live flow: the retention carries this frame, and the
                 // frame refreshes the clock the idle bound reads.
                 Some(seen) if now.duration_since(seen) < DNS_FLOW_IDLE_CAP => {
                     if ends {
-                        flows.remove(&key);
+                        table.flows.remove(&key);
                     } else {
-                        flows.insert(key, now);
+                        table.flows.insert(key, now);
                     }
                     return true;
                 }
@@ -759,7 +857,7 @@ impl BoxPins {
                 // the window, which is what decides whether the box may
                 // open this flow again.
                 Some(_) => {
-                    flows.remove(&key);
+                    table.flows.remove(&key);
                 }
                 None => {}
             }
@@ -772,32 +870,44 @@ impl BoxPins {
             // the window admits the frame itself.
             return true;
         }
-        let mut flows = self
+        let mut table = self
             .flows
             .lock()
             .expect("the DNS flow table's lock is held only across this insert");
-        if flows.len() >= DNS_MAX_FLOWS_PER_BOX {
-            // The retention bound's memory half, run at the cap: the
-            // entries no frame has come back to look up are reclaimed
-            // first, so the cap is spent on live flows.
-            flows.retain(|_, seen| now.duration_since(*seen) < DNS_FLOW_IDLE_CAP);
+        // The retention bound's memory half, run at the cap: the entries no
+        // frame has come back to look up are reclaimed first, so the cap is
+        // spent on live flows — at most once per second per box, never once
+        // per frame, so a hostile relay holding one pin cannot buy the
+        // sweep's walk with every frame it sends.
+        if table.flows.len() >= DNS_MAX_FLOWS_PER_BOX && table.sweep_due(now) {
+            table.sweep(now);
+            self.sweeps.fetch_add(1, Ordering::Relaxed);
         }
-        if flows.len() >= DNS_MAX_FLOWS_PER_BOX {
+        if table.flows.len() >= DNS_MAX_FLOWS_PER_BOX {
             // Still at the cap: the frame rides the window it is inside, and
             // its flow is not retained — fail closed at the window's edge,
             // the only place the refusal bites, since past the window the
             // destination is refused where a recorded flow's retention would
-            // have carried it.
-            tracing::debug!(
-                switch_addr = %self.record.switch_addr(),
-                namespace = %self.record.name(),
-                cap = DNS_MAX_FLOWS_PER_BOX,
-                "the box's flow table is at its cap; admitting this frame by \
-                 the window alone and retaining no flow for it"
-            );
+            // have carried it. The state is visible rather than silent, and
+            // bounded rather than per frame: the per-box counter below is
+            // what a status surface would read (its control verb is a
+            // follow-up), and the `info` line says the cap at most once per
+            // box per minute, at minvmd's default filter, so the box whose
+            // table is full reads in a bundle's log tail.
+            let admitted_at_cap = self.at_cap_admitted.fetch_add(1, Ordering::Relaxed) + 1;
+            if table.claim_at_cap_line(now) {
+                tracing::info!(
+                    switch_addr = %self.record.switch_addr(),
+                    namespace = %self.record.name(),
+                    cap = DNS_MAX_FLOWS_PER_BOX,
+                    admitted_at_cap,
+                    "the box's flow table is at its cap; its frames ride the \
+                     admission window alone and no flow is retained for them"
+                );
+            }
             return true;
         }
-        flows.insert(key, now);
+        table.flows.insert(key, now);
         true
     }
 }
@@ -1080,6 +1190,36 @@ impl DnsPins {
     pub(crate) fn refused_for_want_of_pin(&self) -> u64 {
         self.inner.refused_for_want_of_pin.load(Ordering::Relaxed)
     }
+
+    /// How many frames `record`'s cap admitted by the window alone, without
+    /// retention — the at-cap state's per-box counter, the number the box's
+    /// at-cap `info` line carries.
+    ///
+    /// Test-facing, like [`Self::admitted_by_pin`]: the counter is the box's
+    /// own state, maintained at the decision in every build, and the reader
+    /// exists so a test can assert what the cap did — the status surface
+    /// that would read it needs a control verb, a follow-up.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn at_cap_admissions_of(&self, record: &Arc<BoxRecord>) -> u64 {
+        self.entry(record).map_or(0, |box_pins| {
+            box_pins.at_cap_admitted.load(Ordering::Relaxed)
+        })
+    }
+
+    /// How many times the flow-table sweep ran for `record`'s box — the
+    /// proof of the once-per-second bound, which no frame's own verdict
+    /// can show: a sweep that reclaims nothing leaves no trace but the
+    /// instant it ran.
+    ///
+    /// Test-facing, like [`Self::admitted_by_pin`]: maintained at the sweep
+    /// in every build, read here alone.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn sweeps_of(&self, record: &Arc<BoxRecord>) -> u64 {
+        self.entry(record)
+            .map_or(0, |box_pins| box_pins.sweeps.load(Ordering::Relaxed))
+    }
 }
 
 #[cfg(test)]
@@ -1100,7 +1240,7 @@ pub(crate) mod tests {
     use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS, SVCB};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
     use sessions::EgressPolicy;
-    use sessions::core::egress::{DNS_ADMISSION_WINDOW, DNS_MAX_FLOWS_PER_BOX};
+    use sessions::core::egress::{DNS_ADMISSION_WINDOW, DNS_FLOW_IDLE_CAP, DNS_MAX_FLOWS_PER_BOX};
     use switch::SwitchSubnet;
 
     use super::{DnsPins, IPPROTO_TCP, TCP_FIN, udp_datagram};
@@ -1878,8 +2018,206 @@ pub(crate) mod tests {
     /// carried it. The flows recorded before the cap cost nothing of what
     /// they earned: one of them still rides past the window, idle inside the
     /// shared cap.
+    ///
+    /// The bound is each box's own, and the at-cap state is visible: a
+    /// second box at another lease, resolving the same name, opens and
+    /// keeps its own flow after the first box has filled its cap; the frames
+    /// the first box's cap admitted without retention are counted per box,
+    /// and the `info` line says the cap at most once per box per minute —
+    /// two at-cap frames in the same minute log one line, and the line after
+    /// the minute says the counter the minute spent.
     #[test]
     fn the_flow_table_is_bounded_per_box() {
+        let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
+        let registry = BoxRegistry::new(SUBNET);
+        dns_box(
+            &registry,
+            "weather",
+            LEASE,
+            vec!["example.com".to_string()],
+            Vec::new(),
+        );
+        // A second DNS box at another lease, declaring the same name: the
+        // cap below is spent on the first box's flows alone, and its own
+        // table keeps all its room — the bound is per box, not per host.
+        let other_lease = [100, 64, 0, 10];
+        dns_box(
+            &registry,
+            "other",
+            other_lease,
+            vec!["example.com".to_string()],
+            Vec::new(),
+        );
+        let table = registry.table();
+        let record = table
+            .by_source(LEASE)
+            .expect("the published box's row is held");
+        let other_record = table
+            .by_source(other_lease)
+            .expect("the second box's row is held");
+        let pins = DnsPins::new(SUBNET);
+        let limiter = DropLimiter::new();
+        let now = Instant::now();
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        resolve(
+            &pins,
+            &table,
+            LEASE,
+            "example.com",
+            &[answer],
+            &limiter,
+            now,
+        );
+        resolve(
+            &pins,
+            &table,
+            other_lease,
+            "example.com",
+            &[answer],
+            &limiter,
+            now,
+        );
+
+        // The flow recorded before the cap — the retention the box earned by
+        // using what its answer named — and the rest of the cap spent on
+        // distinct flows to the same pinned address: one SYN per source
+        // port, each its own flow identity.
+        let flow = |lease: [u8; 4], src_port: u16| {
+            l4_of(&tcp_frame(
+                Ipv4Addr::from(lease),
+                src_port,
+                answer,
+                443,
+                0x02, // SYN: a flow's opening segment
+            ))
+        };
+        let first = flow(LEASE, 40_000);
+        assert!(
+            pins.admits_frame(&record, answer.octets(), Some(&first), now),
+            "the first flow through the pin is established"
+        );
+        for port in 1..DNS_MAX_FLOWS_PER_BOX {
+            let port = u16::try_from(40_000 + port).expect("the test's source port fits a u16");
+            assert!(
+                pins.admits_frame(&record, answer.octets(), Some(&flow(LEASE, port)), now),
+                "each distinct flow through the pin is established and recorded"
+            );
+        }
+
+        // The cap is spent. The next new flow's first frame is still admitted
+        // — the window holds — but the flow is not retained, so past the
+        // window its destination is refused where a recorded flow's
+        // retention would have carried it.
+        let past_cap_port =
+            u16::try_from(40_000 + DNS_MAX_FLOWS_PER_BOX).expect("the port fits a u16");
+        let past_cap = flow(LEASE, past_cap_port);
+        assert!(
+            pins.admits_frame(&record, answer.octets(), Some(&past_cap), now),
+            "at the cap a new flow's first frame is still admitted inside \
+             the window"
+        );
+        // A second frame the cap admits the same way, inside the same
+        // minute: the counter the state reads moves per frame, while the
+        // line stays one per box per minute.
+        let past_cap_again = flow(LEASE, past_cap_port + 1);
+        assert!(
+            pins.admits_frame(&record, answer.octets(), Some(&past_cap_again), now),
+            "a second at-cap frame rides the window the same way"
+        );
+        assert_eq!(
+            pins.at_cap_admissions_of(&record),
+            2,
+            "both at-cap frames are counted, each admitted without retention"
+        );
+        assert_eq!(
+            pins.at_cap_admissions_of(&other_record),
+            0,
+            "the counter is per box: the second box's table never reached \
+             the cap"
+        );
+        let at_cap_line = "the box's flow table is at its cap";
+        let logged = log.contents();
+        assert!(
+            logged.contains(at_cap_line)
+                && logged.contains("switch_addr=100.64.0.9")
+                && logged.contains("namespace=weather")
+                && logged.contains(&format!("cap={DNS_MAX_FLOWS_PER_BOX}"))
+                && logged.contains("admitted_at_cap=1"),
+            "the at-cap line names the box, the cap and the counter's \
+             value, at the daemon's own info filter, got: {logged}"
+        );
+        assert_eq!(
+            logged.matches(at_cap_line).count(),
+            1,
+            "two at-cap frames in the same minute say so in one line, not \
+             one per frame: {logged}"
+        );
+
+        // The second box's own flow, opened after the first box filled its
+        // cap: its table has its own room, so the flow is established and
+        // retained — the bound is per box, and one box at its cap narrows
+        // nothing of a sibling's grant.
+        let other_flow = flow(other_lease, 40_000);
+        assert!(
+            pins.admits_frame(&other_record, answer.octets(), Some(&other_flow), now),
+            "a second box's flow is established beside a box at its cap"
+        );
+
+        // Past the line's minute, the next at-cap frame says so again — the
+        // rate limiter bounds the line to the minute, it does not silence
+        // the state after the first one — and the line it writes carries
+        // the counter the minute spent.
+        let minute = now + super::AT_CAP_LINE_INTERVAL;
+        let past_cap_later = flow(LEASE, past_cap_port + 2);
+        assert!(
+            pins.admits_frame(&record, answer.octets(), Some(&past_cap_later), minute),
+            "the at-cap frame past the minute rides the window the same way"
+        );
+        assert_eq!(
+            pins.at_cap_admissions_of(&record),
+            3,
+            "the at-cap frame past the minute is counted too"
+        );
+        let logged = log.contents();
+        assert_eq!(
+            logged.matches(at_cap_line).count(),
+            2,
+            "the line is rate-limited per box per minute, not said once \
+             ever: {logged}"
+        );
+        assert!(
+            logged.contains("admitted_at_cap=3"),
+            "the second line carries the counter's value at it, got: {logged}"
+        );
+        let past = now + DNS_ADMISSION_WINDOW + Duration::from_secs(1);
+        assert!(
+            !pins.admits_frame(&record, answer.octets(), Some(&past_cap), past),
+            "the flow the cap refused to retain ends with the window: past \
+             its edge the destination is refused"
+        );
+        assert!(
+            pins.admits_frame(&record, answer.octets(), Some(&first), past),
+            "a flow recorded before the cap keeps its retention: the box's \
+             established flow still rides past the window"
+        );
+        assert!(
+            pins.admits_frame(&other_record, answer.octets(), Some(&other_flow), past),
+            "the second box's flow keeps its retention past the window: the \
+             cap is the first box's own"
+        );
+    }
+
+    /// At the cap the sweep runs at most once per second per box, never once
+    /// per frame (the architecture review's condition): a sweep walks every
+    /// entry the table holds, and at the shared cap's size that costs tens
+    /// of microseconds a frame would otherwise pay to reclaim nothing — the
+    /// frames inside the second go straight to the window, unretained. What
+    /// a sweep reclaims, a new flow gets: one recorded flow aged past the
+    /// shared idle cap is reclaimed by the next second's sweep, and the new
+    /// flow that arrives for the freed slot is retained — it rides past the
+    /// window's edge, where the frame the same second at the cap does not.
+    #[test]
+    fn at_the_cap_one_sweep_per_second_reclaims_the_idle_flows() {
         let registry = BoxRegistry::new(SUBNET);
         dns_box(
             &registry,
@@ -1905,11 +2243,6 @@ pub(crate) mod tests {
             &limiter,
             now,
         );
-
-        // The flow recorded before the cap — the retention the box earned by
-        // using what its answer named — and the rest of the cap spent on
-        // distinct flows to the same pinned address: one SYN per source
-        // port, each its own flow identity.
         let flow = |src_port: u16| {
             l4_of(&tcp_frame(
                 Ipv4Addr::from(LEASE),
@@ -1919,41 +2252,85 @@ pub(crate) mod tests {
                 0x02, // SYN: a flow's opening segment
             ))
         };
-        let first = flow(40_000);
+
+        // One flow recorded early — the one the shared idle cap will have
+        // aged past once the box is at its cap — and the rest of the cap
+        // spent two seconds later, on flows that stay live at the sweep.
+        let aged = flow(40_000);
         assert!(
-            pins.admits_frame(&record, answer.octets(), Some(&first), now),
-            "the first flow through the pin is established"
+            pins.admits_frame(&record, answer.octets(), Some(&aged), now),
+            "the flow the idle cap will age past is recorded early"
         );
+        let fill = now + Duration::from_secs(2);
         for port in 1..DNS_MAX_FLOWS_PER_BOX {
             let port = u16::try_from(40_000 + port).expect("the test's source port fits a u16");
             assert!(
-                pins.admits_frame(&record, answer.octets(), Some(&flow(port)), now),
+                pins.admits_frame(&record, answer.octets(), Some(&flow(port)), fill),
                 "each distinct flow through the pin is established and recorded"
             );
         }
 
-        // The cap is spent. The next new flow's first frame is still admitted
-        // — the window holds — but the flow is not retained, so past the
-        // window its destination is refused where a recorded flow's
-        // retention would have carried it.
-        let past_cap_port =
+        // A day and a second on: the early flow is idle past the shared cap,
+        // the rest for two seconds less — and the window the box's first
+        // lookup earned has long passed, so the box resolves again and the
+        // flows below are decided by a live window.
+        let late = now + DNS_FLOW_IDLE_CAP + Duration::from_secs(1);
+        resolve(
+            &pins,
+            &table,
+            LEASE,
+            "example.com",
+            &[answer],
+            &limiter,
+            late,
+        );
+
+        // The next new flow, more than a second after the last sweep — none
+        // has run yet, so the first is due: the sweep reclaims the aged
+        // flow, and the freed slot retains the new flow.
+        let fresh_port =
             u16::try_from(40_000 + DNS_MAX_FLOWS_PER_BOX).expect("the port fits a u16");
-        let past_cap = flow(past_cap_port);
+        let fresh = flow(fresh_port);
         assert!(
-            pins.admits_frame(&record, answer.octets(), Some(&past_cap), now),
-            "at the cap a new flow's first frame is still admitted inside \
-             the window"
+            pins.admits_frame(&record, answer.octets(), Some(&fresh), late),
+            "the new flow at the cap is admitted through the slot the sweep \
+             freed"
         );
-        let past = now + DNS_ADMISSION_WINDOW + Duration::from_secs(1);
+        assert_eq!(
+            pins.sweeps_of(&record),
+            1,
+            "the first at-cap frame swept the idle flow the cap reclaimed"
+        );
+
+        // A second at-cap frame inside the same second: no sweep — the
+        // once-per-second bound is what keeps the sweep's walk from being
+        // bought per frame — and the frame rides the window unretained.
+        let within = late + Duration::from_millis(500);
+        let inner = flow(fresh_port + 1);
         assert!(
-            !pins.admits_frame(&record, answer.octets(), Some(&past_cap), past),
-            "the flow the cap refused to retain ends with the window: past \
-             its edge the destination is refused"
+            pins.admits_frame(&record, answer.octets(), Some(&inner), within),
+            "the at-cap frame inside the second still rides the window"
+        );
+        assert_eq!(
+            pins.sweeps_of(&record),
+            1,
+            "no second sweep inside the same second: at most one per box \
+             per second, never one per frame"
+        );
+
+        // Past the window's edge: the flow the sweep's freed slot retained
+        // rides on, where the frame the same second at the cap — admitted
+        // by the window alone, retained nowhere — is refused.
+        let past = late + DNS_ADMISSION_WINDOW + Duration::from_secs(1);
+        assert!(
+            pins.admits_frame(&record, answer.octets(), Some(&fresh), past),
+            "the flow that took the sweep's freed slot is retained: it rides \
+             past the window, where the cap's unretained frames end"
         );
         assert!(
-            pins.admits_frame(&record, answer.octets(), Some(&first), past),
-            "a flow recorded before the cap keeps its retention: the box's \
-             established flow still rides past the window"
+            !pins.admits_frame(&record, answer.octets(), Some(&inner), past),
+            "the frame the second at the cap admitted by the window alone \
+             retained no flow: past the window it is refused"
         );
     }
 
