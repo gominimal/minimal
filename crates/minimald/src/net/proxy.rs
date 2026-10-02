@@ -1940,6 +1940,16 @@ mod tests {
                     reg.report_own_address(target, "web", target_lease, applied);
                 }
                 TargetMode::OwnAddressNative => {
+                    // The creator's hand has published the box's address, as
+                    // `Session::register_hostname` records it; the attach
+                    // path's report and the session's own registration both
+                    // follow it, and neither is a source of the address.
+                    reg.publish_own_address(
+                        target,
+                        "web",
+                        target_lease,
+                        declared_request_ports(Some(&target_policy)),
+                    );
                     reg.report_own_address(target, "web", target_lease, applied);
                     // The session's own registration carries the declared
                     // set, as `Session::register_hostname` passes it.
@@ -2102,9 +2112,16 @@ mod tests {
                 .caller_at(CALLER_LEASE)
                 .expect("the reported lease names the registered caller");
 
-            // The attach path's report — an applied map with no mappings —
-            // and then the session actor's own registration, as a rename
-            // makes it: both must leave the route deny-all.
+            // The creator's hand published the box's address; the attach
+            // path's report — an applied map with no mappings — and then the
+            // session actor's own registration, as a rename makes it, both
+            // follow it: both must leave the route deny-all.
+            reg.publish_own_address(
+                target,
+                "web",
+                Ipv4Addr::LOCALHOST,
+                declared_request_ports(Some(&policy)),
+            );
             reg.report_own_address(target, "web", Ipv4Addr::LOCALHOST, BTreeMap::new());
             reg.register_own_ip(target, "web", declared_request_ports(Some(&policy)));
             let route = reg

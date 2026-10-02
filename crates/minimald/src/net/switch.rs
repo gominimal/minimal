@@ -3458,12 +3458,7 @@ pub(crate) mod tests {
     /// reset rides the **peer's** sequence (`seq`, the peer's next sequence
     /// the box is windowed to receive) and acknowledges what the peer last
     /// acknowledged (`ack`), with a checksum the box's kernel verifies.
-    fn assert_reset_toward_box_terminates_flow(
-        reset: &[u8],
-        observed: &[u8],
-        seq: u32,
-        ack: u32,
-    ) {
+    fn assert_reset_toward_box_terminates_flow(reset: &[u8], observed: &[u8], seq: u32, ack: u32) {
         assert_eq!(reset.len(), 14 + 20 + 20, "an Ethernet + IPv4 + TCP reset");
         assert_eq!(&reset[..6], &observed[..6], "still to the box's own MAC");
         assert_eq!(&reset[6..12], &observed[6..12], "still from the peer's MAC");
@@ -3638,10 +3633,7 @@ pub(crate) mod tests {
             resets.try_recv().is_err(),
             "the reset gets no reply on the switch side"
         );
-        assert!(
-            box_resets.try_recv().is_err(),
-            "and none toward the box"
-        );
+        assert!(box_resets.try_recv().is_err(), "and none toward the box");
 
         // And it charges no budget: the same source's resets arrive in
         // numbers no window would answer, and the source is still owed every

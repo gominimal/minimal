@@ -254,11 +254,14 @@ pub(crate) async fn complete_own_ip_attach(
 /// left to the launch, so the refcount is never double-decremented.
 ///
 /// NET-121's order is this function's shape: the declared ports are bound
-/// first — each failure its own warn line, from `apply_ingress`, and neither
-/// the name nor a substitute address published for a port whose bind failed,
-/// because the error short-circuits everything below — and only the binds
-/// that succeeded are followed by the name's registration and the route's
-/// report, so the name never exists a moment before its ports are reachable.
+/// first — each failure its own warn line, from `apply_ingress` — and no
+/// substitute address is published for a port whose bind failed. The gvproxy
+/// zone's registration runs only after the binds that succeeded, and the
+/// registry name finalize registered earlier is withdrawn on failure, so a
+/// name is never left standing for a port that refused. The published address
+/// itself is only ever one a creator handed (`own_address`): a declared
+/// ingress with none handed fails the attach with the same rollback, rather
+/// than binding at an address nobody chose.
 #[expect(
     clippy::too_many_arguments,
     reason = "left positional: the single call site has just built every one of these, so a struct would be single-use ceremony"
@@ -274,15 +277,18 @@ async fn finish_own_ip_attach(
     own_address: Option<&crate::net::provider::OwnAddressReporter>,
 ) -> io::Result<OwnIpGuard> {
     // The host loopback address this box's declaration publishes on (NET-010):
-    // the box's own leased address, read back from the registry rather than
-    // re-derived, so the forwards bind where the box's name answers. A launch
-    // without a reporter — a task, which owns no proxy route of its own —
-    // publishes on the node's shared address, the same interim a box without
-    // an address of its own does (NET-123).
-    let published =
-        own_address.map_or(Ipv4Addr::LOCALHOST, |reporter| reporter.published_address());
-    let exposed = match ingress {
-        Some(ingress) if !ingress.port_mappings.is_empty() => {
+    // the address a creator handed it, read back from the registry rather than
+    // re-derived, so the forwards bind where the box's name answers. The
+    // daemon has no default of its own to stand in with — a box nobody handed
+    // an address publishes nowhere, and a launch that declared ingress fails
+    // rather than binding forwards at an address nobody chose for it. A launch
+    // without a reporter — a task, which owns no proxy route of its own — is
+    // not this box's publish: tasks declare no ingress, so they never reach
+    // for a published address at all.
+    let published = own_address.and_then(|reporter| reporter.published_address());
+    let exposed = match (ingress, published) {
+        (Some(ingress), _) if ingress.port_mappings.is_empty() => Vec::new(),
+        (Some(ingress), Some(published)) => {
             match crate::net::policy::apply_ingress(&control, published, lease_ip, ingress, gate)
                 .await
             {
@@ -290,15 +296,36 @@ async fn finish_own_ip_attach(
                 // The failure is already said — one warn per failed bind,
                 // with the port and the reason, where the bind happened — so
                 // no aggregate line re-tells it here. The attach fails: no
-                // name is registered, no route reported, no substitute
+                // route reported, and the name finalize registered is
+                // withdrawn — a bind that failed never leaves a name standing
+                // for a port that refused (NET-121) — and no substitute
                 // address stands in for the port that could not bind.
                 Err(e) => {
                     drop(relay);
+                    if let Some(own_address) = own_address {
+                        own_address.withdraw(session_name);
+                    }
                     return Err(e);
                 }
             }
         }
-        _ => Vec::new(),
+        (Some(_), None) => {
+            // A declared ingress with no address handed: fail the attach with
+            // the same rollback as a failed bind — the relay is dropped, the
+            // route never reported, and the name finalize registered is
+            // withdrawn, so the box never publishes at an address nobody
+            // chose for it and its name never answers for ports that are
+            // not bound (NET-010, NET-121).
+            drop(relay);
+            if let Some(own_address) = own_address {
+                own_address.withdraw(session_name);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!("no published address handed for box {session_name}"),
+            ));
+        }
+        (None, _) => Vec::new(),
     };
 
     // One info line per bound forwarder (NET-040, NET-121): the host address
@@ -356,8 +383,10 @@ async fn finish_own_ip_attach(
     //
     // NET-121: this registration runs *after* the binds above — the name
     // resolves only to a box whose declared ports are already bound, so a
-    // connection by name is never answered before its port is reachable,
-    // and a failed bind never leaves a name behind for a port that refused.
+    // connection by name is never answered before its port is reachable. The
+    // registry name is a different story: finalize registered it before any
+    // of this, so it is the failed bind's own rollback that withdraws it
+    // above — the name is never left standing for a port that refused.
     let host_ids = dns::host_ids_for(switch.lock().await.host_id());
     for host_id in host_ids {
         if let Err(e) =
@@ -1223,11 +1252,16 @@ mod tests {
     /// every expose call reaches the switch before any `/services/dns/add`
     /// does, and the registry's route is reported last of all — so the name
     /// resolves only to a box whose ports are already reachable, and a
-    /// connection by name never arrives before its port exists. The
-    /// forwarders stay on the guard for the box's lifetime: its teardown
-    /// unbinds them.
+    /// connection by name never arrives before its port exists. The registry
+    /// this drives is one finalize has already run on (NET-011): the
+    /// creator's hand published the box's address and the registration held
+    /// the name at it before any client attached — the state the attaches of
+    /// the real path find, and the state a *failed* bind (the next proof)
+    /// must not leave standing. The forwarders stay on the guard for the
+    /// box's lifetime: its teardown unbinds them.
     #[tokio::test]
     async fn declared_ports_bound_before_name_registered() {
+        const HANDED: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 9);
         let dir = tempfile::TempDir::new().unwrap();
         let control_path = dir.path().join("gvproxy.sock");
         let (events_tx, mut events_rx) = mpsc::channel(64);
@@ -1243,6 +1277,41 @@ mod tests {
             sessions::SessionId::nil(),
         );
         let policy = declared_two_ports();
+
+        // Finalize has already run (NET-011): the creator handed the box's
+        // published address, finalize recorded the hand, and the
+        // registration held the name at it — before any forwarder was bound,
+        // which is the standing order the next proof's failure must undo.
+        {
+            let mut reg = registry.write().expect("registry lock");
+            reg.publish_own_address(
+                sessions::SessionId::nil(),
+                "web",
+                HANDED,
+                BTreeSet::from([8080, 9090]),
+            );
+            reg.register_own_ip(
+                sessions::SessionId::nil(),
+                "web",
+                BTreeSet::from([8080, 9090]),
+            );
+        }
+        let dns::ZoneEntry::Held {
+            address: held_from_finalize,
+            ..
+        } = registry
+            .read()
+            .expect("registry lock")
+            .zone_entry("web.min.internal", &[])
+        else {
+            panic!("finalize held the name before any bind")
+        };
+        assert_eq!(
+            held_from_finalize,
+            Some(HANDED),
+            "the held name answers at the address the creator handed, \
+             exactly as handed"
+        );
 
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: `socketpair` with a valid domain/type either returns -1
@@ -1290,25 +1359,31 @@ mod tests {
         );
 
         // Both declared ports bound, each at the box's published address —
-        // the registry has none yet, so the attach published on the node's
-        // shared interim (NET-123) at `127.0.0.1`.
+        // the address the creator handed, used exactly as handed and never
+        // substituted: the registry holds it, the forwards bind it, and the
+        // name answers at it.
         let exposed = locals_of(&events, "/services/forwarder/expose");
         assert_eq!(
             exposed,
-            vec!["127.0.0.1:8080", "127.0.0.1:9090"],
+            vec![format!("{HANDED}:8080"), format!("{HANDED}:9090")],
             "each declared port bound once, in declaration order: {events:?}"
         );
 
         // The registry's route exists now, after the binds — the report is
         // the last of the three steps the attach takes. The route is the
-        // full zone name the registry answers (`<name>.min.internal`).
+        // full zone name the registry answers (`<name>.min.internal`), and
+        // it still answers at the handed address.
         let held = registry
             .read()
             .expect("registry lock")
             .zone_entry("web.min.internal", &[]);
-        assert!(
-            matches!(held, crate::net::dns::ZoneEntry::Held { .. }),
-            "the name routes only after the binds: {held:?}"
+        assert_eq!(
+            held,
+            dns::ZoneEntry::Held {
+                owner: "web".to_string(),
+                address: Some(HANDED),
+            },
+            "the name routes only after the binds, at the handed address: {held:?}"
         );
 
         // The forwarders are held until stop: the guard's teardown unbinds
@@ -1320,7 +1395,7 @@ mod tests {
         let unbound = collect_until(&mut events_rx, "/services/forwarder/unexpose", 2).await;
         assert_eq!(
             locals_of(&unbound, "/services/forwarder/unexpose"),
-            vec!["127.0.0.1:8080", "127.0.0.1:9090"],
+            vec![format!("{HANDED}:8080"), format!("{HANDED}:9090")],
             "teardown unbinds every forwarder it held: {unbound:?}"
         );
         fake.abort();
@@ -1335,6 +1410,13 @@ mod tests {
     /// refused port, and the refusal's own reason reaches the caller beside
     /// the port, in the returned error and in the warn line.
     ///
+    /// The registry this drives is one finalize has already run on (NET-011):
+    /// the creator's hand published the box's address and the registration
+    /// held the name at it *before* the binds — the finding's own premise —
+    /// so the rollback's other half is the one thing that makes the end
+    /// state honest: the failed bind withdraws that name, and no name is
+    /// left standing for a port that refused.
+    ///
     /// And either shape rolls the whole half back: the ports that *did* bind
     /// are unexposed before the attach gives up, so a half-bound box holds
     /// nothing — the rollback is asserted per shape, not by extrapolating
@@ -1342,6 +1424,7 @@ mod tests {
     #[tokio::test]
     async fn failed_forwarder_bind_is_reported_not_substituted() {
         const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
+        const HANDED: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 10);
         let capture = crate::test_harness::captured_log();
         let dir = tempfile::TempDir::new().unwrap();
 
@@ -1353,7 +1436,8 @@ mod tests {
         let refused_fake = spawn_control_channel_deciding(
             refused.control_path.clone(),
             |path, body| {
-                if path == "/services/forwarder/expose" && body.contains("127.0.0.1:7070") {
+                if path == "/services/forwarder/expose" && body.contains(&format!("{HANDED}:7070"))
+                {
                     (403, "port 7070 is not declared on this row".to_string())
                 } else {
                     ok()
@@ -1364,6 +1448,36 @@ mod tests {
         );
         let refused_switch = vm_host_switch();
         let refused_policy = declared_three_ports();
+        // Finalize has already run: the hand published the box's address,
+        // the registration held the name at it, and the attach's binds are
+        // what must undo that if they fail.
+        {
+            let mut reg = refused.registry.write().expect("registry lock");
+            reg.publish_own_address(
+                sessions::SessionId::nil(),
+                "web",
+                HANDED,
+                BTreeSet::from([8080, 9090, 7070]),
+            );
+            reg.register_own_ip(
+                sessions::SessionId::nil(),
+                "web",
+                BTreeSet::from([8080, 9090, 7070]),
+            );
+        }
+        let held_before = refused
+            .registry
+            .read()
+            .expect("registry lock")
+            .zone_entry("web.min.internal", &[]);
+        assert_eq!(
+            held_before,
+            dns::ZoneEntry::Held {
+                owner: "web".to_string(),
+                address: Some(HANDED),
+            },
+            "finalize held the name before the binds: {held_before:?}"
+        );
         let err = match crate::net::gvproxy_network::complete_own_ip_attach(
             &refused_switch,
             refused.tap_fd,
@@ -1391,12 +1505,16 @@ mod tests {
         let events = collect_until(&mut refused_events_rx, "/services/forwarder/unexpose", 2).await;
         assert_eq!(
             locals_of(&events, "/services/forwarder/expose"),
-            vec!["127.0.0.1:8080", "127.0.0.1:9090", "127.0.0.1:7070"],
+            vec![
+                format!("{HANDED}:8080"),
+                format!("{HANDED}:9090"),
+                format!("{HANDED}:7070")
+            ],
             "all three binds were attempted: {events:?}"
         );
         assert_eq!(
             locals_of(&events, "/services/forwarder/unexpose"),
-            vec!["127.0.0.1:8080", "127.0.0.1:9090"],
+            vec![format!("{HANDED}:8080"), format!("{HANDED}:9090")],
             "the binds that succeeded are rolled back with the refused one: {events:?}"
         );
         assert!(
@@ -1410,8 +1528,9 @@ mod tests {
             .zone_entry("web.min.internal", &[]);
         assert_eq!(
             held,
-            crate::net::dns::ZoneEntry::Absent,
-            "no substitute address stands in for the refused bind: {held:?}"
+            dns::ZoneEntry::Absent,
+            "the failed bind withdrew the name finalize registered; no \
+             substitute address stands in for the refused bind: {held:?}"
         );
         // The refusal is the log's own fact, said per port: the declared
         // number, and the reason the gate gave, in the same warn line.
@@ -1432,7 +1551,8 @@ mod tests {
         let failed_fake = spawn_control_channel_deciding(
             failed.control_path.clone(),
             |path, body| {
-                if path == "/services/forwarder/expose" && body.contains("127.0.0.1:9090") {
+                if path == "/services/forwarder/expose" && body.contains(&format!("{HANDED}:9090"))
+                {
                     (500, String::new())
                 } else {
                     ok()
@@ -1443,6 +1563,35 @@ mod tests {
         );
         let failed_switch = vm_host_switch();
         let failed_policy = declared_two_ports();
+        // Finalize has already run here too — the same held-from-finalize
+        // name for the failed bind to withdraw.
+        {
+            let mut reg = failed.registry.write().expect("registry lock");
+            reg.publish_own_address(
+                sessions::SessionId::nil(),
+                "web",
+                HANDED,
+                BTreeSet::from([8080, 9090]),
+            );
+            reg.register_own_ip(
+                sessions::SessionId::nil(),
+                "web",
+                BTreeSet::from([8080, 9090]),
+            );
+        }
+        let held_before = failed
+            .registry
+            .read()
+            .expect("registry lock")
+            .zone_entry("web.min.internal", &[]);
+        assert_eq!(
+            held_before,
+            dns::ZoneEntry::Held {
+                owner: "web".to_string(),
+                address: Some(HANDED),
+            },
+            "finalize held the name before the binds: {held_before:?}"
+        );
         let err = match crate::net::gvproxy_network::complete_own_ip_attach(
             &failed_switch,
             failed.tap_fd,
@@ -1468,12 +1617,12 @@ mod tests {
         let events = collect_until(&mut failed_events_rx, "/services/forwarder/unexpose", 1).await;
         assert_eq!(
             locals_of(&events, "/services/forwarder/expose"),
-            vec!["127.0.0.1:8080", "127.0.0.1:9090"],
+            vec![format!("{HANDED}:8080"), format!("{HANDED}:9090")],
             "both binds were attempted: {events:?}"
         );
         assert_eq!(
             locals_of(&events, "/services/forwarder/unexpose"),
-            vec!["127.0.0.1:8080"],
+            vec![format!("{HANDED}:8080")],
             "the bind that succeeded is rolled back with the failed one: {events:?}"
         );
         assert!(
@@ -1487,8 +1636,9 @@ mod tests {
             .zone_entry("web.min.internal", &[]);
         assert_eq!(
             held,
-            crate::net::dns::ZoneEntry::Absent,
-            "no substitute address stands in for the failed bind: {held:?}"
+            dns::ZoneEntry::Absent,
+            "the failed bind withdrew the name finalize registered; no \
+             substitute address stands in for the failed bind: {held:?}"
         );
         let log = capture.contents();
         assert!(
@@ -1496,6 +1646,214 @@ mod tests {
             "the failed bind says its line with the port: {log}"
         );
         failed_fake.abort();
+    }
+
+    /// NET-121/NET-010's no-address half: a launch that declared ingress but
+    /// was handed no address fails its attach — with the same rollback as a
+    /// failed bind — rather than publishing at a default. The daemon has no
+    /// address of its own to stand in with: zero forwarders bound, zero
+    /// names published, the registry's name absent before and after.
+    #[tokio::test]
+    async fn attach_without_a_handed_address_fails_rather_than_publishing_a_default() {
+        const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // A launch with no reporter at all: whatever it declared, nothing
+        // hands it an address to publish at.
+        let bare = attach_scenario(&dir, "gvproxy.sock");
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (handed_tx, _handed_rx) = mpsc::channel(4);
+        let fake = spawn_control_channel_deciding(
+            bare.control_path.clone(),
+            |_, _| ok(),
+            events_tx,
+            handed_tx,
+        );
+        let switch = vm_host_switch();
+        let policy = declared_two_ports();
+        let err = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            bare.tap_fd,
+            ControlChannel::Unix(bare.control_path.clone()),
+            LEASE,
+            "web",
+            Some(&policy),
+            None,
+            false,
+        )
+        .await
+        .err()
+        .expect("no address handed, no publish");
+        assert_eq!(
+            err.to_string(),
+            "no published address handed for box web",
+            "the failure says what was missing, not a default it invented: {err}"
+        );
+        // Zero forwarders, zero names: the failure is decided before any
+        // bind, so no expose and no name registration ever reached the
+        // control channel — only the connect upgrade did.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let mut seen = Vec::new();
+        while let Ok(event) = events_rx.try_recv() {
+            seen.push(event);
+        }
+        assert!(
+            seen.iter().all(|(path, _)| path == "/connect"),
+            "nothing but the connect: no bind, no name: {seen:?}"
+        );
+        assert_eq!(
+            bare.registry
+                .read()
+                .expect("registry lock")
+                .zone_entry("web.min.internal", &[]),
+            dns::ZoneEntry::Absent,
+            "a box nobody handed an address holds no name"
+        );
+        fake.abort();
+
+        // The same launch with a reporter whose registry holds no hand —
+        // the real shape of a creator that has not handed one: finalize
+        // registered nothing (there was no published address to register
+        // at), and the attach refuses to invent one the registry never
+        // recorded.
+        let unhand = attach_scenario(&dir, "gvproxy-2.sock");
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (handed_tx, _handed_rx) = mpsc::channel(4);
+        let unhand_fake = spawn_control_channel_deciding(
+            unhand.control_path.clone(),
+            |_, _| ok(),
+            events_tx,
+            handed_tx,
+        );
+        let switch = vm_host_switch();
+        assert!(
+            unhand
+                .registry
+                .write()
+                .expect("registry lock")
+                .register_own_ip(
+                    sessions::SessionId::nil(),
+                    "web",
+                    BTreeSet::from([8080, 9090])
+                )
+                .is_none(),
+            "finalize with no hand registers no name"
+        );
+        let err = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            unhand.tap_fd,
+            ControlChannel::Unix(unhand.control_path.clone()),
+            LEASE,
+            "web",
+            Some(&policy),
+            Some(&unhand.reporter),
+            false,
+        )
+        .await
+        .err()
+        .expect("a reporter with no hand publishes nothing either");
+        assert_eq!(
+            err.to_string(),
+            "no published address handed for box web",
+            "the same missing fact, the same failure: {err}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let mut seen = Vec::new();
+        while let Ok(event) = events_rx.try_recv() {
+            seen.push(event);
+        }
+        assert!(
+            seen.iter().all(|(path, _)| path == "/connect"),
+            "nothing but the connect: no bind, no name: {seen:?}"
+        );
+        assert_eq!(
+            unhand
+                .registry
+                .read()
+                .expect("registry lock")
+                .zone_entry("web.min.internal", &[]),
+            dns::ZoneEntry::Absent,
+            "the attach left the name as finalize left it: absent"
+        );
+        unhand_fake.abort();
+    }
+
+    /// The other side of the same contract: a reporter whose registry holds
+    /// a handed address publishes at exactly it — `127.0.0.1`, the address
+    /// the old default published at, now sourced from the hand that named
+    /// it — and the failure above is the only alternative: the address the
+    /// forwards bind and the name answers is the one the creator handed, or
+    /// there is no publish at all.
+    #[tokio::test]
+    async fn attach_publishes_at_the_address_the_reporter_handed() {
+        const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
+        const HANDED: Ipv4Addr = Ipv4Addr::LOCALHOST;
+        let dir = tempfile::TempDir::new().unwrap();
+        let scenario = attach_scenario(&dir, "gvproxy.sock");
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (handed_tx, _handed_rx) = mpsc::channel(4);
+        let fake = spawn_control_channel_deciding(
+            scenario.control_path.clone(),
+            |_, _| ok(),
+            events_tx,
+            handed_tx,
+        );
+        let switch = vm_host_switch();
+        let policy = declared_two_ports();
+
+        // The creator's hand: the host loopback itself, published into the
+        // registry before the attach — the shape the round's finding asked
+        // for, that `127.0.0.1` is an address someone handed, never a
+        // default the daemon reached for.
+        scenario
+            .registry
+            .write()
+            .expect("registry lock")
+            .publish_own_address(
+                sessions::SessionId::nil(),
+                "web",
+                HANDED,
+                BTreeSet::from([8080, 9090]),
+            );
+
+        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            scenario.tap_fd,
+            ControlChannel::Unix(scenario.control_path.clone()),
+            LEASE,
+            "web",
+            Some(&policy),
+            Some(&scenario.reporter),
+            false,
+        )
+        .await
+        .expect("the attach completes at the handed address");
+        let events = collect_until(&mut events_rx, "/services/dns/add", 1).await;
+        assert_eq!(
+            locals_of(&events, "/services/forwarder/expose"),
+            vec![format!("{HANDED}:8080"), format!("{HANDED}:9090")],
+            "the forwards bind at the handed address, exactly as handed: {events:?}"
+        );
+        assert_eq!(
+            scenario
+                .registry
+                .read()
+                .expect("registry lock")
+                .zone_entry("web.min.internal", &[]),
+            dns::ZoneEntry::Held {
+                owner: "web".to_string(),
+                address: Some(HANDED),
+            },
+            "the name answers at the same handed address"
+        );
+        Box::new(guard).teardown().await;
+        let unbound = collect_until(&mut events_rx, "/services/forwarder/unexpose", 2).await;
+        assert_eq!(
+            locals_of(&unbound, "/services/forwarder/unexpose"),
+            vec![format!("{HANDED}:8080"), format!("{HANDED}:9090")],
+            "teardown unbinds what the hand addressed: {unbound:?}"
+        );
+        fake.abort();
     }
 
     /// A forwarding stand-in: the gvproxy a host-side client can actually
@@ -1774,27 +2132,41 @@ mod tests {
     /// not a frame the test writes into the relay. The connection is driven
     /// end to end (the client connects, the stand-in opens the client's leg
     /// through the relay, the test plays the box's half of the handshake),
-    /// and then the port is revoked while the box stays up.
+    /// and then the port is revoked while the box stays up. The registry
+    /// finalize has already run on: the creator handed the box's published
+    /// address, and the client connects at exactly it.
     ///
     /// What the revocation owes the client, and what this asserts: the
     /// connection it held *ends* — an EOF or a reset, within the bound
     /// below, never a hang — because the gate terminated the flow it had
     /// tracked: the reset rides the flow's own sequence pair, is addressed
-    /// to the leg, and is the last thing the relay ever says, with nothing
-    /// further reaching the box. And the next connect to the port is
-    /// *refused* — a connection refused, not an accepted-then-dropped —
-    /// because the forwarder's unexpose really dropped the host listener
-    /// before the revocation returned.
+    /// to the leg, and is the last thing the relay says toward the switch.
+    /// And the next connect to the port is *refused* — a connection refused,
+    /// not an accepted-then-dropped — because the forwarder's unexpose
+    /// really dropped the host listener before the revocation returned.
     ///
-    /// The order the daemon takes — the gate's reset, then the unexpose —
+    /// The revocation ends the box's half of the connection too: the gate
+    /// writes a reset into the tap toward the box, from the peer's address
+    /// at the peer's next sequence — the sequence the box's socket is
+    /// windowed to receive — so the box is not left holding a live
+    /// connection into a forwarder that no longer exists. After that one
+    /// reset the box end is silent: nothing further is forwarded in either
+    /// direction.
+    ///
+    /// The order the daemon takes — the gate's resets, then the unexpose —
     /// cannot be shown as one wire order by a stand-in that sees the relay
     /// and the control channel as two connections, so each half is pinned
-    /// where it is observable: the reset is read off the relay (and only
-    /// its arrival closes the client's socket), and the unexpose is answered
-    /// only after the listener is confirmed dropped.
+    /// where it is observable: the switch-side reset is read off the relay
+    /// (and only its arrival closes the client's socket), the box-directed
+    /// one off the tap, and the unexpose is answered only after the
+    /// listener is confirmed dropped.
     #[tokio::test]
     async fn ingress_revocation_unbinds_forwarder_and_terminates_connections() {
         const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
+        // The published address the creator handed this box: the forwarder
+        // binds it, the client connects at it, and the revocation unbinds
+        // it — never a default of the daemon's own.
+        const HANDED: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 12);
         // The leg's address — the same the stand-in's `switch_side` speaks
         // from, so the assertions below can name it.
         const LEG_SOURCE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 50);
@@ -1836,6 +2208,23 @@ mod tests {
             }),
             egress: None,
         };
+        // Finalize has already run (NET-011): the creator handed the box's
+        // published address, finalize recorded the hand, and the
+        // registration held the name at it before any client attached.
+        {
+            let mut reg = registry.write().expect("registry lock");
+            reg.publish_own_address(
+                sessions::SessionId::nil(),
+                "web",
+                HANDED,
+                BTreeSet::from([HOST_PORT]),
+            );
+            reg.register_own_ip(
+                sessions::SessionId::nil(),
+                "web",
+                BTreeSet::from([HOST_PORT]),
+            );
+        }
 
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: `socketpair` with a valid domain/type either returns -1
@@ -1865,8 +2254,8 @@ mod tests {
         let _attach_events = collect_until(&mut events_rx, "/services/dns/add", 2).await;
 
         // A host-side client connects to the declared port — a real socket
-        // on the host loopback, at the address the forwarder bound.
-        let mut client = TcpStream::connect((IpAddr::from(Ipv4Addr::LOCALHOST), HOST_PORT))
+        // on the host loopback, at the address the creator handed.
+        let mut client = TcpStream::connect((IpAddr::from(HANDED), HOST_PORT))
             .await
             .expect("the bound port admits a host-side client");
 
@@ -1929,7 +2318,7 @@ mod tests {
 
         // The next connect to the port is refused — the listener is gone,
         // not a forwarder that accepts and drops.
-        let refused = TcpStream::connect((IpAddr::from(Ipv4Addr::LOCALHOST), HOST_PORT)).await;
+        let refused = TcpStream::connect((IpAddr::from(HANDED), HOST_PORT)).await;
         assert!(
             matches!(&refused, Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused),
             "a revoked port refuses new connections instead of accepting them: {refused:?}"
@@ -1955,9 +2344,25 @@ mod tests {
             5001,
             LEG_ISN + 1,
         );
+
+        // The box's half of the connection ends too: the revocation writes
+        // its own reset into the tap toward the box, from the peer's
+        // address at the peer's next sequence — the leg's last byte was its
+        // completing ACK, so the next sequence is the ISN's successor and
+        // the acknowledgment is what the leg held of the box's stream.
+        let toward_box = read_box_end_frame(&box_end)
+            .await
+            .expect("the revocation resets the box's half of the connection");
+        assert_reset_terminated(
+            &toward_box,
+            (LEG_SOURCE, LEG_PORT),
+            (LEASE, 80),
+            LEG_ISN + 1,
+            5001,
+        );
         assert!(
             box_end_is_silent(&box_end),
-            "the reset is the gate's refusal, not the box's: nothing else \
+            "the reset is the last thing either direction: nothing further \
              was forwarded"
         );
 
@@ -1968,7 +2373,7 @@ mod tests {
         let events = collect_until(&mut events_rx, "/services/forwarder/unexpose", 1).await;
         assert_eq!(
             locals_of(&events, "/services/forwarder/unexpose"),
-            vec![format!("{}:{HOST_PORT}", Ipv4Addr::LOCALHOST)],
+            vec![format!("{HANDED}:{HOST_PORT}")],
             "the revoked port's forwarder is unbound: {events:?}"
         );
 
@@ -1997,12 +2402,14 @@ mod tests {
     /// NET-121's scoping, proved where the wire shows it: revoking one
     /// external port ends *only* that port, never the connections of a
     /// sibling forwarder publishing a different external port to the same
-    /// in-box port — `48080:80` beside `48081:80`, a declaration nothing
+    /// in-box port — `48180:80` beside `48181:80`, a declaration nothing
     /// forbids. The gate refuses by *internal* port alone, because a box's
     /// inbound frames carry no trace of which external forward they arrived
     /// through, so the guard withholds the gate's termination while a live
     /// sibling still serves the internal port and the unbind is the revoked
-    /// port's whole effect.
+    /// port's whole effect. The registry finalize has already run on — the
+    /// creator handed the box's published address, and the forwarders bind
+    /// it.
     ///
     /// What that means on the wire, and what this asserts: the revoked
     /// port's listener drops at once (the next connect is refused) while
@@ -2018,6 +2425,9 @@ mod tests {
     #[tokio::test]
     async fn revoke_terminates_only_the_named_external_ports_connections() {
         const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
+        // The published address the creator handed this box: the two
+        // forwarders bind it and the clients connect at it.
+        const HANDED: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 13);
         // The leg's address — the same the stand-in's `switch_side` speaks
         // from, so the assertions below can name it. Legs are numbered from
         // 40000 in accept order: the two handshakes take the first two, a
@@ -2074,6 +2484,23 @@ mod tests {
             }),
             egress: None,
         };
+        // Finalize has already run (NET-011): the creator handed the box's
+        // published address, finalize recorded the hand, and the
+        // registration held the name at it before any client attached.
+        {
+            let mut reg = registry.write().expect("registry lock");
+            reg.publish_own_address(
+                sessions::SessionId::nil(),
+                "web",
+                HANDED,
+                BTreeSet::from([REVOKED_PORT, SIBLING_PORT]),
+            );
+            reg.register_own_ip(
+                sessions::SessionId::nil(),
+                "web",
+                BTreeSet::from([REVOKED_PORT, SIBLING_PORT]),
+            );
+        }
 
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: `socketpair` with a valid domain/type either returns -1
@@ -2104,14 +2531,12 @@ mod tests {
 
         // A client through each external port, both handshakes completed —
         // two legs of one internal port, both tracked by the gate.
-        let mut first_client =
-            TcpStream::connect((IpAddr::from(Ipv4Addr::LOCALHOST), REVOKED_PORT))
-                .await
-                .expect("the first declared port admits a host-side client");
-        let mut sibling_client =
-            TcpStream::connect((IpAddr::from(Ipv4Addr::LOCALHOST), SIBLING_PORT))
-                .await
-                .expect("the sibling port admits a host-side client");
+        let mut first_client = TcpStream::connect((IpAddr::from(HANDED), REVOKED_PORT))
+            .await
+            .expect("the first declared port admits a host-side client");
+        let mut sibling_client = TcpStream::connect((IpAddr::from(HANDED), SIBLING_PORT))
+            .await
+            .expect("the sibling port admits a host-side client");
         // The legs' handshakes interleave on the box end; both are completed
         // before the revocation, so the gate holds a tail for each. The
         // first leg to complete is the first port's — the connects were
@@ -2132,7 +2557,7 @@ mod tests {
 
         // The revoked port's listener is gone: the next connect is refused,
         // not accepted and dropped.
-        let refused = TcpStream::connect((IpAddr::from(Ipv4Addr::LOCALHOST), REVOKED_PORT)).await;
+        let refused = TcpStream::connect((IpAddr::from(HANDED), REVOKED_PORT)).await;
         assert!(
             matches!(&refused, Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused),
             "the revoked port's listener is gone: {refused:?}"
@@ -2157,10 +2582,9 @@ mod tests {
         // internal port stays admitted, so the sibling's forwards keep
         // crossing the gate. An unscoped revocation would have refused this
         // SYN at the gate — reset back at the leg, nothing to the box.
-        let mut later_client =
-            TcpStream::connect((IpAddr::from(Ipv4Addr::LOCALHOST), SIBLING_PORT))
-                .await
-                .expect("the sibling's listener still admits a host-side client");
+        let mut later_client = TcpStream::connect((IpAddr::from(HANDED), SIBLING_PORT))
+            .await
+            .expect("the sibling's listener still admits a host-side client");
         let [(later_leg, later_isn)] =
             complete_leg_handshakes(&box_end, LEASE, LEG_SOURCE, INTERNAL_PORT, LEG_ISN, 1)
                 .await
@@ -2177,7 +2601,7 @@ mod tests {
         let events = collect_until(&mut events_rx, "/services/forwarder/unexpose", 1).await;
         assert_eq!(
             locals_of(&events, "/services/forwarder/unexpose"),
-            vec![format!("{}:{REVOKED_PORT}", Ipv4Addr::LOCALHOST)],
+            vec![format!("{HANDED}:{REVOKED_PORT}")],
             "the revoked port's forwarder is unbound: {events:?}"
         );
 
@@ -2256,7 +2680,7 @@ mod tests {
         let events = collect_until(&mut events_rx, "/services/forwarder/unexpose", 1).await;
         assert_eq!(
             locals_of(&events, "/services/forwarder/unexpose"),
-            vec![format!("{}:{SIBLING_PORT}", Ipv4Addr::LOCALHOST)],
+            vec![format!("{HANDED}:{SIBLING_PORT}")],
             "the sibling's forwarder is unbound: {events:?}"
         );
 

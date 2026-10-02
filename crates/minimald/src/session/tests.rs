@@ -2684,6 +2684,24 @@ fn own_ip_session_req(name: &str) -> minimald_rpc::CreateSessionRequest {
     }
 }
 
+/// The same request with the hand a real creator sends: the registration's
+/// `box_addresses` row names the box's switch lease and the host loopback
+/// address its publishes bind — the T66 hand — which under the hand model
+/// (NET-010/NET-011) is the only way a box gets a published address. A
+/// request that hands nothing publishes nothing and registers no name.
+fn own_ip_handed_session_req(
+    name: &str,
+    switch: std::net::Ipv4Addr,
+    loopback: std::net::Ipv4Addr,
+) -> minimald_rpc::CreateSessionRequest {
+    let mut request = own_ip_session_req(name);
+    request.config.box_addresses = Some(sessions::BoxAddresses {
+        switch_address: switch,
+        loopback_address: loopback,
+    });
+    request
+}
+
 /// Drives Create → ConfigureLoadout → FinalizeSession for an own-address box
 /// and returns its id. No attach ever happens along the way: the box is
 /// finalised and its name registered while no client has connected — the
@@ -2695,6 +2713,42 @@ async fn finalize_own_ip_session(client: &mut TestClient, name: &str) -> Session
     };
     let id = client
         .call::<CreateSession>(&own_ip_session_req(name))
+        .await
+        .unwrap()
+        .id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .await
+    {
+        Errorable::Ok(_) => id,
+        Errorable::Err { error } => panic!("FinalizeSession failed for {name}: {error}"),
+    }
+}
+
+/// The finalize above, for a box whose creator handed it an address: the
+/// hand rides the create, and finalize publishes and registers at exactly
+/// it (NET-011's hand model).
+async fn finalize_handed_own_ip_session(
+    client: &mut TestClient,
+    name: &str,
+    switch: std::net::Ipv4Addr,
+    loopback: std::net::Ipv4Addr,
+) -> SessionId {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, Errorable, FinalizeSession,
+        FinalizeSessionRequest,
+    };
+    let id = client
+        .call::<CreateSession>(&own_ip_handed_session_req(name, switch, loopback))
         .await
         .unwrap()
         .id;
@@ -2745,26 +2799,35 @@ fn in_reserved_local_range(addr: std::net::Ipv4Addr) -> bool {
 
 /// NET-011: a session's finalisation is what registers its box's
 /// `<name>.min.internal` — the reply to `FinalizeSession` comes back with the
-/// name already held, at the box's own leased loopback address, and the lease
-/// is the one the registry published: the two surfaces that must agree (the
-/// route a proxy follows and the address a resolver answers) name one address.
-/// The registration is in the daemon log, naming the box and the address —
-/// the line a diagnostics bundle's log tail carries.
+/// name already held, at the address the box's creator handed it, and the
+/// publish is the registry's record of that same hand: the two surfaces that
+/// must agree (the route a proxy follows and the address a resolver answers)
+/// name one address, and neither chooses it. The registration is in the
+/// daemon log, naming the box and the address — the line a diagnostics
+/// bundle's log tail carries.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn name_registered_at_finalize() {
+    // The hand a real creator sends: a switch lease and the reserved-range
+    // loopback address the box's publishes bind.
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 9);
     let capture = crate::test_harness::captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let id = finalize_own_ip_session(&mut client, "web").await;
+    let id = finalize_handed_own_ip_session(&mut client, "web", switch, handed).await;
 
-    // No attach has happened — the name is held at the box's own address.
+    // No attach has happened — the name is held at the handed address.
     let (owner, address) = zone_answer_for(&server, "web.min.internal")
         .await
         .expect("the name is held at finalize");
     assert_eq!(owner, "web", "the session owns its box name");
+    assert_eq!(
+        address, handed,
+        "the name answers at the address the creator handed, exactly"
+    );
     assert!(
         in_reserved_local_range(address),
-        "the box's own address comes from the reserved local range, got {address}"
+        "the handed address comes from the reserved local range, got {address}"
     );
 
     // The registry's publish and the zone's answer are one address — the two
@@ -2781,35 +2844,80 @@ async fn name_registered_at_finalize() {
 
     // The registration is said out loud, naming the box and the address.
     let logged = capture.contents();
-    let lease_line = logged
+    let registered_line = logged
         .lines()
-        .find(|line| line.contains("loopback-lease") && line.contains("session_name=\"web\""))
-        .unwrap_or_else(|| panic!("the lease must be logged, got: {logged}"));
+        .find(|line| {
+            line.contains("registered PTask hostname") && line.contains("session_name=\"web\"")
+        })
+        .unwrap_or_else(|| panic!("the registration must be logged, got: {logged}"));
     assert!(
-        lease_line.contains(&format!("ip={address}")),
-        "the lease line names the address it leased, got: {lease_line}"
+        registered_line.contains(&format!("ip={address}")),
+        "the registration line names the handed address, got: {registered_line}"
     );
-    assert!(
-        logged
-            .lines()
-            .any(|line| line.contains("registered PTask hostname") && line.contains("web")),
-        "the R3.5 registration is logged with the box's name, got: {logged}"
+}
+
+/// NET-011's other half, at the session level: a box nobody handed an
+/// address publishes nowhere. Finalize still succeeds — the box lives, and
+/// everything it does that needs no published ingress works — but its name
+/// registers nowhere, because the daemon has no address of its own to stand
+/// in with (the hand model): every lookup answers NXDOMAIN from the moment
+/// the name would have existed, no route exists to forward to, and no
+/// publish was recorded for the attach path to bind forwards at. The attach
+/// path's own failure for the same box — "no published address handed" — is
+/// proved in the gvproxy network proofs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_box_nobody_handed_an_address_registers_no_name() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let id = finalize_own_ip_session(&mut client, "web").await;
+
+    assert_eq!(
+        zone_answer_for(&server, "web.min.internal").await,
+        None,
+        "a box with no handed address answers NXDOMAIN, not a default address"
+    );
+    let registry = server.state.sessions_manager().await.hostnames();
+    let routes = registry.read().expect("registry lock");
+    assert_eq!(
+        routes.resolve("web.min.internal"),
+        None,
+        "and nothing routes to it: the daemon published nothing on its own"
+    );
+    assert_eq!(
+        routes.published_own_address(id),
+        None,
+        "no publish was recorded for the box either"
     );
 }
 
 /// NET-010, runtime half: two own-address boxes that declare the *same* port
-/// each get a host loopback address of their own, granted from the answerer's
-/// record for the reserved local range, so both publish — at their own
-/// addresses, at their own port numbers, never translated — where one loopback
-/// address would have made the second box's port a collision. NET-129's
-/// sub-requirement (report, don't translate) covers the boxes that *do* share
-/// an address; this is the case the shared-address mode exists to avoid.
+/// are each handed a host loopback address of their own — the registration's
+/// rows hand from the reserved local range, one per box — so both publish, at
+/// their own addresses and their own port numbers, never translated, where
+/// one loopback address would have made the second box's port a collision.
+/// NET-129's sub-requirement (report, don't translate) covers the boxes that
+/// *do* share an address; this is the case the shared-address mode exists to
+/// avoid.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_box_gets_own_loopback_address() {
+    let alpha_handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
+    let beta_handed = std::net::Ipv4Addr::new(127, 0, 64, 10);
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let _alpha = finalize_own_ip_session(&mut client, "alpha").await;
-    let _beta = finalize_own_ip_session(&mut client, "beta").await;
+    let _alpha = finalize_handed_own_ip_session(
+        &mut client,
+        "alpha",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        alpha_handed,
+    )
+    .await;
+    let _beta = finalize_handed_own_ip_session(
+        &mut client,
+        "beta",
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+        beta_handed,
+    )
+    .await;
 
     let (_, alpha_address) = zone_answer_for(&server, "alpha.min.internal")
         .await
@@ -2855,22 +2963,24 @@ async fn each_box_gets_own_loopback_address() {
 /// NET-010's cross-record collision report, at the moment the design puts it
 /// (design §7.1: cross-node collisions are reported at session start, like a
 /// port collision). The daemon's own start takes the same report once, over
-/// whatever was live before it came up; this is the half that catches a grant
-/// a second state root's daemon made **after** this one booted, which no
-/// report this daemon ran at its start can ever see again. The stand-in for
-/// that second root's publish is a live listener at an address this daemon's
-/// record never names — the shape no `EADDRINUSE` ever reports, because the
-/// collision is on the address, not a port — bound here *after* the daemon
-/// has started, so the report that names it below can only be the session's.
+/// whatever was live before it came up; this is the half that catches a
+/// publish a second state root's daemon made **after** this one booted, which
+/// no report this daemon ran at its start can ever see again. The stand-in
+/// for that second root's publish is a live listener at an address this
+/// daemon's record never names — the shape no `EADDRINUSE` ever reports,
+/// because the collision is on the address, not a port — bound here *after*
+/// the daemon has started, so the report that names it below can only be the
+/// session's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_start_reports_a_publish_no_grant_names() {
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
     let capture = crate::test_harness::captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
 
-    // The pool's last address: grantable, so nothing rules it out on shape,
-    // and not one this daemon's empty record has named — a second root's
-    // grant, as the kernel's socket table sees it.
+    // The range's last address: inside the reserved slice, so nothing rules
+    // it out on shape, and not one this daemon's empty record has named — a
+    // second root's publish, as the kernel's socket table sees it.
     let foreign = sessions::core::loopback::POOL_LAST;
     let _listener = std::net::TcpListener::bind((foreign, 0))
         .unwrap_or_else(|error| panic!("the unrecorded address binds: {error}"));
@@ -2879,25 +2989,30 @@ async fn a_session_start_reports_a_publish_no_grant_names() {
     // the address in what follows is the session-start report's — the
     // daemon-start report ran at `TestServer::new`, before the bind.
     let before_finalize = capture.contents().len();
-    let _web = finalize_own_ip_session(&mut client, "web").await;
+    let _web = finalize_handed_own_ip_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        handed,
+    )
+    .await;
     let logged = &capture.contents()[before_finalize..];
     assert!(
         logged.lines().any(|line| {
             line.contains("loopback-publish-collision") && line.contains(&format!("ip={foreign}"))
         }),
-        "a session start must report the live publish no grant names: {logged}"
+        "a session start must report the live publish no record names: {logged}"
     );
 
     // And the box itself is untouched by the report: it is advisory, so the
-    // box published at the address its own grant gave it, as though the
-    // other root were not there.
+    // box published at the address its hand named, as though the other root
+    // were not there.
     let (_, address) = zone_answer_for(&server, "web.min.internal")
         .await
         .expect("the box's name answers at its own address");
     assert_eq!(
-        address,
-        sessions::core::loopback::POOL_FIRST,
-        "the collision report costs the box nothing: its own grant stands"
+        address, handed,
+        "the collision report costs the box nothing: its hand stands"
     );
 }
 
@@ -2909,9 +3024,16 @@ async fn a_session_start_reports_a_publish_no_grant_names() {
 /// proxy are told one and the same place.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn name_answers_without_attached_client() {
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let _id = finalize_own_ip_session(&mut client, "web").await;
+    let _id = finalize_handed_own_ip_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        handed,
+    )
+    .await;
 
     // No attach: the zone answers A, not NODATA and not NXDOMAIN.
     let (_, address) = zone_answer_for(&server, "web.min.internal")
@@ -2937,18 +3059,29 @@ async fn name_answers_without_attached_client() {
 
 /// NET-012: destroying the box is what ends the name. Every later lookup
 /// answers NXDOMAIN — held while the box existed (NET-013), absent the moment
-/// it is destroyed — and the address it held returns to the answerer's record
-/// with the release line the observability contract asks for, so the next box
-/// may publish on it (NET-010).
+/// it is destroyed — and the publish goes with the name: the address was the
+/// host-side creator's to take back, not this daemon's pool to release
+/// (NET-010), so destroy withdraws the registry's record of it and nothing
+/// answers at it again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn destroyed_box_name_is_nxdomain() {
-    let capture = crate::test_harness::captured_log();
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let id = finalize_own_ip_session(&mut client, "web").await;
+    let id = finalize_handed_own_ip_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        handed,
+    )
+    .await;
     let (_, address) = zone_answer_for(&server, "web.min.internal")
         .await
         .expect("the name answers while the box lives");
+    assert_eq!(
+        address, handed,
+        "the box's name answers at the hand while it lives"
+    );
 
     use minimald_rpc::{DestroySession, DestroySessionRequest, Errorable};
     match client
@@ -2966,83 +3099,83 @@ async fn destroyed_box_name_is_nxdomain() {
         "a destroyed box's name must answer NXDOMAIN"
     );
     let registry = server.state.sessions_manager().await.hostnames();
+    let routes = registry.read().expect("registry lock");
     assert_eq!(
-        registry
-            .read()
-            .expect("registry lock")
-            .resolve("web.min.internal"),
+        routes.resolve("web.min.internal"),
         None,
         "and nothing routes to a destroyed box"
     );
-
-    // The release is said out loud, naming the box and the address it held.
-    let logged = capture.contents();
-    let release_line = logged
-        .lines()
-        .find(|line| line.contains("loopback-release") && line.contains("session_name=\"web\""))
-        .unwrap_or_else(|| panic!("the release must be logged, got: {logged}"));
-    assert!(
-        release_line.contains(&format!("ip={address}")),
-        "the release line names the address it returned to the slice, got: {release_line}"
+    assert_eq!(
+        routes.published_own_address(id),
+        None,
+        "the publish is withdrawn with the name: no later session, and no \
+         later name, answers at the destroyed box's address"
     );
 }
 
-/// NET-010's durability half (design §7.1): the grant is the answerer's
-/// record, not the daemon's memory, so a daemon that restarts re-derives its
-/// live boxes' grants from the record rather than starting from an empty
-/// table. The restarted daemon below adopts nothing by itself — a box's
-/// resumed session asks again the moment its actor comes up, and the record
-/// answers with the address it already holds, so the box's name answers at
-/// the same address from before the restart to long after it, from finalize
-/// to destroy (NET-011), with no client ever attached (NET-013).
+/// NET-010's durability half (design §7.1): the hand is the record's row,
+/// not the daemon's memory — a creator wrote the box's addresses into the
+/// session's record at create, and the registry's publish is derived from
+/// it — so a daemon that restarts re-derives its live boxes' published
+/// addresses from the record rather than starting from an empty table. The
+/// restarted daemon below adopts nothing by itself: a box's resumed session
+/// asks again the moment its actor comes up, and the record answers with
+/// the address it already holds, so the box's name answers at the same
+/// address from before the restart to long after it, from finalize to
+/// destroy (NET-011), with no client ever attached (NET-013).
 ///
 /// The restart below is a real one: `shutdown(true)` **stops** both boxes —
 /// the manager's shutdown path, which is a stop and not a delete — before
-/// the first server is torn down. A stop keeps the grant (NET-013: the
+/// the first server is torn down. A stop keeps the record (NET-013: the
 /// address is the box's own from finalize to destroy, and a stopped box
 /// that resumes must find it where it left it), so the record the second
-/// daemon reads still names both addresses. Resuming the **second** box
+/// daemon reads still names both boxes' hands. Resuming the **second** box
 /// first is the check that keeps this from being vacuous: if the stop had
-/// released its grant, the fresh record would have handed the resumed box
-/// the lowest free address — the first box's `.2` — and only the recorded
-/// `.3` it kept proves the grant survived the stop and the restart.
+/// dropped its row, the resumed box would have nothing to publish at, and
+/// only the recorded address it kept proves the row survived the stop and
+/// the restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_daemon_re_derives_the_box_s_address_from_the_answerer() {
     use minimald_rpc::{SessionDelta, SessionDeltaRequest};
 
+    let alpha_handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
+    let beta_handed = std::net::Ipv4Addr::new(127, 0, 64, 10);
     let capture = crate::test_harness::captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let alpha = finalize_own_ip_session(&mut client, "alpha").await;
-    let beta = finalize_own_ip_session(&mut client, "beta").await;
+    let alpha = finalize_handed_own_ip_session(
+        &mut client,
+        "alpha",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        alpha_handed,
+    )
+    .await;
+    let beta = finalize_handed_own_ip_session(
+        &mut client,
+        "beta",
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+        beta_handed,
+    )
+    .await;
     let (_, alpha_address) = zone_answer_for(&server, "alpha.min.internal")
         .await
         .expect("alpha's name answers at the first daemon");
     let (_, beta_address) = zone_answer_for(&server, "beta.min.internal")
         .await
         .expect("beta's name answers at the first daemon");
-    let pool_second = {
-        // The address the allocator hands the second of two fresh boxes:
-        // one octet above the pool's first, well short of the pool's last.
-        let [a, b, c, d] = sessions::core::loopback::POOL_FIRST.octets();
-        std::net::Ipv4Addr::new(a, b, c, d + 1)
-    };
     assert_eq!(
-        alpha_address,
-        sessions::core::loopback::POOL_FIRST,
-        "a fresh host's first grant is the pool's lowest address"
+        alpha_address, alpha_handed,
+        "the first box publishes at the address it was handed"
     );
     assert_eq!(
-        beta_address, pool_second,
-        "the second box's grant is the next one up, so keeping it and not \
-         being re-granted the first is a difference this test can see"
+        beta_address, beta_handed,
+        "the second box publishes at its own hand, not the first box's"
     );
 
     // "Restart the daemon": stop every session the way a daemon that is
-    // going down stops them — grants kept, records kept; a stop is not a
-    // destroy — then tear the first server down and boot a second one on
-    // the same state root, the one record every daemon on this host grants
-    // through.
+    // going down stops them — records kept, publishes kept; a stop is not
+    // a destroy — then tear the first server down and boot a second one on
+    // the same state root, whose record still carries every box's hand.
     server
         .state
         .sessions_manager()
@@ -3053,9 +3186,8 @@ async fn a_restarted_daemon_re_derives_the_box_s_address_from_the_answerer() {
     let stopped = capture.contents();
     // Scoped by session name, not by word alone: the capture buffer is
     // process-wide and under libtest (`just test-cross`, minimald's macOS
-    // coverage) every test in the binary shares it, so an assertion that *no*
-    // line says `loopback-release` would fail on another test's destroy —
-    // `destroyed_box_name_is_nxdomain` releases on purpose. What this check
+    // coverage) every test in the binary shares it, so a scoped assertion is
+    // the honest form even when no other test here releases. What this check
     // owns is these two boxes: neither alpha nor beta may be released by a
     // stop.
     assert!(
@@ -3080,8 +3212,8 @@ async fn a_restarted_daemon_re_derives_the_box_s_address_from_the_answerer() {
         .await;
 
     // Beta answers at the address the record already held it — the
-    // re-derivation, not the fresh grant a record emptied by the stop
-    // would have made, which is the first box's `.2`.
+    // re-derivation, and a stop that had dropped the row would have left
+    // the name absent instead, which is a difference this test can see.
     let (owner, resumed_beta) = zone_answer_for(&server, "beta.min.internal")
         .await
         .expect("beta's name answers after the restart");
@@ -3109,7 +3241,7 @@ async fn a_restarted_daemon_re_derives_the_box_s_address_from_the_answerer() {
         .expect("alpha's name answers after the restart");
     assert_eq!(
         resumed_alpha, alpha_address,
-        "the first box's grant survived the stop and the restart too"
+        "the first box's recorded address survived the stop and the restart too"
     );
 
     let registry = server.state.sessions_manager().await.hostnames();
@@ -3133,11 +3265,12 @@ async fn a_restarted_daemon_re_derives_the_box_s_address_from_the_answerer() {
 /// it: the book opens **pending** and the walk lands when it lands. A daemon
 /// restarted with a live own-address box is therefore serving the RPC that
 /// brings the box's actor up — an attach right after `min up` — before its own
-/// verdict has, and that actor's ask is the resumed box's. The ask must be
-/// answered with the address the record already names: telling it the range is
-/// absent would publish the box on the node's shared `127.0.0.1` and leave its
-/// recorded line spent until a rename or a re-finalize asked again, so the
-/// box's name would answer somewhere else from finalize to destroy.
+/// verdict has, and that actor's registration is the resumed box's. The
+/// publish must come from the record's hand, the address the record already
+/// names: answering the ask with "the range is unproven" would leave the box
+/// published nowhere and its name absent until a rename or a re-finalize
+/// asked again, so the box's name would answer nowhere from finalize to
+/// destroy.
 ///
 /// The window is held here by hand: the harness daemon is a native one, whose
 /// own loopback *is* its publish surface, so it reads the probe's answer
@@ -3148,16 +3281,22 @@ async fn a_restarted_daemon_re_derives_the_box_s_address_from_the_answerer() {
 async fn a_resumed_box_answers_at_its_own_address_while_the_verdict_is_pending() {
     use minimald_rpc::{SessionDelta, SessionDeltaRequest};
 
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
     let server = TestServer::new().await;
     let mut client = server.connect().await;
-    let web = finalize_own_ip_session(&mut client, "web").await;
+    let web = finalize_handed_own_ip_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        handed,
+    )
+    .await;
     let (_, address) = zone_answer_for(&server, "web.min.internal")
         .await
         .expect("the box's name answers at the first daemon");
     assert_eq!(
-        address,
-        sessions::core::loopback::POOL_FIRST,
-        "a fresh host's first grant is the pool's lowest address"
+        address, handed,
+        "the box publishes at the address it was handed"
     );
 
     // "Restart the daemon" — the same shape the restart test above drives: a
@@ -3204,15 +3343,15 @@ async fn a_resumed_box_answers_at_its_own_address_while_the_verdict_is_pending()
         "the pending window must not publish the box on the node's shared address"
     );
 
-    // And the publish is the box's own, not the interim: the registry the
-    // restarted daemon built holds the recorded address, so a connection to
+    // And the publish is the box's own, not the node's: the registry the
+    // restarted daemon built holds the recorded hand, so a connection to
     // the box's declared port is forwarded to it and not to the node.
     let registry = server.state.sessions_manager().await.hostnames();
     let routes = registry.read().expect("registry lock");
     assert_eq!(
         routes.published_own_address(web),
         Some(address),
-        "the resumed box's publish is at its own address, not the interim"
+        "the resumed box's publish is at its own address, not the node's"
     );
     assert_eq!(
         routes
@@ -3227,30 +3366,38 @@ async fn a_resumed_box_answers_at_its_own_address_while_the_verdict_is_pending()
     );
 }
 
-/// NET-129 session path: two own-address boxes finalizing while the daemon's
-/// range verdict is held pending both publish on the node's shared address.
-/// Declaring the same port, the collision is reported as a
-/// `shared-address-port-collision` warn (the diagnostics contract) and the
-/// registry records the shared-address interim publishes so listings can see
-/// the collision. The ports are never translated. This uses the manager's
-/// `hold_range_verdict_pending` test seam, which is the supported way to put a
-/// native daemon's book into the pending state a microVM daemon opens in.
+/// NET-129 session path: two own-address boxes whose creators hand them the
+/// *same* address — the shared-address mode — and that declare the same port.
+/// The collision is intrinsic to the mode (the boxes were told to publish at
+/// one place), so it is reported as a `shared-address-port-collision` warn at
+/// the second finalize (the diagnostics contract) and never fixed by
+/// translating a port. Both publishes stand: each box's record names the
+/// address, each name answers at it, and the report is the operator's, not
+/// the registry's, to act on.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shared_address_port_collision_reported_at_finalize_without_attached_client() {
+    let shared = std::net::Ipv4Addr::new(127, 0, 64, 9);
     let server = TestServer::new().await;
-    server
-        .state
-        .sessions_manager()
-        .await
-        .hold_range_verdict_pending();
     let capture = crate::test_harness::captured_log();
     let mut client = server.connect().await;
 
-    let first = finalize_own_ip_session(&mut client, "first").await;
-    let second = finalize_own_ip_session(&mut client, "second").await;
+    let first = finalize_handed_own_ip_session(
+        &mut client,
+        "first",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        shared,
+    )
+    .await;
+    let second = finalize_handed_own_ip_session(
+        &mut client,
+        "second",
+        std::net::Ipv4Addr::new(100, 64, 128, 10),
+        shared,
+    )
+    .await;
 
-    // Both names answer at the node's shared address while no client is attached.
+    // Both names answer at the one shared address while no client is attached.
     let (_, first_address) = zone_answer_for(&server, "first.min.internal")
         .await
         .expect("first's name answers on the shared address");
@@ -3259,25 +3406,27 @@ async fn shared_address_port_collision_reported_at_finalize_without_attached_cli
         .expect("second's name answers on the shared address");
     assert_eq!(
         first_address, second_address,
-        "both interim boxes publish at the node's shared address"
+        "both shared-address boxes publish at the address they were handed"
     );
     assert_eq!(
-        first_address,
-        std::net::Ipv4Addr::LOCALHOST,
-        "a native node's interim address is host loopback"
+        first_address, shared,
+        "the shared address is the hand, exactly"
     );
 
-    // No own-address publish is recorded: the boxes are on the interim, not
-    // holding a grant, so neither published_own_address returns anything.
+    // Both publishes are recorded as the boxes' own: a shared hand is still
+    // each box's hand, and neither publish is dropped for the collision's
+    // sake — the report is advisory, the registry keeps what it was told.
     let registry = server.state.sessions_manager().await.hostnames();
     let routes = registry.read().expect("registry lock");
-    assert!(
-        routes.published_own_address(first).is_none(),
-        "a shared-address box does not record the node address as its own"
+    assert_eq!(
+        routes.published_own_address(first),
+        Some(shared),
+        "a shared-address box records the handed address as its own"
     );
-    assert!(
-        routes.published_own_address(second).is_none(),
-        "the second shared-address box does not record the node address as its own"
+    assert_eq!(
+        routes.published_own_address(second),
+        Some(shared),
+        "the second shared-address box records the same hand"
     );
     assert_eq!(
         routes
