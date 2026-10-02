@@ -1290,6 +1290,33 @@ pub enum LoopbackGrant {
     RecordUnavailable,
 }
 
+#[cfg(target_os = "linux")]
+impl LoopbackGrant {
+    /// The address a box's declaration publishes at, given this ask's answer
+    /// (NET-123): the granted one where the answerer's record names or grants
+    /// it, and the `127.0.0.1` interim where the host's publish surface
+    /// cannot bind the range — the absent verdict's own arm, and the pending
+    /// window's, where nothing has vouched for an address of the range so
+    /// none is spent and the box publishes on the interim until the walk
+    /// lands and a rename or re-finalize asks again.
+    ///
+    /// `None` — publishing nothing, so the attach of a box that declared
+    /// ingress fails with "no published address handed" — for the two
+    /// answers that are faults rather than facts about the surface: a spent
+    /// pool and an unreadable record. Those are reported, never substituted:
+    /// standing a box at an address the answerer did not grant would be the
+    /// silent fallback NET-121 forbids, and the interim is not one — it is the
+    /// surface's own answer about what it can bind.
+    #[must_use]
+    pub fn publishable_address(self) -> Option<Ipv4Addr> {
+        match self {
+            LoopbackGrant::Granted(address) => Some(address),
+            LoopbackGrant::RangePending | LoopbackGrant::RangeAbsent => Some(Ipv4Addr::LOCALHOST),
+            LoopbackGrant::PoolSpent | LoopbackGrant::RecordUnavailable => None,
+        }
+    }
+}
+
 /// The verdict over the reserved local range on this host — NET-123's bind
 /// probe's answer, as it stands **right now**, which is why it is a state and
 /// not a fact. A daemon that can bind on its own publish surface has the
@@ -1502,6 +1529,31 @@ impl LoopbackLeaseBook {
     pub fn set_range_verdict(&self, verdict: RangeVerdict) {
         self.verdict
             .store(verdict.key(), std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether `address` may be published as a box's own under the verdict
+    /// this book holds (NET-123): the gate a handed address goes through
+    /// before it stands in for a lease.
+    ///
+    /// An address outside the reserved local range needs no vouching — the
+    /// hand that carried it chose it — while one from the range is
+    /// publishable only until the host's publish surface has *measured* the
+    /// range absent. The measurement is the one this book holds: the
+    /// daemon-start probe's on a native host, the forwarder-conducted walk's
+    /// on a microVM one. A verdict still pending does not withdraw it, because
+    /// a hand has a provenance of its own — the VM host daemon's table row,
+    /// keyed by the box's switch address, which a resumed box keeps its
+    /// address on inside the walk's window (NET-013) — while a landed absent
+    /// verdict is the surface's own answer over it: the VM host daemon hands
+    /// slice addresses of the range without measuring the host's loopback, so
+    /// a box that published its hand verbatim would bind its declared ports
+    /// at an address the surface cannot bind — `EADDRNOTAVAIL` at every bind
+    /// on a stock macOS host, exactly the refusal the verdict exists to keep
+    /// a box from publishing at. With the verdict against it the hand
+    /// publishes nothing and the box's ask falls through, to the interim.
+    #[must_use]
+    pub fn vouches_for(&self, address: Ipv4Addr) -> bool {
+        !in_reserved_local_range(address) || self.verdict() != RangeVerdict::Absent
     }
 
     /// Grants `namespace` an address from the host's pool, or answers with
@@ -3121,6 +3173,119 @@ mod tests {
         assert_eq!(
             restarted.grant(LeaseNamespace::Node),
             LoopbackGrant::RangeAbsent
+        );
+    }
+
+    /// The verdict gate a VM host daemon's hand goes through (NET-123): the
+    /// hand names a slice address of the reserved local range without
+    /// measuring the loopback it binds on, so the guest's verdict decides
+    /// whether it is publishable. A verdict still walking trusts the hand's
+    /// own provenance — the host-side table row a resumed box keeps its
+    /// address on inside the window (NET-013) — while a verdict that has
+    /// landed absent is the publish surface's own answer over it: an address
+    /// the surface cannot bind is not publishable, whatever handed it. An
+    /// address outside the range needs no vouching at all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_landed_absent_verdict_withdraws_the_vouching_a_handed_range_address_needs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        let handed = sessions::core::loopback::POOL_FIRST;
+
+        // A native daemon's book: its own loopback answered before it opened.
+        let present = lease_book(&state_root);
+        assert!(
+            present.vouches_for(handed),
+            "a present range vouches for the hand"
+        );
+
+        // A microVM daemon's book inside the walk's window: nothing has
+        // measured the surface yet, so the hand's provenance stands.
+        let pending = LoopbackLeaseBook::open(&state_root, RangeVerdict::Pending).unwrap();
+        assert!(
+            pending.vouches_for(handed),
+            "the pending window trusts the hand's provenance"
+        );
+
+        // The walk lands absent — the stock-macOS shape, where no alias of
+        // the range binds — and the same hand is no longer publishable: the
+        // box that publishes it verbatim would bind its declared ports at an
+        // address every bind refuses.
+        pending.set_range_verdict(RangeVerdict::Absent);
+        assert!(
+            !pending.vouches_for(handed),
+            "a landed absent verdict overrules the hand: the surface cannot bind it"
+        );
+
+        // An address outside the reserved range is not the surface's to
+        // vouch for: a hand that names the interim needs no verdict.
+        assert!(
+            pending.vouches_for(Ipv4Addr::LOCALHOST),
+            "an address outside the reserved range needs no vouching"
+        );
+    }
+
+    /// What each grant answer means for the box's publish (NET-123): the two
+    /// answers that are facts about the publish surface — the range absent,
+    /// the verdict still walking — publish the box on the `127.0.0.1`
+    /// interim, the one address a host can listen on whatever its loopback
+    /// carries, while the two that are faults — a spent pool, an unreadable
+    /// record — publish nothing, so the attach of a box that declared
+    /// ingress fails rather than standing it at an address nobody granted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_surface_withheld_grant_publishes_the_interim_and_a_fault_publishes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+
+        // The absent range: the ask is answered with the surface's verdict,
+        // and the publish a box makes of it is the interim.
+        let absent = LoopbackLeaseBook::open(&state_root, RangeVerdict::Absent).unwrap();
+        let withheld = absent.grant(LeaseNamespace::Box {
+            session: session_id(1),
+        });
+        assert_eq!(withheld, LoopbackGrant::RangeAbsent);
+        assert_eq!(
+            withheld.publishable_address(),
+            Some(Ipv4Addr::LOCALHOST),
+            "an absent range publishes the box on the interim"
+        );
+
+        // The pending window: the same interim, for the same reason —
+        // nothing has vouched for an address of the range, so none is spent.
+        let pending = LoopbackLeaseBook::open(&state_root, RangeVerdict::Pending).unwrap();
+        let walking = pending.grant(LeaseNamespace::Box {
+            session: session_id(2),
+        });
+        assert_eq!(walking, LoopbackGrant::RangePending);
+        assert_eq!(
+            walking.publishable_address(),
+            Some(Ipv4Addr::LOCALHOST),
+            "the pending window publishes the box on the interim"
+        );
+
+        // A grant publishes exactly what the record names.
+        let present = LoopbackLeaseBook::open(&state_root, RangeVerdict::Present).unwrap();
+        let granted = present.grant(LeaseNamespace::Box {
+            session: session_id(3),
+        });
+        assert_eq!(
+            granted.publishable_address(),
+            Some(sessions::core::loopback::POOL_FIRST),
+            "a granted address is the box's publish"
+        );
+
+        // The faults publish nothing: a spent pool, and a record the
+        // answerer cannot read or write.
+        assert_eq!(
+            LoopbackGrant::PoolSpent.publishable_address(),
+            None,
+            "a spent pool never stands the box at an address"
+        );
+        assert_eq!(
+            LoopbackGrant::RecordUnavailable.publishable_address(),
+            None,
+            "an unreadable record never stands the box at an address"
         );
     }
 

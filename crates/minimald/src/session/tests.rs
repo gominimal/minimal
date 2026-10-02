@@ -2867,10 +2867,12 @@ async fn name_registered_at_finalize() {
 /// answerer's authenticated channel, never a daemon's own choice): the name
 /// is held from finalize, at the granted address, the route and the zone
 /// answer name one address, and the publish is recorded for the attach path
-/// to bind its forwards at. The withheld-grant shape — spent pool, absent
-/// range, unreadable record — registers no name and fails the attach with
-/// "no published address handed"; that half is proved in the gvproxy
-/// network proofs.
+/// to bind its forwards at. The withheld-grant shapes a fault makes — a
+/// spent pool, an unreadable record — register no name and fail the attach
+/// with "no published address handed" (proved in the gvproxy network
+/// proofs); the shapes the host's publish surface makes — an absent range,
+/// a verdict still walking — publish the box on the `127.0.0.1` interim
+/// (NET-123), which the dns proofs pin beside the hand's verdict gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_box_nobody_handed_an_address_publishes_at_the_answerers_grant() {
     let capture = crate::test_harness::captured_log();

@@ -818,12 +818,16 @@ impl Session {
                 // lease record chooses it, and the release at destroy hands
                 // it back — and it is not a substitute either: it is asked
                 // before any forwarder binds, so the binds and the name
-                // answer at the one address it granted, or a grant withheld
-                // (spent pool, absent range, pending verdict, unreadable
-                // record) publishes nothing and registers no name, and the
-                // attach of a box that declared ingress fails with "no
-                // published address handed" rather than binding forwards at
-                // an address nobody granted.
+                // answer at the one address it granted. A grant withheld for
+                // a fault — a spent pool, an unreadable record — publishes
+                // nothing and registers no name, and the attach of a box
+                // that declared ingress fails with "no published address
+                // handed" rather than binding forwards at an address nobody
+                // granted; a grant withheld for the host's surface — an
+                // absent range, a verdict still walking — publishes the box
+                // on the `127.0.0.1` interim (NET-123), so the binds and
+                // the name answer at the one address the host can listen
+                // on.
                 //
                 // The address is asked for **before** the registry's write
                 // lock, and never underneath it: the ask is a synchronous
@@ -849,6 +853,19 @@ impl Session {
                 // `local`. It is never drawn from the pool: the host-side
                 // table's row owns it, so neither the grant's info line nor
                 // the release at destroy runs for a handed box.
+                //
+                // The hand still goes through the verdict the host's publish
+                // surface holds (NET-123): the VM host daemon hands slice
+                // addresses without measuring the loopback they bind on, and
+                // on a host whose surface cannot bind the range the hand
+                // names an address no bind will ever hold. [`vouches_for`]
+                // is the gate — a pending verdict trusts the hand's own
+                // provenance (the host-side row, which a resumed box keeps
+                // its address on inside the walk's window, NET-013), a
+                // landed absent one overrules it — so an unvouched hand
+                // publishes nothing and the ask below answers the box with
+                // the interim rather than binding forwards at an address the
+                // surface refuses.
                 let already_published = {
                     let reg = self
                         .hostnames
@@ -858,7 +875,8 @@ impl Session {
                 };
                 let handed = record
                     .box_addresses
-                    .map(|addresses| addresses.loopback_address);
+                    .map(|addresses| addresses.loopback_address)
+                    .filter(|address| self.loopback.vouches_for(*address));
                 let published = already_published
                     .or(handed)
                     .or_else(|| self.lease_loopback_address(record, &name));
@@ -937,21 +955,27 @@ impl Session {
     /// record is the host-global allocation NET-010 binds, the one
     /// authenticated channel every daemon on the host asks through.
     ///
-    /// `None` — with the warn line that says why — when the host's pool is
-    /// spent or the answerer cannot answer (an absent range, a pending
-    /// verdict inside the deferred walk's window, an unreadable record):
-    /// the box then publishes nothing and registers no name, and the attach
-    /// of a box that declared ingress fails with "no published address
-    /// handed" rather than binding forwards at an address nobody granted —
-    /// reported, never substituted. A grant the box already holds — a
-    /// resumed session asking again after a restart — answers with the
-    /// recorded address, which is how a box's address stays stable across a
-    /// daemon restart, whether or not the restarted daemon's range verdict
-    /// has landed yet (NET-013).
+    /// `None` — with the warn line that says why — for the two answers that
+    /// are faults rather than facts about the host's surface: a spent pool
+    /// and an unreadable record. The box then publishes nothing and registers
+    /// no name, and the attach of a box that declared ingress fails with
+    /// "no published address handed" rather than binding forwards at an
+    /// address nobody granted — reported, never substituted.
+    ///
+    /// The two answers that are facts about the surface — the range absent,
+    /// the verdict still walking its deferred window — publish the box on the
+    /// `127.0.0.1` interim (NET-123's absent arm): the host can listen there
+    /// whatever its `lo0` carries, so the box's declared ports are published
+    /// and reachable instead of failing at an address the surface cannot
+    /// bind. A grant the box already holds — a resumed session asking again
+    /// after a restart — answers with the recorded address, which is how a
+    /// box's address stays stable across a daemon restart, whether or not the
+    /// restarted daemon's range verdict has landed yet (NET-013).
     #[cfg(target_os = "linux")]
     fn lease_loopback_address(&self, record: &Record, name: &str) -> Option<std::net::Ipv4Addr> {
         let namespace = crate::net::dns::LeaseNamespace::Box { session: record.id };
-        match self.loopback.grant(namespace) {
+        let granted = self.loopback.grant(namespace);
+        match granted {
             crate::net::dns::LoopbackGrant::Granted(address) => {
                 tracing::info!(
                     session_id = %record.id,
@@ -960,7 +984,6 @@ impl Session {
                     action = "loopback-lease",
                     "leased a host loopback address for the box's published ports"
                 );
-                Some(address)
             }
             crate::net::dns::LoopbackGrant::PoolSpent => {
                 tracing::warn!(
@@ -970,7 +993,6 @@ impl Session {
                     "the host's reserved local range is spent; the box's \
                      declared ingress has no address to publish at"
                 );
-                None
             }
             crate::net::dns::LoopbackGrant::RangePending => {
                 tracing::warn!(
@@ -978,20 +1000,19 @@ impl Session {
                     session_name = name,
                     action = "loopback-range-pending",
                     "the verdict over the reserved local range is still pending; \
-                     the box's declared ingress has no address to publish at \
+                     the box's declared ingress publishes on the 127.0.0.1 interim \
                      until the publish-surface walk lands"
                 );
-                None
             }
             crate::net::dns::LoopbackGrant::RangeAbsent => {
                 tracing::warn!(
                     session_id = %record.id,
                     session_name = name,
                     action = "loopback-range-absent",
-                    "the reserved local range is absent on this host; \
-                     the box's declared ingress has no address to publish at"
+                    "the reserved local range is absent on this host's publish \
+                     surface; the box's declared ingress publishes on the \
+                     127.0.0.1 interim"
                 );
-                None
             }
             crate::net::dns::LoopbackGrant::RecordUnavailable => {
                 tracing::warn!(
@@ -1001,9 +1022,9 @@ impl Session {
                     "the answerer's lease record could not be read or written; \
                      the box's declared ingress has no address to publish at"
                 );
-                None
             }
         }
+        granted.publishable_address()
     }
 
     /// Returns a destroyed box's host loopback address to the host's pool
