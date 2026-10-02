@@ -4115,8 +4115,21 @@ proof_native_resolution_from_host_answerer_on_vm_host() {
   fi
 
   # Warm the lane: `min ls` is the call that autospawns the VM host daemon —
-  # the answerer serves beside it — and boots the guest behind it.
-  if ! mnl ls >/dev/null 2>&1; then
+  # the answerer serves beside it — and boots the guest behind it. The
+  # answerer's start record is INFO, and a daemon's filter comes from RUST_LOG
+  # at autospawn (it inherits the CLI's env), while this harness quiets the
+  # whole run to `warn` for output parsing — which drops the record before it
+  # reaches any sink, and a daemon an earlier case left up was spawned under
+  # that quiet filter and never wrote one: the Linux KVM lane passed this case
+  # only by reading the record its install proofs' `minvmd=info` spawns had
+  # left behind in the shared log dir, and the macOS lane runs no install
+  # proof, so nothing had. Take the VM down first — on a VM target that is the
+  # daemon itself (the restart proof pins sessions survive it) — and let the
+  # ONE command that autospawns carry `minvmd` at info: command-local, never
+  # an export, and `minvmd` is the daemon's crate, so the CLI's own stdout
+  # stays quiet.
+  mnl stop --force >/dev/null 2>&1 || true # a standalone run has no daemon yet
+  if ! RUST_LOG="warn,minvmd=info" mnl ls >/dev/null 2>&1; then
     echo "::error::'min ls' could not bring this VM lane's daemon up (the host answerer serves beside it)"
     fail
   fi
@@ -4134,9 +4147,15 @@ proof_native_resolution_from_host_answerer_on_vm_host() {
   # The VM host daemon's own log candidates, newest first: the answerer is a
   # host process, so its start record sits beside the daemon's in minvmd's
   # file log; the detached supervisor's run.log is the fallback (the fsr
-  # case's candidate list).
+  # case's candidate list). No `-maxdepth` on the find: BSD find (the macOS
+  # lane) rejects it as an unknown primary, and with that error swallowed
+  # the candidate list would read only run.log — which carries no tracing
+  # records — and the case would fail as though the daemon had said nothing.
+  # The logs dir is flat (dated files, pruned in place), so the recursion
+  # costs nothing; the plain find is the same idiom `recover_minvmd_log`
+  # below already runs on this lane.
   host_answerer_log_candidates() {
-    find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null | sort -r
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log*' -type f 2>/dev/null | sort -r
     printf '%s\n' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/run.log"
   }
 
