@@ -2085,6 +2085,49 @@ async fn ls_leashes_the_vms_it_did_not_select() {
     );
 }
 
+/// The stopped-VM half of [`ls_leashes_the_vms_it_did_not_select`] on its own,
+/// under the bound that proves the ask: with no wedged VM in the picture, a
+/// stopped VM's stale `ssh.sock` is ECONNREFUSED on one probe attempt —
+/// "not running" ([`client::ProbeRefusal::NotRunning`]), no ~2 s connect
+/// retry, no warning — so a listing that passes it costs the VMs that are
+/// up, not the stopped ones' retry windows. The wedged test's 8 s bound is
+/// for the wedge's leash and cannot tell a 2 s retry from none; this one
+/// can. Mirrors `a_stopped_vm_does_not_hold_a_box_name_resolution`, the
+/// resolution path's own proof of the same treatment.
+#[tokio::test]
+async fn a_stopped_vm_does_not_hold_a_listing() {
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    let provider = state.path().join("providers/local-minvmd0");
+    std::fs::create_dir_all(provider.join("beta")).expect("the stopped VM's dir");
+
+    // The selected VM, running, with its box.
+    let default_sock =
+        client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
+            .expect("the default VM's socket path");
+    let default_vm = minimald::test_harness::TestServer::new().await;
+    default_vm.listen_on_uds(&default_sock).await;
+    create_box_on(&default_vm, "api").await;
+
+    // The stopped VM: the listener died and left its socket path behind.
+    let stale = std::os::unix::net::UnixListener::bind(provider.join("beta/ssh.sock"))
+        .expect("the stopped VM's socket path binds");
+    drop(stale);
+
+    let started = std::time::Instant::now();
+    let listings = cmd::ls_listings(&vm_globals(state.path(), None))
+        .await
+        .expect("listing past a stopped VM succeeds");
+    let elapsed = started.elapsed();
+    assert_eq!(listings.len(), 1, "only the running VM lists");
+    assert_eq!(listings[0].vm, "default");
+    assert_eq!(listed_names(&listings[0]), ["api"]);
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "a stopped VM's stale socket must not charge the listing its \
+         connect-retry window ({elapsed:?})"
+    );
+}
+
 /// NET-058: a box name resolves to the VM that owns it with no global flag —
 /// across every VM's socket, since the selected VM's daemon has just said it
 /// does not know the name. The resolution covers the selected VM too (a
