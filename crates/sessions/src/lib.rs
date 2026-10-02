@@ -81,6 +81,10 @@ pub struct PortMapping {
 /// The hostnames NET-068's integration test exercises. Kept in `sessions` so
 /// the `minimald` unit fixture and the `minvmd` integration test share one
 /// list and cannot drift.
+///
+/// Docker Hub serves image blobs through a 307 redirect that lands on either
+/// of its CDNs, `production.cloudflare.docker.com` or
+/// `production.cloudfront.docker.com`, so a container pull needs both.
 #[doc(hidden)]
 pub const NET068_TOOLCHAIN_EGRESS_HOSTS: &[&str] = &[
     "github.com",
@@ -92,6 +96,7 @@ pub const NET068_TOOLCHAIN_EGRESS_HOSTS: &[&str] = &[
     "registry-1.docker.io",
     "auth.docker.io",
     "production.cloudflare.docker.com",
+    "production.cloudfront.docker.com",
 ];
 
 /// Effective egress policy for a session.

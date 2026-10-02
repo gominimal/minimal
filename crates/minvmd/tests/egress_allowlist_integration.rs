@@ -206,7 +206,9 @@ impl Guest {
         let deadline = Instant::now() + RUNNING_TIMEOUT;
         loop {
             let status = json(&minvmd(guest._state.path(), &["status", "--json"]));
-            if status["state"] == "running" && status["vmm_pid"].is_number() {
+            if status.get("state").is_some_and(|s| s == "running")
+                && status.get("vmm_pid").is_some_and(|p| p.is_number())
+            {
                 break;
             }
             assert!(

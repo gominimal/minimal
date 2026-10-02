@@ -1222,6 +1222,10 @@ pub(crate) mod tests {
                 "production.cloudflare.docker.com.",
                 Ipv4Addr::new(104, 16, 124, 175),
             ),
+            (
+                "production.cloudfront.docker.com.",
+                Ipv4Addr::new(18, 238, 238, 89),
+            ),
         ];
         for (index, (name, address)) in toolchain.iter().enumerate() {
             // A unique source port per name so the DNS conntrack windows do not collide.
