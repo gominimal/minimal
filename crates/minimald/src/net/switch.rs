@@ -2044,9 +2044,13 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
 fn tcp_checksum(segment: &[u8], src: Ipv4Addr, dst: Ipv4Addr) -> u16 {
     let mut sum = ones_sum(src.octets().as_slice());
     sum += ones_sum(dst.octets().as_slice());
-    // The pseudo-header's remaining words: the zero byte, the protocol number,
-    // and the TCP length.
-    sum += u32::from(IPPROTO_TCP) << 8;
+    // The pseudo-header's remaining words: the `[zero][protocol]` word and
+    // the TCP length. The word is big-endian `[0x00][0x06]` (RFC 793 §3.1),
+    // so the protocol contributes *itself*, unshifted — parking it in the
+    // zero byte's place yields a checksum no TCP stack verifies, and every
+    // reset this module builds would be dropped where it is meant to end a
+    // connection.
+    sum += u32::from(IPPROTO_TCP);
     sum += u32::from(u16::try_from(segment.len()).unwrap_or(u16::MAX));
     sum += ones_sum(segment);
     ones_complement(sum)
@@ -3172,6 +3176,66 @@ pub(crate) mod tests {
         }
     }
 
+    /// Verifies `frame`'s TCP checksum the way the receiving kernel does —
+    /// the wire's own test, not the builder's arithmetic recomputed: the
+    /// pseudo-header assembled *as bytes* (source, destination,
+    /// `[zero][protocol]`, the big-endian TCP length; RFC 793 §3.1) summed
+    /// with the segment's own bytes, checksum field left in place, must fold
+    /// to `0xffff` (RFC 1071).
+    ///
+    /// Deliberately independent of [`tcp_checksum`]: a check that recomputes
+    /// with the builder's own function inherits whatever byte-order mistake
+    /// the builder made, so a wrong pseudo-header passes. Here the byte
+    /// order is an explicit construction the reader can hold against the
+    /// RFC's layout.
+    pub(crate) fn assert_tcp_checksum_verifies_on_the_wire(frame: &[u8]) {
+        assert_eq!(frame.len(), 14 + 20 + 20, "an Ethernet + IPv4 + TCP frame");
+        let mut summed: Vec<u8> = Vec::with_capacity(12 + 20);
+        summed.extend_from_slice(&frame[26..30]); // source
+        summed.extend_from_slice(&frame[30..34]); // destination
+        summed.push(0); // the pseudo-header's reserved byte
+        summed.push(frame[23]); // the transport — TCP
+        summed.extend_from_slice(&20u16.to_be_bytes()); // the TCP length
+        summed.extend_from_slice(&frame[34..54]); // the segment, checksum in place
+        let mut sum: u32 = 0;
+        for word in summed.chunks_exact(2) {
+            sum += u32::from(u16::from_be_bytes([word[0], word[1]]));
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        assert_eq!(
+            sum, 0xffff,
+            "the checksum folds to 0xffff on the wire — one a receiving kernel \
+             verifies, not a reset the peer silently drops: frame {frame:02x?}"
+        );
+    }
+
+    /// [`tcp_checksum`] matches the wire definition on a fixed vector: the
+    /// reset the NET-014 proof's refusal carries — `100.64.0.9:9999 →
+    /// 100.64.0.5:40000`, sequence zero, acknowledging a bare SYN (its
+    /// sequence plus the SYN flag's weight), data offset `0x50`, RST|ACK —
+    /// has checksum `0x23f2` under the RFC's own pseudo-header. The value
+    /// is computed off-tree, from a textbook RFC 1071 sum over RFC 793
+    /// §3.1's pseudo-header bytes: it pins the word's byte order in a way a
+    /// self-recomputed expectation cannot, because a builder that parks the
+    /// protocol in the zero byte's place recomputes its own mistake.
+    #[test]
+    fn tcp_checksum_matches_the_wire_definition() {
+        let mut segment = [0u8; 20];
+        segment[0..2].copy_from_slice(&9999u16.to_be_bytes());
+        segment[2..4].copy_from_slice(&40000u16.to_be_bytes());
+        segment[4..8].copy_from_slice(&0u32.to_be_bytes()); // sequence zero
+        segment[8..12].copy_from_slice(&1u32.to_be_bytes()); // ack: SYN + its weight
+        segment[12] = 0x50; // data offset 5
+        segment[13] = 0x14; // RST|ACK
+        assert_eq!(
+            tcp_checksum(&segment, LEASE, PEER),
+            0x23f2,
+            "the wire's checksum for this reset, per RFC 793's pseudo-header"
+        );
+    }
+
     /// Asserts `reset` is the reset that refuses `syn`: the Ethernet
     /// addresses swapped, the IPv4 and TCP tuples swapped (the box's address
     /// as the source), RST|ACK set, sequence zero, and the acknowledgement
@@ -3216,19 +3280,11 @@ pub(crate) mod tests {
         );
         assert_eq!(reset[46], 0x50, "TCP data offset 5");
         assert_eq!(reset[47], 0x14, "RST|ACK: a refusal, not an acceptance");
-        // The checksum, recomputed the way its writer computed it — over the
-        // header with the checksum field zeroed: the honest one the box's
-        // kernel verifies. (Summing the wire bytes with the field left in
-        // yields the complement's 0xFFFF, whose complement is zero.)
-        let mut segment = [0u8; 20];
-        segment.copy_from_slice(&reset[34..54]);
-        segment[16..18].fill(0);
-        let checksum = tcp_checksum(&segment, LEASE, PEER);
-        assert_eq!(
-            u16::from_be_bytes([reset[50], reset[51]]),
-            checksum,
-            "the checksum is one the box's kernel verifies"
-        );
+        // The checksum, verified the way the box's kernel verifies it: the
+        // wire's own fold over the pseudo-header and the segment — not the
+        // builder's arithmetic recomputed, which would inherit any
+        // byte-order mistake the builder made.
+        assert_tcp_checksum_verifies_on_the_wire(reset);
     }
 
     /// [`tcp_frame`] with the sequence and acknowledgement numbers an
@@ -3303,14 +3359,7 @@ pub(crate) mod tests {
             "the reset acknowledges what the gate tracked"
         );
         assert_eq!(reset[47], 0x14, "RST|ACK: a termination");
-        let mut segment = [0u8; 20];
-        segment.copy_from_slice(&reset[34..54]);
-        segment[16..18].fill(0);
-        assert_eq!(
-            u16::from_be_bytes([reset[50], reset[51]]),
-            tcp_checksum(&segment, LEASE, PEER),
-            "the checksum is one the receiver's kernel verifies"
-        );
+        assert_tcp_checksum_verifies_on_the_wire(reset);
     }
 
     /// The gate's two reset shapes (NET-014, NET-121, RFC 793 §3.4), and the
