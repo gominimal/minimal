@@ -1920,13 +1920,11 @@ async fn ls_shows_vm_per_box() {
             .to_string()
     };
     assert!(
-        answerer_row_of("default")
-            .contains("this VM's minvmd holds it on 127.0.0.1:7656"),
+        answerer_row_of("default").contains("this VM's minvmd holds it on 127.0.0.1:7656"),
         "the VM whose minvmd holds the port says so, in its own row:\n{table}"
     );
     assert!(
-        answerer_row_of("alpha")
-            .contains("another VM host daemon holds it on 127.0.0.1:7656"),
+        answerer_row_of("alpha").contains("another VM host daemon holds it on 127.0.0.1:7656"),
         "the registered VM names the holder, in its own row:\n{table}"
     );
     assert!(

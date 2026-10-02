@@ -535,8 +535,7 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
         let mut read = Vec::with_capacity(listings.len());
         for listing in &listings {
             read.push(
-                crate::cmd::session::vm_host_answerer_status_at(listing.control_sock.clone())
-                    .await,
+                crate::cmd::session::vm_host_answerer_status_at(listing.control_sock.clone()).await,
             );
         }
         read

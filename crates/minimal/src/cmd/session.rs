@@ -790,9 +790,19 @@ pub(crate) async fn activate_session(
         match vm_host_answerer_status(global).await {
             Some(status) => {
                 let read = crate::resolver::host_answerer_read(status).await;
-                (Some(status), read.port, read.answerer_bound, read.held_no_channel)
+                (
+                    Some(status),
+                    read.port,
+                    read.answerer_bound,
+                    read.held_no_channel,
+                )
             }
-            None => (None, created.zone_answerer_port, created.answerer_bound, false),
+            None => (
+                None,
+                created.zone_answerer_port,
+                created.answerer_bound,
+                false,
+            ),
         };
     // The interim itself, named at every session start on a VM-backed host
     // — TTY and non-TTY, ahead of the warning, the advisory and the verdict
@@ -2921,10 +2931,9 @@ mod tests {
     /// prints nothing, exactly as its `min ls` line does.
     #[test]
     fn session_start_names_the_zone_answerer_at_every_start() {
-        let holder = vm_host_answerer_start_line(minimald_rpc::ZoneAnswererStatus::Holder {
-            port: 7_656,
-        })
-        .expect("a holder is a state to name");
+        let holder =
+            vm_host_answerer_start_line(minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 })
+                .expect("a holder is a state to name");
         assert_eq!(
             holder,
             "zone answerer: answered by the VM host daemon \
