@@ -4965,10 +4965,29 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
   # `minvmd.log.<date>` whose dated name no `*.log` pattern reaches. The
   # fresh-install proof names the same sink; newest first, the dated
   # name sorts after the unsuffixed one, a later date after an earlier.
+  bep_host_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
+      | sort -r | head -n1
+  }
+  # ...but the whole run's daemons share that sink, so an unscoped grep
+  # reads the earlier cases' daemons too (each of them logged its own
+  # `host gvproxy switch up` long before this case began). This case's
+  # lines are the ones the newest log gained since the snapshot below.
+  bep_case_log() {
+    local f
+    f="$(bep_host_log)"
+    [ -n "$f" ] || return 0
+    if [ "$f" = "$bep_log0" ] && [ "${bep_log0_lines:-0}" -gt 0 ]; then
+      tail -n +"$((bep_log0_lines + 1))" "$f" 2>/dev/null
+    else
+      # A rotation mid-case: the newest file postdates the snapshot, so
+      # every line in it is this case's.
+      cat "$f" 2>/dev/null
+    fi
+  }
   bep_host_log_tail() {
     local f
-    f="$(find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
-      | sort -r | head -n1)"
+    f="$(bep_host_log)"
     if [ -n "$f" ]; then
       echo "--- minvmd log ($f) tail ---"
       tail -60 "$f" 2>/dev/null || true
@@ -4982,6 +5001,57 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
     unset MINVMD_BEP_STUB
     bep_host_log_tail
     fail
+  }
+
+  # Snapshot the shared host log before this case's daemon exists — the
+  # activations below autospawn it — so bep_case_log can scope to the
+  # lines it gained from here on.
+  bep_log0="$(bep_host_log)"
+  bep_log0_lines=0
+  if [ -n "$bep_log0" ]; then
+    bep_log0_lines="$(wc -l <"$bep_log0" 2>/dev/null)" || bep_log0_lines=0
+  fi
+
+  # The probe's failure annotations: the facts that decide which leg of
+  # the chain failed, each on its own `::error::` line — plain-text
+  # blocks (the log tail below, a cat of stderr) never reach the run's
+  # annotation stream, and the lane's annotation is all this case's
+  # failure is read by from outside. socat's exit names what the box
+  # saw; the ARP entry says whether the switch's peer answered
+  # resolution at all; the cross-probe to an unlistened port isolates
+  # the box-to-peer path from the pool's listener (a RST there means the
+  # path is fine and the failure is at :8118's accept or the delivery's
+  # dial); the daemon's own lines name any refusal with its reason.
+  # One letter a/b per box: the files below key on the lowercase one.
+  bep_probe_diagnostics() {
+    local box="$1" sid="$2" label xerr arp cross peer
+    label="$(printf '%s' "$box" | tr '[:lower:]' '[:upper:]')"
+    peer="$(bep_case_log \
+      | grep -h -e 'host gvproxy switch up' -e 'failed to spawn host gvproxy switch' \
+        -e 'box egress proxy' 2>/dev/null | tail -n4 | tr '\n' ';' | tail -c 600)"
+    echo "::error::host daemon of this case said: ${peer:-<nothing about the box egress proxy>}"
+    xerr="$(tr '\n' ' ' <"$WORK/bep-box-$box-answer.err" 2>/dev/null | tail -c 400)"
+    echo "::error::box $label's probe stderr: ${xerr:-<empty — socat exited nonzero with nothing to say>}"
+    if arp="$(mnl session exec "$sid" sh -c 'cat /proc/net/arp' 2>/dev/null)"; then
+      arp="$(printf '%s\n' "$arp" | awk -v ip="$proxy_ip" '$1 == ip { print $4 }')"
+      if [ -n "$arp" ]; then
+        echo "::error::box $label's ARP entry for $proxy_ip is $arp — the peer answered resolution, so the SYN was framed to it"
+      else
+        echo "::error::box $label has no ARP entry for $proxy_ip — the proxy address never resolved, so the box cannot frame the SYN at all"
+      fi
+    else
+      echo "::error::box $label's ARP entry for $proxy_ip: unreadable (session exec failed)"
+    fi
+    if mnl session exec "$sid" "/usr/bin/socat /dev/null TCP:$proxy_ip:443,connect-timeout=5" \
+        >/dev/null 2>"$WORK/bep-box-$box-cross.err"; then
+      cross="$(tr '\n' ' ' <"$WORK/bep-box-$box-cross.err" 2>/dev/null | tail -c 300)"
+      echo "::error::box $label's cross-probe to $proxy_ip:443 (unlistened) completed instead of being reset — unexpected; stderr: ${cross:-<empty>}"
+    elif grep -q 'Connection refused' "$WORK/bep-box-$box-cross.err" 2>/dev/null; then
+      echo "::error::box $label's cross-probe to $proxy_ip:443 got the peer's RST — the box-to-peer path answers; the failure is at the pool's :$proxy_port listener or the delivery's dial to the stand-in"
+    else
+      cross="$(tr '\n' ' ' <"$WORK/bep-box-$box-cross.err" 2>/dev/null | tail -c 300)"
+      echo "::error::box $label's cross-probe to $proxy_ip:443 was not reset either — the box-to-peer path itself is down in this daemon; stderr: ${cross:-<empty>}"
+    fi
   }
 
   local proxy_ip proxy_port bepb_sid_a bepb_sid_b bepb_ip_a bepb_ip_b bep_sock bep_wait
@@ -5028,6 +5098,41 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
     fi
     sleep 1
   done
+
+  # The socket only says the daemon bound the stand-in — the stand-in is
+  # bound before the switch is even spawned, so a daemon whose switch
+  # never came up looks identical to a healthy one to the wait above, and
+  # every probe below would fail in terms of a peer that is not there.
+  # (A switch that will not come up under this case's flag now fails the
+  # daemon's boot outright, so an activation that got this far means a
+  # daemon that started one — but assert it from the daemon's own log
+  # rather than trust the bind; if the line never appears, the tail
+  # below names the spawn that failed.) The log line is this case's
+  # daemon's: bep_case_log scopes out every earlier daemon's identical
+  # `host gvproxy switch up`.
+  bep_peer_seen=0
+  bep_wait=0
+  while [ "$bep_wait" -le 15 ]; do
+    if bep_case_log | grep -q 'host gvproxy switch up; box egress proxy peer started'; then
+      bep_peer_seen=1
+      break
+    fi
+    if bep_case_log | grep -q -e 'failed to spawn host gvproxy switch' \
+        -e 'gvproxy binary not found' \
+        -e 'failed to bind the box egress proxy stand-in acceptor'; then
+      echo "::error::this case's daemon came up without the box egress proxy's peer — the switch never started, so the probes below would fail against a host that is not there. The daemon's log says:"
+      bep_case_log | grep -e 'failed to spawn host gvproxy switch' \
+        -e 'gvproxy binary not found' \
+        -e 'failed to bind the box egress proxy stand-in acceptor' | tail -n5 | sed 's/^/  /'
+      bep_fail
+    fi
+    bep_wait=$((bep_wait + 1))
+    sleep 1
+  done
+  if [ "$bep_peer_seen" -ne 1 ]; then
+    echo "::error::the daemon's log never said the box egress proxy peer started (waited ${bep_wait}s for 'host gvproxy switch up' among this case's lines)"
+    bep_fail
+  fi
 
   # Each box's lease address — the source its connection must be presented
   # from — read from the box's own view, like the MAC case above reads its
@@ -5083,6 +5188,7 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
     >"$WORK/bep-box-a-answer.out" 2>"$WORK/bep-box-a-answer.err" || {
     echo "::error::box A's connection to the proxy's address did not complete"
     cat "$WORK/bep-box-a-answer.err" 2>/dev/null || true
+    bep_probe_diagnostics a "$bepb_sid_a"
     bep_fail
   }
   mnl session exec "$bepb_sid_b" \
@@ -5090,6 +5196,7 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
     >"$WORK/bep-box-b-answer.out" 2>"$WORK/bep-box-b-answer.err" || {
     echo "::error::box B's connection to the proxy's address did not complete"
     cat "$WORK/bep-box-b-answer.err" 2>/dev/null || true
+    bep_probe_diagnostics b "$bepb_sid_b"
     bep_fail
   }
 
@@ -5103,11 +5210,15 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
       echo "::error::the proxy did not see box $box's connection from its own switch address ($box_ip)"
       echo "--- answer ---"; cat "$WORK/bep-box-$box-answer.out" 2>/dev/null || true
       echo "--- stderr ---"; cat "$WORK/bep-box-$box-answer.err" 2>/dev/null || true
+      sid_var="bepb_sid_$box"
+      bep_probe_diagnostics "$box" "${!sid_var}"
       bep_fail
     fi
     if ! grep -q -- "destination=$proxy_ip:$proxy_port" "$WORK/bep-box-$box-answer.out"; then
       echo "::error::box $box's answer does not name the proxy's address as the destination"
       echo "--- answer ---"; cat "$WORK/bep-box-$box-answer.out" 2>/dev/null || true
+      sid_var="bepb_sid_$box"
+      bep_probe_diagnostics "$box" "${!sid_var}"
       bep_fail
     fi
   done
