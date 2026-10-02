@@ -739,12 +739,22 @@ impl HostnameRegistry {
         })
     }
 
-    /// The own-address boxes whose published address falls in the reserved
-    /// local range, as `(session_name, address)` pairs. Used when the range
-    /// verdict lands `Absent` so the daemon can warn by name about boxes that
-    /// were answered from the record while no verdict was available.
+    /// The own-address publishes standing inside the reserved local range, as
+    /// `(session id, session_name, address, ports)` — the boxes an **absent**
+    /// verdict landing moves onto the `127.0.0.1` interim (NET-123): a hand
+    /// the pending window vouched for by its provenance rather than by a
+    /// measurement, or a grant a recorded namespace holds, each now naming
+    /// an address the publish surface cannot bind, so every forward the box
+    /// would bind there fails with `EADDRNOTAVAIL`. The name rides along
+    /// because the move re-registers the box's route at the interim; a
+    /// publish whose session holds no registered name (a stopped box, one
+    /// whose name another session took over) is not listed — its next
+    /// finalize is the moment its ask runs again, through the verdict-gated
+    /// reads the session actor makes.
     #[must_use]
-    pub fn own_address_names_in_reserved_range(&self) -> Vec<(String, Ipv4Addr)> {
+    pub fn own_publishes_in_reserved_range(
+        &self,
+    ) -> Vec<(SessionId, String, Ipv4Addr, BTreeSet<u16>)> {
         self.own_published
             .iter()
             .filter(|(_, own)| in_reserved_local_range(own.address))
@@ -752,7 +762,30 @@ impl HostnameRegistry {
                 self.by_session
                     .iter()
                     .find(|(_, registration)| registration.id == *id)
-                    .map(|(name, _)| (name.clone(), own.address))
+                    .map(|(name, _)| (*id, name.clone(), own.address, own.ports.clone()))
+            })
+            .collect()
+    }
+
+    /// The own-address publishes standing at the `127.0.0.1` interim
+    /// (NET-123), as `(session id, session_name, ports)` — the boxes a
+    /// **present** verdict landing re-asks for. The interim is the ask's
+    /// own answer for a verdict that had not landed, never an address a hand
+    /// named (a VM host hands addresses of the range's slice), so the landing
+    /// that replaces the verdict is the one moment those asks upgrade to a
+    /// grant — for the boxes it finds live; a box whose publish the landing
+    /// misses, because it was stopped across the landing, asks again at its
+    /// next finalize, which does not short-circuit on the interim either.
+    #[must_use]
+    pub fn interim_own_publishes(&self) -> Vec<(SessionId, String, BTreeSet<u16>)> {
+        self.own_published
+            .iter()
+            .filter(|(_, own)| own.address == Ipv4Addr::LOCALHOST)
+            .filter_map(|(id, own)| {
+                self.by_session
+                    .iter()
+                    .find(|(_, registration)| registration.id == *id)
+                    .map(|(name, _)| (*id, name.clone(), own.ports.clone()))
             })
             .collect()
     }
@@ -1297,8 +1330,14 @@ impl LoopbackGrant {
     /// it, and the `127.0.0.1` interim where the host's publish surface
     /// cannot bind the range — the absent verdict's own arm, and the pending
     /// window's, where nothing has vouched for an address of the range so
-    /// none is spent and the box publishes on the interim until the walk
-    /// lands and a rename or re-finalize asks again.
+    /// none is spent. The interim is recorded as the box's own publish — the
+    /// name routes at it and the attach binds its forwards at it — but it is
+    /// the surface's answer, never an address the box owns, so it cannot
+    /// outstay the window that made it: the walk's landing re-points every
+    /// box standing on it when its verdict lands (a present landing re-asks
+    /// the grant, an absent one keeps it), and a finalize that finds the box
+    /// standing on the interim asks again rather than answering from the
+    /// record.
     ///
     /// `None` — publishing nothing, so the attach of a box that declared
     /// ingress fails with "no published address handed" — for the two
@@ -1545,12 +1584,17 @@ impl LoopbackLeaseBook {
     /// keyed by the box's switch address, which a resumed box keeps its
     /// address on inside the walk's window (NET-013) — while a landed absent
     /// verdict is the surface's own answer over it: the VM host daemon hands
-    /// slice addresses of the range without measuring the host's loopback, so
-    /// a box that published its hand verbatim would bind its declared ports
-    /// at an address the surface cannot bind — `EADDRNOTAVAIL` at every bind
-    /// on a stock macOS host, exactly the refusal the verdict exists to keep
-    /// a box from publishing at. With the verdict against it the hand
-    /// publishes nothing and the box's ask falls through, to the interim.
+    /// slice addresses of the range without measuring the host's loopback —
+    /// the root fix is the host daemon measuring before it hands (#1818),
+    /// this gate the interim until it lands — so a box that published its
+    /// hand verbatim would bind its declared ports at an address the surface
+    /// cannot bind: `EADDRNOTAVAIL` at every bind on a stock macOS host,
+    /// exactly the refusal the verdict exists to keep a box from publishing
+    /// at. With the verdict against it the hand publishes nothing and the
+    /// box's ask falls through, to the interim — and the gate reads the
+    /// record the same way it reads the hand: a publish the window left at
+    /// an unvouched address asks again rather than standing at it, so no
+    /// box holds an address a landed verdict contradicts.
     #[must_use]
     pub fn vouches_for(&self, address: Ipv4Addr) -> bool {
         !in_reserved_local_range(address) || self.verdict() != RangeVerdict::Absent

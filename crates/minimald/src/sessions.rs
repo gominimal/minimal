@@ -326,15 +326,17 @@ impl Manager {
             // daemon that held its own SSH accept for the host's loopback
             // verdict would make every `minvmd stop` race the probe instead
             // of reaching the daemon behind it. So that arm is spawned here
-            // and its verdict applied when it lands — the book opens on the
-            // pending verdict (no *fresh* grant at an address nothing has
-            // vouched for; a namespace the record already names is still
-            // answered with the address it holds, NET-013) and the walk, once
-            // it has an answer, both un-withholds and hands the node its
-            // address; the registry re-points the names that answered the
-            // interim. A box that asks for a fresh grant in that window keeps
-            // the interim address it got — the same publish a range-absent
-            // host gives it — until a rename or a re-finalize asks again.
+            // and its verdict applied when it lands
+            // (`land_range_verdict`): the book opens on the pending verdict
+            // (no *fresh* grant at an address nothing has vouched for; a
+            // namespace the record already names is still answered with the
+            // address it holds, NET-013) and the walk, once it has an answer,
+            // both un-withholds and hands the node its address, and re-points
+            // the publishes the window left standing — a hand the landing
+            // overrules moves onto the interim, an interim ask the landing
+            // upgrades to a grant — so no box holds an address the landed
+            // verdict contradicts, and the interim never outstays the
+            // window that made it.
             let (probe, shuttle) = match transport {
                 crate::net::SwitchTransport::HostShuttle { cid, port } => (None, Some((cid, port))),
                 _ => (
@@ -450,31 +452,21 @@ impl Manager {
                         "the daemon-start range probe walked the forwarder's loopback \
                          and picked the publish surface",
                     );
-                    book.set_range_verdict(if probe.present() {
-                        crate::net::dns::RangeVerdict::Present
-                    } else {
-                        crate::net::dns::RangeVerdict::Absent
-                    });
+                    land_range_verdict(
+                        &book,
+                        &registry,
+                        if probe.present() {
+                            crate::net::dns::RangeVerdict::Present
+                        } else {
+                            crate::net::dns::RangeVerdict::Absent
+                        },
+                    );
                     if !probe.present() {
                         tracing::warn!(
                             first_failure = ?probe.first_failure,
                             "the reserved local range is absent on the publish surface; \
                              publishing boxes on the 127.0.0.1 interim",
                         );
-                        for (name, address) in registry
-                            .read()
-                            .expect("hostname registry lock poisoned")
-                            .own_address_names_in_reserved_range()
-                        {
-                            tracing::warn!(
-                                session_name = %name,
-                                ip = %address,
-                                action = "loopback-range-absent-box",
-                                "a box already published at a reserved local address, but \
-                                 the range is now absent; the name stays until a rename \
-                                 or re-finalize",
-                            );
-                        }
                         return;
                     }
                     let node = match book.grant(crate::net::dns::LeaseNamespace::Node) {
@@ -542,6 +534,114 @@ impl Manager {
 
         tokio::spawn(mngr.mainloop());
         Ok(handle)
+    }
+}
+
+/// Lands a range verdict the way the deferred walk lands it
+/// ([`crate::sessions::Manager::init`]'s spawned probe): the state moves
+/// first, then the arm that follows it runs over the publishes the old
+/// verdict left standing — the one moment a verdict's landing has effects
+/// beside the atomic it sets, and the reason the walk cannot simply store
+/// its answer.
+///
+/// An **absent** landing moves every own-address publish standing inside the
+/// reserved local range onto the `127.0.0.1` interim (NET-123). The pending
+/// window vouches a hand by its provenance rather than by a measurement, so
+/// a box finalized inside the window — a resumed box the record answered
+/// (NET-013), or any box a VM host handed before the walk answered — is
+/// published at the unmeasured hand, and once the surface answers *absent*
+/// that hand names an address no forward will ever bind (`EADDRNOTAVAIL` at
+/// every bind) while the box's later finalizes would keep it: the registry's
+/// already-published short-circuit trusts the record, and only destroy
+/// cleared it. The landing is the one moment the daemon holds both facts —
+/// the verdict and every publish it contradicts — so it re-publishes each
+/// such box at the interim, name and route with it, and the box's attach
+/// binds where the surface listens instead of failing until destroy.
+///
+/// A **present** landing re-asks for every own-address publish standing at
+/// the interim: the interim is the ask's own answer for a verdict that had
+/// not landed, never an address the box owns, so the landing that replaces
+/// the verdict is the moment those asks upgrade to grants — without it the
+/// box would stand at `127.0.0.1` until destroy. A grant withheld at the
+/// re-ask leaves the box at the interim, the surface's own answer again.
+///
+/// The verdict is set **before** either arm runs, so a finalize racing the
+/// landing reads the landed verdict: its hand is gated by
+/// [`crate::net::dns::LoopbackLeaseBook::vouches_for`], its ask by the
+/// verdict's own arm, and each sweep only re-publishes what still stands.
+#[cfg(target_os = "linux")]
+fn land_range_verdict(
+    book: &crate::net::dns::LoopbackLeaseBook,
+    registry: &RwLock<crate::net::dns::HostnameRegistry>,
+    verdict: crate::net::dns::RangeVerdict,
+) {
+    book.set_range_verdict(verdict);
+    match verdict {
+        crate::net::dns::RangeVerdict::Present => {
+            // The boxes the window stood at the interim. Enumerated under a
+            // read lock, then re-asked outside every registry lock: the ask
+            // is a read-modify-write of the answerer's record under its own
+            // lock file, and the registry is what every DNS answer this
+            // daemon serves reads — the same order the finalize path's ask
+            // follows.
+            let standing = registry
+                .read()
+                .expect("hostname registry lock poisoned")
+                .interim_own_publishes();
+            for (session, name, ports) in standing {
+                let granted = book.grant(crate::net::dns::LeaseNamespace::Box { session });
+                if let crate::net::dns::LoopbackGrant::Granted(address) = granted {
+                    tracing::info!(
+                        session_id = %session,
+                        session_name = %name,
+                        ip = %address,
+                        action = "loopback-lease",
+                        "the verdict landed present; a box standing on the \
+                         interim was granted an address of its own"
+                    );
+                    let mut reg = registry.write().expect("hostname registry lock poisoned");
+                    reg.publish_own_address(session, &name, address, ports.clone());
+                    reg.register_own_ip(session, &name, ports);
+                } else {
+                    // A grant withheld at the re-ask leaves the box at the
+                    // interim — the surface's own answer again, said out
+                    // loud — and its next finalize re-asks.
+                    tracing::warn!(
+                        session_id = %session,
+                        session_name = %name,
+                        grant = ?granted,
+                        action = "loopback-lease-withheld",
+                        "the verdict landed present but the box's re-ask was \
+                         refused; it keeps the 127.0.0.1 interim it stands on"
+                    );
+                }
+            }
+        }
+        crate::net::dns::RangeVerdict::Absent => {
+            // The boxes the window published at reserved-range addresses:
+            // the surface cannot bind what they hold, and their attach
+            // would fail at it until destroy. One registry lock across the
+            // sweep, so no answer reads a half-moved table.
+            let mut reg = registry.write().expect("hostname registry lock poisoned");
+            for (session, name, from, ports) in reg.own_publishes_in_reserved_range() {
+                tracing::warn!(
+                    session_id = %session,
+                    session_name = %name,
+                    from = %from,
+                    to = %Ipv4Addr::LOCALHOST,
+                    action = "loopback-range-absent-box",
+                    "a box's publish stood inside the reserved local range; \
+                     the range is absent on the publish surface, so the \
+                     publish — name and route with it — moves to the \
+                     127.0.0.1 interim",
+                );
+                reg.publish_own_address(session, &name, Ipv4Addr::LOCALHOST, ports.clone());
+                reg.register_own_ip(session, &name, ports);
+            }
+        }
+        // The state a book opens on and the state a test re-opens it in:
+        // nothing has been published under it to sweep.
+        crate::net::dns::RangeVerdict::Pending => {}
     }
 }
 
@@ -1140,6 +1240,19 @@ impl ManagerHandle {
     pub(crate) fn hold_range_verdict_pending(&self) {
         self.loopback
             .set_range_verdict(crate::net::dns::RangeVerdict::Pending);
+    }
+
+    /// Lands a range verdict with the arms the deferred walk runs when it
+    /// lands one — the state change and the re-publishes that follow it — so
+    /// a test drives the window's endings the way the walk does.
+    /// [`Self::hold_range_verdict_pending`] opens the window; this closes it,
+    /// over whatever the window published.
+    ///
+    /// Test-only: the production path that lands a verdict is the walk
+    /// itself, and it lands the probe's answer, never a test's.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn land_range_verdict(&self, verdict: crate::net::dns::RangeVerdict) {
+        land_range_verdict(&self.loopback, &self.hostnames, verdict);
     }
 
     /// Lists the sessions known to this (minimald) instance.

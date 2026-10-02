@@ -3401,6 +3401,195 @@ async fn a_resumed_box_answers_at_its_own_address_while_the_verdict_is_pending()
     );
 }
 
+/// The pending-hand race, closed: a handed reserved-range box finalized
+/// inside the deferred walk's window is published at the hand the pending
+/// verdict vouched for by its provenance alone — an address the host has not
+/// measured, and on a host whose surface cannot bind the range one no bind
+/// will ever hold. When the walk then lands absent, the landing is the one
+/// moment the daemon holds both facts — the verdict and every publish it
+/// contradicts — so it moves the publish onto the `127.0.0.1` interim, name
+/// and route with it: the box's attach binds where the surface listens
+/// instead of failing with `EADDRNOTAVAIL` until destroy, which is what an
+/// arm that only warned left it doing.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handed_box_pending_at_finalize_moves_to_the_interim_when_the_verdict_lands_absent() {
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    manager.hold_range_verdict_pending();
+    let mut client = server.connect().await;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
+    let web = finalize_handed_own_ip_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        handed,
+    )
+    .await;
+
+    // Inside the window: the pending verdict vouches the hand, so the box
+    // publishes at it.
+    let registry = manager.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(handed),
+        "inside the pending window the box publishes at the hand it was given"
+    );
+
+    // The walk lands absent: the hand now names an address the surface
+    // cannot bind, and the landing moves the publish onto the interim.
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let landed = {
+        let routes = registry.read().expect("registry lock");
+        routes.published_own_address(web)
+    };
+    assert_eq!(
+        landed,
+        Some(std::net::Ipv4Addr::LOCALHOST),
+        "the landing moves the box's publish onto the 127.0.0.1 interim"
+    );
+    let (_, address) = zone_answer_for(&server, "web.min.internal")
+        .await
+        .expect("the name survives the landing");
+    assert_eq!(
+        address,
+        std::net::Ipv4Addr::LOCALHOST,
+        "the name answers at the interim, the address the surface can bind"
+    );
+}
+
+/// The interim must not outstay the window that made it: a box nobody handed
+/// an address, finalized inside the deferred walk's window, publishes at the
+/// ask's own answer for a verdict that has not landed — the `127.0.0.1`
+/// interim. The landing that replaces the verdict is the moment that ask
+/// upgrades: when the walk lands present, every box standing at the interim
+/// is re-asked and re-published at its grant, name and route with it, so the
+/// box takes an address of its own instead of standing at the interim until
+/// destroy.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interim_publish_takes_its_grant_when_the_verdict_lands_present() {
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    manager.hold_range_verdict_pending();
+    let mut client = server.connect().await;
+    let web = finalize_own_ip_session(&mut client, "web").await;
+
+    // Inside the window: the ask answers pending, so the box publishes on
+    // the interim — reachable, at the one address the surface can always
+    // bind.
+    let registry = manager.hostnames();
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(std::net::Ipv4Addr::LOCALHOST),
+        "inside the pending window the ask publishes the box on the interim"
+    );
+
+    // The walk lands present: the interim was the ask's answer for a verdict
+    // that had not landed, so the landing re-asks and the publish moves to
+    // the grant.
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    let granted = {
+        let routes = registry.read().expect("registry lock");
+        routes
+            .published_own_address(web)
+            .expect("the landing upgrades the interim publish to a grant")
+    };
+    assert_ne!(
+        granted,
+        std::net::Ipv4Addr::LOCALHOST,
+        "the box no longer stands at the interim"
+    );
+    assert!(
+        in_reserved_local_range(granted),
+        "the upgrade is a grant from the reserved local range, got {granted}"
+    );
+    let (_, address) = zone_answer_for(&server, "web.min.internal")
+        .await
+        .expect("the name survives the landing");
+    assert_eq!(
+        address, granted,
+        "the name answers at the granted address, moved with the publish"
+    );
+}
+
+/// The wiring test for the hand's verdict gate (the `.filter(vouches_for)` on
+/// the hand's read): a handed reserved address finalizes to
+/// `published_own_address == 127.0.0.1` under an absent book — the hand names
+/// an address the surface cannot bind, so it publishes nothing and the ask
+/// answers with the interim — and to the hand under a pending one, which
+/// trusts the hand's own provenance. Remove the filter and the absent half
+/// fails at the hand.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handed_reserved_address_finalizes_to_the_interim_under_an_absent_book_and_to_the_hand_under_a_pending_one()
+ {
+    // An absent book: the landing ran before any box existed, so its sweep
+    // found nothing and only the verdict is in play.
+    {
+        let server = TestServer::new().await;
+        let manager = server.state.sessions_manager().await;
+        manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+        let mut client = server.connect().await;
+        let handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
+        let web = finalize_handed_own_ip_session(
+            &mut client,
+            "web",
+            std::net::Ipv4Addr::new(100, 64, 128, 9),
+            handed,
+        )
+        .await;
+        assert_eq!(
+            manager
+                .hostnames()
+                .read()
+                .expect("registry lock")
+                .published_own_address(web),
+            Some(std::net::Ipv4Addr::LOCALHOST),
+            "under an absent book the hand is unvouched, so the finalize \
+             publishes the interim"
+        );
+        let (_, address) = zone_answer_for(&server, "web.min.internal")
+            .await
+            .expect("the name is held under an absent book");
+        assert_eq!(
+            address,
+            std::net::Ipv4Addr::LOCALHOST,
+            "the name answers at the interim, never at the unbindable hand"
+        );
+    }
+
+    // A pending book: the hand's own provenance carries it, so the same
+    // finalize publishes the hand.
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    manager.hold_range_verdict_pending();
+    let mut client = server.connect().await;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
+    let web = finalize_handed_own_ip_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        handed,
+    )
+    .await;
+    assert_eq!(
+        manager
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(handed),
+        "under a pending book the finalize publishes the hand it was given"
+    );
+}
+
 /// NET-129 session path: two own-address boxes whose creators hand them the
 /// *same* address — the shared-address mode — and that declare the same port.
 /// The collision is intrinsic to the mode (the boxes were told to publish at
