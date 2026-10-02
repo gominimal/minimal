@@ -1140,6 +1140,10 @@ pub(crate) struct Launched<P, G> {
 /// Actor messages to a [`Host`].
 enum Message {
     Kill(bool),
+    /// Rename the session: update the host's display name and republish the
+    /// new `MINIMAL_SESSION_NAME` through the per-attach environment channel,
+    /// so the already-running shell picks it up at its next prompt.
+    Rename(String),
     /// Bind a client channel to this host. The [`ConnectionEnv`] rides along
     /// on every attach — not just the one that minted the host — because it
     /// describes the terminal on the other end of *this* channel; the
@@ -1377,6 +1381,23 @@ impl HostHandle {
             Err(_e) => Err(()),
         }
     }
+
+    /// Renames the session: the host updates its display name and republishes
+    /// the new `MINIMAL_SESSION_NAME` through the per-attach environment
+    /// channel, so the already-running shell picks it up at its next prompt.
+    ///
+    /// Best-effort: a dead or wedged host drops the message silently, and the
+    /// record-side rename has already succeeded by the time this is called.
+    pub async fn rename(&self, new_name: String) {
+        let _ = self
+            .sender
+            .send_timeout(
+                Message::Rename(new_name),
+                crate::session::HOST_PROBE_TIMEOUT,
+            )
+            .await;
+    }
+
     /// Binds `c` to this host, carrying the attaching terminal's facts.
     ///
     /// `connection` is merged into the host's stored facts on every attach, so
@@ -2119,7 +2140,9 @@ impl AttachEnv {
 
 /// The facts that describe *the terminal currently attached*, as opposed to
 /// the session's own composed environment: `TERM` from the PTY request, plus
-/// the banner's detach hint derived from the channel's session keys.
+/// the banner's detach hint derived from the channel's session keys, and
+/// `MINIMAL_SESSION_NAME` when the session is renamed — republished so the
+/// already-running shell picks up the new name at its next prompt.
 ///
 /// Kept apart from [`AttachEnv`] because its lifetime is different. A session
 /// shell is spawned once and lives across many attaches, so its `environ` is
@@ -4161,6 +4184,16 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     }
                     Message::Attach(channel, sz, connection, keys) => {
                         self.attach(channel, sz, false, connection, keys).await;
+                    }
+                    Message::Rename(new_name) => {
+                        self.session_name = new_name.clone();
+                        // The shell's `environ` is frozen at launch, so the
+                        // new name reaches it the same way `TERM` does: by
+                        // republishing through the per-attach environment
+                        // files the shell re-sources at every prompt.
+                        self.connection_env
+                            .insert("MINIMAL_SESSION_NAME".to_string(), new_name);
+                        self.publish_connection_env().await;
                     }
                     Message::SetTitleCallback(title) => {
                         self.attrs.title = Some((title, SystemTime::now()));

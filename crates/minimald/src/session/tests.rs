@@ -1799,6 +1799,38 @@ async fn an_attach_with_no_terminal_keeps_the_last_published_one() {
     );
 }
 
+/// Renaming a running session republishes the new `MINIMAL_SESSION_NAME`
+/// through the per-attach environment channel, so the already-running
+/// shell picks it up at its next prompt without a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_session_republishes_minimal_session_name() {
+    use minimald_rpc::{Errorable, RenameSession, RenameSessionRequest, RenameSessionResponse};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+
+    // Attach so the host is live and the attach-env files exist.
+    let mut channel = client.open_shell(session_id).await;
+    await_echo(&mut channel).await;
+
+    // Rename the session.
+    let resp = client
+        .call::<RenameSession>(&RenameSessionRequest {
+            id: session_id,
+            new_name: "renamed".to_string(),
+        })
+        .await;
+    assert_eq!(resp, Errorable::Ok(RenameSessionResponse));
+
+    // The republished attach-env now carries the new name.
+    let renamed = published_attach_env(&server, session_id).await;
+    assert!(
+        renamed.contains("export MINIMAL_SESSION_NAME='renamed'"),
+        "the attach-env should carry the new name after rename; got: {renamed:?}"
+    );
+}
+
 /// Regression: a session shell minted headlessly — by the activation
 /// hooks, with no terminal anywhere in the picture — used to keep that
 /// terminal-less environment for the session's whole life, because
