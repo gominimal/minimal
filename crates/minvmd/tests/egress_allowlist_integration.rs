@@ -275,18 +275,23 @@ impl Guest {
     /// instead so the console is still visible. Invalid UTF-8 is replaced
     /// rather than losing the whole tail.
     fn tail_boot_log(&mut self) -> String {
-        let contents = match std::fs::read(&self.boot_log_path) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        let bytes = match std::fs::read(&self.boot_log_path) {
+            Ok(bytes) => bytes,
             Err(e) => return format!("(no boot log at {}: {e})", self.boot_log_path.display()),
         };
-        let total_len = contents.len();
-        let tail = if total_len >= self.boot_log_offset {
-            &contents[self.boot_log_offset..]
+        // The offset counts raw bytes, never decoded ones: a lossy decode
+        // widens each invalid byte to a three-byte replacement character, so
+        // an offset taken from it could land past the next read's new bytes
+        // or inside a character.
+        let total_len = bytes.len();
+        let new_bytes = if total_len >= self.boot_log_offset {
+            &bytes[self.boot_log_offset..]
         } else {
             // Log was truncated/rotated; just print the whole current contents.
-            &contents[..]
+            &bytes[..]
         };
         self.boot_log_offset = total_len;
+        let tail = String::from_utf8_lossy(new_bytes);
         // Keep only the evidence the DNS gate and policy warnings emit; the
         // diagnostics requirement is to name the host that was not admitted.
         // Match on the message text alone ("admitted a resolved name's
