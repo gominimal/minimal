@@ -1101,7 +1101,7 @@ mod tests {
     /// published loopback address, the address its name must answer with.
     fn web_registry() -> (BoxRegistry, Ipv4Addr) {
         let registry = BoxRegistry::new(SUBNET);
-        registry.register_node_namespace(7654, DEFAULT_ANSWERER_PORT);
+        registry.register_node_namespace(7654);
         let web = Ipv4Addr::new(127, 0, 64, 9);
         registry.register(BoxRegistration::new(
             "web",

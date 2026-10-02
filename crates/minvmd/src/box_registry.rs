@@ -776,13 +776,16 @@ impl BoxRegistry {
     /// with ([`SwitchSubnet::daemon_ip`]) — the guest is neither asked nor
     /// able to influence what this row holds.
     ///
-    /// The admitted ports are the two the daemon's own setup publishes at
-    /// its address: the hostname proxy's and the zone answerer's, both
-    /// assigned by the VM host before the VM boots
-    /// ([`crate::cmd::run`] hands them to the guest on the kernel command
+    /// The admitted port is the one the daemon's own setup publishes at its
+    /// address: the hostname proxy's, assigned by the VM host before the VM
+    /// boots ([`crate::cmd::run`] hands it to the guest on the kernel command
     /// line) and bound by the guest daemon as handed — so the publishes the
-    /// daemon makes to attach them are publishes of ports this row already
-    /// names, not requests for the host to open its own.
+    /// daemon makes to attach it are publishes of a port this row already
+    /// names, not requests for the host to open its own. The zone answerer is
+    /// not the node's to admit (NET-138): on a VM-backed host the in-VM daemon
+    /// starts no answerer — the host answerer serves the zone — so an
+    /// answerer port on this row would be an admitted port with nothing
+    /// behind it, a standing grant.
     ///
     /// The rules are the allow-all interim the absent-policy default ships:
     /// the node-plane baseline set is un-enrolled until NET-130's enumeration
@@ -790,10 +793,10 @@ impl BoxRegistry {
     /// gate existed — its own package fetches above all, which is the
     /// VM-side shape of NET-080. NET-130 tightens this row to the categories
     /// design §5.1 enumerates.
-    pub fn register_node_namespace(&self, proxy_port: u16, answerer_port: u16) -> Arc<BoxRecord> {
+    pub fn register_node_namespace(&self, proxy_port: u16) -> Arc<BoxRecord> {
         self.register(
             BoxRegistration::new(NODE_NAMESPACE, self.subnet.daemon_ip(), Ipv4Addr::LOCALHOST)
-                .with_admitted_ports([proxy_port, answerer_port]),
+                .with_admitted_ports([proxy_port]),
         )
     }
 
@@ -1121,7 +1124,7 @@ mod tests {
             BoxRegistration::new("db", Ipv4Addr::new(100, 64, 0, 10), Ipv4Addr::LOCALHOST)
                 .with_admitted_ports([5432, 5433]),
         );
-        let node = registry.register_node_namespace(7654, 7656);
+        let node = registry.register_node_namespace(7654);
 
         // Every published namespace holds a row, resolved by the address the
         // gate's per-frame lookup uses.
@@ -1144,10 +1147,11 @@ mod tests {
         assert_eq!(node.switch_addr(), SUBNET.daemon_ip());
         assert_eq!(
             node.admitted_ports(),
-            [7654, 7656],
-            "the node's row names the proxy and answerer ports the VM host \
-             assigned and handed over, so the daemon's own publishes are \
-             publishes of ports the row already declares"
+            [7654],
+            "the node's row names the proxy port the VM host assigned and \
+             handed over — the answerer is not the node's to admit (NET-138) — \
+             so the daemon's own publishes are publishes of a port the row \
+             already declares"
         );
 
         // The table carries the plan its rows are addressed on, and the plan's
@@ -1374,7 +1378,7 @@ mod tests {
                     deny_subnets: None,
                 }),
         );
-        registry.register_node_namespace(7654, 7656);
+        registry.register_node_namespace(7654);
         let mut harness = gate_over(registry).await;
 
         let before: Vec<_> = harness
@@ -1474,7 +1478,7 @@ mod tests {
             Ipv4Addr::new(100, 64, 0, 10),
             Ipv4Addr::new(100, 64, 0, 10),
         ));
-        registry.register_node_namespace(7654, 7656);
+        registry.register_node_namespace(7654);
 
         let view = registry.zone_view();
         let rows: Vec<(String, Option<Ipv4Addr>, bool)> = view

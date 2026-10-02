@@ -2613,6 +2613,40 @@ mod tests {
                 "the daemon must answer nothing in the zone's place on a VM host, got: {outcome:?}"
             ),
         }
+
+        // The same deployment model with nothing handed at all — no handed
+        // boot token and no configured port, the state a VM boots in now the
+        // handoff carries the proxy port only: an answerer that ran anyway
+        // would take the documented default (7656) on the guest's wildcard.
+        // Both of its outcomes are caught without this test binding that
+        // port itself (a dev host may hold it): a bind that succeeded would
+        // set the discovery claim, and one that failed would log its
+        // component line — neither may appear.
+        let dir = TempDir::new().unwrap();
+        let unconfigured = ServerStateHandle::new(
+            Config {
+                in_microvm: true,
+                zone_answerer_port: None,
+                ..test_config(&dir)
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        start_host_proxies(&unconfigured, true, None, None).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            unconfigured.zone_answerer_port().await,
+            None,
+            "a VM-hosted daemon with nothing handed binds no answerer on the \
+             default port either: the host answerer owns the zone (NET-138)"
+        );
+        assert!(
+            !buf.contents().contains("zone-answerer"),
+            "no zone-answerer line may appear for a VM-hosted daemon with \
+             nothing handed, got: {}",
+            buf.contents()
+        );
     }
 
     /// T63 (NET-025): the pid-1 boot reads its handed ports fail-closed and

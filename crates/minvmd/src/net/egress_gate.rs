@@ -6192,7 +6192,7 @@ mod tests {
         // The deny-all box: no declared subnets, so its row admits nothing
         // but the resolver carve-out — the box a spoof must not unseal.
         tcp_box(&registry, "locked", [100, 64, 0, 11], vec![]);
-        registry.register_node_namespace(7654, 7656);
+        registry.register_node_namespace(7654);
         let table = registry.table();
         let baseline = NodePlaneBaseline::built_in(SUBNET);
         let node = baseline.node_addr();
@@ -6606,8 +6606,8 @@ mod tests {
         let registry = BoxRegistry::new(SUBNET);
         // The run path's own registration: the allow-all interim node row at
         // the daemon's address, registered at VM boot (cmd/run.rs) with the
-        // two ports the boot line hands the guest daemon.
-        registry.register_node_namespace(7654, 7656);
+        // proxy port the boot line hands the guest daemon.
+        registry.register_node_namespace(7654);
         let table = registry.table();
         // Built without [`NodePlaneBaseline::in_force`], so this is the
         // phase the build ships.
@@ -7567,7 +7567,7 @@ mod tests {
     async fn node_row_survives_the_relay_that_carried_its_frames() {
         let registry = BoxRegistry::new(SUBNET);
         tcp_lan_box(&registry, LEASE);
-        let node = registry.register_node_namespace(7654, 7656);
+        let node = registry.register_node_namespace(7654);
         registry.spawn_withdrawal_drainer();
         let mut h = gate_over(registry).await;
 
@@ -7633,7 +7633,7 @@ mod tests {
     async fn node_row_survives_relay_end() {
         let registry = BoxRegistry::new(SUBNET);
         tcp_lan_box(&registry, LEASE);
-        let node = registry.register_node_namespace(7654, 7656);
+        let node = registry.register_node_namespace(7654);
         // The reports, read directly: the drainer is not started, so the
         // report's content is the test's to assert on.
         let reports = registry

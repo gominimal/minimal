@@ -446,17 +446,17 @@ fn run_foreground() -> Result<()> {
     // diagnostic bundle's daemon log tail shows a host running it.
     // `UNREGISTERED_SOURCE_PHASE` (egress_gate) is the constant T66 flips.
     let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
-    // The node's own ports are resolved once before the VM boots — the
-    // operator's override (`MINVMD_NODE_*_PORT` in this supervisor's env) or
-    // the default-first probe, so a VM sharing a host with a native daemon
+    // The node's own proxy port is resolved once before the VM boots — the
+    // operator's override (`MINVMD_NODE_PROXY_PORT` in this supervisor's env)
+    // or the default-first probe, so a VM sharing a host with a native daemon
     // still lands on the default proxy port when it is free — and the one
-    // resolved pair is written twice: handed to the guest through the VMM
+    // resolved port is written twice: handed to the guest through the VMM
     // child's env onto the kernel command line, and declared as the node
-    // row's own publishes. The daemon's setup publishes them at its address
-    // (NET-025); the pair it publishes is the pair the guest binds.
-    let node_ports =
-        assign_node_ports().context("assigning the node's proxy and answerer ports")?;
-    boxes.register_node_namespace(node_ports.proxy_port(), node_ports.answerer_port());
+    // row's own publish. The daemon's setup publishes it at its address
+    // (NET-025); the port it publishes is the port the guest binds.
+    let node_proxy_port =
+        assign_node_proxy_port().context("assigning the node's proxy port")?;
+    boxes.register_node_namespace(node_proxy_port);
     // A box's row goes with its shuttle connection: the gate reports which
     // addresses each relay carried at the relay's end, and this drainer thread
     // applies the reports for the life of the process (NET-133).
@@ -618,21 +618,16 @@ fn run_foreground() -> Result<()> {
     alive_lock.inherit_into(&mut cmd);
     let mut child = cmd
         .env(MARKER_SOCK_ENV, &marker_sock_path)
-        // The node ports travel to the guest through the VMM child's env: the
-        // child is a separate process (like the marker socket path), and its
-        // backend appends them to the kernel command line, where the kernel
-        // hands unrecognized `KEY=VALUE` tokens to init as env vars. The
-        // explicit `.env` also shadows any inherited operator override under
-        // the same names, so the child carries exactly this resolution — the
-        // same pair the node row registered.
-        .env(
-            crate::vm::NODE_PROXY_PORT_ENV,
-            node_ports.proxy_port().to_string(),
-        )
-        .env(
-            crate::vm::NODE_ANSWERER_PORT_ENV,
-            node_ports.answerer_port().to_string(),
-        )
+        // The node's proxy port travels to the guest through the VMM child's
+        // env: the child is a separate process (like the marker socket path),
+        // and its backend appends it to the kernel command line, where the
+        // kernel hands unrecognized `KEY=VALUE` tokens to init as env vars.
+        // The explicit `.env` also shadows any inherited operator override
+        // under the same name, so the child carries exactly this resolution —
+        // the same port the node row registered. No answerer port rides: the
+        // in-VM daemon starts no answerer on a VM-backed host (NET-138), and
+        // the host answerer serves the zone.
+        .env(crate::vm::NODE_PROXY_PORT_ENV, node_proxy_port.to_string())
         .spawn()
         .with_context(|| format!("spawning VMM child: {}", exe.display()))?;
 
@@ -805,53 +800,27 @@ fn run_foreground() -> Result<()> {
 // Only `run_foreground` calls these, and it needs libkrun; without it the
 // crate is a runtime-bailing stub, but the tests below still cover this on
 // every target.
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NodePorts {
-    proxy: u16,
-    answerer: u16,
-}
-
-impl NodePorts {
-    /// The hostname proxy's TCP port the guest daemon binds as handed (NET-025).
-    #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-    pub(crate) fn proxy_port(&self) -> u16 {
-        self.proxy
-    }
-
-    /// The zone answerer's UDP port the guest daemon binds as handed (NET-025).
-    #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-    pub(crate) fn answerer_port(&self) -> u16 {
-        self.answerer
-    }
-}
-
-/// The defaults the assignment probes first. They mirror the native daemon's
-/// own defaults (`DEFAULT_EGRESS_PROXY_PORT` in minimald's `net/proxy.rs`,
-/// `ANSWERER_PORT` in its `net/answerer.rs`): `minvmd` does not depend on the
-/// daemon, so the values are pinned here beside the constants they mirror.
+/// The default the assignment probes first. It mirrors the native daemon's
+/// own default (`DEFAULT_EGRESS_PROXY_PORT` in minimald's `net/proxy.rs`):
+/// `minvmd` does not depend on the daemon, so the value is pinned here beside
+/// the constant it mirrors.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 const NODE_DEFAULT_PROXY_PORT: u16 = 7654;
-#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-const NODE_DEFAULT_ANSWERER_PORT: u16 = 7656;
 
-/// Assigns both node ports: TCP for the proxy, UDP for the answerer. The
-/// operator's override ([`crate::vm::NODE_PROXY_PORT_ENV`] /
-/// [`crate::vm::NODE_ANSWERER_PORT_ENV`] set in this supervisor's own env)
-/// wins over the probe, and the one resolved pair is what both the guest
-/// handoff (the VMM child's env) and the node row's own publishes are
-/// written from — handed == registered, never two resolutions.
+/// Assigns the node's hostname-proxy TCP port. The operator's override
+/// ([`crate::vm::NODE_PROXY_PORT_ENV`] set in this supervisor's own env) wins
+/// over the probe, and the one resolved port is what both the guest handoff
+/// (the VMM child's env) and the node row's own publish are written from —
+/// handed == registered, never two resolutions. The zone answerer's port is
+/// deliberately not the node's to hand: on a VM-backed host the in-VM daemon
+/// starts no answerer (NET-138) and the host answerer serves the zone, so a
+/// handed answerer port would be an admitted port with nothing behind it.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn assign_node_ports() -> Result<NodePorts> {
-    let proxy = match node_port_override(crate::vm::NODE_PROXY_PORT_ENV)? {
-        Some(proxy) => proxy,
-        None => assign_node_port(NODE_DEFAULT_PROXY_PORT, false)?,
-    };
-    let answerer = match node_port_override(crate::vm::NODE_ANSWERER_PORT_ENV)? {
-        Some(answerer) => answerer,
-        None => assign_node_port(NODE_DEFAULT_ANSWERER_PORT, true)?,
-    };
-    Ok(NodePorts { proxy, answerer })
+fn assign_node_proxy_port() -> Result<u16> {
+    match node_port_override(crate::vm::NODE_PROXY_PORT_ENV)? {
+        Some(proxy) => Ok(proxy),
+        None => assign_node_port(NODE_DEFAULT_PROXY_PORT),
+    }
 }
 
 /// Reads one operator override for a node port off this supervisor's env —
@@ -886,16 +855,11 @@ fn node_port_override(name: &'static str) -> Result<Option<u16>> {
 /// taken by another process — a lost race the guest's own log tail shows
 /// (a handed port never silently moves, NET-024).
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn assign_node_port(preferred: u16, udp: bool) -> Result<u16> {
+fn assign_node_port(preferred: u16) -> Result<u16> {
     use anyhow::Context as _;
     let probe = |port: u16| -> std::io::Result<u16> {
-        if udp {
-            let socket = std::net::UdpSocket::bind(("0.0.0.0", port))?;
-            Ok(socket.local_addr()?.port())
-        } else {
-            let listener = std::net::TcpListener::bind(("0.0.0.0", port))?;
-            Ok(listener.local_addr()?.port())
-        }
+        let listener = std::net::TcpListener::bind(("0.0.0.0", port))?;
+        Ok(listener.local_addr()?.port())
     };
     match probe(preferred) {
         Ok(assigned) => Ok(assigned),
@@ -1020,7 +984,7 @@ mod tests {
         // collides with a wildcard probe on Linux and not everywhere else.
         let held = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
         let busy = held.local_addr().unwrap().port();
-        let assigned = super::assign_node_port(busy, false).unwrap();
+        let assigned = super::assign_node_port(busy).unwrap();
         assert_ne!(assigned, busy, "a held port is not assigned as-is");
         assert!(assigned != 0, "the fallback is a real port");
 
@@ -1032,83 +996,56 @@ mod tests {
         let free = freed.local_addr().unwrap().port();
         drop(freed);
         assert_eq!(
-            super::assign_node_port(free, false).unwrap(),
+            super::assign_node_port(free).unwrap(),
             free,
             "a free port is assigned as asked"
         );
 
-        // The answerer's probe is the same default-first over UDP, held on
-        // the same wildcard the UDP probe addresses.
-        let held_udp = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
-        let busy_udp = held_udp.local_addr().unwrap().port();
-        let assigned_udp = super::assign_node_port(busy_udp, true).unwrap();
-        assert_ne!(
-            assigned_udp, busy_udp,
-            "a held UDP port is not assigned as-is"
-        );
+        // The supervisor assigns the proxy port and hands it to the guest:
+        // whatever the host picked, it is a real port the guest can bind as
+        // handed (the cmdline and bind halves are the vm.rs and minimald
+        // tests of the same name).
+        let port = super::assign_node_proxy_port().unwrap();
+        assert!(port != 0, "the node's proxy port is assigned");
 
-        // The supervisor assigns both ports as a pair and hands them to the
-        // guest: whatever the host picked, each is a real port the guest can
-        // bind as handed (the cmdline and bind halves are the vm.rs and
-        // minimald tests of the same name).
-        let ports = super::assign_node_ports().unwrap();
-        assert!(
-            ports.proxy_port() != 0 && ports.answerer_port() != 0,
-            "both node ports are assigned"
-        );
-
-        // The operator's override resolves the pair, and the one resolved
-        // pair is written twice from the same value: handed to the guest
+        // The operator's override resolves the port, and the one resolved
+        // port is written twice from the same value: handed to the guest
         // through the VMM child's env, and declared as the node row's own
-        // publishes. Pinned here through the override env, so the assertion
-        // can name both carries of the same values — handed == registered.
-        let previous = (
-            std::env::var(crate::vm::NODE_PROXY_PORT_ENV).ok(),
-            std::env::var(crate::vm::NODE_ANSWERER_PORT_ENV).ok(),
-        );
+        // publish. Pinned here through the override env, so the assertion
+        // can name both carries of the same value — handed == registered.
+        let previous = std::env::var(crate::vm::NODE_PROXY_PORT_ENV).ok();
         unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, "17901") };
-        unsafe { std::env::set_var(crate::vm::NODE_ANSWERER_PORT_ENV, "17902") };
-        let pinned = super::assign_node_ports().unwrap();
-        assert_eq!(pinned.proxy_port(), 17901, "the override is the resolution");
-        assert_eq!(
-            pinned.answerer_port(),
-            17902,
-            "the override is the resolution"
-        );
+        let pinned = super::assign_node_proxy_port().unwrap();
+        assert_eq!(pinned, 17901, "the override is the resolution");
         let registry = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
-        let node = registry.register_node_namespace(pinned.proxy_port(), pinned.answerer_port());
+        let node = registry.register_node_namespace(pinned);
         assert_eq!(
             node.admitted_ports(),
-            [17901, 17902],
-            "the row publishes the pair the guest is handed"
+            [17901],
+            "the row publishes the port the guest is handed — the hostname \
+             proxy only, the answerer is not the node's to admit (NET-138)"
         );
 
         // The override's own garbage fails at the supervisor, naming the
         // variable and the value — never a fallback to selection that would
-        // hand the guest a pair different from the one the operator pinned.
+        // hand the guest a port different from the one the operator pinned.
         unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, "no-port-here") };
-        let err = super::assign_node_ports().unwrap_err().to_string();
+        let err = super::assign_node_proxy_port().unwrap_err().to_string();
         assert!(
             err.contains("MINVMD_NODE_PROXY_PORT") && err.contains("no-port-here"),
             "an undecodable override names the variable and the value, got: {err}"
         );
         unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, "0") };
-        let err = super::assign_node_ports().unwrap_err().to_string();
+        let err = super::assign_node_proxy_port().unwrap_err().to_string();
         assert!(
             err.contains("not a port to pin"),
             "a zero override is refused, got: {err}"
         );
-        match &previous.0 {
+        match &previous {
             Some(previous) => unsafe {
                 std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, previous)
             },
             None => unsafe { std::env::remove_var(crate::vm::NODE_PROXY_PORT_ENV) },
-        }
-        match &previous.1 {
-            Some(previous) => unsafe {
-                std::env::set_var(crate::vm::NODE_ANSWERER_PORT_ENV, previous)
-            },
-            None => unsafe { std::env::remove_var(crate::vm::NODE_ANSWERER_PORT_ENV) },
         }
     }
 }
