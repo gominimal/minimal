@@ -423,6 +423,16 @@ test-cross: (_need "cross" "cargo install cross --locked")
     cross clippy --workspace --exclude minvmd --all-targets --target {{musl-target}} --locked -- -D warnings
     CROSS_CONTAINER_OPTS="--env HOME=/tmp" cross test --workspace --exclude minvmd --target {{musl-target}} --locked
 
+# commitlint is not replicated by `just ci`; `just hooks` installs its local
+# twin as the commit-msg hook (scripts/git-hooks/commit-msg) for this clone,
+# every worktree included, so an over-long line is refused before the commit
+# exists instead of after the push.
+#
+# Point this clone's git hooks at scripts/git-hooks (commit-msg = commitlint's local twin).
+hooks:
+    git config core.hooksPath scripts/git-hooks
+    @echo "hooks: core.hooksPath = scripts/git-hooks (commit-msg checks the message before each commit)"
+
 # Not replicated: commitlint, the dogfood jobs, the installer lane (`just test-installer`).
 #
 # The local PR gate set, cheapest first.

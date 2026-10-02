@@ -1,0 +1,27 @@
+#!/bin/sh
+# commit-msg hook: the local twin of CI's commitlint gate (commitlint.config.cjs).
+#
+# Install with `just hooks` (sets core.hooksPath to scripts/git-hooks for this
+# clone, every worktree included). With Node present it runs commitlint itself
+# against the message; without it, it applies the two length rules that account
+# for nearly every CI red: a subject or body line over 100 columns.
+set -eu
+msg="$1"
+
+if command -v npx >/dev/null 2>&1 && [ -f commitlint.config.cjs ]; then
+  if ! npx --no-install commitlint --edit "$msg" 2>/dev/null; then
+    # commitlint not installed locally: fall through to the length rules.
+    if npx --no-install commitlint --version >/dev/null 2>&1; then
+      exit 1
+    fi
+  else
+    exit 0
+  fi
+fi
+
+awk '
+  /^#/ { next }
+  NR == 1 && length > 100 { print "commit-msg: subject is " length " columns (max 100)"; bad = 1 }
+  NR > 1 && length > 100 { print "commit-msg: body line " NR " is " length " columns (max 100)"; bad = 1 }
+  END { exit bad }
+' "$msg"

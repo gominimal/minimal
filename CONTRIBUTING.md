@@ -16,6 +16,8 @@ We welcome contributions of all kinds — bug reports, documentation improvement
 This repository uses [Conventional Commits v1.0.0](https://www.conventionalcommits.org/en/v1.0.0/),
 enforced in CI by **commitlint**. See [docs/commit-conventions.md](docs/commit-conventions.md)
 for the full standard, types, scopes, and examples.
+Run `just hooks` once per clone to install the local twin of that gate as the
+`commit-msg` hook, so an over-long line is refused before the commit exists.
 
 The most common trip-up: a commit has **one type**, and multiple scopes go
 *inside* the parentheses — `type(scope-a,scope-b): summary`, **not**
