@@ -902,7 +902,7 @@ impl BepStack {
         }
     }
 
-    /// The pool's per-slot service: new established connections dial, live
+    /// The pool's per-slot service: newly accepted connections dial, live
     /// flows' bytes move, finished flows' slots return to the pool.
     fn service(&mut self) {
         for idx in 0..self.slots.len() {
@@ -937,10 +937,16 @@ impl BepStack {
             self.retire_slot(idx);
             return;
         }
-        if is_listening_flow && state == tcp::State::Established {
+        if is_listening_flow && matches!(state, tcp::State::Established | tcp::State::CloseWait) {
             // The cap pass has already counted this connection (and aborted
             // it if it was past its box's share); a slot that is still
-            // established is delivered.
+            // carrying it is delivered. CloseWait is included because a
+            // handshake can complete straight into it: smoltcp folds a FIN
+            // that arrives with the handshake's ACK — and the box's FIN
+            // always lands before the service pass, these turns being a
+            // hundred times slower than a kernel's — past `Established`
+            // without a stop. A box that finished sending as it connected
+            // still owns a connection: it can still receive the answer.
             let remote = self
                 .slot_remote(idx)
                 .expect("an accepted socket names the box it came from");
@@ -1591,6 +1597,18 @@ pub mod test_util {
             let socket = self.host.sockets.get_mut::<tcp::Socket>(*handle);
             socket.recv_slice(buf).unwrap_or(0)
         }
+
+        /// Finish sending on the flow: a FIN leaves on the next
+        /// [`poll`](Self::poll). This is the shape of a client that asked
+        /// its whole question with the connect and shut its write side
+        /// down, still listening for the answer — a probe that half-closes
+        /// as it connects.
+        pub fn close(&mut self, flow: usize) {
+            let Some(handle) = self.flows.get(flow) else {
+                return;
+            };
+            self.host.sockets.get_mut::<tcp::Socket>(*handle).close();
+        }
     }
 
     /// The leg's stack wired to [`TestBox`]es over channels, driven turn by
@@ -1661,6 +1679,14 @@ pub mod test_util {
         #[must_use]
         pub fn pool_len(&self) -> usize {
             self.stack.pool_len()
+        }
+
+        /// The instant the next [`turn`](Self::turn) polls the stack at, so
+        /// a test can poll a box between turns without leaving the lane's
+        /// clock.
+        #[must_use]
+        pub fn now(&self) -> Instant {
+            Instant::from_millis(self.clock_millis)
         }
 
         /// One turn: the boxes' queued frames to the stack, the stack's one
@@ -2830,6 +2856,71 @@ mod tests {
         assert!(
             answer.starts_with(b"source="),
             "B still connects through its share"
+        );
+    }
+
+    /// NET-132/T69: a box that finished sending as it connected still owns
+    /// a connection. A FIN that arrives with — or right behind — the
+    /// handshake's ACK takes the pool's socket straight past `Established`
+    /// into `CloseWait`, and such a connection is still delivered: the
+    /// acceptor takes it from the box's own switch address, and the answer
+    /// still reaches a box that can only listen.
+    #[tokio::test]
+    async fn a_half_closed_connection_is_still_delivered() {
+        let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let box_ip = Ipv4Addr::from(subnet.first_ptask());
+
+        h.boxes.register(box_ip);
+        drive(&mut h.lane, 2).await;
+        h.lane.add_box(box_ip);
+        drive(&mut h.lane, 1).await;
+        h.lane.boxes_mut()[0].arp_for(proxy_ip);
+        drive(&mut h.lane, 3).await;
+
+        // Three turns in: the SYN across, the stack asking for the box's
+        // address on the way, the SYN-ACK back, the box established — its
+        // ACK still queued on the box's side of the lane, so the stack's
+        // socket is not established yet and nothing has been delivered.
+        let flow = h.lane.boxes_mut()[0].connect(proxy_ip, PROXY_PORT);
+        drive(&mut h.lane, 3).await;
+        assert_eq!(h.lane.boxes()[0].flow_state(flow), State::Established);
+        assert_eq!(
+            h.acceptor.as_ref().expect("acceptor").connections(),
+            0,
+            "the handshake has not reached the stack's service pass yet"
+        );
+
+        // The box finished sending with the connect, the way the e2e probe
+        // does: its FIN joins the handshake's ACK in the box's queue, so the
+        // stack's one poll takes the connection straight to CloseWait — a
+        // handshake the service pass never sees as established.
+        let now = h.lane.now();
+        {
+            let b = &mut h.lane.boxes_mut()[0];
+            b.close(flow);
+            b.poll(now);
+        }
+        drive(&mut h.lane, 8).await;
+
+        // The connection was delivered anyway: the acceptor took it once,
+        // from the box's own switch address, at the proxy's port.
+        let accepted = h.acceptor.as_ref().expect("acceptor").accepted();
+        assert_eq!(
+            accepted.len(),
+            1,
+            "a connection the box half-closed at connect was still delivered"
+        );
+        assert_eq!(accepted[0].source.addr, IpAddress::Ipv4(box_ip));
+        assert_eq!(accepted[0].destination.addr, IpAddress::Ipv4(proxy_ip));
+        assert_eq!(accepted[0].destination.port, PROXY_PORT);
+        // And the answer reached the box, which only ever listens.
+        let answer = read_flow(&mut h.lane, 0, flow, 8).await;
+        assert!(
+            answer.starts_with(b"source="),
+            "the answer reached a box that half-closed at connect: {:?}",
+            String::from_utf8_lossy(&answer)
         );
     }
 
