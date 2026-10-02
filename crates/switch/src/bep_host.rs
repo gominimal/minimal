@@ -90,8 +90,19 @@
 //! shape the box's own answer would have carried, fed straight back in
 //! through the device's receive queue. An address with no pin gets no
 //! answer at all — no request is aimed, nothing is broadcast, and the
-//! flow's own retransmission asks again when a row gives it a pin. The
-//! smoltcp feature set this crate builds with excludes `proto-ipv6`, so
+//! flow's own retransmission asks again when a row gives it a pin.
+//!
+//! The same ruling faces the inbound lane: smoltcp fills the interface's
+//! neighbour cache from any ARP packet aimed at the leg — requests
+//! included — taking the sender's address and MAC as given, so the
+//! pre-screen drops every inbound ARP request or reply whose sender pair
+//! is neither a pinned pair nor the address's switch-derived MAC, with a
+//! throttled warn naming the claimed address. A box's bytes are sent only
+//! to that box, whatever another box claims on the lane; a request whose
+//! pair holds still passes, so a box that has never connected can still
+//! find the leg.
+//!
+//! The smoltcp feature set this crate builds with excludes `proto-ipv6`, so
 //! the stack cannot emit neighbour solicitation, router solicitation or
 //! MLD either.
 //! `idle_peer_emits_no_frames` pins the silence and `peer_binds_no_socket`
@@ -876,6 +887,7 @@ pub struct BepStack {
     row_warns: WarnThrottle,
     mac_warns: WarnThrottle,
     down_warns: WarnThrottle,
+    neighbour_warns: WarnThrottle,
 }
 
 impl BepStack {
@@ -916,6 +928,7 @@ impl BepStack {
             row_warns: WarnThrottle::default(),
             mac_warns: WarnThrottle::default(),
             down_warns: WarnThrottle::default(),
+            neighbour_warns: WarnThrottle::default(),
         }
     }
 
@@ -991,6 +1004,11 @@ impl BepStack {
     /// is the sum of the shares, and every SYN in one drain is decided
     /// before any socket answers it.
     ///
+    /// Each frame class is ruled in its own arm, so a later ruling — a
+    /// per-port active reject for UDP, say — is added to its own class
+    /// without touching another's: the arms stay separate, never folded
+    /// into one drop path.
+    ///
     /// A connection-opening SYN to [`PROXY_PORT`] at the leg's address is
     /// checked against its source's row: no row, no connection — the
     /// box-side answer to a source the registry does not hold. A SYN
@@ -1013,6 +1031,26 @@ impl BepStack {
     /// with no socket at all. The socket that holds the tuple answers
     /// its own retransmits, and the cap never counts one connection
     /// twice.
+    ///
+    /// An inbound ARP request or reply is ruled on its sender's claim
+    /// (see [`ArpClaim`]): smoltcp fills the interface's neighbour cache
+    /// from any ARP aimed at the leg, requests included, taking the
+    /// sender's address and MAC as given, so a claim that is neither a
+    /// pinned pair nor the address's switch-derived MAC — a box
+    /// announcing a sibling's address with its own MAC — is dropped
+    /// before the interface ever sees it, with a throttled warn naming
+    /// the claimed address. A claim that holds passes, so the leg still
+    /// answers ARP requests for its own address and a box that has never
+    /// connected — whose first ARP precedes any pin — can still find it.
+    /// Nothing here is aimed at a box and nothing is answered: the drop
+    /// is silence.
+    ///
+    /// Everything else passes through untouched, on its own path: UDP
+    /// datagrams and every segment that does not open a connection reach
+    /// the interface, which answers them the way a stack answers —
+    /// port-unreachable for a datagram with no socket, a reset for a
+    /// port nothing listens at. Unpinned addresses keep getting no
+    /// answer at all there; that silence is intended.
     ///
     /// An admitted SYN pins its source address to the frame's source MAC
     /// — the pin [`reconcile`] drops when the row withdraws, and the one
@@ -1050,7 +1088,31 @@ impl BepStack {
         let leg_ip = self.host.ip();
         let leg_mac = self.host.mac();
         for frame in self.host.take_inbound() {
+            // The neighbour ruling's inbound half, its own arm: an ARP
+            // frame is ruled on its sender's claim and never reaches a
+            // listener or a socket either way. `ArpClaim::parse` leaves
+            // every other frame to the arms below.
+            if let Some(claim) = ArpClaim::parse(&frame) {
+                if claim.holds(&self.answers) {
+                    self.host.enqueue_inbound(frame);
+                } else {
+                    self.neighbour_warns.hit(now, |suppressed| {
+                        tracing::warn!(
+                            source = %claim.addr,
+                            mac = %claim.mac,
+                            suppressed,
+                            "box egress proxy: dropped an ARP claim whose sender \
+                             pair is neither pinned nor the address's \
+                             switch-derived MAC"
+                        );
+                    });
+                }
+                continue;
+            }
             let Some(syn) = ScreenedSyn::parse(&frame, leg_ip) else {
+                // Everything else passes through on its own path — UDP
+                // datagrams included, so a later per-port active reject
+                // is added here without touching the arms above it.
                 self.host.enqueue_inbound(frame);
                 continue;
             };
@@ -1108,14 +1170,24 @@ impl BepStack {
 
     /// Reconcile the pool against the box source: a new row adds its share
     /// of listening sockets, a withdrawn row's live flows are aborted —
-    /// their reset leaves this turn — its pin is dropped with them (a pin
-    /// that outlived its row would answer the next occupant of the address
-    /// with the old occupant's MAC), and the pool is then trimmed to the
-    /// registered shares, idle listeners first, because a slot is
-    /// anonymous once it is in the pool: the total is the sum of the
-    /// shares, and which box's connection a slot carries is written on the
-    /// connection, not the slot. A connection from a source with no row is
-    /// the cap pass's to answer: a source with no row holds nothing.
+    /// their reset leaves this turn — and only then is its pin dropped
+    /// with them (a pin that outlived its row would answer the next
+    /// occupant of the address with the old occupant's MAC), and the pool
+    /// is then trimmed to the registered shares, idle listeners first,
+    /// because a slot is anonymous once it is in the pool: the total is
+    /// the sum of the shares, and which box's connection a slot carries is
+    /// written on the connection, not the slot. A connection from a source
+    /// with no row is the cap pass's to answer: a source with no row holds
+    /// nothing.
+    ///
+    /// The sockets end before the pin drops because the interface's own
+    /// neighbour cache keeps the withdrawn row's entry for up to 60 s
+    /// after `unpin`, and that outliving is safe only because no socket
+    /// is left to send into the stale entry — a released address wears
+    /// the same derived MAC on its next occupant, so a live socket for
+    /// the old row would reach the new holder — and because a released
+    /// address is not handed out again within the cache's lifetime: the
+    /// switch's address-reuse quarantine must stay longer than 60 s.
     fn reconcile(&mut self) {
         let desired: Vec<Ipv4Address> = self.boxes.box_switch_addresses();
         let cap = self.wire.per_source_cap;
@@ -1455,6 +1527,56 @@ impl BepStack {
             activated: None,
             flow: Flow::Listening,
         };
+    }
+}
+
+/// The sender claim one inbound ARP frame makes: the address it speaks
+/// from and the MAC it wears — the pair smoltcp's `process_arp` would
+/// take as given and write into the leg's neighbour cache from any ARP
+/// packet aimed at the leg, requests included. A claim that does not
+/// hold is dropped in the pre-screen, so the cache never learns it and
+/// no answer is aimed at the claimed MAC.
+struct ArpClaim {
+    /// The address the ARP speaks from — claimed, not yet believed.
+    addr: Ipv4Addr,
+    /// The MAC the ARP says it wears — the claim's other half.
+    mac: EthernetAddress,
+}
+
+impl ArpClaim {
+    /// Recognize the frame the neighbour ruling faces: an ARP request or
+    /// reply, whatever it is aimed at, because a claim that is not aimed
+    /// at the leg is still a claim, and the leg answers no part of it.
+    /// `None` for every frame that is not one — an ARP with an operation
+    /// this stack does not speak, and everything that is not ARP at all —
+    /// and the caller rules on those in their own arms.
+    fn parse(frame: &[u8]) -> Option<Self> {
+        let eth = EthernetFrame::new_checked(frame).ok()?;
+        if eth.ethertype() != EthernetProtocol::Arp {
+            return None;
+        }
+        let packet = ArpPacket::new_checked(eth.payload()).ok()?;
+        match ArpRepr::parse(&packet).ok()? {
+            ArpRepr::EthernetIpv4 {
+                operation: ArpOperation::Request | ArpOperation::Reply,
+                source_hardware_addr: mac,
+                source_protocol_addr: addr,
+                ..
+            } => Some(Self { addr, mac }),
+            _ => None,
+        }
+    }
+
+    /// Whether the claim holds: the sender pair is one the pre-screen
+    /// pinned — the fact the box's admitted SYN earned — or the MAC is the
+    /// address's switch-derived one, the MAC a pinned pair always carries
+    /// and the one a box's first ARP still needs to pass, before any pin
+    /// exists, for the box to connect at all. A claim wearing another
+    /// box's MAC — a sibling's address announced from this box's tap —
+    /// holds neither way.
+    fn holds(&self, answers: &NeighbourAnswers) -> bool {
+        answers.pinned_mac(self.addr) == Some(self.mac)
+            || self.mac == EthernetAddress(MacAddr::for_switch_ip(self.addr).0)
     }
 }
 
@@ -2211,6 +2333,16 @@ pub mod test_util {
             self.stack.pool_len()
         }
 
+        /// The pin `addr` carries, when the pre-screen has admitted a
+        /// connection from it: the MAC its SYN came from. `None` once its
+        /// row withdraws — the observable the pin-drop tests assert
+        /// through, since a pin that outlived its row would answer the
+        /// address's next occupant with the old occupant's MAC.
+        #[must_use]
+        pub fn pinned_mac(&self, addr: Ipv4Addr) -> Option<EthernetAddress> {
+            self.stack.answers.pinned_mac(addr)
+        }
+
         /// The instant the next [`turn`](Self::turn) polls the stack at, so
         /// a test can poll a box between turns without leaving the lane's
         /// clock.
@@ -2229,9 +2361,10 @@ pub mod test_util {
         /// Feed the leg a frame as if a box on the lane had sent it: the
         /// raw-frame path the tests use for the shapes no box's own stack
         /// would write — a SYN re-sent on a tuple the pool already holds,
-        /// a SYN whose source MAC is not its address's switch-derived one.
-        /// The frame is ruled on by the next [`turn`](Self::turn)'s
-        /// pre-screen, exactly as a box's frames are.
+        /// a SYN whose source MAC is not its address's switch-derived one,
+        /// an ARP claim that borrows a sibling's address. The frame is
+        /// ruled on by the next [`turn`](Self::turn)'s pre-screen, exactly
+        /// as a box's frames are.
         pub fn inject_frame(&mut self, frame: Vec<u8>) {
             let _ = self.stack_in.send(frame);
         }
@@ -2288,8 +2421,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
-    /// One ARP request frame, as a box on the plan would send it: broadcast,
-    /// from the asker's switch-derived MAC, asking who has `target_ip`.
+    /// One ARP request frame: broadcast, asking who has `target_ip`. The
+    /// sender pair — `sender_mac` at `sender_ip` — is the caller's to
+    /// choose: a box's own switch-derived pair, or the spoofed claim a
+    /// box's own stack would never write, a sibling's address announced
+    /// from another box's MAC.
     fn arp_request(
         sender_mac: EthernetAddress,
         sender_ip: Ipv4Addr,
@@ -3043,6 +3179,43 @@ mod tests {
         }
     }
 
+    /// A stand-in acceptor of exactly one delivery: it answers one line at
+    /// accept and holds a second line until the test signals it — the shape
+    /// the tests use to place bytes at a chosen point in the flow's story,
+    /// after a claim the pre-screen should have dropped or after a row's
+    /// withdrawal. The late write is the probe, not the assertion: the
+    /// connection it lands in may already be gone.
+    async fn late_answer_acceptor(
+        sock: &Path,
+        token: [u8; TOKEN_LEN],
+    ) -> tokio::sync::oneshot::Sender<()> {
+        let listener = tokio::net::UnixListener::bind(sock).expect("bind the stand-in acceptor");
+        let (late_tx, late_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("the delivery dials");
+            let mut head = [0u8; TOKEN_LEN + DELIVERY_HEADER_LEN];
+            stream
+                .read_exact(&mut head)
+                .await
+                .expect("token then header");
+            assert_eq!(&head[..TOKEN_LEN], &token[..], "this boot's token");
+            stream
+                .write_all(b"first\n")
+                .await
+                .expect("the answer at accept");
+            let _ = late_rx.await;
+            let _ = stream.write_all(b"late\n").await;
+            let mut sink = [0u8; FLOW_CHUNK_LEN];
+            loop {
+                match stream.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+        late_tx
+    }
+
     /// Drive the lane for `rounds` turns, letting the delivery tasks run
     /// between them.
     async fn drive(lane: &mut test_util::TestLane, rounds: usize) {
@@ -3439,6 +3612,94 @@ mod tests {
         );
     }
 
+    /// NET-132/T69: withdrawal ends the row's sockets before the pin
+    /// drops. The interface's own neighbour cache keeps the withdrawn
+    /// row's entry for up to 60 s after the unpin, and a released
+    /// address wears the same switch-derived MAC on its next occupant,
+    /// so a socket still open for the old row could send its owed bytes
+    /// into that stale entry and reach the new holder. The row is
+    /// withdrawn while its flow is open and the acceptor still owes it
+    /// bytes: the flow's socket is aborted — its reset is the one frame
+    /// that leaves for it — and no frame for it leaves the peer
+    /// afterwards, not even when the owed bytes arrive.
+    #[tokio::test]
+    async fn a_withdrawn_rows_flow_sends_no_frame_after_its_reset() {
+        let subnet = SwitchSubnet::default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proxy_sock = dir.path().join("proxy.sock");
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let box_ip = Ipv4Addr::from(subnet.first_ptask());
+        let box_mac = EthernetAddress(MacAddr::for_switch_ip(box_ip).0);
+        let token = [0x5au8; TOKEN_LEN];
+
+        let late_tx = late_answer_acceptor(&proxy_sock, token).await;
+
+        let boxes = TestBoxes::default();
+        boxes.register(box_ip);
+        let wire = BepWire::new(proxy_sock, token).with_per_source_cap(1);
+        let mut lane = test_util::TestLane::new(subnet, wire, Arc::new(boxes.clone()));
+        lane.add_box(box_ip);
+        drive(&mut lane, 2).await;
+        lane.boxes_mut()[0].arp_for(proxy_ip);
+        drive(&mut lane, 3).await;
+
+        // The flow is open and delivered, and the acceptor still owes it a
+        // late answer — bytes that would leave through the leg's socket if
+        // the withdrawal left one standing.
+        let flow = lane.boxes_mut()[0].connect(proxy_ip, PROXY_PORT);
+        drive(&mut lane, 40).await;
+        let answer = read_flow(&mut lane, 0, flow, 8).await;
+        assert_eq!(answer, b"first\n", "the flow was delivered and answered");
+
+        // Its row withdraws while the flow is open.
+        let mark = lane.stack_outbound().len();
+        boxes.withdraw(box_ip);
+        drive(&mut lane, 10).await;
+        assert_eq!(
+            lane.boxes()[0].flow_state(flow),
+            State::Closed,
+            "the withdrawn row's socket was aborted"
+        );
+
+        // The one frame that left for it is the abort's own reset, and
+        // nothing else: the socket ended, so no byte it still owed could
+        // be sent into the neighbour cache entry the row left behind.
+        let outbound = lane.stack_outbound();
+        assert_eq!(
+            outbound.len(),
+            mark + 1,
+            "the withdrawal answered its open flow with one reset and \
+             nothing else"
+        );
+        let eth = EthernetFrame::new_checked(&outbound[mark]).expect("the peer sends ethernet");
+        assert_eq!(
+            eth.dst_addr(),
+            box_mac,
+            "the reset is addressed to the box whose row withdrew"
+        );
+        let ip = Ipv4Packet::new_checked(eth.payload()).expect("an IPv4 packet");
+        let tcp = TcpPacket::new_checked(ip.payload()).expect("a TCP segment");
+        assert!(tcp.rst(), "the frame is the aborted socket's reset");
+        assert_eq!(tcp.dst_port(), test_util::FIRST_CLIENT_PORT);
+
+        // The bytes the acceptor still owed the flow arrive — and no
+        // frame for it leaves the peer: the socket that would have sent
+        // them is gone, and the box never receives them.
+        let mark_after_reset = outbound.len();
+        late_tx.send(()).expect("the acceptor's connection is held");
+        drive(&mut lane, 30).await;
+        assert_eq!(
+            lane.stack_outbound().len(),
+            mark_after_reset,
+            "no frame for the withdrawn row's flow left the peer afterwards"
+        );
+        let late = read_flow(&mut lane, 0, flow, 8).await;
+        assert!(
+            late.is_empty(),
+            "the box never received the bytes the dead flow was still owed"
+        );
+    }
+
     /// NET-132/T69: a box that finished sending as it connected still owns
     /// a connection. A FIN that arrives with — or right behind — the
     /// handshake's ACK takes the pool's socket straight past `Established`
@@ -3624,6 +3885,96 @@ mod tests {
         );
     }
 
+    /// NET-132/T69: the leg never learns a neighbour from an ARP claim.
+    /// smoltcp fills its neighbour cache from any inbound ARP aimed at the
+    /// leg — requests included — taking the sender's address and MAC as
+    /// given, so a box that sends the leg an ARP claiming a sibling's
+    /// address with its own MAC re-points where the leg sends the
+    /// sibling's return bytes. The pre-screen drops the claim — it is
+    /// neither a pinned pair nor the claimed address's switch-derived
+    /// MAC — and B's return bytes still reach only B, at B's MAC. The
+    /// leg still answers the ARP requests whose senders hold, so a box
+    /// that has never connected can still find it.
+    #[tokio::test]
+    async fn a_gratuitous_arp_cannot_re_point_a_boxs_return_bytes() {
+        let subnet = SwitchSubnet::default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proxy_sock = dir.path().join("proxy.sock");
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let box_a = Ipv4Addr::from(subnet.first_ptask());
+        let box_b = Ipv4Addr::from(subnet.first_ptask() + 1);
+        let a_mac = EthernetAddress(MacAddr::for_switch_ip(box_a).0);
+        let b_mac = EthernetAddress(MacAddr::for_switch_ip(box_b).0);
+        let token = [0x5au8; TOKEN_LEN];
+
+        let late_tx = late_answer_acceptor(&proxy_sock, token).await;
+
+        let boxes = TestBoxes::default();
+        boxes.register(box_a);
+        boxes.register(box_b);
+        let wire = BepWire::new(proxy_sock, token).with_per_source_cap(1);
+        let mut lane = test_util::TestLane::new(subnet, wire, Arc::new(boxes.clone()));
+        lane.add_box(box_a);
+        lane.add_box(box_b);
+        drive(&mut lane, 2).await;
+        lane.boxes_mut()[0].arp_for(proxy_ip);
+        lane.boxes_mut()[1].arp_for(proxy_ip);
+        drive(&mut lane, 3).await;
+
+        // B holds a delivered flow the acceptor still owes a late answer.
+        let b_flow = lane.boxes_mut()[1].connect(proxy_ip, PROXY_PORT);
+        drive(&mut lane, 40).await;
+        let answer = read_flow(&mut lane, 1, b_flow, 8).await;
+        assert_eq!(answer, b"first\n", "B's flow was delivered and answered");
+
+        // Box A sends the leg an ARP claiming B's address with A's MAC —
+        // the frame smoltcp would fill its neighbour cache from, aimed
+        // at the leg's own address so the cache would take it.
+        let mark = lane.stack_outbound().len();
+        lane.inject_frame(arp_request(a_mac, box_b, proxy_ip));
+        drive(&mut lane, 5).await;
+        assert_eq!(
+            lane.stack_outbound().len(),
+            mark,
+            "the claim was answered with nothing: no reply, no frame at all"
+        );
+
+        // The acceptor's late answer still reaches B — and only B, at
+        // B's MAC: the cache entry the claim would have overwritten
+        // never learned it.
+        late_tx.send(()).expect("the acceptor's connection is held");
+        drive(&mut lane, 30).await;
+        let late = read_flow(&mut lane, 1, b_flow, 8).await;
+        assert_eq!(late, b"late\n", "B's return bytes still reach B");
+        let outbound = lane.stack_outbound();
+        assert!(
+            outbound.len() > mark,
+            "the late answer left the peer, addressed somewhere"
+        );
+        for frame in &outbound[mark..] {
+            let eth = EthernetFrame::new_checked(frame).expect("the peer sends ethernet");
+            assert_ne!(
+                eth.dst_addr(),
+                EthernetAddress::BROADCAST,
+                "the peer never emits a broadcast frame"
+            );
+            assert_eq!(
+                eth.dst_addr(),
+                b_mac,
+                "every frame the leg sent after the claim is addressed to \
+                 B, never to the claimant's MAC"
+            );
+            if eth.ethertype() == EthernetProtocol::Arp {
+                let arp = ArpPacket::new_checked(eth.payload()).expect("an ARP packet");
+                assert_ne!(
+                    arp.operation(),
+                    ArpOperation::Request,
+                    "the peer never emits an ARP request"
+                );
+            }
+        }
+    }
+
     /// NET-132/T69: a SYN from a registered address whose frame carries a
     /// MAC that is not the address's switch-derived one never reaches a
     /// listener: a connection opened from a row's address but another
@@ -3695,27 +4046,25 @@ mod tests {
         assert_eq!(h.lane.pool_len(), 1, "the share stands, still listening");
     }
 
-    /// NET-132/T69: a withdrawn address's pin goes with its row. Box A
-    /// delivers a flow from its address; its row withdraws; another box —
-    /// registered at the same address, wearing a different MAC — connects.
-    /// The new occupant's claim is refused (its MAC is not the address's
-    /// switch-derived one) and never delivered, and every frame the peer
-    /// sends it is addressed to the new MAC: never the old occupant's,
-    /// never a broadcast. A pin that outlived its row — or a refusal
-    /// answered from the address's derived MAC, or from the stale
-    /// neighbour cache entry — would put those frames on the old
-    /// occupant's MAC; this is the edge that catches it.
+    /// NET-132/T69: an address's pin goes with its row, and the address's
+    /// next occupant arrives as itself. Box A at X delivers a flow and its
+    /// row withdraws; the pin for X is gone with it — asserted directly
+    /// through the lane's accessor, because a pin that outlived its row
+    /// answers the address's next occupant with the old occupant's MAC
+    /// and no frame on the lane would show it. Between the rows, a frame
+    /// from X to the leg gets no delivery. A box re-registered at X,
+    /// wearing X's switch-derived MAC, connects and is delivered, and
+    /// every frame the peer sends it is addressed to that MAC — zero ARP
+    /// requests, zero broadcasts.
     #[tokio::test]
-    async fn a_reused_address_refusal_follows_its_new_occupant() {
+    async fn a_reused_address_arrives_only_through_a_new_row() {
         let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
         let subnet = SwitchSubnet::default();
         let proxy_ip = subnet.box_egress_proxy_address();
         let box_ip = Ipv4Addr::from(subnet.first_ptask());
-        let old_mac = EthernetAddress(MacAddr::for_switch_ip(box_ip).0);
-        let new_mac = EthernetAddress([0x52, 0x54, 0x00, 0x99, 0x99, 0x99]);
+        let box_mac = EthernetAddress(MacAddr::for_switch_ip(box_ip).0);
 
-        // Box A at the address delivers a flow: the address carries a pin
-        // and the leg's neighbour cache entry.
+        // Box A at X delivers a flow: the address carries a pin.
         h.boxes.register(box_ip);
         drive(&mut h.lane, 2).await;
         h.lane.add_box(box_ip);
@@ -3727,73 +4076,116 @@ mod tests {
         assert_eq!(h.lane.boxes()[0].flow_state(a_flow), State::Established);
         let delivered = h.acceptor.as_ref().expect("acceptor").accepted().len();
         assert_eq!(delivered, 1, "box A's flow was delivered");
+        assert_eq!(
+            h.lane.pinned_mac(box_ip),
+            Some(box_mac),
+            "the address carries a pin while its row stands"
+        );
 
-        // Its row withdraws: the share goes, the flow aborts, the pin
-        // goes with it. The leg's neighbour cache entry is the stale
-        // state a wrong answer could be built from.
+        // Its row withdraws: the share goes, the flow aborts, and the pin
+        // for X goes with it.
         h.boxes.withdraw(box_ip);
         drive(&mut h.lane, 10).await;
         assert_eq!(
-            h.lane.pool_len(),
-            0,
-            "the withdrawn row's share went with it"
+            h.lane.boxes()[0].flow_state(a_flow),
+            State::Closed,
+            "the withdrawn row's flow was aborted"
         );
+        assert_eq!(h.lane.pinned_mac(box_ip), None, "the pin went with the row");
 
-        // A box with a different MAC is registered at the same address and
-        // connects.
-        h.boxes.register(box_ip);
-        drive(&mut h.lane, 2).await;
-        let mark = h.lane.stack_outbound().len();
-        h.lane.inject_frame(tcp_syn_from(
-            new_mac,
+        // Between the rows, a frame from X to the leg gets no delivery:
+        // the pool holds nothing for it, and the acceptor takes nothing.
+        h.lane.inject_frame(tcp_syn(
             box_ip,
             proxy_ip,
-            test_util::FIRST_CLIENT_PORT,
+            test_util::FIRST_CLIENT_PORT + 1,
             PROXY_PORT,
         ));
         drive(&mut h.lane, 3).await;
-
-        // Every frame the peer sent the new occupant is addressed to the
-        // new MAC — the one frame it had coming was the refusal's reset —
-        // and none to the old occupant's, none to a broadcast. The
-        // connection itself was never delivered.
-        let outbound = h.lane.stack_outbound();
-        assert_eq!(
-            outbound.len(),
-            mark + 1,
-            "the refused reuse is answered with one reset and nothing else"
-        );
-        let eth = EthernetFrame::new_checked(&outbound[mark]).expect("the peer sends ethernet");
-        assert_ne!(
-            eth.dst_addr(),
-            EthernetAddress::BROADCAST,
-            "the peer never emits a broadcast frame"
-        );
-        assert_ne!(
-            eth.dst_addr(),
-            old_mac,
-            "the old occupant's MAC gets nothing: the pin went with the row"
-        );
-        assert_eq!(
-            eth.dst_addr(),
-            new_mac,
-            "the refusal follows the new occupant's MAC"
-        );
         assert_eq!(
             h.acceptor.as_ref().expect("acceptor").accepted().len(),
             delivered,
-            "the reuse was never delivered"
+            "a frame from the withdrawn address was never delivered"
         );
+
+        // A box re-registered at X, wearing X's switch-derived MAC,
+        // connects and is delivered. Every frame the peer sends it is
+        // addressed to that MAC, with zero ARP requests and zero
+        // broadcasts: the pin the new row earned says the same thing the
+        // switch's static lease does.
+        h.boxes.register(box_ip);
+        drive(&mut h.lane, 2).await;
+        let mark = h.lane.stack_outbound().len();
+        let new_flow = h.lane.boxes_mut()[0].connect(proxy_ip, PROXY_PORT);
+        drive(&mut h.lane, 30).await;
+        let answer = read_flow(&mut h.lane, 0, new_flow, 8).await;
+        assert!(
+            answer.starts_with(b"source="),
+            "the address's new occupant was delivered: {:?}",
+            String::from_utf8_lossy(&answer)
+        );
+        assert_eq!(
+            h.lane.pinned_mac(box_ip),
+            Some(box_mac),
+            "the new row's pin is the address's derived pair"
+        );
+        let accepted = h.acceptor.as_ref().expect("acceptor").accepted();
+        assert_eq!(
+            accepted.len(),
+            delivered + 1,
+            "one connection per admitted flow"
+        );
+        assert_eq!(
+            accepted[1].source.addr,
+            IpAddress::Ipv4(box_ip),
+            "the delivery is from the address, as its new holder"
+        );
+        let mut saw_arp = false;
+        for frame in &h.lane.stack_outbound()[mark..] {
+            let eth = EthernetFrame::new_checked(frame).expect("the peer sends ethernet");
+            assert_ne!(
+                eth.dst_addr(),
+                EthernetAddress::BROADCAST,
+                "the peer never emits a broadcast frame"
+            );
+            assert_eq!(
+                eth.dst_addr(),
+                box_mac,
+                "every frame is addressed to the address's switch-derived MAC"
+            );
+            if eth.ethertype() == EthernetProtocol::Arp {
+                saw_arp = true;
+                let arp = ArpPacket::new_checked(eth.payload()).expect("an ARP packet");
+                assert_ne!(
+                    arp.operation(),
+                    ArpOperation::Request,
+                    "the peer never emits an ARP request"
+                );
+            }
+        }
+        assert!(!saw_arp, "no ARP at all crosses the lane for this flow");
     }
 
     /// NET-132/T69: a bare SYN on a tuple the pool already holds is
-    /// dropped, not passed to the interface: smoltcp assigns an inbound
-    /// SYN to any listening socket in arrival order, so a retransmit let
-    /// through would open a second connection on the tuple in a
-    /// sibling's listener and leave the sibling's own same-turn SYN with
-    /// no socket at all. Box A holds its one connection (its share is the
-    /// cap), re-sends a SYN on that tuple in the same turn as a sibling's
-    /// SYN — and the sibling is delivered.
+    /// dropped, not passed to the interface: smoltcp gives an inbound SYN
+    /// to the first socket in set order whose `accepts()` matches, and a
+    /// listening socket accepts any SYN to the port — so a retransmit
+    /// that reaches the interface is taken by whichever free listener
+    /// sits ahead of the socket that holds the tuple, opening a second
+    /// connection on it and leaving the sibling's own same-turn SYN with
+    /// no socket at all.
+    ///
+    /// The set is built so the drop is what the test reaches, not the
+    /// held socket's own 4-tuple match: at cap 1, B connects first and A
+    /// connects second, so B's connection sits in the pool's first socket
+    /// and A's in its second. B's flow then ends and its slot is
+    /// refreshed as a listener — back at the front of the set, because a
+    /// refreshed slot keeps its place — so a free listener precedes A's
+    /// held socket, and a retransmit that was let through could not fall
+    /// into A's own socket. B connects again, one turn puts its SYN on
+    /// the box side of the lane, and A re-sends a SYN on the tuple it
+    /// holds, so both reach the pre-screen in one drain. The sibling is
+    /// delivered and A's connection stands.
     #[tokio::test]
     async fn a_retransmit_on_a_held_tuple_takes_no_siblings_listener() {
         let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
@@ -3803,7 +4195,12 @@ mod tests {
         let box_a = Ipv4Addr::from(subnet.first_ptask());
         let box_b = Ipv4Addr::from(subnet.first_ptask() + 1);
 
-        // A opens — and holds — its one connection.
+        // B connects first, A second: B's connection takes the pool's
+        // first socket in set order, A's the second — the arrangement
+        // that leaves a free listener ahead of A's held socket once B's
+        // flow ends.
+        let b_first = h.lane.boxes_mut()[1].connect(proxy_ip, PROXY_PORT);
+        drive(&mut h.lane, 5).await;
         let a_first = h.lane.boxes_mut()[0].connect(proxy_ip, PROXY_PORT);
         drive(&mut h.lane, 25).await;
         assert_eq!(
@@ -3812,18 +4209,38 @@ mod tests {
             "A holds its one connection"
         );
         assert_eq!(
-            h.acceptor.as_ref().expect("acceptor").accepted().len(),
-            1,
-            "A's connection was delivered"
+            h.lane.boxes()[1].flow_state(b_first),
+            State::Established,
+            "B held its one connection first"
+        );
+        let delivered = h.acceptor.as_ref().expect("acceptor").accepted().len();
+        assert_eq!(delivered, 2, "both connections were delivered");
+
+        // B's flow ends: its slot returns to the pool as a fresh listener
+        // at the front of the set, ahead of A's held socket.
+        h.lane.boxes_mut()[1].close(b_first);
+        drive(&mut h.lane, 30).await;
+        assert!(
+            matches!(
+                h.lane.boxes()[1].flow_state(b_first),
+                State::Closed | State::TimeWait
+            ),
+            "B's first flow ended and its slot came back"
+        );
+        assert_eq!(
+            h.lane.pool_len(),
+            2,
+            "both shares stand: one listener, one held connection"
         );
 
-        // Two turns put B's SYN on the box side of the lane — the first
-        // takes its resolution ask across, the second dispatches the SYN
-        // now that its neighbour is filled — and then A re-sends a SYN on
-        // the tuple it holds, so both reach the pre-screen in one drain:
-        // A's retransmit first, then the sibling's SYN.
-        let b_first = h.lane.boxes_mut()[1].connect(proxy_ip, PROXY_PORT);
-        drive(&mut h.lane, 2).await;
+        // B connects again; one turn puts its SYN on the box side of the
+        // lane — one turn from the leg.
+        let b_second = h.lane.boxes_mut()[1].connect(proxy_ip, PROXY_PORT);
+        drive(&mut h.lane, 1).await;
+
+        // A re-sends a SYN on the tuple it holds, so both reach the
+        // pre-screen in one drain: A's retransmit first, then the
+        // sibling's SYN.
         h.lane.inject_frame(tcp_syn(
             box_a,
             proxy_ip,
@@ -3833,8 +4250,9 @@ mod tests {
         drive(&mut h.lane, 40).await;
 
         // The sibling was delivered: its SYN found its own listener,
-        // because the retransmit never reached one.
-        let answer = read_flow(&mut h.lane, 1, b_first, 8).await;
+        // because the retransmit never reached one. A's held connection
+        // stands, and nothing opened a second connection on A's tuple.
+        let answer = read_flow(&mut h.lane, 1, b_second, 8).await;
         assert!(
             answer.starts_with(b"source="),
             "the sibling's same-turn SYN was delivered, not starved by A's \
@@ -3847,8 +4265,28 @@ mod tests {
             "A's held connection stands"
         );
         let accepted = h.acceptor.as_ref().expect("acceptor").accepted();
-        assert_eq!(accepted.len(), 2, "one connection per admitted flow");
-        assert_eq!(accepted[1].source.addr, IpAddress::Ipv4(box_b));
+        assert_eq!(
+            accepted.len(),
+            delivered + 1,
+            "one connection per admitted flow: B's second, and nothing for \
+             the retransmit"
+        );
+        assert_eq!(
+            accepted[2].source.addr,
+            IpAddress::Ipv4(box_b),
+            "the new delivery is the sibling's, from its own address"
+        );
+        let on_as_tuple = accepted
+            .iter()
+            .filter(|header| {
+                header.source.addr == IpAddress::Ipv4(box_a)
+                    && header.source.port == test_util::FIRST_CLIENT_PORT
+            })
+            .count();
+        assert_eq!(
+            on_as_tuple, 1,
+            "A's own delivery is the only connection its tuple ever opened"
+        );
     }
 
     /// NET-132/T69: a row that registers in the same turn as its first
