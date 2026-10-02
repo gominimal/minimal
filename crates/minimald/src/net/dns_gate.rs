@@ -151,18 +151,26 @@
 //!   caching resolver either discards (back to no negative cache) or
 //!   treats as a broken reply, which is a worse outcome than the honest
 //!   empty answer that keeps `getaddrinfo` degrading to IPv4.
-//! * Reply matching is loose, and the source check is the whole defence:
-//!   the gate reads a reply's first question for the name and nothing
-//!   else — not the query id, not the qtype, and not whether the box ever
-//!   asked the question. A forged reply from the resolver's address —
+//! * Reply matching here is loose, and the source check is the whole defence
+//!   this gate keeps: it reads a reply's first question for the name and
+//!   nothing else — not the query id, not the qtype, and not whether the box
+//!   ever asked the question. A forged reply from the resolver's address —
 //!   hairpinned through the switch by a peer — could pin an
 //!   attacker-chosen address, and that defence is the relay's own
 //!   source-address check (NET-084), which is what stops any non-lease
 //!   source from imitating the resolver; until it is in force, this gate
 //!   inherits that hole rather than widening it, since it admits nothing
 //!   the box could not already have reached by resolving through the real
-//!   resolver. Matching the id would need per-query state on the egress leg
-//!   for a check that does not change what the box can reach.
+//!   resolver. The deciding copy does not share it: the host-side table
+//!   above records each of the box's own outstanding queries on its egress
+//!   leg — the question, the transaction id, and the port the query left
+//!   from — and a reply pins there only by answering one, consuming the
+//!   entry, so a forged or replayed reply pins nothing on the host; its
+//!   entrance is closed there too, where a reply-shaped frame on the
+//!   guest→switch leg is decided like any other frame and pins nothing.
+//!   This gate keeps the loose match as the precision copy: it adds no
+//!   per-query state of its own, and on a VM-backed host the reach a reply
+//!   buys is the host's decision to make, not this one's.
 //! * DNS over TCP is not carried. A deny-all box's TCP to the resolver is
 //!   dropped by the frame verdict, so a `TC=1` answer cannot be retried
 //!   over TCP and that resolution fails. Not a rebinding vector — the gate
@@ -1730,6 +1738,82 @@ pub(crate) mod tests {
             .expect("the relay keeps deciding")
             .expect("the switch side stays open");
         assert_eq!(last, sentinel, "the infrastructure deny set is refused");
+    }
+
+    /// The completed infrastructure deny set, on this leg too (the
+    /// architecture review's condition, beside NET-067): an allowed name that
+    /// answers this host's own address — `0.0.0.0` names the host itself, so
+    /// the range it heads is loopback's neighbour — or a multicast group is
+    /// refused before its answer can become a pin, and each refusal is logged
+    /// in the shared format under its own key: the name, the answer and the
+    /// rule. Neither the refusal nor the frame verdict a connection to those
+    /// addresses meets is decided by any rule the box's declaration names —
+    /// had the intersection admitted them, the pin would have lifted the
+    /// undeclared-destination drop — so the sentinel after each connection is
+    /// the pin's own absence made visible.
+    #[tokio::test]
+    async fn this_host_and_multicast_answers_are_refused_and_logged() {
+        let capture = captured_log();
+        let mut harness = spawn_test_relay(&denied_range_egress());
+
+        // Two names, because a refusal's key is the name: this host's own
+        // address and a multicast group, each heard on its own line.
+        for (name, refused) in [
+            ("example.com.", Ipv4Addr::UNSPECIFIED),
+            ("other.example.", Ipv4Addr::new(224, 0, 0, 1)),
+        ] {
+            let query = udp_payload_frame(LEASE, 40000, RESOLVER, 53, &dns_query(name, RecordType::A));
+            harness.box_end.write_all(&query).unwrap();
+            let forwarded =
+                tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                    .await
+                    .expect("the query is forwarded")
+                    .expect("the switch side stays open");
+            assert_eq!(forwarded, query);
+            let reply = udp_payload_frame(RESOLVER, 53, LEASE, 40000, &dns_response(name, &[refused]));
+            harness
+                .switch
+                .write_all(&wire_frame(&reply))
+                .await
+                .unwrap();
+            let passed = read_box_frame(&harness)
+                .await
+                .expect("the reply itself passes through: resolution is honest");
+            assert_eq!(passed, reply);
+        }
+
+        let logged = capture.contents();
+        for expected in [
+            "an allowed name resolved into a refused range",
+            "rule_matched=\"dns-rebinding-infrastructure\"",
+            "name=\"example.com\"",
+            "answer=0.0.0.0",
+            "name=\"other.example\"",
+            "answer=224.0.0.1",
+        ] {
+            assert!(
+                logged.contains(expected),
+                "the refusal line must carry {expected:?}: {logged}"
+            );
+        }
+
+        // And neither answer bought reach: the connection to each is the
+        // relay's drop, whatever a pin would have lifted for it.
+        for refused in [Ipv4Addr::UNSPECIFIED, Ipv4Addr::new(224, 0, 0, 1)] {
+            let frame = egress_tcp_frame(LEASE, refused, 443);
+            let sentinel = arp_frame(LEASE);
+            harness.box_end.write_all(&frame).unwrap();
+            harness.box_end.write_all(&sentinel).unwrap();
+            let next =
+                tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                    .await
+                    .expect("the relay keeps deciding")
+                    .expect("the switch side stays open");
+            assert_eq!(
+                next, sentinel,
+                "an answer inside the completed infrastructure set never became a pin"
+            );
+        }
     }
 
     /// NET-072: a box-zone name resolves with no `egress.allow_dns_hosts`
