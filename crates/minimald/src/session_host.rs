@@ -1585,9 +1585,9 @@ impl HostIpEnforcement {
 
 /// What the launch's leaf decision means for the box's egress verdict:
 /// a host-address box with a leaf is enforced — but only while this host
-/// can decide per box at all, the start-time fact the loaded table's
-/// presence marker carries: a leaf placed on a host whose table is not
-/// loaded decides nothing while looking decided, so a box in it runs
+/// can decide per box at all, the fresh fact the probe read at this
+/// launch: a leaf placed on a host whose table is not loaded decides
+/// nothing while looking decided, so a box in it runs
 /// unenforced and is recorded as such, never reported as enforced over a
 /// refusal that is not there. A host-address box without a leaf runs with
 /// the host's address and no verdict of its own, and any other network
@@ -2606,10 +2606,10 @@ async fn create_session_leaf(
             // One info line per host-address box launch naming its classifier
             // identity (NET-079's observability): the subtree its declaration
             // picked, the leaf that verdict placed it in, and whether this
-            // host can decide per box — the start-time fact the loaded
-            // table's presence marker carries. A leaf placed on a host whose
-            // table is not loaded decides nothing while looking decided, so
-            // the line never says `per_box` for one.
+            // host can decide per box — the fresh fact this launch's probe
+            // just read from the table's effect. A leaf placed on a host
+            // whose table is not loaded decides nothing while looking
+            // decided, so the line never says `per_box` for one.
             if can_decide_per_box {
                 tracing::info!(
                     session = session_name,
@@ -2888,31 +2888,45 @@ fn refuses_unenforced_host_address_box(
         && (!placed || (verdict == sandbox2::config::Verdict::Deny && !can_decide_per_box))
 }
 
-/// Whether a native launch whose host-address box was not placed in a
-/// classifier leaf, or was placed on a host that cannot decide per box,
-/// advises about that state.
+/// Whether a launch whose host-address box was not placed in a classifier
+/// leaf, or was placed on a host that cannot decide per box, advises about
+/// that state.
 ///
-/// The counterpart of [`refuses_unenforced_host_address_box`]: natively an
-/// unenforced host-address box is NET-079's advisory posture, never a
-/// refusal (design §7.4), so every *session* launch the record says `none`
-/// for says so — once per launch, like the resolver advisory it is modelled
-/// on (design §7.1), never once per daemon. A guest never advises: its
-/// unplaceable box is refused, and its unenforced deny-all box is the
-/// interim — guest-side classifier enforcement not being available yet —
-/// said so by the refusal. What this predicate does not carry is the
-/// launch's audience — a launch minted for lifecycle hooks advises nobody
-/// (a hook run is not a session start), which the launch itself folds in
-/// over [`SandboxLauncher::for_hooks`]. Pure over its inputs, so the gate
-/// is pinned where it is written.
-fn advises_unenforced_placement(guest: bool, enforcement: Option<HostIpEnforcement>) -> bool {
-    !guest && enforcement == Some(HostIpEnforcement::Unenforced)
+/// The counterpart of [`refuses_unenforced_host_address_box`]: an unenforced
+/// host-address box is the advisory posture on *either* kind of host —
+/// natively NET-079's exception, in the guest the interim's own state — so
+/// every *session* launch the record says `none` for says so, once per
+/// launch like the resolver advisory it is modelled on (design §7.1), never
+/// once per daemon. The guest's refusals stand untouched beside it: a box
+/// the guest cannot place is refused and advises nothing (the refusal is
+/// that state's surface), and so is a deny-all box on a table the guest has
+/// not loaded — the interim is the *other* host-address boxes' state, the
+/// ones that need no verdict enforced to run, and the ruling's ask is that
+/// their state be said at every session start, not left as a daemon log
+/// line alone. What this predicate does not carry is the launch's audience
+/// — a launch minted for lifecycle hooks advises nobody (a hook run is not
+/// a session start), which the launch itself folds in over
+/// [`SandboxLauncher::for_hooks`]. Pure over its inputs, so the gate is
+/// pinned where it is written.
+fn advises_unenforced_placement(enforcement: Option<HostIpEnforcement>) -> bool {
+    enforcement == Some(HostIpEnforcement::Unenforced)
 }
 
-/// The advisory text for a native launch whose host-address box runs
-/// unenforced: what the state is, and what would change it — spelled for
+/// The advisory text for a launch whose host-address box runs unenforced:
+/// what the state is, and what would change it — spelled for the host and
 /// the state that produced it, so a person reading the log is told which
-/// half of the step this host owes.
-fn unenforced_placement_notice(leaf: Option<&sandbox2::config::ClassifierLeaf>) -> String {
+/// half of the step this host owes. The guest names no install command:
+/// no privileged step exists inside a microVM, so the person to tell is the
+/// image's builder, and the interim's words are all the guest has to say.
+fn unenforced_placement_notice(
+    guest: bool,
+    leaf: Option<&sandbox2::config::ClassifierLeaf>,
+) -> String {
+    if guest {
+        return "guest-side classifier enforcement is not available yet; \
+                this host-address box runs unenforced (host_ip_enforcement=none)"
+            .to_string();
+    }
     match leaf {
         None => format!(
             "this host places no classifier leaf for this session: its box \
@@ -3021,9 +3035,24 @@ impl SessionLauncher for SandboxLauncher {
         // in between leaves no leaf behind, and it drops after the process
         // guard below so the box's processes are gone before their leaf is
         // removed.
-        let can_decide_per_box = crate::net::classifier::recorded().can_decide_per_box();
-        let leaf = if matches!(network_mode, NetworkMode::HostNet) {
-            create_session_leaf(
+        //
+        // Whether this host can decide per box is read fresh, per launch,
+        // from the table's *effect* (design §7.4) — the start reading is not
+        // kept, because a marker survives whatever emptied the table and the
+        // refusal does not, and a start reading would survive it the same
+        // way. The probe binds a listener, forks a child, and waits, so it
+        // runs on the blocking pool, and only a host-address launch reads
+        // one: no other mode has a verdict the cgroup decides, and the one
+        // over the same `classifier_root` the box is placed into, so both
+        // halves of this launch answer over one tree.
+        let (leaf, can_decide_per_box) = if matches!(network_mode, NetworkMode::HostNet) {
+            let root = classifier_root.clone();
+            let can_decide_per_box = tokio::task::spawn_blocking(move || {
+                crate::net::classifier::recorded(&root).can_decide_per_box()
+            })
+            .await
+            .map_err(io::Error::other)?;
+            let leaf = create_session_leaf(
                 &classifier_root,
                 guest,
                 &session_id,
@@ -3031,16 +3060,17 @@ impl SessionLauncher for SandboxLauncher {
                 classifier_verdict,
                 can_decide_per_box,
             )
-            .await?
+            .await?;
+            (leaf, can_decide_per_box)
         } else {
-            None
+            (None, false)
         };
         let mut leaf_guard = leaf.clone().map(BoxLeafGuard::new);
 
         // What this launch's leaf decision means for the box's egress
         // verdict: enforced only while this host can decide per box at all
-        // — the start-time fact the loaded table's presence marker carries
-        // — so a leaf placed on a host whose table is not loaded is
+        // — the fresh fact the probe just read, the table's refusal in
+        // force — so a leaf placed on a host whose table is not loaded is
         // recorded as the unenforced state it is, and the refusal and the
         // advice below read the one decision.
         let enforcement = host_ip_enforcement(network_mode, leaf.as_ref(), can_decide_per_box);
@@ -3056,7 +3086,11 @@ impl SessionLauncher for SandboxLauncher {
         // classifier enforcement is not available yet — so its refusal
         // names the interim, while the unplaceable tree names the broken
         // image it is. Natively the same states run the box unenforced
-        // and say so in the log instead (NET-079's exception).
+        // and say so in the log instead (NET-079's exception). A refused
+        // box never reaches the advisory below — the refusal is the only
+        // thing that launch says; the interim's advisory is for the
+        // host-address boxes that run, the ones a verdict has nothing to
+        // enforce in yet.
         if refuses_unenforced_host_address_box(
             guest,
             network_mode,
@@ -3096,18 +3130,19 @@ impl SessionLauncher for SandboxLauncher {
             return Err(io::Error::other(refusal));
         }
 
-        // The advisory for that same state, natively, as a diagnostic record
-        // per launch — on the daemon's log stream, and nowhere else. This is
-        // not the session's stderr channel and not a field any client reads:
-        // the session reply and the CLI's start output are untouched by it,
-        // so a scripted `min session start` never sees this line. What a
-        // person in a session gets is the banner below, written onto the
-        // session's own pty — that banner is the in-session surface, and
-        // this record is its daemon-log twin, attributed to the session and
-        // carrying the decision in the machine spelling a reader greps for
-        // (`host_ip_enforcement`). Carrying the field out to a client — over
-        // the session reply, and surfaced by `min doctor` — is issue #1773,
-        // outside this task's layers.
+        // The advisory for that same state, on either kind of host, as a
+        // diagnostic record per launch — on the daemon's log stream, and
+        // nowhere else. This is not the session's stderr channel and not a
+        // field any client reads: the session reply and the CLI's start
+        // output are untouched by it, so a scripted `min session start`
+        // never sees this line. What a person in a session gets is the
+        // banner below, written onto the session's own pty — that banner is
+        // the in-session surface, and this record is its daemon-log twin,
+        // attributed to the session and carrying the decision in the
+        // machine spelling a reader greps for (`host_ip_enforcement`).
+        // Carrying the field out to a client — over the session reply, and
+        // surfaced by `min doctor` — is issue #1773, outside this task's
+        // layers.
         //
         // At the placement decision, not after the build: a launch that goes
         // no further than this (a tree-less host, an env that fails to
@@ -3116,14 +3151,18 @@ impl SessionLauncher for SandboxLauncher {
         // advises on every session start, the install hint it carries is the
         // answer to a host without the tree, and silencing every launch
         // after the first takes the notice away from exactly the session a
-        // person is about to work in.
+        // person is about to work in. In the guest the hint is not what the
+        // state means — there is no installer to run there — so the notice
+        // is the interim's own words, and the session that just started is
+        // told at its own start, both here in the daemon's log and in the
+        // pty banner below, never per daemon and never for a hook run.
         //
         // A launch minted for lifecycle hooks advises on neither surface: a
         // hook run is not a session start, and its record would count one
         // hook run as one. The placement itself is not gated with it.
-        let advise = advises_unenforced_placement(guest, enforcement) && !for_hooks;
+        let advise = advises_unenforced_placement(enforcement) && !for_hooks;
         if advise {
-            let notice = unenforced_placement_notice(leaf.as_ref());
+            let notice = unenforced_placement_notice(guest, leaf.as_ref());
             tracing::info!(
                 session = %session_name,
                 host_ip_enforcement = %HostIpEnforcement::Unenforced.machine_str(),
@@ -3286,20 +3325,23 @@ impl SessionLauncher for SandboxLauncher {
 
             let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
 
-            // NET-079: a host-address box this native launch could not place
-            // gets the advisory in the terminal itself — this banner is the
+            // NET-079: a host-address box this launch runs unenforced gets
+            // the advisory in the terminal itself — this banner is the
             // in-session surface, the prose a person at the terminal reads;
             // the record for that same decision went to the daemon's log at
             // the placement decision, which no client reads (issue #1773
             // tracks carrying it out). The person about to type in this
             // session is the one whose egress is not being decided, and the
             // state is the deployment's, not the session's, so the notice
-            // says what would change it. Never in the guest: a guest's
-            // unplaced host-address box never gets this far, its launch
-            // being refused (design §7.1). And never on a hook launch: its
+            // says what would change it. A guest's *refused* box never gets
+            // this far, its launch being refused (design §7.1) — but the
+            // guest's other host-address boxes do, and say the interim's
+            // words: a session started in a VM host that does not enforce
+            // per box yet is told so at its own start, like any host's.
+            // And never on a hook launch: its
             // pty is read by nobody, and a hook run is not a session start.
             if advise {
-                let notice = unenforced_placement_notice(leaf.as_ref());
+                let notice = unenforced_placement_notice(guest, leaf.as_ref());
                 // The same write the shell fallback notice uses, for the
                 // same reasons: onto the pty's slave, best-effort, CRLF —
                 // see the comment there.

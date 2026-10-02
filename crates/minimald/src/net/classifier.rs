@@ -28,20 +28,30 @@
 //! the sockets closing *is* the termination. The rule set is fixed with
 //! the table: nothing is edited at box launch or stop.
 //!
-//! Whether the host can decide per box is a start-time fact, read here once
-//! and recorded: the privileged step installs the tree, delegates it, and
-//! loads the table, and a host missing any of that decides nothing per box
-//! — its host-address boxes run unenforced, never refused (NET-079's
-//! exception), with the cause named at session start and the install
-//! command printed only when the missing step is the cause. The guest is
-//! the one exception to that exception: its daemon is the only one that
-//! could have made its image load the table, so until it does, a deny-all
-//! host-address box is refused rather than run on a refusal that is not
-//! there (design §7.1) — and no installer exists for a person to run, so
-//! none is named.
+//! Whether the host can decide per box is read from the table's *effect*,
+//! never from a fact that merely vouches for it (design §7.4): the probe
+//! below places a short-lived child in a deny-subtree leaf and connects to
+//! a loopback listener the daemon holds, control leg first, and only a
+//! connection the filter refused reads as `per_box`. The step's presence
+//! marker says only that the installer ran — a marker survives a reboot
+//! whose table reload failed, a flush, a conflicting ruleset; the refusal
+//! does not, so the marker is the advisory's fact and the probe's is the
+//! verdict. The probe runs at daemon start and again before each
+//! host-address launch, because a table can go away between them. A host
+//! that decides nothing per box runs its host-address boxes unenforced,
+//! never refused (NET-079's exception), with the cause named at session
+//! start and the install command printed only when a command can end the
+//! cause. The guest is the one exception to that exception: its daemon is
+//! the only one that could have made its image load the table, so until it
+//! does, a deny-all host-address box is refused rather than run on a
+//! refusal that is not there (design §7.1) — and no installer exists for a
+//! person to run, so none is named; its other host-address boxes run
+//! unenforced like any host's and say so per launch, in the interim's
+//! words.
 
-use std::net::Ipv4Addr;
-use std::path::Path;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use sandbox2::config::Verdict;
 
@@ -104,6 +114,23 @@ pub enum Cause {
     /// refused on this ground rather than placed in a leaf that decides
     /// nothing, so no command is named.
     GuestTableNotLoaded,
+    /// The step's half is installed and its marker says the table loaded,
+    /// but the table is not refusing: a probe placed in a deny leaf made a
+    /// connection the deny chain would have refused — completed, refused
+    /// with an errno the chain never reads as, or never reported inside the
+    /// probe's deadline. A marker survives a reboot whose reload failed or
+    /// a flush; a refusal does not, and the refusal is the fact a `per_box`
+    /// record rests on (design §7.4), so the marker alone decides nothing
+    /// here. Reloading the table ends it, so the install command is named.
+    TableNotEffective,
+    /// The table's effect could not be read: the daemon's own control-leg
+    /// connection to the probe's listener failed, or no probe child could be
+    /// placed in a deny leaf — so whether the table is refusing is unknown,
+    /// and an unknown effect is not a verdict (the probe reports the least
+    /// it can prove, never the most it can guess). No command is named
+    /// because none is known to end it: the cause says what failed to be
+    /// read, and a person reading it decides what to look at.
+    ProbeUnreadable,
 }
 
 impl Cause {
@@ -123,6 +150,16 @@ impl Cause {
                  guest image has not loaded the classifier's packet-filter \
                  table, so no per-box verdict is decided in it"
             }
+            Self::TableNotEffective => {
+                "the classifier's table is marked loaded but its refusal is not \
+                 in force: a probe's connection out of a deny leaf was not \
+                 refused"
+            }
+            Self::ProbeUnreadable => {
+                "the classifier table's effect could not be read: the daemon's \
+                 own control connection or the probe's placement failed, so \
+                 whether the table is refusing is unknown"
+            }
         }
     }
 
@@ -140,10 +177,14 @@ impl Cause {
     /// verdict enforced and runs.
     ///
     /// [`Cause::StepNotInstalled`] is the one cause this cannot arise as in
-    /// a guest ([`decide`] maps the missing step to the guest's own
-    /// cause), so it takes the deny-all spelling with
-    /// [`Cause::GuestTableNotLoaded`]: the match stays exhaustive over
-    /// causes, never claiming a host kind that cannot produce it.
+    /// a guest ([`decide`] maps the missing step to the guest's own cause),
+    /// so it takes the deny-all spelling with
+    /// [`Cause::GuestTableNotLoaded`]; the two probe causes can arise on
+    /// either kind of host and take the same spelling for the same reason —
+    /// a deny-all box must not run on a refusal that is not in force, and
+    /// a box that needs no verdict enforced still runs. The match stays
+    /// exhaustive over causes, never claiming a host kind that cannot
+    /// produce it.
     pub fn host_ip_box_outcome(self, guest: bool) -> &'static str {
         if !guest {
             return "its host-address boxes run unenforced";
@@ -153,7 +194,10 @@ impl Cause {
                 "its host-address boxes are refused: it cannot place one in a \
                  leaf that confines"
             }
-            Self::StepNotInstalled | Self::GuestTableNotLoaded => {
+            Self::StepNotInstalled
+            | Self::GuestTableNotLoaded
+            | Self::TableNotEffective
+            | Self::ProbeUnreadable => {
                 "its deny-all host-address boxes are refused and its other \
                  host-address boxes run unenforced"
             }
@@ -165,19 +209,26 @@ impl Cause {
     /// and nothing for a host that cannot confine a box, because installing
     /// the step over that tree would leave the cause standing, or for a
     /// guest whose table its own image never loaded, because the person to
-    /// tell is the image's builder and no installer exists there.
+    /// tell is the image's builder and no installer exists there. A table
+    /// the marker vouches for but the probe does not ends with the same
+    /// command — the install is the one thing that reloads it — while a
+    /// probe that could not read the table names nothing: no command is
+    /// known to make a probe run.
     pub fn install_command(self) -> Option<String> {
         match self {
-            Self::StepNotInstalled => Some(sandbox2::classifier::install_hint()),
-            Self::CannotConfine | Self::GuestTableNotLoaded => None,
+            Self::StepNotInstalled | Self::TableNotEffective => {
+                Some(sandbox2::classifier::install_hint())
+            }
+            Self::CannotConfine | Self::GuestTableNotLoaded | Self::ProbeUnreadable => None,
         }
     }
 }
 
 /// Whether this host can decide a host-address box's egress verdict per box
-/// (NET-079), and why not when it cannot: the start-time fact the daemon
-/// records, the create response carries, and `min session activate` turns
-/// into the advisory at session start.
+/// (NET-079), and why not when it cannot: the fact the daemon reads at
+/// start and again before each host-address launch, the create response
+/// carries, and `min session activate` turns into the advisory at session
+/// start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
     decided: bool,
@@ -186,9 +237,11 @@ pub struct Decision {
 
 impl Decision {
     /// A host that decides per box: its covering cgroup2 confines, the
-    /// cohort's subtrees are delegated, and the loaded table's presence
-    /// marker is there — the three facts a verdict needs to be decided
-    /// *on* something, guest or native alike.
+    /// step's subtrees and marker are there, and a probe's connection out
+    /// of a deny leaf was refused the way the loaded table refuses — the
+    /// facts a verdict needs to be decided *on* something, guest or native
+    /// alike. The refusal is the one of them a reboot empties, which is why
+    /// it, not the marker beside it, is the fact the verdict rests on.
     pub fn decided() -> Self {
         Self {
             decided: true,
@@ -221,27 +274,639 @@ impl Decision {
 /// `cgroup.subtree_control`.
 const DELEGATION_FILES: [&str; 3] = ["cgroup.procs", "cgroup.threads", "cgroup.subtree_control"];
 
-/// The start-time check (NET-079): whether this host can decide a
-/// host-address box's egress verdict per box, and why not when it cannot.
+/// The loopback families the probe reads the filter over. Loopback is
+/// where the probe's own listener sits, and the two addresses are the two
+/// ways a process on this host reaches it. A family that is not enabled on
+/// this host is not probed — which is why [`Reading::Refused`] carries the
+/// families it read: a family it did not read is a family whose bypass it
+/// cannot see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Family {
+    /// IPv4 loopback, where a connection the chain rejects with `icmpx
+    /// admin-prohibited` reads as EHOSTUNREACH.
+    V4,
+    /// IPv6 loopback, where the same rejection reads as EACCES.
+    V6,
+}
+
+impl Family {
+    /// The loopback address this family probes: the address its listener
+    /// binds and its child connects to.
+    pub(crate) const fn loopback(self) -> IpAddr {
+        match self {
+            Self::V4 => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Self::V6 => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        }
+    }
+
+    /// The family's own spelling for the probe's log record: the address a
+    /// person reads, not the enum's.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::V4 => "127.0.0.1",
+            Self::V6 => "::1",
+        }
+    }
+}
+
+/// The errnos by which a connection refused by the table's deny chain reads
+/// on loopback (design §4.1): `reject with icmpx admin-prohibited`
+/// surfaces as EHOSTUNREACH over IPv4 and as EACCES over IPv6, and EPERM
+/// is a security module's refusal of the same connection. Nothing else
+/// reads as the table talking — ECONNREFUSED is the probe's own listener
+/// gone, ENETUNREACH a routing answer — so a refusal outside this set is
+/// evidence the table is not what refused, and no `per_box` reading is
+/// ever built on one.
+const REJECT_SET: [libc::c_int; 3] = [libc::EHOSTUNREACH, libc::EACCES, libc::EPERM];
+
+/// How long the parent waits for one probe child's report: the child does
+/// one migration write and one loopback connect, both of which the kernel
+/// answers in its own time, so a child that outlives this will not report —
+/// and reads as [`Observed::TimedOut`], never as a refusal.
+const PROBE_DEADLINE: Duration = Duration::from_secs(1);
+
+/// The migration file a child writes its own pid into: `cgroup.procs`, the
+/// file the kernel makes in every cgroup2 directory and the one a stand-in
+/// tree must carry for a probe child to place itself in.
+const PROCS_FILE: &str = "cgroup.procs";
+
+/// What one probe child's connection met, with the errno where one was
+/// read: one leg of the probe, kept per family so the decision's record
+/// names the evidence it rests on and not only the verdict it settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Observed {
+    /// `connect()` completed: the filter admitted a connection out of a
+    /// deny leaf, which a loaded table never does.
+    Connected,
+    /// `connect()` was refused with this errno.
+    Refused(i32),
+    /// The child never reported inside the probe's deadline — a hang, not
+    /// a refusal, and read as the least the leg can prove.
+    TimedOut,
+    /// The child could not be placed in the deny leaf (this errno), so no
+    /// connection was made and the leg read nothing.
+    Unplaced(i32),
+    /// The child reported nothing legible: the fork failed, the pipe broke,
+    /// or the report did not decode.
+    Silent,
+}
+
+impl Observed {
+    /// The leg's own spelling for the probe's log record, the errno
+    /// included where one was read.
+    pub(crate) fn describe(self) -> String {
+        match self {
+            Self::Connected => "connected".to_string(),
+            Self::Refused(errno) => format!("refused, errno {errno}"),
+            Self::TimedOut => "did not report within the deadline".to_string(),
+            Self::Unplaced(errno) => format!("was not placed, errno {errno}"),
+            Self::Silent => "reported nothing legible".to_string(),
+        }
+    }
+}
+
+/// What the probe read the table's effect as: the fact a `per_box` record
+/// rests on and no marker can vouch for (design §7.4) — a marker survives
+/// a reboot whose reload failed; the refusal it vouched for does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Reading {
+    /// Every family read was refused with an errno in [`REJECT_SET`]: the
+    /// table is loaded and its chain is refusing, each leg's observation
+    /// carried for the record.
+    Refused(Vec<(Family, Observed)>),
+    /// A family's connection met what a loaded table would not let it meet
+    /// — it completed, was refused with an errno the chain never reads as,
+    /// or never reported in time — so the table is not refusing and
+    /// `per_box` would be a claim the filter does not back.
+    NotRefused {
+        /// The leg that settled it, with what it met.
+        because: String,
+        /// Every leg the probe ran, the evidence the record names.
+        families: Vec<(Family, Observed)>,
+    },
+    /// The table's effect could not be read: the daemon's own control
+    /// connection failed, or no probe child could be placed. Unknown is
+    /// not a verdict, and the reading never claims one.
+    Inconclusive {
+        /// What failed, in the failing call's own words.
+        because: String,
+    },
+}
+
+impl Reading {
+    /// The reading a set of per-family legs settles, pure over its input —
+    /// the reject set and the every-family rule are decided here, pinned
+    /// where they are written, not inside the probe that must not decide.
+    ///
+    /// One family that connected, timed out, or was refused outside the
+    /// set settles the whole reading as [`Reading::NotRefused`]: a bypass
+    /// on any family is a full bypass, and no other leg can un-meet that
+    /// connection. A family whose leg could not be read — unplaced, or
+    /// silent — leaves the effect unseen on it, so with no positive
+    /// evidence the reading is [`Reading::Inconclusive`] rather than a
+    /// refusal that may not have survived the leg that never ran. Only
+    /// when every family it read was refused the table's own way does the
+    /// reading say [`Reading::Refused`].
+    pub(crate) fn of(observations: &[(Family, Observed)]) -> Self {
+        if let Some((family, observed)) = observations.iter().find(|(_, observed)| {
+            matches!(observed, Observed::Connected | Observed::TimedOut)
+                || matches!(observed, Observed::Refused(errno) if !REJECT_SET.contains(errno))
+        }) {
+            return Self::NotRefused {
+                because: format!("{} {}", family.name(), observed.describe()),
+                families: observations.to_vec(),
+            };
+        }
+        if let Some((family, observed)) = observations
+            .iter()
+            .find(|(_, observed)| matches!(observed, Observed::Unplaced(_) | Observed::Silent))
+        {
+            return Self::Inconclusive {
+                because: format!("the leg on {} {}", family.name(), observed.describe()),
+            };
+        }
+        if observations.is_empty() {
+            return Self::Inconclusive {
+                because: "no loopback family could be probed on this host".to_string(),
+            };
+        }
+        Self::Refused(observations.to_vec())
+    }
+
+    /// The probe's own record, one line naming every family it read and
+    /// what the leg there met, errno included — the evidence, spelled once
+    /// so the decision that logs it and a bundle's tail agree by
+    /// construction.
+    pub(crate) fn record(&self) -> String {
+        match self {
+            Self::Refused(families) => format!(
+                "the table refused the probe out of a deny leaf on every family read ({})",
+                Self::legs(families)
+            ),
+            Self::NotRefused { because, families } => format!(
+                "the table did not refuse the probe: {because} ({})",
+                Self::legs(families)
+            ),
+            Self::Inconclusive { because } => {
+                format!("the table's effect could not be read: {because}")
+            }
+        }
+    }
+
+    /// The per-family tail of the record.
+    fn legs(families: &[(Family, Observed)]) -> String {
+        families
+            .iter()
+            .map(|(family, observed)| format!("{} {}", family.name(), observed.describe()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The probe (NET-079, design §4.1, §7.4): reads the filter's effect the
+/// way a deny-all box's connections meet it — a short-lived child placed in
+/// a deny-subtree leaf of the daemon's delegated tree, connecting to the
+/// loopback listener the daemon holds at each `endpoints` entry.
 ///
-/// Read-only, over the same facts the privileged step installs — the
+/// The control leg runs first: the daemon connects to each listener from
+/// its own cgroup, outside the deny subtree, because a listener the daemon
+/// itself cannot reach says nothing about the filter — any probe leg to it
+/// could only have read its own listener. A control failure makes the
+/// reading inconclusive before any child is forked.
+///
+/// Each family then gets one child, which places itself in the probe's
+/// throwaway leaf — the one migration primitive a launch's placement probe
+/// performs too — connects once, reports both errnos over a pipe, and
+/// exits; the parent waits inside [`PROBE_DEADLINE`] and reads what the
+/// child met. No capability beyond that: no `CAP_NET_ADMIN`, no root
+/// helper, and no byte written outside the leaf the probe names after
+/// itself and removes.
+pub(crate) fn probe_effect(root: &Path, endpoints: &[(Family, SocketAddr)]) -> Reading {
+    for (family, addr) in endpoints {
+        if let Err(cause) = TcpStream::connect(addr) {
+            return Reading::Inconclusive {
+                because: format!(
+                    "the daemon's own connect to its probe listener on {} failed: {cause}",
+                    family.name()
+                ),
+            };
+        }
+    }
+    let leaf = probe_leaf(root);
+    // A probe that died before its own cleanup leaves its leaf behind, and
+    // this probe removes it rather than wedging into it: the file first —
+    // over a stand-in tree that is the modeled `cgroup.procs` a previous
+    // probe made, while a kernel-owned one refuses removal and stays the
+    // kernel's — then the leaf itself.
+    let _ = std::fs::remove_file(leaf.join(PROCS_FILE));
+    let _ = std::fs::remove_dir(&leaf);
+    if let Err(cause) = std::fs::create_dir(&leaf) {
+        return Reading::Inconclusive {
+            because: format!("making the probe's deny leaf: {cause}"),
+        };
+    }
+    // The kernel makes `cgroup.procs` at mkdir on cgroup2 and removes it
+    // with the cgroup; a tree with no kernel behind it — a test's
+    // stand-in — has no file for the child to write its pid into, so the
+    // probe makes the one for its own throwaway leaf, the only leaf here
+    // it would ever create, and owes its removal below.
+    let procs = leaf.join(PROCS_FILE);
+    let made_procs = !procs.exists() && std::fs::write(&procs, b"").is_ok();
+    let observations = endpoints
+        .iter()
+        .map(|(family, addr)| probe_family(&procs, *family, addr))
+        .collect::<Vec<_>>();
+    // The throwaway leaf is owed its removal even when a leg read nothing.
+    if made_procs {
+        let _ = std::fs::remove_file(&procs);
+    }
+    let _ = std::fs::remove_dir(&leaf);
+    Reading::of(&observations)
+}
+
+/// The probe's throwaway leaf, in the deny subtree the refusing rule
+/// matches: `<root>/boxes/deny/filter-probe-<pid>`, named by this daemon's
+/// own pid so two daemons probing one tree never share one. A leaf left
+/// behind by a probe that died before its own cleanup is remade, not
+/// wedged into, by the next.
+fn probe_leaf(root: &Path) -> PathBuf {
+    sandbox2::classifier::box_leaf(
+        root,
+        &format!("filter-probe-{}", std::process::id()),
+        Verdict::Deny,
+    )
+}
+
+/// One probe leg: forks a child, hands it the probe leaf's `cgroup.procs`
+/// and this family's listener, waits inside [`PROBE_DEADLINE`] for its
+/// report, and returns what the child's connect met. The child is killed
+/// and reaped at the deadline if it has not reported — no probe child
+/// outlives the decision it was forked for.
+fn probe_family(procs: &Path, family: Family, addr: &SocketAddr) -> (Family, Observed) {
+    // Everything the child needs is prepared before the fork, the only
+    // place allocation still may run: after the fork the child touches
+    // nothing but raw syscalls, the same pre-exec discipline a sandbox's
+    // closure keeps.
+    let c_procs = match std::ffi::CString::new(procs.as_os_str().as_encoded_bytes()) {
+        Ok(c_procs) => c_procs,
+        Err(_) => return (family, Observed::Unplaced(libc::EINVAL)),
+    };
+    let port = addr.port();
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `pipe2(2)` writes two descriptors into `fds` and touches
+    // nothing else.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return (family, Observed::Silent);
+    }
+    // SAFETY: `fork(2)` runs in this (possibly multithreaded) process, and
+    // the child runs only async-signal-safe calls between the fork and its
+    // `_exit` — open, write, close, getpid, socket, connect — so no
+    // allocator or lock can be held across the fork by the child itself,
+    // in kind with the pre-exec closure this probe models.
+    let pid = unsafe { libc::fork() };
+    if pid == -1 {
+        // SAFETY: both descriptors were made above and none crossed a fork.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return (family, Observed::Silent);
+    }
+    if pid == 0 {
+        // SAFETY: the read end belongs to the parent; the write end is the
+        // child's whole report channel, and `probe_child` never returns.
+        unsafe {
+            libc::close(fds[0]);
+            probe_child(c_procs.as_ptr(), family, port, fds[1]);
+        }
+    }
+    // SAFETY: the write end is the child's, closed here so the read below
+    // can see the report's end.
+    unsafe { libc::close(fds[1]) };
+    let observed = wait_for_report(fds[0], pid);
+    // SAFETY: the read end, which this half owns.
+    unsafe { libc::close(fds[0]) };
+    (family, observed)
+}
+
+/// The parent's half of one leg: poll the child's pipe for its report
+/// inside [`PROBE_DEADLINE`], read and reap it when it comes, kill and reap
+/// it when it does not. The report is the placement's errno then the
+/// connect's, each 0 standing for "made / completed" — so a leg that was
+/// placed and connected reads connected, and one that was placed and
+/// refused reads the refusal's errno. `fd` is the read end this half owns
+/// and `pid` the unreaped child holding its write end.
+fn wait_for_report(fd: libc::c_int, pid: libc::pid_t) -> Observed {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `poll(2)` writes into `pfd` and reads `fd`, both this half's.
+    let ready = unsafe { libc::poll(&mut pfd, 1, PROBE_DEADLINE.as_millis() as libc::c_int) };
+    if ready <= 0 {
+        // A timeout and an unreadable pipe are both a leg that read nothing
+        // — never a refusal — and the child never outlives either.
+        // SAFETY: `kill(2)` and `waitpid(2)` address the child this leg
+        // forked, which is reaped either way.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+        return if ready == 0 {
+            Observed::TimedOut
+        } else {
+            Observed::Silent
+        };
+    }
+    let mut report = [0 as libc::c_int; 2];
+    // SAFETY: `read(2)` writes into `report` from the pipe `fd` reads.
+    let read = unsafe { libc::read(fd, report.as_mut_ptr().cast(), 8) };
+    // SAFETY: reaping the child this leg forked, which has exited by the
+    // report it just wrote.
+    unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+    if read != 8 {
+        return Observed::Silent;
+    }
+    let [placement, connect] = report;
+    if placement != 0 {
+        return Observed::Unplaced(placement);
+    }
+    if connect == 0 {
+        return Observed::Connected;
+    }
+    Observed::Refused(connect)
+}
+
+/// The probe child's half, raw syscalls only: this runs between a `fork`
+/// and its `_exit`, where only async-signal-safe calls belong. The child
+/// opens the probe leaf's `cgroup.procs` for append and writes its own pid
+/// into it — the one migration primitive the placement rests on — then
+/// connects once to the family's loopback listener, whose address it
+/// rebuilds from the family and the port it is handed: the listener is
+/// bound at the family's own loopback address, so nothing of the parent's
+/// but the copy the fork made survives to borrow. It reports the
+/// placement's errno then the connect's over the pipe and exits either
+/// way.
+///
+/// # Safety
+///
+/// `c_procs` is a live C string and `report` the write end of a pipe the
+/// parent is polling; the function never returns.
+unsafe fn probe_child(
+    c_procs: *const libc::c_char,
+    family: Family,
+    port: u16,
+    report: libc::c_int,
+) -> ! {
+    // SAFETY: `open(2)` reads `c_procs`; the flags are the append the
+    // migration primitive uses — no `O_CREAT`, because a missing
+    // `cgroup.procs` is a missing leaf and is reported, not made — and
+    // `O_CLOEXEC` keeps the descriptor from crossing an exec this child
+    // never reaches anyway.
+    let procs = unsafe { libc::open(c_procs, libc::O_WRONLY | libc::O_APPEND | libc::O_CLOEXEC) };
+    if procs == -1 {
+        // `Error::last_os_error` is `Error::Os(RawOsError)` around this
+        // thread's errno — no allocation, so it belongs to the
+        // async-signal-safe set the child may run.
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(1);
+        tell(report, errno, 0);
+        // SAFETY: `_exit(2)` never returns, so the child ends here.
+        unsafe { libc::_exit(1) };
+    }
+    if !write_own_pid(procs) {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(1);
+        // SAFETY: the descriptor just opened, closed on the failing path.
+        unsafe { libc::close(procs) };
+        tell(report, errno, 0);
+        // SAFETY: the child ends here.
+        unsafe { libc::_exit(1) };
+    }
+    // SAFETY: the migration's file, done with.
+    unsafe { libc::close(procs) };
+    let domain = match family {
+        Family::V4 => libc::AF_INET,
+        Family::V6 => libc::AF_INET6,
+    };
+    // SAFETY: `socket(2)` makes the one descriptor this child connects with.
+    let socket = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if socket == -1 {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(1);
+        tell(report, 0, errno);
+        // SAFETY: the child ends here.
+        unsafe { libc::_exit(1) };
+    }
+    let connected = match family {
+        Family::V4 => {
+            // SAFETY: `sockaddr_in` is a C struct of integers and padding;
+            // zeroed is its init, and every field that matters is set below.
+            let mut to: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            to.sin_family = libc::AF_INET as libc::sa_family_t;
+            to.sin_port = port.to_be();
+            to.sin_addr = libc::in_addr {
+                s_addr: libc::INADDR_LOOPBACK,
+            };
+            // SAFETY: `connect(2)` reads the `sockaddr_in` filled in above.
+            unsafe {
+                libc::connect(
+                    socket,
+                    (&raw const to).cast(),
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        }
+        Family::V6 => {
+            // SAFETY: `sockaddr_in6` is a C struct of integers and padding;
+            // zeroed is its init, and every field that matters is set below.
+            let mut to: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            to.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            to.sin6_port = port.to_be();
+            to.sin6_addr = libc::in6_addr {
+                s6_addr: Ipv6Addr::LOCALHOST.octets(),
+            };
+            // SAFETY: `connect(2)` reads the `sockaddr_in6` filled in above.
+            unsafe {
+                libc::connect(
+                    socket,
+                    (&raw const to).cast(),
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    };
+    // SAFETY: the one descriptor this child made, done with either way.
+    unsafe { libc::close(socket) };
+    if connected == 0 {
+        tell(report, 0, 0);
+        // SAFETY: the child ends here.
+        unsafe { libc::_exit(0) };
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(1);
+    tell(report, 0, errno);
+    // SAFETY: the child ends here.
+    unsafe { libc::_exit(0) };
+}
+
+/// Writes this process's own pid, decimal and newline-terminated, to `fd`
+/// with raw writes — the migration itself: a pid in `cgroup.procs` is a
+/// process in the cgroup. `format!` allocates and cannot run here, so the
+/// digits are placed by hand, most-significant first, and a pid is at most
+/// seven decimal digits on any Linux, so the newline never runs out of
+/// room. `fd` is an open file.
+fn write_own_pid(fd: libc::c_int) -> bool {
+    let mut text = [0u8; 8];
+    // SAFETY: `getpid(2)` cannot fail.
+    let mut pid = unsafe { libc::getpid() };
+    let mut at = text.len() - 1;
+    text[at] = b'\n';
+    loop {
+        at -= 1;
+        text[at] = b'0' + (pid % 10) as u8;
+        pid /= 10;
+        if pid == 0 {
+            break;
+        }
+    }
+    write_all(fd, &text[at..])
+}
+
+/// One raw write of exactly `bytes`, retrying the short writes and
+/// interruptions a blocking fd can produce; `false` when the write failed
+/// for any other reason. `fd` is an open file.
+fn write_all(fd: libc::c_int, bytes: &[u8]) -> bool {
+    let mut done = 0;
+    while done < bytes.len() {
+        // SAFETY: `write(2)` reads `bytes[done..]`, which outlives the call.
+        let n = unsafe { libc::write(fd, bytes[done..].as_ptr().cast(), bytes.len() - done) };
+        if n > 0 {
+            done += n as usize;
+        } else if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// The child's whole report — two native-endian words, the placement's
+/// errno then the connect's — over the pipe. A parent that has gone first
+/// loses the report with the pipe, which is the parent's problem; the
+/// child never waits on it. `fd` is the write end of the pipe.
+fn tell(fd: libc::c_int, placement: libc::c_int, connect: libc::c_int) {
+    let words = [placement, connect];
+    // SAFETY: the two words are read as the eight bytes they are.
+    let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), words.len() * 4) };
+    write_all(fd, bytes);
+}
+
+/// Binds one family's probe listener on an ephemeral loopback port, retrying
+/// in the practically impossible case the kernel hands out the answerer's
+/// own: the answerer's address is the one destination the deny chain
+/// admits (NET-079's carve-out), so a probe connection landed there would
+/// be admitted by a table doing exactly what it was told and read as the
+/// table being absent.
+fn bind_probe_listener(family: Family) -> std::io::Result<TcpListener> {
+    for _ in 0..4 {
+        let listener = TcpListener::bind(SocketAddr::new(family.loopback(), 0))?;
+        if listener.local_addr()?.port() != crate::net::answerer::ANSWERER_PORT {
+            return Ok(listener);
+        }
+    }
+    Err(std::io::Error::other(
+        "the probe's port choice collided with the answerer's",
+    ))
+}
+
+/// The probe's listeners, one per family this host's loopback can carry.
+fn bind_probe_listeners() -> std::io::Result<Vec<(Family, TcpListener)>> {
+    let mut listeners = Vec::new();
+    for family in [Family::V4, Family::V6] {
+        match bind_probe_listener(family) {
+            Ok(listener) => listeners.push((family, listener)),
+            // A bind that fails for want of the family itself — no IPv6
+            // loopback on this host — is one family fewer to read, not an
+            // error: a host without the family cannot bypass through it,
+            // and the reading names the families it did read.
+            Err(cause)
+                if family == Family::V6
+                    && matches!(
+                        cause.raw_os_error(),
+                        Some(libc::EAFNOSUPPORT) | Some(libc::EADDRNOTAVAIL)
+                    ) => {}
+            Err(cause) => return Err(cause),
+        }
+    }
+    Ok(listeners)
+}
+
+/// Reads the table's effect on this host (NET-079, design §7.4): the probe,
+/// with its own listener — a destination the daemon holds on loopback, on
+/// a port other than the answerer's, is the place a deny-all box's
+/// connections would be refused. The probe binds, forks, connects, and
+/// waits, so an async caller runs it on the blocking pool; it logs one
+/// record per run, naming every family it read and what the leg there met,
+/// the errno included.
+pub(crate) fn read_filter(root: &Path) -> Reading {
+    // Held for the probe's whole duration: a listener nothing holds is the
+    // dead-listener case the control leg exists to catch.
+    let listeners = match bind_probe_listeners() {
+        Ok(listeners) => listeners,
+        Err(cause) => {
+            return Reading::Inconclusive {
+                because: format!("binding the probe's loopback listener: {cause}"),
+            };
+        }
+    };
+    let endpoints: Vec<_> = listeners
+        .iter()
+        .filter_map(|(family, listener)| listener.local_addr().ok().map(|addr| (*family, addr)))
+        .collect();
+    let reading = probe_effect(root, &endpoints);
+    // The healthy refusal is the quiet case — a launch's own record already
+    // names its enforcement — while anything else is the state a person
+    // reading the log has to see.
+    if matches!(reading, Reading::Refused(_)) {
+        tracing::debug!(probe = %reading.record(), "the classifier table refused the probe's connection out of a deny leaf");
+    } else {
+        tracing::info!(probe = %reading.record(), "read the classifier table's effect on this host");
+    }
+    reading
+}
+
+/// The check (NET-079, design §7.4): whether this host can decide a
+/// host-address box's egress verdict per box, and why not when it cannot.
+/// It runs at daemon start and again before each host-address launch,
+/// because the fact it rests on does not outlive the table.
+///
+/// Read-only over the same facts the privileged step installs — the
 /// cgroup2 the tree sits on (`nsdelegate` is what makes a box's cgroup
 /// namespace a delegation boundary, so a box cannot migrate out of its
 /// leaf), the cohort's two delegated subtrees, and the loaded table's
-/// presence marker, the one fact that says the refusal a deny-all box's
-/// connections meet is actually there, written only by an install whose
-/// `nft -f` transaction succeeded. Nothing here needs `CAP_NET_ADMIN` or
-/// writes a byte: the step's own `--pid` half and the launch's placement
-/// probe decide what only a migration can.
+/// presence marker — and then over the one fact none of those can vouch
+/// for: `read` probes the table's effect, and only a connection refused
+/// the way the loaded chain refuses turns the marker's claim into a
+/// verdict. The facts gate the probe, so a host missing the step pays no
+/// probe — and no fact is taken as evidence of another: a marker present
+/// over a table whose refusal is gone is its own cause, not a decision.
+/// Nothing here needs `CAP_NET_ADMIN`, a root helper, or a byte written
+/// outside the probe's own throwaway leaf: the step's `--pid` half, a
+/// loopback connect, and a migration the launch's placement probe performs
+/// too are all the privileges it uses.
 ///
-/// The guest answers the same three questions, and for the same reason:
-/// its daemon is the microVM's pid 1, so the tree it mounts and the table
-/// its image loads are its own boot's work — and reporting a guest as
-/// decided while its table is not loaded would place a deny-all box in a
-/// leaf that decides nothing while looking decided, on the one host whose
-/// image is the fix. The guest's cause is named for the image's builder:
-/// no installer exists inside a microVM, so no command is named for it.
-pub fn decide(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision {
+/// The guest answers the same questions, and for the same reason: its
+/// daemon is the microVM's pid 1, so the tree it mounts and the table its
+/// image loads are its own boot's work — and reporting a guest as decided
+/// while its table is not loaded would place a deny-all box in a leaf that
+/// decides nothing while looking decided, on the one host whose image is
+/// the fix. The guest's cause is named for the image's builder: no
+/// installer exists inside a microVM, so no command is named for it.
+pub(crate) fn decide(
+    root: &Path,
+    mountinfo: Option<&str>,
+    guest: bool,
+    read: impl FnOnce() -> Reading,
+) -> Decision {
     // The confinement half first: without `nsdelegate` a cgroup namespace
     // is not a delegation boundary, so no leaf under this tree confines a
     // process however installed — the cause no command clears, on either
@@ -266,7 +931,48 @@ pub fn decide(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision {
             Cause::StepNotInstalled
         });
     }
-    Decision::decided()
+    // The table's half, the one the facts above cannot vouch for: the
+    // marker says the install ran, not that the refusal it recorded is
+    // still in force — a reboot that lost the reload, a flush, or a
+    // conflicting ruleset leaves the marker standing over an empty filter,
+    // which is the false `per_box` this decision must not claim. Only the
+    // probe's refusal reads as decided; a connection the chain did not
+    // refuse is its own cause, and a probe that could not read the table
+    // says so and claims nothing.
+    match read() {
+        Reading::Refused(_) => Decision::decided(),
+        Reading::NotRefused { .. } => Decision::undecidable(Cause::TableNotEffective),
+        Reading::Inconclusive { because } => {
+            tracing::info!(
+                cause = %Cause::ProbeUnreadable.detail(),
+                because = %because,
+                "the classifier table's effect could not be read on this host"
+            );
+            Decision::undecidable(Cause::ProbeUnreadable)
+        }
+    }
+}
+
+/// [`decide`] with its probe attached: the decision the daemon reads, over
+/// its own tree, mount table, and host kind. The probe binds a listener,
+/// forks a child, and waits, so an async caller runs it on the blocking
+/// pool.
+pub fn decide_now(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision {
+    decide(root, mountinfo, guest, || read_filter(root))
+}
+
+/// The decision a host-address box's launch answers against, read fresh:
+/// start's own reading is not kept, because a table can go away between it
+/// and the launch — the way a marker outlives the table it vouched for, a
+/// start reading would outlive its probe. Read over the same
+/// `classifier_root` the box is placed into, so the two halves of one
+/// launch answer over one tree.
+pub(crate) fn recorded(root: &Path) -> Decision {
+    decide_now(
+        root,
+        sandbox2::classifier::own_mountinfo().as_deref(),
+        crate::guest::is_microvm_daemon(),
+    )
 }
 
 /// Whether the cohort's two subtrees are there as the step delegates them:
@@ -285,38 +991,11 @@ fn subtrees_delegated(root: &Path) -> bool {
 }
 
 /// Whether the loaded table's presence marker is there: the directory the
-/// step writes only after its `nft -f` transaction succeeded, and the one
-/// fact that says the refusal a deny-all box's connections meet is loaded.
+/// step writes only after its `nft -f` transaction succeeded — the fact
+/// that says the installer ran, and the advisory's; the probe says whether
+/// the refusal it recorded is still in force.
 fn table_marker_present(root: &Path) -> bool {
     root.join(sandbox2::classifier::TABLE_MARKER).is_dir()
-}
-
-/// The decision this daemon recorded at start. `None` until the start
-/// block records one, and then [`recorded`] probes again rather than answer
-/// from nothing: the facts it reads are read-only, so re-reading them
-/// changes nothing and cannot lie.
-static RECORDED: std::sync::RwLock<Option<Decision>> = std::sync::RwLock::new(None);
-
-/// Records `decision` as this daemon's start-time fact about its host.
-pub fn record(decision: Decision) {
-    *RECORDED.write().expect("classifier decision lock poisoned") = Some(decision);
-}
-
-/// The decision to answer a create with: the one [`record`] wrote, or a
-/// fresh probe when nothing did.
-pub(crate) fn recorded() -> Decision {
-    if let Some(recorded) = RECORDED
-        .read()
-        .expect("classifier decision lock poisoned")
-        .clone()
-    {
-        return recorded;
-    }
-    decide(
-        Path::new(sandbox2::classifier::TREE_ROOT),
-        sandbox2::classifier::own_mountinfo().as_deref(),
-        crate::guest::is_microvm_daemon(),
-    )
 }
 
 /// The two source identities the ruleset tests render the installer's
@@ -738,14 +1417,30 @@ mod tests {
         );
     }
 
-    /// The start-time check names the cause, and the cause names the
-    /// remedy — or says, by naming none, that there is not one to run:
-    /// the step's own install ends the step-not-installed cause on a
-    /// native host (NET-079 names that one), while a host that cannot
-    /// confine a box and a guest whose image never loaded the table have
-    /// no command, because running one would leave each cause standing.
-    /// The cause and the command are the daemon's start-time facts, spelled
-    /// once in [`Cause`], so they are pinned here as data.
+    /// The reading a loaded table gives: every family the probe read,
+    /// refused with an errno in the reject set — the pair the design says
+    /// the two loopbacks read (`icmpx admin-prohibited` as EHOSTUNREACH
+    /// over IPv4, EACCES over IPv6, design §4.1). Handed to [`decide`] as
+    /// the probe's answer, so the facts that gate it are pinned against a
+    /// reading that would decide anything it was handed.
+    fn refused_reading() -> Reading {
+        Reading::Refused(vec![
+            (Family::V4, Observed::Refused(libc::EHOSTUNREACH)),
+            (Family::V6, Observed::Refused(libc::EACCES)),
+        ])
+    }
+
+    /// The check names the cause, and the cause names the remedy — or says,
+    /// by naming none, that there is not one to run: the step's own
+    /// install ends the step-not-installed cause on a native host (NET-079
+    /// names that one), while a host that cannot confine a box, a probe
+    /// that could not read the table, and a guest whose image never loaded
+    /// the table have no command, because running one would leave each
+    /// cause standing. The facts gate the probe, so every undecidable cause
+    /// below is pinned against a reading that would have decided per box —
+    /// a refusal the probe never observed cannot rescue a tree that fails
+    /// its facts. The cause and the command are spelled once in [`Cause`],
+    /// so they are pinned here as data.
     #[test]
     fn decide_names_the_cause_and_the_command_that_ends_it() {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
@@ -754,7 +1449,7 @@ mod tests {
         // A host whose cgroup2 covers the tree without `nsdelegate` cannot
         // confine a box, whatever kind of host it is — the cause is the
         // confinement, on native and guest alike, and no command ends it.
-        let undelegated = decide(root, Some(&mountinfo(root, false)), false);
+        let undelegated = decide(root, Some(&mountinfo(root, false)), false, refused_reading);
         assert!(
             !undelegated.can_decide_per_box(),
             "a cgroup2 without nsdelegate decides nothing per box"
@@ -766,14 +1461,14 @@ mod tests {
             "no install command is named for a host that cannot confine a box"
         );
         assert_eq!(
-            decide(root, Some(&mountinfo(root, false)), true).cause(),
+            decide(root, Some(&mountinfo(root, false)), true, refused_reading).cause(),
             Some(Cause::CannotConfine),
             "the guest answers the confinement question the same way"
         );
 
         // A confining host with no step installed names the step, with the
         // exact command that installs it.
-        let step_missing = decide(root, Some(&mountinfo(root, true)), false);
+        let step_missing = decide(root, Some(&mountinfo(root, true)), false, refused_reading);
         let cause = step_missing
             .cause()
             .expect("a host with no step names the step");
@@ -800,7 +1495,7 @@ mod tests {
         // is the interim rather than a broken image — and no installer
         // exists inside a microVM, so no command is named for a person who
         // cannot run one.
-        let guest_unloaded = decide(root, Some(&mountinfo(root, true)), true);
+        let guest_unloaded = decide(root, Some(&mountinfo(root, true)), true, refused_reading);
         assert_eq!(
             guest_unloaded.cause(),
             Some(Cause::GuestTableNotLoaded),
@@ -829,8 +1524,8 @@ mod tests {
             "no install command is named inside a guest"
         );
 
-        // The marker alone is what says the table is loaded: a host with
-        // the subtrees but no marker has no refusal installed, and a
+        // The marker alone is not what says the table is in force: a host
+        // with the subtrees but no marker has no refusal installed, and a
         // deny-all box there would run as though refused when nothing is
         // — for a guest, that is the state a launch refuses rather than
         // places (design §7.1).
@@ -838,27 +1533,29 @@ mod tests {
         std::fs::remove_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
             .expect("removing the marker");
         assert_eq!(
-            decide(root, Some(&mountinfo(root, true)), false).cause(),
+            decide(root, Some(&mountinfo(root, true)), false, refused_reading).cause(),
             Some(Cause::StepNotInstalled),
             "the table's marker is the step's half too, on the native host"
         );
         assert_eq!(
-            decide(root, Some(&mountinfo(root, true)), true).cause(),
+            decide(root, Some(&mountinfo(root, true)), true, refused_reading).cause(),
             Some(Cause::GuestTableNotLoaded),
             "and the guest's subtrees alone do not decide anything per box \
              in it either"
         );
 
-        // A host with both halves decides per box, guest or native: the
-        // marker is what the decision rests on, and the guest's own boot
-        // is the one step that can write it there.
+        // A host with both halves and a table that is refusing decides per
+        // box, guest or native: the probe read the effect the marker
+        // vouches for, and the guest's own boot is the one step that can
+        // write it there.
         std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
             .expect("the step writes the table's marker");
         for (kind, guest) in [("native", false), ("guest", true)] {
-            let decided = decide(root, Some(&mountinfo(root, true)), guest);
+            let decided = decide(root, Some(&mountinfo(root, true)), guest, refused_reading);
             assert!(
                 decided.can_decide_per_box(),
-                "a confining {kind} host with the step installed decides per box"
+                "a confining {kind} host with the step installed and its table \
+                 refusing decides per box"
             );
             assert_eq!(
                 decided.cause(),
@@ -866,6 +1563,67 @@ mod tests {
                 "a decided {kind} host names no cause"
             );
         }
+
+        // The same host, the same marker, a table whose refusal is not in
+        // force: the probe's connection was not refused the chain's way, so
+        // the marker's claim does not become a verdict — this is the false
+        // `per_box` the probe exists to refuse to claim (design §7.4).
+        let marker_only = decide(root, Some(&mountinfo(root, true)), false, || {
+            Reading::NotRefused {
+                because: "127.0.0.1 connected".to_string(),
+                families: vec![(Family::V4, Observed::Connected)],
+            }
+        });
+        assert!(
+            !marker_only.can_decide_per_box(),
+            "a marker that survived its table decides nothing"
+        );
+        let cause = marker_only.cause().expect("the cause is named");
+        assert_eq!(
+            cause,
+            Cause::TableNotEffective,
+            "the marker is not the verdict"
+        );
+        let detail = cause.detail();
+        assert!(
+            detail.contains("marked loaded") && detail.contains("was not refused"),
+            "the cause names what the marker said and what the probe read: {detail}"
+        );
+        let command = cause
+            .install_command()
+            .expect("reloading the table is the command that ends it");
+        assert!(
+            command.contains("install-host-classifier.sh"),
+            "the command is the one thing that reloads the table: {command}"
+        );
+
+        // And a probe that could not read the table at all claims nothing:
+        // unknown is not a verdict, and no command is named for it because
+        // none is known to make a probe run.
+        let unreadable = decide(root, Some(&mountinfo(root, true)), false, || {
+            Reading::Inconclusive {
+                because: "the leg on 127.0.0.1 was not placed, errno 13".to_string(),
+            }
+        });
+        assert!(
+            !unreadable.can_decide_per_box(),
+            "an unreadable table is not a decided one"
+        );
+        let cause = unreadable.cause().expect("the cause is named");
+        assert_eq!(
+            cause,
+            Cause::ProbeUnreadable,
+            "the unreadable table is its own cause"
+        );
+        let detail = cause.detail();
+        assert!(
+            detail.contains("could not be read") && detail.contains("unknown"),
+            "the cause says what is unknown, not what is missing: {detail}"
+        );
+        assert!(
+            cause.install_command().is_none(),
+            "no install command is named for a probe that could not run"
+        );
     }
 
     /// The cause names what happens to a host-address box on the host it was
@@ -878,13 +1636,21 @@ mod tests {
     /// every host-address box is refused, while a table that is not loaded —
     /// guest-side enforcement not being available yet — refuses the deny-all
     /// box, whose declaration promises a verdict nothing would enforce, and
-    /// runs every other, which needs no verdict enforced. Pinned as data,
-    /// the same spelling the start-up line renders.
+    /// runs every other, which needs no verdict enforced. The two probe
+    /// causes take the guest's deny-all spelling for the same reason: a
+    /// refusal that is not in force, or one the host could not see, is not
+    /// a verdict to run a deny-all box on. Pinned as data, the same
+    /// spelling the start-up line renders.
     #[test]
     fn the_cause_names_what_happens_to_the_box_on_each_host() {
         for (cause, why) in [
             (Cause::StepNotInstalled, "a host without the step"),
             (Cause::CannotConfine, "a host that cannot confine a box"),
+            (
+                Cause::TableNotEffective,
+                "a host whose marker survived its table",
+            ),
+            (Cause::ProbeUnreadable, "a host whose probe read nothing"),
         ] {
             assert_eq!(
                 cause.host_ip_box_outcome(false),
@@ -898,29 +1664,245 @@ mod tests {
              leaf that confines",
             "a guest that cannot confine a box has no leaf to decide anything in"
         );
+        for (cause, why) in [
+            (Cause::GuestTableNotLoaded, "the interim"),
+            (
+                Cause::TableNotEffective,
+                "a table whose refusal is not in force",
+            ),
+            (Cause::ProbeUnreadable, "an effect the host could not read"),
+        ] {
+            assert_eq!(
+                cause.host_ip_box_outcome(true),
+                "its deny-all host-address boxes are refused and its other \
+                 host-address boxes run unenforced",
+                "{why} refuses the deny-all box and runs the rest"
+            );
+        }
+    }
+
+    /// The reading's own rule (design §4.1, §7.4): a `per_box` fact is
+    /// built only from refusals the loaded chain itself reads as —
+    /// EHOSTUNREACH over IPv4 loopback, EACCES over IPv6, EPERM a security
+    /// module's — and only when every family the probe read was refused
+    /// that way, because a connection that completed on any family is a
+    /// full bypass and no other leg can un-meet it. The errnos the probe
+    /// read are carried per family into the record, so the evidence a
+    /// `per_box` rests on is what a person reads. Pinned as data here, and
+    /// not in the probe: the probe reports, the reading decides.
+    #[test]
+    fn a_per_box_reading_rests_only_on_the_set_the_chain_reads_as() {
+        // The pair the design says the probe reads on the two loopbacks
+        // (design §4.1): one `reject with icmpx admin-prohibited`, two
+        // errnos.
+        let legs = [
+            (Family::V4, Observed::Refused(libc::EHOSTUNREACH)),
+            (Family::V6, Observed::Refused(libc::EACCES)),
+        ];
+        let reading = Reading::of(&legs);
+        let carried = match &reading {
+            Reading::Refused(families) => families.clone(),
+            other => panic!("two in-set refusals read as the table refusing: {other:?}"),
+        };
         assert_eq!(
-            Cause::GuestTableNotLoaded.host_ip_box_outcome(true),
-            "its deny-all host-address boxes are refused and its other \
-             host-address boxes run unenforced",
-            "the interim refuses the deny-all box and runs the rest"
+            carried, legs,
+            "the reading carries the evidence it rests on, per family"
+        );
+        // The record names each family's errno: the evidence a `per_box`
+        // rests on is what a person reads in the daemon's log.
+        let record = reading.record();
+        for (family, errno) in [("127.0.0.1", libc::EHOSTUNREACH), ("::1", libc::EACCES)] {
+            assert!(
+                record.contains(family) && record.contains(&format!("errno {errno}")),
+                "the record names what {family} read, errno included: {record}"
+            );
+        }
+
+        // EPERM is the set's third face — a security module refusing the
+        // same connection — and reads as the table too.
+        let permed = [
+            (Family::V4, Observed::Refused(libc::EPERM)),
+            (Family::V6, Observed::Refused(libc::EHOSTUNREACH)),
+        ];
+        assert!(
+            matches!(Reading::of(&permed), Reading::Refused(_)),
+            "EPERM is in the set the loaded chain reads as"
+        );
+
+        // A host whose IPv6 loopback is not enabled reads only v4, and one
+        // in-set refusal over the only family it could read is the table
+        // refusing: the family the host does not have is not a family
+        // anything can bypass through.
+        let v4_only = [(Family::V4, Observed::Refused(libc::EHOSTUNREACH))];
+        assert!(
+            matches!(Reading::of(&v4_only), Reading::Refused(_)),
+            "a family not enabled on this host is not read, and the one read \
+             decides"
+        );
+
+        // Anything else — a connection that completed, a leg that never
+        // reported, or a refusal with an errno the chain never reads as
+        // (ECONNREFUSED is the probe's own listener gone, ENETUNREACH a
+        // routing answer) — is evidence the table is not what refused, on
+        // any family, and settles the whole reading that way: a bypass on
+        // any family is a full bypass.
+        for (observed, why) in [
+            (Observed::Connected, "a connection the filter admitted"),
+            (Observed::TimedOut, "a leg that never reported"),
+            (
+                Observed::Refused(libc::ECONNREFUSED),
+                "the probe's own listener gone",
+            ),
+            (Observed::Refused(libc::ENETUNREACH), "a routing answer"),
+        ] {
+            for family in [Family::V4, Family::V6] {
+                let (other, errno) = if family == Family::V4 {
+                    (Family::V6, libc::EACCES)
+                } else {
+                    (Family::V4, libc::EHOSTUNREACH)
+                };
+                let legs = [(other, Observed::Refused(errno)), (family, observed)];
+                match Reading::of(&legs) {
+                    Reading::NotRefused { because, .. } => assert!(
+                        because.starts_with(family.name()),
+                        "{why} on {} settles the reading, in its own words: \
+                         {because}",
+                        family.name()
+                    ),
+                    other => panic!(
+                        "{why} on {} voids the reading, not {other:?}",
+                        family.name()
+                    ),
+                }
+            }
+        }
+
+        // A leg that could not be read is not a refusal it never observed:
+        // with no positive evidence anywhere, the effect is unknown, and
+        // unknown is not a verdict — which is what keeps a `per_box` from
+        // resting on a reading that could not see one family.
+        let unplaced = [
+            (Family::V4, Observed::Unplaced(libc::EACCES)),
+            (Family::V6, Observed::Unplaced(libc::EACCES)),
+        ];
+        match Reading::of(&unplaced) {
+            Reading::Inconclusive { because } => assert!(
+                because.contains("was not placed"),
+                "the unreadable legs are named: {because}"
+            ),
+            other => panic!("a probe that placed no child read nothing: {other:?}"),
+        }
+        let mixed = [
+            (Family::V4, Observed::Refused(libc::EHOSTUNREACH)),
+            (Family::V6, Observed::Unplaced(libc::EACCES)),
+        ];
+        assert!(
+            matches!(Reading::of(&mixed), Reading::Inconclusive { .. }),
+            "a refused leg does not stand in for a family the probe could not \
+             read"
+        );
+        assert!(
+            matches!(Reading::of(&[]), Reading::Inconclusive { .. }),
+            "a probe with no family to read knows nothing"
         );
     }
 
-    /// The recorded decision answers a create from the fact the start block
-    /// wrote, and a daemon that never recorded one probes again — read-only
-    /// facts, so the re-read answers the same.
+    /// The control leg is what makes the probe's reading mean anything: a
+    /// listener the daemon itself cannot reach from its own cgroup says
+    /// nothing about the filter, so the reading is inconclusive and no
+    /// probe child is forked — the daemon's own connect runs first, and its
+    /// failure is the reading's cause, named in the daemon's words.
     #[test]
-    fn recorded_decision_answers_from_the_start_fact() {
-        record(Decision::decided());
+    fn a_listener_the_daemon_cannot_reach_reads_as_inconclusive() {
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        // A listener bound and then dropped: a port that was once live and
+        // is on nobody's socket now — the daemon's own connect to it fails,
+        // with nothing of the filter involved.
+        let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("a loopback listener to point the probe at");
+        let addr = listener.local_addr().expect("the dead listener's address");
+        drop(listener);
+        match probe_effect(tree.path(), &[(Family::V4, addr)]) {
+            Reading::Inconclusive { because } => assert!(
+                because.contains("the daemon's own connect"),
+                "the reading names the control leg that failed: {because}"
+            ),
+            other => panic!("a dead listener is inconclusive, not {other:?}"),
+        }
+        // The control leg never forked a child, so the probe's leaf was
+        // never made either: a probe that read nothing leaves nothing.
         assert!(
-            recorded().can_decide_per_box(),
-            "what the start block recorded is what a create is answered with"
+            !probe_leaf(tree.path()).exists(),
+            "the control leg runs before any child is placed"
         );
-        record(Decision::undecidable(Cause::StepNotInstalled));
+    }
+
+    /// The marker is not the verdict, over a tree a table is not refusing
+    /// behind: the step's half present — subtrees delegated, marker written
+    /// — and no table loaded, which is exactly what a stand-in tree is
+    /// (and what a real tree whose table lost its reboot's reload is, the
+    /// state the marker survives and the refusal does not). The probe reads
+    /// the effect itself: its child places into a deny leaf, connects to
+    /// the daemon's held listener, is admitted, and the decision is the
+    /// cause that says so — the box recorded `none`, never a `per_box`
+    /// claimed over a filter that admits the probe (design §7.4).
+    #[test]
+    fn a_marker_survives_its_table_but_decides_nothing() {
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        let root = tree.path();
+        installed_cohort(root);
+        let decision = decide(root, Some(&mountinfo(root, true)), false, || {
+            read_filter(root)
+        });
+        assert!(
+            !decision.can_decide_per_box(),
+            "the marker's claim is cross-checked against the table's own \
+             effect, and there is no refusal behind it"
+        );
         assert_eq!(
-            recorded().cause(),
-            Some(Cause::StepNotInstalled),
-            "the recorded cause outlives the probe that found it"
+            decision.cause(),
+            Some(Cause::TableNotEffective),
+            "a marker that survived its table is its own cause"
+        );
+        // The probe cleaned up its own leaf: the reading a launch takes
+        // leaves the tree as it found it, bar the tree's own facts.
+        assert!(
+            !probe_leaf(root).exists(),
+            "the probe removes the throwaway leaf it placed its child in"
+        );
+    }
+
+    /// The decision a launch answers with is read fresh, over the tree it
+    /// is about to place a box in — never a start fact kept between
+    /// launches, because a table can go away between them and a kept
+    /// decision would outlive its probe the way a marker outlives its
+    /// table. Pinned over a stand-in tree the host's own mount table does
+    /// not cover: the reading is undecidable for the confinement cause
+    /// whatever the step's half under it looks like, and reading it again
+    /// answers the same — nothing was kept, so there is nothing for the
+    /// second reading to inherit.
+    #[test]
+    fn the_decision_is_read_fresh_over_the_tree_it_answers_for() {
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        let root = tree.path();
+        installed_cohort(root);
+        let first = recorded(root);
+        assert!(
+            !first.can_decide_per_box(),
+            "a tree the host's own mount table does not cover decides nothing \
+             per box, step's half or no step's half"
+        );
+        assert_eq!(
+            first.cause(),
+            Some(Cause::CannotConfine),
+            "the real mount table is the fact the launch reads, not the one a \
+             test would like it to"
+        );
+        assert_eq!(
+            recorded(root),
+            first,
+            "nothing is kept between readings: the fact is the tree's own, \
+             re-read per launch"
         );
     }
 }
