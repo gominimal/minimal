@@ -174,29 +174,59 @@ struct Guest {
     sock_path: PathBuf,
     gate_sock: PathBuf,
     gvproxy: PathBuf,
+    /// The VMM child's pid from `status --json`, killed directly when
+    /// `minvmd stop` fails.
+    vmm_pid: Option<u32>,
     _state: TempDir,
 }
 
 impl Drop for Guest {
     fn drop(&mut self) {
-        // Panic-safe teardown: a failed assertion must not leak the detached
-        // supervisor, its VMM child, or its switch. Bounded, so a wedged
-        // daemon cannot hang the teardown either.
-        let _ = minvmd(self._state.path(), &self.gvproxy, &["stop"]);
+        // Teardown that never panics (it may run while a failed assertion
+        // unwinds) and never leaks: a failed assertion must not leave the
+        // detached supervisor, its VMM child, or its switch running. Bounded,
+        // so a wedged daemon cannot hang the teardown either; when `stop`
+        // fails, the recorded VMM is killed, and the supervisor exits with it.
+        let stopped = match try_minvmd(self._state.path(), &self.gvproxy, &["stop"]) {
+            Ok(out) if out.status.success() => return,
+            Ok(out) => format!(
+                "exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(e) => e,
+        };
+        eprintln!("vm_escape_integration: minvmd stop failed ({stopped})");
+        if let Some(pid) = self.vmm_pid.and_then(|p| libc::pid_t::try_from(p).ok()) {
+            eprintln!("vm_escape_integration: killing VMM pid {pid}");
+            // SAFETY: kill only sends a signal to the pid `status` reported.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
     }
 }
 
 /// Run one `minvmd` subcommand against the isolated state dir, bounded by
-/// [`SUBPROC_TIMEOUT`]. The env the VM needs (`MINVMD_VM_OWN_IP`,
-/// `MINVMD_GVPROXY_BIN`) is inherited by the detached supervisor and its VMM
-/// child, so it is set on every call. stdin is off the terminal, or libkrun's
-/// console setup stops the process group.
+/// [`SUBPROC_TIMEOUT`]; panics when it cannot be run or does not exit.
+fn minvmd(state: &Path, gvproxy: &Path, args: &[&str]) -> Output {
+    try_minvmd(state, gvproxy, args).unwrap_or_else(|e| {
+        #[expect(clippy::panic, reason = "a subcommand that cannot run fails the test")]
+        {
+            panic!("vm_escape_integration: {e}")
+        }
+    })
+}
+
+/// [`minvmd`] without the panic. The env the VM needs (`MINVMD_VM_OWN_IP`,
+/// `MINVMD_GVPROXY_BIN`, `MINVMD_READY_TIMEOUT_SECS`) is inherited by the
+/// detached supervisor and its VMM child, so it is set on every call. stdin
+/// is off the terminal, or libkrun's console setup stops the process group.
+/// stdout and stderr are drained on reader threads while the child runs, so
+/// a chatty child cannot fill a pipe and stall into the timeout.
 #[expect(
     clippy::let_underscore_must_use,
-    clippy::panic,
-    reason = "a wedged subcommand is killed best-effort, then fails the test"
+    reason = "a wedged subcommand is killed and reaped best-effort"
 )]
-fn minvmd(state: &Path, gvproxy: &Path, args: &[&str]) -> Output {
+fn try_minvmd(state: &Path, gvproxy: &Path, args: &[&str]) -> Result<Output, String> {
     let mut child = Command::new(minvmd_bin())
         .args(args)
         // HOME too, not just XDG_STATE_HOME: any `dirs`-based fallback that
@@ -205,21 +235,56 @@ fn minvmd(state: &Path, gvproxy: &Path, args: &[&str]) -> Output {
         .env("XDG_STATE_HOME", state)
         .env("MINVMD_VM_OWN_IP", "1")
         .env("MINVMD_GVPROXY_BIN", gvproxy)
+        // `--timeout` bounds only `run --detach`'s own poll; the supervisor's
+        // READY wait reads this (60 s by default), and a cold boot can
+        // outrun that, so give it the same budget.
+        .env("MINVMD_READY_TIMEOUT_SECS", DETACH_TIMEOUT_SECS)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawning minvmd");
+        .map_err(|e| format!("spawning minvmd {args:?}: {e}"))?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
     let deadline = Instant::now() + SUBPROC_TIMEOUT;
-    while child.try_wait().expect("polling minvmd").is_none() {
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("minvmd {args:?} did not exit within {SUBPROC_TIMEOUT:?} (wedged daemon?)");
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "minvmd {args:?} did not exit within {SUBPROC_TIMEOUT:?} (wedged daemon?)"
+                ));
+            }
+            Err(e) => return Err(format!("polling minvmd {args:?}: {e}")),
         }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    child.wait_with_output().expect("collecting minvmd output")
+    };
+    Ok(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
 }
 
 /// Renders one JSON log record as `key=value` pairs, nested objects
@@ -253,6 +318,7 @@ impl Guest {
             // beside the bridge socket.
             gate_sock: provider_dir.join("gvproxy-gate.sock"),
             gvproxy: gvproxy.to_path_buf(),
+            vmm_pid: None,
             _state: state,
         };
         let run = guest.minvmd(&["run", "--detach", "--timeout", DETACH_TIMEOUT_SECS]);
@@ -264,14 +330,22 @@ impl Guest {
             String::from_utf8_lossy(&run.stderr),
             guest.run_log(),
         );
+        let mut guest = guest;
         let deadline = Instant::now() + RUNNING_TIMEOUT;
         loop {
             let status = guest.minvmd(&["status", "--json"]);
             let status: serde_json_lenient::Value = serde_json_lenient::from_slice(&status.stdout)
                 .unwrap_or(serde_json_lenient::Value::Null);
-            if status.get("state").is_some_and(|s| s == "running")
-                && status.get("vmm_pid").is_some_and(|p| p.is_number())
-            {
+            let vmm_pid = status
+                .get("vmm_pid")
+                .and_then(serde_json_lenient::Value::as_u64)
+                .and_then(|p| u32::try_from(p).ok());
+            if vmm_pid.is_some() {
+                // Recorded before Running too, so a boot that never gets
+                // there is still torn down.
+                guest.vmm_pid = vmm_pid;
+            }
+            if status.get("state").is_some_and(|s| s == "running") && vmm_pid.is_some() {
                 return guest;
             }
             assert!(
