@@ -34,9 +34,8 @@
 //! acceptor that is down is specified to answer (NET-132).
 
 use std::io::{Read, Write};
-// `SO_PEERCRED` is Linux's, so the import is too: off Linux nothing in this
-// file asks for a raw fd, and an ungated import would read as unused there.
-#[cfg(target_os = "linux")]
+// Both peer-credential reads ask the kernel over the stream's own fd —
+// `SO_PEERCRED` on Linux, `getpeereid` off it — so the import is ungated.
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -207,6 +206,21 @@ fn daemon_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// Whether `presented` is this boot's token, decided in time independent
+/// of where the two first differ: the token is a shared secret, and a
+/// byte-at-a-time comparison would leak how many leading bytes a guess
+/// got right through the moment the refusal closes the connection — a
+/// channel a same-uid host process could read across guesses. Both
+/// arrays are the fixed [`TOKEN_LEN`], so the fold runs over every byte
+/// every time and only the accumulation of their differences decides.
+fn token_matches(presented: &[u8; TOKEN_LEN], expected: &[u8; TOKEN_LEN]) -> bool {
+    let mut diff = 0u8;
+    for byte in 0..TOKEN_LEN {
+        diff |= presented[byte] ^ expected[byte];
+    }
+    diff == 0
+}
+
 /// The peer's credentials, the kernel's own answer for who holds the other
 /// end of `stream`: its uid, and its pid where the platform names one —
 /// Linux does. `SO_PEERCRED` is decided at connect time, so nothing the
@@ -242,14 +256,25 @@ fn peer_credentials(stream: &UnixStream) -> std::io::Result<(u32, Option<u32>)> 
     ))
 }
 
-/// Off Linux the kernel offers no stable way to read the peer's
-/// credentials, so the stand-in has none to check: the 0600 socket already
-/// bounds who may connect to the same user, and the per-boot token decides
-/// what that user may present. The uid handed back is the daemon's own, so
-/// the credential refusal is vacuous rather than a refusal of everything.
+/// Off Linux the kernel offers one credential fact for a connected unix
+/// socket: the peer's uid, read with `getpeereid`. It comes with no pid,
+/// so the pid check is vacuous there — naming the peer's process is
+/// `SO_PEERCRED`'s, a Linux extra — but the uid check is real: a 0600
+/// socket in a 0700 dir bounds who may *connect*, and this bounds what
+/// the stand-in believes about the one who did, the same user this
+/// process runs as and no other.
 #[cfg(not(target_os = "linux"))]
-fn peer_credentials(_stream: &UnixStream) -> std::io::Result<(u32, Option<u32>)> {
-    Ok((daemon_uid(), None))
+fn peer_credentials(stream: &UnixStream) -> std::io::Result<(u32, Option<u32>)> {
+    let mut uid = libc::uid_t::default();
+    let mut gid = libc::gid_t::default();
+    // SAFETY: getpeereid writes the peer's uid and gid into the two
+    // locals; the fd is the stream's own and stays valid for the
+    // borrow's life.
+    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((uid, None))
 }
 
 /// Serve one presented connection: check the credentials, read the token,
@@ -284,7 +309,7 @@ fn serve_connection(mut stream: UnixStream, shared: &Shared) {
         audit(shared, "short");
         return;
     }
-    if token != shared.token {
+    if !token_matches(&token, &shared.token) {
         audit(shared, "token");
         return;
     }
@@ -341,7 +366,7 @@ mod tests {
     use std::path::Path;
 
     use switch::SwitchSubnet;
-    use switch::bep_host::test_util::{FIRST_CLIENT_PORT, TestLane};
+    use switch::bep_host::test_util::{FIRST_CLIENT_PORT, State, TestLane};
     use switch::bep_host::{BepWire, DEFAULT_PER_SOURCE_CAP, PROXY_PORT};
 
     /// The source address a hand-made presentation claims: a box's address
@@ -490,15 +515,34 @@ mod tests {
             "a same-uid process that is not the daemon is refused for its pid"
         );
         assert_eq!(credential_refusal(uid, Some(3), uid, 3), None);
+
+        // Off Linux the kernel still names the peer's uid — `getpeereid`
+        // — and the stand-in reads it: this process's own uid, the fact
+        // the uid check runs on there. No pid comes with it, so the pid
+        // check is the Linux extra it has always been.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let stream = UnixStream::connect(&sock).expect("the stand-in's socket accepts");
+            let (peer_uid, peer_pid) =
+                peer_credentials(&stream).expect("the kernel names the peer's uid");
+            assert_eq!(
+                peer_uid,
+                daemon_uid(),
+                "getpeereid names this process's own uid"
+            );
+            assert_eq!(peer_pid, None, "no pid is named off Linux");
+        }
     }
 
     /// NET-132/T69: a delivered connection arrives at the proxy's unix
     /// socket from the box's own switch address — the delivery header's
     /// source — with this boot's token ahead of it, and the stand-in's
-    /// answer names that source back to the box. Two boxes deliver at once
-    /// and each is named by its own address, never each other's; the pool
-    /// behind them is partitioned by the rows the registry holds, so each
-    /// box's share is the per-source cap.
+    /// answer names that source back to the box. Two boxes deliver at
+    /// once and each is named by its own address, never each other's; the
+    /// pool behind them is partitioned by the box rows the registry
+    /// holds, so each box's share is the per-source cap — and the node
+    /// namespace's row, which is not a box, buys no share: the daemon
+    /// address it holds is refused like any source no row speaks from.
     #[tokio::test]
     async fn delivered_connection_arrives_from_the_boxs_switch_address() {
         let subnet = SwitchSubnet::default();
@@ -508,7 +552,9 @@ mod tests {
         // The supervisor wires the peer before any client box exists: the
         // node's own row is the one fact the host can name at boot, holding
         // the default port pair it hands the guest when nothing overrides it
-        // (cmd/run.rs resolves the same pair at VM boot).
+        // (cmd/run.rs resolves the same pair at VM boot). It is the guest's
+        // own root netns, not a box, so it buys no share in the pool: the
+        // partition the delivery runs under is by boxes alone.
         registry.register_node_namespace(7654, 7656);
         let dir = tempfile::tempdir().expect("tempdir");
         let proxy_sock = dir.path().join("bep-stub.sock");
@@ -533,13 +579,13 @@ mod tests {
         drive(&mut lane, 2).await;
         assert_eq!(
             lane.pool_len(),
-            DEFAULT_PER_SOURCE_CAP,
-            "the node's one row holds one share"
+            0,
+            "the node namespace's row is not a box: it holds no share"
         );
 
         // The two client boxes register the way the activating client
         // registers them (T66): rows the host allocates, from the plan's
-        // hand-out run, and the pool grows a share per row.
+        // hand-out run, and the pool grows a share per box row.
         let box_a = registry
             .register_client_box(crate::box_registry::ClientBoxSpec {
                 name: "box-a".to_string(),
@@ -557,8 +603,8 @@ mod tests {
         drive(&mut lane, 2).await;
         assert_eq!(
             lane.pool_len(),
-            3 * DEFAULT_PER_SOURCE_CAP,
-            "every row the registry holds adds its share of the per-source cap"
+            2 * DEFAULT_PER_SOURCE_CAP,
+            "the two boxes' rows hold one share each; the node's adds none"
         );
 
         // A box rides the lane at the address its row holds, the way a
@@ -611,6 +657,35 @@ mod tests {
         assert_eq!(presented.len(), 2, "one answer per delivered connection");
         assert!(presented.contains(&expected_a), "box A was presented once");
         assert!(presented.contains(&expected_b), "box B was presented once");
+
+        // A connection from the daemon address — the address the node
+        // namespace's row holds — is reset: the source holds no share, so
+        // the pool's screen refuses it before any listener answers, and
+        // the daemon's own tap can never arrive through the boxes'
+        // delivery. Nothing about it was presented.
+        let daemon_ip = subnet.daemon_ip();
+        lane.add_box(daemon_ip);
+        drive(&mut lane, 1).await;
+        lane.boxes_mut()[2].arp_for(proxy_ip);
+        drive(&mut lane, 3).await;
+        let from_daemon = lane.boxes_mut()[2].connect(proxy_ip, PROXY_PORT);
+        drive(&mut lane, 40).await;
+        assert_eq!(
+            lane.boxes()[2].flow_state(from_daemon),
+            State::Closed,
+            "a connection from the daemon address was reset"
+        );
+        let presented = stub.presented();
+        assert_eq!(
+            presented.len(),
+            2,
+            "nothing from the daemon address was presented as a box"
+        );
+        assert_eq!(
+            lane.pool_len(),
+            2 * DEFAULT_PER_SOURCE_CAP,
+            "the refused connection took no share away from the boxes"
+        );
     }
 
     /// Drive the lane for `rounds` turns, letting the delivery tasks run

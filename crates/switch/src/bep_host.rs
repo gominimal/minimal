@@ -1779,6 +1779,11 @@ pub mod test_util {
     use super::*;
     use smoltcp::wire::{ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol};
 
+    /// The TCP state a [`TestBox`]'s flow is in, re-exported so a test in
+    /// another crate can name it without taking the stack as its own
+    /// dependency.
+    pub use smoltcp::socket::tcp::State;
+
     /// The first source port a [`TestBox`] connects from; each further
     /// flow's port is one higher. Known to the tests, so an acceptor can
     /// pick one flow to stall by the endpoint it presented.
