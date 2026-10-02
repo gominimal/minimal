@@ -72,6 +72,7 @@ const MAX_HEAD: usize = 8 * 1024;
 /// open the socket but never send the `\r\n\r\n` end-of-head marker, so a slow
 /// or stalled client cannot tie up a connection task indefinitely.
 const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const UPSTREAM_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The host-side lookup the proxy performs for each request: a `Host:`-header
 /// host (with any `:port` already stripped) to the route its requests forward
@@ -491,9 +492,14 @@ where
         }
     };
 
-    let mut upstream = match TcpStream::connect(upstream_addr).await {
-        Ok(upstream) => upstream,
-        Err(error) => {
+    let mut upstream = match tokio::time::timeout(
+        UPSTREAM_DIAL_TIMEOUT,
+        TcpStream::connect(upstream_addr),
+    )
+    .await
+    {
+        Ok(Ok(upstream)) => upstream,
+        Ok(Err(error)) => {
             tracing::warn!(
                 component = "dns-proxy",
                 host = %host,
@@ -504,6 +510,18 @@ where
                 "refused a proxied request"
             );
             return write_status(&mut client, "502 Bad Gateway").await;
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                component = "dns-proxy",
+                host = %host,
+                session = route.session(),
+                upstream = %upstream_addr,
+                reason = "the upstream box did not answer within the dial timeout",
+                status = "504 Gateway Timeout",
+                "refused a proxied request"
+            );
+            return write_status(&mut client, "504 Gateway Timeout").await;
         }
     };
 

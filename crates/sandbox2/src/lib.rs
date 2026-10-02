@@ -2873,6 +2873,10 @@ fn write_resolv_conf(rootfs: &Path, resolver: &network::Resolver) -> Result<(), 
 /// Idempotent: `new_container` runs once per task invocation over the same
 /// rootfs, so an entry a previous invocation already wrote is skipped instead
 /// of growing the file a line per exec.
+///
+/// The rewrite is atomic: the body is written to a temp file in the same
+/// directory and renamed over the target, so a concurrent writer or reader
+/// never sees a truncated or missing file.
 fn write_hosts(rootfs: &Path, hosts: &[network::HostEntry]) -> Result<(), Error> {
     if hosts.is_empty() {
         return Ok(());
@@ -2895,12 +2899,10 @@ fn write_hosts(rootfs: &Path, hosts: &[network::HostEntry]) -> Result<(), Error>
         }
         body.push_str(&format!("{}\t{}\n", entry.address, entry.name));
     }
-    match fs::remove_file(&etc_hosts) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(Error::IO("replacing /etc/hosts", etc_hosts.clone(), e)),
-    }
-    fs::write(&etc_hosts, body).map_err(|e| Error::IO("writing /etc/hosts", etc_hosts, e))
+    let temp = etc_hosts.with_file_name(format!("hosts.tmp{}", std::process::id()));
+    fs::write(&temp, &body).map_err(|e| Error::IO("writing /etc/hosts temp", temp.clone(), e))?;
+    fs::rename(&temp, &etc_hosts)
+        .map_err(|e| Error::IO("renaming /etc/hosts into place", etc_hosts, e))
 }
 
 /// Whether `body` already answers `entry` — a line whose whitespace-separated
