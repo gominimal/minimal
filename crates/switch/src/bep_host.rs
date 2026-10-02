@@ -682,7 +682,11 @@ impl BepHost {
     /// straight back — not the pool's to rule on — so the next interface
     /// poll reads it.
     fn take_inbound(&mut self) -> VecDeque<Vec<u8>> {
-        let mut pending = self.device.pending.lock().expect("the pending queue is uncontended");
+        let mut pending = self
+            .device
+            .pending
+            .lock()
+            .expect("the pending queue is uncontended");
         let mut inbound = std::mem::take(&mut *pending);
         drop(pending);
         while let Ok(frame) = self.device.rx.try_recv() {
@@ -3658,8 +3662,7 @@ mod tests {
             mark + 1,
             "the refused SYN is answered with one reset and nothing else"
         );
-        let eth =
-            EthernetFrame::new_checked(&outbound[mark]).expect("the peer sends ethernet");
+        let eth = EthernetFrame::new_checked(&outbound[mark]).expect("the peer sends ethernet");
         assert_ne!(
             eth.dst_addr(),
             EthernetAddress::BROADCAST,
@@ -3760,8 +3763,7 @@ mod tests {
             mark + 1,
             "the refused reuse is answered with one reset and nothing else"
         );
-        let eth =
-            EthernetFrame::new_checked(&outbound[mark]).expect("the peer sends ethernet");
+        let eth = EthernetFrame::new_checked(&outbound[mark]).expect("the peer sends ethernet");
         assert_ne!(
             eth.dst_addr(),
             EthernetAddress::BROADCAST,
