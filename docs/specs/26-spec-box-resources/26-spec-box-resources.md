@@ -4,6 +4,7 @@ title: Box resources — a host-sized guest, one enforced memory limit per box, 
 owner: mitodrummer
 epic: gominimal/inbox#698
 arch: https://github.com/gominimal/arch/blob/main/architecture.md#box-resources
+arch_sha: 5c1201517ba07347344fb9725efb06ee39d5c03e
 updated: 2026-10-02
 ---
 
@@ -527,11 +528,11 @@ memory than the host has is refused end to end, with the numbers, before any lim
   tier:     T0
   verify:   cargo nextest run -p minimal advisory_host_create_warns_on_stderr
 
-- **BRES-075** WHERE the host delegates a cgroup2 subtree with the memory controller enabled to the native `minimald`, WHEN `minimald` creates a box's leaf on `local0` THE SYSTEM SHALL set the leaf's `memory.swap.max` to 0 unless every swap device enabled on the host is a zram device or an encrypted (dm-crypt) device, so that box memory never reaches a plaintext swap partition or swap file on the developer's disk, enforced by the native `minimald` and the kernel outside the box, on the host side of TB2 on the developer's machine (no TB3), inside a subtree the host's cgroup manager delegates, against every process in the box including root inside it.
+- **BRES-075** WHERE the host delegates a cgroup2 subtree with the memory controller enabled to the native `minimald`, WHEN `minimald` creates a box's leaf on `local0` THE SYSTEM SHALL set the leaf's `memory.swap.max` to 0 unless every swap device enabled on the host is a zram device or a dm-crypt device keyed fresh at each boot (a `/dev/urandom` key in `/etc/crypttab`, so the key never outlives the boot), so that box memory never reaches a plaintext swap partition or swap file on the developer's disk, enforced by the native `minimald` and the kernel outside the box, on the host side of TB2 on the developer's machine (no TB3), inside a subtree the host's cgroup manager delegates, against every process in the box including root inside it.
   tier:     T0
   verify:   cargo nextest run -p minimald local0_leaf_swap_max_zero_unless_host_swap_zram_or_encrypted_root_integration
 
-- **BRES-076** WHERE the host delegates a cgroup2 subtree with the memory controller enabled to the native `minimald` THE SYSTEM SHALL count `local0`'s reservations as deliverable only when the kernel's effective protection for the boxes subtree can reach `local0`'s allocatable: every ancestor above the delegated subtree, up to but not including the cgroup root, carries a `memory.min` of at least that allocatable (a `MemoryMin=` on the delegating unit and on each slice above it), and every cgroup between the delegated subtree's root and the boxes subtree carries one too or cgroup2 is mounted with `memory_recursiveprot`, decided by the Box Host daemon from what it reads, on the host side of TB2.
+- **BRES-076** WHERE the host delegates a cgroup2 subtree with the memory controller enabled to the native `minimald` THE SYSTEM SHALL count `local0`'s reservations as deliverable only when the kernel's effective protection for the boxes subtree can reach `local0`'s allocatable: every ancestor above the delegated subtree, up to but not including the cgroup root, carries a `memory.min` of at least that allocatable (a `MemoryMin=` on the delegating unit and on each slice above it), at each of those levels the `memory.min` claimed by the chain's cgroup and its siblings together is at most their parent's, so no sibling dilutes the protection the kernel distributes, and every cgroup between the delegated subtree's root and the boxes subtree carries one too or cgroup2 is mounted with `memory_recursiveprot`, decided by the Box Host daemon from what it reads, on the host side of TB2.
   tier:     T0
   verify:   cargo nextest run -p minimald local0_reservations_advisory_without_ancestor_protection_root_integration
 
@@ -772,7 +773,7 @@ The other invariants:
 
 - **Invariant:** THE SYSTEM SHALL keep a box's swapped memory unreadable once the boot that
   wrote it ends. In the guest that is zram; on `local0` a box's leaf may swap only where every
-  host swap device is zram or encrypted. Whether the physical host pages the VM's memory is an
+  host swap device is zram or encrypted under a per-boot key. Whether the physical host pages the VM's memory is an
   Open question.
   enforced by: zram created by the Box Host daemon at guest boot; no swap on any volume that
   persists or is snapshotted; the daemon's own cgroup never swaps; on `local0`, a leaf
@@ -830,8 +831,7 @@ limit on the rest of the desktop.
   says swap is unreadable once the boot ends and the host's own processes never swap, but not
   what a box on `local0` may swap to when the desktop's swap is a plaintext partition or file.
   Proposed for the architecture: on `local0` a box swaps only where the host's swap is zram or
-  encrypted, and otherwise its swap allowance is 0 (BRES-075). The rule's "a key that exists only
-  for that boot" is stricter than what BRES-075 detects, which is any dm-crypt device.]
+  encrypted under a per-boot key, and otherwise its swap allowance is 0 (BRES-075).]
 - [NEEDS CLARIFICATION (MEDIUM): Architecture gap — allocatable is capacity minus the Box Host's
   reserve, and swap held in memory is not counted. zram's compressed pages are charged to no
   memory cgroup, so boxes that swap can push the guest past its reserve into a global OOM.
