@@ -78,18 +78,32 @@
 //! unlistened port, the ICMP port-unreachable — and each of those goes to
 //! the box that asked and to no other destination: no gratuitous ARP at
 //! attach, no ARP probe, nothing on an idle lane, and no socket at all
-//! until a registered box's share puts one there. The smoltcp feature set
-//! this crate builds with excludes `proto-ipv6`, so the stack cannot emit
-//! neighbour solicitation, router solicitation or MLD either.
+//! until a registered box's share puts one there. It never emits an ARP
+//! request either — not even the one its own stack writes when a flow it
+//! owes bytes to outlives the neighbour cache's 60-second entry. That is
+//! the architecture ruling on the neighbour: the pre-screen pins each
+//! registered box's address to the MAC its admitted SYN came from (and
+//! refuses one whose source MAC is not its address's switch-derived MAC
+//! — the host-side leg of the same anti-spoof line the switch's static
+//! leases hold), the pin is dropped when its row withdraws, and the
+//! stack's own ask is answered from that pin: one synthetic reply, the
+//! shape the box's own answer would have carried, fed straight back in
+//! through the device's receive queue. An address with no pin gets no
+//! answer at all — no request is aimed, nothing is broadcast, and the
+//! flow's own retransmission asks again when a row gives it a pin. The
+//! smoltcp feature set this crate builds with excludes `proto-ipv6`, so
+//! the stack cannot emit neighbour solicitation, router solicitation or
+//! MLD either.
 //! `idle_peer_emits_no_frames` pins the silence and `peer_binds_no_socket`
 //! pins the empty set.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use crate::{DEFAULT_MTU, MacAddr, SwitchSubnet};
@@ -297,8 +311,17 @@ impl BepBoxSource for NoBoxes {
 pub struct BepDevice {
     rx: UnboundedReceiver<Vec<u8>>,
     tx: UnboundedSender<Vec<u8>>,
-    /// Frames the channel delivered, waiting for the interface's `receive`.
-    pending: VecDeque<Vec<u8>>,
+    /// Frames waiting for the interface's `receive`: the ones the channel
+    /// delivered and the synthetic ARP replies the transmit tokens queue.
+    /// Shared with the tokens, which hold no other handle into the device
+    /// — a reply has to land in the receive queue the next poll reads, not
+    /// on the transmit side, where the interface would never see it.
+    pending: Arc<StdMutex<VecDeque<Vec<u8>>>>,
+    /// The neighbour answers, armed on the leg's device only: the ruling
+    /// is the peer's, not the boxes' (see [`NeighbourAnswers`]). A box's
+    /// device stays unarmed — a box is a client, and its own resolution
+    /// reaches the lane the way any client's does.
+    answers: Option<Arc<NeighbourAnswers>>,
 }
 
 /// The peer ends of a [`BepDevice`]'s channels: what feeds the stack and what
@@ -325,7 +348,8 @@ impl BepDevice {
             Self {
                 rx: inbound_rx,
                 tx: outbound_tx,
-                pending: VecDeque::new(),
+                pending: Arc::new(StdMutex::new(VecDeque::new())),
+                answers: None,
             },
             BepDeviceEnds {
                 inbound: inbound_tx,
@@ -338,7 +362,10 @@ impl BepDevice {
     /// drain takes, and the one the test boxes enqueue their ARP requests
     /// through.
     fn enqueue(&mut self, frame: Vec<u8>) {
-        self.pending.push_back(frame);
+        self.pending
+            .lock()
+            .expect("the pending queue is uncontended")
+            .push_back(frame);
     }
 }
 
@@ -353,11 +380,17 @@ impl Device for BepDevice {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        self.pending.pop_front().map(|frame| {
+        let frame = self
+            .pending
+            .lock()
+            .expect("the pending queue is uncontended")
+            .pop_front();
+        frame.map(|frame| {
             (
                 BepRxToken { frame },
                 BepTxToken {
                     tx: self.tx.clone(),
+                    answers: self.answers.clone(),
                 },
             )
         })
@@ -368,6 +401,7 @@ impl Device for BepDevice {
         // available; a send later fails only when the leg's lane is gone.
         Some(BepTxToken {
             tx: self.tx.clone(),
+            answers: self.answers.clone(),
         })
     }
 
@@ -406,6 +440,10 @@ impl smoltcp::phy::RxToken for BepRxToken {
 /// and the token sends it out the device's outbound channel.
 pub struct BepTxToken {
     tx: UnboundedSender<Vec<u8>>,
+    /// The device's neighbour answers, when the device is the leg's: the
+    /// ARP requests the stack writes are answered from here instead of
+    /// leaving. `None` on a box's device.
+    answers: Option<Arc<NeighbourAnswers>>,
 }
 
 impl smoltcp::phy::TxToken for BepTxToken {
@@ -422,32 +460,123 @@ impl smoltcp::phy::TxToken for BepTxToken {
 
 impl BepTxToken {
     fn send_out(&self, frame: Vec<u8>) {
-        let _ = self.tx.send(aim_arp_requests_at_their_target(frame));
+        // The ruling on the neighbour: this peer never puts an ARP request
+        // on the lane. Its own stack writes one only when a flow it owes
+        // bytes to outlived the neighbour cache's entry — and the ask is
+        // answered from the pin the pre-screen recorded when that box's
+        // SYN was admitted: one synthetic reply queued straight back into
+        // the device's receive queue, the shape the box's own answer
+        // would have carried, which the next poll reads as if it had
+        // arrived. An address with no pin — never connected, or its row
+        // withdrawn — is answered with nothing: the request is dropped,
+        // never aimed at a target, never broadcast, and the flow's own
+        // retransmission asks again once a row gives the address a pin.
+        //
+        // The ruling is the armed device's alone. A box's token carries
+        // no answers — a box is a client, and its own ask reaches the
+        // lane the way any client's does, which is how the leg answers
+        // it in the first place.
+        if let Some(answers) = self.answers.as_ref()
+            && let Some(target) = arp_request_target(&frame)
+        {
+            if let Some(mac) = answers.pinned_mac(target) {
+                answers.feed_reply(target, mac);
+            }
+            return;
+        }
+        let _ = self.tx.send(frame);
     }
 }
 
-/// Aim an outbound ARP request at the one address it asks about, instead
-/// of the broadcast address smoltcp writes onto it: this peer's lane is a
-/// point-to-point socket to the switch, not a shared wire, and a
-/// broadcast frame is the one the switch forwards to every box on the
-/// plan — the one shape of frame the peer must never emit, since it
-/// addresses a box that never addressed it. The request still asks the
-/// same question (`who has target_protocol_addr`); only its own
-/// destination changes, to the switch-derived MAC of the only peer that
-/// can answer, and the answer it reads does not change at all.
-fn aim_arp_requests_at_their_target(mut frame: Vec<u8>) -> Vec<u8> {
-    if let Some(target) = arp_request_target(&frame)
-        && let Ok(mut eth) = EthernetFrame::new_checked(&mut frame)
-    {
-        eth.set_dst_addr(EthernetAddress(MacAddr::for_switch_ip(target).0));
+/// The peer's answers to its own stack's neighbour resolution: the pins
+/// the pre-screen records — each registered box's address against the MAC
+/// its admitted SYN came from — plus the leg's own identity and the
+/// device's receive queue, so the answer is written exactly as the box's
+/// would have been and lands where the interface's next poll reads it.
+///
+/// Arming is the stack's, not the device's: [`BepStack::new`] arms the
+/// leg's device alone. A box's stack is a client and resolves the way any
+/// client does — its requests reach the lane, where the leg answers them.
+#[derive(Debug)]
+struct NeighbourAnswers {
+    /// One pin per registered box's address, recorded when the pre-screen
+    /// admits its SYN and dropped when its row withdraws — the rule that
+    /// keeps a pin from outliving the row that earned it.
+    pins: StdMutex<BTreeMap<Ipv4Addr, EthernetAddress>>,
+    /// The leg's MAC: the reply's Ethernet destination, the one address
+    /// the interface's ingress accepts.
+    own_mac: EthernetAddress,
+    /// The leg's address: the reply's target protocol address, the one
+    /// whose resolution this answer completes.
+    own_ip: Ipv4Addr,
+    /// The device's receive queue, where the reply is queued for the
+    /// interface's next poll.
+    pending: Arc<StdMutex<VecDeque<Vec<u8>>>>,
+}
+
+impl NeighbourAnswers {
+    /// The pin `target` carries, when the pre-screen has admitted a
+    /// connection from it: the MAC its SYN came from.
+    fn pinned_mac(&self, target: Ipv4Addr) -> Option<EthernetAddress> {
+        self.pins
+            .lock()
+            .expect("the pins are uncontended")
+            .get(&target)
+            .copied()
     }
-    frame
+
+    /// Record the pin: `addr`'s admitted SYN came from `mac`. The
+    /// pre-screen's admission step; a later SYN from the same address
+    /// re-records the same pair.
+    fn pin(&self, addr: Ipv4Addr, mac: EthernetAddress) {
+        self.pins
+            .lock()
+            .expect("the pins are uncontended")
+            .insert(addr, mac);
+    }
+
+    /// Drop `addr`'s pin: its row withdrew, and a pin that outlived its
+    /// row would answer the next occupant of the address with the old
+    /// occupant's MAC.
+    fn unpin(&self, addr: Ipv4Addr) {
+        self.pins
+            .lock()
+            .expect("the pins are uncontended")
+            .remove(&addr);
+    }
+
+    /// Queue the ARP reply that resolves `target` as `mac`: written as if
+    /// the box had sent it — unicast to the leg, the pinned MAC as the
+    /// sender's — straight into the device's receive queue, where the
+    /// interface's next poll reads it and fills its neighbour cache from
+    /// it the way it would from the box's own answer.
+    fn feed_reply(&self, target: Ipv4Addr, mac: EthernetAddress) {
+        let repr = ArpRepr::EthernetIpv4 {
+            operation: ArpOperation::Reply,
+            source_hardware_addr: mac,
+            source_protocol_addr: target,
+            target_hardware_addr: self.own_mac,
+            target_protocol_addr: self.own_ip,
+        };
+        let len = EthernetFrame::<&[u8]>::buffer_len(repr.buffer_len());
+        let mut buf = vec![0u8; len];
+        let mut frame = EthernetFrame::new_unchecked(&mut buf);
+        frame.set_dst_addr(self.own_mac);
+        frame.set_src_addr(mac);
+        frame.set_ethertype(EthernetProtocol::Arp);
+        let mut packet = ArpPacket::new_unchecked(frame.payload_mut());
+        repr.emit(&mut packet);
+        self.pending
+            .lock()
+            .expect("the pending queue is uncontended")
+            .push_back(buf);
+    }
 }
 
 /// The address an outbound frame asks about, when the frame is an ARP
 /// request whose own Ethernet destination is the broadcast address —
-/// the frame smoltcp writes when it must re-resolve a neighbour, and
-/// the one shape of frame this peer must never put on the lane.
+/// the frame smoltcp writes when it must resolve a neighbour, and the
+/// one shape of frame this peer must never put on the lane.
 fn arp_request_target(frame: &[u8]) -> Option<Ipv4Addr> {
     let eth = EthernetFrame::new_checked(frame).ok()?;
     if eth.dst_addr() != EthernetAddress::BROADCAST || eth.ethertype() != EthernetProtocol::Arp {
@@ -548,14 +677,26 @@ impl BepHost {
     /// Take every frame the lane has delivered, before the interface sees
     /// any of them — the pre-screen's path: it rules on each frame and
     /// queues back the ones the pool admits ([`BepHost::enqueue_inbound`])
-    /// before the interface's poll runs.
+    /// before the interface's poll runs. A synthetic ARP reply the last
+    /// turn's transmit token queued is lifted with the rest and passed
+    /// straight back — not the pool's to rule on — so the next interface
+    /// poll reads it.
     fn take_inbound(&mut self) -> VecDeque<Vec<u8>> {
-        let mut inbound = VecDeque::new();
-        std::mem::swap(&mut inbound, &mut self.device.pending);
+        let mut pending = self.device.pending.lock().expect("the pending queue is uncontended");
+        let mut inbound = std::mem::take(&mut *pending);
+        drop(pending);
         while let Ok(frame) = self.device.rx.try_recv() {
             inbound.push_back(frame);
         }
         inbound
+    }
+
+    /// Arm the device's neighbour answers — the leg's own resolution,
+    /// answered from the pre-screen's pins instead of asked on the lane.
+    /// Only [`BepStack::new`] arms one: a box's stack resolves the way any
+    /// client does.
+    fn arm_neighbour_answers(&mut self, answers: Arc<NeighbourAnswers>) {
+        self.device.answers = Some(answers);
     }
 
     /// Queue `frame` for the interface's next poll — what the pre-screen
@@ -715,6 +856,10 @@ pub struct BepStack {
     partition: Vec<Ipv4Address>,
     wire: BepWire,
     boxes: Arc<dyn BepBoxSource>,
+    /// The pins behind the leg's neighbour answers: shared with the
+    /// device's transmit tokens, which read them to answer the stack's
+    /// own ARP asks (see [`NeighbourAnswers`]).
+    answers: Arc<NeighbourAnswers>,
     /// Dial answers from the delivery tasks.
     done_rx: UnboundedReceiver<DialDone>,
     done_tx: UnboundedSender<DialDone>,
@@ -725,6 +870,7 @@ pub struct BepStack {
     next_activation: u64,
     cap_warns: WarnThrottle,
     row_warns: WarnThrottle,
+    mac_warns: WarnThrottle,
     down_warns: WarnThrottle,
 }
 
@@ -742,12 +888,21 @@ impl BepStack {
         boxes: Arc<dyn BepBoxSource>,
     ) -> Self {
         let (done_tx, done_rx) = unbounded_channel();
+        let mut host = BepHost::new(device, subnet, subnet.box_egress_proxy_address());
+        let answers = Arc::new(NeighbourAnswers {
+            pins: StdMutex::new(BTreeMap::new()),
+            own_mac: host.mac(),
+            own_ip: host.ip(),
+            pending: Arc::clone(&host.device.pending),
+        });
+        host.arm_neighbour_answers(Arc::clone(&answers));
         Self {
-            host: BepHost::new(device, subnet, subnet.box_egress_proxy_address()),
+            host,
             slots: Vec::new(),
             partition: Vec::new(),
             wire,
             boxes,
+            answers,
             done_rx,
             done_tx,
             notify: Arc::new(Notify::new()),
@@ -755,6 +910,7 @@ impl BepStack {
             next_activation: 0,
             cap_warns: WarnThrottle::default(),
             row_warns: WarnThrottle::default(),
+            mac_warns: WarnThrottle::default(),
             down_warns: WarnThrottle::default(),
         }
     }
@@ -784,16 +940,22 @@ impl BepStack {
 
     /// One full turn of the pool at `now`. The order is the choreography:
     ///
-    /// 1. the inbound frames pre-screened: a SYN to [`PROXY_PORT`] whose
-    ///    source has no row, or already holds its cap's worth of
+    /// 1. the partition reconciled against the box source — shares added
+    ///    and withdrawn, a withdrawn row's live flows aborted and its
+    ///    pin dropped. Reconciling before the screen is the same order as
+    ///    the admission itself: a row that registers in the same turn as
+    ///    its first SYN is screened against the share that turn already
+    ///    added, never against a sibling's, and the screen reads the
+    ///    partition the pool actually holds;
+    /// 2. the inbound frames pre-screened: a SYN to [`PROXY_PORT`] whose
+    ///    source has no row, whose source MAC is not its address's
+    ///    switch-derived MAC, or which already holds its cap's worth of
     ///    sockets, is refused with a reset before the interface ever
     ///    sees it — smoltcp assigns inbound SYNs to any listening socket
     ///    in arrival order, so a box that opens more connections than
     ///    its share in one turn would take a sibling's listener, and
     ///    the sibling's same-turn SYN would meet no socket at all;
-    /// 2. the stack's frames in, its answers out;
-    /// 3. the partition reconciled against the box source — shares added
-    ///    and withdrawn, a withdrawn row's live flows aborted;
+    /// 3. the stack's frames in, its answers out;
     /// 4. the dial answers taken: a live flow gets its pipes, a failed
     ///    dial aborts the socket — an acceptor that is down resets the
     ///    box's connection;
@@ -808,9 +970,9 @@ impl BepStack {
     /// 8. the stack polled once more so everything the service queued
     ///    leaves inside the turn.
     pub fn poll(&mut self, now: Instant) {
+        self.reconcile();
         self.prescreen(now);
         self.host.poll(now);
-        self.reconcile();
         self.dispatch_dials(now);
         self.enforce_caps(now);
         self.host.poll(now);
@@ -827,14 +989,31 @@ impl BepStack {
     ///
     /// A connection-opening SYN to [`PROXY_PORT`] at the leg's address is
     /// checked against its source's row: no row, no connection — the
-    /// box-side answer to a source the registry does not hold — and a
-    /// source that already holds [`BepWire::per_source_cap`] sockets
-    /// keeps only the ones it has. Every refusal is answered with a reset
-    /// the box's own stack accepts, and the warn it leaves in the log
-    /// names the source and the reason, one line per interval with the
-    /// count it suppressed. A retransmitted SYN of a connection the pool
-    /// already carries passes through — the socket that holds it answers,
-    /// and the cap does not count one connection twice.
+    /// box-side answer to a source the registry does not hold. A SYN
+    /// whose frame's source MAC is not its address's switch-derived MAC
+    /// is refused the same way: a connection opened from a row's address
+    /// but another box's tap never reaches a listener — the host-side leg
+    /// of the same anti-spoof line the switch's static leases hold. A
+    /// source that already holds [`BepWire::per_source_cap`] sockets keeps
+    /// only the ones it has. Every refusal is answered with a reset the
+    /// box's own stack accepts, addressed to the MAC the SYN came from —
+    /// a registered box's switch-derived one, a spoofer's own tap MAC —
+    /// and the warn it leaves in the log names the source and the reason,
+    /// one line per interval with the count it suppressed.
+    ///
+    /// A bare SYN whose `(source, port)` the pool already holds is
+    /// dropped, not refused and not passed: smoltcp assigns an inbound
+    /// SYN to any listening socket in arrival order, so letting a
+    /// retransmit through would open a second connection on the tuple in
+    /// a sibling's listener and leave the sibling's own same-turn SYN
+    /// with no socket at all. The socket that holds the tuple answers
+    /// its own retransmits, and the cap never counts one connection
+    /// twice.
+    ///
+    /// An admitted SYN pins its source address to the frame's source MAC
+    /// — the pin [`reconcile`] drops when the row withdraws, and the one
+    /// the leg's own neighbour asks are answered from (see
+    /// [`NeighbourAnswers`]).
     ///
     /// [`enforce_caps`] stays as the second line: a row withdrawn between
     /// turns, and a connection the screen let past that a later turn
@@ -843,8 +1022,7 @@ impl BepStack {
         // Facts first: each source's held connections, and the endpoints
         // they came from — the socket set's borrow does not survive the
         // refusals the pass may issue.
-        let mut held: std::collections::BTreeMap<Ipv4Addr, usize> =
-            std::collections::BTreeMap::new();
+        let mut held: BTreeMap<Ipv4Addr, usize> = BTreeMap::new();
         let mut taken: Vec<(Ipv4Addr, u16)> = Vec::new();
         for slot in &self.slots {
             let socket = self.host.sockets.get::<tcp::Socket>(slot.handle);
@@ -857,7 +1035,13 @@ impl BepStack {
                 taken.push((addr, remote.port));
             }
         }
-        let rows = self.boxes.box_switch_addresses();
+        // The partition this turn's reconcile just wrote: one registry
+        // read per turn — reconcile's — and the rows the pool holds
+        // shares for, so a row that registered in the same turn as its
+        // first SYN is screened against the share that turn added. The
+        // clone stands in for the borrow: the refusals below mutate the
+        // host while the rows are still being consulted.
+        let rows = self.partition.clone();
         let cap = self.wire.per_source_cap;
         let leg_ip = self.host.ip();
         let leg_mac = self.host.mac();
@@ -866,13 +1050,6 @@ impl BepStack {
                 self.host.enqueue_inbound(frame);
                 continue;
             };
-            if taken.contains(&(syn.source, syn.source_port)) {
-                // A retransmit of a connection the pool already carries:
-                // the interface's socket answers it, and the cap does not
-                // count one connection twice.
-                self.host.enqueue_inbound(frame);
-                continue;
-            }
             let share = held.get(&syn.source).copied().unwrap_or(0);
             if !rows.contains(&syn.source) {
                 self.row_warns.hit(now, |suppressed| {
@@ -884,6 +1061,27 @@ impl BepStack {
                     );
                 });
                 self.host.emit_frame(syn.refused_reset(leg_ip, leg_mac));
+            } else if syn.mac != EthernetAddress(MacAddr::for_switch_ip(syn.source).0) {
+                // The claim came from a MAC the switch would never lease
+                // to this address: a connection opened from a row's
+                // address but another box's tap. The refusal answers it at
+                // the MAC it came from, so it reaches whoever sent it.
+                self.mac_warns.hit(now, |suppressed| {
+                    tracing::warn!(
+                        source = %syn.source,
+                        mac = %syn.mac,
+                        suppressed,
+                        "box egress proxy: reset a connection whose source \
+                         MAC is not its address's switch-derived MAC"
+                    );
+                });
+                self.host.emit_frame(syn.refused_reset(leg_ip, leg_mac));
+            } else if taken.contains(&(syn.source, syn.source_port)) {
+                // A retransmit of a connection the pool already carries.
+                // Dropped: the socket holding the tuple answers it, and
+                // a listener a sibling needs is left to the sibling's own
+                // same-turn SYN.
+                continue;
             } else if share >= cap {
                 self.cap_warns.hit(now, |suppressed| {
                     tracing::warn!(
@@ -898,6 +1096,7 @@ impl BepStack {
             } else {
                 *held.entry(syn.source).or_default() += 1;
                 taken.push((syn.source, syn.source_port));
+                self.answers.pin(syn.source, syn.mac);
                 self.host.enqueue_inbound(frame);
             }
         }
@@ -905,12 +1104,14 @@ impl BepStack {
 
     /// Reconcile the pool against the box source: a new row adds its share
     /// of listening sockets, a withdrawn row's live flows are aborted —
-    /// their reset leaves this turn — and the pool is then trimmed to the
-    /// registered shares, idle listeners first, because a slot is anonymous
-    /// once it is in the pool: the total is the sum of the shares, and
-    /// which box's connection a slot carries is written on the connection,
-    /// not the slot. A connection from a source with no row is the cap
-    /// pass's to answer: a source with no row holds nothing.
+    /// their reset leaves this turn — its pin is dropped with them (a pin
+    /// that outlived its row would answer the next occupant of the address
+    /// with the old occupant's MAC), and the pool is then trimmed to the
+    /// registered shares, idle listeners first, because a slot is
+    /// anonymous once it is in the pool: the total is the sum of the
+    /// shares, and which box's connection a slot carries is written on the
+    /// connection, not the slot. A connection from a source with no row is
+    /// the cap pass's to answer: a source with no row holds nothing.
     fn reconcile(&mut self) {
         let desired: Vec<Ipv4Address> = self.boxes.box_switch_addresses();
         let cap = self.wire.per_source_cap;
@@ -939,6 +1140,7 @@ impl BepStack {
             .collect();
         for addr in &withdrawn {
             self.abort_their_flows(*addr);
+            self.answers.unpin(*addr);
             tracing::debug!(
                 box_addr = %addr,
                 "box egress proxy pool: a withdrawn box's share was removed"
@@ -1262,6 +1464,10 @@ struct ScreenedSyn {
     source: Ipv4Addr,
     /// The source port, half of the endpoint a retransmit repeats.
     source_port: u16,
+    /// The frame's Ethernet source MAC — who the connection claim came
+    /// from. The admission check holds it to the address's switch-derived
+    /// MAC, the pin records it on admission, and the refusal answers it.
+    mac: EthernetAddress,
     /// The SYN's sequence number, for the acknowledgment the refusal's
     /// reset carries: the SYN's own sequence plus one, the number the
     /// box's stack is waiting to hear acknowledged.
@@ -1276,6 +1482,7 @@ impl ScreenedSyn {
     /// passes those through.
     fn parse(frame: &[u8], leg_ip: Ipv4Address) -> Option<Self> {
         let eth = EthernetFrame::new_checked(frame).ok()?;
+        let mac = eth.src_addr();
         if eth.ethertype() != EthernetProtocol::Ipv4 {
             return None;
         }
@@ -1302,6 +1509,7 @@ impl ScreenedSyn {
         Some(Self {
             source,
             source_port: repr.src_port,
+            mac,
             seq: repr.seq_number,
         })
     }
@@ -1310,8 +1518,9 @@ impl ScreenedSyn {
     /// smoltcp's own `rst_reply` gives — sequence zero, the SYN's
     /// sequence plus one acknowledged, no window — so the box's stack
     /// accepts it and closes rather than retrying a connection that will
-    /// never be answered. Addressed to the box's switch-derived MAC,
-    /// never to a broadcast.
+    /// never be answered. Addressed to the MAC the SYN came from — a
+    /// registered box's switch-derived MAC, and a spoofer's own tap MAC,
+    /// so the refusal reaches whoever sent it — never to a broadcast.
     fn refused_reset(&self, leg_ip: Ipv4Address, leg_mac: EthernetAddress) -> Vec<u8> {
         let repr = TcpRepr {
             src_port: PROXY_PORT,
@@ -1337,7 +1546,7 @@ impl ScreenedSyn {
         let len = EthernetFrame::<&[u8]>::buffer_len(ip_repr.buffer_len() + repr.buffer_len());
         let mut buf = vec![0u8; len];
         let mut frame = EthernetFrame::new_unchecked(&mut buf);
-        frame.set_dst_addr(EthernetAddress(MacAddr::for_switch_ip(self.source).0));
+        frame.set_dst_addr(self.mac);
         frame.set_src_addr(leg_mac);
         frame.set_ethertype(EthernetProtocol::Ipv4);
         let mut ip_packet = Ipv4Packet::new_unchecked(frame.payload_mut());
@@ -2013,6 +2222,16 @@ pub mod test_util {
             &self.stack_out_log
         }
 
+        /// Feed the leg a frame as if a box on the lane had sent it: the
+        /// raw-frame path the tests use for the shapes no box's own stack
+        /// would write — a SYN re-sent on a tuple the pool already holds,
+        /// a SYN whose source MAC is not its address's switch-derived one.
+        /// The frame is ruled on by the next [`turn`](Self::turn)'s
+        /// pre-screen, exactly as a box's frames are.
+        pub fn inject_frame(&mut self, frame: Vec<u8>) {
+            let _ = self.stack_in.send(frame);
+        }
+
         /// One turn: the boxes' queued frames to the stack, the stack's one
         /// poll — ingress, delivery, service, egress — its answers fanned
         /// to the boxes, each box's one poll.
@@ -2119,9 +2338,28 @@ mod tests {
         buf
     }
 
-    /// Build a TCP SYN from `src:src_port` to `dst:dst_port`.
+    /// Build a TCP SYN from `src:src_port` to `dst:dst_port`, framed as if
+    /// it left the MAC a box at `src` wears — its switch-derived one.
     fn tcp_syn(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
-        let src_mac = EthernetAddress(MacAddr::for_switch_ip(src_ip).0);
+        tcp_syn_from(
+            EthernetAddress(MacAddr::for_switch_ip(src_ip).0),
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+        )
+    }
+
+    /// Build a TCP SYN from `src:src_port` to `dst:dst_port`, framed from
+    /// `src_mac` — the builder the MAC-ruling tests use for the source
+    /// MAC a box's own stack would never write.
+    fn tcp_syn_from(
+        src_mac: EthernetAddress,
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+    ) -> Vec<u8> {
         let dst_mac = EthernetAddress(MacAddr::for_switch_ip(dst_ip).0);
         let repr = TcpRepr {
             src_port,
@@ -3262,17 +3500,23 @@ mod tests {
         );
     }
 
-    /// NET-132/T69: the peer never emits a broadcast frame. The lane is a
-    /// point-to-point socket to the switch, not a shared wire, and a
-    /// broadcast Ethernet frame is the one the switch forwards to every
-    /// box on the plan — the one frame that addresses boxes which never
-    /// addressed the peer. The neighbour cache's 60-second entry makes
-    /// this reachable: a flow that goes quiet past that expiry must
-    /// re-resolve its neighbour, and the ARP request that re-resolves it
-    /// is aimed at the box it asks about — its switch-derived MAC —
-    /// never at the broadcast address smoltcp wrote onto it.
+    /// NET-132/T69: the peer never emits a broadcast frame, and never an
+    /// ARP request — not even the one its own stack writes when a flow it
+    /// owes bytes to outlives the neighbour cache's 60-second entry. The
+    /// lane is a point-to-point socket to the switch, not a shared wire,
+    /// and a broadcast Ethernet frame is the one the switch forwards to
+    /// every box on the plan — the one frame that addresses boxes which
+    /// never addressed the peer; an ARP request is a frame no box asked
+    /// for, aimed at an address whose occupant the peer cannot know. The
+    /// ruling: the pre-screen pins the box's address to the MAC its
+    /// admitted SYN came from, and the stack's own re-resolution ask is
+    /// answered from that pin — one synthetic reply fed back in through
+    /// the device's receive queue, which the next poll reads as if the
+    /// box had sent it. The re-resolved flow still delivers its late
+    /// bytes, and every frame the peer sent to do it is addressed to the
+    /// box: zero broadcast frames, zero ARP requests.
     #[tokio::test]
-    async fn a_re_resolved_neighbour_is_aimed_not_broadcast() {
+    async fn an_expired_neighbour_is_answered_from_the_pin_never_arp() {
         let subnet = SwitchSubnet::default();
         let dir = tempfile::tempdir().expect("tempdir");
         let proxy_sock = dir.path().join("proxy.sock");
@@ -3338,9 +3582,12 @@ mod tests {
         let late = read_flow(&mut lane, 0, flow, 8).await;
         assert_eq!(late, b"late\n", "the re-resolved flow still delivers");
 
-        // Every frame the stack sent to do it is addressed to the box —
-        // the re-resolution's ARP request included — and none to the
-        // broadcast address.
+        // Every frame the stack sent to do it is addressed to the box,
+        // and none to the broadcast address — and no ARP request appears
+        // at all: the re-resolution was answered from the pin, inside
+        // the stack, where no box ever sees it. (An ARP reply to the
+        // box's own re-resolution ask is a frame the box addressed the
+        // peer with; it is unicast to the box and allowed here.)
         let outbound = lane.stack_outbound();
         assert!(
             outbound.len() > mark,
@@ -3361,18 +3608,321 @@ mod tests {
             );
             if eth.ethertype() == EthernetProtocol::Arp {
                 let arp = ArpPacket::new_checked(eth.payload()).expect("an ARP packet");
-                assert_eq!(
-                    arp.operation(),
-                    ArpOperation::Request,
-                    "the re-resolution is a request"
-                );
-                saw_arp_request = true;
+                if arp.operation() == ArpOperation::Request {
+                    saw_arp_request = true;
+                }
             }
         }
         assert!(
-            saw_arp_request,
-            "the expired neighbour was re-resolved with an ARP request"
+            !saw_arp_request,
+            "the peer never emits an ARP request: its neighbour ask is \
+             answered from the pin"
         );
+    }
+
+    /// NET-132/T69: a SYN from a registered address whose frame carries a
+    /// MAC that is not the address's switch-derived one never reaches a
+    /// listener: a connection opened from a row's address but another
+    /// box's tap — the host-side leg of the same anti-spoof line the
+    /// switch's static leases hold. It is reset, never delivered, and the
+    /// reset is answered at the MAC that sent it, so the refusal reaches
+    /// whoever claimed the address.
+    #[tokio::test]
+    async fn a_syn_with_a_foreign_mac_is_reset_and_never_delivered() {
+        let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let box_ip = Ipv4Addr::from(subnet.first_ptask());
+        let foreign_mac = EthernetAddress([0x52, 0x54, 0x00, 0x99, 0x99, 0x99]);
+
+        h.boxes.register(box_ip);
+        drive(&mut h.lane, 2).await;
+        let mark = h.lane.stack_outbound().len();
+
+        // A SYN that claims the registered address from a MAC the switch
+        // would never lease to it.
+        h.lane.inject_frame(tcp_syn_from(
+            foreign_mac,
+            box_ip,
+            proxy_ip,
+            test_util::FIRST_CLIENT_PORT,
+            PROXY_PORT,
+        ));
+        drive(&mut h.lane, 3).await;
+
+        // One frame left: the refusal's reset, answered at the MAC that
+        // sent the claim — the only place it can reach the claimant.
+        let outbound = h.lane.stack_outbound();
+        assert_eq!(
+            outbound.len(),
+            mark + 1,
+            "the refused SYN is answered with one reset and nothing else"
+        );
+        let eth =
+            EthernetFrame::new_checked(&outbound[mark]).expect("the peer sends ethernet");
+        assert_ne!(
+            eth.dst_addr(),
+            EthernetAddress::BROADCAST,
+            "the peer never emits a broadcast frame"
+        );
+        assert_eq!(
+            eth.dst_addr(),
+            foreign_mac,
+            "the reset reaches the MAC that sent the claim"
+        );
+        let ip = Ipv4Packet::new_checked(eth.payload()).expect("an IPv4 packet");
+        let tcp = TcpPacket::new_checked(ip.payload()).expect("a TCP segment");
+        let repr = TcpRepr::parse(
+            &tcp,
+            &IpAddress::Ipv4(ip.src_addr()),
+            &IpAddress::Ipv4(ip.dst_addr()),
+            &ChecksumCapabilities::default(),
+        )
+        .expect("the reset parses");
+        assert_eq!(repr.control, TcpControl::Rst, "the answer is a reset");
+        assert_eq!(repr.dst_port, test_util::FIRST_CLIENT_PORT);
+
+        // And nothing was delivered: the acceptor took no connection, and
+        // the share still holds one listening socket.
+        assert_eq!(
+            h.acceptor.as_ref().expect("acceptor").connections(),
+            0,
+            "the refused SYN was never delivered"
+        );
+        assert_eq!(h.lane.pool_len(), 1, "the share stands, still listening");
+    }
+
+    /// NET-132/T69: a withdrawn address's pin goes with its row. Box A
+    /// delivers a flow from its address; its row withdraws; another box —
+    /// registered at the same address, wearing a different MAC — connects.
+    /// The new occupant's claim is refused (its MAC is not the address's
+    /// switch-derived one) and never delivered, and every frame the peer
+    /// sends it is addressed to the new MAC: never the old occupant's,
+    /// never a broadcast. A pin that outlived its row — or a refusal
+    /// answered from the address's derived MAC, or from the stale
+    /// neighbour cache entry — would put those frames on the old
+    /// occupant's MAC; this is the edge that catches it.
+    #[tokio::test]
+    async fn a_reused_address_refusal_follows_its_new_occupant() {
+        let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let box_ip = Ipv4Addr::from(subnet.first_ptask());
+        let old_mac = EthernetAddress(MacAddr::for_switch_ip(box_ip).0);
+        let new_mac = EthernetAddress([0x52, 0x54, 0x00, 0x99, 0x99, 0x99]);
+
+        // Box A at the address delivers a flow: the address carries a pin
+        // and the leg's neighbour cache entry.
+        h.boxes.register(box_ip);
+        drive(&mut h.lane, 2).await;
+        h.lane.add_box(box_ip);
+        drive(&mut h.lane, 1).await;
+        h.lane.boxes_mut()[0].arp_for(proxy_ip);
+        drive(&mut h.lane, 3).await;
+        let a_flow = h.lane.boxes_mut()[0].connect(proxy_ip, PROXY_PORT);
+        drive(&mut h.lane, 25).await;
+        assert_eq!(h.lane.boxes()[0].flow_state(a_flow), State::Established);
+        let delivered = h.acceptor.as_ref().expect("acceptor").accepted().len();
+        assert_eq!(delivered, 1, "box A's flow was delivered");
+
+        // Its row withdraws: the share goes, the flow aborts, the pin
+        // goes with it. The leg's neighbour cache entry is the stale
+        // state a wrong answer could be built from.
+        h.boxes.withdraw(box_ip);
+        drive(&mut h.lane, 10).await;
+        assert_eq!(
+            h.lane.pool_len(),
+            0,
+            "the withdrawn row's share went with it"
+        );
+
+        // A box with a different MAC is registered at the same address and
+        // connects.
+        h.boxes.register(box_ip);
+        drive(&mut h.lane, 2).await;
+        let mark = h.lane.stack_outbound().len();
+        h.lane.inject_frame(tcp_syn_from(
+            new_mac,
+            box_ip,
+            proxy_ip,
+            test_util::FIRST_CLIENT_PORT,
+            PROXY_PORT,
+        ));
+        drive(&mut h.lane, 3).await;
+
+        // Every frame the peer sent the new occupant is addressed to the
+        // new MAC — the one frame it had coming was the refusal's reset —
+        // and none to the old occupant's, none to a broadcast. The
+        // connection itself was never delivered.
+        let outbound = h.lane.stack_outbound();
+        assert_eq!(
+            outbound.len(),
+            mark + 1,
+            "the refused reuse is answered with one reset and nothing else"
+        );
+        let eth =
+            EthernetFrame::new_checked(&outbound[mark]).expect("the peer sends ethernet");
+        assert_ne!(
+            eth.dst_addr(),
+            EthernetAddress::BROADCAST,
+            "the peer never emits a broadcast frame"
+        );
+        assert_ne!(
+            eth.dst_addr(),
+            old_mac,
+            "the old occupant's MAC gets nothing: the pin went with the row"
+        );
+        assert_eq!(
+            eth.dst_addr(),
+            new_mac,
+            "the refusal follows the new occupant's MAC"
+        );
+        assert_eq!(
+            h.acceptor.as_ref().expect("acceptor").accepted().len(),
+            delivered,
+            "the reuse was never delivered"
+        );
+    }
+
+    /// NET-132/T69: a bare SYN on a tuple the pool already holds is
+    /// dropped, not passed to the interface: smoltcp assigns an inbound
+    /// SYN to any listening socket in arrival order, so a retransmit let
+    /// through would open a second connection on the tuple in a
+    /// sibling's listener and leave the sibling's own same-turn SYN with
+    /// no socket at all. Box A holds its one connection (its share is the
+    /// cap), re-sends a SYN on that tuple in the same turn as a sibling's
+    /// SYN — and the sibling is delivered.
+    #[tokio::test]
+    async fn a_retransmit_on_a_held_tuple_takes_no_siblings_listener() {
+        let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
+        bring_up_two_boxes(&mut h).await;
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let box_a = Ipv4Addr::from(subnet.first_ptask());
+        let box_b = Ipv4Addr::from(subnet.first_ptask() + 1);
+
+        // A opens — and holds — its one connection.
+        let a_first = h.lane.boxes_mut()[0].connect(proxy_ip, PROXY_PORT);
+        drive(&mut h.lane, 25).await;
+        assert_eq!(
+            h.lane.boxes()[0].flow_state(a_first),
+            State::Established,
+            "A holds its one connection"
+        );
+        assert_eq!(
+            h.acceptor.as_ref().expect("acceptor").accepted().len(),
+            1,
+            "A's connection was delivered"
+        );
+
+        // Two turns put B's SYN on the box side of the lane — the first
+        // takes its resolution ask across, the second dispatches the SYN
+        // now that its neighbour is filled — and then A re-sends a SYN on
+        // the tuple it holds, so both reach the pre-screen in one drain:
+        // A's retransmit first, then the sibling's SYN.
+        let b_first = h.lane.boxes_mut()[1].connect(proxy_ip, PROXY_PORT);
+        drive(&mut h.lane, 2).await;
+        h.lane.inject_frame(tcp_syn(
+            box_a,
+            proxy_ip,
+            test_util::FIRST_CLIENT_PORT,
+            PROXY_PORT,
+        ));
+        drive(&mut h.lane, 40).await;
+
+        // The sibling was delivered: its SYN found its own listener,
+        // because the retransmit never reached one.
+        let answer = read_flow(&mut h.lane, 1, b_first, 8).await;
+        assert!(
+            answer.starts_with(b"source="),
+            "the sibling's same-turn SYN was delivered, not starved by A's \
+             retransmit: {:?}",
+            String::from_utf8_lossy(&answer)
+        );
+        assert_eq!(
+            h.lane.boxes()[0].flow_state(a_first),
+            State::Established,
+            "A's held connection stands"
+        );
+        let accepted = h.acceptor.as_ref().expect("acceptor").accepted();
+        assert_eq!(accepted.len(), 2, "one connection per admitted flow");
+        assert_eq!(accepted[1].source.addr, IpAddress::Ipv4(box_b));
+    }
+
+    /// NET-132/T69: a row that registers in the same turn as its first
+    /// SYN takes no listener from a sibling at cap — it gets its own,
+    /// because the partition is reconciled before the screen. Box B holds
+    /// its share's one and only listener as its connection (it is at
+    /// cap); box A's row lands and its first SYN reaches the leg in one
+    /// turn. Screened before the reconcile, A's admitted SYN would find
+    /// no socket at all — the pool it was admitted against holds only
+    /// B's busy connection — and the stack would answer it with the
+    /// reset it gives an unlistened port.
+    #[tokio::test]
+    async fn a_row_registered_with_its_first_syn_takes_no_sibling_listener() {
+        let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let box_a = Ipv4Addr::from(subnet.first_ptask());
+        let box_b = Ipv4Addr::from(subnet.first_ptask() + 1);
+
+        // Box B registers, comes up, and holds its cap's worth — its
+        // share's only listener is its own connection.
+        h.boxes.register(box_b);
+        drive(&mut h.lane, 2).await;
+        h.lane.add_box(box_a);
+        h.lane.add_box(box_b);
+        drive(&mut h.lane, 1).await;
+        h.lane.boxes_mut()[1].arp_for(proxy_ip);
+        drive(&mut h.lane, 3).await;
+        let b_flow = h.lane.boxes_mut()[1].connect(proxy_ip, PROXY_PORT);
+        drive(&mut h.lane, 30).await;
+        assert_eq!(
+            h.lane.boxes()[1].flow_state(b_flow),
+            State::Established,
+            "B holds its cap's worth: one connection"
+        );
+        let delivered = h.acceptor.as_ref().expect("acceptor").accepted().len();
+        assert_eq!(delivered, 1, "B's connection was delivered");
+
+        // Box A connects while its row is still absent: two turns take
+        // its resolution ask across the lane and its first SYN out of
+        // its stack, so the SYN sits on the box side of the lane, one
+        // turn from the leg.
+        let a_flow = h.lane.boxes_mut()[0].connect(proxy_ip, PROXY_PORT);
+        drive(&mut h.lane, 2).await;
+
+        // The row lands — in the same turn as the SYN it is waiting for.
+        // The next turn's reconcile adds A's share before the screen
+        // reads the partition, so A's SYN is admitted into its own
+        // share's listener, never into B's busy connection and never
+        // into nothing.
+        h.boxes.register(box_a);
+        drive(&mut h.lane, 30).await;
+
+        // A was delivered through its own share, and the sibling at cap
+        // never knew about it.
+        let answer = read_flow(&mut h.lane, 0, a_flow, 8).await;
+        assert!(
+            answer.starts_with(b"source="),
+            "the same-turn row's first SYN was delivered through its own \
+             share: {:?}",
+            String::from_utf8_lossy(&answer)
+        );
+        assert_eq!(
+            h.lane.boxes()[1].flow_state(b_flow),
+            State::Established,
+            "B's connection stands"
+        );
+        let accepted = h.acceptor.as_ref().expect("acceptor").accepted();
+        assert_eq!(accepted.len(), 2, "one connection per admitted flow");
+        assert_eq!(accepted[1].source.addr, IpAddress::Ipv4(box_a));
+        assert_eq!(
+            accepted[0].source.addr,
+            IpAddress::Ipv4(box_b),
+            "B's delivery stands first"
+        );
+        assert_eq!(h.lane.pool_len(), 2, "both shares stand");
     }
 
     /// The delivery header is exactly the fixed layout the acceptor reads:
