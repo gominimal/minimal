@@ -746,11 +746,13 @@ pub fn mount_state_volume(device: &str, mountpoint: &str) -> std::io::Result<()>
 
 /// Quiesce the state volume before VMM teardown (spec R2.1): `syncfs(2)` the
 /// mount to flush all pending writes and the ext4 journal to the block device,
-/// then best-effort trim the freed extents back to the host, then best-effort
-/// lazy-detach the mount so a clean stop leaves the journal closed. A syncfs
-/// error propagates; a trim or unmount failure is logged and swallowed — the
-/// data is already synced, so the worst case is a journal replay on the next
-/// boot.
+/// then close the journal (plain unmount, else remount read-only), then
+/// best-effort trim the freed extents back to the host, then best-effort
+/// lazy-detach the mount. The journal-closing step runs before the trim so a
+/// slow trim cannot push it past the quiesce timeout and leave the journal
+/// dirty. A syncfs error propagates; a trim or unmount failure is logged and
+/// swallowed — the data is already synced, so the worst case is a journal
+/// replay on the next boot.
 pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -761,19 +763,6 @@ pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     drop(dir);
-
-    // Best-effort trim before teardown: a clean stop is the one moment the
-    // guest can return every freed extent to the host, and unlike the
-    // maintenance sweep it must not be skipped when nothing else ran. The
-    // error is logged and swallowed — the data is already synced, so a failed
-    // trim only strands extents for the next boot's sweep to reclaim.
-    if let Err(error) = trim_state_volume(mountpoint) {
-        tracing::warn!(
-            mountpoint,
-            %error,
-            "trimming state volume before teardown (best-effort; already synced)"
-        );
-    }
 
     let c_mountpoint = CString::new(mountpoint)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in mountpoint"))?;
@@ -813,6 +802,24 @@ pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
             "remounting state volume read-only (best-effort; already synced)"
         );
     }
+
+    // Best-effort trim after the journal is closed: the unmount (or remount-ro)
+    // above is what clears `INCOMPAT_RECOVER`, and it must finish inside the
+    // quiesce timeout — a slow trim before it could push that step past the
+    // budget and leave the journal dirty. FITRIM is the online-discard ioctl
+    // and works on a read-only mount, so it still runs on the remount-ro path;
+    // on the clean-unmount path the volume is already gone and the trim is
+    // skipped, which the 6-hourly maintenance sweep makes up for. The error is
+    // logged and swallowed — the data is already synced, so a failed trim only
+    // strands extents for the next boot's sweep to reclaim.
+    if let Err(error) = trim_state_volume(mountpoint) {
+        tracing::warn!(
+            mountpoint,
+            %error,
+            "trimming state volume before teardown (best-effort; already synced)"
+        );
+    }
+
     if unsafe { libc::umount2(c_mountpoint.as_ptr(), libc::MNT_DETACH) } != 0 {
         tracing::warn!(
             mountpoint,
