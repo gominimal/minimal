@@ -74,7 +74,10 @@ impl OwnAddressReporter {
 
 /// The network provider for `mode`. `NoNet` is the sandbox layer's own; `HostNet`
 /// is the sandbox layer's plan, decided here against the switch (on a VM host
-/// the resolver must be the node's DNS layer, not the host's); `OwnIp` needs a
+/// the resolver must be the node's DNS layer, not the host's) and against the
+/// box's own declaration — a native deny-all box resolves through the box
+/// zone's answerer, and its leaf is selected into the deny subtree, both from
+/// the policy below (NET-079); `OwnIp` needs a
 /// lease, a tap and a switch attach. An unrecognised mode (`NetworkMode` is
 /// `#[non_exhaustive]`) gets the empty namespace, the safe direction.
 ///
@@ -107,6 +110,12 @@ pub(crate) fn network_for(
     match mode {
         NetworkMode::HostNet => Arc::new(HostIpAddressNetwork {
             switch: Arc::clone(switch),
+            // NET-079: the subtree this box's declaration places its leaf
+            // in — deny when the declaration admits no destination, allow
+            // otherwise — selected here from the policy the launch passes,
+            // so the plan the box is built around is the one its own
+            // verdict decides.
+            verdict: host_address_verdict(policy.as_ref().and_then(|p| p.egress.as_ref())),
         }),
         NetworkMode::OwnIp => Arc::new(OwnIpNetwork {
             switch: Arc::clone(switch),
@@ -125,9 +134,18 @@ pub(crate) fn network_for(
 /// where the namespace it shares is the *guest's* and the host's own resolver
 /// is unreachable from it. There the plan points the resolver at the node's
 /// DNS layer — the switch gateway, whose static `min.internal.` zone carries
-/// the `host` record (NET-003) — whatever the rootfs ships.
+/// the `host` record (NET-003) — whatever the rootfs ships. And on a native
+/// host under a deny-all declaration, the plan points the resolver at the
+/// box zone's answerer instead of the host's own (NET-079): the one
+/// destination the deny rule admits, where the box resolves exactly the
+/// names the box zone holds and nothing forwards upstream.
 struct HostIpAddressNetwork {
     switch: Arc<Mutex<SwitchClient>>,
+    /// The cohort subtree this box's declaration places its leaf in
+    /// (NET-079) — the deny subtree when the declaration admits no
+    /// destination. Decided before the box's first process exists, like the
+    /// leaf itself, because the plan is built before the spawn.
+    verdict: sandbox2::config::Verdict,
 }
 
 impl std::fmt::Debug for HostIpAddressNetwork {
@@ -135,6 +153,19 @@ impl std::fmt::Debug for HostIpAddressNetwork {
         f.debug_struct("HostIpAddressNetwork")
             .finish_non_exhaustive()
     }
+}
+
+/// Which cohort subtree a host-address box's declaration places its leaf in
+/// (NET-079) — the deny subtree when the declaration admits no destination,
+/// the allow subtree otherwise. The leaf's *placement* is the session
+/// launcher's (a migration the daemon makes); what the provider selects is
+/// the subtree, because the plan it builds for the box is decided by the
+/// same verdict its connections are.
+///
+/// Pure over the declaration, so the verdict a box's plan is built around is
+/// pinned beside the plan it decides.
+fn host_address_verdict(declaration: Option<&sessions::EgressPolicy>) -> sandbox2::config::Verdict {
+    crate::net::classifier::verdict_of(declaration)
 }
 
 impl Network for HostIpAddressNetwork {
@@ -150,6 +181,22 @@ impl Network for HostIpAddressNetwork {
                 )
             };
             if !vm_host {
+                // A native deny-all box resolves through the box zone's
+                // answerer (NET-079), never through the host's own resolver:
+                // the host's resolver forwards any name upstream, so a
+                // deny-all box pointed at it would resolve everything
+                // outside through the one destination its connections are
+                // admitted to. The plan names the answerer's address — the
+                // one address the deny rule admits — and that is all
+                // `/etc/resolv.conf` can name: the answerer's port is the
+                // one the rule admits and the host's resolver hook names
+                // with its `port` directive (NET-122, design §7.1), and it
+                // stays the answerer's own, not the plan's.
+                if self.verdict == sandbox2::config::Verdict::Deny {
+                    return Ok(NetPlan::host().with_resolver(Resolver::Nameservers(vec![
+                        crate::net::classifier::ANSWERER_ADDRESS,
+                    ])));
+                }
                 // Native host: the namespace the box shares is the host's own,
                 // so the sandbox layer's plan answers `host.min.internal` from
                 // `/etc/hosts` at the host's loopback.
@@ -618,6 +665,141 @@ mod tests {
             TapMechanism::InNamespace,
         );
         assert_eq!(plan.resolver(), own.resolver());
+    }
+
+    /// NET-079: on a native host, a deny-all host-address box resolves through
+    /// the box zone's answerer — the resolver Minimal owns for it, the one
+    /// destination its connections are admitted to — never through the host's
+    /// own resolver, which forwards any name upstream and would hand the box
+    /// everything outside through that one carve-out. A box that is not
+    /// deny-all keeps the host's resolver, and a deny-all box on a VM host
+    /// keeps the node's DNS layer: the answerer is this host's loopback, which
+    /// a box in the guest's namespace has no reach into.
+    #[tokio::test]
+    async fn host_ip_box_resolves_through_answerer() {
+        let deny_all = Some(sessions::SessionPolicy::new(
+            Some(sessions::EgressPolicy::deny_all()),
+            None,
+        ));
+        let native = Arc::new(Mutex::new(SwitchClient::new(
+            "/usr/bin/gvproxy",
+            "/run/minimal/gvproxy",
+        )));
+
+        let plan = network_for(
+            NetworkMode::HostNet,
+            &native,
+            "s",
+            deny_all.clone(),
+            None,
+            None,
+        )
+        .plan()
+        .await
+        .expect("host-address plans do not fail");
+        assert_eq!(
+            plan.resolver(),
+            &Resolver::Nameservers(vec![crate::net::classifier::ANSWERER_ADDRESS]),
+            "a native deny-all box resolves through the zone's answerer"
+        );
+        assert_ne!(
+            plan.resolver(),
+            &Resolver::Host,
+            "never through the host's own resolver: it forwards any name upstream"
+        );
+
+        // A box that is not deny-all inherits the host's resolver: no verdict
+        // of its own, no carve-out to be routed through.
+        let plain = network_for(NetworkMode::HostNet, &native, "s", None, None, None)
+            .plan()
+            .await
+            .expect("host-address plans do not fail");
+        assert_eq!(plain.resolver(), &Resolver::Host);
+
+        // On a VM host the deny verdict changes nothing here: the namespace
+        // the box shares is the guest's, and the node's DNS layer answers it.
+        let vm = counting_switch();
+        let guest_plan = network_for(NetworkMode::HostNet, &vm, "s", deny_all, None, None)
+            .plan()
+            .await
+            .expect("host-address plans do not fail");
+        assert_eq!(
+            guest_plan.resolver(),
+            &Resolver::Nameservers(vec![crate::net::SwitchSubnet::default().dns_server()]),
+            "a VM host's deny-all box resolves through the node's DNS layer"
+        );
+    }
+
+    /// NET-079's cgroup half, as the provider selects it: a host-address box's
+    /// leaf is one level under the subtree its verdict picked — deny or allow
+    /// — never directly under the cohort, where the refusing rule's level
+    /// arithmetic would silently miss it and the box would run unenforced
+    /// while looking classified.
+    #[test]
+    fn host_ip_box_cannot_leave_its_cgroup() {
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        let root = tree.path();
+        let cohort = root.join(sandbox2::classifier::BOXES_DIR);
+        let deny = cohort.join(sandbox2::config::DENY_DIR);
+        let allow = cohort.join(sandbox2::config::ALLOW_DIR);
+
+        for (declaration, expected, why) in [
+            (
+                Some(sessions::EgressPolicy::deny_all()),
+                sandbox2::config::Verdict::Deny,
+                "a deny-all box",
+            ),
+            (
+                None,
+                sandbox2::config::Verdict::Allow,
+                "a box with no egress section",
+            ),
+        ] {
+            // The subtree the declaration picks is the one the leaf is placed
+            // in — the same selection the launch's own placement makes.
+            let verdict = host_address_verdict(declaration.as_ref());
+            assert_eq!(verdict, expected, "{why} is classified by its declaration");
+            let leaf = sandbox2::config::ClassifierLeaf::under(root, "a session", verdict);
+            assert_eq!(
+                leaf.dir().parent().and_then(std::path::Path::parent),
+                Some(cohort.as_path()),
+                "{why}'s leaf is one level under its subtree, one level under \
+                 the cohort: {}",
+                leaf.dir().display()
+            );
+            assert_eq!(
+                leaf.dir().parent(),
+                Some(match verdict {
+                    sandbox2::config::Verdict::Deny => deny.as_path(),
+                    sandbox2::config::Verdict::Allow => allow.as_path(),
+                }),
+                "{why}'s leaf is in the subtree its verdict picked"
+            );
+            assert!(
+                leaf.dir().parent() != Some(cohort.as_path()),
+                "no host-address leaf sits directly under the cohort: the deny \
+                 rule's match is on the subtree, and a leaf beside it is \
+                 outside both subtrees ({})",
+                leaf.dir().display()
+            );
+        }
+
+        // And the two subtrees are what the leaf is decided between: a
+        // deny-all box's leaf is in the deny subtree and no other box's is in
+        // it, the same arithmetic the refusing rule and the cohort's source
+        // identity are keyed on.
+        let deny_all = sandbox2::config::ClassifierLeaf::under(
+            root,
+            "a session",
+            sandbox2::config::Verdict::Deny,
+        );
+        assert_eq!(
+            deny_all.relative_dir(),
+            std::path::PathBuf::from(sandbox2::classifier::BOXES_DIR)
+                .join(sandbox2::config::DENY_DIR)
+                .join(sandbox2::classifier::sanitize_box_id("a session")),
+            "the leaf's in-box spelling keeps the whole subtree path"
+        );
     }
 
     /// NET-003 for every box kind: `host.min.internal` answers with the address

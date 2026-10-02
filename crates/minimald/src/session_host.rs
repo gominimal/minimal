@@ -2511,6 +2511,7 @@ async fn create_session_leaf(
     guest: bool,
     session_id: &sessions::SessionId,
     session_name: &str,
+    verdict: sandbox2::config::Verdict,
 ) -> io::Result<Option<sandbox2::config::ClassifierLeaf>> {
     let root = std::path::Path::new(sandbox2::classifier::TREE_ROOT);
     if !sandbox2::classifier::tree_is_real(
@@ -2530,10 +2531,12 @@ async fn create_session_leaf(
     // The placement the box's own join performs, tried first by a throwaway
     // child of this daemon: the proof is a migration the kernel accepted, not
     // the tree's existence. On the blocking pool, because a fork and its reap
-    // do not belong on an executor thread.
+    // do not belong on an executor thread. The probe makes its leaf in the
+    // subtree this box's verdict picked, the same one its own leaf will
+    // live in.
     let placement = match tokio::task::spawn_blocking({
         let root = root.to_path_buf();
-        move || sandbox2::classifier::probe_child_placement(&root)
+        move || sandbox2::classifier::probe_child_placement(&root, verdict)
     })
     .await
     {
@@ -2573,7 +2576,7 @@ async fn create_session_leaf(
         );
         return Ok(None);
     }
-    match create_or_reclaim_box_leaf(root, session_id) {
+    match create_or_reclaim_box_leaf(root, session_id, verdict) {
         Ok((leaf, reclaimed)) => {
             if reclaimed {
                 tracing::info!(
@@ -2584,6 +2587,19 @@ async fn create_session_leaf(
                      let it go, and the launch created it again for this box",
                 );
             }
+            // One info line per host-address box launch naming its classifier
+            // identity (NET-079's observability): the subtree its declaration
+            // picked and the leaf that verdict placed it in — the identity its
+            // connections are decided on, beside the launch's own record.
+            tracing::info!(
+                session = session_name,
+                classifier = verdict.dir_name(),
+                leaf = %leaf.display(),
+                host_ip_enforcement = %HostIpEnforcement::Enforced.machine_str(),
+                "the host-address box's egress verdict is decided on its \
+                 classifier leaf, in the {} subtree",
+                verdict.dir_name()
+            );
             Ok(Some(sandbox2::config::ClassifierLeaf::new(leaf)))
         }
         // `NotFound` is the ordinary shape of "no tree on this host": the
@@ -2637,14 +2653,15 @@ async fn create_session_leaf(
 fn create_or_reclaim_box_leaf(
     root: &std::path::Path,
     session_id: &sessions::SessionId,
+    verdict: sandbox2::config::Verdict,
 ) -> io::Result<(std::path::PathBuf, bool)> {
     let id = session_id.to_string();
-    match sandbox2::classifier::create_box_leaf(root, &id) {
+    match sandbox2::classifier::create_box_leaf(root, &id, verdict) {
         Ok(leaf) => Ok((leaf, false)),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let leftover = sandbox2::classifier::box_leaf(root, &id);
+            let leftover = sandbox2::classifier::box_leaf(root, &id, verdict);
             sandbox2::classifier::remove_box_leaf(&leftover)
-                .and_then(|()| sandbox2::classifier::create_box_leaf(root, &id))
+                .and_then(|()| sandbox2::classifier::create_box_leaf(root, &id, verdict))
                 .map(|leaf| (leaf, true))
                 .map_err(|refused| {
                     io::Error::new(
@@ -2894,6 +2911,13 @@ impl SessionLauncher for SandboxLauncher {
         // Move the session policy out of `self` up front so it can be applied
         // after the switch attach below (the rest of `self` is consumed first).
         let policy = self.policy;
+        // NET-079: the cohort subtree this box's declaration places its leaf
+        // in, decided from the declaration before anything is reserved and
+        // before its first process exists — the same verdict the plan below
+        // resolves a deny-all box through, and the one the placement's own
+        // leaf is named by. The declaration is fixed at create, so a launch
+        // decides it once and a box is never re-verdicted mid-flight.
+        let classifier_verdict = crate::net::classifier::verdict_of(policy.egress.as_ref());
         let network_mode = self.network_mode;
         let net_switch = self.net_switch;
         let own_address = self.own_address;
@@ -2938,7 +2962,7 @@ impl SessionLauncher for SandboxLauncher {
         // guard below so the box's processes are gone before their leaf is
         // removed.
         let leaf = if matches!(network_mode, NetworkMode::HostNet) {
-            create_session_leaf(guest, &session_id, &session_name).await?
+            create_session_leaf(guest, &session_id, &session_name, classifier_verdict).await?
         } else {
             None
         };
