@@ -1501,14 +1501,16 @@ case_installer_switch_binary_executable() {
 # install-host-classifier.sh is the privileged step that lays out the cgroup
 # tree minimald and its boxes are placed in, on a native host. CI cannot mount
 # cgroup2, so the case drives the script against a stand-in mount table through
-# its MINIMAL_OVERRIDE_CGROUP_MOUNTINFO seam, with a stubbed `chown` recording
-# its own argv, over a tree rooted in a temp dir: what is pinned is the
-# decision sequence a root run would take on the real mount — refuse an
+# its MINIMAL_OVERRIDE_CGROUP_MOUNTINFO seam, with stubbed `chown` and `nft`
+# recording their own argv, over a tree rooted in a temp dir: what is pinned
+# is the decision sequence a root run would take on the real mount — refuse an
 # undelegated hierarchy, refuse another namespace's view, delegate the slice
-# and both leaves it lays out whole (each directory plus cgroup.procs,
-# cgroup.threads and cgroup.subtree_control), and leave the cgroup2 mount root
-# above the slice root-owned. The one fact the stand-in cannot stand in for is
-# the kernel: it makes a cgroup's files at mkdir and dissolves them with the
+# and every cgroup it lays out whole (each directory plus cgroup.procs,
+# cgroup.threads and cgroup.subtree_control, the cohort's two subtrees
+# included), leave the cgroup2 mount root above the slice root-owned, load
+# exactly one packet-filter transaction, and write the presence marker the
+# daemon probes only after it. The one fact the stand-in cannot stand in for
+# is the kernel: it makes a cgroup's files at mkdir and dissolves them with the
 # cgroup at rmdir, so the case drops the modeled ones wherever a real rmdir
 # would have taken the cgroup too.
 case_host_classifier_tree_installed() {
@@ -1549,6 +1551,27 @@ printf '%s\n' "$*" >>"$CHOWN_CALLS"
 STUB
     chmod +x "$hcbin/chown"
 
+    # A recording nft stub, in the chown stub's image: the step's second half
+    # is the packet-filter table, and what CI can pin of it without the
+    # capability to load one is the decision sequence — probe for a previous
+    # table, load exactly one transaction, and write the marker only after.
+    # The `-f` argument's file is captured whole: the case and the daemon's
+    # own ruleset tests read the transaction the step rendered.
+    nft_calls="$root/nft.calls"; : >"$nft_calls"
+    nft_input="$root/nft.input"; : >"$nft_input"
+    cat >"$hcbin/nft" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >>"$NFT_CALLS"
+if [ "$1" = "-f" ] && [ -n "${2:-}" ]; then
+    cat "$2" >>"$NFT_INPUT"
+fi
+# No stand-in kernel holds a table, so `list` says absent: the install probes
+# once, skips its delete, and loads fresh.
+[ "$1" = "list" ] && exit 1
+exit 0
+STUB
+    chmod +x "$hcbin/nft"
+
     # run_hc <label> <mountinfo> [args...] ; sets rc, captures output in $OUT.
     run_hc() {
         label="$1"; mi="$2"; shift 2
@@ -1557,6 +1580,8 @@ STUB
         env -i \
             PATH="$hcbin:/usr/bin:/bin" \
             CHOWN_CALLS="$chown_calls" \
+            NFT_CALLS="$nft_calls" \
+            NFT_INPUT="$nft_input" \
             MINIMAL_OVERRIDE_CGROUP_MOUNTINFO="$mi" \
             bash "$hc" --root "$tree" "$@" </dev/null >"$OUT" 2>&1
         rc=$?
@@ -1611,17 +1636,25 @@ STUB
     want_ok "the refusal names the account" grep -q "no such account" "$OUT"
     want_err "a bad account still creates nothing" test -e "$tree"
 
-    # --- The install: the slice, its two leaves, and the whole v2 contract
-    # delegated to the account minimald runs as.
-    run_hc install "$root/mi-on" --user "$me"
+    # --- The install: the slice, its daemon leaf, the cohort's two subtrees,
+    # and the whole v2 contract delegated to the account minimald runs as.
+    run_hc install "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
     check 0 "$rc" "install exits 0 on a delegated cgroup2 mount"
     want_ok "the daemon leaf exists" test -d "$tree/daemon"
     want_ok "the box cohort exists"   test -d "$tree/boxes"
+    want_ok "the deny subtree exists"  test -d "$tree/boxes/deny"
+    want_ok "the allow subtree exists" test -d "$tree/boxes/allow"
+    want_ok "the table's marker exists once the transaction succeeded" \
+        test -d "$tree/classifier-table"
     want_ok "install names the tree it laid out"   grep -q "installed the classifier tree" "$OUT"
     want_ok "install names the delegated account" grep -q "delegated to" "$OUT"
     want_ok "install names the contract it delegated" grep -q "v2 contract" "$OUT"
     want_ok "install says what a daemon in the slice does per launch, not on its next start" \
         grep -q "once minimald is in the slice, each box it launches" "$OUT"
+    want_ok "install names the loaded table" grep -q "loaded the classifier table" "$OUT"
+    want_ok "install names the marker minimald probes" \
+        grep -q "presence marker at $tree/classifier-table" "$OUT"
     want_ok "the slice's cgroup.procs is there for the daemon to write" \
         test -e "$tree/cgroup.procs"
     want_ok "the daemon leaf's cgroup.procs is there for --pid to write" \
@@ -1631,10 +1664,11 @@ STUB
     # migration into a leaf needs write access to the common ancestor's
     # cgroup.procs, and that ancestor is the slice itself — and never
     # reached above the slice: a box runs as the daemon's uid, so a mount
-    # root owned by that account is every cgroup on the host.
+    # root owned by that account is every cgroup on the host. The two
+    # subtrees are delegated like the cohort they live under.
     _o="$(id -u):$(id -g)"
     _want=""
-    for _cg in "" "/daemon" "/boxes"; do
+    for _cg in "" "/daemon" "/boxes" "/boxes/deny" "/boxes/allow"; do
         for _f in cgroup.procs cgroup.threads cgroup.subtree_control; do
             _want="$_want$_o $tree$_cg/$_f "
         done
@@ -1644,21 +1678,45 @@ STUB
     # ledger, not a shell variable, so fold it rather than word-split it.
     _got="$(awk '{printf "%s%s", sep, $0; sep = " "}' "$chown_calls")"
     check "${_want% }" "$_got" \
-        "delegation reached the slice and both leaves whole, never above the slice"
+        "delegation reached the slice and every leaf whole, never above the slice"
+    # The one packet-filter transaction: probed for a previous table, loaded
+    # exactly once, and nothing per-box in it — every rule is keyed on a
+    # cgroup path. The daemon's own ruleset tests read the same input in
+    # depth; this pins what the step decided, at the layer the installer
+    # owns: one transaction, the marker after it, the cohort's two
+    # identities, and the answerer as the deny subtree's one destination.
+    want_ok "the step probed for a previous table before loading" \
+        grep -q "^list table inet minimal_class$" "$nft_calls"
+    want_ok "the step loaded one transaction, exactly once" \
+        [ "$(grep -c '^-f ' "$nft_calls")" -eq 1 ]
+    want_ok "the transaction keys its deny rule on the deny subtree" \
+        grep -q 'cgroupv2 level 3 "minimald.slice/boxes/deny" jump deny_out' "$nft_input"
+    want_ok "the transaction gives the cohort and the node plane distinct sources" \
+        grep -q 'level 2 "minimald.slice/boxes" snat ip to 100.72.0.9' "$nft_input"
+    want_ok "the node-plane rule follows the cohort rule, so it cannot swallow it" \
+        grep -q 'level 1 "minimald.slice" snat ip to 100.72.0.1' "$nft_input"
+    want_ok "the deny rule admits the answerer by address and port only" \
+        grep -q 'ip daddr 127.0.0.1 udp dport 7656 accept' "$nft_input"
+    want_ok "the deny rule refuses actively, never a silent drop" \
+        grep -q 'reject with icmpx admin-prohibited' "$nft_input"
 
     run_hc installed_check "$root/mi-on" --check --user "$me"
     check 0 "$rc" "check exits 0 once the tree is installed"
     want_ok "check reports the delegation it verified" grep -q "delegated:" "$OUT"
     want_ok "check names the contract it verified" grep -q "cgroup.threads" "$OUT"
     want_ok "check says what stays root-owned" grep -q "stays root-owned" "$OUT"
+    want_ok "check reports the table's marker" grep -q "classifier-table" "$OUT"
 
-    # --- Uninstall: the tree comes away whole — but a leaf the script did not
-    # place (a live session's) stops it rather than tearing the box down. The
-    # kernel dissolves a cgroup's own files with it, so the case drops the
-    # modeled ones first and the rmdir rehearsed is the real one.
+    # --- Uninstall: the tree comes away whole — the two subtrees and the
+    # table's marker with it — but a leaf the script did not place (a live
+    # session's) stops it rather than tearing the box down. The kernel
+    # dissolves a cgroup's own files with it, so the case drops the modeled
+    # ones first and the rmdir rehearsed is the real one.
     drop_cgroup_files "$tree"
     drop_cgroup_files "$tree/daemon"
     drop_cgroup_files "$tree/boxes"
+    drop_cgroup_files "$tree/boxes/deny"
+    drop_cgroup_files "$tree/boxes/allow"
     run_hc uninstall "$root/mi-on" --uninstall
     check 0 "$rc" "uninstall removes the installed tree"
     want_err "uninstall leaves no tree behind" test -e "$tree"
@@ -1693,11 +1751,13 @@ STUB
     drop_cgroup_files "$tree"
     drop_cgroup_files "$tree/daemon"
     drop_cgroup_files "$tree/boxes"
-    mkdir "$tree/boxes/a-session"
+    drop_cgroup_files "$tree/boxes/deny"
+    drop_cgroup_files "$tree/boxes/allow"
+    mkdir "$tree/boxes/deny/a-session"
     run_hc uninstall_live "$root/mi-on" --uninstall
     check 1 "$rc" "uninstall dies while a box leaf survives"
     want_ok "the refusal says what is holding the tree" grep -q "stop minimald" "$OUT"
-    want_ok "the live leaf survives the refused uninstall" test -d "$tree/boxes/a-session"
+    want_ok "the live leaf survives the refused uninstall" test -d "$tree/boxes/deny/a-session"
     rm -rf "$tree"   # the sweep this case alone owns; the refused uninstall could not
 
     # --- --pid with no tree to place into names the step that is missing.

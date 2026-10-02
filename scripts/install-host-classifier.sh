@@ -18,6 +18,8 @@
 #
 # Usage:
 #   sudo scripts/install-host-classifier.sh [--user NAME] [--root DIR]
+#         [--answerer-address ADDR] [--answerer-port PORT]
+#         [--cohort-address ADDR --node-plane-address ADDR]
 #   sudo scripts/install-host-classifier.sh --pid PID
 #   sudo scripts/install-host-classifier.sh --uninstall
 #        scripts/install-host-classifier.sh --check      # unprivileged
@@ -29,6 +31,21 @@
 # leaf: the one migration the delegated account cannot make itself,
 # because the common ancestor of the cgroup the daemon starts in and the
 # slice is the root-owned hierarchy root.
+#
+# The install also lays out the cohort's two subtrees, boxes/deny and
+# boxes/allow — a box's declaration, not its session name, decides which
+# one it lives in — and loads the one nftables inet table that decides a
+# deny-all box's connections, as a single `nft -f` transaction. Its output
+# chain matches a box's own cgroup before any source translation and
+# refuses every connection a box in boxes/deny opens except the one to the
+# zone answerer (--answerer-address, --answerer-port; the box's resolver,
+# refused actively and never silently dropped). Its postrouting chain
+# gives the boxes cohort and the rest of the slice their two source
+# identities (--cohort-address, --node-plane-address: both or neither).
+# Rules are keyed on the cgroups' paths alone — never a uid, pid or mark —
+# and nothing is per-box: no rule is added or removed at box launch or
+# stop. The marker minimald probes is written only after that one
+# transaction succeeds, so its presence means the table is loaded.
 set -euo pipefail
 
 # Mirrors sandbox2::classifier's constants (crates/sandbox2/src/lib.rs): the
@@ -36,6 +53,13 @@ set -euo pipefail
 readonly DEFAULT_TREE_ROOT=/sys/fs/cgroup/minimald.slice
 readonly DAEMON_LEAF=daemon
 readonly BOXES_DIR=boxes
+readonly DENY_DIR=deny
+readonly ALLOW_DIR=allow
+# The name the loaded table and its presence marker share: the daemon probes
+# $tree_root/$TABLE_MARKER (read-only, no CAP_NET_ADMIN) because listing the
+# table itself needs the very capability that loaded it.
+readonly TABLE_MARKER=classifier-table
+readonly TABLE_NAME=minimal_class
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
@@ -50,6 +74,19 @@ mode=install
 user=
 pid=
 tree_root=$DEFAULT_TREE_ROOT
+# The one destination a deny-all box's connections are admitted to: the
+# zone answerer the daemon serves, at its own loopback address. The port
+# mirrors the daemon's ANSWERER_PORT; --answerer-address/--answerer-port
+# exist because a daemon may serve the answerer elsewhere (NET-079's
+# carve-out is by address and port, never loopback-wide).
+answerer_address=127.0.0.1
+answerer_port=7656
+# The cohort's and the node plane's source identities (NET-078). They are
+# this host's to know, not the script's to guess: each SNAT rule is rendered
+# only when its address was given, and the two go together — half a
+# classification is one identity wearing two names.
+cohort_address=
+node_plane_address=
 # The parse loop consumes $@; keep the original invocation for the sudo hint
 # below, or a copy-pasted retry silently drops --user/--uninstall.
 original_args=("$@")
@@ -66,6 +103,29 @@ while [ $# -gt 0 ]; do
             tree_root=$2
             shift 2
             ;;
+        --answerer-address)
+            [ $# -ge 2 ] || die "--answerer-address needs an address"
+            answerer_address=$2
+            shift 2
+            ;;
+        --answerer-port)
+            [ $# -ge 2 ] || die "--answerer-port needs a port"
+            case "$2" in ''|*[!0-9]*)
+                die "--answerer-port needs a numeric port, got: $2" ;;
+            esac
+            answerer_port=$2
+            shift 2
+            ;;
+        --cohort-address)
+            [ $# -ge 2 ] || die "--cohort-address needs an address"
+            cohort_address=$2
+            shift 2
+            ;;
+        --node-plane-address)
+            [ $# -ge 2 ] || die "--node-plane-address needs an address"
+            node_plane_address=$2
+            shift 2
+            ;;
         --uninstall) mode=uninstall; shift ;;
         --check)     mode=check; shift ;;
         --pid)
@@ -80,7 +140,7 @@ while [ $# -gt 0 ]; do
         # The header above this line is the usage. Two explicit strips, not
         # 's/^# \?//': \? is a GNU sed extension BSD sed does not know, and this
         # script's own tests run on macOS's /bin/sh too.
-        -h|--help)   sed -n '2,31p' "$0" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
+        -h|--help)   sed -n '2,48p' "$0" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
         *)           die "unknown argument: $1 (see --help)" ;;
     esac
 done
@@ -206,8 +266,14 @@ do_check() {
     # The slice itself is delegated — a migration between two of its leaves
     # is a write to the slice's own cgroup.procs — so every cgroup this
     # script lays out must carry the whole v2 contract: the directory plus
-    # cgroup.procs, cgroup.threads and cgroup.subtree_control.
-    for cgroup in "" "/$DAEMON_LEAF" "/$BOXES_DIR"; do
+    # cgroup.procs, cgroup.threads and cgroup.subtree_control. The two
+    # subtrees under the cohort are part of what the daemon's placement
+    # needs: a box's leaf is one level below the cohort now, in the subtree
+    # its declaration picked.
+    for cgroup in \
+        "" "/$DAEMON_LEAF" "/$BOXES_DIR" \
+        "/$BOXES_DIR/$DENY_DIR" "/$BOXES_DIR/$ALLOW_DIR"
+    do
         path="$tree_root$cgroup"
         if [ ! -d "$path" ]; then
             problem "$path does not exist (install it: $hint)"
@@ -226,9 +292,17 @@ do_check() {
                 problem "$path/$file is owned by $owner, not $owner_uid $owner_gid; without that write the daemon cannot migrate a process across this boundary"
         done
     done
+    # The packet-filter table's presence marker: the daemon probes it
+    # read-only at start, because listing the table needs the capability
+    # that loaded it. Its absence is the one fact this rehearsal can see of
+    # the step's second half, so it is reported, not assumed.
+    if [ ! -d "$tree_root/$TABLE_MARKER" ]; then
+        problem "$tree_root/$TABLE_MARKER is missing: the table's presence marker, written by an install whose nft transaction succeeded (install it: $hint)"
+    fi
     [ "$problems" -eq 0 ] || die "$problems problem(s): the tree is not installed as minimald needs it"
     note "tree:     $tree_root"
-    note "delegated: $owner_uid:$owner_gid — the slice, $DAEMON_LEAF and $BOXES_DIR, each with its cgroup.procs, cgroup.threads and cgroup.subtree_control"
+    note "delegated: $owner_uid:$owner_gid — the slice, $DAEMON_LEAF, $BOXES_DIR and its $DENY_DIR and $ALLOW_DIR subtrees, each with its cgroup.procs, cgroup.threads and cgroup.subtree_control"
+    note "table:    $tree_root/$TABLE_MARKER (the loaded table's marker; minimald records a per-box verdict only while it is there)"
     note "the cgroup2 mount above the slice stays root-owned"
     note "each session box will run in a leaf of its own; minimald's launch log names it"
 }
@@ -272,10 +346,23 @@ if [ "$mode" = place ]; then
 fi
 
 if [ "$mode" = uninstall ]; then
-    # rmdir, never rm: on the real filesystem these are cgroups, and the
+    # The table first: it is this step's own artifact and it outlives the
+    # cgroups it is keyed on — a table left loaded over a removed tree
+    # decides nothing while still looking installed. rmdir, never rm, for
+    # everything else: on the real filesystem these are cgroups, and the
     # kernel refuses to remove one that still holds a process — which is
     # exactly the guard wanted here (stop minimald first).
+    if command -v nft >/dev/null 2>&1 &&
+        nft list table inet "$TABLE_NAME" >/dev/null 2>&1
+    then
+        nft delete table inet "$TABLE_NAME" ||
+            die "cannot remove the classifier table inet $TABLE_NAME (is another nft call holding it?)"
+        note "removed the classifier table inet $TABLE_NAME"
+    fi
     rmdir "$tree_root/$DAEMON_LEAF" 2>/dev/null || true
+    rmdir "$tree_root/$TABLE_MARKER" 2>/dev/null || true
+    rmdir "$tree_root/$BOXES_DIR/$DENY_DIR" 2>/dev/null || true
+    rmdir "$tree_root/$BOXES_DIR/$ALLOW_DIR" 2>/dev/null || true
     rmdir "$tree_root/$BOXES_DIR" 2>/dev/null || true
     if rmdir "$tree_root" 2>/dev/null; then
         note "removed the classifier tree at $tree_root"
@@ -287,6 +374,16 @@ fi
 verify_mount
 resolve_owner
 
+# The cohort's two identities are one fact, not two: a cohort address with
+# no node-plane address (or the reverse) would render half the
+# classification and pass everything the missing rule was for through the
+# one identity given. All or neither — and an honest re-run can add them.
+if [ -n "$cohort_address" ] || [ -n "$node_plane_address" ]; then
+    if [ -z "$cohort_address" ] || [ -z "$node_plane_address" ]; then
+        die "the cohort and node-plane identities go together: pass both --cohort-address and --node-plane-address, or neither"
+    fi
+fi
+
 # mkdir, not install -d: on a cgroup2 mount mkdir is the operation itself (the
 # hierarchy decides its own permissions, there is no mode to set), and it is
 # the one form every host this script runs on guarantees — BSD install -d is a
@@ -294,6 +391,12 @@ resolve_owner
 mkdir -p "$tree_root" ||
     die "cannot create $tree_root (is cgroup2 mounted there, and this account allowed to?)"
 mkdir -p "$tree_root/$DAEMON_LEAF" "$tree_root/$BOXES_DIR"
+mkdir "$tree_root/$BOXES_DIR/$DENY_DIR" 2>/dev/null ||
+    [ -d "$tree_root/$BOXES_DIR/$DENY_DIR" ] ||
+    die "cannot create $tree_root/$BOXES_DIR/$DENY_DIR"
+mkdir "$tree_root/$BOXES_DIR/$ALLOW_DIR" 2>/dev/null ||
+    [ -d "$tree_root/$BOXES_DIR/$ALLOW_DIR" ] ||
+    die "cannot create $tree_root/$BOXES_DIR/$ALLOW_DIR"
 
 # Delegate each cgroup this script lays out — the slice first, because a
 # migration between two of its leaves is a write to the slice's own
@@ -303,7 +406,10 @@ mkdir -p "$tree_root/$DAEMON_LEAF" "$tree_root/$BOXES_DIR"
 # the common ancestor's cgroup.procs, and enabling controllers in the
 # leaves below is a write to subtree_control. Nothing above the slice is
 # touched — the mount root stays root-owned, which is the barrier.
-for cgroup in "" "/$DAEMON_LEAF" "/$BOXES_DIR"; do
+for cgroup in \
+    "" "/$DAEMON_LEAF" "/$BOXES_DIR" \
+    "/$BOXES_DIR/$DENY_DIR" "/$BOXES_DIR/$ALLOW_DIR"
+do
     dir="$tree_root$cgroup"
     for file in cgroup.procs cgroup.threads cgroup.subtree_control; do
         # On a cgroup2 mount the kernel makes these at mkdir; only a
@@ -315,10 +421,109 @@ for cgroup in "" "/$DAEMON_LEAF" "/$BOXES_DIR"; do
     chown "$owner_uid:$owner_gid" "$dir"
 done
 
+# The cgroups' paths as the packet filter spells them: relative to the
+# cgroup2 hierarchy's root, which is where nft's socket match resolves
+# them from. The tree root minus its covering mountpoint (and the "/" the
+# subtraction leaves behind) is that spelling, because verify_mount above
+# refused every other namespace's view — and a tree root that *is* the
+# mount root has no path of its own to be keyed on.
+rel=${tree_root#"$covering_point"}
+rel=${rel#/}
+[ -n "$rel" ] ||
+    die "$tree_root is the cgroup2 mount root itself; the classifier needs a slice below the mount root to key its rules on"
+deny_path="$rel/$BOXES_DIR/$DENY_DIR"
+boxes_path="$rel/$BOXES_DIR"
+
+# cgroup_level <path> — the nft socket match compares that many leading
+# components of the socket's cgroup path, so the level is the path's own
+# depth, derived rather than hardcoded: a --root deeper in the hierarchy
+# shifts every rule with it.
+cgroup_level() {
+    awk -v p="$1" 'BEGIN { printf "%d\n", split(p, a, "/") }'
+}
+
+# render_ruleset — the one table this step owns, on stdout, as one `nft -f`
+# reads it. Every rule is keyed on a cgroup path alone — never a uid, pid or
+# mark, which a box could change about itself — and nothing is per-box, so
+# nothing is edited at box launch or stop: a box's declaration picks its
+# subtree, the subtree carries the verdict, and the launch only places the
+# box in the leaf it already owns.
+#
+# The output chain (priority filter) runs before the postrouting chain
+# (priority srcnat), so a connection refused on the box's own cgroup is
+# refused before any source translation: the deny is decided inside the box
+# host, on the declaration, not on the identity the packet would leave with.
+# The refusal is active — reject, never a silent drop — and each one logs,
+# rate-limited, so a diagnostics bundle's daemon log tail carries the
+# refused connections themselves. The SNAT rules render only when both
+# addresses were given, boxes first so the slice rule cannot swallow the
+# cohort's own identity.
+render_ruleset() {
+    cat <<RULES
+table inet $TABLE_NAME {
+    chain output {
+        type filter hook output priority filter; policy accept;
+        socket cgroupv2 level $(cgroup_level "$deny_path") "$deny_path" jump deny_out
+    }
+    chain deny_out {
+        ip daddr $answerer_address udp dport $answerer_port accept
+        limit rate 1/second burst 4 packets log prefix "minimal-classifier: refused " level warn
+        reject with icmpx admin-prohibited
+    }
+RULES
+    if [ -n "$cohort_address" ]; then
+        cat <<RULES
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        socket cgroupv2 level $(cgroup_level "$boxes_path") "$boxes_path" snat ip to $cohort_address
+        socket cgroupv2 level $(cgroup_level "$rel") "$rel" snat ip to $node_plane_address
+    }
+RULES
+    fi
+    printf '}\n'
+}
+
+# The one nftables transaction. A previous step's table, if any, is removed
+# first — `nft -f` *adds* to a table that exists, and a half-replaced table
+# decides nothing. nft resolves the cgroups' paths against the hierarchy at
+# load, so a transaction naming a cgroup this step did not make dies whole
+# and the marker below is never written over a table that is not there.
+command -v nft >/dev/null 2>&1 ||
+    die "nft is this step's dependency: install it (e.g. apt install nftables) and run this step again"
+if nft list table inet "$TABLE_NAME" >/dev/null 2>&1; then
+    nft delete table inet "$TABLE_NAME" ||
+        die "cannot remove the previous classifier table inet $TABLE_NAME"
+fi
+ruleset="$(mktemp)"
+render_ruleset >"$ruleset"
+if ! nft -f "$ruleset"; then
+    rm -f "$ruleset"
+    die "nft refused the classifier table: the tree is delegated but no per-box verdict is decided yet, and no marker was written (nft's own error is above)"
+fi
+rm -f "$ruleset"
+
+# The presence marker the daemon probes at start: on real cgroupfs a plain
+# file cannot exist, so it is a cgroup of its own — one that holds no
+# process and is never delegated, because only this step writes it. Written
+# after the transaction above succeeded, so a daemon that finds it knows
+# the table is loaded, and its absence is the fact the daemon's start-time
+# probe reports (nothing else claims the step's second half).
+mkdir "$tree_root/$TABLE_MARKER" 2>/dev/null ||
+    [ -d "$tree_root/$TABLE_MARKER" ] ||
+    die "cannot create the table's presence marker at $tree_root/$TABLE_MARKER"
+
 note "installed the classifier tree at $tree_root"
-note "  $DAEMON_LEAF/  the daemon itself, entered at startup or placed with --pid"
-note "  $BOXES_DIR/   one leaf per session box, created before its spawn and removed once reaped"
+note "  $DAEMON_LEAF/            the daemon itself, entered at startup or placed with --pid"
+note "  $BOXES_DIR/$DENY_DIR/    the boxes that admit no destination, resolved through the answerer"
+note "  $BOXES_DIR/$ALLOW_DIR/   every other box"
 note "delegated to $owner_uid:$owner_gid per the v2 contract: each directory plus its cgroup.procs, cgroup.threads and cgroup.subtree_control"
+note "loaded the classifier table inet $TABLE_NAME: $deny_path is refused everything but the answerer at $answerer_address:$answerer_port, and the refusal is active, never a silent drop"
+if [ -n "$cohort_address" ]; then
+    note "the boxes cohort leaves as $cohort_address; everything else in the slice as $node_plane_address"
+else
+    note "no addresses given: the cohort keeps the host's own source identity until a re-run passes --cohort-address and --node-plane-address"
+fi
+note "wrote the table's presence marker at $tree_root/$TABLE_MARKER: minimald records a per-box verdict only while it is there"
 note "the cgroup2 mount above the slice stays root-owned"
 note "place the running daemon next: sudo $0 --pid <pid of minimald> (or start it from a Delegate=yes unit)"
 note "once minimald is in the slice, each box it launches runs in a leaf of its own; its launch log names the leaf each box entered"
