@@ -39,6 +39,7 @@
 //! local task that is woken by inbound frames, by the outbound pump, and by a
 //! periodic `poll_delay`.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::io;
@@ -69,6 +70,39 @@ const CONNECT_REQUEST: &[u8] = b"POST /connect HTTP/1.0\r\nHost: localhost\r\n\r
 /// Maximum interval between stack polls even when no traffic arrives, so smoltcp
 /// TCP timers still advance.
 const POLL_DELAY: Duration = Duration::from_millis(100);
+
+/// Minimum interval between the debug lines the peer logs for one kind of
+/// answer (a reset, a port-unreachable), so a box hammering the proxy address
+/// cannot fill the log. The answers the interval holds back are counted and
+/// named by the next line that does fire.
+const ANSWER_LOG_INTERVAL_MS: i64 = 1_000;
+
+/// The rate limit on one kind of answer's debug line, stepped by the poll's
+/// own clock (the peer has no wall clock to read and needs none): one line per
+/// [`ANSWER_LOG_INTERVAL_MS`], the rest counted into the next line that fires.
+#[derive(Debug, Default)]
+struct AnswerLog {
+    last: Cell<Option<i64>>,
+    suppressed: Cell<u32>,
+}
+
+impl AnswerLog {
+    /// Whether an answer at `now` may log, and how many were held back since
+    /// the last line that fired.
+    fn gate(&self, now: i64) -> Option<u32> {
+        if self
+            .last
+            .get()
+            .is_none_or(|last| now >= last + ANSWER_LOG_INTERVAL_MS)
+        {
+            self.last.set(Some(now));
+            Some(self.suppressed.replace(0))
+        } else {
+            self.suppressed.set(self.suppressed.get().saturating_add(1));
+            None
+        }
+    }
+}
 
 /// A channel-backed smoltcp [`Device`] over the switch's Ethernet lane.
 ///
@@ -217,6 +251,12 @@ pub struct BepHost {
     sockets: SocketSet<'static>,
     ip: Ipv4Address,
     mac: EthernetAddress,
+    /// The rate limits on the two kinds of answer the peer logs: a reset for
+    /// a TCP segment no socket holds, an ICMP port-unreachable for a UDP
+    /// datagram. The frames themselves are never rate-limited — every one is
+    /// answered — only the debug line saying so is.
+    reset_log: AnswerLog,
+    unreachable_log: AnswerLog,
 }
 
 impl fmt::Debug for BepHost {
@@ -256,6 +296,8 @@ impl BepHost {
             sockets: SocketSet::new(vec![]),
             ip,
             mac,
+            reset_log: AnswerLog::default(),
+            unreachable_log: AnswerLog::default(),
         }
     }
 
@@ -276,12 +318,12 @@ impl BepHost {
     /// one call is one full turn of the stack.
     pub fn poll(&mut self, now: Instant) {
         while let Ok(frame) = self.device.rx.try_recv() {
-            self.handle_frame(&frame);
+            self.handle_frame(&frame, now);
         }
         self.iface.poll(now, &mut self.device, &mut self.sockets);
     }
 
-    fn handle_frame(&mut self, frame: &[u8]) {
+    fn handle_frame(&mut self, frame: &[u8], now: Instant) {
         let eth = match EthernetFrame::new_checked(frame) {
             Ok(eth) => eth,
             Err(_) => return,
@@ -310,8 +352,12 @@ impl BepHost {
                     }
                     let src_mac = eth.src_addr();
                     match repr.next_header {
-                        IpProtocol::Tcp => self.handle_tcp(src_mac, repr, ip.payload()),
-                        IpProtocol::Udp => self.handle_udp(src_mac, repr, ip.payload()),
+                        IpProtocol::Tcp => {
+                            self.handle_tcp(src_mac, repr, ip.payload(), now);
+                        }
+                        IpProtocol::Udp => {
+                            self.handle_udp(src_mac, repr, ip.payload(), now);
+                        }
                         _ => {}
                     }
                 }
@@ -350,7 +396,13 @@ impl BepHost {
         self.send_arp(reply, source_hardware_addr);
     }
 
-    fn handle_tcp(&self, src_mac: EthernetAddress, ip_repr: Ipv4Repr, tcp_payload: &[u8]) {
+    fn handle_tcp(
+        &self,
+        src_mac: EthernetAddress,
+        ip_repr: Ipv4Repr,
+        tcp_payload: &[u8],
+        now: Instant,
+    ) {
         let tcp = match TcpPacket::new_checked(tcp_payload) {
             Ok(tcp) => tcp,
             Err(_) => return,
@@ -396,14 +448,24 @@ impl BepHost {
                 );
             },
         );
-        tracing::debug!(
-            src = %Ipv4Addr::from(u32::from_be_bytes(ip_repr.src_addr.octets())),
-            dst_port = tcp.dst_port(),
-            "sent TCP reset for unlistened proxy port"
-        );
+        // Rate-limited: the reset itself is never held back, only this line is.
+        if let Some(suppressed) = self.reset_log.gate(now.total_millis()) {
+            tracing::debug!(
+                src = %Ipv4Addr::from(u32::from_be_bytes(ip_repr.src_addr.octets())),
+                dst_port = tcp.dst_port(),
+                suppressed,
+                "sent TCP reset for unlistened proxy port"
+            );
+        }
     }
 
-    fn handle_udp(&self, src_mac: EthernetAddress, ip_repr: Ipv4Repr, udp_payload: &[u8]) {
+    fn handle_udp(
+        &self,
+        src_mac: EthernetAddress,
+        ip_repr: Ipv4Repr,
+        udp_payload: &[u8],
+        now: Instant,
+    ) {
         let udp = match UdpPacket::new_checked(udp_payload) {
             Ok(udp) => udp,
             Err(_) => return,
@@ -462,12 +524,17 @@ impl BepHost {
                 icmp_buf[2..4].copy_from_slice(&checksum.to_be_bytes());
             },
         );
-        tracing::debug!(
-            src = %Ipv4Addr::from(u32::from_be_bytes(original_src.octets())),
-            src_port,
-            dst_port,
-            "sent ICMP port-unreachable for UDP to proxy address"
-        );
+        // Rate-limited: the port-unreachable itself is never held back, only
+        // this line is.
+        if let Some(suppressed) = self.unreachable_log.gate(now.total_millis()) {
+            tracing::debug!(
+                src = %Ipv4Addr::from(u32::from_be_bytes(original_src.octets())),
+                src_port,
+                dst_port,
+                suppressed,
+                "sent ICMP port-unreachable for UDP to proxy address"
+            );
+        }
     }
 
     fn send_arp(&self, repr: ArpRepr, dst_mac: EthernetAddress) {
@@ -1119,5 +1186,23 @@ mod tests {
             0,
             "the peer binds no socket; T69 is the only task that may"
         );
+    }
+
+    /// The answer the peer logs is rate-limited, so a box hammering the proxy
+    /// address cannot fill the log: the first line fires at once, a burst is
+    /// held back, and the next line that fires names how many were held.
+    #[test]
+    fn answer_log_rate_limits_a_burst() {
+        let log = AnswerLog::default();
+        assert_eq!(log.gate(0), Some(0), "the first answer logs at once");
+        for now in 1..1_000 {
+            assert_eq!(log.gate(now), None, "the burst is held back");
+        }
+        assert_eq!(
+            log.gate(1_000),
+            Some(999),
+            "the interval's end fires and names the answers it held back"
+        );
+        assert_eq!(log.gate(1_001), None, "a fresh burst is held back again");
     }
 }
