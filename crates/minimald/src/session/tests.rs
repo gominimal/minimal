@@ -2676,6 +2676,7 @@ fn own_ip_session_req(name: &str) -> minimald_rpc::CreateSessionRequest {
                     ..Default::default()
                 }),
             },
+            box_addresses: None,
             hooks_enabled: true,
             attrs: Default::default(),
         },
