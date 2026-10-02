@@ -4160,6 +4160,7 @@ name = "minvmd"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "camino",
  "clap",
  "clap_complete",
  "fd-lock",
