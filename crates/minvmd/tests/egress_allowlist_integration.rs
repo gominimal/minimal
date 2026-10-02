@@ -26,8 +26,14 @@
 //! - `MINVMD_KERNEL_PATH`, `MINVMD_ROOTFS_PATH`, `MINVMD_INITRAMFS` must point to
 //!   the kernel, generic rootfs, and minimald initramfs cpio.
 //! - `MINVMD_GVPROXY_BIN` must point to the host gvproxy switch: `just test-vm`
-//!   fetches it and exports this variable, and the test skips with a reason
-//!   when the variable is unset.
+//!   fetches it and exports this variable.
+//!
+//! A missing precondition is reported as a skip, one stderr line of the form
+//! `SKIPPED: hostname_allowlist_toolchain_completes: <reason>`, and the test
+//! returns; it never claims a pass without the switch. A lane that exports
+//! `MINVMD_VM_LANE` has declared itself a VM lane, and there the same missing
+//! precondition panics instead of skipping, so the lane cannot go green on an
+//! unexported switch binary.
 //!
 //! The test writes each tool's exit status and the boot-log admissions/drops
 //! that arrived during it, so a stalled fetch names the host that was not
@@ -41,6 +47,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serial_test::serial;
+use sessions::core::decision::ItemDecision;
+use sessions::core::hooks::{HookResult, PolicyHooks, Unapproved};
+use sessions::core::policy::{HooksPolicy, PatchesPolicy, VarsPolicy};
 use tempfile::TempDir;
 
 /// Hostnames the box declares in `egress.allow_dns_hosts` only (no subnets, no
@@ -85,6 +94,25 @@ const MINVMD_BOOT_LOG_ENV: &str = "MINVMD_BOOT_LOG";
 /// Host-side gvproxy path env.
 const MINVMD_GVPROXY_BIN_ENV: &str = "MINVMD_GVPROXY_BIN";
 
+/// Set by a lane that declares itself a VM lane: a missing precondition then
+/// fails the test instead of skipping it.
+const MINVMD_VM_LANE_ENV: &str = "MINVMD_VM_LANE";
+
+/// A precondition is missing. Under `MINVMD_VM_LANE` that is a failure: the
+/// lane declared itself a VM lane and `lane_fault` says what it did not
+/// provide. Otherwise print the skip line carrying `skip_reason` and return
+/// `false` so the test returns early.
+fn skip_or_fail_lane(skip_reason: &str, lane_fault: &str) -> bool {
+    if std::env::var_os(MINVMD_VM_LANE_ENV).is_some() {
+        panic!(
+            "hostname_allowlist_toolchain_completes: {MINVMD_VM_LANE_ENV} is set: the lane \
+             declared itself a VM lane and {lane_fault}"
+        );
+    }
+    eprintln!("SKIPPED: hostname_allowlist_toolchain_completes: {skip_reason}");
+    false
+}
+
 /// Guest log filter that promotes the DNS-gate admission lines to debug.
 const GUEST_LOG_FILTER: &str = "info,minimald::net::dns_gate=debug";
 
@@ -93,8 +121,10 @@ const GUEST_LOG_FILTER: &str = "info,minimald::net::dns_gate=debug";
 /// available, because an own-IP boot without it has no host-side switch.
 fn e2e_enabled() -> bool {
     if std::env::var("MINVMD_E2E").as_deref() != Ok("1") {
-        eprintln!("egress_allowlist_integration: MINVMD_E2E != 1, skipping");
-        return false;
+        return skip_or_fail_lane(
+            "MINVMD_E2E != 1; the VM harness is opt-in",
+            "did not opt into the VM harness (MINVMD_E2E != 1)",
+        );
     }
     for var in &[
         "MINVMD_KERNEL_PATH",
@@ -107,11 +137,10 @@ fn e2e_enabled() -> bool {
         );
     }
     if std::env::var_os(MINVMD_GVPROXY_BIN_ENV).is_none() {
-        eprintln!(
-            "egress_allowlist_integration: {MINVMD_GVPROXY_BIN_ENV} is not set, \
-             skipping own-IP test (gvproxy is opt-in in CI)"
+        return skip_or_fail_lane(
+            "MINVMD_GVPROXY_BIN is not set; the host switch is required (see #1809)",
+            "exported no switch binary (MINVMD_GVPROXY_BIN is not set)",
         );
-        return false;
     }
     true
 }
@@ -593,54 +622,83 @@ async fn upload_workspace_file(
     Ok(())
 }
 
-/// Client-side policy gate that approves everything the daemon routes back:
-/// the toolchain packages contribute env wiring the composer cannot decide on
-/// its own, and this harness has no user policy, so every item gets the
-/// `AllowOnce` a prompt would give it.
-struct ApproveAll;
+/// The one variable the toolchain packages route back for approval: the
+/// `node` package wires `NPM_CONFIG_CACHE` to a state-volume path through its
+/// `env_state_wiring` attr (gominimal/pkgs `packages/node/build.ncl`), and no
+/// other package in the set or its transitive closure declares any.
+const EXPECTED_PENDING_VAR: &str = "NPM_CONFIG_CACHE";
 
-impl sessions::core::hooks::PolicyHooks for ApproveAll {
+/// Client-side policy gate for the pending items the daemon routes back. It
+/// approves exactly [`EXPECTED_PENDING_VAR`] and fails the test on anything
+/// else, naming the item, so a package that starts contributing another var,
+/// a patch, or a hook surfaces here instead of being waved through.
+struct ApproveExpectedVar;
+
+impl PolicyHooks for ApproveExpectedVar {
     fn on_var_unapproved(
         &self,
-        _policy: sessions::core::policy::VarsPolicy,
-        items: &[sessions::core::hooks::Unapproved<'_, str>],
-    ) -> sessions::core::hooks::HookResult<sessions::core::policy::VarsPolicy> {
-        sessions::core::hooks::HookResult::decided(vec![
-            sessions::core::decision::ItemDecision::AllowOnce;
-            items.len()
-        ])
+        _policy: VarsPolicy,
+        items: &[Unapproved<'_, str>],
+    ) -> HookResult<VarsPolicy> {
+        let decisions = items
+            .iter()
+            .map(|item| {
+                assert_eq!(
+                    item.item(),
+                    EXPECTED_PENDING_VAR,
+                    "unexpected pending var `{}` from {}",
+                    item.item(),
+                    item.source()
+                );
+                ItemDecision::AllowOnce
+            })
+            .collect();
+        HookResult::decided(decisions)
     }
 
     fn on_patch_unapproved(
         &self,
-        _policy: sessions::core::policy::PatchesPolicy,
-        items: &[sessions::core::hooks::Unapproved<'_, camino::Utf8Path>],
-    ) -> sessions::core::hooks::HookResult<sessions::core::policy::PatchesPolicy> {
-        sessions::core::hooks::HookResult::decided(vec![
-            sessions::core::decision::ItemDecision::AllowOnce;
-            items.len()
-        ])
+        _policy: PatchesPolicy,
+        items: &[Unapproved<'_, camino::Utf8Path>],
+    ) -> HookResult<PatchesPolicy> {
+        refuse_unexpected("patch", items)
     }
 
     fn on_hook_unapproved(
         &self,
-        _policy: sessions::core::policy::HooksPolicy,
-        items: &[sessions::core::hooks::Unapproved<'_, camino::Utf8Path>],
-    ) -> sessions::core::hooks::HookResult<sessions::core::policy::HooksPolicy> {
-        sessions::core::hooks::HookResult::decided(vec![
-            sessions::core::decision::ItemDecision::AllowOnce;
-            items.len()
-        ])
+        _policy: HooksPolicy,
+        items: &[Unapproved<'_, camino::Utf8Path>],
+    ) -> HookResult<HooksPolicy> {
+        refuse_unexpected("hook", items)
     }
 }
 
+/// Fail the test naming every item in a domain the harness expects to stay
+/// empty. The gate only calls a hook with a non-empty batch, so this never
+/// returns in practice.
+fn refuse_unexpected<T, P>(domain: &str, items: &[Unapproved<'_, T>]) -> HookResult<P>
+where
+    T: ?Sized + std::fmt::Display,
+{
+    let named: Vec<String> = items
+        .iter()
+        .map(|item| format!("`{}` from {}", item.item(), item.source()))
+        .collect();
+    assert!(
+        named.is_empty(),
+        "unexpected pending {domain}(s): {}",
+        named.join(", ")
+    );
+    HookResult::decided(Vec::new())
+}
+
 /// Phase 3 of the compose flow (see `crates/sessions/docs/COMPOSITION.md`):
-/// gate the daemon's pending items with [`ApproveAll`] and ship the verdict
+/// gate the daemon's pending items with [`ApproveExpectedVar`] and ship the verdict
 /// with `SubmitVerdict`. Package patches whose source does not exist on this
 /// host come back `Ignored`; an `Approved` patch would need the
 /// `WorkspacePatchesTarZst` upload the CLI performs, which this harness does
 /// not, so it is reported rather than left to fail at `FinalizeSession`.
-async fn submit_approve_all_verdict(
+async fn submit_gated_verdict(
     handle: &mut russh::client::Handle<ClientHandler>,
     response: sessions::wire::request::ContributionResponse,
 ) -> Result<(), String> {
@@ -659,7 +717,7 @@ async fn submit_approve_all_verdict(
         response,
         &[],
         sessions::core::policy::UserPolicy::empty(),
-        &ApproveAll,
+        &ApproveExpectedVar,
         sessions::core::compose::ComposeOptions::default(),
         &|name| std::env::var(name),
     )
@@ -754,7 +812,7 @@ async fn configure_and_finalize(
         match resp.ok() {
             Some(ConfigureLoadoutResponse::Materialized) => {}
             Some(ConfigureLoadoutResponse::Pending { response }) => {
-                submit_approve_all_verdict(handle, response).await?;
+                submit_gated_verdict(handle, response).await?;
             }
             None => return Err("ConfigureLoadout returned an error".into()),
         }
