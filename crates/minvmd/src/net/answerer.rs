@@ -414,8 +414,9 @@ impl HostAnswerer {
 
     /// The zone view this answerer answers from: this daemon's own
     /// host-authored table (NET-138) — filed first, so a name both tables
-    /// hold is answered by this host's own row — and the rows other VM
-    /// host daemons registered over the channel folded in on top, the
+    /// hold is answered by this host's own row — the host's own name beside
+    /// it ([`HOST_NAME`], held by the answerer itself), and the rows other
+    /// VM host daemons registered over the channel folded in on top, the
     /// registered address re-gated so no registration can put an address
     /// in the zone the host may not be told (NET-127).
     ///
@@ -439,6 +440,22 @@ impl HostAnswerer {
             .rows()
             .map(|(name, _)| (name.to_string(), OWN_TABLE.to_string()))
             .collect();
+        // The host's own name (NET-003's host half): `host.min.internal` at
+        // the host loopback, held by the answerer itself, because it is the
+        // host's name, not a namespace any table publishes, and the shared
+        // decision holds no special case for it. Held after the own table,
+        // so a box named `host` cannot take the host's name — the row the
+        // answerer answers is the host's — and before the fold, so a
+        // registration for it from any node is refused like every name the
+        // answerer holds first.
+        held.insert(HOST_NAME.to_string(), HOST_ROW.to_string());
+        view.hold(
+            HOST_NAME,
+            ZoneRow {
+                address: Some(Ipv4Addr::LOCALHOST),
+                live: true,
+            },
+        );
         let mut refused: BTreeSet<String> = BTreeSet::new();
         for (connection, row) in self.registered.rows() {
             let name = canonical(&row.name);
@@ -526,6 +543,20 @@ impl HostAnswerer {
 /// The source a name this host's own table holds is named by in the clash
 /// warn — this host-authored table, the fold's first writer.
 const OWN_TABLE: &str = "this host's own table";
+
+/// The host's own name under the zone, as the answerer holds it (NET-003's
+/// host half): the name a lookup of the host itself gets, at the host
+/// loopback. Not a namespace any table publishes, and the shared decision
+/// holds no special case for it, so the row is the answerer's to hold — and
+/// the one the host-side facts read: the CLI's liveness query (the A query
+/// for this name at the reported port that proves the answerer serves) and
+/// the session e2e's dig both read it. A registration for it from any node
+/// is refused, like every name the answerer holds first.
+const HOST_NAME: &str = "host.min.internal";
+
+/// The source the answerer's own [`HOST_NAME`] row keeps its name under in
+/// the fold: the keeper a refused registration's warn names.
+const HOST_ROW: &str = "the host's own row";
 
 /// The source a name the registration `connection` filed is named by in
 /// the clash warn: which co-resident daemon's connection it rode, the only
@@ -861,11 +892,19 @@ fn register_rows(sock: &Path, rows: Vec<RegisteredRow>) -> io::Result<Registrati
 /// The zone rows of `registry`'s table, as the registration wire carries
 /// them: the same view the holder's own answers come from, encoded — one
 /// row per published namespace, its name under the zone, its
-/// host-answerable address, and its liveness.
+/// host-answerable address, and its liveness — minus the node namespace's
+/// row, which never travels the channel: every VM host daemon's table holds
+/// the same name (`minimald.min.internal`), so the holder answers its own
+/// node row and a second VM's registration of it would only be refused as a
+/// clash — the by-construction clash-warn this exclusion takes out. The
+/// host's own name is in no table's view (the answerer holds it itself), so
+/// nothing else needs excluding here.
 fn zone_rows(registry: &BoxRegistry) -> Vec<RegisteredRow> {
+    let node = crate::box_registry::node_zone_name();
     registry
         .zone_view()
         .rows()
+        .filter(|(name, _)| **name != node)
         .map(|(name, row)| RegisteredRow {
             name: name.to_string(),
             address: row.address,
@@ -1208,11 +1247,12 @@ mod tests {
     }
 
     /// The holder answers the zone from the host-authored table (NET-138):
-    /// a published box's name answers its published loopback address, and
-    /// the node's own namespace — a row like any other — answers the shared
-    /// loopback address. The same answer the native daemon's answerer gives
-    /// over the same shared decision, from a table this daemon authored on
-    /// the host.
+    /// a published box's name answers its published loopback address, the
+    /// node's own namespace — a row like any other — answers the shared
+    /// loopback address, and the host's own name answers the host loopback
+    /// (NET-003's host half), the row the answerer itself holds. The same
+    /// decision the native daemon's answerer answers over, from a table
+    /// this daemon authored on the host.
     #[test]
     fn host_answerer_answers_zone_from_table() {
         let (registry, web) = web_registry();
@@ -1245,6 +1285,27 @@ mod tests {
             a_answer(&reply),
             Ipv4Addr::LOCALHOST,
             "the node row answers the shared loopback address"
+        );
+
+        // NET-003's host half, held by the answerer itself: the host's own
+        // name answers the host loopback, the row the CLI's liveness query
+        // reads at the reported port and the session e2e digs — the proof
+        // the answerer serves, not a row any table published.
+        let reply = exchange(
+            &answerer,
+            on_host(),
+            &encode_query("host.min.internal.", RecordType::A),
+        )
+        .expect("the host's own name is a held row");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert!(
+            reply.metadata.authoritative,
+            "the host's own name is the zone's to answer"
+        );
+        assert_eq!(
+            a_answer(&reply),
+            Ipv4Addr::LOCALHOST,
+            "the host's own name answers the host loopback"
         );
     }
 
@@ -1455,7 +1516,9 @@ mod tests {
     /// A name two sources both hold is the first writer's: this host's own
     /// table is filed first, so a registered row for a name it already holds
     /// is refused and never overwrites it — the answer stays the host's own
-    /// row, and the registrant's rows beside the refused one still answer.
+    /// row — and the host's own name is refused from any node the same way,
+    /// because the answerer holds it before the fold. The registrant's rows
+    /// beside the refused ones still answer.
     #[test]
     fn registered_row_does_not_take_a_held_name() {
         let (registry, web) = web_registry();
@@ -1466,6 +1529,11 @@ mod tests {
                     RegisteredRow {
                         name: "web.min.internal".to_string(),
                         address: Some(Ipv4Addr::new(127, 0, 64, 99)),
+                        live: true,
+                    },
+                    RegisteredRow {
+                        name: "host.min.internal".to_string(),
+                        address: Some(Ipv4Addr::new(127, 0, 64, 98)),
                         live: true,
                     },
                     RegisteredRow {
@@ -1489,6 +1557,21 @@ mod tests {
             "the first writer keeps the name; a registrant does not overwrite it"
         );
 
+        // The host's own name is refused from any node through the channel:
+        // the answerer holds it itself (NET-003's host half), and no
+        // registration — whatever address it carried — moves it.
+        let reply = exchange(
+            &answerer,
+            on_host(),
+            &encode_query("host.min.internal.", RecordType::A),
+        )
+        .expect("the host's own name is answered");
+        assert_eq!(
+            a_answer(&reply),
+            Ipv4Addr::LOCALHOST,
+            "a registration for the host's own name is refused; the host row keeps it"
+        );
+
         let reply = exchange(
             &answerer,
             on_host(),
@@ -1504,12 +1587,14 @@ mod tests {
 
     /// Two VM host daemons on one machine: the one that holds the answerer
     /// port answers for both, because the other registers its table's zone
-    /// rows with it over the channel — and the registration's lifetime is
-    /// its connection, so a daemon that exits never leaves names answering
-    /// behind it. Driven through a real UDP socket and a real channel
-    /// socket, the way the two daemons run: the holder through its own
-    /// acquisition loop, the registrant through the registration that loop
-    /// performs.
+    /// rows with it over the channel — its box names with no row refused,
+    /// its node row never sent (every VM's node row is the same name, so
+    /// the channel would refuse it by construction) — and the
+    /// registration's lifetime is its connection, so a daemon that exits
+    /// never leaves names answering behind it. Driven through a real UDP
+    /// socket and a real channel socket, the way the two daemons run: the
+    /// holder through its own acquisition loop, the registrant through the
+    /// registration that loop performs.
     #[test]
     fn second_vm_host_daemon_registers_names_with_holder() {
         let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
@@ -1544,16 +1629,50 @@ mod tests {
         // The second daemon's table, registered the way its own acquisition
         // loop would: one connection, one registration line, one ack — and
         // the rows are held before the ack is written, so they answer by the
-        // time this returns.
+        // time this returns. Its table holds the node row every VM host
+        // daemon's does (`minimald.min.internal`), the very row the channel
+        // must not carry: one name for every VM means the second VM's
+        // registration of it would be refused as a clash by construction —
+        // the holder answers its own, and a second VM's box names register
+        // with no refusal at all.
         let second = BoxRegistry::new(SUBNET);
+        second.register_node_namespace(7654);
         let second_web = Ipv4Addr::new(127, 0, 64, 11);
         second.register(BoxRegistration::new(
             "peer",
             Ipv4Addr::new(100, 64, 0, 11),
             second_web,
         ));
+        let rows = zone_rows(&second);
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            ["peer.min.internal"],
+            "the registration carries the second VM's box names and never the \
+             node row: every VM's node row is the same name, so the channel \
+             would only refuse it"
+        );
         let registration =
-            register_rows(&channel, zone_rows(&second)).expect("the holder accepts the table");
+            register_rows(&channel, rows.clone()).expect("the holder accepts the table");
+
+        // Both VMs' box names are registered and no row is refused: every
+        // row the second daemon sent answers through the holder at the
+        // address it sent — a refused row would answer with its keeper's
+        // address or nothing, and the sent set is the whole second table.
+        for row in &rows {
+            let reply = query(port, &format!("{}.", row.name), RecordType::A)
+                .unwrap_or_else(|| panic!("the holder answers {}", row.name));
+            assert_eq!(
+                reply.metadata.response_code,
+                ResponseCode::NoError,
+                "{} registered with the holder", row.name
+            );
+            assert_eq!(
+                a_answer(&reply),
+                row.address.expect("the sent rows hold addresses"),
+                "{} answers at the address the second daemon's table holds for it",
+                row.name
+            );
+        }
 
         let reply = query(port, "peer.min.internal.", RecordType::A).expect("the holder answers");
         assert_eq!(
@@ -1565,6 +1684,17 @@ mod tests {
             a_answer(&reply),
             second_web,
             "the second daemon's name answers at its own address, through the first's socket"
+        );
+
+        // The node's name the channel did not carry still answers — the
+        // holder's own node row, the one the zone answers host-side; inside
+        // the guest the second VM's own DNS layer answers its own.
+        let reply = query(port, "minimald.min.internal.", RecordType::A)
+            .expect("the node's name is answered by the holder's own row");
+        assert_eq!(
+            a_answer(&reply),
+            Ipv4Addr::LOCALHOST,
+            "the node's name answers the holder's own row host-side"
         );
 
         // The connection is the registration's lifetime: dropped, the

@@ -47,6 +47,20 @@ type WithdrawalReport = Vec<[u8; 4]>;
 /// root-netns tap [`BoxRegistry::register_node_namespace`] publishes.
 const NODE_NAMESPACE: &str = "minimald";
 
+/// The node namespace's row's name under the zone, as
+/// [`BoxRegistry::zone_view`] holds it: `minimald.min.internal`, the same
+/// name every VM host daemon's table holds its own node's row under. The
+/// row never travels the answerer channel (`net::answerer::zone_rows`
+/// excludes it): one name for every VM means a second VM's registration of
+/// it is refused by the holder's first-writer rule by construction — a
+/// standing clash-warn for the normal multi-VM case — so the holder's own
+/// node row is the one the zone answers host-side, and inside the guest
+/// the node's DNS layer keeps answering the name for its own VM.
+#[must_use]
+pub fn node_zone_name() -> String {
+    zone_name(NODE_NAMESPACE)
+}
+
 /// The published rows, keyed by switch address in wire octets — the key the
 /// gate's per-frame lookup uses, straight off the frame summary. A `BTreeMap`
 /// because the row set's order escapes to diagnostics and to
