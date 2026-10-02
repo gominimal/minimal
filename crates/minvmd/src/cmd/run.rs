@@ -507,7 +507,13 @@ fn run_foreground() -> Result<()> {
                 &boxes,
             ) {
                 Ok(gvproxy) => {
-                    tracing::info!(pid = gvproxy.pid(), "host gvproxy switch up");
+                    let subnet = boxes.subnet();
+                    tracing::info!(
+                        pid = gvproxy.pid(),
+                        proxy_ip = %subnet.box_egress_proxy_address(),
+                        proxy_mac = %subnet.bep_mac(),
+                        "host gvproxy switch up; box egress proxy peer started",
+                    );
                     Some(gvproxy)
                 }
                 // An own-IP VM cannot work without the switch: fail loudly. A
