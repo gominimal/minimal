@@ -4805,11 +4805,23 @@ proof_switch_steers_proxy_mac_frames_to_the_host_stack() {
     BEP_SEED_DIR=""
     fail
   }
+  # The reset alone does not prove the steer: a reset from the gateway's own
+  # stack would read the same. The ARP entry the SYN left behind names the MAC
+  # the frame went to, so the proof reads it from the same box after the probe
+  # and requires the peer's MAC, not the gateway's.
   mnl session exec "$bep_sid" \
-    "/usr/bin/socat /dev/null TCP:$proxy_ip:443,connect-timeout=5" \
-    >/dev/null 2>"$WORK/bep-mac-probe.err" || true
-  if grep -q "Connection refused" "$WORK/bep-mac-probe.err"; then
-    echo "BEP MAC test OK: TCP SYN from $bep_ip to $proxy_ip reached the host stack peer and returned RST"
+    "/usr/bin/socat /dev/null TCP:$proxy_ip:443,connect-timeout=5 2>/tmp/bep-mac-probe.err; cat /tmp/bep-mac-probe.err >&2; cat /proc/net/arp" \
+    >"$WORK/bep-mac-arp.out" 2>"$WORK/bep-mac-probe.err" || true
+  local bep_mac_seen
+  bep_mac_seen="$(awk -v ip="$proxy_ip" '$1 == ip { print $4; exit }' "$WORK/bep-mac-arp.out")"
+  if grep -q "Connection refused" "$WORK/bep-mac-probe.err" && [ "$bep_mac_seen" = "$proxy_mac" ]; then
+    echo "BEP MAC test OK: TCP SYN from $bep_ip to $proxy_ip went to $proxy_mac, reached the host stack peer and returned RST"
+  elif [ -n "$bep_mac_seen" ] && [ "$bep_mac_seen" != "$proxy_mac" ]; then
+    echo "::error::TCP SYN from $bep_ip to $proxy_ip went to $bep_mac_seen, not the peer's $proxy_mac; the switch did not steer the proxy-MAC frame"
+    cat "$WORK/bep-mac-probe.err" 2>/dev/null || true
+    rm -rf "$BEP_SEED_DIR"
+    BEP_SEED_DIR=""
+    fail
   else
     echo "::error::TCP SYN from $bep_ip to $proxy_ip did not produce a RST; proxy-MAC frame may not have reached the peer"
     cat "$WORK/bep-mac-probe.err" 2>/dev/null || true
