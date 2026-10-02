@@ -410,8 +410,8 @@ mod tests {
         SwitchRow::of(NODE_ADDR, vec![7654, 7656], Vec::new())
     }
 
-    /// A box's row at [`ROW_LEASE`]: one declared mapping's both ends
-    /// (`8080`–`8080`), one declared name.
+    /// A box's row at [`ROW_LEASE`]: one declared listener (`8080`), one
+    /// declared name.
     fn box_row() -> SwitchRow {
         SwitchRow::of(ROW_LEASE, vec![8080], vec![0])
     }

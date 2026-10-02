@@ -71,6 +71,7 @@ pub struct BoxRecord {
     admitted_ports: Vec<u16>,
     declared_names: Vec<String>,
     egress: EgressRules,
+    resolves_names: bool,
 }
 
 impl BoxRecord {
@@ -104,9 +105,12 @@ impl BoxRecord {
     ///   client-driven one, the same path that fills this table). The frame
     ///   verdict reads [`Self::egress`] alone and never this.
     /// * The **publish** dimension — the ports a switch publish at this
-    ///   namespace's address may name, both ends of each: the host-side
-    ///   listener a forwarder binds and the port inside it dials. The gate's
-    ///   publish decision (NET-081's control verbs) reads this and
+    ///   namespace's address may name: the host-side listener a forwarder
+    ///   binds, the end the registration wire carries. A mapping's inside
+    ///   end is not a record of the publish — it is the port the forwarder
+    ///   dials on the target, governed by the target's own ingress
+    ///   declaration inside the VM, which no row here is compiled from. The
+    ///   gate's publish decision (NET-081's control verbs) reads this and
     ///   [`Self::declared_names`] as the records it admits a publish by;
     ///   nothing outside the declaration is publishable, so a row that names
     ///   no ports publishes none.
@@ -133,6 +137,22 @@ impl BoxRecord {
     #[must_use]
     pub fn egress(&self) -> &EgressRules {
         &self.egress
+    }
+
+    /// Whether the namespace's own relay can lift an undeclared-destination
+    /// drop by itself: `true` when its declaration named DNS hosts, because
+    /// the name-based admission (`allow_dns_hosts`, NET-066) lives in the
+    /// in-guest gate — resolution-time pins, held for their admission window
+    /// — and compiles to nothing in the frame rules. A row that named hosts
+    /// drops a frame outside its allowed subnets *in the guest* unless its
+    /// box's gate holds a pin for the destination, so the host-side verdict
+    /// for such a row defers exactly that one drop class to the guest's,
+    /// keeping the two decisions consistent for the frames a resolved name
+    /// admits. `false` — no names declared — means the guest lifts nothing
+    /// either, and the host-side drop is the whole story.
+    #[must_use]
+    pub fn resolves_names(&self) -> bool {
+        self.resolves_names
     }
 }
 
@@ -420,6 +440,16 @@ impl BoxRegistry {
                 self.subnet.dns_server().octets(),
                 registration.switch_addr.octets(),
             ),
+            // The name-based admission lives in the guest's gate, not in the
+            // frame rules: whether this row's host-side verdict may defer the
+            // undeclared-destination drop to the in-guest one is the
+            // declaration's own fact, read off the policy here and carried
+            // beside the rules for the verdict to consult.
+            resolves_names: registration
+                .egress
+                .as_ref()
+                .and_then(|policy| policy.allow_dns_hosts.as_ref())
+                .is_some_and(|hosts| !hosts.is_empty()),
             switch_addr: registration.switch_addr,
             loopback_addr: registration.loopback_addr,
             admitted_ports: registration.admitted_ports,

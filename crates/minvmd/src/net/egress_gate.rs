@@ -1492,9 +1492,10 @@ impl PublishedForwards {
 /// summarize is not a request the gate can decide.
 ///
 /// The name records are indices into the dictionary this decision builds:
-/// the rows' declared names interned first, in switch-address order, then
-/// the request's own — a name no row declares gets a fresh index no row
-/// holds, so the decision refuses it without a second code path. The
+/// the rows' own names — the session name each row was registered under —
+/// and declared names interned first, in switch-address order, then the
+/// request's own — a name no row holds gets a fresh index no row holds, so
+/// the decision refuses it without a second code path. The
 /// dictionary is per decision, bounded by [`MAX_REQUEST_NAME_INDEX`]: a
 /// decision with more distinct names in play than an index can name is
 /// refused rather than wrapped, because an index that wraps is a different
@@ -1569,21 +1570,25 @@ fn decide_control_request(
 /// The published rows, as the pure decision's table: one [`SwitchRow`] per
 /// published namespace, carrying the ports and names the publish decision
 /// admits records by. The name indices come out of `dictionary`, which this
-/// seeds with the rows' declared names in switch-address order; `None` when
+/// seeds with the rows' own names — the session name the row was registered
+/// under, lowercased as the daemon's client spells its zone records, the one
+/// name the daemon publishes for its box without any declaration carrying it
+/// — and then the rows' declared names, in switch-address order; `None` when
 /// the rows carry more distinct names than a `u8` index can name — a shape
 /// the honest registry cannot reach, refused closed.
 fn switch_rows_of(rows: &[Arc<BoxRecord>], dictionary: &mut Vec<String>) -> Option<Vec<SwitchRow>> {
-    let mut seen: HashMap<&str, u8> = HashMap::new();
+    let mut seen: HashMap<String, u8> = HashMap::new();
     let mut switch_rows = Vec::with_capacity(rows.len());
     for record in rows {
-        let mut names = Vec::with_capacity(record.declared_names().len());
-        for name in record.declared_names() {
-            let index = match seen.get(name.as_str()) {
+        let own = record.name().to_ascii_lowercase();
+        let mut names = Vec::with_capacity(record.declared_names().len() + 1);
+        for name in std::iter::once(own.as_str()).chain(record.declared_names().iter().map(String::as_str)) {
+            let index = match seen.get(name) {
                 Some(&index) => index,
                 None => {
                     let index = u8::try_from(dictionary.len()).ok()?;
-                    seen.insert(name.as_str(), index);
-                    dictionary.push(name.clone());
+                    seen.insert(name.to_string(), index);
+                    dictionary.push(name.to_string());
                     index
                 }
             };
@@ -1746,12 +1751,19 @@ const MAX_ZONE_RECORDS: usize = MAX_REQUEST_RECORDS;
 
 /// Summarizes an expose request into a [`SwitchRequest`]: the remote is the
 /// switch address the forwarder dials and the address the publish is at; the
-/// records are its two ends, the host-side listener first — a publish is
-/// admitted only when the namespace's declaration names **both**, so
-/// half of a mapping cannot be attached to a namespace the other half does
-/// not belong to. The local must be the loopback the daemon's client binds
-/// on and the protocol one the client spells; anything else is a body the
-/// gate does not summarize.
+/// record is the host-side listener's port — the end the registration wire
+/// carries (`RegisterBoxRequest::ingress_ports` names each declared
+/// mapping's external port) and so the one the row's publish dimension
+/// admits by. The mapping's inside end is not a record of the publish: it is
+/// the port the forwarder dials on the target namespace, governed by that
+/// namespace's own ingress declaration inside the VM — the in-guest relay
+/// admits exactly the internal ports its box declared, and drops the rest —
+/// and no row here can admit or refuse it, because the declaration the row
+/// is compiled from never carried it. Demanding the inside end of the row
+/// would refuse every mapping whose two ends differ, which is most of them.
+/// The local must be the loopback the daemon's client binds on and the
+/// protocol one the client spells; anything else is a body the gate does not
+/// summarize.
 fn summarize_expose(body: &[u8]) -> Result<SwitchRequest, RefusedRequest> {
     let malformed = |what: Option<String>| RefusedRequest {
         rule: MALFORMED_PUBLISH_RULE,
@@ -1767,18 +1779,14 @@ fn summarize_expose(body: &[u8]) -> Result<SwitchRequest, RefusedRequest> {
     let Ok(local_port) = loopback_port(&parsed.local) else {
         return Err(malformed(Some(parsed.local)));
     };
-    let Some((remote_addr, remote_port)) = host_port(&parsed.remote) else {
+    let Some((remote_addr, _)) = host_port(&parsed.remote) else {
         return Err(malformed(Some(parsed.remote)));
     };
     if !is_client_protocol(&parsed.protocol) {
         return Err(malformed(Some(parsed.protocol)));
     }
-    SwitchRequest::of(
-        SwitchVerb::Publish,
-        remote_addr,
-        &[Record::Port(local_port), Record::Port(remote_port)],
-    )
-    .ok_or_else(|| malformed(None))
+    SwitchRequest::of(SwitchVerb::Publish, remote_addr, &[Record::Port(local_port)])
+        .ok_or_else(|| malformed(None))
 }
 
 /// Summarizes a retraction: the listener it names, keyed at the address the
@@ -1856,9 +1864,29 @@ fn summarize_dns_add(
         if dictionary.len() >= MAX_REQUEST_NAME_INDEX {
             return Err(malformed(Some(record.name.clone())));
         }
+        // A record a row already holds a name for is that row's own: the
+        // bare form exact-matches, and the host-qualified form the daemon
+        // publishes beside it (`<name>.<host-id>`, NET-002) dot-extends it —
+        // the host ids a shared switch answers for are every co-resident
+        // daemon's, unbounded, so no declaration can carry the qualified form
+        // and the publish maps it onto the held name's index instead. The
+        // dot anchors the match at the name's boundary, so `web` does not
+        // swallow `webmail`; and the decision's address keying keeps the
+        // mapping the owner's — the row that decides the publish is the row
+        // at the records' common address, and only that row's held index
+        // applies it. A name neither held nor extending one is fresh, a
+        // fresh index no row holds, and the decision refuses it.
         let index = dictionary
             .iter()
             .position(|held| held == &record.name)
+            .or_else(|| {
+                dictionary.iter().position(|held| {
+                    record
+                        .name
+                        .strip_prefix(held.as_str())
+                        .is_some_and(|rest| rest.starts_with('.'))
+                })
+            })
             .unwrap_or_else(|| {
                 dictionary.push(record.name.clone());
                 dictionary.len() - 1
@@ -2163,7 +2191,10 @@ enum GateAdmit {
     /// one a deny-all box's row must not override.
     Baseline,
     /// A published namespace's row admitted the frame under its own rules —
-    /// the same decision the in-guest relay makes, now made outside.
+    /// the same decision the in-guest relay makes, now made outside; the one
+    /// drop class the row defers to the guest's decision is the
+    /// undeclared-destination one for a row that declared DNS hosts, whose
+    /// name-based admission the host's rules cannot carry.
     Row,
     /// The announced interim admitted the frame: its source is an address the
     /// plan could hand to a box but no published namespace holds, so no rules
@@ -2215,10 +2246,28 @@ fn gate_verdict(
     }
     // The namespace that holds the source decides its frames by its own
     // compiled rules — the shared verdict, unchanged, now made outside where
-    // nothing inside can change it.
+    // nothing inside can change it. One drop class defers to the in-guest
+    // decision instead of being made here: a row that declared DNS hosts has
+    // a name-based admission its frame rules cannot carry (NET-066 lives in
+    // the guest's gate, resolution-time pins the host never sees), so the
+    // guest lifts an undeclared-destination drop when its box's gate holds a
+    // pin for the destination — the same frame, decided by the same
+    // declaration, where the pins actually are. Deferring it here is the only
+    // way the two halves agree; making it here would drop every pinned frame
+    // the guest admitted, a host-side veto over an admission the box's own
+    // declaration granted. Everything else stays host-made: a denied
+    // destination, an undeclared protocol, a foreign source, a family the
+    // verdict reads no source from — a pin governs none of those, and the
+    // guest lifts none of them either, so the host refusing them is parity,
+    // not pre-emption.
     if let Some(record) = table.by_source(src) {
         return match egress::verdict(summary, record.egress()) {
             FrameVerdict::Admit => Ok(GateAdmit::Row),
+            FrameVerdict::Drop(reason)
+                if matches!(reason, DropReason::UndeclaredSubnet { .. }) && record.resolves_names() =>
+            {
+                Ok(GateAdmit::Row)
+            }
             FrameVerdict::Drop(reason) => Err(GateDrop::Verdict(reason)),
         };
     }
@@ -3145,6 +3194,91 @@ mod tests {
         );
     }
 
+    /// The one drop class a row defers to the guest's decision: a namespace
+    /// that declared DNS hosts carries a name-based admission its frame rules
+    /// cannot (NET-066's admission lives in the in-guest gate, resolution-time
+    /// pins the host never sees), so the host-side verdict passes the
+    /// undeclared-destination frame on for the guest's gate to admit or drop
+    /// by the pin its box holds. The classes no pin governs are still
+    /// decided here: a denied destination, whose answers the guest's own gate
+    /// refuses (NET-067), is refused by the host's own rules. A namespace
+    /// that declared an *empty* name list lifts nothing in the guest either,
+    /// so its undeclared frames are refused here, like a no-names row's.
+    #[tokio::test]
+    async fn a_row_that_resolves_names_defers_the_undeclared_destination_drop() {
+        let registry = BoxRegistry::new(SUBNET);
+        // The declared box's own shape: a narrow allowed subnet, names
+        // beside it, and a denied range the same declaration subtracts.
+        registry.register(
+            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    allow_subnets: Some(vec!["203.0.113.0/24".to_string()]),
+                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                    deny_subnets: Some(vec!["198.51.100.0/24".to_string()]),
+                }),
+        );
+        // The edge of the deferral's condition: names *declared empty* —
+        // `Some(vec![])` — is not a namespace whose guest lifts anything,
+        // because its gate allows no names to resolve, so no defer.
+        let empty = [100, 64, 0, 10];
+        registry.register(
+            BoxRegistration::new("closed-names", Ipv4Addr::from(empty), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    allow_subnets: Some(vec!["203.0.113.0/24".to_string()]),
+                    allow_dns_hosts: Some(Vec::new()),
+                    deny_subnets: None,
+                }),
+        );
+        let mut h = gate_over(registry).await;
+
+        // Undeclared destination of the name-declaring row — the shape a
+        // resolved name's address has: deferred, so it reaches the switch and
+        // the in-guest decision owns it.
+        let pinned = ipv4_frame(LEASE, 6, [93, 184, 216, 34], 443);
+        send_frame(&mut h.guest, &pinned).await;
+        let seen = expect_frame(&mut h.switch).await;
+        assert_eq!(
+            seen, pinned,
+            "the undeclared destination of a name-declaring row defers to the guest's gate"
+        );
+
+        // Denied destination of the same row: no pin governs a denied range
+        // and the guest refuses it too, so the host's own verdict stands.
+        let denied = ipv4_frame(LEASE, 6, [198, 51, 100, 9], 443);
+        let marker = ipv4_frame(LEASE, 6, [203, 0, 113, 7], 443);
+        send_frame(&mut h.guest, &denied).await;
+        send_frame(&mut h.guest, &marker).await;
+        let seen = expect_frame(&mut h.switch).await;
+        assert_eq!(
+            seen, marker,
+            "the denied range is still the host's own drop; the marker did"
+        );
+        expect_silence(&mut h.switch).await;
+        wait_for_log(&h.log, "egress-denied-subnet").await;
+        let logged = h.log.contents();
+        assert!(
+            !logged.contains("egress-undeclared-subnet"),
+            "a deferred drop is not a host-side drop: no undeclared line, got: {logged}"
+        );
+
+        // The empty-names row's undeclared frame: refused here, as its guest
+        // would refuse it too.
+        let undeclared = ipv4_frame(empty, 6, [93, 184, 216, 34], 443);
+        let marker = ipv4_frame(empty, 6, [203, 0, 113, 7], 443);
+        send_frame(&mut h.guest, &undeclared).await;
+        send_frame(&mut h.guest, &marker).await;
+        let seen = expect_frame(&mut h.switch).await;
+        assert_eq!(
+            seen, marker,
+            "an empty name list is no defer: the undeclared frame is the host's drop"
+        );
+        expect_silence(&mut h.switch).await;
+    }
+
     /// NET-081's failure case, as the phase this build ships holds it: a frame
     /// whose source address the plan could never hand to a box never leaves
     /// the VM, and a frame whose source the plan *could* hand out but no
@@ -3492,6 +3626,100 @@ mod tests {
             !logged.contains("dropped"),
             "no frame was decided on this connection, got: {logged}"
         );
+    }
+
+    /// A published row publishes its **own** name — the session name it was
+    /// registered under — both forms the daemon's zone-add carries: the bare
+    /// two-label name (NET-001) and the deprecated host-qualified one beside
+    /// it (NET-002), whose host ids are every co-resident daemon's on the
+    /// shared switch, unbounded, so no declaration can carry the qualified
+    /// form and the decision maps it onto the held name's index instead. The
+    /// name a row does not hold — another session's, or a label that merely
+    /// extends the row's own past the dot boundary — is refused at the same
+    /// address: the publish's records are the owner's own, and nobody else's
+    /// row decides them.
+    #[tokio::test]
+    async fn a_row_publishes_its_own_name_bare_and_host_qualified() {
+        let registry = BoxRegistry::new(SUBNET);
+        // The row registered as `web` at its lease, no declared names: the
+        // registration wire carries none — the box's name is the row's own.
+        tcp_lan_box(&registry, LEASE);
+        // The daemon's own zone-add for this box: two records, both at the
+        // box's lease — the bare name, and the qualified form under a
+        // co-resident daemon's host id.
+        let body = br#"{"name":"min.internal.","records":[
+            {"name":"web","ip":"100.64.0.9"},{"name":"web.host-a1b2","ip":"100.64.0.9"}]}"#;
+        let mut request = b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\n\
+                           Content-Type: application/json\r\n"
+            .to_vec();
+        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        request.extend_from_slice(body);
+        let mut h = gate_connected(registry).await;
+        h.guest
+            .write_all(&request)
+            .await
+            .expect("writing the zone-add");
+        let mut spoken = vec![0u8; request.len()];
+        read_within(&mut h.switch, &mut spoken).await;
+        assert_eq!(
+            spoken, request,
+            "the row's own name, both forms, reached the switch whole"
+        );
+    }
+
+    /// The same publish's refusal: a zone-add whose record names another
+    /// session — or a label that merely extends the row's own past the dot
+    /// boundary, `webmail` beside `web` — is refused at the row's own
+    /// address, before a byte of it reaches the switch, and the refusal names
+    /// the record it was refused for.
+    #[tokio::test]
+    async fn a_zone_add_of_a_foreign_name_at_a_rows_address_is_refused() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let body = br#"{"name":"min.internal.","records":[
+            {"name":"webmail","ip":"100.64.0.9"},{"name":"other","ip":"100.64.0.9"}]}"#;
+        let mut request = b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\n\
+                           Content-Type: application/json\r\n"
+            .to_vec();
+        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        request.extend_from_slice(body);
+        let mut h = gate_connected(registry).await;
+        h.guest
+            .write_all(&request)
+            .await
+            .expect("writing the zone-add");
+
+        // Refused, and named: the rule is its own class, the address is the
+        // one the publish was at, and the record is the first one the row
+        // does not hold — the dot-boundary case, `webmail` beside `web`.
+        wait_for_log(&h.log, UNDECLARED_PUBLISH_RECORD_RULE).await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains("rule_matched=\"egress-undeclared-publish-record\""),
+            "the refusal names its own class, got: {logged}"
+        );
+        assert!(
+            logged.contains("source=100.64.0.9"),
+            "the refusal names the address it was at, got: {logged}"
+        );
+        assert!(
+            logged.contains("port_or_name="),
+            "the refusal names the record it was refused for, got: {logged}"
+        );
+        assert!(
+            logged.contains("does not admit"),
+            "the refusal names the reason, got: {logged}"
+        );
+
+        // Nothing of it reached the switch, and the guest's side comes down.
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, h.switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("{n} byte(s) of a refused zone-add reached the switch"),
+            Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+            Err(_) => panic!("the gate left the switch side hanging"),
+        }
+        expect_teardown(&mut h.guest).await;
     }
 
     /// A control body's bytes are never scanned for the connect path: the
@@ -5660,10 +5888,13 @@ mod tests {
         tcp_lan_box(&registry, LEASE);
         // An honest-shaped expose — the loopback listener the daemon's own
         // client binds on, the address and port spelling its client builds —
-        // asking for 8080→9999 at the row's own address: the 8080 end the
-        // row declares, the 9999 end it does not. The publish stops at what
-        // the host published.
-        let body = br#"{"local":"127.0.0.1:8080","remote":"100.64.0.9:9999","protocol":"tcp"}"#;
+        // publishing a 9999 listener at the row's own address: the publish's
+        // record is the listener it binds, and 9999 is a port the row does
+        // not declare. The mapping's inside end (8080) decides nothing here:
+        // the inside is the target's own, decided by its in-guest ingress
+        // rules, so a refusal turns on the listener alone. The publish stops
+        // at what the host published.
+        let body = br#"{"local":"127.0.0.1:9999","remote":"100.64.0.9:8080","protocol":"tcp"}"#;
         let mut request =
             b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
         request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
@@ -5715,6 +5946,39 @@ mod tests {
         expect_teardown(&mut h.guest).await;
     }
 
+    /// The publish decision's record is the host-side listener, so a mapping
+    /// whose two ends differ publishes when the row declares the listener —
+    /// the shape every own-address box's ingress mapping has (an external
+    /// port on the host, an internal one in the box), and the one the
+    /// both-ends reading refused: the row carries what the registration wire
+    /// carried, the external ports, and the inside end is the target's own,
+    /// decided by its in-guest ingress rules and never by a row here. The
+    /// exposed mapping reaching the switch whole is the proof the publish was
+    /// applied, not merely answered.
+    #[tokio::test]
+    async fn a_mapping_whose_ends_differ_publishes_when_the_listener_is_declared() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        // 8080 on the host, dialing 18080 inside the box: the listener end is
+        // the row's, the inside one no row carries.
+        let body = br#"{"local":"127.0.0.1:8080","remote":"100.64.0.9:18080","protocol":"tcp"}"#;
+        let mut request =
+            b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        request.extend_from_slice(body);
+        let mut h = gate_connected(registry).await;
+        h.guest
+            .write_all(&request)
+            .await
+            .expect("writing the expose");
+        let mut spoken = vec![0u8; request.len()];
+        read_within(&mut h.switch, &mut spoken).await;
+        assert_eq!(
+            spoken, request,
+            "the declared listener's publish reached the switch whole"
+        );
+    }
+
     /// A retraction is decided by the row at the address the gate attributes
     /// it to: the ledger keeps every applied publish's listener → address
     /// pair, so the daemon's teardown — whose body names only the listener,
@@ -5736,8 +6000,10 @@ mod tests {
             let mut h = gate_connected_with_phase(registry, phase).await;
 
             // An honest expose at the row's own address — the shape the
-            // daemon's client sends, the listener and the remote both ports
-            // the row declares — admitted by the row under either phase.
+            // daemon's client sends, its listener a port the row declares —
+            // admitted by the row under either phase. The inside end here
+            // happens to be the listener's port too, but it decides nothing:
+            // the record is the listener alone.
             let body = br#"{"local":"127.0.0.1:8080","remote":"100.64.0.9:8080","protocol":"tcp"}"#;
             let mut expose =
                 b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
