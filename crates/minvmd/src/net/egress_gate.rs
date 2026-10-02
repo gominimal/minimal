@@ -380,9 +380,11 @@ const UNDECLARED_PUBLISH_RECORD_RULE: &str = "egress-undeclared-publish-record";
 
 /// The rule name for a retraction the decision is applied by nothing at: a
 /// listener no applied publish names — keyed at the unspecified address the
-/// ledger's absence keys it at, and no row holds that — or a listener whose
-/// attributed address's row does not hold the record it names. In both there
-/// is no publication left to retract at the address the retraction is
+/// ledger's absence keys it at, and no row holds that — or a listener the
+/// row at its attributed address never published at runtime: a declared
+/// port's forward among them, which the host holds for the session's
+/// lifetime and no guest request withdraws (design §7.1, NET-121). In both
+/// there is nothing the guest's to retract at the address the retraction is
 /// decided by. Under the interim a retraction keyed at an in-plan address no
 /// row holds is still applied — the teardowns of publications whose rows are
 /// still to come are the ones that must work — and refused here only after
@@ -1434,13 +1436,13 @@ struct ControlDecision {
 /// switch address it was applied at: the ledger a retraction is attributed
 /// by. The unexpose body names only the loopback listener it retracts — the
 /// wire carries no switch address — but the decision is keyed per address
-/// (`switch_request::applied` applies a retract by the row at the request's
-/// own address), so the gate supplies the address from the one place it is
-/// a host-side fact: the publish the listener's forward came from. A
-/// retraction for a listener no applied publish names is keyed at the
-/// unspecified address, which no row holds, and refused — a guest cannot
-/// retract a publication the gate never admitted by naming a port some row
-/// happens to declare.
+/// (`switch_request::applied` decides a retract by the row at the request's
+/// own address, against the ports that row's runtime published), so the
+/// gate supplies the address from the one place it is a host-side fact: the
+/// publish the listener's forward came from. A retraction for a listener no
+/// applied publish names is keyed at the unspecified address, which no row
+/// holds, and refused — a guest cannot retract a publication the gate never
+/// admitted by naming a port some row happens to declare.
 ///
 /// The ledger is shared by the gate's connections: the publish and its
 /// teardown arrive on different ones — the daemon's client speaks one
@@ -1623,6 +1625,11 @@ fn switch_rows_of(rows: &[Arc<BoxRecord>], dictionary: &mut Vec<String>) -> Opti
             };
             names.push(index);
         }
+        // The row's runtime-published set — the ports the box's own listens
+        // published, the only ones a retraction at its address is applied
+        // for — is empty until listen-publishing (NET-016, NET-017) lands:
+        // today no guest retraction at a held address is applied, and a
+        // declared port's forward never is.
         switch_rows.push(SwitchRow::of(
             record.switch_addr().octets(),
             record.admitted_ports().to_vec(),
@@ -6320,12 +6327,16 @@ mod tests {
     /// it to: the ledger keeps every applied publish's listener → address
     /// pair, so the daemon's teardown — whose body names only the listener,
     /// the wire carrying no switch address — is keyed at the publication's
-    /// own address and applied by the row that holds it, and a retraction
+    /// own address and decided by the row that holds it, and a retraction
     /// for a listener no applied publish names is keyed at the unspecified
-    /// address no row holds and refused. The refused one is the change: the
-    /// same request was applied table-wide before — any row holding the
-    /// port applied it — so a fabricated retraction of a port some row
-    /// declared travelled to the switch.
+    /// address no row holds. Both are refused today — the row's runtime
+    /// has published nothing a guest may withdraw, and the unspecified
+    /// address is nobody's — and the attribution is what tells them apart:
+    /// each refusal line names the source the retraction was keyed at, the
+    /// row's own address for the one and `0.0.0.0` for the other. Before
+    /// the keying the same stray request was applied table-wide — any row
+    /// holding the port applied it — so a fabricated retraction of a port
+    /// some row declared travelled to the switch.
     #[tokio::test]
     async fn a_retraction_is_keyed_at_the_address_its_publication_was_applied_at() {
         for phase in [
@@ -6373,7 +6384,8 @@ mod tests {
             // The teardown, on its own connection as the daemon's client
             // speaks it — one request per connection, the body naming only
             // the listener. The gate keys it at the address the publish was
-            // applied at, the row's own, whose row holds the port: applied.
+            // applied at, the row's own: the refusal names that source, not
+            // the unspecified one, which is the attribution made visible.
             let body = br#"{"local":"127.0.0.1:8080","protocol":"tcp"}"#;
             let mut unexpose =
                 b"POST /services/forwarder/unexpose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
@@ -6385,12 +6397,23 @@ mod tests {
                 .write_all(&unexpose)
                 .await
                 .expect("writing the retraction");
-            let mut spoken = vec![0u8; unexpose.len()];
-            read_within(&mut switch, &mut spoken).await;
-            assert_eq!(
-                spoken, unexpose,
-                "a retraction keyed at its publication's address reaches the switch"
+            wait_for_log(&h.log, UNDECLARED_RETRACT_RULE).await;
+            let logged = h.log.contents();
+            assert!(
+                logged.contains("rule_matched=\"egress-undeclared-retract\"")
+                    && logged.contains("source=100.64.0.9")
+                    && logged.contains("port_or_name=port 8080"),
+                "a retraction is keyed at the address its publication was applied at, got: \
+                 {logged}"
             );
+            let mut probe = [0u8; 1];
+            match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+                Ok(Ok(0)) => {}
+                Ok(Ok(n)) => panic!("{n} byte(s) of a refused retraction reached the switch"),
+                Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+                Err(_) => panic!("the gate left the switch side hanging"),
+            }
+            expect_teardown(&mut guest).await;
 
             // A retraction for a listener no applied publish names: keyed at
             // the unspecified address, refused before a byte of it is written
@@ -6407,7 +6430,7 @@ mod tests {
                 .write_all(&stray)
                 .await
                 .expect("writing the stray retraction");
-            wait_for_log(&h.log, UNDECLARED_RETRACT_RULE).await;
+            wait_for_log(&h.log, "source=0.0.0.0").await;
             let logged = h.log.contents();
             assert!(
                 logged.contains("rule_matched=\"egress-undeclared-retract\""),
@@ -6434,6 +6457,125 @@ mod tests {
                 Err(_) => panic!("the gate left the switch side hanging"),
             }
             expect_teardown(&mut guest).await;
+        }
+    }
+
+    /// A declared port's forward is the host's for the session's lifetime:
+    /// bound at publish, unbound only by host-side ingress revocation
+    /// (design §7.1, NET-121), never by a guest request. A box whose row
+    /// admits `8080` publishes its forward and then asks, on the shuttle,
+    /// to unexpose it — the one shape under which the gate attributes the
+    /// retraction to the row's own address — and the gate refuses it before
+    /// a byte reaches the switch, says so on the retraction's own rule
+    /// naming the box's address and the port, and the row still admits
+    /// `8080`: the table is untouched, and the same forward publishes again.
+    /// The row's runtime-published set — what a retraction at its address is
+    /// applied for — is empty until listen-publishing lands, and a declared
+    /// port is never in it. Both phases refuse: the row holds the address,
+    /// so no interim is consulted.
+    #[tokio::test]
+    async fn retract_of_declared_port_refused() {
+        for phase in [
+            UnregisteredSourcePhase::Announced,
+            UnregisteredSourcePhase::InForce,
+        ] {
+            let registry = BoxRegistry::new(SUBNET);
+            tcp_lan_box(&registry, LEASE);
+            let mut h = gate_connected_with_phase(registry, phase).await;
+
+            // The declared forward's publish, applied by the row, and its
+            // answer read back so the ledger's attribution is in place.
+            let body = br#"{"local":"127.0.0.1:8080","remote":"100.64.0.9:8080","protocol":"tcp"}"#;
+            let mut expose =
+                b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+            expose.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+            expose.extend_from_slice(body);
+            h.guest
+                .write_all(&expose)
+                .await
+                .expect("writing the expose");
+            let mut spoken = vec![0u8; expose.len()];
+            read_within(&mut h.switch, &mut spoken).await;
+            assert_eq!(
+                spoken, expose,
+                "the declared forward's publish reached the switch"
+            );
+            let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            h.switch
+                .write_all(answer)
+                .await
+                .expect("writing gvproxy's answer");
+            let mut seen = vec![0u8; answer.len()];
+            read_within(&mut h.guest, &mut seen).await;
+            assert_eq!(seen, answer, "the publish's answer reaches the guest");
+
+            // The guest's withdrawal of the declared forward: keyed at the
+            // row's own address, where the row declares the port and its
+            // runtime published nothing — refused, and never written on.
+            let body = br#"{"local":"127.0.0.1:8080","protocol":"tcp"}"#;
+            let mut unexpose =
+                b"POST /services/forwarder/unexpose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+            unexpose
+                .extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+            unexpose.extend_from_slice(body);
+            let (mut guest, mut switch) = connect_control(&h).await;
+            guest
+                .write_all(&unexpose)
+                .await
+                .expect("writing the retraction");
+            wait_for_log(&h.log, UNDECLARED_RETRACT_RULE).await;
+            let logged = h.log.contents();
+            assert!(
+                logged.contains("rule_matched=\"egress-undeclared-retract\""),
+                "the refusal is the retraction's own rule, got: {logged}"
+            );
+            assert!(
+                logged.contains("source=100.64.0.9"),
+                "the refusal names the box whose declared forward was asked for, got: {logged}"
+            );
+            assert!(
+                logged.contains("port_or_name=port 8080"),
+                "the refusal names the declared port, got: {logged}"
+            );
+            assert!(
+                logged.contains("nothing published at its address admits what it retracts"),
+                "the refusal says the row's runtime published nothing to withdraw, got: \
+                 {logged}"
+            );
+            let mut probe = [0u8; 1];
+            match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+                Ok(Ok(0)) => {}
+                Ok(Ok(n)) => {
+                    panic!("{n} byte(s) of a declared port's retraction reached the switch")
+                }
+                Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+                Err(_) => panic!("the gate left the switch side hanging"),
+            }
+            expect_teardown(&mut guest).await;
+
+            // The row keeps the port: the table still admits 8080 at the
+            // box's address, and the same declared forward publishes again,
+            // applied by the row exactly as before.
+            let row = h
+                .table
+                .by_source(LEASE)
+                .expect("the box's row is still published");
+            assert_eq!(
+                row.admitted_ports(),
+                [8080],
+                "a refused retraction leaves the row's declared port in place"
+            );
+            let (mut guest, mut switch) = connect_control(&h).await;
+            guest
+                .write_all(&expose)
+                .await
+                .expect("writing the second expose");
+            let mut spoken = vec![0u8; expose.len()];
+            read_within(&mut switch, &mut spoken).await;
+            assert_eq!(
+                spoken, expose,
+                "the declared forward still publishes after its refused withdrawal"
+            );
         }
     }
 
