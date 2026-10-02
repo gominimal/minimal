@@ -1562,7 +1562,12 @@ async fn drive_proxy_until_serving(
 ///
 /// The daemon log names the listener's address and port at start (the bind's
 /// `reachable` event, the serving event here) and each failure warns once
-/// with its reason, remedy and next retry. Unlike a routing proxy, the
+/// with its reason, remedy and next retry. The serving moment is also when
+/// the daemon logs its half of NET-018's one observability line
+/// ([`crate::rpc::log_live_name_surface`]): the answerer's bind is the
+/// daemon's half of the native condition, so the bind's success is the
+/// earliest moment that fact is true — and it is the daemon's moment,
+/// logged whether or not any client ever asks. Unlike a routing proxy, the
 /// answerer records no `min ls` note: a box's routing does not depend on it
 /// (the proxies carry that), and its failures are the host's resolver config
 /// to read in the log.
@@ -1747,6 +1752,12 @@ async fn drive_answerer_until_serving<T: crate::net::answerer::Zone>(
         source.as_str()
     );
     state.set_zone_answerer_port(bound_port).await;
+    // NET-018's observability line, at the moment its fact can first be
+    // true: the answerer's bind is the daemon's half of the native
+    // surface, so this — the bind's success — is when a diagnostics
+    // bundle's daemon-log tail can first read that half. The proxy half of
+    // the line is read behind a settle window; see the function.
+    crate::rpc::log_live_name_surface(&state, bound_port).await;
 }
 
 /// Upper bound on one host-loopback publish attempt in
