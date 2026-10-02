@@ -1261,6 +1261,77 @@ mod tests {
         );
     }
 
+    /// The restart case the platform default is kept for: the previous run's
+    /// accepted connections leave their sockets in `TIME_WAIT` on the
+    /// documented port, and the fresh daemon must rebind the same port —
+    /// `SO_REUSEADDR`'s one effect on Linux — instead of failing the bind with
+    /// `EADDRINUSE` and moving off it, the failure that broke the native
+    /// daemon e2e's restart (`native-daemon-e2e`, run 37035644090: the proxy
+    /// stayed unbound on `127.0.0.1:7654` and the NET-001 curl exited 7).
+    /// The control bind carries `SO_REUSEADDR` off — the hand-built socket the
+    /// removed `bind_without_reuse` used to make, which std's and tokio's
+    /// `TcpListener::bind` are not: both set the option on Unix — and is
+    /// refused the port, which is what proves the `TIME_WAIT` tuple is really
+    /// held and the rebind below is not just racing past it.
+    #[tokio::test]
+    async fn proxy_bind_rebinds_over_the_time_wait_a_restart_leaves() {
+        // Build the leftover a restart meets: one accepted connection,
+        // closed first by the listener's side, so its local tuple — the
+        // listener's own address, the port the documented default binds — is
+        // what lands in TIME_WAIT.
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        drop(accepted);
+        drop(client);
+        drop(listener);
+
+        // A bind with `SO_REUSEADDR` off is refused the port — the
+        // `EADDRINUSE` the no-reuse bind turned the daemon's own restart
+        // into. The kernel moves the closed socket into TIME_WAIT
+        // asynchronously, so poll for the refusal rather than assuming it is
+        // there yet.
+        let mut refused = false;
+        for _ in 0..100 {
+            let socket = TcpSocket::new_v4().unwrap();
+            socket.set_reuseaddr(false).unwrap();
+            match socket.bind(addr) {
+                Ok(()) => drop(socket),
+                Err(error) => {
+                    assert_eq!(
+                        error.kind(),
+                        io::ErrorKind::AddrInUse,
+                        "the TIME_WAIT port must refuse a no-reuse bind with EADDRINUSE, \
+                         got: {error}"
+                    );
+                    refused = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            refused,
+            "a bind with SO_REUSEADDR off was never refused, so the TIME_WAIT \
+             tuple never formed and the rebind below proves nothing"
+        );
+
+        // The daemon's bind is the platform default and rebinds the port: the
+        // restart keeps the documented port its recipes point at, and the
+        // socket carries the `SO_REUSEADDR` that made that possible.
+        use std::os::fd::AsRawFd as _;
+        let rebound = bind_listener(addr)
+            .await
+            .expect("a restart must rebind over the TIME_WAIT sockets its previous run left");
+        let value = socket_option(rebound.as_raw_fd(), libc::SO_REUSEADDR);
+        assert_eq!(
+            value, 1,
+            "the proxy's listener must bind with the platform-default SO_REUSEADDR on, \
+             got {value}"
+        );
+    }
+
     /// Reads one `SOL_SOCKET` socket option off `fd`, as the kernel holds it.
     /// Returns `-1` when the read itself fails, so the assertion that follows
     /// names the unreadable option rather than panicking here.
