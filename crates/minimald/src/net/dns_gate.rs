@@ -1227,6 +1227,18 @@ pub(crate) mod tests {
                 Ipv4Addr::new(18, 238, 238, 89),
             ),
         ];
+        // The names here pair each host with a representative address, so
+        // they cannot be read off the shared constant; they are held to it
+        // instead, so a host added there fails here until it is exercised.
+        let exercised: Vec<&str> = toolchain
+            .iter()
+            .map(|(name, _)| name.trim_end_matches('.'))
+            .collect();
+        assert_eq!(
+            exercised,
+            sessions::NET068_TOOLCHAIN_EGRESS_HOSTS,
+            "every NET-068 toolchain host is exercised, in the constant's order"
+        );
         for (index, (name, address)) in toolchain.iter().enumerate() {
             // A unique source port per name so the DNS conntrack windows do not collide.
             let src_port = 40000 + u16::try_from(index).unwrap();
