@@ -38,8 +38,8 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
+use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -210,7 +210,11 @@ fn daemon_uid() -> u32 {
 /// peer writes can influence what this reads.
 #[cfg(target_os = "linux")]
 fn peer_credentials(stream: &UnixStream) -> std::io::Result<(u32, Option<u32>)> {
-    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: getsockopt writes at most `size_of::<ucred>()` bytes into
     // `cred`, whose length is passed alongside it; the fd is the stream's
@@ -293,7 +297,10 @@ fn serve_connection(mut stream: UnixStream, shared: &Shared) {
     }
     let header = DeliveryHeader::parse(&head)
         .expect("the header slice is exactly DELIVERY_HEADER_LEN bytes long");
-    let line = format!("source={} destination={}\n", header.source, header.destination);
+    let line = format!(
+        "source={} destination={}\n",
+        header.source, header.destination
+    );
     if stream.write_all(line.as_bytes()).is_err() {
         return;
     }
@@ -330,9 +337,9 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::path::Path;
 
+    use switch::SwitchSubnet;
     use switch::bep_host::test_util::{FIRST_CLIENT_PORT, TestLane};
     use switch::bep_host::{BepWire, DEFAULT_PER_SOURCE_CAP, PROXY_PORT};
-    use switch::SwitchSubnet;
 
     /// The source address a hand-made presentation claims: a box's address
     /// on the plan's lease run, the kind of address a host process would
@@ -381,7 +388,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        panic!("no connection was refused for {reason}: {:?}", stub.refusals());
+        panic!(
+            "no connection was refused for {reason}: {:?}",
+            stub.refusals()
+        );
     }
 
     /// NET-132/T69: a same-uid host process without this boot's token — or
@@ -416,7 +426,10 @@ mod tests {
         // The right token with the wrong header version: refused for the
         // version, never answered.
         let answer = present(&sock, &token, 0);
-        assert!(answer.is_empty(), "a wrong version is answered with nothing");
+        assert!(
+            answer.is_empty(),
+            "a wrong version is answered with nothing"
+        );
         await_refusal(&stub, "version");
 
         // Nothing so far was presented as a box.
@@ -431,7 +444,8 @@ mod tests {
         // so this test process is the foreign one.
         let foreign_sock = dir.path().join("bep-stub-foreign.sock");
         let (foreign_tx, foreign_rx) = std::sync::mpsc::channel();
-        let foreign = spawn(foreign_sock.clone(), foreign_rx).expect("the stand-in binds its socket");
+        let foreign =
+            spawn(foreign_sock.clone(), foreign_rx).expect("the stand-in binds its socket");
         foreign_tx
             .send(StubStart {
                 token,
@@ -439,7 +453,10 @@ mod tests {
             })
             .expect("the supervisor hands the start facts over the channel");
         let answer = present(&foreign_sock, &token, DELIVERY_HEADER_VERSION);
-        assert!(answer.is_empty(), "a foreign process is answered with nothing");
+        assert!(
+            answer.is_empty(),
+            "a foreign process is answered with nothing"
+        );
         await_refusal(&foreign, "pid");
         assert!(
             foreign.presented().is_empty(),

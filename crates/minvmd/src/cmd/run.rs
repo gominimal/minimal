@@ -814,7 +814,11 @@ impl RegisteredBoxes {
 
 impl switch::bep_host::BepBoxSource for RegisteredBoxes {
     fn box_switch_addresses(&self) -> Vec<std::net::Ipv4Addr> {
-        self.table.rows().iter().map(|row| row.switch_addr()).collect()
+        self.table
+            .rows()
+            .iter()
+            .map(|row| row.switch_addr())
+            .collect()
     }
 }
 
