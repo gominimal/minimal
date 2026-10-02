@@ -699,6 +699,15 @@ impl DnsPins {
     /// sets are the answers the box's own lookup received. A datagram
     /// addressed to an address no row holds pins nothing, and neither does
     /// one for a row that declared no names: there is no entry to fill.
+    ///
+    /// The pre-check is the port the reply was served from: ingress UDP is
+    /// mostly not DNS — the answers to a box's own datagrams arrive from
+    /// whatever port they were sent to — so a datagram from any port but
+    /// [`DNS_PORT`] is refused **here**, before the row is looked up and
+    /// before the table's lock is taken, and non-DNS ingress never pays
+    /// either. It is the same fact [`BoxPins::observe`] decides the reply's
+    /// source by, read once more where it is cheapest; the resolver's
+    /// address and every other check stay where they were.
     pub(crate) fn observe_reply(
         &self,
         table: &BoxTable,
@@ -707,6 +716,9 @@ impl DnsPins {
         limiter: &DropLimiter,
         now: Instant,
     ) {
+        if pkt.src.port() != DNS_PORT {
+            return;
+        }
         let Some(record) = table.by_source(pkt.dst.ip().octets()) else {
             return;
         };
