@@ -532,7 +532,7 @@ memory than the host has is refused end to end, with the numbers, before any lim
   tier:     T0
   verify:   cargo nextest run -p minimald local0_leaf_swap_max_zero_unless_host_swap_zram_or_encrypted_root_integration
 
-- **BRES-076** WHERE the host delegates a cgroup2 subtree with the memory controller enabled to the native `minimald` THE SYSTEM SHALL count `local0`'s reservations as deliverable only when the kernel's effective protection for the boxes subtree can reach `local0`'s allocatable: every ancestor above the delegated subtree, up to but not including the cgroup root, carries a `memory.min` of at least that allocatable (a `MemoryMin=` on the delegating unit and on each slice above it), at each of those levels the `memory.min` claimed by the chain's cgroup and its siblings together is at most their parent's, so no sibling dilutes the protection the kernel distributes, and every cgroup between the delegated subtree's root and the boxes subtree carries one too or cgroup2 is mounted with `memory_recursiveprot`, decided by the Box Host daemon from what it reads, on the host side of TB2.
+- **BRES-076** WHERE the host delegates a cgroup2 subtree with the memory controller enabled to the native `minimald` THE SYSTEM SHALL count `local0`'s reservations as deliverable only when the kernel's effective protection for the boxes subtree can reach `local0`'s allocatable: every ancestor above the delegated subtree, up to but not including the cgroup root, carries a `memory.min` of at least that allocatable (a `MemoryMin=` on the delegating unit and on each slice above it), at each of those levels below the root's own children the `memory.min` claimed by the chain's cgroup and its siblings together is at most their parent's, so no sibling dilutes the protection the kernel distributes (a child of the cgroup root keeps its own `memory.min` unscaled, so that level is not compared), and every cgroup between the delegated subtree's root and the boxes subtree carries one too or cgroup2 is mounted with `memory_recursiveprot`, decided by the Box Host daemon from what it reads, on the host side of TB2.
   tier:     T0
   verify:   cargo nextest run -p minimald local0_reservations_advisory_without_ancestor_protection_root_integration
 
@@ -545,6 +545,10 @@ memory than the host has is refused end to end, with the numbers, before any lim
   verify:   cargo nextest run -p minimald default_box_size_below_256mib_refused_exit_8
   property: For every allocatable, a box whose `ram` is omitted or `"auto"` is admitted only when one half of that allocatable, rounded down, is at least 256 MiB, so no box is admitted at a default size below 256 MiB.
   harness:  `crates/sessions/src/core/admission.rs` `kani_default_box_size_floor_refuses_below_256mib`, 8 boxes in all (7 counted plus the new one), symbolic `u64` byte sizes, `#[kani::unwind(9)]`
+
+- **BRES-079** WHERE the host delegates a cgroup2 subtree with the memory controller enabled to the native `minimald`, WHEN the set of swap devices enabled on the host changes (the kernel signals it through `poll` on `/proc/swaps`) THE SYSTEM SHALL decide BRES-075 again over the new set and set `memory.swap.max` to 0 on every box leaf on `local0` when any enabled device is neither zram nor a dm-crypt device keyed fresh at each boot, enforced by the native `minimald` and the kernel outside the box, on the host side of TB2 on the developer's machine (no TB3), against every process in the box including root inside it.
+  tier:     T0
+  verify:   cargo nextest run -p minimald local0_swapon_plaintext_zeroes_leaf_swap_max_root_integration
 
 ## Non-goals
 
@@ -777,8 +781,9 @@ The other invariants:
   Open question.
   enforced by: zram created by the Box Host daemon at guest boot; no swap on any volume that
   persists or is snapshotted; the daemon's own cgroup never swaps; on `local0`, a leaf
-  `memory.swap.max` of 0 over any other host swap
-  covered by: BRES-007, BRES-008, BRES-010, BRES-075
+  `memory.swap.max` of 0 over any other host swap, applied again whenever the host's swap set
+  changes
+  covered by: BRES-007, BRES-008, BRES-010, BRES-075, BRES-079
 - **Invariant:** THE SYSTEM SHALL never reveal another box's name or owner in a refusal, nor a
   killed process's command line in a log line or event.
   enforced by: the admission core takes other boxes' reservations as bare numbers, and an OOM
@@ -798,7 +803,9 @@ unchanged. Two follow from the hard constraint's scope: when overcommitted boxes
 allocatable, the kernel may kill in a box other than the one that grew, protected only by each
 box's `memory.min`; and on `local0` a machine-wide OOM caused by processes outside the boxes
 subtree is outside every claim here, since the reserve is a figure admission subtracts, not a
-limit on the rest of the desktop.
+limit on the rest of the desktop. On `local0`, pages a box swaps between the host enabling a
+plaintext swap device and `minimald` zeroing the leaves' swap allowance (BRES-079) can reach that
+device; this spec claims nothing for that window.
 
 ## Open questions
 
