@@ -1230,7 +1230,9 @@ pub(crate) mod tests {
         Record::from_rdata(
             Name::from_utf8(owner).expect("the record's owner parses"),
             60,
-            RData::CNAME(CNAME(Name::from_utf8(target).expect("the record's target parses"))),
+            RData::CNAME(CNAME(
+                Name::from_utf8(target).expect("the record's target parses"),
+            )),
         )
     }
 
@@ -1268,8 +1270,8 @@ pub(crate) mod tests {
             53,
             &dns_query(name),
         );
-        let (pkt, datagram) =
-            udp_datagram(&query).expect("the test's query frame parses as the egress leg parses it");
+        let (pkt, datagram) = udp_datagram(&query)
+            .expect("the test's query frame parses as the egress leg parses it");
         pins.observe_query(table, &pkt, datagram, now);
     }
 
@@ -1326,10 +1328,9 @@ pub(crate) mod tests {
         limiter: &DropLimiter,
         now: Instant,
     ) {
-        let frame =
-            udp_payload_frame(SUBNET.dns_server(), 53, Ipv4Addr::from(lease), 40000, reply);
-        let (pkt, datagram) =
-            udp_datagram(&frame).expect("the test's reply frame parses as the relay's ingress leg parses it");
+        let frame = udp_payload_frame(SUBNET.dns_server(), 53, Ipv4Addr::from(lease), 40000, reply);
+        let (pkt, datagram) = udp_datagram(&frame)
+            .expect("the test's reply frame parses as the relay's ingress leg parses it");
         pins.observe_reply(table, &pkt, datagram, limiter, now);
     }
 
@@ -1879,7 +1880,15 @@ pub(crate) mod tests {
         // The full exchange the row's own bytes would answer, on both legs:
         // the row never earns its entry — the reply leg's sight of it is the
         // refusal — so nothing is recorded for it and nothing pins.
-        resolve(&pins, &table, LEASE, "example.com", &[answer], &limiter, now);
+        resolve(
+            &pins,
+            &table,
+            LEASE,
+            "example.com",
+            &[answer],
+            &limiter,
+            now,
+        );
         assert!(
             !pins.admits_frame(&record, answer.octets(), None, now),
             "a row whose resolver is not the plan's own pins nothing"
@@ -1901,7 +1910,15 @@ pub(crate) mod tests {
         // per row, not once per reply — while a row the plan does own, in the
         // same table, still pins for its own answers: the guard refuses the
         // drift and nothing else.
-        resolve(&pins, &table, LEASE, "example.com", &[answer], &limiter, now);
+        resolve(
+            &pins,
+            &table,
+            LEASE,
+            "example.com",
+            &[answer],
+            &limiter,
+            now,
+        );
         let home = BoxRegistry::new(SUBNET);
         let other = [100, 64, 0, 10];
         dns_box(
@@ -1967,7 +1984,15 @@ pub(crate) mod tests {
         // query outstanding: the box never asked, so it pins nothing — the
         // reply still reaches the box, and it is the connection to the answer
         // that stays unadmitted.
-        observe(&pins, &table, LEASE, "example.com", &[answer], &limiter, now);
+        observe(
+            &pins,
+            &table,
+            LEASE,
+            "example.com",
+            &[answer],
+            &limiter,
+            now,
+        );
         assert!(
             !pins.admits_frame(&record, answer.octets(), None, now),
             "a reply the box never asked for pins nothing"
@@ -1992,7 +2017,15 @@ pub(crate) mod tests {
             !pins.admits_frame(&record, answer.octets(), None, now),
             "a reply with a mismatched transaction id pins nothing"
         );
-        observe(&pins, &table, LEASE, "example.com", &[answer], &limiter, now);
+        observe(
+            &pins,
+            &table,
+            LEASE,
+            "example.com",
+            &[answer],
+            &limiter,
+            now,
+        );
         assert!(
             pins.admits_frame(&record, answer.octets(), None, now),
             "the mismatched reply spent nothing: the reply that answers the \
@@ -2004,7 +2037,15 @@ pub(crate) mod tests {
         // the only one the address holds, and past its edge the pin is gone,
         // where a replay that pinned would have opened a fresh one.
         let past = now + DNS_ADMISSION_WINDOW + Duration::from_secs(1);
-        observe(&pins, &table, LEASE, "example.com", &[answer], &limiter, past);
+        observe(
+            &pins,
+            &table,
+            LEASE,
+            "example.com",
+            &[answer],
+            &limiter,
+            past,
+        );
         assert!(
             !pins.admits_frame(&record, answer.octets(), None, past),
             "a replay of the same reply pins nothing more: the window it \
@@ -2179,9 +2220,7 @@ pub(crate) mod tests {
         let v6_mapped = Record::from_rdata(
             typed.clone(),
             60,
-            RData::AAAA(AAAA(Ipv6Addr::new(
-                0, 0, 0, 0, 0, 0xffff, 0x0102, 0x0304,
-            ))),
+            RData::AAAA(AAAA(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0102, 0x0304))),
         );
         let typed_answer = Ipv4Addr::new(198, 51, 100, 67);
         resolve_reply(
@@ -2248,8 +2287,24 @@ pub(crate) mod tests {
 
         let this_host = Ipv4Addr::UNSPECIFIED;
         let multicast = Ipv4Addr::new(224, 0, 0, 1);
-        resolve(&pins, &table, LEASE, "example.com", &[this_host], &limiter, now);
-        resolve(&pins, &table, LEASE, "other.example", &[multicast], &limiter, now);
+        resolve(
+            &pins,
+            &table,
+            LEASE,
+            "example.com",
+            &[this_host],
+            &limiter,
+            now,
+        );
+        resolve(
+            &pins,
+            &table,
+            LEASE,
+            "other.example",
+            &[multicast],
+            &limiter,
+            now,
+        );
         for refused in [this_host, multicast] {
             assert!(
                 !pins.admits_frame(&record, refused.octets(), None, now),

@@ -1762,7 +1762,8 @@ pub(crate) mod tests {
             ("example.com.", Ipv4Addr::UNSPECIFIED),
             ("other.example.", Ipv4Addr::new(224, 0, 0, 1)),
         ] {
-            let query = udp_payload_frame(LEASE, 40000, RESOLVER, 53, &dns_query(name, RecordType::A));
+            let query =
+                udp_payload_frame(LEASE, 40000, RESOLVER, 53, &dns_query(name, RecordType::A));
             harness.box_end.write_all(&query).unwrap();
             let forwarded =
                 tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
@@ -1770,12 +1771,9 @@ pub(crate) mod tests {
                     .expect("the query is forwarded")
                     .expect("the switch side stays open");
             assert_eq!(forwarded, query);
-            let reply = udp_payload_frame(RESOLVER, 53, LEASE, 40000, &dns_response(name, &[refused]));
-            harness
-                .switch
-                .write_all(&wire_frame(&reply))
-                .await
-                .unwrap();
+            let reply =
+                udp_payload_frame(RESOLVER, 53, LEASE, 40000, &dns_response(name, &[refused]));
+            harness.switch.write_all(&wire_frame(&reply)).await.unwrap();
             let passed = read_box_frame(&harness)
                 .await
                 .expect("the reply itself passes through: resolution is honest");
