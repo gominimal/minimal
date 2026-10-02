@@ -1609,6 +1609,10 @@ STUB
     check 1 "$rc" "check exits 1 before the tree exists"
     want_ok "check names the tree it cannot find" grep -q "does not exist" "$OUT"
     want_ok "check advises the install, not a re-check" grep -q "install it: sudo" "$OUT"
+    want_ok "the pre-install hint names the cohort's identity flag" \
+        grep -q -- "--cohort-address <cohort address>" "$OUT"
+    want_ok "the pre-install hint names the node plane's identity flag too" \
+        grep -q -- "--node-plane-address <node-plane address>" "$OUT"
     want_err "check creates nothing" test -e "$tree"
 
     # --- Refusals: every one of them dies before a directory is made.

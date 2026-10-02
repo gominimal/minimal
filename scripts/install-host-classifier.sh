@@ -244,9 +244,18 @@ do_check() {
     resolve_owner
     # The fix for a missing tree is the install, not a re-check: hint the
     # caller's own invocation with --check dropped, keeping whatever --root
-    # and --user they asked about.
+    # and --user they asked about. The two source identities the install
+    # refuses to run without (see require_identities) are appended for
+    # whichever this check was not told — the hint must be the command an
+    # install would accept, so copy-pasting it lands on the refusal the
+    # install makes of a half-told classification, never a refusal of the
+    # hint's own shape.
     hint_args=()
     for a in "${original_args[@]}"; do [ "$a" = --check ] || hint_args+=("$a"); done
+    [ -n "$cohort_address" ] ||
+        hint_args+=(--cohort-address "<cohort address>")
+    [ -n "$node_plane_address" ] ||
+        hint_args+=(--node-plane-address "<node-plane address>")
     hint="sudo $0${hint_args[0]+ }${hint_args[*]-}"
     if covering="$(covering_mount "$tree_root")"; then
         read -r covering_point nsdel nsroot <<<"$covering"
@@ -432,8 +441,9 @@ RULES
 # wearing the other half's name, so an install refuses to render half of
 # it. They go together or the install does not run.
 require_identities() {
-    [ -n "$cohort_address" ] && [ -n "$node_plane_address" ] ||
+    if [ -z "$cohort_address" ] || [ -z "$node_plane_address" ]; then
         die "the install needs both source identities: pass --cohort-address ADDR (what the boxes cohort leaves as) and --node-plane-address ADDR (what the rest of the slice leaves as)"
+    fi
 }
 
 if [ "$mode" = check ]; then
