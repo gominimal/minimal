@@ -224,22 +224,21 @@ pub struct ResourcePool {
     pub memory_bytes: u64,
 }
 
-/// The name surface a daemon reports as live for `*.min.internal` (NET-018):
-/// native DNS once host-OS resolution and published addresses are both
-/// deployed on the host it serves, the hostname proxy until then — and the
-/// proxy keeps serving either way, so a client that captured its port keeps
-/// routing (NET-019).
+/// The name surface a daemon reports as live for `*.min.internal` (NET-018)
+/// — *what the daemon can know of it*: native DNS once this daemon's
+/// box-zone answerer is serving and its own bind probe finds the reserved
+/// local range present, the hostname proxy until then — and the proxy keeps
+/// serving either way, so a client that captured its port keeps routing
+/// (NET-019).
 ///
-/// The daemon fills this from the two halves of that condition it can see:
-/// its box-zone answerer serving — the listener the host's resolver is
-/// pointed at, whose port it reports only once the answerer is up — and its
-/// bind probe finding the reserved local range present, the addresses
-/// published boxes hold ([`ListSessionsResponse::zone_answerer_port`] and
-/// [`CreateSessionResponse::interim_loopback`] carry the same two facts
-/// separately). `Native` therefore names the surface this daemon answers the
-/// zone from; whether the *host's resolver* is pointed at the answerer is the
-/// client's half to detect, and the advisory it prints (NET-122) is what
-/// points it there.
+/// That is the daemon's half of design §7.1's supersession condition, not
+/// the whole of it. The daemon probes the loopback *it* sits on — the
+/// guest's on a VM-backed host, where it always reads present — so a
+/// `Native` here says this daemon answers the zone from its answerer, never
+/// that the *host's* resolver resolves the zone. Whether it does is the
+/// client's half to detect (NET-122's advisory names the command that
+/// configures it), and the client decides what it prints from both: native
+/// only when the two agree, the proxy otherwise.
 ///
 /// `Proxy` is the default, so a daemon that predates the field reports the
 /// surface that shipped first — the safe read, since no host may be told
@@ -260,12 +259,15 @@ pub enum NameSurface {
 }
 
 impl NameSurface {
-    /// The words the daemon's log line names the surface by.
+    /// The word this surface is named by wherever it is spelled as a string:
+    /// the daemon's log line and the wire this type serializes to (snake
+    /// case `proxy`/`native`) — one spelling, so a log's `name_surface`
+    /// field and the reply it came from cannot disagree.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Proxy => "hostname-proxy",
-            Self::Native => "native-dns",
+            Self::Proxy => "proxy",
+            Self::Native => "native",
         }
     }
 }
@@ -311,8 +313,10 @@ pub struct ListSessionsResponse {
     /// the field, or while the answerer has not come up yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone_answerer_port: Option<u16>,
-    /// Which of the two naming surfaces is live, from [`NameSurface`] — read
-    /// that for the condition. Present on every daemon that knows the field;
+    /// The daemon's verdict on which of the two naming surfaces is live, from
+    /// [`NameSurface`] — read that for what the verdict does and does not
+    /// know: the client combines it with the host's own resolver state to
+    /// decide what it prints. Present on every daemon that knows the field;
     /// a daemon that predates it decodes as the default, the proxy.
     #[serde(default)]
     pub name_surface: NameSurface,
@@ -674,8 +678,10 @@ pub struct CreateSessionResponse {
     /// `None` prints the notice exactly as this reply's older readers did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_all_opt_out: Option<bool>,
-    /// Which of the two naming surfaces is live, from [`NameSurface`] — read
-    /// that for the condition. Carried on the activation reply, beside the
+    /// The daemon's verdict on which of the two naming surfaces is live, from
+    /// [`NameSurface`] — read that for what the verdict does and does not
+    /// know: the client combines it with the host's own resolver state to
+    /// decide what it prints. Carried on the activation reply, beside the
     /// two ports and the interim flag it is derived from, because activation
     /// is where the user is about to rely on the names the surface answers;
     /// a daemon that predates the field decodes as the default, the proxy.
@@ -1688,7 +1694,7 @@ mod tests {
         let json = serde_json_lenient::to_string(&resp).expect("serializes");
         assert!(
             json.contains(r#""name_surface":"native""#),
-            "a native-dns daemon must say so on the wire, got: {json}",
+            "a native daemon must say so on the wire, got: {json}",
         );
         assert_eq!(round_trip(&resp), resp);
     }

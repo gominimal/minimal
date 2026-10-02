@@ -124,7 +124,7 @@ async fn serve_list_sessions(
                 .await
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
             // NET-018: the surface verdict this reply reports, and the line
-            // that names it. The probe is the published-addresss half of the
+            // that names it. The probe is the published-address half of the
             // condition; it only decides anything once the answerer — the
             // other half — is up, so a daemon whose answerer has not come up
             // pays nothing per list.
@@ -309,7 +309,7 @@ async fn serve_create_session(
                     // flag on the reply is what tells the client to surface
                     // the naming advisory again (NET-122).
                     let probe = session_start_loopback_probe(&id).await;
-                    // NET-018: the same probe is the published-addresss half
+                    // NET-018: the same probe is the published-address half
                     // of the name-surface verdict the reply carries, beside
                     // the answerer port — the other half — it already holds.
                     let hostname_proxy_port = s.hostname_proxy_port().await;
@@ -395,21 +395,23 @@ async fn session_start_loopback_probe(session_id: &SessionId) -> crate::net::loo
     probe
 }
 
-/// The live name surface for `*.min.internal` (NET-018): native DNS once the
-/// daemon's box-zone answerer is serving — the listener the host's resolver
-/// is pointed at, whose port the daemon reports only once it is up — and the
-/// reserved local range is present, so published boxes answer at their own
-/// addresses. Either half missing and the hostname proxy is the only thing
-/// that can answer a `*.min.internal` name, so that is the live surface; and
-/// either way the proxy keeps serving (NET-019), which is why this verdict
-/// never stops it.
+/// The live name surface this daemon reports for `*.min.internal` (NET-018)
+/// — what the daemon can know of design §7.1's supersession condition: its
+/// box-zone answerer serving (the listener the host's resolver is pointed
+/// at, whose port the daemon reports only once it is up) and its own bind
+/// probe finding the reserved local range present. Either half missing and
+/// the hostname proxy is the only thing this daemon can answer a
+/// `*.min.internal` name through, so that is the verdict; and either way the
+/// proxy keeps serving (NET-019), which is why this verdict never stops it.
 ///
-/// These are the two halves the daemon can see of design §7.1's supersession
-/// condition. Whether the host's resolver is *pointed* at the answerer is the
-/// client's half (NET-122): the advisory `min session activate` prints from
-/// its own host-resolver detection composes with this verdict — the surface
-/// says where names answer from, the advisory how to point the resolver
-/// there — rather than competing with it.
+/// The probe measures the loopback the daemon itself sits on — the guest's
+/// on a VM-backed host, where it always reads present — so `Native` here
+/// says this daemon answers the zone from its answerer, never that the
+/// host's own processes resolve it. Whether the host's resolver is *pointed*
+/// at the answerer is the client's half (NET-122): it detects that
+/// host-side, and it decides what it prints from both halves — native only
+/// when the two agree, the proxy otherwise — rather than taking this
+/// verdict as the condition itself.
 pub(crate) fn live_name_surface(
     answerer_port: Option<u16>,
     probe: &crate::net::loopback::RangeProbe,
@@ -3040,10 +3042,14 @@ mod tests {
     /// report native DNS as the live name surface, and the one log line
     /// names that surface and that the hostname proxy keeps serving beside
     /// it: the verdict switches what a client *reports*, never what the
-    /// proxy does (NET-019). The answerer is the half the daemon's start
-    /// path brings up on a detached driver; here it is driven to serving
-    /// the same way, the proxy beside it, so the first RPC that computes a
-    /// verdict is the moment the line names.
+    /// proxy does (NET-019). NET-019's other half is proved on this
+    /// daemon's own proxy too: after the native verdict, one request
+    /// still routes through the listener whose port the reply carries —
+    /// the pure verdict in `proxy`'s test routes through a serve loop a
+    /// test spun up itself; this is the daemon's. The answerer is the half
+    /// the daemon's start path brings up on a detached driver; here it is
+    /// driven to serving the same way, the proxy beside it, so the first
+    /// RPC that computes a verdict is the moment the line names.
     ///
     /// The fresh-daemon list first proves the default verdict is the
     /// proxy: no half, no native report.
@@ -3119,13 +3125,13 @@ mod tests {
         // the subscriber's business.
         let log = log.contents();
         assert!(
-            log.contains("the live name surface is hostname-proxy"),
+            log.contains("the live name surface is proxy"),
             "the verdict before either half is up is logged and names the proxy, got: {log}"
         );
         let native_line = log
             .lines()
-            .find(|line| line.contains("the live name surface is native-dns"))
-            .expect("the native-dns verdict logs one line a diagnostics bundle can tail");
+            .find(|line| line.contains("the live name surface is native"))
+            .expect("the native verdict logs one line a diagnostics bundle can tail");
         assert!(
             native_line.contains("proxy_serves=true"),
             "the line says the proxy still serves beside native DNS (NET-019): {native_line}"
@@ -3140,6 +3146,30 @@ mod tests {
         assert!(
             native_line.contains(&format!("127.0.0.1:{port}")),
             "the line names the port a client keeps routing through: {native_line}"
+        );
+
+        // NET-019 on the daemon's own proxy: the verdict that just reported
+        // native DNS stops nothing — one request still routes through the
+        // listener whose port the reply carries. The registry holds the
+        // create's session as a host-net route the way the session-start
+        // path registers one, so the request has a target to reach.
+        let backend_port = crate::net::proxy::spawn_backend().await;
+        server
+            .state
+            .sessions_manager()
+            .await
+            .hostnames()
+            .write()
+            .expect("hostname registry lock poisoned")
+            .register_host_net(created.id, "surface-native");
+        let routed = crate::net::proxy::proxy_get(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            &format!("surface-native.min.internal:{backend_port}"),
+        )
+        .await;
+        assert!(
+            routed.contains("200 OK"),
+            "the daemon's own proxy still routes beside the native verdict (NET-019), got: {routed}"
         );
     }
 
