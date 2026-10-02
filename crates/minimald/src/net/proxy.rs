@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::net::{TcpListener, TcpStream};
 
 use super::dns::HostnameRegistry;
 use super::policy::Direction;
@@ -273,34 +273,6 @@ impl BindFailure {
     }
 }
 
-/// The listen backlog a bound proxy listener keeps: the value `TcpListener::bind`
-/// uses on every platform this daemon runs on (mio's `bind`, which the standard
-/// library's `TcpListener::bind` also takes), so building the socket by hand
-/// below changes the reuse options and nothing else.
-const LISTEN_BACKLOG: u32 = 128;
-
-/// Builds and binds the proxy's listener at `addr`, with neither `SO_REUSEADDR`
-/// nor `SO_REUSEPORT` set — the socket is built by hand rather than taken from
-/// [`TcpListener::bind`], which sets `SO_REUSEADDR` on Unix. A reuse option is
-/// the licence to share or shadow a port another holder has, and this daemon
-/// must never take it: two daemons on one host (NET-027, NET-059) meet on one
-/// port number only through the walk the *publication* takes, while the bind —
-/// a handed port in particular — has to fail loudly when someone else already
-/// holds it, as the surfaced error the caller's report carries, instead of
-/// binding beside the holder and answering for ports that are not this
-/// daemon's. `TcpSocket` leaves both options off until asked, and the one ask
-/// here is the explicit `false` that pins that.
-fn bind_without_reuse(addr: SocketAddr) -> io::Result<TcpListener> {
-    let socket = if addr.is_ipv4() {
-        TcpSocket::new_v4()?
-    } else {
-        TcpSocket::new_v6()?
-    };
-    socket.set_reuseaddr(false)?;
-    socket.bind(addr)?;
-    socket.listen(LISTEN_BACKLOG)
-}
-
 /// Binds the egress-proxy listener at `addr`, returning it on success. On a
 /// bind failure it returns a [`BindFailure`] carrying the reason (the address
 /// and the OS error) and the remedy that clears it, and logs nothing: the
@@ -318,13 +290,29 @@ fn bind_without_reuse(addr: SocketAddr) -> io::Result<TcpListener> {
 /// it as a bind-and-drop probe is what made gominimal/inbox#560 look like a
 /// false alarm on macOS.
 ///
+/// The bind is the platform default [`TcpListener::bind`] makes: `SO_REUSEADDR`
+/// on Unix, and never `SO_REUSEPORT`. On Linux, `SO_REUSEADDR` never lets a
+/// second socket listen on an address:port an active listener holds — a port
+/// another daemon is bound and listening on is still refused with `EADDRINUSE`,
+/// as the surfaced error the caller's report carries — so its one effect is
+/// that a restart can rebind over the `TIME_WAIT` sockets the previous run's
+/// accepted connections left, which is how a native daemon restarted in place
+/// keeps [`DEFAULT_EGRESS_PROXY_PORT`], the documented port its recipes point
+/// `HTTP(S)_PROXY` at, instead of failing the rebind and silently moving off
+/// it. `SO_REUSEPORT` is the licence to answer beside a live holder and is never
+/// asked for. The rule that two VMs never shadow one host port (NET-059) is
+/// not this bind's to carry: a microVM daemon binds inside its guest's own
+/// netns, where the two never meet, and the one port they do share — the
+/// host-loopback publication the walk in `server::drive_proxy_until_serving`
+/// takes — is minvmd's forwarded-port bind (#1814).
+///
 /// # Errors
 ///
 /// Returns a [`BindFailure`] when the address cannot be bound; the OS error is
 /// carried inside the failure's reason, and its kind beside it
 /// ([`BindFailure::kind`]).
 pub async fn bind_listener(addr: SocketAddr) -> Result<TcpListener, BindFailure> {
-    match bind_without_reuse(addr) {
+    match TcpListener::bind(addr).await {
         Ok(listener) => {
             tracing::info!(
                 component = "dns-proxy",
@@ -1224,20 +1212,16 @@ mod tests {
         );
     }
 
-    /// The listener's bind carries neither reuse option, so a port another
-    /// holder has is refused instead of shared: `TcpListener::bind` sets
-    /// `SO_REUSEADDR` on Unix, and a daemon that bound through it would answer
-    /// beside (or, under `SO_REUSEPORT`, for) a port another daemon holds — one
-    /// VM's proxy picking up the other VM's names, the exact shape two VMs on
-    /// one host must never take (NET-059). The refused bind is the loud
-    /// failure the caller surfaces: a handed port's duplicate is the report
-    /// `min session activate` and `min ls` print, never a silent neighbour.
-    ///
-    /// The options are read off the bound socket, because the refusal alone
-    /// cannot tell the two apart: a second bind to one held address fails with
-    /// `EADDRINUSE` whether or not the reuse option is set, so the pin is the
-    /// kernel's own answer for the socket's options, on both platforms this
-    /// daemon runs on.
+    /// The bind is the platform default: `SO_REUSEADDR` on Unix, never
+    /// `SO_REUSEPORT`. A second bind to a port an active listener holds still
+    /// fails with `EADDRINUSE` — on Linux, `SO_REUSEADDR` never licenses
+    /// listening beside a live listener, only rebinding over the `TIME_WAIT`
+    /// sockets a restart's own previous connections left — and the refusal is
+    /// the loud failure the caller surfaces: a handed port's duplicate is the
+    /// report `min session activate` and `min ls` print, never a silent
+    /// neighbour. `SO_REUSEPORT`, the one option that would answer beside a
+    /// live holder, is never set: it is read off the bound socket, because the
+    /// kernel's own answer is the pin, on both platforms this daemon runs on.
     #[tokio::test]
     async fn proxy_bind_refuses_a_port_already_held_on_loopback() {
         use std::os::fd::AsRawFd as _;
@@ -1263,22 +1247,18 @@ mod tests {
         drop(held);
 
         // And the listener it builds really carries the rule: a free port
-        // binds, and neither reuse option is set on the socket that comes
-        // back. `SO_REUSEPORT` is never asked for anywhere in the bind, so
-        // reading it is the defence against a default that ever changes.
+        // binds with `SO_REUSEPORT` off. `SO_REUSEADDR` is the platform
+        // default the bind keeps on purpose, so it is not pinned here;
+        // `SO_REUSEPORT` is never asked for anywhere in the bind, and reading
+        // it is the defence against a default that ever changes.
         let listener = bind_listener((IpAddr::V4(Ipv4Addr::LOCALHOST), 0).into())
             .await
             .expect("a free loopback port binds");
-        for (option, name) in [
-            (libc::SO_REUSEADDR, "SO_REUSEADDR"),
-            (libc::SO_REUSEPORT, "SO_REUSEPORT"),
-        ] {
-            let value = socket_option(listener.as_raw_fd(), option);
-            assert_eq!(
-                value, 0,
-                "the proxy's listener must bind with {name} off, got {value}"
-            );
-        }
+        let value = socket_option(listener.as_raw_fd(), libc::SO_REUSEPORT);
+        assert_eq!(
+            value, 0,
+            "the proxy's listener must never bind with SO_REUSEPORT, got {value}"
+        );
     }
 
     /// Reads one `SOL_SOCKET` socket option off `fd`, as the kernel holds it.
