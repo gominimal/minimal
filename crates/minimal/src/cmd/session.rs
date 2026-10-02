@@ -162,6 +162,27 @@ pub(crate) async fn vm_host_answerer_status(
     }
 }
 
+/// The interim's own start line (NET-138): who answers this VM's box zone,
+/// under the label the session's other facts print beside. Every session
+/// start on a VM-backed host prints it — TTY and non-TTY, before the
+/// advisory and the verdict — because the interim is a fact about the
+/// machine the session is about to rely on: which VM host daemon answers
+/// the zone decides where the names resolve from, and a start that said
+/// nothing left the holder discoverable only from `min ls`. The same line
+/// `min ls` prints for the state ([`crate::resolver::vm_host_answerer_line`]),
+/// so the two surfaces name one holder the same way. Pure, so the test
+/// asserts the wording without capturing stderr.
+///
+/// `None` for the pre-acquisition state — a daemon still bringing its
+/// answerer up has nothing to name yet, and the start prints nothing for
+/// it, exactly as `min ls` does.
+#[must_use]
+pub(crate) fn vm_host_answerer_start_line(
+    status: minimald_rpc::ZoneAnswererStatus,
+) -> Option<String> {
+    crate::resolver::vm_host_answerer_line(status).map(|line| format!("zone answerer: {line}"))
+}
+
 /// Withdraws the box's host row (T66) when the session that registered it
 /// is gone — destroyed, or an activation that failed after registering:
 /// the row has no holder left, so its creator presents the pair the
@@ -746,14 +767,25 @@ pub(crate) async fn activate_session(
     // means this VM's names are not answered on the host whatever this
     // host's hook and range say, so neither is read and the warning says
     // the fact instead of the advisory.
-    let (answerer_port, answerer_bound, held_no_channel) =
+    let (vm_answerer, answerer_port, answerer_bound, held_no_channel) =
         match vm_host_answerer_status(global).await {
             Some(status) => {
                 let read = crate::resolver::host_answerer_read(status).await;
-                (read.port, read.answerer_bound, read.held_no_channel)
+                (Some(status), read.port, read.answerer_bound, read.held_no_channel)
             }
-            None => (created.zone_answerer_port, created.answerer_bound, false),
+            None => (None, created.zone_answerer_port, created.answerer_bound, false),
         };
+    // The interim itself, named at every session start on a VM-backed host
+    // — TTY and non-TTY, ahead of the warning, the advisory and the verdict
+    // below — because who answers the zone is the machine fact the names
+    // this session is about to rely on rest on, and a holder another VM's
+    // minvmd took is otherwise discoverable only from `min ls`. The
+    // pre-acquisition state prints nothing: nothing is held yet to name.
+    if let Some(status) = vm_answerer
+        && let Some(line) = vm_host_answerer_start_line(status)
+    {
+        eprintln!("{line}");
+    }
     if held_no_channel && let Some(answerer_port) = answerer_port {
         // NET-138's warning, at every session start — TTY and non-TTY: it
         // rides stderr unconditionally, because the first lookup that
@@ -2860,6 +2892,45 @@ mod tests {
             vm_host_answerer_status(&old).await,
             None,
             "a refusal from a daemon that predates the verb is silence, not a state"
+        );
+    }
+
+    /// NET-138's interim, surfaced at every session start: the line names
+    /// who answers the zone under the `zone answerer:` label — this VM's
+    /// minvmd when it holds the port, the machine's other holder when this
+    /// VM's table is registered with it — and the pre-acquisition state
+    /// prints nothing, exactly as its `min ls` line does.
+    #[test]
+    fn session_start_names_the_zone_answerer_at_every_start() {
+        let holder = vm_host_answerer_start_line(minimald_rpc::ZoneAnswererStatus::Holder {
+            port: 7_656,
+        })
+        .expect("a holder is a state to name");
+        assert_eq!(
+            holder,
+            "zone answerer: answered by the VM host daemon \
+             (single-operator interim) · this VM's minvmd holds it on \
+             127.0.0.1:7656 (UDP) · point the host's resolver at it for \
+             *.min.internal",
+            "the start line names this VM's minvmd as the holder"
+        );
+        let registered =
+            vm_host_answerer_start_line(minimald_rpc::ZoneAnswererStatus::Registered {
+                port: 7_656,
+            })
+            .expect("a registered table is a state to name");
+        assert_eq!(
+            registered,
+            "zone answerer: answered by the VM host daemon \
+             (single-operator interim) · another VM host daemon holds it on \
+             127.0.0.1:7656 (UDP); this VM's table is registered with it · \
+             point the host's resolver at it for *.min.internal",
+            "the start line names the holder this VM's table answers through"
+        );
+        assert_eq!(
+            vm_host_answerer_start_line(minimald_rpc::ZoneAnswererStatus::Starting),
+            None,
+            "the pre-acquisition state prints nothing at session start"
         );
     }
 
