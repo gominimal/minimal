@@ -58,10 +58,11 @@
 //! gate lives and dies with the switch runtime it was started on.
 //!
 //! The Box Egress Proxy's host leg is separate from all of that
-//! (`bep_host`, NET-132): a userspace smoltcp stack over a channel-backed
-//! device, standing in for the proxy's listener on the switch's plan. It is
-//! declared here and wired into the leg that carries a box's connection to
-//! the proxy's listener when the proxy's own work lands.
+//! (`switch::bep_host`, NET-132): a userspace smoltcp stack over a
+//! channel-backed device, standing in for the proxy's listener on the
+//! switch's plan. The switch runtime starts it once the switch socket is up
+//! and stops it with the switch; the leg that carries a box's connection to
+//! the proxy's listener is wired when the proxy's own work lands.
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -87,8 +88,7 @@ mod shuttle;
 pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_gate_sock, resolve_switch_sock};
 mod baseline;
 pub use baseline::{NodeBaselinePhase, NodePlaneBaseline};
-pub(crate) mod bep_host;
-pub use bep_host::{BepDevice, BepDeviceEnds, BepHost};
+pub use switch::{BepDevice, BepDeviceEnds, BepHost, BepPeer};
 
 /// Default time to wait for gvproxy to exit on SIGTERM before escalating to
 /// SIGKILL.
@@ -718,6 +718,7 @@ impl HostGvproxy {
             // its rows were compiled against — so a lease the gate checks a
             // frame's source by is one the switch actually routes.
             .with_subnet(registry.subnet());
+        let subnet = registry.subnet();
         let table = registry.table();
         // The node-plane baseline set: the helper's built-in enumeration of
         // the categories the in-VM daemon's own traffic may reach (NET-130),
@@ -726,7 +727,7 @@ impl HostGvproxy {
         // by it, beside the boxes' rows; announced — the shipped posture —
         // the allow-all interim node row still does, and the gate's
         // start-up line names the posture deciding.
-        let baseline = NodePlaneBaseline::built_in(registry.subnet());
+        let baseline = NodePlaneBaseline::built_in(subnet);
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<u32>>();
 
@@ -789,6 +790,26 @@ impl HostGvproxy {
                         drop(ready_tx.send(Err(e)));
                         return;
                     }
+                    // Start the Box Egress Proxy host stack peer after the switch
+                    // socket is known to accept connections: the peer owns the
+                    // proxy's infrastructure address on the subnet, speaks the
+                    // same length-framed Ethernet the switch socket carries, and
+                    // stops when this runtime drops at switch teardown.
+                    let _bep_peer = match BepPeer::spawn(&sock, subnet).await {
+                        Ok(peer) => peer,
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to start box egress proxy peer");
+                            switch.stop().await;
+                            drop(ready_tx.send(Err(e)));
+                            return;
+                        }
+                    };
+                    tracing::info!(
+                        proxy_ip = %subnet.box_egress_proxy_address(),
+                        proxy_mac = %subnet.bep_mac(),
+                        "box egress proxy peer started",
+                    );
+
                     if ready_tx.send(Ok(pid)).is_err() {
                         // Caller went away before learning the PID; tear down.
                         switch.stop().await;
@@ -799,6 +820,8 @@ impl HostGvproxy {
                     tokio::select! {
                         _ = stop_rx => {
                             switch.stop().await;
+                            drop(_bep_peer);
+                            drop(_gate);
                         }
                         status = exit.recv() => {
                             tracing::error!(
@@ -806,7 +829,9 @@ impl HostGvproxy {
                                 code = status.and_then(|s| s.code()),
                                 "host gvproxy switch exited unexpectedly",
                             );
-                            // gvproxy is already gone; drop the handle (no signal).
+                            // gvproxy is already gone; drop the handles (no signal).
+                            drop(_bep_peer);
+                            drop(_gate);
                             drop(switch);
                         }
                     }
