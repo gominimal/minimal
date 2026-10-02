@@ -1506,7 +1506,10 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
         dynamic_ingress: None,
     };
     let control = ControlChannel::Unix(sock.clone());
-    let exposed = apply_ingress(&control, lease.ip, &ingress)
+    // Published on the node's shared loopback address — the shared-address
+    // lane this proof has always exercised — so the host connect below, to
+    // 127.0.0.1:EXTERNAL, is the address the forward is bound on.
+    let exposed = apply_ingress(&control, std::net::Ipv4Addr::LOCALHOST, lease.ip, &ingress)
         .await
         .expect("apply ingress");
 

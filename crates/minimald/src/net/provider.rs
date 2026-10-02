@@ -57,6 +57,19 @@ impl OwnAddressReporter {
             .expect("hostname registry lock poisoned");
         registry.report_own_address(self.session_id, session_name, lease, ports);
     }
+
+    /// The host loopback address this box's declaration publishes on (NET-010):
+    /// the address finalize leased for it out of the daemon's slice of the
+    /// reserved local range, or the node's shared address until one is leased.
+    /// The attach path reads it here — rather than re-deriving one — so the
+    /// forwards it binds and the name the registry answers stay at the one
+    /// address the box owns.
+    pub(crate) fn published_address(&self) -> Ipv4Addr {
+        self.registry
+            .read()
+            .expect("hostname registry lock poisoned")
+            .published_or_node(self.session_id)
+    }
 }
 
 /// The network provider for `mode`. `NoNet` is the sandbox layer's own; `HostNet`

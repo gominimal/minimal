@@ -88,7 +88,8 @@
 #   restart                          daemon stop → autospawn, hooks survive
 #   fresh_install_own_ip_ingress_publishes_loopback
 #                                    a real install.sh run ships the switch;
-#                                    own-IP ingress answers at 127.0.0.1:8080
+#                                    own-IP ingress answers at the box's own
+#                                    loopback address, read from the record
 #   network_posture_from_stock_install
 #                                    from a real install.sh run: --network and
 #                                    --ingress in help+reference+hints, a none
@@ -905,6 +906,22 @@ fi
 }
 
 # ---------------------------------------------------------------------------
+# The host address a daemon published an own-IP box's ingress on, read from
+# the expose record in the daemon's log (NET-040's observability record: one
+# line per exposed mapping, naming the address the switch actually bound).
+# Reading it — rather than assuming 127.0.0.1 — is what keeps this harness
+# honest about NET-010: an own-address box publishes at the address the
+# answerer granted it out of the reserved local range, and the record is the
+# one place on the host that names it. $1 = the daemon's log file, $2 = the
+# session name; prints the newest matching record's host address, nothing
+# when no record names the session.
+published_loopback_host() {
+  grep -h -- 'exposed ingress port on the host loopback' "$1" 2>/dev/null \
+    | grep -F "\"session\":\"$2\"" | tail -n1 \
+    | sed -n 's/.*"host":"\([0-9][0-9.]*\)".*/\1/p'
+}
+
+# ---------------------------------------------------------------------------
 # Own-IP egress declared and enforced, end to end (NET T20). Gated on
 # MINVMD_GVPROXY_BIN like the own-IP proof above: own-address enforcement lives
 # on the switch, so a target without one has nothing to prove here.
@@ -1329,7 +1346,11 @@ proof_own_ip_egress_declared_and_enforced() {
 # THIS checkout's own binaries, reached through the same stub-curl trick
 # install_test.sh uses, so the installer itself runs unmodified — the
 # installed pair must serve an own-IP box whose `--ingress 8080:8080` mapping
-# answers ON THE HOST at 127.0.0.1:8080 with the box's own server's response.
+# answers ON THE HOST at the box's OWN loopback address with the box's own
+# server's response — the address read from the daemon's expose record, never
+# assumed: an own-address box publishes at the address the answerer granted it
+# out of the reserved local range (NET-010), so a proof that probed a fixed
+# 127.0.0.1 would be looking at the interim, not the box.
 # That is the own-address pipeline in the exact shape a user gets it: the
 # installer ships gvproxy-min into ~/.local/bin (and names the path it
 # verified), the daemon finds it there through switch::installed_gvproxy_bin,
@@ -1357,11 +1378,16 @@ proof_own_ip_egress_declared_and_enforced() {
 #     stage that path — writable /usr/bin, never over an existing binary;
 #     the probe ORDER that finds it is pinned by the switch crate's resolver
 #     tests either way.
-#   * The host half of the mapping is 127.0.0.1:8080; a host that already
-#     has a listener there (the agent-runtime boxes this harness itself runs
-#     on do) publishes on the fallback 18082 instead — the box always serves
-#     its INTERNAL 8080, so the mapping exercised is always <host-port>:8080
-#     and a clean host runs it exactly as the proof sentence says.
+#   * The host half of the mapping is <the box's address>:<host port>, the
+#     address from the expose record and the port below. The port is 8080; a
+#     host that already has a listener at 127.0.0.1:8080 (the agent-runtime
+#     boxes this harness itself runs on do) takes the fallback 18082 instead —
+#     the box always serves its INTERNAL 8080, so the mapping exercised is
+#     always <host-port>:8080 and a clean host runs it exactly as the proof
+#     sentence says. The claim guards the one publish that could ever land on
+#     127.0.0.1: the interim a box with no granted address of its own
+#     publishes on — which cannot happen on this lane (the range is bindable
+#     on every Linux host), but costs nothing to keep honest.
 #
 # Ordered after `restart`: it stops whatever daemon is up and swaps the
 # driving pair to the installed one, so nothing that still shares the
@@ -1373,6 +1399,7 @@ proof_fresh_install_own_ip_ingress_publishes_loopback() {
 local fi_arch fi_gvproxy fi_root fi_home fi_bucket fi_stubbin fi_seed fi_out
 local fi_h_minimald fi_h_minimal fi_h_gvmin fi_sid fi_sid2 fi_log fi_rec
 local fi_ready fi_answered fi_status fi_bucket_host fi_hport fi_portpat
+local fi_host fi_host2 fi_pkg_log
 local fi_lane_minimald fi_restore_profile
 if [ -n "$E2E_VM" ] || [ "$(uname -s)" != Linux ]; then
   echo "fresh-install loopback publish SKIPPED (VM-backed lane: the pair this proof installs lives host-side)"
@@ -1398,12 +1425,15 @@ if [ ! -c /dev/net/tun ]; then
 fi
 
 # The proof's mapping is 8080:8080 — the box serves its INTERNAL 8080, the
-# switch publishes the host half on the loopback. A host may already have a
-# listener on the host port (the agent-runtime boxes this harness itself runs
-# on do), so claim it BEFORE anything is installed, and when it is taken
-# publish on the fallback port instead: the whole pipeline — install, switch
-# discovery, expose, host answer, log record — is exercised either way, and a
-# clean host runs the mapping exactly as the proof sentence says it.
+# switch publishes the host half at the box's own address out of the reserved
+# local range (read from the expose record below). What is claimed here is the
+# host PORT: 127.0.0.1:<port> is where a box with no granted address of its own
+# would publish (the interim), and a host may already have a listener at the
+# 8080 one (the agent-runtime boxes this harness itself runs on do), so claim
+# it BEFORE anything is installed and take the fallback port when it is
+# occupied — the whole pipeline — install, switch discovery, expose, host
+# answer, log record — is exercised either way, and a clean host runs the
+# mapping exactly as the proof sentence says it.
 fi_hport=8080
 if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$fi_hport/" 2>/dev/null; then
   if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:18082/" 2>/dev/null; then
@@ -1636,27 +1666,10 @@ if (
     exit 1
   }
 
-  # NET-040: the mapping answers ON THE HOST loopback, with the box's own
-  # server's response.
-  fi_answered=""
-  fi_status=""
-  for _ in $(seq 1 40); do
-    fi_status="$(curl -sS --max-time 5 -o "$fi_root/host.body" -w '%{http_code}' \
-      "http://127.0.0.1:$fi_hport/" 2>/dev/null || true)"
-    if [ "$fi_status" = "200" ] && grep -q "fi-fresh-install-own-ip" "$fi_root/host.body" 2>/dev/null; then
-      fi_answered=1; break
-    fi
-    sleep 0.25
-  done
-  [ -n "$fi_answered" ] || {
-    echo "::error::the host loopback never answered at 127.0.0.1:$fi_hport (last status: '${fi_status:-none}')"
-    echo "--- host body ---"; cat "$fi_root/host.body" 2>/dev/null || true
-    exit 1
-  }
-  echo "127.0.0.1:$fi_hport answered the box's own server (200: $(cat "$fi_root/host.body"))"
-
   # NET-040 observability: one daemon-log record per exposed mapping, with
-  # the host address, the port and the session.
+  # the host address, the port and the session — and NET-010's address: the
+  # record names the box's own granted address, which the host probe below
+  # targets. Read it before probing, never assume 127.0.0.1.
   fi_log="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null | sort | tail -n1)"
   fi_rec=""
   for _ in $(seq 1 10); do
@@ -1670,22 +1683,52 @@ if (
     echo "--- daemon log (tail) ---"; tail -20 "$fi_log" 2>/dev/null || true
     exit 1
   fi
+  fi_host="$(published_loopback_host "$fi_log" e2e-fresh-ingress)"
   case "$fi_rec" in
-    *'"host":"127.0.0.1"'*"$fi_portpat"*) ;;
+    *'"host":"'"$fi_host"'"'*"$fi_portpat"*) ;;
     *)
-      echo "::error::the expose record does not carry host 127.0.0.1 and the published port $fi_hport"
+      echo "::error::the expose record does not carry a host address and the published port $fi_hport"
+      echo "--- record ---"; printf '%s\n' "$fi_rec"
+      exit 1
+      ;;
+  esac
+  case "$fi_host" in
+    127.0.64.*)
+      ;;
+    *)
+      echo "::error::the box published at ${fi_host:-<no address in the record>}, which is not an address out of the reserved local range 127.0.64.0/24 — an own-IP box's mapping answers at its own granted address (NET-010), and on this Linux lane the range is always bindable so the 127.0.0.1 interim never stands in for it"
       echo "--- record ---"; printf '%s\n' "$fi_rec"
       exit 1
       ;;
   esac
   echo "daemon log: $fi_rec"
 
+  # NET-040: the mapping answers ON THE HOST loopback, at that address, with
+  # the box's own server's response.
+  fi_answered=""
+  fi_status=""
+  for _ in $(seq 1 40); do
+    fi_status="$(curl -sS --max-time 5 -o "$fi_root/host.body" -w '%{http_code}' \
+      "http://$fi_host:$fi_hport/" 2>/dev/null || true)"
+    if [ "$fi_status" = "200" ] && grep -q "fi-fresh-install-own-ip" "$fi_root/host.body" 2>/dev/null; then
+      fi_answered=1; break
+    fi
+    sleep 0.25
+  done
+  [ -n "$fi_answered" ] || {
+    echo "::error::the host loopback never answered at $fi_host:$fi_hport (last status: '${fi_status:-none}')"
+    echo "--- host body ---"; cat "$fi_root/host.body" 2>/dev/null || true
+    exit 1
+  }
+  echo "$fi_host:$fi_hport answered the box's own server (200: $(cat "$fi_root/host.body"))"
+
   mnl session destroy --force "$fi_sid" >/dev/null 2>&1 || true
   mnl stop --force >/dev/null 2>&1 || true
-  # The switch goes down with the daemon; wait out the host port it held so
-  # the package-path half below re-publishes on the same one.
+  # The switch goes down with the daemon; wait out the forward it held at the
+  # box's address so the package-path half below cannot collide with a
+  # lingering bind on the same address if the answerer hands it back out.
   for _ in $(seq 1 20); do
-    curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$fi_hport/" 2>/dev/null || break
+    curl -sS --max-time 2 -o /dev/null "http://$fi_host:$fi_hport/" 2>/dev/null || break
     sleep 0.25
   done
 
@@ -1711,21 +1754,42 @@ if (
     mnl session exec "$fi_sid2" \
       "nohup /usr/bin/socat TCP-LISTEN:8080,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &" \
       >/dev/null 2>&1
+    # This box's own address, from its own record — the second daemon may hold
+    # the same address as the first (its grant was released at destroy) or a
+    # different one; the record says which, the probe does not guess. The log
+    # path is re-read: this activate spawned a daemon of its own, and the day
+    # may have rolled over to a new file since the first half read it.
+    fi_pkg_log=""
+    fi_host2=""
+    for _ in $(seq 1 10); do
+      fi_pkg_log="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null | sort | tail -n1)"
+      fi_host2="$(published_loopback_host "$fi_pkg_log" e2e-fresh-ingress-pkg)"
+      [ -n "$fi_host2" ] && break
+      sleep 0.25
+    done
+    case "$fi_host2" in
+      127.0.64.*) ;;
+      *)
+        echo "::error::the package-path box published at ${fi_host2:-<no expose record>}, which is not an address out of the reserved local range 127.0.64.0/24 (NET-010)"
+        echo "--- activate stderr ---"; cat "$fi_root/activate-pkg.err" 2>/dev/null || true
+        exit 1
+        ;;
+    esac
     fi_answered=""
     for _ in $(seq 1 40); do
       if curl -sS --max-time 5 -o "$fi_root/host-pkg.body" \
-          "http://127.0.0.1:$fi_hport/" 2>/dev/null \
+          "http://$fi_host2:$fi_hport/" 2>/dev/null \
           && grep -q "fi-fresh-install-pkgpath" "$fi_root/host-pkg.body" 2>/dev/null; then
         fi_answered=1; break
       fi
       sleep 0.25
     done
     [ -n "$fi_answered" ] || {
-      echo "::error::the package-path switch never published the mapping at 127.0.0.1:$fi_hport"
+      echo "::error::the package-path switch never published the mapping at $fi_host2:$fi_hport"
       echo "--- activate stderr ---"; cat "$fi_root/activate-pkg.err" 2>/dev/null || true
       exit 1
     }
-    echo "package-path half OK: /usr/bin/gvproxy-min served the same mapping ($(cat "$fi_root/host-pkg.body"))"
+    echo "package-path half OK: /usr/bin/gvproxy-min served the same mapping at $fi_host2:$fi_hport ($(cat "$fi_root/host-pkg.body"))"
     mnl session destroy --force "$fi_sid2" >/dev/null 2>&1 || true
   else
     if [ -e /usr/bin/gvproxy-min ]; then
@@ -1773,9 +1837,10 @@ echo "::endgroup::"
 #     unreachable too. The stock posture (host_ip, the default) completes
 #     an outbound request (NET-107).
 #   * from the fresh install, `--network own_ip --ingress 8080:8080`
-#     answers ON THE HOST at 127.0.0.1:8080 with the box's own server's
-#     response (NET-040) — and that box completes an outbound request
-#     through the switch the installer shipped (NET-107's switch half).
+#     answers ON THE HOST at the box's own loopback address with the box's
+#     own server's response (NET-040, NET-010) — and that box completes an
+#     outbound request through the switch the installer shipped (NET-107's
+#     switch half).
 #
 # Lane gating, decided by where the proof's pieces actually run:
 #   * Native Linux only: the install pair lives host-side on a VM lane
@@ -2324,6 +2389,11 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     echo "step: min session destroy --force (the none box) → exit 0"
 
     # ---- the own-IP posture: publish on the host loopback, reach out --------
+    # The host PORT is claimed the loopback-publish proof's way (8080, the
+    # 18082 fallback when 8080 is taken): the box publishes at its own granted
+    # address, and this guards the interim at 127.0.0.1 a box with no grant of
+    # its own would publish on. The ADDRESS is read from the expose record
+    # below, never assumed.
     if [ "$np_want_switch" -eq 1 ]; then
       local np_hport2=8080
       if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$np_hport2/" 2>/dev/null; then
@@ -2395,23 +2465,44 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
         exit 1
       fi
       echo "the box answers its own ingress mapping at 127.0.0.1:8080"
+      # The box's published host address, from its expose record (NET-010): an
+      # own-IP box publishes at its own granted address out of the reserved
+      # local range, so the host probe targets the record's address — never a
+      # fixed 127.0.0.1.
+      local np_daemon_log np_expose np_host
+      np_daemon_log="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null | sort | tail -n1)"
+      np_host=""
+      for _ in $(seq 1 10); do
+        np_host="$(published_loopback_host "$np_daemon_log" e2e-posture-ownip)"
+        [ -n "$np_host" ] && break
+        sleep 0.25
+      done
+      case "$np_host" in
+        127.0.64.*) ;;
+        *)
+          echo "::error::the own-IP box published at ${np_host:-<no expose record>}, which is not an address out of the reserved local range 127.0.64.0/24 (NET-010)"
+          echo "--- daemon log (tail) ---"
+          tail -20 "$np_daemon_log" 2>/dev/null || true
+          exit 1
+          ;;
+      esac
       local np_status
       np_status="$(curl -sS --max-time 5 -o "$np_root/host-answer.body" -w '%{http_code}' \
-        "http://127.0.0.1:$np_hport2/" 2>"$np_root/host-answer.err" || true)"
+        "http://$np_host:$np_hport2/" 2>"$np_root/host-answer.err" || true)"
       if [ "$np_status" != "200" ] \
         || ! grep -Fq "$POSTURE_OWNIP_MARKER" "$np_root/host-answer.body" 2>/dev/null; then
-        echo "::error::the fresh install's own-IP ingress did not answer on the host loopback at 127.0.0.1:$np_hport2 (NET-040)"
+        echo "::error::the fresh install's own-IP ingress did not answer on the host loopback at $np_host:$np_hport2 (NET-040)"
         echo "  status: $np_status, body: $(cat "$np_root/host-answer.body" 2>/dev/null || true)"
         echo "--- curl stderr ---"
         cat "$np_root/host-answer.err" 2>/dev/null || true
         exit 1
       fi
-      echo "step: host curl http://127.0.0.1:$np_hport2/ → 200, body carries the box's marker (NET-040)"
+      echo "step: host curl http://$np_host:$np_hport2/ → 200, body carries the box's marker (NET-040)"
 
       # Observability, not an assertion: the loopback-publish proof owns
-      # the expose record's assert. Find the record and print it.
-      local np_daemon_log np_expose=""
-      np_daemon_log="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null | sort | tail -n1)"
+      # the expose record's assert. Print the record the address above came
+      # from.
+      local np_expose=""
       for _ in $(seq 1 10); do
         np_expose="$(grep -h -- 'exposed ingress port on the host loopback' "$np_daemon_log" 2>/dev/null \
           | grep -F '"session":"e2e-posture-ownip"' | tail -n1)"
@@ -2431,7 +2522,7 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
       mnl session destroy --force "$np_own_sid" >/dev/null 2>&1 || true
       mnl stop --force >/dev/null 2>&1 || true
       for _ in $(seq 1 20); do
-        curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$np_hport2/" 2>/dev/null || break
+        curl -sS --max-time 2 -o /dev/null "http://$np_host:$np_hport2/" 2>/dev/null || break
         sleep 0.25
       done
     else
