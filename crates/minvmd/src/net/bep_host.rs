@@ -24,8 +24,23 @@
 //! with the HyperKit `/connect` request, and runs the stack in a dedicated
 //! local task that is woken by inbound frames, by the outbound pump, and by a
 //! periodic `poll_delay`.
+//!
+//! The peer is silent until spoken to. It originates no frame except in
+//! answer to one that addressed it — the ARP reply, the TCP reset, the ICMP
+//! port-unreachable — and each of those goes to the box that asked and to no
+//! other destination: no gratuitous ARP at attach, no ARP probe, nothing on
+//! an idle lane. The smoltcp feature set this crate builds with excludes
+//! `proto-ipv6`, so the stack cannot emit neighbour solicitation, router
+//! solicitation or MLD either. `idle_peer_emits_no_frames` pins the silence.
+//!
+//! The peer terminates nothing above the network layer here: no smoltcp TCP,
+//! UDP or ICMP socket is bound on its [`SocketSet`] (`peer_binds_no_socket`
+//! pins that), so every segment to the proxy address is reset and every
+//! datagram is answered port-unreachable. The task that puts the proxy's
+//! listener on this address (T69) is the only one that may bind a socket on
+//! the peer, and it carries the per-source caps and the gate rule before it
+//! does.
 
-use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::net::Ipv4Addr;
@@ -66,8 +81,6 @@ const POLL_DELAY: Duration = Duration::from_millis(100);
 pub struct BepDevice {
     rx: UnboundedReceiver<Vec<u8>>,
     tx: UnboundedSender<Vec<u8>>,
-    /// Frames the host loop has admitted and wants the interface to process.
-    pending: VecDeque<Vec<u8>>,
 }
 
 /// The peer ends of a [`BepDevice`]'s channels: what feeds the stack and what
@@ -94,7 +107,6 @@ impl BepDevice {
             Self {
                 rx: inbound_rx,
                 tx: outbound_tx,
-                pending: VecDeque::new(),
             },
             BepDeviceEnds {
                 inbound: inbound_tx,
@@ -122,13 +134,11 @@ impl Device for BepDevice {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let frame = self.pending.pop_front()?;
-        Some((
-            BepRxToken { frame },
-            BepTxToken {
-                tx: self.tx.clone(),
-            },
-        ))
+        // Inbound frames take one path: [`BepHost::poll`] drains the channel
+        // and answers each frame itself, so the interface has no socket to
+        // deliver to and nothing to receive. The task that binds the proxy's
+        // listener (T69) is the one that hands frames to the interface.
+        None
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
@@ -255,30 +265,23 @@ impl BepHost {
         self.mac
     }
 
-    /// Send a gratuitous ARP announcement for the leg's address.
-    ///
-    /// The peer originates no frame unless addressed, but at attach it tells
-    /// the switch and any neighbors its MAC for the proxy address so inbound
-    /// frames can be addressed to it.
-    pub fn announce(&self) {
-        let repr = ArpRepr::EthernetIpv4 {
-            operation: ArpOperation::Request,
-            source_hardware_addr: self.mac,
-            source_protocol_addr: self.ip,
-            target_hardware_addr: EthernetAddress::BROADCAST,
-            target_protocol_addr: self.ip,
-        };
-        self.send_arp(repr, EthernetAddress::BROADCAST);
-    }
-
-    /// Step the stack at `now`: process every buffered inbound frame, then
-    /// emit whatever the interface has to send. Both drain to quiescence, so
-    /// one call is one full turn of the stack.
+    /// Step the stack at `now`: take every inbound frame off the device's
+    /// channel and answer it, then emit whatever the interface has to send.
+    /// Both drain to quiescence, so one call is one full turn of the stack.
+    /// This is the only consumer of the inbound channel: the peer's poll task
+    /// calls it and never drains the channel itself.
     pub fn poll(&mut self, now: Instant) {
         while let Ok(frame) = self.device.rx.try_recv() {
             self.handle_frame(&frame);
         }
         self.iface.poll(now, &mut self.device, &mut self.sockets);
+    }
+
+    /// Whether the lane feeding the device has closed: every inbound sender
+    /// is gone, so no frame will ever arrive and the stack has nothing left
+    /// to serve.
+    fn lane_closed(&self) -> bool {
+        self.device.rx.is_closed()
     }
 
     fn handle_frame(&mut self, frame: &[u8]) {
@@ -549,7 +552,7 @@ impl BepPeer {
     /// socket at `switch_sock`.
     ///
     /// The peer dials the switch, upgrades the connection with the HyperKit
-    /// `/connect` request, sends one gratuitous ARP, and then runs three
+    /// `/connect` request, announces nothing, and then runs three
     /// cooperating tasks:
     ///
     /// - a socket reader that reads length-framed Ethernet frames from the
@@ -607,14 +610,15 @@ impl BepPeer {
         pumps.spawn(async move {
             let mut len_buf = [0u8; 2];
             loop {
-                match read_half.read(&mut len_buf).await {
-                    Ok(0) => return,
-                    Ok(2) => {}
-                    Ok(_) => {
-                        // A short length read means the socket is closing.
+                // The prefix may arrive one byte at a time on a healthy
+                // stream; only a clean end of stream ends the pump.
+                match read_half.read_exact(&mut len_buf).await {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "box egress proxy peer: switch socket read failed");
                         return;
                     }
-                    Err(_) => return,
                 }
                 let len = u16::from_le_bytes(len_buf) as usize;
                 if len == 0 || len > usize::from(DEFAULT_MTU) + 14 + 4 {
@@ -668,7 +672,6 @@ impl BepPeer {
                 .expect("current-thread runtime for BepHost");
             rt.block_on(async move {
                 let mut host = BepHost::new(device, subnet, proxy_ip);
-                host.announce();
                 host.poll(Instant::from_millis(0));
 
                 let start = tokio::time::Instant::now();
@@ -681,17 +684,16 @@ impl BepPeer {
                         // that spawned this blocking task can shut down.
                         _ = &mut stop_rx => break,
                     }
-                    loop {
-                        match host.device.rx.try_recv() {
-                            Ok(frame) => host.device.pending.push_back(frame),
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                            // The reader pump is gone and no frame will ever
-                            // arrive: the interface has nothing left to serve.
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
-                        }
-                    }
+                    // `poll` is the one consumer of the inbound channel: it
+                    // takes the frames the reader pump enqueued and answers
+                    // them. Draining the channel here would starve it.
                     let elapsed = start.elapsed().as_millis() as i64;
                     host.poll(Instant::from_millis(elapsed));
+                    if host.lane_closed() {
+                        // The reader pump is gone and no frame will ever
+                        // arrive: the interface has nothing left to serve.
+                        return;
+                    }
                 }
             });
         });
@@ -1048,5 +1050,143 @@ mod tests {
             .await
             .expect("read after peer drop should not error");
         assert_eq!(n, 0, "peer socket must close when the peer is dropped");
+    }
+
+    /// NET-132: no socket is bound on the peer in this task. The stack's
+    /// socket set is empty at build time and stays empty across a turn that
+    /// answered a segment and a datagram: a TCP segment is reset and a UDP
+    /// datagram gets port-unreachable because nothing listens, not because a
+    /// socket refused them. T69 is the only task that may bind one.
+    #[test]
+    fn peer_binds_no_socket() {
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let (device, mut ends) = BepDevice::pair();
+        let mut host = BepHost::new(device, subnet, proxy_ip);
+        assert_eq!(host.sockets.iter().count(), 0, "no socket at build time");
+
+        let peer_ip = Ipv4Addr::from(subnet.first_ptask());
+        ends.inbound
+            .send(tcp_syn(peer_ip, proxy_ip, 1234, 443))
+            .unwrap();
+        ends.inbound
+            .send(udp_datagram(peer_ip, proxy_ip, 1234, 53, b"query"))
+            .unwrap();
+        host.poll(Instant::from_millis(0));
+        assert_eq!(
+            host.sockets.iter().count(),
+            0,
+            "answering traffic binds no socket"
+        );
+        // Both answers went out, from the one path that handles frames.
+        assert!(ends.outbound.try_recv().is_ok());
+        assert!(ends.outbound.try_recv().is_ok());
+    }
+
+    /// A stand-in for the switch's `-listen` socket: bound at `sock`, it
+    /// accepts the peer's one connection, checks the upgrade head and hands
+    /// back the raw frame stream the switch would carry.
+    async fn stand_in_switch(sock: &Path) -> tokio::task::JoinHandle<tokio::net::UnixStream> {
+        let listener = tokio::net::UnixListener::bind(sock).expect("bind stand-in switch socket");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("peer connected");
+            let mut head = vec![0u8; super::CONNECT_REQUEST.len()];
+            stream
+                .read_exact(&mut head)
+                .await
+                .expect("read upgrade head");
+            assert_eq!(&head, super::CONNECT_REQUEST);
+            stream
+        })
+    }
+
+    /// Read one length-framed Ethernet frame off the stand-in switch stream.
+    async fn read_framed(stream: &mut tokio::net::UnixStream) -> Vec<u8> {
+        let mut len_buf = [0u8; 2];
+        stream
+            .read_exact(&mut len_buf)
+            .await
+            .expect("read the length prefix");
+        let mut frame = vec![0u8; usize::from(u16::from_le_bytes(len_buf))];
+        stream.read_exact(&mut frame).await.expect("read the frame");
+        frame
+    }
+
+    /// NET-132: the peer is silent until addressed. Across an interval that
+    /// covers several poll periods, an idle peer writes nothing onto the
+    /// switch socket: no gratuitous ARP at attach, no probe, nothing.
+    #[tokio::test]
+    async fn idle_peer_emits_no_frames() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("switch.sock");
+        let accept_fut = stand_in_switch(&sock).await;
+
+        let peer = BepPeer::spawn(&sock, SwitchSubnet::default())
+            .await
+            .expect("peer spawns against a listening switch socket");
+        let mut switch = accept_fut.await.expect("acceptor task completed");
+
+        // Five poll periods: long enough for any announcement or probe the
+        // stack might schedule at attach to have been written.
+        let mut buf = [0u8; 64];
+        let read = tokio::time::timeout(POLL_DELAY * 5, switch.read(&mut buf)).await;
+        assert!(
+            read.is_err(),
+            "the idle peer wrote {:?} onto the switch socket",
+            read.map(|n| n.map(|n| buf[..n].to_vec()))
+        );
+        drop(peer);
+    }
+
+    /// NET-132 over the production path: the real [`BepPeer`] — reader pump,
+    /// poll task, writer pump — answers an ARP request for the proxy address
+    /// that arrives length-framed on the switch socket, and the reply comes
+    /// back length-framed on the same socket, addressed to the asking box.
+    /// The length prefix is written one byte at a time so a short read of it
+    /// cannot end the peer.
+    #[tokio::test]
+    async fn spawned_peer_answers_arp_over_the_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("switch.sock");
+        let accept_fut = stand_in_switch(&sock).await;
+
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let proxy_mac = EthernetAddress(MacAddr::for_switch_ip(proxy_ip).0);
+        let peer = BepPeer::spawn(&sock, subnet)
+            .await
+            .expect("peer spawns against a listening switch socket");
+        let mut switch = accept_fut.await.expect("acceptor task completed");
+
+        let box_ip = Ipv4Addr::from(subnet.first_ptask());
+        let box_mac = EthernetAddress(MacAddr::for_switch_ip(box_ip).0);
+        let request = arp_request(box_mac, box_ip, proxy_ip);
+        let len = u16::try_from(request.len()).unwrap().to_le_bytes();
+        switch.write_all(&len[..1]).await.unwrap();
+        switch.flush().await.unwrap();
+        tokio::time::sleep(POLL_DELAY).await;
+        switch.write_all(&len[1..]).await.unwrap();
+        switch.write_all(&request).await.unwrap();
+        switch.flush().await.unwrap();
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut switch))
+            .await
+            .expect("the peer answered within five seconds");
+        let frame = EthernetFrame::new_checked(&reply).expect("reply is ethernet");
+        assert_eq!(frame.dst_addr(), box_mac);
+        assert_eq!(frame.src_addr(), proxy_mac);
+        assert_eq!(frame.ethertype(), EthernetProtocol::Arp);
+        let arp = ArpPacket::new_checked(frame.payload()).unwrap();
+        assert_eq!(
+            ArpRepr::parse(&arp).unwrap(),
+            ArpRepr::EthernetIpv4 {
+                operation: ArpOperation::Reply,
+                source_hardware_addr: proxy_mac,
+                source_protocol_addr: proxy_ip,
+                target_hardware_addr: box_mac,
+                target_protocol_addr: box_ip,
+            }
+        );
+        drop(peer);
     }
 }
