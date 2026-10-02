@@ -33,11 +33,14 @@
 //! loads the table, and a host missing any of that decides nothing per box
 //! — its host-address boxes run unenforced, never refused (NET-079's
 //! exception), with the cause named at session start and the install
-//! command printed only when the missing step is the cause.
+//! command printed only when the missing step is the cause. The guest is
+//! the one exception to that exception: its daemon is the only one that
+//! could have made its image load the table, so until it does, a deny-all
+//! host-address box is refused rather than run on a refusal that is not
+//! there (design §7.1) — and no installer exists for a person to run, so
+//! none is named.
 
 use std::net::Ipv4Addr;
-#[cfg(test)]
-use std::net::SocketAddr;
 use std::path::Path;
 
 use sandbox2::config::Verdict;
@@ -50,22 +53,6 @@ use sandbox2::config::Verdict;
 /// host's own services and its forwarding resolver listen, and admitting a
 /// deny-all box to them would admit it to everything upstream.
 pub(crate) const ANSWERER_ADDRESS: Ipv4Addr = Ipv4Addr::LOCALHOST;
-
-/// The one destination a deny-all host-address box's connections are
-/// admitted to (NET-079): the resolver Minimal owns for it, at that
-/// resolver's own address *and port*. An address alone would be the
-/// loopback baseline exception design §4.1 rejects; a port alone is nothing
-/// a packet can match. `port` is the answerer's own — the port the daemon
-/// serves the box zone on, the same one the privileged step's
-/// `--answerer-port` names in the rule that admits it.
-///
-/// Test-only: the destination is pinned as data (below), because it is the
-/// installer's rule that enforces it, not the daemon — nothing in the
-/// daemon builds one at runtime.
-#[cfg(test)]
-pub(crate) fn answerer_destination(port: u16) -> SocketAddr {
-    SocketAddr::new(std::net::IpAddr::V4(ANSWERER_ADDRESS), port)
-}
 
 /// Which cohort subtree `declaration` places a box's leaf in (NET-079): the
 /// deny subtree is for the declaration that admits no destination — the one
@@ -109,6 +96,13 @@ pub enum Cause {
     /// refuses to install over a tree no cgroup2 covers — so none is
     /// named.
     CannotConfine,
+    /// The guest's boot has not loaded the deny table: the tree and the
+    /// table were this guest image's own to build — there is no privileged
+    /// step a person can run inside a microVM, and the person to tell is
+    /// the image's builder, not whoever is holding the session. A deny-all
+    /// host-address box is refused on this ground rather than placed in a
+    /// leaf that decides nothing, so no command is named.
+    GuestTableNotLoaded,
 }
 
 impl Cause {
@@ -123,17 +117,23 @@ impl Cause {
                 "no cgroup2 mount with nsdelegate covers the classifier tree, so a \
                  box could migrate out of its leaf"
             }
+            Self::GuestTableNotLoaded => {
+                "this guest image has not loaded the classifier's packet-filter \
+                 table, so no per-box verdict is decided in it"
+            }
         }
     }
 
     /// The exact command that ends this cause, when one can: the step's
     /// install when the step is what is missing — NET-079 names that one —
     /// and nothing for a host that cannot confine a box, because installing
-    /// the step over that tree would leave the cause standing.
+    /// the step over that tree would leave the cause standing, or for a
+    /// guest whose table its own image never loaded, because the person to
+    /// tell is the image's builder and no installer exists there.
     pub fn install_command(self) -> Option<String> {
         match self {
             Self::StepNotInstalled => Some(sandbox2::classifier::install_hint()),
-            Self::CannotConfine => None,
+            Self::CannotConfine | Self::GuestTableNotLoaded => None,
         }
     }
 }
@@ -149,9 +149,10 @@ pub struct Decision {
 }
 
 impl Decision {
-    /// A host that decides per box. The guest's answer: its daemon is the
-    /// microVM's pid 1, the tree it mounts is its own, and a box it cannot
-    /// place is refused at launch rather than advised about.
+    /// A host that decides per box: its covering cgroup2 confines, the
+    /// cohort's subtrees are delegated, and the loaded table's presence
+    /// marker is there — the three facts a verdict needs to be decided
+    /// *on* something, guest or native alike.
     pub fn decided() -> Self {
         Self {
             decided: true,
@@ -196,19 +197,21 @@ const DELEGATION_FILES: [&str; 3] = ["cgroup.procs", "cgroup.threads", "cgroup.s
 /// `nft -f` transaction succeeded. Nothing here needs `CAP_NET_ADMIN` or
 /// writes a byte: the step's own `--pid` half and the launch's placement
 /// probe decide what only a migration can.
+///
+/// The guest answers the same three questions, and for the same reason:
+/// its daemon is the microVM's pid 1, so the tree it mounts and the table
+/// its image loads are its own boot's work — and reporting a guest as
+/// decided while its table is not loaded would place a deny-all box in a
+/// leaf that decides nothing while looking decided, on the one host whose
+/// image is the fix. The guest's cause is named for the image's builder:
+/// no installer exists inside a microVM, so no command is named for it.
 pub fn decide(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision {
-    // The guest's tree is its own boot's work, and a box it cannot place is
-    // refused at launch (design §7.1): a host-shaped start-time fact about a
-    // step this image has no installer for would advise a person who is not
-    // there, and never the image's own builder.
-    if guest {
-        return Decision::decided();
-    }
     // The confinement half first: without `nsdelegate` a cgroup namespace
     // is not a delegation boundary, so no leaf under this tree confines a
-    // process however installed — the cause no command clears. A mount
-    // table that cannot be read is the same absence of evidence, and the
-    // check may not report a host as confining on no evidence.
+    // process however installed — the cause no command clears, on either
+    // kind of host. A mount table that cannot be read is the same absence
+    // of evidence, and the check may not report a host as confining on no
+    // evidence.
     let confining = sandbox2::classifier::cgroup2_covering(root, mountinfo.unwrap_or(""))
         .is_some_and(|(_, nsdelegate)| nsdelegate);
     if !confining {
@@ -216,9 +219,16 @@ pub fn decide(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision {
     }
     // The step's half: the cohort's two subtrees — a box's leaf is always
     // in one of them, so one missing is the whole step missing — and the
-    // marker the loaded table's presence rests on.
+    // marker the loaded table's presence rests on. Natively that is the
+    // step a person can run, so its cause names the install; in the guest
+    // it is the image's own half, so its cause names the table and nothing
+    // can be run.
     if !subtrees_delegated(root) || !table_marker_present(root) {
-        return Decision::undecidable(Cause::StepNotInstalled);
+        return Decision::undecidable(if guest {
+            Cause::GuestTableNotLoaded
+        } else {
+            Cause::StepNotInstalled
+        });
     }
     Decision::decided()
 }
@@ -273,6 +283,95 @@ pub(crate) fn recorded() -> Decision {
     )
 }
 
+/// The two source identities the ruleset tests render the installer's
+/// table with: any two distinct addresses would do, and these are the
+/// installer's own harness pair, so a rule named here is spelled the way
+/// the step's own tests spell it.
+#[cfg(test)]
+pub(crate) const TEST_COHORT_ADDRESS: &str = "100.72.0.9";
+#[cfg(test)]
+pub(crate) const TEST_NODE_PLANE_ADDRESS: &str = "100.72.0.1";
+
+/// The installer's rendered table, exactly as a host loads it, over a
+/// stand-in tree the caller never sees: the privileged step's
+/// `--print-ruleset` mode prints the transaction its install would hand
+/// `nft -f`, with the cgroup paths and match levels derived from the same
+/// mount facts an install reads. Reading the step's own output — rather
+/// than restating its rules here — is what makes the tests below pin what
+/// a host actually loads.
+#[cfg(test)]
+pub(crate) fn rendered_ruleset() -> String {
+    let scratch = tempfile::tempdir().expect("a temp dir standing in for the cgroup2 mount");
+    // The tree root named as the production one is: the slice under its
+    // own mount, so the cgroup paths the rendered rules name are the ones
+    // they name on a real host.
+    let mountpoint = scratch.path().join("cgroup");
+    let root = mountpoint.join(
+        std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+            .file_name()
+            .expect("the tree root is a slice below the cgroup2 mount root"),
+    );
+    std::fs::create_dir_all(&root).expect("the print mode's mount covers the tree root");
+    let mountinfo = scratch.path().join("mountinfo");
+    std::fs::write(
+        &mountinfo,
+        format!(
+            "35 30 0:26 / {} rw,relatime shared:2 - cgroup2 cgroup2 rw,nsdelegate\n",
+            mountpoint.display(),
+        ),
+    )
+    .expect("writing the stand-in mount table");
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/install-host-classifier.sh");
+    let printed = std::process::Command::new("bash")
+        .env("MINIMAL_OVERRIDE_CGROUP_MOUNTINFO", &mountinfo)
+        .arg(script)
+        .arg("--print-ruleset")
+        .arg("--root")
+        .arg(&root)
+        .arg("--cohort-address")
+        .arg(TEST_COHORT_ADDRESS)
+        .arg("--node-plane-address")
+        .arg(TEST_NODE_PLANE_ADDRESS)
+        .output()
+        .expect("running the privileged step's print mode");
+    assert!(
+        printed.status.success(),
+        "the step's print mode renders its ruleset: {}",
+        String::from_utf8_lossy(&printed.stderr),
+    );
+    String::from_utf8(printed.stdout).expect("the rendered ruleset is text")
+}
+
+/// The rules of one chain in a rendered ruleset, in the order the table
+/// loads them, indentation-trimmed: the chains are the whole story of a
+/// verdict — what the output chain routes, what `deny_out` admits, what
+/// postrouting translates — and reading them by name is how the tests
+/// below pin each one. The chain's own `type … hook …` declaration is
+/// plumbing, not a rule, and is not included.
+#[cfg(test)]
+pub(crate) fn chain_rules<'a>(ruleset: &'a str, chain: &str) -> Vec<&'a str> {
+    let mut rules = Vec::new();
+    let mut inside = false;
+    for line in ruleset.lines() {
+        let line = line.trim_start();
+        if line.starts_with("chain ") {
+            inside = line.starts_with(&format!("chain {chain} "));
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if line == "}" {
+            break;
+        }
+        if !line.is_empty() && !line.starts_with("type ") {
+            rules.push(line);
+        }
+    }
+    rules
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +391,15 @@ mod tests {
                 "memory_recursiveprot"
             }
         )
+    }
+
+    /// The tree root's own name — the component the installer renders a
+    /// ruleset's cgroup paths below their covering mount from.
+    fn tree_root_name() -> &'static str {
+        std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("the tree root is a slice below the cgroup2 mount root")
     }
 
     /// The cohort the step installs: both subtrees with their
@@ -384,6 +492,49 @@ mod tests {
             [sandbox2::config::ALLOW_DIR, sandbox2::config::DENY_DIR],
             "the cohort holds the two subtrees and nothing else"
         );
+
+        // The rendered table's postrouting chain is that layout made
+        // real: the cohort's rule keys on `boxes/` — one match level over
+        // both subtrees, covering every box leaf and no node-plane leaf —
+        // with the cohort's identity, and the node plane's keys on the
+        // slice with its own, so the daemon's traffic leaves as the node
+        // plane and a box's leaves as the cohort. The cohort's rule comes
+        // first, because a slice-wide match would otherwise swallow it; the
+        // loopback guard keeps a packet to the answerer, which never
+        // leaves the host, from being rewritten on its own way there. The
+        // identities are the ones the step was told, not ones it guessed:
+        // it refuses to render the pair half-done.
+        let rel = tree_root_name();
+        let cohort_path = format!("{}/{}", rel, sandbox2::classifier::BOXES_DIR);
+        let ruleset = rendered_ruleset();
+        let postrouting = chain_rules(&ruleset, "postrouting");
+        let cohort_rule = format!(
+            "socket cgroupv2 level {} \"{}\" oifname != \"lo\" snat ip to {}",
+            cohort_path.split('/').count(),
+            cohort_path,
+            TEST_COHORT_ADDRESS
+        );
+        let node_plane_rule = format!(
+            "socket cgroupv2 level {} \"{}\" oifname != \"lo\" snat ip to {}",
+            rel.split('/').count(),
+            rel,
+            TEST_NODE_PLANE_ADDRESS
+        );
+        assert_eq!(
+            postrouting.first(),
+            Some(&cohort_rule.as_str()),
+            "the cohort's rule is first, keyed on the cohort at its own level: {postrouting:?}"
+        );
+        assert_eq!(
+            postrouting.get(1),
+            Some(&node_plane_rule.as_str()),
+            "the node plane's rule follows, keyed on the slice with its own identity: {postrouting:?}"
+        );
+        assert_eq!(
+            postrouting.len(),
+            2,
+            "nothing else is source-translated: no per-box rule, no uid, no pid: {postrouting:?}"
+        );
     }
 
     /// NET-079: a box declared deny-all is placed under the subtree whose
@@ -456,79 +607,117 @@ mod tests {
             ),
             "the deny-all box's leaf is in the deny subtree alone"
         );
+
+        // The rendered table is what makes the subtree mean refusal, and
+        // the whole placement above is what makes it mean it for *this*
+        // box: the filter output chain routes every socket the deny
+        // subtree holds — the box's leaf's own parent, so the box and
+        // every process it forks, which inherit the cgroup and cannot
+        // fork their way out — to `deny_out`, at the subtree's own depth
+        // in the hierarchy.
+        let rel = tree_root_name();
+        let deny_subtree = format!(
+            "{}/{}/{}",
+            rel,
+            sandbox2::classifier::BOXES_DIR,
+            sandbox2::config::DENY_DIR
+        );
+        let ruleset = rendered_ruleset();
+        let output = chain_rules(&ruleset, "output");
+        let jump = format!(
+            "socket cgroupv2 level {} \"{}\" jump deny_out",
+            deny_subtree.split('/').count(),
+            deny_subtree
+        );
+        assert!(
+            output.contains(&jump.as_str()),
+            "the output chain matches the deny subtree at its own level and \
+             routes it to deny_out: {output:?}"
+        );
+        // The refusal is total on new connections and active on every
+        // one: the chain ends in a rejection, and nothing in it drops —
+        // a silent drop would hide the refused connections from a
+        // diagnostics bundle's daemon log, the one place a person reads
+        // them.
+        let deny_out = chain_rules(&ruleset, "deny_out");
+        assert_eq!(
+            deny_out.last(),
+            Some(&"reject with icmpx admin-prohibited"),
+            "the deny chain ends in an active refusal: {deny_out:?}"
+        );
+        assert!(
+            deny_out.iter().all(|rule| !rule.contains("drop")),
+            "nothing in the deny chain drops: {deny_out:?}"
+        );
     }
 
     /// NET-079: the one carve-out from a deny-all verdict is the address
     /// and port of the resolver Minimal owns for the box — one destination,
     /// not the loopback, and not the host's own resolver at DNS's port.
+    /// Read off the table a host actually loads, because that table is the
+    /// carve-out: a wider rule here is a wider rule in the box, and the
+    /// daemon's own constants — the address the answerer serves at, the
+    /// port it serves on — are what the rendered default must equal, not
+    /// numbers restated beside them.
     #[test]
     fn host_ip_deny_all_reaches_only_the_answerer() {
-        let answerer = answerer_destination(crate::net::answerer::ANSWERER_PORT);
-        assert_eq!(
-            answerer,
-            SocketAddr::new(
-                std::net::IpAddr::V4(ANSWERER_ADDRESS),
-                crate::net::answerer::ANSWERER_PORT
-            ),
-            "the carve-out is the answerer's own address and port"
+        let ruleset = rendered_ruleset();
+        let deny_out = chain_rules(&ruleset, "deny_out");
+
+        // The answerer is admitted at its own address *and* port — the
+        // destination the daemon serves the box zone from, so the rule a
+        // host loads without asking names the same one the daemon answers
+        // on. An address alone is the loopback baseline exception design
+        // §4.1 rejects; a port alone matches anything on it.
+        let answerer = format!(
+            "ip daddr {ANSWERER_ADDRESS} udp dport {} accept",
+            crate::net::answerer::ANSWERER_PORT
         );
-        // Whether a destination is admitted is one comparison, so nothing
-        // wider can creep in: an address alone is the loopback baseline
-        // exception design §4.1 rejects, and a port alone matches anything
-        // on it.
-        let admitted = |destination: SocketAddr| destination == answerer;
         assert!(
-            admitted(answerer),
-            "the resolver Minimal owns for the box is admitted"
+            deny_out.contains(&answerer.as_str()),
+            "the deny chain admits the answerer at its own address and port: {deny_out:?}"
         );
-        for (destination, why) in [
-            (
-                SocketAddr::new(
-                    std::net::IpAddr::V4(ANSWERER_ADDRESS),
-                    crate::net::answerer::ANSWERER_PORT + 1,
-                ),
-                "the right address at the wrong port",
-            ),
-            (
-                SocketAddr::new(std::net::IpAddr::V4(ANSWERER_ADDRESS), 53),
-                "the host's own resolver, at DNS's port",
-            ),
-            (
-                SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 53),
-                "any other loopback service",
-            ),
-            (
-                SocketAddr::new(
-                    std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
-                    crate::net::answerer::ANSWERER_PORT,
-                ),
-                "another loopback address, at the answerer's port",
-            ),
-            (
-                SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
-                "an outside destination",
-            ),
-        ] {
-            assert!(
-                !admitted(destination),
-                "{why} is not admitted: only the answerer's address and port is ({destination})"
-            );
-        }
+
+        // And nothing else is: the chain's accepts are the conntrack one —
+        // a flow already admitted stays in on its own conntrack state —
+        // and the answerer's. Every other destination a deny-all box's
+        // connections can name meets the rejection at the chain's end,
+        // which is what makes the carve-out the *only* thing the box
+        // reaches.
+        let accepts: Vec<&str> = deny_out
+            .iter()
+            .filter(|rule| rule.ends_with("accept"))
+            .copied()
+            .collect();
+        assert_eq!(
+            accepts,
+            ["ct state established,related accept", answerer.as_str()],
+            "the deny chain's only non-established accept is the answerer: {deny_out:?}"
+        );
+        assert!(
+            !deny_out
+                .iter()
+                .any(|rule| rule.contains("127.0.0.1") && !rule.contains(&answerer)),
+            "no rule admits the loopback wide: {deny_out:?}"
+        );
     }
 
-    /// NET-079: on a host that cannot decide per box, session start names
-    /// the cause, prints the exact install command only when the missing
-    /// step is the cause, and never asks anything. The daemon's half of
-    /// that is what the create response carries, so the cause and the
-    /// command are pinned here as data.
+    /// The start-time check names the cause, and the cause names the
+    /// remedy — or says, by naming none, that there is not one to run:
+    /// the step's own install ends the step-not-installed cause on a
+    /// native host (NET-079 names that one), while a host that cannot
+    /// confine a box and a guest whose image never loaded the table have
+    /// no command, because running one would leave each cause standing.
+    /// The cause and the command are the daemon's start-time facts, spelled
+    /// once in [`Cause`], so they are pinned here as data.
     #[test]
-    fn native_host_advises_classifier_install_without_prompt() {
+    fn decide_names_the_cause_and_the_command_that_ends_it() {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
         let root = tree.path();
 
         // A host whose cgroup2 covers the tree without `nsdelegate` cannot
-        // confine a box, and the advisory names that — never the install
-        // command, which would leave the cause standing.
+        // confine a box, whatever kind of host it is — the cause is the
+        // confinement, on native and guest alike, and no command ends it.
         let undelegated = decide(root, Some(&mountinfo(root, false)), false);
         assert!(
             !undelegated.can_decide_per_box(),
@@ -540,10 +729,10 @@ mod tests {
             cause.install_command().is_none(),
             "no install command is named for a host that cannot confine a box"
         );
-        assert!(
-            !cause.detail().contains('?'),
-            "the cause is a fact, never a question: {}",
-            cause.detail()
+        assert_eq!(
+            decide(root, Some(&mountinfo(root, false)), true).cause(),
+            Some(Cause::CannotConfine),
+            "the guest answers the confinement question the same way"
         );
 
         // A confining host with no step installed names the step, with the
@@ -568,37 +757,69 @@ mod tests {
             command.starts_with("sudo "),
             "the command is the one a person runs, spelled exactly: {command}"
         );
-        assert!(
-            !cause.detail().contains('?') && !command.contains('?'),
-            "an advisory never asks a question — it names a command: {} / {command}",
-            cause.detail()
-        );
 
-        // A host with both halves decides per box, and advises nothing: the
-        // absence of an advisory is the fact a decided host reports.
-        installed_cohort(root);
-        let decided = decide(root, Some(&mountinfo(root, true)), false);
-        assert!(
-            decided.can_decide_per_box(),
-            "a confining host with the step installed decides per box"
-        );
+        // The same shape in a guest names its own image's half instead:
+        // the tree and the table were its boot's work, so a missing table
+        // is a broken image rather than a deployment state, and no
+        // installer exists inside a microVM — no command is named for a
+        // person who cannot run one.
+        let guest_unloaded = decide(root, Some(&mountinfo(root, true)), true);
         assert_eq!(
-            decided.cause(),
-            None,
-            "a decided host names no cause, so session start prints nothing"
+            guest_unloaded.cause(),
+            Some(Cause::GuestTableNotLoaded),
+            "the guest's missing table is its image's own half"
+        );
+        assert!(
+            !guest_unloaded.can_decide_per_box(),
+            "a guest whose table is not loaded decides nothing per box, \
+             whatever its tree looks like"
+        );
+        assert!(
+            guest_unloaded
+                .cause()
+                .expect("the cause is named")
+                .install_command()
+                .is_none(),
+            "no install command is named inside a guest"
         );
 
-        // The marker alone is what says the table is loaded: a host with the
-        // subtrees but no marker has no refusal installed, and a deny-all
-        // box there would run as though refused when nothing is.
+        // The marker alone is what says the table is loaded: a host with
+        // the subtrees but no marker has no refusal installed, and a
+        // deny-all box there would run as though refused when nothing is
+        // — for a guest, that is the state a launch refuses rather than
+        // places (design §7.1).
+        installed_cohort(root);
         std::fs::remove_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
             .expect("removing the marker");
-        let no_table = decide(root, Some(&mountinfo(root, true)), false);
         assert_eq!(
-            no_table.cause(),
+            decide(root, Some(&mountinfo(root, true)), false).cause(),
             Some(Cause::StepNotInstalled),
-            "the table's marker is the step's half too"
+            "the table's marker is the step's half too, on the native host"
         );
+        assert_eq!(
+            decide(root, Some(&mountinfo(root, true)), true).cause(),
+            Some(Cause::GuestTableNotLoaded),
+            "and the guest's subtrees alone do not decide anything per box \
+             in it either"
+        );
+
+        // A host with both halves decides per box, guest or native: the
+        // marker is what the decision rests on, and the guest's own boot
+        // is the one step that can write it there.
+        std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+            .expect("the step writes the table's marker");
+        for (kind, guest) in [("native", false), ("guest", true)] {
+            let decided = decide(root, Some(&mountinfo(root, true)), guest);
+            assert!(
+                decided.can_decide_per_box(),
+                "a confining {kind} host with the step installed decides per box"
+            );
+            assert_eq!(
+                decided.cause(),
+                None,
+                "a decided {kind} host names no cause"
+            );
+        }
     }
 
     /// The recorded decision answers a create from the fact the start block

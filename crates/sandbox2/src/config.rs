@@ -1,6 +1,7 @@
 use crate::network::{NetPlan, Network};
 use crate::{Error, Sandbox};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::OsStr;
 use std::fs;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
@@ -317,6 +318,25 @@ impl ClassifierLeaf {
             .strip_prefix(self.tree_root())
             .map(Path::to_path_buf)
             .unwrap_or_else(|_| self.dir.clone())
+    }
+
+    /// Whether this leaf sits in the [`DENY_DIR`] subtree — i.e. whether the
+    /// box it places was declared deny-all. A leaf's verdict is a property of
+    /// the path the daemon placed it at ([`Verdict::dir_name`]), so this reads
+    /// it back off the path rather than being told: the caller that knows a
+    /// leaf's *directory* (an argv option, a log line) knows its box's verdict
+    /// without a second field to keep in step.
+    ///
+    /// A path whose parent is neither subtree — a leaf squatted directly
+    /// under the cohort, or a directory that is not a leaf at all — answers
+    /// `false`: it is not a deny-all box's leaf, so nothing about it warrants
+    /// the fatal handling that spelling carries.
+    #[must_use]
+    pub fn is_deny(&self) -> bool {
+        self.dir
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == OsStr::new(DENY_DIR))
     }
 }
 
@@ -1102,5 +1122,26 @@ mod tests {
                  constructor's, so no caller can spell a leaf the cohort owns"
             );
         }
+    }
+
+    /// A leaf's verdict reads back off its path: the caller that knows the
+    /// directory knows which subtree its box was placed in — the spelling the
+    /// injection shim's fatal join is keyed on (a deny-all box's leaf cannot
+    /// be joined non-fatally, NET-079).
+    #[test]
+    fn a_leaf_is_deny_only_when_its_parent_is_the_deny_subtree() {
+        assert!(
+            ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/deny/b1").is_deny(),
+            "a leaf in the deny subtree belongs to a deny-all box"
+        );
+        assert!(
+            !ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/allow/b1").is_deny(),
+            "a leaf in the allow subtree is every other box"
+        );
+        assert!(
+            !ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/b1").is_deny(),
+            "a leaf squatted directly under the cohort is in neither subtree, \
+             so it is not a deny-all box's leaf however it got there"
+        );
     }
 }

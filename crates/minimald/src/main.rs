@@ -684,9 +684,12 @@ async fn async_main() -> Result<(), MainError> {
     // table's marker) change only when a person acts on this host, and
     // recorded so the create response and session start advise with the
     // same cause. The one info line a host that cannot decide per box owes
-    // names the cause, so the daemon's log carries what a session's start is
-    // about to tell the person in the terminal — and stays quiet on a host
-    // that decides, which is not a state to report.
+    // names the cause, and the exact command that ends it when one can —
+    // the step's install for a host without the step, nothing for a host
+    // that cannot confine a box or a guest whose image never loaded the
+    // table — so the daemon's log carries what a session's start is about
+    // to tell the person in the terminal, and stays quiet on a host that
+    // decides, which is not a state to report.
     let classifier_decision = minimald::net::classifier::decide(
         tree_root,
         sandbox2::classifier::own_mountinfo().as_deref(),
@@ -696,6 +699,7 @@ async fn async_main() -> Result<(), MainError> {
         tracing::info!(
             tree = sandbox2::classifier::TREE_ROOT,
             cause = cause.detail(),
+            install = ?cause.install_command(),
             host_ip_enforcement = "none",
             "this host cannot decide a host-address box's egress verdict \
              per box, so its host-address boxes run unenforced"

@@ -951,21 +951,6 @@ pub mod classifier {
         }
     }
 
-    /// The command a person runs on this host to move *this daemon* into the
-    /// tree its boxes are placed in: the installer's `--pid` step is the one
-    /// migration the delegated account cannot make itself, so the hint names
-    /// this daemon's pid — the one fact the person cannot guess and the
-    /// advisory that carries the hint would otherwise have to name a
-    /// placeholder for.
-    #[cfg(target_os = "linux")]
-    #[must_use]
-    pub fn place_hint() -> String {
-        format!(
-            "sudo scripts/install-host-classifier.sh --pid {}",
-            std::process::id()
-        )
-    }
-
     /// Makes one level of the classifier layout, taking `AlreadyExists` as
     /// success: more than one hand builds the layout — the installer's,
     /// a previous daemon's, this entry's own on a restart — and a level is
