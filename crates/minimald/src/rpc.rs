@@ -3122,9 +3122,10 @@ mod tests {
         // answerer and its port — the one fact the replies carry — that
         // native DNS waits on the host's resolver before it is the live
         // surface there, that `min ls` reports the host's verdict, and the
-        // proxy's half beside it. The assertions read the message, not the
-        // fields, whose quoting is the subscriber's business — except the
-        // one field the daemon's half is, which a bundle's reader greps.
+        // proxy's half beside it. The assertions read the message, plus the
+        // two fields a bundle's reader greps (`answerer_bound`,
+        // `proxy_serves`); the rest of the field quoting is the
+        // subscriber's business.
         let log = log.contents();
         let answerer_line = log
             .lines()
