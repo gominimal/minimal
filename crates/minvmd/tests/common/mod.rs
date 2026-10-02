@@ -48,15 +48,18 @@ locked_commit = "f4de33d06dada4edcf5076dded10e9c303cf597e"
 /// spawns `minvmd boot --foreground` makes it a group leader
 /// (`process_group(0)`) so its `__krun-vmm` child dies with it: killing the
 /// parent alone reparents the VMM to init, where it keeps the VM running and
-/// holds the harness's inherited stdio open.
+/// holds the harness's inherited stdio open. The parent is also killed
+/// directly, so the reap cannot block on a group signal that missed.
 #[expect(
     clippy::let_underscore_must_use,
     reason = "best-effort teardown: the group may already be gone"
 )]
 pub fn kill_group(child: &mut Child) {
-    let _ = Command::new("kill")
-        .args(["-KILL", &format!("-{}", child.id())])
-        .status();
+    let pgid = libc::pid_t::try_from(child.id()).expect("a child pid fits pid_t");
+    // SAFETY: killpg only sends a signal; `pgid` is the group `child` leads,
+    // and `child` is not reaped yet, so its id cannot have been reused.
+    unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    let _ = child.kill();
     let _ = child.wait();
 }
 
