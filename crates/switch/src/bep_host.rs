@@ -365,6 +365,12 @@ impl BepHost {
             Ok(tcp) => tcp,
             Err(_) => return,
         };
+        // RFC 9293 section 3.5.2: a reset is never sent in response to a
+        // segment that carries RST. The segment is dropped before any reset
+        // field is computed, so it leaves no frame and no log line behind.
+        if tcp.rst() {
+            return;
+        }
         let seq = tcp.seq_number();
         let ack = tcp.ack_number();
         let (rst_seq, rst_ack, rst_ack_set) = if tcp.ack() {
@@ -619,9 +625,17 @@ impl BepPeer {
             loop {
                 // The prefix may arrive one byte at a time on a healthy
                 // stream; only a clean end of stream ends the pump.
+                // Every return below ends the peer for the rest of the
+                // switch's life (nothing restarts it), so each one says why.
                 match read_half.read_exact(&mut len_buf).await {
                     Ok(_) => {}
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return,
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        tracing::warn!(
+                            reason = "eof",
+                            "box egress proxy peer: switch socket closed; reader pump stopped"
+                        );
+                        return;
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "box egress proxy peer: switch socket read failed");
                         return;
@@ -630,10 +644,19 @@ impl BepPeer {
                 let len = u16::from_le_bytes(len_buf) as usize;
                 if len == 0 || len > usize::from(DEFAULT_MTU) + 14 + 4 {
                     // Malformed length; drop the connection.
+                    tracing::warn!(
+                        len,
+                        "box egress proxy peer: frame length outside 1..=MTU+18; reader pump stopped"
+                    );
                     return;
                 }
                 let mut frame = vec![0u8; len];
-                if read_half.read_exact(&mut frame).await.is_err() {
+                if let Err(e) = read_half.read_exact(&mut frame).await {
+                    tracing::warn!(
+                        error = %e,
+                        len,
+                        "box egress proxy peer: frame body read failed; reader pump stopped"
+                    );
                     return;
                 }
                 if inbound_tx.send(frame).is_err() {
@@ -803,6 +826,42 @@ mod tests {
         ip_frame(src_mac, dst_mac, src_ip, dst_ip, IpProtocol::Tcp, &tcp_buf)
     }
 
+    /// Build a TCP segment carrying RST, with or without ACK, from
+    /// `src:src_port` to `dst:dst_port`.
+    fn tcp_rst(
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        with_ack: bool,
+    ) -> Vec<u8> {
+        let src_mac = EthernetAddress(MacAddr::for_switch_ip(src_ip).0);
+        let dst_mac = EthernetAddress(MacAddr::for_switch_ip(dst_ip).0);
+        let repr = TcpRepr {
+            src_port,
+            dst_port,
+            control: TcpControl::Rst,
+            seq_number: TcpSeqNumber(1_000_000),
+            ack_number: with_ack.then_some(TcpSeqNumber(2_000_000)),
+            window_len: 0,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            timestamp: None,
+            payload: &[],
+        };
+        let mut tcp_buf = vec![0u8; repr.buffer_len()];
+        let mut tcp = TcpPacket::new_unchecked(&mut tcp_buf);
+        repr.emit(
+            &mut tcp,
+            &IpAddress::Ipv4(src_ip),
+            &IpAddress::Ipv4(dst_ip),
+            &ChecksumCapabilities::ignored(),
+        );
+        ip_frame(src_mac, dst_mac, src_ip, dst_ip, IpProtocol::Tcp, &tcp_buf)
+    }
+
     /// Build a UDP datagram from `src:src_port` to `dst:dst_port`.
     fn udp_datagram(
         src_ip: Ipv4Addr,
@@ -913,6 +972,31 @@ mod tests {
         assert!(tcp.rst());
         assert_eq!(tcp.dst_port(), 1234);
         assert_eq!(tcp.src_port(), 443);
+    }
+
+    /// RFC 9293 section 3.5.2: a segment carrying RST is never answered with
+    /// a reset, with or without ACK alongside it.
+    #[test]
+    fn incoming_rst_gets_no_reply() {
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let (device, mut ends) = BepDevice::pair();
+        let mut host = BepHost::new(device, subnet, proxy_ip);
+
+        let peer_ip = Ipv4Addr::from(subnet.first_ptask());
+        for with_ack in [false, true] {
+            ends.inbound
+                .send(tcp_rst(peer_ip, proxy_ip, 1234, 443, with_ack))
+                .expect("send TCP RST");
+            host.poll(Instant::from_millis(0));
+            assert!(
+                matches!(
+                    ends.outbound.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+                "a RST (ack={with_ack}) must not be answered"
+            );
+        }
     }
 
     #[test]

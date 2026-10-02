@@ -4709,12 +4709,12 @@ while True:
 #
 # ---------------------------------------------------------------------------
 # NET-132: the host-side stack peer owns the proxy's infrastructure address.
-# These two cases are gated like the own-IP proof:
-#   * a switch must exist (`MINVMD_GVPROXY_BIN` on the lane), and
-#   * inside the VM the peer's MAC and ARP behaviour are observable only where
-#     /dev/net/tun and userns let an own-address box attach.
-# Where the prereqs are absent the case prints what it cannot assert and
-# returns 0, so a lane that cannot run them reports honestly rather than green.
+# These two cases are gated exactly like the own-IP proof: a switch must exist
+# (`MINVMD_GVPROXY_BIN` on the lane), and nothing else. The own-address box
+# attaches inside the guest on the VM-backed lanes, so the host's /dev/net/tun
+# and user namespaces say nothing about whether it can; a box that fails to
+# attach is a failure of the case, not a skip. Without a switch the case prints
+# what it cannot assert and returns 0.
 #
 # What is proved:
 #   * switch_steers_proxy_mac_frames_to_the_host_stack: a frame addressed to the
@@ -4727,16 +4727,6 @@ proof_switch_steers_proxy_mac_frames_to_the_host_stack() {
   echo "::group::switch steers proxy-MAC frames to the host stack peer (NET-132)"
   if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
     echo "switch_steers_proxy_mac_frames_to_the_host_stack SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
-    echo "::endgroup::"
-    return 0
-  fi
-  if [ ! -c /dev/net/tun ] || [ ! -r /dev/net/tun ]; then
-    echo "switch_steers_proxy_mac_frames_to_the_host_stack SKIPPED (/dev/net/tun not available; own-address boxes cannot attach on this host)"
-    echo "::endgroup::"
-    return 0
-  fi
-  if [ ! -e /proc/sys/kernel/unprivileged_userns_clone ] && [ "$(id -u)" -ne 0 ]; then
-    echo "switch_steers_proxy_mac_frames_to_the_host_stack SKIPPED (unprivileged user namespaces unavailable and not root; own-address boxes cannot attach)"
     echo "::endgroup::"
     return 0
   fi
@@ -4839,16 +4829,6 @@ proof_switch_answers_no_arp_for_the_proxy_address() {
   echo "::group::switch answers no ARP for the proxy address (NET-132)"
   if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
     echo "switch_answers_no_arp_for_the_proxy_address SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
-    echo "::endgroup::"
-    return 0
-  fi
-  if [ ! -c /dev/net/tun ] || [ ! -r /dev/net/tun ]; then
-    echo "switch_answers_no_arp_for_the_proxy_address SKIPPED (/dev/net/tun not available; own-address boxes cannot attach on this host)"
-    echo "::endgroup::"
-    return 0
-  fi
-  if [ ! -e /proc/sys/kernel/unprivileged_userns_clone ] && [ "$(id -u)" -ne 0 ]; then
-    echo "switch_answers_no_arp_for_the_proxy_address SKIPPED (unprivileged user namespaces unavailable and not root; own-address boxes cannot attach)"
     echo "::endgroup::"
     return 0
   fi
