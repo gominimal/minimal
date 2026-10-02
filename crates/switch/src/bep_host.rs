@@ -1784,7 +1784,7 @@ mod tests {
             &mut tcp,
             &IpAddress::Ipv4(src_ip),
             &IpAddress::Ipv4(dst_ip),
-            &ChecksumCapabilities::ignored(),
+            &ChecksumCapabilities::default(),
         );
         ip_frame(src_mac, dst_mac, src_ip, dst_ip, IpProtocol::Tcp, &tcp_buf)
     }
@@ -1820,7 +1820,7 @@ mod tests {
             &mut tcp,
             &IpAddress::Ipv4(src_ip),
             &IpAddress::Ipv4(dst_ip),
-            &ChecksumCapabilities::ignored(),
+            &ChecksumCapabilities::default(),
         );
         ip_frame(src_mac, dst_mac, src_ip, dst_ip, IpProtocol::Tcp, &tcp_buf)
     }
@@ -1844,7 +1844,7 @@ mod tests {
             &IpAddress::Ipv4(dst_ip),
             payload.len(),
             |buf| buf.copy_from_slice(payload),
-            &ChecksumCapabilities::ignored(),
+            &ChecksumCapabilities::default(),
         );
         ip_frame(src_mac, dst_mac, src_ip, dst_ip, IpProtocol::Udp, &udp_buf)
     }
@@ -2107,9 +2107,10 @@ mod tests {
             0,
             "answering traffic binds no socket"
         );
-        // Three answers went out — the ARP reply, the reset, the
-        // port-unreachable — and nothing else.
-        for expected in ["arp reply", "reset", "port unreachable"] {
+        // Two answers went out — the reset and the port-unreachable — and
+        // nothing else. The ARP reply is accounted inside `arp_exchange`,
+        // which consumed it while teaching the stack its neighbour.
+        for expected in ["reset", "port unreachable"] {
             assert!(
                 ends.outbound.try_recv().is_ok(),
                 "expected the {expected} to leave"
