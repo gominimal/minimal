@@ -623,7 +623,7 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minimald joined_process_refuses_namespace_bypass_families
     <!-- S10a/AC3; prose 53; event-driven; a seal set only at box start does not reach a process the daemon injects from outside -->
-  - IF a path other than `socket(2)` or `socketpair(2)` would create such a socket for a process in a box, `io_uring` included, THEN THE SYSTEM SHALL refuse that path to the box.
+  - IF a path other than `socket(2)` or `socketpair(2)` can create such a socket for a process in a box, `io_uring` included, THEN THE SYSTEM SHALL refuse that path to the box.
     tier:   T0
     verify: cargo nextest run -p sandbox2 box_io_uring_socket_refused
     <!-- S10a/AC3; prose 53; unwanted; the SHALL above names every socket, not every `socket(2)`: a socket an `io_uring` operation creates reaches the same families, so the seal refuses the creating path (`io_uring_setup`) inside the box; the published profile for box processes (architecture AT9, open gap 2) is a default-deny syscall allowlist, which refuses a new socket-creating path by construction, and on a VM-backed host a `socket_create` LSM hook keyed on the box's cgroup, which decides every creation path at once; guest-local vsock is removed from the guest kernel as well, so no reach survives a seal that fails -->
