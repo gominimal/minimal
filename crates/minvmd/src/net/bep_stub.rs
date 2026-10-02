@@ -34,6 +34,9 @@
 //! acceptor that is down is specified to answer (NET-132).
 
 use std::io::{Read, Write};
+// `SO_PEERCRED` is Linux's, so the import is too: off Linux nothing in this
+// file asks for a raw fd, and an ungated import would read as unused there.
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -395,9 +398,10 @@ mod tests {
     }
 
     /// NET-132/T69: a same-uid host process without this boot's token — or
-    /// with the token but the wrong header version, or from a process that
-    /// is not the host daemon — is refused and audited, and never arrives
-    /// as a box: the stand-in presents nothing to any of them.
+    /// with the token but the wrong header version, or (on Linux, where the
+    /// kernel names the peer's process) from a process that is not the host
+    /// daemon — is refused and audited, and never arrives as a box: the
+    /// stand-in presents nothing to any of them.
     #[test]
     fn host_process_never_arrives_from_a_box_address() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -438,30 +442,37 @@ mod tests {
             "no refused connection was presented as a box"
         );
 
-        // A same-uid host process that is not the host daemon: the pid
-        // check refuses it before it presents anything, token or not. The
-        // stand-in here claims a foreign daemon — init stands in for one —
-        // so this test process is the foreign one.
-        let foreign_sock = dir.path().join("bep-stub-foreign.sock");
-        let (foreign_tx, foreign_rx) = std::sync::mpsc::channel();
-        let foreign =
-            spawn(foreign_sock.clone(), foreign_rx).expect("the stand-in binds its socket");
-        foreign_tx
-            .send(StubStart {
-                token,
-                daemon_pid: 1,
-            })
-            .expect("the supervisor hands the start facts over the channel");
-        let answer = present(&foreign_sock, &token, DELIVERY_HEADER_VERSION);
-        assert!(
-            answer.is_empty(),
-            "a foreign process is answered with nothing"
-        );
-        await_refusal(&foreign, "pid");
-        assert!(
-            foreign.presented().is_empty(),
-            "a foreign process was never presented as a box"
-        );
+        // A same-uid host process that is not the host daemon: the pid check
+        // refuses it before it presents anything, token or not. Naming the
+        // peer's process is `SO_PEERCRED`'s, a Linux socket option, so this
+        // leg of the proof runs only there: off Linux the stand-in has no
+        // pid to check (see `peer_credentials`) and the token is the whole
+        // of what a same-uid process must hold. The stand-in here claims a
+        // foreign daemon — init stands in for one — so this test process is
+        // the foreign one.
+        #[cfg(target_os = "linux")]
+        {
+            let foreign_sock = dir.path().join("bep-stub-foreign.sock");
+            let (foreign_tx, foreign_rx) = std::sync::mpsc::channel();
+            let foreign =
+                spawn(foreign_sock.clone(), foreign_rx).expect("the stand-in binds its socket");
+            foreign_tx
+                .send(StubStart {
+                    token,
+                    daemon_pid: 1,
+                })
+                .expect("the supervisor hands the start facts over the channel");
+            let answer = present(&foreign_sock, &token, DELIVERY_HEADER_VERSION);
+            assert!(
+                answer.is_empty(),
+                "a foreign process is answered with nothing"
+            );
+            await_refusal(&foreign, "pid");
+            assert!(
+                foreign.presented().is_empty(),
+                "a foreign process was never presented as a box"
+            );
+        }
 
         // The uid check decides before anything is read, so a foreign user
         // is refused on the credential alone — no socket on this host can
