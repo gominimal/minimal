@@ -2295,8 +2295,9 @@ fn gate_verdict(
     let record = table.by_source(src);
     if summary.destination() == Some(table.gateway()) {
         let dst_port = summary.destination_port();
-        let declared_exposure =
-            record.as_ref().is_some_and(|record| record.admitted_ports().contains(&dst_port));
+        let declared_exposure = record
+            .as_ref()
+            .is_some_and(|record| record.admitted_ports().contains(&dst_port));
         if dst_port != RESOLVER_PORT && !declared_exposure {
             return Err(GateDrop::SwitchControlSurface { src, dst_port });
         }
@@ -3341,8 +3342,7 @@ mod tests {
         let api_port = 443;
         let bare_probe = ipv4_frame(bare, 6, SUBNET.gateway().octets(), api_port);
         let open_probe = ipv4_frame(open, 6, SUBNET.gateway().octets(), api_port);
-        let unregistered_probe =
-            ipv4_frame(unregistered, 6, SUBNET.gateway().octets(), api_port);
+        let unregistered_probe = ipv4_frame(unregistered, 6, SUBNET.gateway().octets(), api_port);
         let marker = ipv4_frame(bare, 6, [10, 9, 9, 9], 80);
         send_frame(&mut h.guest, &bare_probe).await;
         send_frame(&mut h.guest, &open_probe).await;
@@ -5255,8 +5255,12 @@ mod tests {
         // not at the gateway: the refusal is not gated on the row, so the
         // announced concession never reaches a frame naming the switch's own
         // address on a port nothing published answers.
-        let unregistered_surface =
-            summarize(&ipv4_frame([100, 64, 0, 99], 6, SUBNET.gateway().octets(), 443));
+        let unregistered_surface = summarize(&ipv4_frame(
+            [100, 64, 0, 99],
+            6,
+            SUBNET.gateway().octets(),
+            443,
+        ));
         assert_eq!(
             gate_verdict(
                 &unregistered_surface,
