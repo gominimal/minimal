@@ -1507,9 +1507,12 @@ case_installer_switch_binary_executable() {
 # undelegated hierarchy, refuse another namespace's view, delegate the slice
 # and every cgroup it lays out whole (each directory plus cgroup.procs,
 # cgroup.threads and cgroup.subtree_control, the cohort's two subtrees
-# included), leave the cgroup2 mount root above the slice root-owned, load
-# exactly one packet-filter transaction, and write the presence marker the
-# daemon probes only after it. The one fact the stand-in cannot stand in for
+# included), leave the cgroup2 mount root above the slice root-owned, refuse
+# to render the cohort's two source identities half-done, load exactly one
+# packet-filter transaction that replaces the table rather than adding to
+# it, remove the presence marker before the load and write it again only
+# after, and print the very transaction it loads under --print-ruleset. The
+# one fact the stand-in cannot stand in for
 # is the kernel: it makes a cgroup's files at mkdir and dissolves them with the
 # cgroup at rmdir, so the case drops the modeled ones wherever a real rmdir
 # would have taken the cgroup too.
@@ -1553,10 +1556,12 @@ STUB
 
     # A recording nft stub, in the chown stub's image: the step's second half
     # is the packet-filter table, and what CI can pin of it without the
-    # capability to load one is the decision sequence — probe for a previous
-    # table, load exactly one transaction, and write the marker only after.
-    # The `-f` argument's file is captured whole: the case and the daemon's
-    # own ruleset tests read the transaction the step rendered.
+    # capability to load one is the decision sequence — the transaction file
+    # that replaces the table, loaded exactly once, and the marker only
+    # after. The `-f` argument's file is captured whole: the case and the
+    # daemon's own ruleset tests read the transaction the step rendered.
+    # NFT_FAIL makes the load die, for the case that a failed re-load must
+    # leave no marker behind it.
     nft_calls="$root/nft.calls"; : >"$nft_calls"
     nft_input="$root/nft.input"; : >"$nft_input"
     cat >"$hcbin/nft" <<'STUB'
@@ -1564,9 +1569,10 @@ STUB
 printf '%s\n' "$*" >>"$NFT_CALLS"
 if [ "$1" = "-f" ] && [ -n "${2:-}" ]; then
     cat "$2" >>"$NFT_INPUT"
+    exit "${NFT_FAIL:-0}"
 fi
-# No stand-in kernel holds a table, so `list` says absent: the install probes
-# once, skips its delete, and loads fresh.
+# No stand-in kernel holds a table, so `list` says absent: the uninstall
+# probes once, skips its delete, and reports nothing removed.
 [ "$1" = "list" ] && exit 1
 exit 0
 STUB
@@ -1582,6 +1588,7 @@ STUB
             CHOWN_CALLS="$chown_calls" \
             NFT_CALLS="$nft_calls" \
             NFT_INPUT="$nft_input" \
+            NFT_FAIL="${NFT_FAIL:-0}" \
             MINIMAL_OVERRIDE_CGROUP_MOUNTINFO="$mi" \
             bash "$hc" --root "$tree" "$@" </dev/null >"$OUT" 2>&1
         rc=$?
@@ -1636,6 +1643,23 @@ STUB
     want_ok "the refusal names the account" grep -q "no such account" "$OUT"
     want_err "a bad account still creates nothing" test -e "$tree"
 
+    # --- The two source identities are required, together: a table that
+    # refuses a deny-all box's connections while its cohort keeps the host's
+    # own source identity is half of the classification, so the step refuses
+    # to render half of it — with either missing, and with both missing.
+    run_hc no_identity "$root/mi-on" --user "$me"
+    check 1 "$rc" "install dies without the two source identities"
+    want_ok "the refusal names the flag it needs" \
+        grep -q -- "--cohort-address ADDR" "$OUT"
+    want_ok "the refusal names the other flag too" \
+        grep -q -- "--node-plane-address ADDR" "$OUT"
+    want_err "no identities, no tree" test -e "$tree"
+
+    run_hc half_identity "$root/mi-on" --user "$me" --cohort-address 100.72.0.9
+    check 1 "$rc" "install dies with one of the two identities missing"
+    want_ok "the refusal says they go together" grep -q "both source identities" "$OUT"
+    want_err "half an identity still creates nothing" test -e "$tree"
+
     # --- The install: the slice, its daemon leaf, the cohort's two subtrees,
     # and the whole v2 contract delegated to the account minimald runs as.
     run_hc install "$root/mi-on" --user "$me" \
@@ -1679,26 +1703,54 @@ STUB
     _got="$(awk '{printf "%s%s", sep, $0; sep = " "}' "$chown_calls")"
     check "${_want% }" "$_got" \
         "delegation reached the slice and every leaf whole, never above the slice"
-    # The one packet-filter transaction: probed for a previous table, loaded
-    # exactly once, and nothing per-box in it — every rule is keyed on a
-    # cgroup path. The daemon's own ruleset tests read the same input in
-    # depth; this pins what the step decided, at the layer the installer
-    # owns: one transaction, the marker after it, the cohort's two
-    # identities, and the answerer as the deny subtree's one destination.
-    want_ok "the step probed for a previous table before loading" \
-        grep -q "^list table inet minimal_class$" "$nft_calls"
+    # The one packet-filter transaction, loaded exactly once, and nothing
+    # per-box in it — every rule is keyed on a cgroup path. The daemon's own
+    # ruleset tests read the same input in depth; this pins what the step
+    # decided, at the layer the installer owns: the transaction replaces the
+    # table rather than adding to it, the cohort's two identities, the
+    # answerer as the deny subtree's one destination, and the retarget that
+    # makes the answerer the destination a deny-all box's lookups reach.
     want_ok "the step loaded one transaction, exactly once" \
         [ "$(grep -c '^-f ' "$nft_calls")" -eq 1 ]
+    want_ok "the step probes for no previous table: the transaction deletes it in-batch" \
+        [ "$(grep -c '^list table' "$nft_calls")" -eq 0 ]
+    want_ok "the transaction replaces the table: it declares what it deletes" \
+        grep -q '^add table inet minimal_class$' "$nft_input"
+    want_ok "the delete travels with the definition, before it" \
+        awk '/^delete table inet minimal_class$/ {d = NR}
+             /^table inet minimal_class \{/ {t = NR}
+             END {exit !(d && t && d < t)}' "$nft_input"
     want_ok "the transaction keys its deny rule on the deny subtree" \
         grep -q 'cgroupv2 level 3 "minimald.slice/boxes/deny" jump deny_out' "$nft_input"
-    want_ok "the transaction gives the cohort and the node plane distinct sources" \
-        grep -q 'level 2 "minimald.slice/boxes" snat ip to 100.72.0.9' "$nft_input"
-    want_ok "the node-plane rule follows the cohort rule, so it cannot swallow it" \
-        grep -q 'level 1 "minimald.slice" snat ip to 100.72.0.1' "$nft_input"
+    # deny_out's first rule is pinned as the exact line it must be: a flow
+    # already admitted stays admitted, and the refusal falls on new
+    # connections only.
+    check "$(awk '/chain deny_out \{/ {ch = 1; next}
+                  ch && /^\}/ {exit}
+                  ch && NF {sub(/^[ \t]+/, ""); print; exit}' "$nft_input")" \
+          "ct state established,related accept" \
+          "deny_out admits established and related flows as its first rule"
     want_ok "the deny rule admits the answerer by address and port only" \
         grep -q 'ip daddr 127.0.0.1 udp dport 7656 accept' "$nft_input"
+    want_ok "the deny subtree's DNS-port lookups are retargeted onto the answerer" \
+        grep -q 'level 3 "minimald.slice/boxes/deny" ip daddr 127.0.0.1 udp dport 53 dnat ip to 127.0.0.1:7656' "$nft_input"
+    want_ok "the retarget runs at dstnat, before the filter chain decides" \
+        grep -q 'type nat hook output priority dstnat' "$nft_input"
     want_ok "the deny rule refuses actively, never a silent drop" \
         grep -q 'reject with icmpx admin-prohibited' "$nft_input"
+    want_ok "the transaction gives the cohort and the node plane distinct sources, loopback excluded" \
+        grep -q 'level 2 "minimald.slice/boxes" oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
+    want_ok "the node-plane rule follows the cohort rule, loopback excluded too" \
+        grep -q 'level 1 "minimald.slice" oifname != "lo" snat ip to 100.72.0.1' "$nft_input"
+
+    # --- --print-ruleset prints the same transaction the install loaded:
+    # the daemon's own ruleset tests read this mode, so the two spellings
+    # cannot drift.
+    run_hc print_ruleset "$root/mi-on" --print-ruleset \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 0 "$rc" "--print-ruleset exits 0"
+    check "$(cat "$nft_input")" "$(cat "$OUT")" \
+        "print-ruleset prints exactly the transaction the install loaded"
 
     run_hc installed_check "$root/mi-on" --check --user "$me"
     check 0 "$rc" "check exits 0 once the tree is installed"
@@ -1706,6 +1758,26 @@ STUB
     want_ok "check names the contract it verified" grep -q "cgroup.threads" "$OUT"
     want_ok "check says what stays root-owned" grep -q "stays root-owned" "$OUT"
     want_ok "check reports the table's marker" grep -q "classifier-table" "$OUT"
+
+    # --- A re-install whose transaction dies leaves no marker: the step
+    # removes it before the load and writes it only after, so the daemon
+    # reads a host that decides nothing per box rather than a marker that
+    # vouches for a table this step did not render. The tree's half is
+    # already done, and stays.
+    NFT_FAIL=1
+    run_hc reload_failed "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 1 "$rc" "a re-install whose nft transaction dies exits 1"
+    want_err "a failed re-load leaves no marker" test -e "$tree/classifier-table"
+    want_ok "the failure says no marker was written" \
+        grep -q "no marker was written" "$OUT"
+    want_ok "the tree itself survives a failed re-load" test -d "$tree/boxes/deny"
+    NFT_FAIL=0
+    run_hc reloaded "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 0 "$rc" "the next good re-install exits 0"
+    want_ok "the next good re-install restores the marker" \
+        test -d "$tree/classifier-table"
 
     # --- Uninstall: the tree comes away whole — the two subtrees and the
     # table's marker with it — but a leaf the script did not place (a live
@@ -1721,8 +1793,9 @@ STUB
     check 0 "$rc" "uninstall removes the installed tree"
     want_err "uninstall leaves no tree behind" test -e "$tree"
 
-    run_hc reinstalled "$root/mi-on" --user "$me"
-    check 0 "$rc" "install over an existing tree exits 0"
+    run_hc reinstalled "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 0 "$rc" "install after an uninstall exits 0"
 
     # --- --pid: the daemon's first hop into the slice is the one migration
     # the delegated account cannot make itself — the common ancestor of the
@@ -1771,6 +1844,7 @@ STUB
     check 0 "$rc" "--help exits 0"
     want_ok "usage shows the sudo form" grep -q "sudo scripts/install-host-classifier.sh" "$OUT"
     want_ok "usage shows the unprivileged --check" grep -q -- "--check" "$OUT"
+    want_ok "usage shows the unprivileged --print-ruleset" grep -q -- "--print-ruleset" "$OUT"
     want_ok "usage shows the --pid step" grep -q -- "--pid PID" "$OUT"
 
     # --- Without the rehearsal seam the script demands root, like the other
