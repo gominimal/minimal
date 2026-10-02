@@ -284,13 +284,18 @@ async fn finish_own_ip_attach(
     // each forward's own `local` bind, never from the request: the record
     // stays true to what the forwarder holds if the address `expose_request`
     // binds ever moves off the loopback.
+    //
+    // The message text is a contract beside the fields: `session-e2e.sh`'s
+    // `published_loopback_host` reads the publish record — the address the
+    // forwarder actually bound — out of the daemon log by exactly this
+    // phrase, so it is not reworded without that reader moving too.
     for forwarder in &exposed {
         match forwarder.host_port() {
             Some((host, port)) => tracing::info!(
                 host,
                 port,
                 session = session_name,
-                "bound declared ingress port on the host loopback"
+                "exposed ingress port on the host loopback"
             ),
             // `expose_request` cannot build a `local` that splits into no
             // host and port; if one ever appears, name what the forwarder
@@ -298,7 +303,7 @@ async fn finish_own_ip_attach(
             None => tracing::info!(
                 local = %forwarder.local(),
                 session = session_name,
-                "bound declared ingress port on the host loopback"
+                "exposed ingress port on the host loopback"
             ),
         }
     }
