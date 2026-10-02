@@ -14,6 +14,7 @@ on:
     pull_request:
         branches: ["main", "release/**"]
     merge_group:
+        branches: ["main", "release/**"]
     workflow_dispatch:
     # Reusable so the nightly test tier can run the macOS/HVF e2e on a schedule
     # (nightly-tests.yml `macos-e2e`). On a scheduled call `github.event_name`

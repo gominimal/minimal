@@ -26,6 +26,7 @@ on:
   pull_request:
     branches: ["main", "release/**"]
   merge_group:
+    branches: ["main", "release/**"]
   workflow_dispatch:
 
 env:
