@@ -2526,12 +2526,12 @@ fn gate_verdict(
     // so on every admit. Outside that block, or once the default binds,
     // NET-081's failure case: an address no namespace holds never leaves the
     // VM.
-    let Some(record) = table.by_source(src) else {
-        if phase == UnregisteredSourcePhase::Announced && table.is_allocatable(src) {
-            return Ok(GateAdmit::Unregistered { src });
-        }
+    let record = table.by_source(src);
+    if record.is_none()
+        && !(phase == UnregisteredSourcePhase::Announced && table.is_allocatable(src))
+    {
         return Err(GateDrop::UnknownSource { src });
-    };
+    }
     // The infrastructure deny set, decided for every row before the row's
     // own rules (design §5.3, NET-067): the host and the fabric, not
     // destinations — link-local and the metadata services in it, loopback,
@@ -2540,9 +2540,16 @@ fn gate_verdict(
     // routing and the row's rules, so that no row admits it — an allow-all
     // row's `0.0.0.0/0` included, the CIDR-admitted direct-IP flow the set
     // names — and so that the deferral below never sees it: an undeclared
-    // destination inside the set is this drop, not the guest's to lift.
+    // destination inside the set is this drop, not the guest's to lift. A
+    // source the announced interim admits without a row takes it too, as
+    // allow-all for RFC 1918 space: the set applies to every box-plane
+    // packet, and the interim concedes a row's absence, not the fabric.
     if let Some(dst) = summary.destination()
-        && infrastructure_destination(dst, table.subnet(), record.egress().allow_subnets())
+        && infrastructure_destination(
+            dst,
+            table.subnet(),
+            record.as_ref().and_then(|row| row.egress().allow_subnets()),
+        )
     {
         return Err(GateDrop::Infrastructure {
             src,
@@ -2550,6 +2557,9 @@ fn gate_verdict(
             dst_port: summary.destination_port(),
         });
     }
+    let Some(record) = record else {
+        return Ok(GateAdmit::Unregistered { src });
+    };
     // The namespace that holds the source decides its frames by its own
     // compiled rules — the shared verdict, unchanged, now made outside where
     // nothing inside can change it. One drop class defers to the in-guest
@@ -3900,12 +3910,17 @@ mod tests {
     /// the rebinding intersection's exemption holds it. Each drop names its
     /// destination and port under the rule, rate-limited per source, so the
     /// first refused frame of each source is the one whose line is read.
+    /// A source the announced interim admits without a row takes the same
+    /// rule: refused to the metadata service, admitted to private space as
+    /// the allow-all the interim concedes.
     #[tokio::test]
     async fn infrastructure_destinations_drop_on_the_host_for_every_row() {
         let registry = BoxRegistry::new(SUBNET);
         let open = [100, 64, 0, 10];
         let lan = [100, 64, 0, 11];
         let bare = [100, 64, 0, 12];
+        // Held by no row: the announced interim's source.
+        let unregistered = [100, 64, 0, 13];
         registry.register(
             BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
                 .with_admitted_ports([8080])
@@ -3942,6 +3957,7 @@ mod tests {
             ipv4_frame(open, 6, [10, 1, 2, 3], 80),
             ipv4_frame(lan, 6, [10, 1, 2, 3], 80),
             ipv4_frame(bare, 6, [10, 1, 2, 3], 80),
+            ipv4_frame(unregistered, 6, [10, 1, 2, 3], 80),
         ];
         for frame in &admitted {
             send_frame(&mut h.guest, frame).await;
@@ -3967,6 +3983,7 @@ mod tests {
             ipv4_frame(bare, 6, metadata, 80),
             ipv4_frame(lan, 6, metadata, 80),
             ipv4_frame(lan, 6, other_block, 80),
+            ipv4_frame(unregistered, 6, metadata, 80),
         ];
         for frame in &refused {
             send_frame(&mut h.guest, frame).await;
@@ -3992,6 +4009,7 @@ mod tests {
             "destination=169.254.169.254",
             "source=100.64.0.12",
             "destination=100.65.0.9",
+            "source=100.64.0.13",
             "port=80",
             "rule_matched=\"egress-infrastructure-destination\"",
         ] {
