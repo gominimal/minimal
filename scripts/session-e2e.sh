@@ -327,7 +327,9 @@ fi
 # without the flag — and both of its lanes arrive here with no
 # E2E_MINIMAL_ARGS at all (the macOS CI lane exports none; the justfile's
 # e2e-env adds the args on Linux only), so the script supplies the flag
-# for them itself. An explicit E2E_MINIMAL_ARGS is kept verbatim, and
+# for them itself. That default is what #1816 retires; until that fix
+# lands, this branch keeps supplying the flag exactly as it is.
+# An explicit E2E_MINIMAL_ARGS is kept verbatim, and
 # Linux is untouched: a Linux run without provider args is the native
 # lane and must stay exactly that.
 if [ "$(uname -s)" = Darwin ] && [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
@@ -5155,11 +5157,16 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
   # bound before the switch is even spawned, so a daemon whose switch
   # never came up looks identical to a healthy one to the wait above, and
   # every probe below would fail in terms of a peer that is not there.
-  # (A switch that will not come up under this case's flag now fails the
-  # daemon's boot outright, so an activation that got this far means a
-  # daemon that started one — but assert it from the daemon's own log
-  # rather than trust the bind; if a line never appears, the tail
-  # below names the spawn that failed.) Both lines the gate waits for are
+  # (A switch that will not come up under this case's flag fails the
+  # daemon's boot outright, and so does a stand-in that will not bind, so
+  # an activation that got this far means a daemon that started both —
+  # but assert it from the daemon's own log rather than trust the bind;
+  # if a line never appears, the tail below names the spawn that failed.
+  # A stand-in bind failure no longer boots on degraded — it fails the
+  # boot where the bind happens, so it never reaches this gate as a
+  # booted daemon at all: the activation above dies waiting on a daemon
+  # that never came up, its own words in the supervisor's run.log on the
+  # stderr the detached supervisor keeps.) Both lines the gate waits for are
   # this case's daemon's own records: the stand-in's is written only under
   # MINVMD_BEP_STUB — the flag's receipt in the daemon's voice, not just
   # the socket file the wait above saw — and the switch's proves the peer
@@ -5174,12 +5181,10 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
       break
     fi
     if bep_case_log | grep -q -e 'failed to spawn host gvproxy switch' \
-        -e 'gvproxy binary not found' \
-        -e 'failed to bind the box egress proxy stand-in acceptor'; then
+        -e 'gvproxy binary not found'; then
       echo "::error::this case's daemon came up without the box egress proxy's peer — the switch never started, so the probes below would fail against a host that is not there. The daemon's log says:"
       bep_case_log | grep -e 'failed to spawn host gvproxy switch' \
-        -e 'gvproxy binary not found' \
-        -e 'failed to bind the box egress proxy stand-in acceptor' | tail -n5 | sed 's/^/  /'
+        -e 'gvproxy binary not found' | tail -n5 | sed 's/^/  /'
       bep_fail
     fi
     bep_wait=$((bep_wait + 1))
@@ -5189,6 +5194,36 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
     echo "::error::the daemon's log never named its box egress proxy surface (waited ${bep_wait}s among this case's lines for 'box egress proxy stand-in acceptor up' and 'host gvproxy switch up; box egress proxy peer started')"
     bep_fail
   fi
+
+  # Both boxes must be registered with this case's daemon before any
+  # probe runs: the CLI registers each box with the VM host daemon as it
+  # activates (T66), and an own_ip box that is not registered has no row
+  # in the box-egress pool's partition — its connection to the proxy's
+  # address is reset with nothing on the CLI's stderr naming the cause,
+  # which is the exact posture difference this case exists to catch. The
+  # daemon's own registration line is the fact, one info line per box
+  # naming the box and both addresses; assert it from this case's lines
+  # (bep_case_log scopes out every earlier daemon's), waiting out the
+  # log writer's flush, and fail naming the box that never registered
+  # instead of a blank probe answer far below.
+  for bep_box_name in e2e-bep-box-a e2e-bep-box-b; do
+    bep_reg_seen=0
+    bep_wait=0
+    while [ "$bep_wait" -le 10 ]; do
+      if bep_case_log | grep 'registered box with the VM host daemon' \
+        | grep -q "$bep_box_name"; then
+        bep_reg_seen=1
+        break
+      fi
+      bep_wait=$((bep_wait + 1))
+      sleep 1
+    done
+    if [ "$bep_reg_seen" -ne 1 ]; then
+      echo "::error::$bep_box_name never registered with the VM host daemon — no row in the box-egress pool's partition, so its connection to the proxy's address is reset with nothing naming the cause. This case's daemon's registration lines say:"
+      bep_case_log | grep -e 'registered box with the VM host daemon' -e 'box registration' | tail -n5 | sed 's/^/  /'
+      bep_fail
+    fi
+  done
 
   # Each box's lease address — the source its connection must be presented
   # from — read from the box's own view, like the MAC case above reads its
