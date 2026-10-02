@@ -2802,7 +2802,10 @@ fn in_reserved_local_range(addr: std::net::Ipv4Addr) -> bool {
 /// name already held, at the address the box's creator handed it, and the
 /// publish is the registry's record of that same hand: the two surfaces that
 /// must agree (the route a proxy follows and the address a resolver answers)
-/// name one address, and neither chooses it. The registration is in the
+/// name one address. A creator that hands nothing still publishes — at the
+/// answerer's grant, the shape the test below this one drives — so no
+/// surface here chooses an address on the box's behalf: the hand or the
+/// grant names it, and both are said out loud. The registration is in the
 /// daemon log, naming the box and the address — the line a diagnostics
 /// bundle's log tail carries.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2857,36 +2860,66 @@ async fn name_registered_at_finalize() {
 }
 
 /// NET-011's other half, at the session level: a box nobody handed an
-/// address publishes nowhere. Finalize still succeeds — the box lives, and
-/// everything it does that needs no published ingress works — but its name
-/// registers nowhere, because the daemon has no address of its own to stand
-/// in with (the hand model): every lookup answers NXDOMAIN from the moment
-/// the name would have existed, no route exists to forward to, and no
-/// publish was recorded for the attach path to bind forwards at. The attach
-/// path's own failure for the same box — "no published address handed" — is
-/// proved in the gvproxy network proofs.
+/// address — a native launch, whose creator is the daemon itself (NET-040:
+/// a fresh install's `--network own_ip --ingress` publishes on the host) —
+/// publishes at the address the answerer's record granted it. Finalize
+/// still asks the host-global allocation (NET-010: arbitrated through the
+/// answerer's authenticated channel, never a daemon's own choice): the name
+/// is held from finalize, at the granted address, the route and the zone
+/// answer name one address, and the publish is recorded for the attach path
+/// to bind its forwards at. The withheld-grant shape — spent pool, absent
+/// range, unreadable record — registers no name and fails the attach with
+/// "no published address handed"; that half is proved in the gvproxy
+/// network proofs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_box_nobody_handed_an_address_registers_no_name() {
+async fn a_box_nobody_handed_an_address_publishes_at_the_answerers_grant() {
+    let capture = crate::test_harness::captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
     let id = finalize_own_ip_session(&mut client, "web").await;
 
+    // No attach has happened — the name is held at the granted address.
+    let (owner, address) = zone_answer_for(&server, "web.min.internal")
+        .await
+        .expect("a box nobody handed an address publishes at the grant");
+    assert_eq!(owner, "web", "the session owns its box name");
     assert_eq!(
-        zone_answer_for(&server, "web.min.internal").await,
-        None,
-        "a box with no handed address answers NXDOMAIN, not a default address"
+        address,
+        sessions::core::loopback::POOL_FIRST,
+        "an empty record's first grant is the pool's first address, got {address}"
     );
+    assert!(
+        in_reserved_local_range(address),
+        "the granted address comes from the reserved local range, got {address}"
+    );
+
+    // The registry's publish and the zone's answer are one address — and the
+    // publish is what the attach path will read to bind its forwards at.
     let registry = server.state.sessions_manager().await.hostnames();
     let routes = registry.read().expect("registry lock");
     assert_eq!(
-        routes.resolve("web.min.internal"),
-        None,
-        "and nothing routes to it: the daemon published nothing on its own"
-    );
-    assert_eq!(
         routes.published_own_address(id),
-        None,
-        "no publish was recorded for the box either"
+        Some(address),
+        "the publish the attach path binds forwards at is the grant"
+    );
+    let route = routes
+        .resolve("web.min.internal")
+        .expect("the name routes at the grant");
+    assert_eq!(
+        route.address(),
+        address,
+        "the route a proxy follows answers at the granted address, exactly"
+    );
+
+    // The grant is said out loud, naming the box and the address.
+    let logged = capture.contents();
+    let lease_line = logged
+        .lines()
+        .find(|line| line.contains("loopback-lease") && line.contains("session_name=\"web\""))
+        .unwrap_or_else(|| panic!("the lease must be logged, got: {logged}"));
+    assert!(
+        lease_line.contains(&format!("ip={address}")),
+        "the lease line names the address it granted, got: {lease_line}"
     );
 }
 
