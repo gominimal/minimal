@@ -567,7 +567,11 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-081** WHERE the host is VM-backed THE SYSTEM SHALL apply per-box source-addressed egress rules derived from the expanded box specs outside the VM.
   tier:     T0
   verify:   cargo nextest run -p minvmd host_side_rules_applied_outside_vm
-  <!-- S10a/AC1; prose 51; optional-feature -->
+  <!-- S10a/AC1; prose 51; optional-feature. The verify covers rows whose
+       egress is CIDR-only: for a row that resolves names, the destination
+       rule is decided inside the VM until the host pins from the answers the
+       box's own queries received; the other drop classes are host-side for
+       every row. -->
   - IF a frame leaves the VM from a source address that belongs to no box THEN THE SYSTEM SHALL drop it.
     tier:   T2
     verify: cargo nextest run -p minvmd unknown_source_default_deny
