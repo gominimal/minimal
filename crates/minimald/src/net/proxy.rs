@@ -290,6 +290,22 @@ impl BindFailure {
 /// it as a bind-and-drop probe is what made gominimal/inbox#560 look like a
 /// false alarm on macOS.
 ///
+/// The bind is the platform default [`TcpListener::bind`] makes: `SO_REUSEADDR`
+/// on Unix, and never `SO_REUSEPORT`. On Linux, `SO_REUSEADDR` never lets a
+/// second socket listen on an address:port an active listener holds — a port
+/// another daemon is bound and listening on is still refused with `EADDRINUSE`,
+/// as the surfaced error the caller's report carries — so its one effect is
+/// that a restart can rebind over the `TIME_WAIT` sockets the previous run's
+/// accepted connections left, which is how a native daemon restarted in place
+/// keeps [`DEFAULT_EGRESS_PROXY_PORT`], the documented port its recipes point
+/// `HTTP(S)_PROXY` at, instead of failing the rebind and silently moving off
+/// it. `SO_REUSEPORT` is the licence to answer beside a live holder and is never
+/// asked for. The rule that two VMs never shadow one host port (NET-059) is
+/// not this bind's to carry: a microVM daemon binds inside its guest's own
+/// netns, where the two never meet, and the one port they do share — the
+/// host-loopback publication the walk in `server::drive_proxy_until_serving`
+/// takes — is minvmd's forwarded-port bind (#1814).
+///
 /// # Errors
 ///
 /// Returns a [`BindFailure`] when the address cannot be bound; the OS error is
@@ -1284,6 +1300,148 @@ mod tests {
         );
     }
 
+    /// The bind is the platform default: `SO_REUSEADDR` on Unix, never
+    /// `SO_REUSEPORT`. A second bind to a port an active listener holds still
+    /// fails with `EADDRINUSE` — on Linux, `SO_REUSEADDR` never licenses
+    /// listening beside a live listener, only rebinding over the `TIME_WAIT`
+    /// sockets a restart's own previous connections left — and the refusal is
+    /// the loud failure the caller surfaces: a handed port's duplicate is the
+    /// report `min session activate` and `min ls` print, never a silent
+    /// neighbour. `SO_REUSEPORT`, the one option that would answer beside a
+    /// live holder, is never set: it is read off the bound socket, because the
+    /// kernel's own answer is the pin, on both platforms this daemon runs on.
+    #[tokio::test]
+    async fn proxy_bind_refuses_a_port_already_held_on_loopback() {
+        use std::os::fd::AsRawFd as _;
+
+        // A held port, the way another daemon holds a handed one: bound on the
+        // host loopback and listening, before this daemon's bind runs.
+        let held = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = held.local_addr().unwrap();
+        let failure = bind_listener(addr)
+            .await
+            .expect_err("a held port must be refused, not shared");
+        assert_eq!(
+            failure.kind,
+            io::ErrorKind::AddrInUse,
+            "the refused bind must report the kernel's EADDRINUSE, got: {}",
+            failure.reported()
+        );
+        assert!(
+            failure.reported().contains("could not bind"),
+            "the refusal must be the surfaced error the reports carry, got: {}",
+            failure.reported()
+        );
+        drop(held);
+
+        // And the listener it builds really carries the rule: a free port
+        // binds with `SO_REUSEPORT` off. `SO_REUSEADDR` is the platform
+        // default the bind keeps on purpose, so it is not pinned here;
+        // `SO_REUSEPORT` is never asked for anywhere in the bind, and reading
+        // it is the defence against a default that ever changes.
+        let listener = bind_listener((IpAddr::V4(Ipv4Addr::LOCALHOST), 0).into())
+            .await
+            .expect("a free loopback port binds");
+        let value = socket_option(listener.as_raw_fd(), libc::SO_REUSEPORT);
+        assert_eq!(
+            value, 0,
+            "the proxy's listener must never bind with SO_REUSEPORT, got {value}"
+        );
+    }
+
+    /// The restart case the platform default is kept for: the previous run's
+    /// accepted connections leave their sockets in `TIME_WAIT` on the
+    /// documented port, and the fresh daemon must rebind the same port —
+    /// `SO_REUSEADDR`'s one effect on Linux — instead of failing the bind with
+    /// `EADDRINUSE` and moving off it, the failure that broke the native
+    /// daemon e2e's restart (`native-daemon-e2e`, run 37035644090: the proxy
+    /// stayed unbound on `127.0.0.1:7654` and the NET-001 curl exited 7).
+    /// The control bind carries `SO_REUSEADDR` off — the hand-built socket the
+    /// removed `bind_without_reuse` used to make, which std's and tokio's
+    /// `TcpListener::bind` are not: both set the option on Unix — and is
+    /// refused the port, which is what proves the `TIME_WAIT` tuple is really
+    /// held and the rebind below is not just racing past it.
+    #[tokio::test]
+    async fn proxy_bind_rebinds_over_the_time_wait_a_restart_leaves() {
+        // Build the leftover a restart meets: one accepted connection,
+        // closed first by the listener's side, so its local tuple — the
+        // listener's own address, the port the documented default binds — is
+        // what lands in TIME_WAIT.
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        drop(accepted);
+        drop(client);
+        drop(listener);
+
+        // A bind with `SO_REUSEADDR` off is refused the port — the
+        // `EADDRINUSE` the no-reuse bind turned the daemon's own restart
+        // into. The kernel moves the closed socket into TIME_WAIT
+        // asynchronously, so poll for the refusal rather than assuming it is
+        // there yet.
+        let mut refused = false;
+        for _ in 0..100 {
+            let socket = TcpSocket::new_v4().unwrap();
+            socket.set_reuseaddr(false).unwrap();
+            match socket.bind(addr) {
+                Ok(()) => drop(socket),
+                Err(error) => {
+                    assert_eq!(
+                        error.kind(),
+                        io::ErrorKind::AddrInUse,
+                        "the TIME_WAIT port must refuse a no-reuse bind with EADDRINUSE, \
+                         got: {error}"
+                    );
+                    refused = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            refused,
+            "a bind with SO_REUSEADDR off was never refused, so the TIME_WAIT \
+             tuple never formed and the rebind below proves nothing"
+        );
+
+        // The daemon's bind is the platform default and rebinds the port: the
+        // restart keeps the documented port its recipes point at, and the
+        // socket carries the `SO_REUSEADDR` that made that possible.
+        use std::os::fd::AsRawFd as _;
+        let rebound = bind_listener(addr)
+            .await
+            .expect("a restart must rebind over the TIME_WAIT sockets its previous run left");
+        let value = socket_option(rebound.as_raw_fd(), libc::SO_REUSEADDR);
+        assert_eq!(
+            value, 1,
+            "the proxy's listener must bind with the platform-default SO_REUSEADDR on, \
+             got {value}"
+        );
+    }
+
+    /// Reads one `SOL_SOCKET` socket option off `fd`, as the kernel holds it.
+    /// Returns `-1` when the read itself fails, so the assertion that follows
+    /// names the unreadable option rather than panicking here.
+    fn socket_option(fd: std::os::fd::RawFd, option: libc::c_int) -> libc::c_int {
+        let mut value: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `fd` is a live socket this test owns and holds for the call;
+        // `value` and `len` are the buffers the kernel writes into, both
+        // correctly sized for one `c_int`.
+        let status = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                std::ptr::addr_of_mut!(value).cast::<libc::c_void>(),
+                std::ptr::addr_of_mut!(len),
+            )
+        };
+        assert_eq!(status, 0, "reading the socket option must succeed");
+        value
+    }
+
     /// `CONNECT` carries the authority in its request line; a plain method
     /// carries it in the `Host:` header. Both parse to the same authority.
     #[test]
@@ -2253,6 +2411,617 @@ mod tests {
         }
     }
 
+    /// NET-059: two VMs on one host both route their box names through the
+    /// host at the same time. On a VM boot, each VM's host ports come from
+    /// minvmd's handed assignment — the boot-line tokens the guest daemon
+    /// binds as pinned, one pair of its own per VM — so each publishes at
+    /// exactly the numbers it was handed and the walk never runs
+    /// (`two_vms_pinned_ports_route_concurrently` drives that shape). This
+    /// test drives the boots the walk *does* cover: no handed port — an
+    /// older minvmd, a native run, a host that handed `0` — where each
+    /// daemon binds its own loopback at the same documented port, as two
+    /// guests each hold their own netns, and the *publications* contend.
+    /// The first VM's publication holds the default; the second's is
+    /// refused there and takes the next rung, and its *listener* keeps the
+    /// documented port its boxes share its loopback with. A host client
+    /// dialing each VM's published port reaches that VM's boxes — and no
+    /// other VM's — concurrently.
+    ///
+    /// Both halves of the host's hostname surface are driven: the routing
+    /// proxies (`Host:`-dialled TCP) and the box-zone answerers (A queries),
+    /// each VM's answerer taking the same two-gated startup its proxy takes
+    /// and contending for the same host loopback through the same ledger, so
+    /// a host resolver pointed at one VM's published answerer port gets that
+    /// VM's zone — its own box held, the other VM's nobody's here — while
+    /// the other VM's resolver does the mirror, at the same time.
+    ///
+    /// The gvproxy forwarder each publication goes through is played two
+    /// ways: the *port* a publication lands on is arbitrated by
+    /// [`crate::server::HostExpose::HeldPorts`], the stand-in that holds
+    /// every host port it accepts, and the *forward* itself is wired by hand
+    /// (`spawn_forward` for TCP, `spawn_udp_forward` for the answerer's
+    /// datagrams), binding the published host port and relaying to the guest
+    /// listener — what the real forwarder does with the exposure the driver
+    /// asked it for, and the half of "through the host" that lives on the
+    /// host rather than in this crate.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn two_vms_hostnames_route_concurrently() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use hickory_proto::op::ResponseCode;
+        use tempfile::TempDir;
+
+        use crate::server::{
+            Config, HOST_PUBLISH_PORT_STRIDE, HostExpose, HostProxyStartup, ProxyPort,
+            RetryBackoff, ServerStateHandle,
+        };
+
+        // The documented default each VM binds in its own guest: a free
+        // port with a free rung above it — the walk's next proposal — probed
+        // the way every other borrowed port in this suite is.
+        let guest_port = loop {
+            let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            let Some(rung) = crate::server::next_host_publish_port(port) else {
+                continue;
+            };
+            match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, rung)) {
+                Ok(rung_probe) => drop(rung_probe),
+                Err(_) => continue,
+            }
+            break port;
+        };
+        let rung = guest_port + u16::try_from(HOST_PUBLISH_PORT_STRIDE).unwrap();
+
+        // Two VM-shaped daemons: `in_microvm` is what routes an own-address
+        // box to its lease, and each binds the same documented default on its
+        // own loopback — two guests, two netns, one port number each.
+        let vm_host = |dir: &TempDir| Config {
+            in_microvm: true,
+            ..crate::server::test_config(dir.path())
+        };
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let a = ServerStateHandle::new(vm_host(&dir_a), None).await.unwrap();
+        let b = ServerStateHandle::new(vm_host(&dir_b), None).await.unwrap();
+
+        // The host port ledger both publications contend through: the
+        // stand-in forwarder that holds every port it accepts — the
+        // contention two VMs put on one host's loopback.
+        let held = Arc::new(Mutex::new(HashSet::new()));
+
+        // The first VM publishes on the default; the second is refused
+        // there and walks to the rung. Both listeners keep the port they
+        // bound, whatever the host did with the publication.
+        let guest_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), guest_port);
+        let guest_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)), guest_port);
+        crate::server::drive_proxy_until_serving(
+            a.clone(),
+            HostProxyStartup::Egress {
+                bind_base: guest_a.ip(),
+                port: ProxyPort::DefaultThenSelect {
+                    default: guest_port,
+                },
+            },
+            true,
+            HostExpose::HeldPorts(Arc::clone(&held)),
+            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
+        )
+        .await;
+        let port_a = wait_for_proxy_port(&a).await;
+        assert_eq!(
+            port_a, guest_port,
+            "the first VM's publication must hold the documented default"
+        );
+        crate::server::drive_proxy_until_serving(
+            b.clone(),
+            HostProxyStartup::Egress {
+                bind_base: guest_b.ip(),
+                port: ProxyPort::DefaultThenSelect {
+                    default: guest_port,
+                },
+            },
+            true,
+            HostExpose::HeldPorts(Arc::clone(&held)),
+            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
+        )
+        .await;
+        let port_b = wait_for_proxy_port(&b).await;
+        assert_eq!(
+            port_b, rung,
+            "the second VM's publication must take a host port of its own"
+        );
+
+        // Each VM's own box, on its own lease, at the one external port both
+        // registries publish — the two leases the attach path would report.
+        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let box_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let lease_a = Ipv4Addr::new(127, 0, 0, 4);
+        let lease_b = Ipv4Addr::new(127, 0, 0, 5);
+        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_a), box_port), "vm-a-web").await;
+        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_b), box_port), "vm-b-api").await;
+        a.sessions_manager()
+            .await
+            .hostnames()
+            .write()
+            .unwrap()
+            .report_own_address(
+                SessionId::nil(),
+                "web",
+                lease_a,
+                BTreeMap::from([(80, box_port)]),
+            );
+        b.sessions_manager()
+            .await
+            .hostnames()
+            .write()
+            .unwrap()
+            .report_own_address(
+                SessionId::nil(),
+                "api",
+                lease_b,
+                BTreeMap::from([(80, box_port)]),
+            );
+
+        // The forwards the publications describe, played by hand: each VM's
+        // published host port relays to that VM's proxy — the half of the
+        // publication that lives on the host.
+        let host_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
+        let host_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
+        spawn_forward(host_a, guest_a).await;
+        spawn_forward(host_b, guest_b).await;
+
+        // Both VMs' box names route through the host at the same time: each
+        // published port reaches its own VM's box and refuses the other
+        // VM's names, concurrently.
+        let (a_web, a_api, b_api, b_web) = tokio::join!(
+            proxy_get(host_a, "web.min.internal"),
+            proxy_get(host_a, "api.min.internal"),
+            proxy_get(host_b, "api.min.internal"),
+            proxy_get(host_b, "web.min.internal"),
+        );
+        assert!(a_web.contains("vm-a-web"), "got: {a_web}");
+        assert!(
+            a_api.contains("502"),
+            "VM A's proxy must refuse VM B's box, got: {a_api}"
+        );
+        assert!(b_api.contains("vm-b-api"), "got: {b_api}");
+        assert!(
+            b_web.contains("502"),
+            "VM B's proxy must refuse VM A's box, got: {b_web}"
+        );
+
+        // And neither VM's listener moved: each still answers its own
+        // loopback at the documented default its own boxes share with the
+        // daemon — the port a refused publication must never relocate, and
+        // the surface the boxes' fixed-port recipes depend on.
+        let (a_direct, b_direct) = tokio::join!(
+            proxy_get(guest_a, "web.min.internal"),
+            proxy_get(guest_b, "api.min.internal"),
+        );
+        assert!(
+            a_direct.contains("vm-a-web"),
+            "VM A's listener must keep the documented default, got: {a_direct}"
+        );
+        assert!(
+            b_direct.contains("vm-b-api"),
+            "VM B's listener must keep the documented default, got: {b_direct}"
+        );
+
+        // The other half of the hostname surface: each VM's box-zone
+        // answerer, the same two-gated startup its proxy takes, contending
+        // for the same host loopback through the same ledger. Both VMs bind
+        // the answerer's documented default on their own guest loopbacks —
+        // so the host ports their *publications* contend for are the ones
+        // that must differ, exactly as the proxies' did.
+        let zone_port = loop {
+            let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            let Some(zone_rung) = crate::server::next_host_publish_port(port) else {
+                continue;
+            };
+            if [guest_port, rung].contains(&port) || [guest_port, rung].contains(&zone_rung) {
+                continue;
+            }
+            match std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, zone_rung)) {
+                Ok(rung_probe) => drop(rung_probe),
+                Err(_) => continue,
+            }
+            break port;
+        };
+        let zone_rung = zone_port + u16::try_from(HOST_PUBLISH_PORT_STRIDE).unwrap();
+
+        let zone_scope = crate::net::answerer::AnswerScope::Microvm {
+            subnet: crate::net::DEFAULT_SUBNET,
+        };
+        crate::server::drive_answerer_until_serving(
+            a.clone(),
+            crate::net::answerer::ZoneAnswerer::new(
+                a.sessions_manager().await.hostnames(),
+                zone_scope.clone(),
+            ),
+            guest_a.ip(),
+            ProxyPort::DefaultThenSelect { default: zone_port },
+            true,
+            HostExpose::HeldPorts(Arc::clone(&held)),
+            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
+        )
+        .await;
+        let zone_port_a = wait_for_zone_port(&a).await;
+        assert_eq!(
+            zone_port_a, zone_port,
+            "the first VM's answerer publication must hold its default's number"
+        );
+        crate::server::drive_answerer_until_serving(
+            b.clone(),
+            crate::net::answerer::ZoneAnswerer::new(
+                b.sessions_manager().await.hostnames(),
+                zone_scope,
+            ),
+            guest_b.ip(),
+            ProxyPort::DefaultThenSelect { default: zone_port },
+            true,
+            HostExpose::HeldPorts(Arc::clone(&held)),
+            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
+        )
+        .await;
+        let zone_port_b = wait_for_zone_port(&b).await;
+        assert_eq!(
+            zone_port_b, zone_rung,
+            "the second VM's answerer publication must take a host port of its own"
+        );
+
+        // The forwards those publications describe, played by hand: each
+        // VM's published host port relays datagrams to that VM's answerer —
+        // the UDP half of the forward a host resolver's packets ride.
+        let zone_host_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), zone_port_a);
+        let zone_host_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), zone_port_b);
+        let zone_guest_a = SocketAddr::new(guest_a.ip(), zone_port);
+        let zone_guest_b = SocketAddr::new(guest_b.ip(), zone_port);
+        spawn_udp_forward(zone_host_a, zone_guest_a).await;
+        spawn_udp_forward(zone_host_b, zone_guest_b).await;
+
+        // Both VMs' box names answer through the host at the same time, each
+        // through the answerer port its VM published: its own box is held in
+        // its zone (NODATA at a lease the host may not be told — NET-127 —
+        // but held, never a leak), and the other VM's box is nobody's here.
+        let (a_web, a_api, b_api, b_web) = tokio::join!(
+            zone_lookup(zone_host_a, "web.min.internal"),
+            zone_lookup(zone_host_a, "api.min.internal"),
+            zone_lookup(zone_host_b, "api.min.internal"),
+            zone_lookup(zone_host_b, "web.min.internal"),
+        );
+        assert_eq!(
+            a_web.metadata.response_code,
+            ResponseCode::NoError,
+            "VM A's zone must hold its own box"
+        );
+        assert_eq!(
+            a_api.metadata.response_code,
+            ResponseCode::NXDomain,
+            "VM A's zone must not hold VM B's box"
+        );
+        assert_eq!(
+            b_api.metadata.response_code,
+            ResponseCode::NoError,
+            "VM B's zone must hold its own box"
+        );
+        assert_eq!(
+            b_web.metadata.response_code,
+            ResponseCode::NXDomain,
+            "VM B's zone must not hold VM A's box"
+        );
+
+        // And neither VM's answerer moved: each still serves its zone on its
+        // own loopback at the documented default its own boxes query — the
+        // in-guest surface a refused publication must never relocate.
+        let (a_zone_direct, b_zone_direct) = tokio::join!(
+            zone_lookup(zone_guest_a, "web.min.internal"),
+            zone_lookup(zone_guest_b, "api.min.internal"),
+        );
+        assert_eq!(
+            a_zone_direct.metadata.response_code,
+            ResponseCode::NoError,
+            "VM A's answerer must keep the documented default"
+        );
+        assert_eq!(
+            b_zone_direct.metadata.response_code,
+            ResponseCode::NoError,
+            "VM B's answerer must keep the documented default"
+        );
+    }
+
+    /// NET-059 as a VM boot really runs it since T63: minvmd assigns each
+    /// VM its own distinct node ports on the host and hands them on the
+    /// boot line, and each guest daemon binds them as [`ProxyPort::Pinned`]
+    /// — so two VMs on one host publish their hostname proxies and zone
+    /// answerers at exactly the numbers they were handed, and the
+    /// publication walk never runs on this path
+    /// (`two_vms_hostnames_route_concurrently` drives the boots with no
+    /// handed port — an older minvmd, a native run, a host that handed `0`
+    /// — that the walk covers). Both publish at their pinned numbers, no
+    /// `relocated` line appears in either daemon's startup, and both VMs'
+    /// box names route through the host at the same time: each through the
+    /// port its VM was handed, reaching its own VM's box and refusing the
+    /// other VM's, concurrently, on both halves of the host's hostname
+    /// surface — the routing proxies (`Host:`-dialled TCP) and the
+    /// box-zone answerers (A queries).
+    ///
+    /// The gvproxy forwarder each publication goes through is played two
+    /// ways, as in the walking test: the *port* is arbitrated by
+    /// [`crate::server::HostExpose::HeldPorts`] — the stand-in that holds
+    /// every host port it accepts, the ledger minvmd's own assignment
+    /// guarantees is never contended — and the *forward* itself is wired by
+    /// hand (`spawn_forward` for TCP, `spawn_udp_forward` for the answerer's
+    /// datagrams), binding the handed host port and relaying to the guest
+    /// listener.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn two_vms_pinned_ports_route_concurrently() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use hickory_proto::op::ResponseCode;
+        use tempfile::TempDir;
+
+        use crate::server::{
+            Config, HostExpose, HostProxyStartup, ProxyPort, RetryBackoff, ServerStateHandle,
+        };
+
+        // The handed pairs, the way minvmd's assignment makes them: one
+        // proxy port and one answerer port per VM, all four distinct on the
+        // host — the property two pinned publications rely on. Probed free
+        // on the loopback, TCP for the proxies and UDP for the answerers,
+        // the way every other borrowed port in this suite is.
+        let free_tcp = |taken: &mut HashSet<u16>| -> u16 {
+            loop {
+                let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                let port = probe.local_addr().unwrap().port();
+                drop(probe);
+                if taken.insert(port) {
+                    break port;
+                }
+            }
+        };
+        let free_udp = |taken: &mut HashSet<u16>| -> u16 {
+            loop {
+                let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                let port = probe.local_addr().unwrap().port();
+                drop(probe);
+                if taken.insert(port) {
+                    break port;
+                }
+            }
+        };
+        let mut handed = HashSet::new();
+        let proxy_a_port = free_tcp(&mut handed);
+        let answerer_a_port = free_udp(&mut handed);
+        let proxy_b_port = free_tcp(&mut handed);
+        let answerer_b_port = free_udp(&mut handed);
+
+        // Two VM-shaped daemons: `in_microvm` is what routes an own-address
+        // box to its lease, and each binds the pair its VM was handed on its
+        // own loopback — two guests, two netns, two numbers.
+        let vm_host = |dir: &TempDir| Config {
+            in_microvm: true,
+            ..crate::server::test_config(dir.path())
+        };
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let a = ServerStateHandle::new(vm_host(&dir_a), None).await.unwrap();
+        let b = ServerStateHandle::new(vm_host(&dir_b), None).await.unwrap();
+
+        // The host port ledger both publications go through: the stand-in
+        // forwarder that holds every port it accepts, standing in for the
+        // host gvproxy that holds the handed numbers.
+        let held = Arc::new(Mutex::new(HashSet::new()));
+
+        // The log the daemons' startup lines land in: the walk's own line
+        // is what must never appear on this path.
+        let (buf, guard) = capture_logs();
+
+        // Each VM's proxy, pinned to the port its VM was handed: the
+        // publication lands on the host at exactly that number, on the
+        // first proposal — no rung, no refusal.
+        let guest_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), proxy_a_port);
+        let guest_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)), proxy_b_port);
+        crate::server::drive_proxy_until_serving(
+            a.clone(),
+            HostProxyStartup::Egress {
+                bind_base: guest_a.ip(),
+                port: ProxyPort::Pinned(proxy_a_port),
+            },
+            true,
+            HostExpose::HeldPorts(Arc::clone(&held)),
+            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
+        )
+        .await;
+        let port_a = wait_for_proxy_port(&a).await;
+        assert_eq!(
+            port_a, proxy_a_port,
+            "VM A's proxy must publish at exactly the number it was handed"
+        );
+        crate::server::drive_proxy_until_serving(
+            b.clone(),
+            HostProxyStartup::Egress {
+                bind_base: guest_b.ip(),
+                port: ProxyPort::Pinned(proxy_b_port),
+            },
+            true,
+            HostExpose::HeldPorts(Arc::clone(&held)),
+            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
+        )
+        .await;
+        let port_b = wait_for_proxy_port(&b).await;
+        assert_eq!(
+            port_b, proxy_b_port,
+            "VM B's proxy must publish at exactly the number it was handed"
+        );
+
+        // Each VM's own box, on its own lease, at the one external port both
+        // registries publish — the two leases the attach path would report.
+        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let box_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let lease_a = Ipv4Addr::new(127, 0, 0, 4);
+        let lease_b = Ipv4Addr::new(127, 0, 0, 5);
+        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_a), box_port), "vm-a-web").await;
+        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_b), box_port), "vm-b-api").await;
+        a.sessions_manager()
+            .await
+            .hostnames()
+            .write()
+            .unwrap()
+            .report_own_address(
+                SessionId::nil(),
+                "web",
+                lease_a,
+                BTreeMap::from([(80, box_port)]),
+            );
+        b.sessions_manager()
+            .await
+            .hostnames()
+            .write()
+            .unwrap()
+            .report_own_address(
+                SessionId::nil(),
+                "api",
+                lease_b,
+                BTreeMap::from([(80, box_port)]),
+            );
+
+        // The forwards those publications describe, played by hand: each
+        // VM's handed host port relays to that VM's proxy — the half of the
+        // publication that lives on the host.
+        let host_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
+        let host_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
+        spawn_forward(host_a, guest_a).await;
+        spawn_forward(host_b, guest_b).await;
+
+        // Both VMs' box names route through the host at the same time: each
+        // handed port reaches its own VM's box and refuses the other VM's
+        // names, concurrently.
+        let (a_web, a_api, b_api, b_web) = tokio::join!(
+            proxy_get(host_a, "web.min.internal"),
+            proxy_get(host_a, "api.min.internal"),
+            proxy_get(host_b, "api.min.internal"),
+            proxy_get(host_b, "web.min.internal"),
+        );
+        assert!(a_web.contains("vm-a-web"), "got: {a_web}");
+        assert!(
+            a_api.contains("502"),
+            "VM A's proxy must refuse VM B's box, got: {a_api}"
+        );
+        assert!(b_api.contains("vm-b-api"), "got: {b_api}");
+        assert!(
+            b_web.contains("502"),
+            "VM B's proxy must refuse VM A's box, got: {b_web}"
+        );
+
+        // The other half of the hostname surface, handed the same way: each
+        // VM's box-zone answerer pinned to the port its VM was handed, the
+        // same two-gated startup its proxy takes.
+        let zone_scope = crate::net::answerer::AnswerScope::Microvm {
+            subnet: crate::net::DEFAULT_SUBNET,
+        };
+        crate::server::drive_answerer_until_serving(
+            a.clone(),
+            crate::net::answerer::ZoneAnswerer::new(
+                a.sessions_manager().await.hostnames(),
+                zone_scope.clone(),
+            ),
+            guest_a.ip(),
+            ProxyPort::Pinned(answerer_a_port),
+            true,
+            HostExpose::HeldPorts(Arc::clone(&held)),
+            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
+        )
+        .await;
+        let zone_port_a = wait_for_zone_port(&a).await;
+        assert_eq!(
+            zone_port_a, answerer_a_port,
+            "VM A's answerer must publish at exactly the number it was handed"
+        );
+        crate::server::drive_answerer_until_serving(
+            b.clone(),
+            crate::net::answerer::ZoneAnswerer::new(
+                b.sessions_manager().await.hostnames(),
+                zone_scope,
+            ),
+            guest_b.ip(),
+            ProxyPort::Pinned(answerer_b_port),
+            true,
+            HostExpose::HeldPorts(Arc::clone(&held)),
+            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
+        )
+        .await;
+        let zone_port_b = wait_for_zone_port(&b).await;
+        assert_eq!(
+            zone_port_b, answerer_b_port,
+            "VM B's answerer must publish at exactly the number it was handed"
+        );
+
+        // The UDP forwards those publications describe, played by hand: each
+        // VM's handed host port relays datagrams to that VM's answerer —
+        // the half a host resolver's packets ride.
+        let zone_host_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), zone_port_a);
+        let zone_host_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), zone_port_b);
+        let zone_guest_a = SocketAddr::new(guest_a.ip(), answerer_a_port);
+        let zone_guest_b = SocketAddr::new(guest_b.ip(), answerer_b_port);
+        spawn_udp_forward(zone_host_a, zone_guest_a).await;
+        spawn_udp_forward(zone_host_b, zone_guest_b).await;
+
+        // Both VMs' box names answer through the host at the same time, each
+        // through the port its VM was handed: its own box is held in its
+        // zone (NODATA at a lease the host may not be told — NET-127 — but
+        // held, never a leak), and the other VM's box is nobody's here.
+        let (a_web, a_api, b_api, b_web) = tokio::join!(
+            zone_lookup(zone_host_a, "web.min.internal"),
+            zone_lookup(zone_host_a, "api.min.internal"),
+            zone_lookup(zone_host_b, "api.min.internal"),
+            zone_lookup(zone_host_b, "web.min.internal"),
+        );
+        assert_eq!(
+            a_web.metadata.response_code,
+            ResponseCode::NoError,
+            "VM A's zone must hold its own box"
+        );
+        assert_eq!(
+            a_api.metadata.response_code,
+            ResponseCode::NXDomain,
+            "VM A's zone must not hold VM B's box"
+        );
+        assert_eq!(
+            b_api.metadata.response_code,
+            ResponseCode::NoError,
+            "VM B's zone must hold its own box"
+        );
+        assert_eq!(
+            b_web.metadata.response_code,
+            ResponseCode::NXDomain,
+            "VM B's zone must not hold VM A's box"
+        );
+
+        // And neither daemon's startup ever walked: no `relocated` line may
+        // appear, because a handed publication that is refused keeps
+        // proposing its port (the retry is the remedy) and these two never
+        // refused each other anything.
+        drop(guard);
+        let logged = buf.contents();
+        assert!(
+            !logged.contains("relocated"),
+            "a handed, pinned publication never walks to a rung, so the \
+             walk's line must not appear in either VM's startup: {logged}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Test helpers.
     // -----------------------------------------------------------------------
@@ -2312,6 +3081,169 @@ mod tests {
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// Spawns a one-shot backend on `addr` that answers every connection
+    /// with a `200 OK` carrying `body`, closing when it has — the box each
+    /// VM's name routes to, distinguishable by what it says.
+    #[cfg(target_os = "linux")]
+    async fn spawn_backend_on(addr: SocketAddr, body: &'static str) {
+        let backend = TcpListener::bind(addr).await.unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = backend.accept().await {
+                tokio::spawn(async move {
+                    let mut scratch = [0u8; 1024];
+                    // Neither the read's count nor the answer's fate is what
+                    // this backend exists for; the drop that follows closes
+                    // the connection the test then reads to its end, which is
+                    // its success path.
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "the request is only read to be drained"
+                    )]
+                    let _ = sock.read(&mut scratch).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "the answer's fate is not what this backend records"
+                    )]
+                    let _ = sock.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+    }
+
+    /// Binds `local` on the host loopback and relays every connection to
+    /// `remote`: the forward a published port stands for, played by hand —
+    /// the real gvproxy forwarder binds the host port and bridges it to the
+    /// guest listener over the switch, and this is the same wiring with the
+    /// switch replaced by a loopback dial, so a test's dials go through the
+    /// host port the way a host client's do.
+    #[cfg(target_os = "linux")]
+    async fn spawn_forward(local: SocketAddr, remote: SocketAddr) {
+        let listener = TcpListener::bind(local).await.unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(mut upstream) = TcpStream::connect(remote).await else {
+                        return;
+                    };
+                    // The relay ends when either side closes; how it ended is
+                    // the test's business, read from the response it got.
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "a closed relay is its outcome, not its failure"
+                    )]
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut upstream).await;
+                });
+            }
+        });
+    }
+
+    /// Waits until the state reports the host port its hostname proxy's
+    /// publication landed on.
+    #[cfg(target_os = "linux")]
+    async fn wait_for_proxy_port(state: &crate::server::ServerStateHandle) -> u16 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(port) = state.hostname_proxy_port().await {
+                    return port;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the hostname proxy must publish and report its port")
+    }
+
+    /// Waits until the state reports the host port its zone answerer's
+    /// publication landed on — the answerer's own discovery field, carried
+    /// beside the proxy's the same way the RPC reply serves both.
+    #[cfg(target_os = "linux")]
+    async fn wait_for_zone_port(state: &crate::server::ServerStateHandle) -> u16 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(port) = state.zone_answerer_port().await {
+                    return port;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the zone answerer must publish and report its port")
+    }
+
+    /// Sends one A query for `name` to the answerer at `addr` and decodes the
+    /// reply — the dial a host resolver makes, bounded because a test that
+    /// never hears back must fail, not hang.
+    #[cfg(target_os = "linux")]
+    async fn zone_lookup(addr: SocketAddr, name: &str) -> hickory_proto::op::Message {
+        use hickory_proto::op::Message;
+        use hickory_proto::rr::RecordType;
+
+        use crate::net::answerer::encode_query;
+
+        let client = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let query = encode_query(name, RecordType::A);
+        client.send_to(&query, addr).await.unwrap();
+        let mut scratch = [0u8; 512];
+        let (len, _) =
+            tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut scratch))
+                .await
+                .expect("the answerer must answer its published host port")
+                .expect("a datagram, not a timeout");
+        Message::from_vec(&scratch[..len]).expect("the answerer's reply decodes")
+    }
+
+    /// Binds `local` on the host loopback and relays each datagram to
+    /// `remote`, one upstream exchange at a time: the UDP half of the forward
+    /// a published port stands for, played by hand — the real gvproxy
+    /// forwarder binds the host port and bridges it to the guest socket over
+    /// the switch, and this is the same wiring with the switch replaced by a
+    /// loopback dial, so a test's resolver dials go through the host port the
+    /// way a host resolver's datagrams do.
+    #[cfg(target_os = "linux")]
+    async fn spawn_udp_forward(local: SocketAddr, remote: SocketAddr) {
+        let listener = tokio::net::UdpSocket::bind(local).await.unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((len, reply_to)) = listener.recv_from(&mut buf).await else {
+                    return;
+                };
+                let Ok(upstream) = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await
+                else {
+                    return;
+                };
+                let Ok(()) = upstream.connect(remote).await else {
+                    return;
+                };
+                if upstream.send(&buf[..len]).await.is_err() {
+                    return;
+                }
+                let mut scratch = [0u8; 512];
+                // One datagram, one exchange: a query that goes unanswered
+                // upstream simply never comes back, and the test's own bound
+                // is what notices.
+                if let Ok(Ok((n, _))) = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    upstream.recv_from(&mut scratch),
+                )
+                .await
+                {
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "the reply's fate is the test's to read from what came back"
+                    )]
+                    let _ = listener.send_to(&scratch[..n], reply_to).await;
+                }
+            }
+        });
     }
 
     /// A caller's egress declaration that denies exactly the target's address
