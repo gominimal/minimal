@@ -812,7 +812,9 @@ pub(crate) fn command(port: u16) -> String {
 /// has no other way to see. The interim fact names the step that ends it:
 /// installing the range on the host — by design §7.1 the job of the same
 /// advisory command on macOS, once that command reserves the range (a
-/// root-held boot step, not yet part of the command it renders here). The
+/// root-held boot step that T76
+/// (<https://github.com/gominimal/minimal/issues/1817>) adds to the command
+/// rendered here). The
 /// command the advisory names is therefore said to configure the resolver,
 /// and the range fact stands beside it rather than under it, so a user who
 /// ran the command is not told it ended the interim. String assembly only.
@@ -865,8 +867,9 @@ pub(crate) fn advisory_at(
     if interim {
         // The interim ends when the range is installed on the host — the
         // root-held boot step design §7.1 folds into the macOS advisory
-        // command. The command rendered here does not carry that step yet,
-        // so the fact names the range as what is missing and stops there:
+        // command. That step is T76's to add to the command rendered here
+        // (https://github.com/gominimal/minimal/issues/1817); until it does,
+        // the fact names the range as what is missing and stops there:
         // it neither claims the command below ends the interim nor claims
         // nothing ever will.
         facts.push(format!(
