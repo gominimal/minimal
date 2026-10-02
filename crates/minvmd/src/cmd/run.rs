@@ -539,12 +539,12 @@ fn run_foreground() -> Result<()> {
             let proxy_sock = switch_sock.with_file_name("gvproxy-bep.sock");
             // MINVMD_BEP_STUB is the e2e lane's flag and nothing else's: it
             // is what puts a stand-in acceptor at the path the wire names,
-            // so the lane can read what a delivery presents — and it is
-            // what decides, below, whether the pool is partitioned by the
-            // table's box rows at all. The handle is underscore-bound: its
-            // serving thread owns the socket and outlives this block for
-            // the daemon's life, and the supervisor has nothing further to
-            // ask of it.
+            // so the lane can read what a delivery presents — and the bind
+            // below is what decides, through the handle it leaves, whether
+            // the pool is partitioned by the table's box rows at all. The
+            // handle is underscore-bound: its serving thread owns the
+            // socket and outlives this block for the daemon's life, and
+            // the supervisor has nothing further to ask of it.
             let stub_enabled = std::env::var_os("MINVMD_BEP_STUB").is_some();
             let _bep_stub = if stub_enabled {
                 let (start_tx, start_rx) = std::sync::mpsc::channel();
@@ -561,11 +561,17 @@ fn run_foreground() -> Result<()> {
                         Some(stub)
                     }
                     Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            "failed to bind the box egress proxy stand-in acceptor"
-                        );
-                        None
+                        // Fail the boot, the same argument the
+                        // switch-spawn failure beside this block makes: a
+                        // boot under the flag exists to be probed through
+                        // the stand-in, and a boot without one leaves the
+                        // lane waiting on a socket that never comes —
+                        // every probe below it failing in terms of an
+                        // acceptor that was never there. The bind happens
+                        // on the calling thread precisely so this is where
+                        // its failure surfaces.
+                        return Err(error)
+                            .context("binding the box egress proxy stand-in acceptor");
                     }
                 }
             } else {
@@ -583,7 +589,7 @@ fn run_foreground() -> Result<()> {
                 crate::net::DEFAULT_DATAPATH_CHECK_INTERVAL,
                 &boxes,
                 wire,
-                bep_box_source(stub_enabled, boxes.table()),
+                bep_box_source(_bep_stub.is_some(), boxes.table()),
             ) {
                 Ok(gvproxy) => {
                     let subnet = boxes.subnet();
@@ -876,8 +882,9 @@ impl switch::bep_host::BepBoxSource for RegisteredBoxes {
 }
 
 /// The box source the peer's pool is partitioned by: the table's box rows
-/// when the stand-in acceptor is up, and [`switch::bep_host::NoBoxes`] —
-/// no row, no share, no socket — when it is not.
+/// when a stand-in acceptor actually bound at the wire's path, and
+/// [`switch::bep_host::NoBoxes`] — no row, no share, no socket — when one
+/// did not.
 ///
 /// A socket in the pool is a lane onto the host for the box whose share
 /// holds it, and nothing yet stands between one and whatever reaches it:
@@ -887,13 +894,15 @@ impl switch::bep_host::BepBoxSource for RegisteredBoxes {
 /// own reset — until that rule lands and lets the shares bind. The
 /// stand-in's own boot (`MINVMD_BEP_STUB`, the e2e lane's flag and nothing
 /// else's) is the one wiring that registers rows, and only a lane that
-/// asked for it gets them.
+/// asked for it gets them; the caller passes the stand-in's own handle —
+/// whether one is bound, not whether the flag that asks for one was set —
+/// so the pool can never be partitioned by a path nothing is listening on.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn bep_box_source(
-    stub_enabled: bool,
+    stand_in_bound: bool,
     table: crate::box_registry::BoxTable,
 ) -> std::sync::Arc<dyn switch::bep_host::BepBoxSource> {
-    if stub_enabled {
+    if stand_in_bound {
         std::sync::Arc::new(RegisteredBoxes::new(table))
     } else {
         std::sync::Arc::new(switch::bep_host::NoBoxes)
