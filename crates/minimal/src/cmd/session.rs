@@ -663,32 +663,39 @@ pub(crate) async fn activate_session(
     // the reserved range absent. It only ever names the command that
     // points the host's resolver at the answerer; running it (and any
     // privilege prompt it carries) is the user's act, never the session
-    // start's. Kept, not just printed: the advisory is this host's half of
-    // NET-018's condition — it prints only when the host's resolver is not
-    // pointed at the answerer, or something keeps a configured hook from
-    // reaching host lookups — so the surface line below decides from it.
-    let name_advisory =
-        crate::resolver::session_advisory(created.zone_answerer_port, created.interim_loopback)
-            .await;
+    // start's. One read of this host's resolver state decides both this and
+    // the surface verdict below it, so the two lines cannot disagree about
+    // one host.
+    let detection = crate::resolver::session_detection().await;
+    let name_advisory = crate::resolver::session_advisory_at(
+        &detection,
+        created.zone_answerer_port,
+        created.interim_loopback,
+    );
     if let Some(advisory) = &name_advisory {
         eprintln!("{advisory}");
     }
     // NET-018: name the live surface at the moment the user is about to rely
-    // on the names — decided from the daemon's verdict *and* this host's
-    // half, so the line and the advisory above cannot disagree on the page:
-    // a daemon that says native knows only its answerer serving and the
-    // range present on the loopback *it* sits on — the guest's on a
-    // VM-backed host, always present — so on a host whose resolver it cannot
-    // see, the names still route only through the proxy, and that is what
-    // the line says. The proxy's half is said with it either way (NET-019):
+    // on the names — decided in the one function both verbs share
+    // (`resolver`), from the same detection the advisory read: this host's
+    // hook (and the stub-bypass blocker that says whether its lookups
+    // consult what the hook configures), the daemon's answerer-bound
+    // report, and the reserved range on this host's own loopback. `None` —
+    // the answerer not bound — prints nothing: no native surface to name,
+    // and the ports and the advisory above have told the proxy's story.
+    // The proxy's half is said with the native arm either way (NET-019):
     // the `HTTP(S)_PROXY` recipes this activation prints keep working
-    // beside native DNS, so nothing already captured goes stale. A daemon
-    // that says the proxy prints nothing — its reason and remedy have their
-    // own lines.
-    if let Some(surface) = reported_name_surface(created.name_surface, name_advisory.is_none()) {
+    // beside native DNS, so nothing already captured goes stale.
+    if let Some(surface) = crate::resolver::live_name_surface_at(
+        &detection,
+        created.zone_answerer_port,
+        created.answerer_bound,
+    )
+    .await
+    {
         eprintln!(
             "{}",
-            name_surface_line(surface, created.hostname_proxy_port)
+            crate::resolver::name_surface_line(surface, created.hostname_proxy_port)
         );
     }
     let id = created.id;

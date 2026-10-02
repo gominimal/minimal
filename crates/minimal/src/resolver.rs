@@ -804,7 +804,10 @@ pub(crate) fn advisory_at(
 }
 
 /// The advisory to print at this session's start, given what the daemon
-/// reported on its create response.
+/// reported on its create response and a detection the caller already read
+/// — the session-start path's form, so the advisory and the live-surface
+/// verdict printed below it share one read of this host's resolver state
+/// and cannot disagree about it.
 ///
 /// `zone_answerer_port` is `None` while the daemon is still bringing its
 /// answerer up (or from a daemon predating the field, which the create's
@@ -819,13 +822,166 @@ pub(crate) fn advisory_at(
 /// lookups there.
 ///
 /// Printed once per session start, to stderr; never prompts.
-pub(crate) async fn session_advisory(
+pub(crate) fn session_advisory_at(
+    detection: &(Hook, Option<String>),
     zone_answerer_port: Option<u16>,
     interim_loopback: bool,
 ) -> Option<String> {
     let port = zone_answerer_port?;
-    let (hook, blocker) = session_detection().await;
-    advisory_at(&hook, port, interim_loopback, blocker.as_deref())
+    let (hook, blocker) = detection;
+    advisory_at(hook, port, interim_loopback, blocker.as_deref())
+}
+
+/// The surface a `*.{ZONE}` name resolves through on this host, as the two
+/// verbs that can print it report it (NET-018). [`LiveSurface::Native`] is
+/// native DNS: the host's own resolver answers the zone from the daemon's
+/// answerer, no proxy settings involved. [`LiveSurface::Proxy`] is the
+/// hostname proxy: names resolve only through the listener an
+/// `HTTP(S)_PROXY` export points at.
+///
+/// It lives here, beside the detection and the advisory, because the
+/// verdict is the *host's* — the one place it can be computed is the host
+/// the names resolve on — so `min session activate` and `min ls` both
+/// print from the one function that reads it and cannot disagree about
+/// one host. T65's verbs inherit it unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveSurface {
+    /// Native DNS: the host resolver answers `*.{ZONE}` from the answerer.
+    Native,
+    /// The hostname proxy: names resolve only through it.
+    Proxy,
+}
+
+/// Design §7.1's supersession condition, as the three facts it is: this
+/// host's resolver hook routes [`ZONE`] to the answerer on `answerer_port`
+/// — with no [`stub_bypass_blocker`], because on a host whose lookups
+/// bypass the resolver a routing-domain hook configures, the hook is
+/// configuration no host process consults — the daemon's box-zone answerer
+/// is bound in its own namespace, and the reserved local range whose
+/// addresses the boxes publish from is present on this host's loopback.
+/// Native DNS is live only when all three hold; any one of them missing
+/// and the hostname proxy is the only surface that answers a box name.
+/// Pure, so the table is unit-testable on every platform the suite runs
+/// on, whatever that host's own files say.
+pub(crate) fn native_surface_at(
+    hook: &Hook,
+    answerer_port: u16,
+    answerer_bound: bool,
+    range_present: bool,
+    blocker: Option<&str>,
+) -> bool {
+    answerer_bound && hook.routes(answerer_port) && range_present && blocker.is_none()
+}
+
+/// The live surface for the facts one reply carries, from a detection the
+/// caller already read — `min session activate`'s form: the session start
+/// reads this host's resolver state once (see [`session_advisory_at`]) and
+/// decides both the advisory and this verdict from that one read.
+///
+/// `None` — nothing to print — when the daemon's answerer is not bound in
+/// its own namespace (`answerer_bound` false, or the reply carrying no
+/// port): there is then no native surface to name, the proxy is the only
+/// surface and the port lines and the advisory already tell its story, and
+/// — the same read — a daemon old enough to predate the field is not
+/// evidence its answerer serves, so silence is the arm that cannot
+/// misreport (see the field's doc in `minimald-rpc`). Otherwise the
+/// verdict is the three facts': native when they all hold, the proxy when
+/// any one of them does not.
+///
+/// The published-range fact is read last, and only behind the two cheap
+/// ones: a host whose resolver does not route the zone to the answerer —
+/// or one whose lookups bypass the resolver a hook would configure —
+/// cannot read native whatever the range says, so it pays no bind probe.
+pub(crate) async fn live_name_surface_at(
+    detection: &(Hook, Option<String>),
+    zone_answerer_port: Option<u16>,
+    answerer_bound: bool,
+) -> Option<LiveSurface> {
+    let port = zone_answerer_port?;
+    if !answerer_bound {
+        return None;
+    }
+    let (hook, blocker) = detection;
+    // The two cheap facts first: a host whose resolver does not route the
+    // zone to the answerer — or one whose lookups bypass the resolver a
+    // hook would configure — cannot read native whatever the range says,
+    // so it settles on the proxy without paying the bind probe below.
+    if !hook.routes(port) || blocker.is_some() {
+        return Some(LiveSurface::Proxy);
+    }
+    let range_present = range_present_on_host().await;
+    Some(if native_surface_at(hook, port, true, range_present, blocker.as_deref()) {
+        LiveSurface::Native
+    } else {
+        LiveSurface::Proxy
+    })
+}
+
+/// [`live_name_surface_at`] with the detection this verb reads itself —
+/// `min ls`'s form: the list has no session-start advisory to share a
+/// read with, so the same bounded, read-only detection runs here, and
+/// only when the daemon's answerer is bound (the cheap half the reply
+/// carries), so a proxy-only host pays nothing per list.
+pub(crate) async fn live_name_surface(
+    zone_answerer_port: Option<u16>,
+    answerer_bound: bool,
+) -> Option<LiveSurface> {
+    if zone_answerer_port.is_none() || !answerer_bound {
+        return None;
+    }
+    let detection = session_detection().await;
+    live_name_surface_at(&detection, zone_answerer_port, answerer_bound).await
+}
+
+/// Whether the reserved local range is present on *this* host's loopback:
+/// the same bind probe the daemon runs at session start (`switch::loopback`,
+/// one definition next to the range it probes), run where the verdict is
+/// decided — the CLI's own host, which is the host whose processes resolve
+/// the names, on a VM-backed one and a native one alike. Blocking, so on a
+/// blocking thread; a probe task that panics or is lost reads as absent,
+/// because without a verdict the verbs may not say native.
+async fn range_present_on_host() -> bool {
+    tokio::task::spawn_blocking(switch::loopback::probe)
+        .await
+        .map(|probe| probe.present())
+        .unwrap_or_else(|join| {
+            tracing::warn!(
+                error = %join,
+                "the live-surface bind probe did not run; treating the \
+                 reserved local range as absent"
+            );
+            false
+        })
+}
+
+/// NET-018's report: the line `min ls` and `min session activate` print,
+/// naming the surface [`live_name_surface`] decided is live. `proxy_port`
+/// is the port the same reply carries, when the proxy came up: NET-019
+/// keeps it serving beside native DNS, and the line says so, because a
+/// client that captured `HTTP(S)_PROXY` at activation keeps routing
+/// through it — the export does not go stale when the surface changes.
+/// With no port the proxy is down, and the line says that in the daemon's
+/// own words rather than claiming it still serves. Pure, so both verbs
+/// print the same words and tests assert them without capturing output.
+#[must_use]
+pub fn name_surface_line(surface: LiveSurface, proxy_port: Option<u16>) -> String {
+    let proxy_half = match proxy_port {
+        Some(port) => format!("; the hostname proxy still serves on 127.0.0.1:{port}"),
+        None => "; the hostname proxy is not serving".to_string(),
+    };
+    match surface {
+        LiveSurface::Native => format!(
+            "native DNS is the live name surface · <name>.min.internal answers from \
+             the zone answerer and each box's own reserved-range address{proxy_half}"
+        ),
+        LiveSurface::Proxy => match proxy_port {
+            Some(port) => format!(
+                "the hostname proxy is the live name surface · <name>.min.internal \
+                 routes through it on 127.0.0.1:{port}"
+            ),
+            None => "the hostname proxy is the live name surface; it is not serving".to_string(),
+        },
+    }
 }
 
 /// The reserved range as `network/prefix`, the form the advisory and the
@@ -1013,14 +1169,15 @@ mod tests {
     #[tokio::test]
     async fn session_advisory_agrees_with_the_hook_it_detected() {
         let port = 15353;
-        let (hook, blocker) = session_detection().await;
-        let advisory = session_advisory(Some(port), false).await;
+        let detection = session_detection().await;
+        let advisory = session_advisory_at(&detection, Some(port), false);
+        let (hook, blocker) = &detection;
         if hook.routes(port) && blocker.is_none() {
             assert!(advisory.is_none(), "configured host must not be advised");
         } else if let Some(blocker) = blocker {
             let advisory = advisory.expect("a host the command cannot reach must be told why");
             assert!(
-                advisory.contains(&blocker),
+                advisory.contains(blocker),
                 "the advisory says why no command is named: {advisory}"
             );
             assert!(
@@ -1043,7 +1200,149 @@ mod tests {
         // `None` is the daemon still bringing its answerer up — there is no
         // port to point a command at, so nothing is printed rather than a
         // command that cannot work.
-        assert!(session_advisory(None, false).await.is_none());
+        let detection = session_detection().await;
+        assert!(session_advisory_at(&detection, None, false).is_none());
+    }
+
+    /// A routing hook for the answerer's port, the state a host is in once
+    /// the advisory's command has run.
+    fn routing_hook() -> Hook {
+        Hook::configured("test", Some(15353), "test hook routes the zone")
+    }
+
+    #[test]
+    fn native_surface_needs_all_three_facts() {
+        let port = 15353;
+        let routes = routing_hook();
+        let blocker: Option<&str> = None;
+        // All three facts: native DNS is live.
+        assert!(
+            native_surface_at(&routes, port, true, true, blocker),
+            "a routing hook on a bound answerer over a present range is native DNS"
+        );
+        // Each fact on its own is the difference between native and the
+        // proxy, so each missing one must drop the verdict.
+        assert!(
+            !native_surface_at(&routes, port, false, true, blocker),
+            "an unbound answerer cannot answer the zone natively"
+        );
+        assert!(
+            !native_surface_at(
+                &Hook::absent("test", "no hook"),
+                port,
+                true,
+                true,
+                blocker
+            ),
+            "a host whose resolver does not route the zone reads the proxy"
+        );
+        assert!(
+            !native_surface_at(&routes, port, true, false, blocker),
+            "a host without the reserved range has no published addresses to resolve"
+        );
+        // The reviewer's host, spelled out: the routing-domain hook is
+        // configured — it routes — but the stub-bypass blocker says no host
+        // process's lookups consult what it configures, so it is dead
+        // configuration and the verdict must not be native on its word.
+        assert!(
+            !native_surface_at(&routes, port, true, true, Some("lookups bypass resolved")),
+            "a hook no host process consults does not make native DNS live"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_surface_prints_nothing_until_the_answerer_binds() {
+        // No port on the reply — the daemon still bringing its answerer up
+        // — and no bound report are both the read that changes nothing:
+        // nothing prints, and an old daemon's silence is never mistaken
+        // for an answerer that serves.
+        let detection = (routing_hook(), None);
+        assert!(live_name_surface_at(&detection, None, true).await.is_none());
+        assert!(live_name_surface_at(&detection, Some(15353), false).await.is_none());
+        assert!(live_name_surface(None, false).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn live_surface_is_the_proxy_when_either_cheap_fact_is_missing() {
+        let port = 15353;
+        // A hook that does not route: proxy, settled without a probe.
+        let absent = (Hook::absent("test", "no hook"), None);
+        assert_eq!(
+            live_name_surface_at(&absent, Some(port), true).await,
+            Some(LiveSurface::Proxy),
+            "a host whose resolver does not route the zone prints the proxy as live"
+        );
+        // The reviewer's host: a routing hook whose stub-bypass blocker
+        // makes it configuration no host process consults — the proxy, and
+        // both verbs must read it, never native on the hook's word alone.
+        let blocked = (routing_hook(), Some("lookups bypass resolved".to_string()));
+        assert_eq!(
+            live_name_surface_at(&blocked, Some(port), true).await,
+            Some(LiveSurface::Proxy),
+            "a hook no host process consults is the proxy's story, on both verbs"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_verdict_and_advisory_cannot_disagree() {
+        let port = 15353;
+        // The two lines share one read, so the states they print from are
+        // the same: a host the verdict calls native is a host the advisory
+        // has nothing to say about, and a host the advisory must warn is
+        // one the verdict calls the proxy.
+        let detection = (routing_hook(), None);
+        let advisory = session_advisory_at(&detection, Some(port), false);
+        assert!(advisory.is_none(), "a native verdict has no advisory: {advisory:?}");
+        let blocked = (routing_hook(), Some("lookups bypass resolved".to_string()));
+        assert!(
+            session_advisory_at(&blocked, Some(port), false).is_some(),
+            "the blocked hook is still the advisory's to say"
+        );
+        assert!(
+            !native_surface_at(
+                &blocked.0,
+                port,
+                true,
+                true,
+                blocked.1.as_deref()
+            ),
+            "and it is the proxy the verdict names for the same read"
+        );
+    }
+
+    #[test]
+    fn name_surface_line_says_which_surface_and_where_the_proxy_serves() {
+        let native = name_surface_line(LiveSurface::Native, Some(15390));
+        assert!(
+            native.contains("native DNS is the live name surface"),
+            "the native arm names the surface: {native}"
+        );
+        assert!(
+            native.contains("the hostname proxy still serves on 127.0.0.1:15390"),
+            "the native arm says the proxy keeps serving beside it (NET-019): {native}"
+        );
+        let not_serving = name_surface_line(LiveSurface::Native, None);
+        assert!(
+            not_serving.contains("the hostname proxy is not serving"),
+            "a daemon with no proxy port is one whose proxy is not serving: {not_serving}"
+        );
+        assert!(
+            !not_serving.contains("still serves"),
+            "with no port to name, the line must not claim the proxy serves: {not_serving}"
+        );
+        let proxy = name_surface_line(LiveSurface::Proxy, Some(15390));
+        assert!(
+            proxy.contains("the hostname proxy is the live name surface"),
+            "the proxy arm names the surface: {proxy}"
+        );
+        assert!(
+            proxy.contains("routes through it on 127.0.0.1:15390"),
+            "the proxy arm names where it serves: {proxy}"
+        );
+        assert!(
+            !proxy.contains("native DNS is the live name surface"),
+            "the proxy arm must not say the native words: {proxy}"
+        );
     }
 
     #[cfg(any(test, target_os = "macos"))]
