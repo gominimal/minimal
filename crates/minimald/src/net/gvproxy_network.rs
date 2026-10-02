@@ -374,8 +374,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use switch::MacAddr;
     use sandbox2::NetGuard as _;
+    use switch::MacAddr;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::{Mutex, mpsc};
