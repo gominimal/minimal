@@ -8,15 +8,11 @@
 set -eu
 msg="$1"
 
-if command -v npx >/dev/null 2>&1 && [ -f commitlint.config.cjs ]; then
-  if ! npx --no-install commitlint --edit "$msg" 2>/dev/null; then
-    # commitlint not installed locally: fall through to the length rules.
-    if npx --no-install commitlint --version >/dev/null 2>&1; then
-      exit 1
-    fi
-  else
-    exit 0
-  fi
+# Probe for commitlint first, so only the probe's "not installed" noise is
+# discarded and commitlint's own errors always reach the user.
+if command -v npx >/dev/null 2>&1 && [ -f commitlint.config.cjs ] &&
+  npx --no-install commitlint --version >/dev/null 2>&1; then
+  exec npx --no-install commitlint --edit "$msg"
 fi
 
 awk '
