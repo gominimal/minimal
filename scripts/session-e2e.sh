@@ -472,6 +472,11 @@ teardown() {
   [ -n "$SECOND_SEED_DIR" ] && rm -rf "$SECOND_SEED_DIR"
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
+  # The proxy-source proof's two boxes: their project dirs are removed on its
+  # success path, but every failure path in it goes straight to `fail`, so the
+  # trap is the one place that always sees them.
+  [ -n "$BEPB_SEED_DIR_A" ] && rm -rf "$BEPB_SEED_DIR_A"
+  [ -n "$BEPB_SEED_DIR_B" ] && rm -rf "$BEPB_SEED_DIR_B"
   # The forward holds the laptop-side listener; INT is the documented stop,
   # KILL the backstop so a hung relay cannot outlive the run.
   if [ -n "$RETIRED_FWD_PID" ]; then
@@ -5013,16 +5018,20 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
   # address on its listener port is accepted by the delivery's pool, dialled
   # through to the stand-in acceptor with this boot's token and the fixed
   # header, and the acceptor's one answer line travels back through the
-  # delivery to this box: socat prints it, the box's own lease address in
-  # the source field is the proof, and anything else is a failure of the
-  # delivery's identity.
+  # delivery to this box — so the probe must print that line on the box's
+  # stdout, where the greps below read it: socat's left address is an empty
+  # pipe and `-t 10` holds the connection open for the answer once that pipe
+  # reaches EOF, the same shape the hostname-proxy case's bogus-head probe
+  # uses. A `/dev/null` left address — the shape the MAC and ARP cases use,
+  # which need only a RST and socat's stderr — would hand the answer to
+  # /dev/null and leave this case's greps with nothing to read.
   mnl session exec "$bepb_sid_a" 'test -x /usr/bin/socat' >/dev/null 2>&1 || {
     echo "::error::box A has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"
     unset MINVMD_BEP_STUB
     fail
   }
   mnl session exec "$bepb_sid_a" \
-    "/usr/bin/socat /dev/null TCP:$proxy_ip:$proxy_port,connect-timeout=15" \
+    "printf '' | /usr/bin/socat -t 10 - TCP:$proxy_ip:$proxy_port,connect-timeout=15" \
     >"$WORK/bep-box-a-answer.out" 2>"$WORK/bep-box-a-answer.err" || {
     echo "::error::box A's connection to the proxy's address did not complete"
     cat "$WORK/bep-box-a-answer.err" 2>/dev/null || true
@@ -5030,7 +5039,7 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
     fail
   }
   mnl session exec "$bepb_sid_b" \
-    "/usr/bin/socat /dev/null TCP:$proxy_ip:$proxy_port,connect-timeout=15" \
+    "printf '' | /usr/bin/socat -t 10 - TCP:$proxy_ip:$proxy_port,connect-timeout=15" \
     >"$WORK/bep-box-b-answer.out" 2>"$WORK/bep-box-b-answer.err" || {
     echo "::error::box B's connection to the proxy's address did not complete"
     cat "$WORK/bep-box-b-answer.err" 2>/dev/null || true
