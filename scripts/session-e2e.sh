@@ -77,6 +77,10 @@
 #   session_exec                     `min session exec` in the session's namespaces
 #   session_outbound_request         an outbound request from inside the session (NET-107)
 #   own_ip                           `--network own_ip` tap + switch attach
+#   own_ip_egress_declared_and_enforced
+#                                    the four egress fields declared, allowed
+#                                    and disallowed connections, the coming
+#                                    deny-all announcement, and the opt-out
 #   task_run                         `min task run` / `min session run` loop
 #   hooks                            lifecycle hooks, loadouts, patches, shells
 #   skip_scaffold                    the daemon-scaffolded blueprint upload lane
@@ -84,16 +88,27 @@
 #   restart                          daemon stop → autospawn, hooks survive
 #   fresh_install_own_ip_ingress_publishes_loopback
 #                                    a real install.sh run ships the switch;
-#                                    own-IP ingress answers at 127.0.0.1:8080
+#                                    own-IP ingress answers at the box's own
+#                                    loopback address, read from the record
 #   network_posture_from_stock_install
 #                                    from a real install.sh run: --network and
 #                                    --ingress in help+reference+hints, a none
 #                                    box that attaches and reaches nothing,
 #                                    the stock posture's reach, own-IP again
+#   linux_stock_install_runs_vm_boxes
+#                                    from a real install.sh run on a KVM host:
+#                                    the VM stack the stock install ships runs
+#                                    a box end to end — activate, listed, exec,
+#                                    destroy delisted — off the images and
+#                                    switch the install placed, with the VM
+#                                    host daemon's start record naming them
 #   min_internal_names_through_proxy NET-001..004 through the shipped proxy
 #   proxy_refuses_like_direct        the proxy refuses exactly as the switch
 #                                    does: paired direct/proxied attempts,
 #                                    h2 closed, h2c stripped (NET-069..071, 135)
+#   native_resolution_without_proxy_env
+#                                    NET-009/122/123: the advisory, the probe,
+#                                    and host-OS resolution with no proxies
 #   hostnames_recover_and_two_daemons_route NET-020..027 warning, recovery,
 #                                   two daemons on one machine routing
 #   retired_surfaces_gone            NET-109/110: the retired surfaces are gone,
@@ -104,6 +119,23 @@ set -uo pipefail # not -e: capture failures so we can dump diagnostics
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 E2E_VM="${E2E_VM:-}"
+
+# The three Linux fresh-install KVM proofs are documented as VM-backed cases
+# (NET-049/NET-051, plus the stock-install integration case) and are invoked
+# directly by their task test lines. When called that way, behave as if the
+# caller exported the KVM lane environment variables: E2E_VM=1 and
+# E2E_MINIMAL_ARGS="--provider local-minvmd". Without this the script's
+# min_daemon probe defaults to minimald on Linux and the standalone case fails
+# before it reaches the proof.
+case "${1:-}" in
+  fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
+    | linux_stock_install_runs_vm_boxes)
+    E2E_VM="${E2E_VM:-1}"
+    if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
+      E2E_MINIMAL_ARGS="--provider local-minvmd"
+    fi
+    ;;
+esac
 
 # The non-baseline package the sandbox proof adds and then runs. It must be a
 # real upstream package that is genuinely ABSENT from a fresh shell-stack
@@ -132,6 +164,8 @@ HOOK_SEED_DIR="" # seeded by the lifecycle-hooks proof below; removed on teardow
 PATCH_SRC_DIR="" # patch sources for the patch-modes proof; removed on teardown
 SKIP_SEED_DIR="" # seeded by the skip-lane scaffold proof below; removed on teardown
 OWNIP_SEED_DIR="" # seeded by the own-IP proof below; removed on teardown
+NATIVE_SEED_DIR="" # seeded by the native-resolution proof below; removed on teardown
+NATIVE_REVERT_LINK="" # the link that proof pointed the host resolver at; reverted on teardown
 PROXY_SEED_DIR="" # seeded by the min.internal proxy proof; removed on teardown
 PROXY_OWN_SEED_DIR="" # its own-address box's seed; removed on teardown
 PROXY_HOST_DIR="" # the host-loopback dir that proof serves; removed on teardown
@@ -147,6 +181,7 @@ RECOVER_SWITCH_SOCK="" # the minvmd switch socket beat C moves; restored
 RECOVER_SWITCH_HOLD="" # where beat C parks it mid-proof
 RETIRED_SEED_DIR="" # seeded by the retired-surfaces proof below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
+EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -320,6 +355,37 @@ else
       break
     fi
   done
+  # Nothing prebuilt — but this checkout can build the pair itself, and every
+  # case below is runnable standalone from a bare checkout, so do the same
+  # build `just e2e-native` does first (`cargo build -p minimald --bin
+  # minimald -p minimal --bin min --locked`): the CLI plus the one daemon it
+  # autospawns by name, `min_daemon` computed above per OS/backend. Dormant on
+  # real lanes — they export target/debug on PATH or pass MINIMAL_E2E_MIN, so
+  # one of the branches above already won — so this only pays where the gates
+  # below would otherwise have nothing to check. A sandboxed bare checkout
+  # (the agent runtime boxes are themselves session boxes: `min` on PATH is
+  # the in-sandbox helper, and target/ is empty) is exactly that: the pair
+  # builds, and the case then runs — or skips on its own prerequisites —
+  # instead of the run dying at the CLI gate with a build instruction the
+  # caller cannot read mid-verify.
+  if [ -z "$min_cli_dir" ] && command -v cargo >/dev/null 2>&1; then
+    echo "no usable 'min' on PATH and no build under target/; building the pair this run drives (cargo build --locked -p minimal --bin min -p $min_daemon --bin $min_daemon)"
+    if (cd "$ROOT" && cargo build --locked -p minimal --bin min \
+        -p "$min_daemon" --bin "$min_daemon") >"$WORK/cli-build.log" 2>&1; then
+      for d in "$ROOT/target/debug" "${CARGO_TARGET_DIR:-/nonexistent}/debug"; do
+        if [ -x "$d/min" ]; then
+          min_cli_dir="$d"
+          break
+        fi
+      done
+      if [ -n "$min_cli_dir" ]; then
+        echo "built the pair: $min_cli_dir/min and $min_cli_dir/$min_daemon"
+      fi
+    else
+      echo "::warning::building the CLI pair failed — the gates below name what is missing. Build log tail follows:" >&2
+      tail -20 "$WORK/cli-build.log" 2>/dev/null || true
+    fi
+  fi
   if [ -n "$min_cli_dir" ]; then
     PATH="$min_cli_dir:$PATH"
     export PATH
@@ -367,6 +433,17 @@ teardown() {
   [ -n "$PATCH_SRC_DIR" ] && rm -rf "$PATCH_SRC_DIR"
   [ -n "$SKIP_SEED_DIR" ] && rm -rf "$SKIP_SEED_DIR"
   [ -n "$OWNIP_SEED_DIR" ] && rm -rf "$OWNIP_SEED_DIR"
+  [ -n "$NATIVE_SEED_DIR" ] && rm -rf "$NATIVE_SEED_DIR"
+  # The native-resolution proof points the HOST resolver at the daemon's
+  # answerer; a run that died between that and its own revert must not leave
+  # the change behind. `resolvectl revert` restores the link's DNS state and
+  # `ip link del` removes the dedicated link the command created — the soak
+  # runs this script ten times on one runner, so the next iteration must
+  # find the host as this one did.
+  if [ -n "$NATIVE_REVERT_LINK" ]; then
+    sudo -n resolvectl revert "$NATIVE_REVERT_LINK" >/dev/null 2>&1 || true
+    sudo -n ip link del "$NATIVE_REVERT_LINK" >/dev/null 2>&1 || true
+  fi
   [ -n "$PROXY_SEED_DIR" ] && rm -rf "$PROXY_SEED_DIR"
   [ -n "$PROXY_OWN_SEED_DIR" ] && rm -rf "$PROXY_OWN_SEED_DIR"
   [ -n "$PROXY_HOST_DIR" ] && rm -rf "$PROXY_HOST_DIR"
@@ -394,6 +471,7 @@ teardown() {
   [ -n "$RECOVER_SEED_DIR" ] && rm -rf "$RECOVER_SEED_DIR"
   [ -n "$SECOND_SEED_DIR" ] && rm -rf "$SECOND_SEED_DIR"
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
+  [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
   # The forward holds the laptop-side listener; INT is the documented stop,
   # KILL the backstop so a hung relay cannot outlive the run.
   if [ -n "$RETIRED_FWD_PID" ]; then
@@ -828,12 +906,451 @@ fi
 }
 
 # ---------------------------------------------------------------------------
+# The host address a daemon published an own-IP box's ingress on, read from
+# the expose record in the daemon's log (NET-040's observability record: one
+# line per exposed mapping, naming the address the switch actually bound).
+# Reading it — rather than assuming 127.0.0.1 — is what keeps this harness
+# honest about NET-010: an own-address box publishes at the address the
+# answerer granted it out of the reserved local range, and the record is the
+# one place on the host that names it. $1 = the daemon's log file, $2 = the
+# session name; prints the newest matching record's host address, nothing
+# when no record names the session.
+published_loopback_host() {
+  grep -h -- 'exposed ingress port on the host loopback' "$1" 2>/dev/null \
+    | grep -F "\"session\":\"$2\"" | tail -n1 \
+    | sed -n 's/.*"host":"\([0-9][0-9.]*\)".*/\1/p'
+}
+
+# ---------------------------------------------------------------------------
+# Own-IP egress declared and enforced, end to end (NET T20). Gated on
+# MINVMD_GVPROXY_BIN like the own-IP proof above: own-address enforcement lives
+# on the switch, so a target without one has nothing to prove here.
+#
+# This case drives the four egress flags the CLI exposes today
+# (`--allow-subnets`, `--allow-dns-hosts`, `--allow-protocols`, `--deny-subnets`)
+# through an own-address box, checks that `min session policy` shows the
+# effective rules, proves an allowed connection completes and a disallowed one
+# is dropped silently and logged, and records the deny-all default story around
+# it: while the default is only announced this build still allows a bare
+# own-address box and prints the coming change; an explicit deny-all declaration
+# stands in for the in-force default to show the box reaching nothing; and the
+# announcement names the opt-out flag that keeps the prior default.
+proof_own_ip_egress_declared_and_enforced() {
+  echo "::group::own-IP egress: declared and enforced (NET T20)"
+
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "own-IP egress proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  EGRESS_SEED_DIR="$(hook_mktemp /tmp/mnleg.XXXXXX)"
+  hook_seed_preamble > "$EGRESS_SEED_DIR/minimal.toml"
+  mkdir "$EGRESS_SEED_DIR/.git"
+
+  # The drop warning is a daemon-side record. On a native lane that log lives
+  # on this host; on a VM lane it is inside the guest tmpfs, inaccessible here
+  # (see hook_log_readable). Use the file's existing helper so the assertion
+  # only runs where it can actually read the log, and fails closed when it
+  # cannot.
+  assert_egress_drop_logged() {
+    if ! hook_log_readable; then
+      echo "egress-drop log check skipped (guest-side daemon log on VM lane)"
+      return 0
+    fi
+    if [ -n "$(hook_log_has 'network policy violation')" ]; then
+      echo "daemon log: found the egress-drop warning"
+      return 0
+    fi
+    echo "::error::no daemon log recorded the disallowed connection's drop"
+    fail
+  }
+
+  # Whether one of this proof's curl probes actually reached a server. curl
+  # ALWAYS writes its -w line — and writes `HTTP:000` when nothing answered —
+  # so a completed exchange is a zero exit OR any real status back, whatever
+  # the code and whatever curl then thought of the certificate. Judging by
+  # `HTTP:200` alone (an earlier draft) would read a redirect or a TLS
+  # complaint after a live answer as a drop, and prove enforcement nobody
+  # enforced.
+  egress_curl_answered() {
+    local eca_rc="$1" eca_status="$2"
+    [ "$eca_rc" -eq 0 ] && return 0
+    [ -n "$eca_status" ] && [ "$eca_status" != "HTTP:000" ] && return 0
+    return 1
+  }
+
+  # ---- NET-076: the coming deny-all default is announced -------------------
+  # A bare own-address box still allows everything while the default is only
+  # announced, but the user is told what is coming and how to keep the current
+  # behaviour.
+  announce_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-egress-announce --network own_ip 2>"$WORK/egress-announce.err")" || {
+    echo "::error::'min session activate --network own_ip' (announcement probe) failed"
+    cat "$WORK/egress-announce.err" 2>/dev/null || true
+    fail
+  }
+  announce_sid="$(printf '%s\n' "$announce_sid" | tail -n1 | tr -d '\r')"
+  if ! grep -q "Heads-up: the next release denies all external reach" "$WORK/egress-announce.err"; then
+    echo "::error::activate did not announce the coming deny-all default (NET-076)"
+    cat "$WORK/egress-announce.err" 2>/dev/null || true
+    fail
+  fi
+  if ! grep -q -- "--egress-deny-all-opt-out" "$WORK/egress-announce.err"; then
+    echo "::error::the deny-all announcement did not name the opt-out flag"
+    cat "$WORK/egress-announce.err" 2>/dev/null || true
+    fail
+  fi
+  echo "NET-076 OK: activate announced the coming default and named the opt-out"
+
+  # The remaining probes exercise allowed/disallowed flows against the public
+  # internet, so they follow the same weather-aware policy as
+  # proof_session_outbound_request: at least one host must answer to prove the
+  # box can reach the network, but no CI gate turns red because example.com or
+  # example.org is having a bad minute. A helper returns 0 if >=1 host answers.
+  # The hosts are the caller's: the default pair is the sibling proof's, and a
+  # policy-bound box names only the destination its rules admit — probing a
+  # destination the box's own policy forbids could never answer, so asking one
+  # to prove its reachability that way is vacuous (the declared box below
+  # names example.com, the one host its allow list admits; example.org's
+  # disallowed outcome is asserted in its own right further down).
+  egress_reachability_probe() {
+    local er_sid="$1" er_prefix="$2"
+    shift 2
+    local er_hosts="$*"
+    [ -n "$er_hosts" ] || er_hosts="example.com example.org"
+    local er_ok=0 er_total=0 er_failed=""
+    local er_host er_try er_out er_status
+    for er_host in $er_hosts; do
+      er_total=$((er_total + 1))
+      er_status=0
+      er_out=""
+      for er_try in 1 2 3; do
+        er_out="$(mnl session exec "$er_sid" \
+          "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 30 https://$er_host" \
+          2>"$WORK/${er_prefix}-reach.err")"
+        er_status=$?
+        if [ "$er_status" -eq 0 ] && [ "$er_out" = "HTTP:200" ]; then
+          break
+        fi
+        if [ "$er_try" -lt 3 ]; then
+          echo "reachability probe https://$er_host failed on attempt ${er_try}/3 (status ${er_status}, got '${er_out:-<none>}'); retrying"
+          cat "$WORK/${er_prefix}-reach.err" 2>/dev/null || true
+          sleep "$((er_try * 3))"
+        fi
+      done
+      if [ "$er_status" -eq 0 ] && [ "$er_out" = "HTTP:200" ]; then
+        er_ok=$((er_ok + 1))
+        echo "reachability probe https://$er_host: HTTP 200 (attempt ${er_try}/3)"
+      else
+        er_failed="${er_failed} https://$er_host (status ${er_status}, got '${er_out:-<none>}')"
+        echo "reachability probe https://$er_host failed all 3 attempts; transcript above"
+      fi
+    done
+    if [ "$er_ok" -gt 0 ]; then
+      echo "external-reachability guard OK (${er_ok}/${er_total} hosts answered)"
+      return 0
+    fi
+    echo "::warning::external-reachability guard failed for ${er_prefix} box against all ${er_total} hosts (${er_failed}); the remaining probes that need the public internet are skipped as warnings"
+    return 1
+  }
+
+  if egress_reachability_probe "$announce_sid" "announce" example.com example.org; then
+    echo "allowed-connection OK: a bare box still reaches the network during the announcement"
+  else
+    echo "allowed-connection WARNING: the bare box could not prove external reachability; the announcement text and opt-out were still verified above"
+  fi
+
+  # ---- the destination the declared box must be refused, proven live first --
+  # NET-062's drop is only meaningful against a destination this lane can
+  # actually reach: a connection nobody could have completed reads as a
+  # "silent drop" on a networkless lane, which is enforcement nobody enforced.
+  # So the SAME run first asks a box with NO egress section — the announce box
+  # above, which the announcement phase still leaves unrestricted — to
+  # complete the exact connection the declared box must be refused. Its
+  # completing proves the destination is live and reachable through this
+  # switch fabric, so the declared box's non-completion below can only be its
+  # own rules — and it doubles as the reach the coming deny-all default takes
+  # away (NET-074).
+  #
+  # The destination is a LITERAL public address, and it is chosen so nothing
+  # the declared box admits can ever cover it. Its allow subnets are a
+  # documentation range and its deny subnets another, which leaves the one
+  # other way an address outside `allow_subnets` still connects: a DNS pin,
+  # design §5.3's DNS-pinned admission, which admits an *address* for the
+  # window its name resolved in — and admits it however the application
+  # learned it, `curl --resolve` included, because the pin table is keyed by
+  # address alone (crates/minimald/src/net/dns_gate.rs). An earlier round
+  # probed a host-resolved address of example.com itself on the belief that
+  # "the box's own resolution" and the host's never agree; the macOS lane is
+  # where they do — both ride the same upstream — so the pinned address was
+  # held, the "disallowed" connection was an allowed one, and the proof read
+  # a completed connection as a failure to enforce. The candidates are public
+  # anycast service endpoints, live on 443 and stable by design, that the one
+  # name this box pins (example.com) can never resolve to — and being
+  # literals, no resolver has to agree with anything for the probe to run.
+  # Two of them, because a lane whose network blocks one still deserves the
+  # proof: the first the bare box reaches is the one the declared box must be
+  # refused.
+  egress_disallowed_dst=""
+  for egress_dst_candidate in 1.1.1.1 9.9.9.9; do
+    for egress_dst_try in 1 2 3; do
+      egress_dst_out="$(mnl session exec "$announce_sid" \
+        "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 20 https://$egress_dst_candidate/" \
+        2>"$WORK/egress-dst-live.err")"
+      egress_dst_rc=$?
+      if egress_curl_answered "$egress_dst_rc" "${egress_dst_out:-}"; then
+        egress_disallowed_dst="$egress_dst_candidate"
+        echo "control GET https://$egress_dst_candidate/ from the bare box -> ${egress_dst_out:-<none>} (attempt ${egress_dst_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
+        break
+      fi
+      echo "control GET https://$egress_dst_candidate/ from the bare box failed on attempt ${egress_dst_try}/3 (rc ${egress_dst_rc}, got '${egress_dst_out:-<none>}')"
+      cat "$WORK/egress-dst-live.err" 2>/dev/null || true
+      if [ "$egress_dst_try" -lt 3 ]; then
+        sleep 3
+      fi
+    done
+    if [ -n "$egress_disallowed_dst" ]; then
+      break
+    fi
+  done
+  if [ -z "$egress_disallowed_dst" ]; then
+    echo "::warning::the bare box could not reach a disallowed candidate destination on this run, so the disallowed-connection drop below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
+  fi
+  mnl session destroy --force "$announce_sid" >/dev/null 2>&1 || true
+
+  # ---- NET-060/061/062/063: four-field declaration, effective rules, drop --
+  # The allowed list is intentionally narrow: one non-loopback documentation
+  # CIDR, example.com, and TCP+UDP. The CIDR is TEST-NET-3 (RFC 5737): a range
+  # no real destination ever sits inside, so the rule can never admit live
+  # traffic — but it is a genuine allow rule, unlike the loopback entry an
+  # earlier round used: the infrastructure deny set always refuses 127.0.0.0/8
+  # (design §5.3's rebinding defence, CIDR-admitted flows included), so a
+  # `127.0.0.1/32` rule can never admit anything and would present a dead
+  # entry as a working allow rule. The resolver carve-out handles DNS to the
+  # switch gateway, so example.com resolves and is admitted by name.
+  declare_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-egress-declared --network own_ip \
+    --allow-subnets 203.0.113.0/24 \
+    --allow-dns-hosts example.com \
+    --allow-protocols tcp \
+    --allow-protocols udp \
+    --deny-subnets 198.51.100.0/24 \
+    2>"$WORK/egress-declared.err")" || {
+    echo "::error::'min session activate' with the four egress fields failed"
+    cat "$WORK/egress-declared.err" 2>/dev/null || true
+    fail
+  }
+  declare_sid="$(printf '%s\n' "$declare_sid" | tail -n1 | tr -d '\r')"
+  if grep -q "Heads-up: the next release denies all external reach" "$WORK/egress-declared.err"; then
+    echo "::error::a declared box was announced as if it had no egress section"
+    cat "$WORK/egress-declared.err" 2>/dev/null || true
+    fail
+  fi
+  echo "own-IP session with four egress fields: $declare_sid"
+
+  policy_out="$(mnl session policy "$declare_sid" 2>"$WORK/egress-policy.err")" || {
+    echo "::error::'min session policy' failed for the declared box"
+    cat "$WORK/egress-policy.err" 2>/dev/null || true
+    fail
+  }
+  echo "effective policy of the declared box:"
+  printf '%s\n' "$policy_out" | sed 's/^/  /'
+  if ! grep -q "subnets  203.0.113.0/24" <<<"$policy_out" \
+    || ! grep -q "dns hosts  example.com" <<<"$policy_out" \
+    || ! grep -q "protocols  tcp, udp" <<<"$policy_out" \
+    || ! grep -q "deny subnets  198.51.100.0/24" <<<"$policy_out"; then
+    echo "::error::'min session policy' did not show all four declared egress fields"
+    echo "--- raw policy output ---"
+    printf '%s\n' "$policy_out"
+    fail
+  fi
+  echo "NET-061 OK: the four egress fields are visible in the effective policy"
+
+  # The connection probes need the public internet. Their control is the
+  # allowed name's own completion (NET-063): example.com is the one
+  # destination this box's rules admit, so its completing proves both the
+  # lane's network and the allowed path — and, on the SAME run, separates a
+  # policy drop from a dead network, which is what lets the fast-failure
+  # branches below be hard fails instead of weather warnings. The control's
+  # result is kept for the deny-all stand-in further down, whose own
+  # reachability cannot be probed from itself (it reaches nothing by
+  # construction, so a guard run from it could never pass).
+  declared_reach_ok=0
+  if egress_reachability_probe "$declare_sid" "declared" example.com; then
+    declared_reach_ok=1
+    echo "NET-063 OK: https://example.com completed — allowed by name and protocol, and the control that separates a policy drop below from a dead network"
+
+    # ---- NET-062: a packet to an unadmitted address drops silently ---------
+    # The silent drop NET-062 binds is a packet property, not a name one: a
+    # name outside `allow_dns_hosts` is a resolver matter (design §5.3 refuses
+    # non-matching names at resolution), so the drop is proven against a
+    # destination ADDRESS no rule and no pin admits — the literal chosen and
+    # proven live further up, from the bare box, in this same run. Two
+    # controls bracket it: the bare box's completed connection to the very
+    # destination (a live destination on this lane, reached through the same
+    # fabric) and this box's own completed connection to example.com above
+    # (this box's network and its allowed path), so a non-completion here is
+    # neither a dead route nor a dead box, and a fast refusal is the box's own
+    # doing rather than weather.
+    if [ -z "$egress_disallowed_dst" ]; then
+      echo "::warning::NET-062: the disallowed-address drop is skipped as a weather warning (the bare box reached no candidate destination above, so a drop here would prove nothing about the rules)"
+    else
+      deny_start_ms="$(now_ms)"
+      mnl session exec "$declare_sid" \
+        "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://$egress_disallowed_dst/" \
+        >"$WORK/egress-deny-ip.out" 2>"$WORK/egress-deny-ip.err"
+      deny_rc=$?
+      deny_elapsed_ms=$(( $(now_ms) - deny_start_ms ))
+      deny_status="$(cat "$WORK/egress-deny-ip.out" 2>/dev/null)"
+      deny_err="$(tr '\n' ' ' < "$WORK/egress-deny-ip.err" 2>/dev/null)"
+      echo "disallowed-address GET https://$egress_disallowed_dst/ -> rc=$deny_rc status=${deny_status:-<none>} elapsed=${deny_elapsed_ms}ms curl: ${deny_err:-<none>}"
+      if egress_curl_answered "$deny_rc" "${deny_status:-}"; then
+        echo "::error::NET-062: a connection to an address no rule admits ($egress_disallowed_dst) completed — the bare box completed this same connection above, so the lane reaches the destination and the egress rules did not enforce"
+        cat "$WORK/egress-deny-ip.err" 2>/dev/null || true
+        fail
+      fi
+      if printf '%s' "$deny_err" | grep -qi 'reset by peer'; then
+        echo "::error::NET-062: the disallowed connection was reset, not dropped silently"
+        cat "$WORK/egress-deny-ip.err" 2>/dev/null || true
+        fail
+      fi
+      if [ "$deny_elapsed_ms" -ge 6000 ]; then
+        echo "NET-062 OK: the disallowed connection to $egress_disallowed_dst dropped silently (no answer and no reset until the 10 s timeout), while the bare box completed the same connection in this run"
+        assert_egress_drop_logged
+        echo "NET-062 (rate-limited warning) OK: the drop is logged"
+      else
+        echo "::error::NET-062: the disallowed connection failed in ${deny_elapsed_ms}ms — a fast refusal, not a silent drop. The controls bracketing this probe (the bare box's completed connection to the same destination, and this box's own to https://example.com) both completed on this run, so the network path is alive and the fast failure is the box's own doing"
+        cat "$WORK/egress-deny-ip.err" 2>/dev/null || true
+        fail
+      fi
+    fi
+
+    # ---- the disallowed NAME, its own assertion ----------------------------
+    # example.org is outside `allow_dns_hosts`, so its connection must not
+    # complete. Whether it is refused FAST at resolution (the design outcome:
+    # the resolver refuses a non-matching name) or TIMES OUT with no reset
+    # (the current relay leaves the name unpinned and drops the SYN) is NOT
+    # asserted either way — reconciling those two is the dns_gate work's, not
+    # this proof's — but the observed outcome is printed, with the curl error
+    # and the elapsed time, so the transcript names which behaviour this
+    # build has.
+    name_deny_start_ms="$(now_ms)"
+    mnl session exec "$declare_sid" \
+      "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://example.org" \
+      >"$WORK/egress-deny-name.out" 2>"$WORK/egress-deny-name.err"
+    name_rc=$?
+    name_elapsed_ms=$(( $(now_ms) - name_deny_start_ms ))
+    name_status="$(cat "$WORK/egress-deny-name.out" 2>/dev/null)"
+    name_err="$(tr '\n' ' ' < "$WORK/egress-deny-name.err" 2>/dev/null)"
+    if egress_curl_answered "$name_rc" "${name_status:-}"; then
+      echo "::error::https://example.org completed — a name outside allow_dns_hosts reached its destination; the egress rules did not enforce"
+      cat "$WORK/egress-deny-name.err" 2>/dev/null || true
+      fail
+    fi
+    name_outcome="fast refusal"
+    if grep -qi 'could not resolve' "$WORK/egress-deny-name.err" 2>/dev/null; then
+      name_outcome="fast resolver refusal"
+    elif [ "$name_elapsed_ms" -ge 6000 ]; then
+      name_outcome="timeout with no reset"
+    fi
+    echo "disallowed-name GET https://example.org -> rc=$name_rc status=${name_status:-<none>} elapsed=${name_elapsed_ms}ms ($name_outcome) curl: ${name_err:-<none>}"
+  else
+    echo "allowed/disallowed-connection WARNING: the declared box could not complete its allowed connection to https://example.com; the connection assertions that need the public internet are skipped as weather warnings"
+  fi
+
+  # ---- NET-074 stand-in: no egress section reaches nothing once the default
+  # is in force. The shipped phase is announced, so we exercise the
+  # enforcement shape with an explicit deny-all declaration (deny 0.0.0.0/0);
+  # the unit and CLI tests already cover the in-force resolution, and the
+  # announcement above covers the transition notice. This is a stand-in for
+  # NET-074's REACH only: NET-075's observable is the word `deny all` in
+  # `min session policy`, which an explicit-rule box cannot show — it shows
+  # its rule — so that rendering stays with the CLI tests that pin it.
+  deny_all_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-egress-deny-all --network own_ip \
+    --deny-subnets 0.0.0.0/0 \
+    2>"$WORK/egress-deny-all.err")" || {
+    echo "::error::'min session activate --deny-subnets 0.0.0.0/0' failed"
+    cat "$WORK/egress-deny-all.err" 2>/dev/null || true
+    fail
+  }
+  deny_all_sid="$(printf '%s\n' "$deny_all_sid" | tail -n1 | tr -d '\r')"
+
+  # "A box with no effective reach reaches nothing" only means something if
+  # the lane can already reach the public internet — otherwise the
+  # non-completion being asserted here is just the dead network. The control
+  # is the declared box's guard from THIS run, not a probe from the deny-all
+  # box itself: that box reaches nothing by construction, so a guard run from
+  # it could never pass and the assertion would always be skipped. Branch on
+  # the control — a hard assertion when it passed, a weather warning when it
+  # did not — and probe the same endpoint the control just proved answers.
+  if [ "$declared_reach_ok" != 1 ]; then
+    echo "::warning::NET-074: the declared box could not prove external reachability in this run, so the deny-all stand-in's reach assertion is skipped as a weather warning"
+  else
+    deny_all_start_ms="$(now_ms)"
+    mnl session exec "$deny_all_sid" \
+      "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://example.com" \
+      >"$WORK/egress-deny-all.out" 2>"$WORK/egress-deny-all-curl.err"
+    deny_all_rc=$?
+    deny_all_elapsed_ms=$(( $(now_ms) - deny_all_start_ms ))
+    deny_all_status="$(cat "$WORK/egress-deny-all.out" 2>/dev/null)"
+    deny_all_err="$(tr '\n' ' ' < "$WORK/egress-deny-all-curl.err" 2>/dev/null)"
+    if egress_curl_answered "$deny_all_rc" "${deny_all_status:-}"; then
+      echo "::error::a deny-all box reached an external destination"
+      cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
+      fail
+    fi
+    # Two outcomes are legitimate for this box, and only two: the resolver
+    # refuses the name outright (example.com is in no allow list, and the
+    # address it resolves to sits inside the 0.0.0.0/0 deny), or the SYN
+    # leaves, matches the deny, and gets no answer until the timeout — the
+    # silent drop NET-062 binds, which is what an enforcing filter looks like
+    # from inside the box. A fast failure that is neither of those means the
+    # connection reached something that answered it, and the control that
+    # gated this branch completed https://example.com from the declared box in
+    # this run, so the destination answers on this lane: the fast failure is
+    # the box's own escaping SYN (or a broken probe), never weather. The
+    # disallowed-IP probe above hard-fails this same shape; accepting it here
+    # would print a policy hole as `NET-074 OK`.
+    deny_all_outcome="fast refusal"
+    if grep -qi 'could not resolve' "$WORK/egress-deny-all-curl.err" 2>/dev/null; then
+      deny_all_outcome="fast resolver refusal"
+    elif [ "$deny_all_elapsed_ms" -ge 6000 ]; then
+      deny_all_outcome="timeout with no reset"
+    fi
+    echo "deny-all GET https://example.com -> rc=$deny_all_rc status=${deny_all_status:-<none>} elapsed=${deny_all_elapsed_ms}ms ($deny_all_outcome) curl: ${deny_all_err:-<none>}"
+    if printf '%s' "$deny_all_err" | grep -qi 'reset by peer'; then
+      echo "::error::NET-074: the deny-all box's connection to https://example.com was reset by the destination — the SYN escaped the 0.0.0.0/0 deny and reached a server this run's control proved answers"
+      cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
+      fail
+    fi
+    if [ "$deny_all_outcome" = "fast refusal" ]; then
+      echo "::error::NET-074: the deny-all box failed in ${deny_all_elapsed_ms}ms — a fast refusal that is neither a resolver refusal nor a silent drop. The control above completed https://example.com from the declared box in this run, so the destination answers on this lane and the fast failure is the box's own escaping connection or a broken probe, not weather"
+      cat "$WORK/egress-deny-all-curl.err" 2>/dev/null || true
+      fail
+    fi
+    echo "NET-074 OK: a box with no effective external reach gets nothing (explicit deny-all stand-in for the in-force default)"
+  fi
+
+  mnl session destroy --force "$declare_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$deny_all_sid" >/dev/null 2>&1 || true
+  rm -rf "$EGRESS_SEED_DIR"; EGRESS_SEED_DIR=""
+  echo "own-IP egress declared and enforced OK"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # Fresh-install loopback publish proof (NET-040/NET-041/NET-102): from a REAL
 # scripts/install.sh run into a fresh HOME — a local mock bucket built out of
 # THIS checkout's own binaries, reached through the same stub-curl trick
 # install_test.sh uses, so the installer itself runs unmodified — the
 # installed pair must serve an own-IP box whose `--ingress 8080:8080` mapping
-# answers ON THE HOST at 127.0.0.1:8080 with the box's own server's response.
+# answers ON THE HOST at the box's OWN loopback address with the box's own
+# server's response — the address read from the daemon's expose record, never
+# assumed: an own-address box publishes at the address the answerer granted it
+# out of the reserved local range (NET-010), so a proof that probed a fixed
+# 127.0.0.1 would be looking at the interim, not the box.
 # That is the own-address pipeline in the exact shape a user gets it: the
 # installer ships gvproxy-min into ~/.local/bin (and names the path it
 # verified), the daemon finds it there through switch::installed_gvproxy_bin,
@@ -861,11 +1378,16 @@ fi
 #     stage that path — writable /usr/bin, never over an existing binary;
 #     the probe ORDER that finds it is pinned by the switch crate's resolver
 #     tests either way.
-#   * The host half of the mapping is 127.0.0.1:8080; a host that already
-#     has a listener there (the agent-runtime boxes this harness itself runs
-#     on do) publishes on the fallback 18082 instead — the box always serves
-#     its INTERNAL 8080, so the mapping exercised is always <host-port>:8080
-#     and a clean host runs it exactly as the proof sentence says.
+#   * The host half of the mapping is <the box's address>:<host port>, the
+#     address from the expose record and the port below. The port is 8080; a
+#     host that already has a listener at 127.0.0.1:8080 (the agent-runtime
+#     boxes this harness itself runs on do) takes the fallback 18082 instead —
+#     the box always serves its INTERNAL 8080, so the mapping exercised is
+#     always <host-port>:8080 and a clean host runs it exactly as the proof
+#     sentence says. The claim guards the one publish that could ever land on
+#     127.0.0.1: the interim a box with no granted address of its own
+#     publishes on — which cannot happen on this lane (the range is bindable
+#     on every Linux host), but costs nothing to keep honest.
 #
 # Ordered after `restart`: it stops whatever daemon is up and swaps the
 # driving pair to the installed one, so nothing that still shares the
@@ -877,6 +1399,7 @@ proof_fresh_install_own_ip_ingress_publishes_loopback() {
 local fi_arch fi_gvproxy fi_root fi_home fi_bucket fi_stubbin fi_seed fi_out
 local fi_h_minimald fi_h_minimal fi_h_gvmin fi_sid fi_sid2 fi_log fi_rec
 local fi_ready fi_answered fi_status fi_bucket_host fi_hport fi_portpat
+local fi_host fi_host2 fi_pkg_log
 local fi_lane_minimald fi_restore_profile
 if [ -n "$E2E_VM" ] || [ "$(uname -s)" != Linux ]; then
   echo "fresh-install loopback publish SKIPPED (VM-backed lane: the pair this proof installs lives host-side)"
@@ -902,12 +1425,15 @@ if [ ! -c /dev/net/tun ]; then
 fi
 
 # The proof's mapping is 8080:8080 — the box serves its INTERNAL 8080, the
-# switch publishes the host half on the loopback. A host may already have a
-# listener on the host port (the agent-runtime boxes this harness itself runs
-# on do), so claim it BEFORE anything is installed, and when it is taken
-# publish on the fallback port instead: the whole pipeline — install, switch
-# discovery, expose, host answer, log record — is exercised either way, and a
-# clean host runs the mapping exactly as the proof sentence says it.
+# switch publishes the host half at the box's own address out of the reserved
+# local range (read from the expose record below). What is claimed here is the
+# host PORT: 127.0.0.1:<port> is where a box with no granted address of its own
+# would publish (the interim), and a host may already have a listener at the
+# 8080 one (the agent-runtime boxes this harness itself runs on do), so claim
+# it BEFORE anything is installed and take the fallback port when it is
+# occupied — the whole pipeline — install, switch discovery, expose, host
+# answer, log record — is exercised either way, and a clean host runs the
+# mapping exactly as the proof sentence says it.
 fi_hport=8080
 if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$fi_hport/" 2>/dev/null; then
   if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:18082/" 2>/dev/null; then
@@ -1140,27 +1666,10 @@ if (
     exit 1
   }
 
-  # NET-040: the mapping answers ON THE HOST loopback, with the box's own
-  # server's response.
-  fi_answered=""
-  fi_status=""
-  for _ in $(seq 1 40); do
-    fi_status="$(curl -sS --max-time 5 -o "$fi_root/host.body" -w '%{http_code}' \
-      "http://127.0.0.1:$fi_hport/" 2>/dev/null || true)"
-    if [ "$fi_status" = "200" ] && grep -q "fi-fresh-install-own-ip" "$fi_root/host.body" 2>/dev/null; then
-      fi_answered=1; break
-    fi
-    sleep 0.25
-  done
-  [ -n "$fi_answered" ] || {
-    echo "::error::the host loopback never answered at 127.0.0.1:$fi_hport (last status: '${fi_status:-none}')"
-    echo "--- host body ---"; cat "$fi_root/host.body" 2>/dev/null || true
-    exit 1
-  }
-  echo "127.0.0.1:$fi_hport answered the box's own server (200: $(cat "$fi_root/host.body"))"
-
   # NET-040 observability: one daemon-log record per exposed mapping, with
-  # the host address, the port and the session.
+  # the host address, the port and the session — and NET-010's address: the
+  # record names the box's own granted address, which the host probe below
+  # targets. Read it before probing, never assume 127.0.0.1.
   fi_log="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null | sort | tail -n1)"
   fi_rec=""
   for _ in $(seq 1 10); do
@@ -1174,22 +1683,52 @@ if (
     echo "--- daemon log (tail) ---"; tail -20 "$fi_log" 2>/dev/null || true
     exit 1
   fi
+  fi_host="$(published_loopback_host "$fi_log" e2e-fresh-ingress)"
   case "$fi_rec" in
-    *'"host":"127.0.0.1"'*"$fi_portpat"*) ;;
+    *'"host":"'"$fi_host"'"'*"$fi_portpat"*) ;;
     *)
-      echo "::error::the expose record does not carry host 127.0.0.1 and the published port $fi_hport"
+      echo "::error::the expose record does not carry a host address and the published port $fi_hport"
+      echo "--- record ---"; printf '%s\n' "$fi_rec"
+      exit 1
+      ;;
+  esac
+  case "$fi_host" in
+    127.0.64.*)
+      ;;
+    *)
+      echo "::error::the box published at ${fi_host:-<no address in the record>}, which is not an address out of the reserved local range 127.0.64.0/24 — an own-IP box's mapping answers at its own granted address (NET-010), and on this Linux lane the range is always bindable so the 127.0.0.1 interim never stands in for it"
       echo "--- record ---"; printf '%s\n' "$fi_rec"
       exit 1
       ;;
   esac
   echo "daemon log: $fi_rec"
 
+  # NET-040: the mapping answers ON THE HOST loopback, at that address, with
+  # the box's own server's response.
+  fi_answered=""
+  fi_status=""
+  for _ in $(seq 1 40); do
+    fi_status="$(curl -sS --max-time 5 -o "$fi_root/host.body" -w '%{http_code}' \
+      "http://$fi_host:$fi_hport/" 2>/dev/null || true)"
+    if [ "$fi_status" = "200" ] && grep -q "fi-fresh-install-own-ip" "$fi_root/host.body" 2>/dev/null; then
+      fi_answered=1; break
+    fi
+    sleep 0.25
+  done
+  [ -n "$fi_answered" ] || {
+    echo "::error::the host loopback never answered at $fi_host:$fi_hport (last status: '${fi_status:-none}')"
+    echo "--- host body ---"; cat "$fi_root/host.body" 2>/dev/null || true
+    exit 1
+  }
+  echo "$fi_host:$fi_hport answered the box's own server (200: $(cat "$fi_root/host.body"))"
+
   mnl session destroy --force "$fi_sid" >/dev/null 2>&1 || true
   mnl stop --force >/dev/null 2>&1 || true
-  # The switch goes down with the daemon; wait out the host port it held so
-  # the package-path half below re-publishes on the same one.
+  # The switch goes down with the daemon; wait out the forward it held at the
+  # box's address so the package-path half below cannot collide with a
+  # lingering bind on the same address if the answerer hands it back out.
   for _ in $(seq 1 20); do
-    curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$fi_hport/" 2>/dev/null || break
+    curl -sS --max-time 2 -o /dev/null "http://$fi_host:$fi_hport/" 2>/dev/null || break
     sleep 0.25
   done
 
@@ -1215,21 +1754,42 @@ if (
     mnl session exec "$fi_sid2" \
       "nohup /usr/bin/socat TCP-LISTEN:8080,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &" \
       >/dev/null 2>&1
+    # This box's own address, from its own record — the second daemon may hold
+    # the same address as the first (its grant was released at destroy) or a
+    # different one; the record says which, the probe does not guess. The log
+    # path is re-read: this activate spawned a daemon of its own, and the day
+    # may have rolled over to a new file since the first half read it.
+    fi_pkg_log=""
+    fi_host2=""
+    for _ in $(seq 1 10); do
+      fi_pkg_log="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null | sort | tail -n1)"
+      fi_host2="$(published_loopback_host "$fi_pkg_log" e2e-fresh-ingress-pkg)"
+      [ -n "$fi_host2" ] && break
+      sleep 0.25
+    done
+    case "$fi_host2" in
+      127.0.64.*) ;;
+      *)
+        echo "::error::the package-path box published at ${fi_host2:-<no expose record>}, which is not an address out of the reserved local range 127.0.64.0/24 (NET-010)"
+        echo "--- activate stderr ---"; cat "$fi_root/activate-pkg.err" 2>/dev/null || true
+        exit 1
+        ;;
+    esac
     fi_answered=""
     for _ in $(seq 1 40); do
       if curl -sS --max-time 5 -o "$fi_root/host-pkg.body" \
-          "http://127.0.0.1:$fi_hport/" 2>/dev/null \
+          "http://$fi_host2:$fi_hport/" 2>/dev/null \
           && grep -q "fi-fresh-install-pkgpath" "$fi_root/host-pkg.body" 2>/dev/null; then
         fi_answered=1; break
       fi
       sleep 0.25
     done
     [ -n "$fi_answered" ] || {
-      echo "::error::the package-path switch never published the mapping at 127.0.0.1:$fi_hport"
+      echo "::error::the package-path switch never published the mapping at $fi_host2:$fi_hport"
       echo "--- activate stderr ---"; cat "$fi_root/activate-pkg.err" 2>/dev/null || true
       exit 1
     }
-    echo "package-path half OK: /usr/bin/gvproxy-min served the same mapping ($(cat "$fi_root/host-pkg.body"))"
+    echo "package-path half OK: /usr/bin/gvproxy-min served the same mapping at $fi_host2:$fi_hport ($(cat "$fi_root/host-pkg.body"))"
     mnl session destroy --force "$fi_sid2" >/dev/null 2>&1 || true
   else
     if [ -e /usr/bin/gvproxy-min ]; then
@@ -1277,9 +1837,10 @@ echo "::endgroup::"
 #     unreachable too. The stock posture (host_ip, the default) completes
 #     an outbound request (NET-107).
 #   * from the fresh install, `--network own_ip --ingress 8080:8080`
-#     answers ON THE HOST at 127.0.0.1:8080 with the box's own server's
-#     response (NET-040) — and that box completes an outbound request
-#     through the switch the installer shipped (NET-107's switch half).
+#     answers ON THE HOST at the box's own loopback address with the box's
+#     own server's response (NET-040, NET-010) — and that box completes an
+#     outbound request through the switch the installer shipped (NET-107's
+#     switch half).
 #
 # Lane gating, decided by where the proof's pieces actually run:
 #   * Native Linux only: the install pair lives host-side on a VM lane
@@ -1828,6 +2389,11 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     echo "step: min session destroy --force (the none box) → exit 0"
 
     # ---- the own-IP posture: publish on the host loopback, reach out --------
+    # The host PORT is claimed the loopback-publish proof's way (8080, the
+    # 18082 fallback when 8080 is taken): the box publishes at its own granted
+    # address, and this guards the interim at 127.0.0.1 a box with no grant of
+    # its own would publish on. The ADDRESS is read from the expose record
+    # below, never assumed.
     if [ "$np_want_switch" -eq 1 ]; then
       local np_hport2=8080
       if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$np_hport2/" 2>/dev/null; then
@@ -1899,23 +2465,44 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
         exit 1
       fi
       echo "the box answers its own ingress mapping at 127.0.0.1:8080"
+      # The box's published host address, from its expose record (NET-010): an
+      # own-IP box publishes at its own granted address out of the reserved
+      # local range, so the host probe targets the record's address — never a
+      # fixed 127.0.0.1.
+      local np_daemon_log np_expose np_host
+      np_daemon_log="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null | sort | tail -n1)"
+      np_host=""
+      for _ in $(seq 1 10); do
+        np_host="$(published_loopback_host "$np_daemon_log" e2e-posture-ownip)"
+        [ -n "$np_host" ] && break
+        sleep 0.25
+      done
+      case "$np_host" in
+        127.0.64.*) ;;
+        *)
+          echo "::error::the own-IP box published at ${np_host:-<no expose record>}, which is not an address out of the reserved local range 127.0.64.0/24 (NET-010)"
+          echo "--- daemon log (tail) ---"
+          tail -20 "$np_daemon_log" 2>/dev/null || true
+          exit 1
+          ;;
+      esac
       local np_status
       np_status="$(curl -sS --max-time 5 -o "$np_root/host-answer.body" -w '%{http_code}' \
-        "http://127.0.0.1:$np_hport2/" 2>"$np_root/host-answer.err" || true)"
+        "http://$np_host:$np_hport2/" 2>"$np_root/host-answer.err" || true)"
       if [ "$np_status" != "200" ] \
         || ! grep -Fq "$POSTURE_OWNIP_MARKER" "$np_root/host-answer.body" 2>/dev/null; then
-        echo "::error::the fresh install's own-IP ingress did not answer on the host loopback at 127.0.0.1:$np_hport2 (NET-040)"
+        echo "::error::the fresh install's own-IP ingress did not answer on the host loopback at $np_host:$np_hport2 (NET-040)"
         echo "  status: $np_status, body: $(cat "$np_root/host-answer.body" 2>/dev/null || true)"
         echo "--- curl stderr ---"
         cat "$np_root/host-answer.err" 2>/dev/null || true
         exit 1
       fi
-      echo "step: host curl http://127.0.0.1:$np_hport2/ → 200, body carries the box's marker (NET-040)"
+      echo "step: host curl http://$np_host:$np_hport2/ → 200, body carries the box's marker (NET-040)"
 
       # Observability, not an assertion: the loopback-publish proof owns
-      # the expose record's assert. Find the record and print it.
-      local np_daemon_log np_expose=""
-      np_daemon_log="$(find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null | sort | tail -n1)"
+      # the expose record's assert. Print the record the address above came
+      # from.
+      local np_expose=""
       for _ in $(seq 1 10); do
         np_expose="$(grep -h -- 'exposed ingress port on the host loopback' "$np_daemon_log" 2>/dev/null \
           | grep -F '"session":"e2e-posture-ownip"' | tail -n1)"
@@ -1935,7 +2522,7 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
       mnl session destroy --force "$np_own_sid" >/dev/null 2>&1 || true
       mnl stop --force >/dev/null 2>&1 || true
       for _ in $(seq 1 20); do
-        curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$np_hport2/" 2>/dev/null || break
+        curl -sS --max-time 2 -o /dev/null "http://$np_host:$np_hport2/" 2>/dev/null || break
         sleep 0.25
       done
     else
@@ -2061,6 +2648,7 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
     printf '\n[stack]\nuse = "shell"\n'
     printf '\n[tasks.e2e-echo]\necho = "TASK_RUN_E2E_OK"\n'
     printf '\n[tasks.e2e-fail]\nbash = "exit 7"\n'
+    printf '\n[tasks.e2e-envprint]\nexec = "printenv E2E_INHERIT_MARKER"\nenv_vars.E2E_INHERIT_MARKER = { inherit = true }\n'
   } > "$TASK_SEED_DIR/minimal.toml"
   mkdir "$TASK_SEED_DIR/.git"
 
@@ -2173,6 +2761,60 @@ if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
   fi
   grep -q 'min task run' "$WORK/task-alias.err" \
     || { echo "::error::hidden 'min run' error does not name 'min task run'"; cat "$WORK/task-alias.err" 2>/dev/null || true; fail; }
+
+  # env_vars inherit crosses the VM boundary: the client reads the value out
+  # of the invoking shell and the task's `printenv` sees it inside the
+  # session. The var is project-origin, so it must be allow-listed first.
+  # The export lives in THIS shell — the invoking shell the client resolves
+  # against — not in the run's subshell, where it would reach `min` just the
+  # same but read as an accident (SC2030).
+  mkdir -p "$XDG_CONFIG_HOME/minimal"
+  printf '[vars]\nallow = ["E2E_INHERIT_MARKER"]\n' > "$XDG_CONFIG_HOME/minimal/user_policy.toml"
+  export E2E_INHERIT_MARKER=hello-from-the-host
+  env_out="$(cd "$TASK_SEED_DIR" && mnl task run e2e-envprint 2>"$WORK/env-inherit.err")"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "::error::'min task run e2e-envprint' with inherited var exited $rc (expected 0)"
+    echo "--- task stderr ---"; cat "$WORK/env-inherit.err" 2>/dev/null || true
+    fail
+  fi
+  if [[ "$env_out" != *hello-from-the-host* ]]; then
+    echo "::error::inherited env var did not reach the task, got '$env_out'"
+    fail
+  fi
+  echo "env_vars inherit: value crossed the VM boundary OK"
+
+  # An inherited var that is not set in the invoking shell is a client-side
+  # error naming the var, before any session is composed.
+  unset E2E_INHERIT_MARKER
+  (cd "$TASK_SEED_DIR" && mnl task run e2e-envprint >/dev/null 2>"$WORK/env-unset.err")
+  rc=$?
+  if [ "$rc" -ne 1 ]; then
+    echo "::error::'min task run e2e-envprint' with unset inherited var exited $rc (expected 1)"
+    fail
+  fi
+  grep -q 'E2E_INHERIT_MARKER is not set in this shell' "$WORK/env-unset.err" \
+    || { echo "::error::unset inherited var error does not name the var"; cat "$WORK/env-unset.err" 2>/dev/null || true; fail; }
+  echo "env_vars inherit: unset var refused client-side OK"
+
+  # Without the allow entry the var is refused at the policy gate, and the
+  # error carries the `[vars] allow` snippet to paste.
+  rm -f "$XDG_CONFIG_HOME/minimal/user_policy.toml"
+  export E2E_INHERIT_MARKER=hello-from-the-host
+  (cd "$TASK_SEED_DIR" && mnl task run e2e-envprint >/dev/null 2>"$WORK/env-ungranted.err")
+  rc=$?
+  if [ "$rc" -ne 1 ]; then
+    echo "::error::'min task run e2e-envprint' with ungranted var exited $rc (expected 1)"
+    fail
+  fi
+  grep -Fq '[vars]' "$WORK/env-ungranted.err" \
+    || { echo "::error::ungranted var error does not carry the [vars] allow snippet"; cat "$WORK/env-ungranted.err" 2>/dev/null || true; fail; }
+  grep -Fq 'allow =' "$WORK/env-ungranted.err" \
+    || { echo "::error::ungranted var error does not carry the allow = entry"; cat "$WORK/env-ungranted.err" 2>/dev/null || true; fail; }
+  grep -q 'E2E_INHERIT_MARKER' "$WORK/env-ungranted.err" \
+    || { echo "::error::ungranted var error does not name the var"; cat "$WORK/env-ungranted.err" 2>/dev/null || true; fail; }
+  unset E2E_INHERIT_MARKER # leave the invoking shell as this proof found it
+  echo "env_vars inherit: ungranted var refused at the policy gate OK"
 
   echo "task run proof OK"
   echo "::endgroup::"
@@ -3041,6 +3683,377 @@ if [ -n "$HOOK_RESTART_SID" ]; then
   echo "hooks survive a daemon restart OK (listed, and still executable)"
   echo "::endgroup::"
 fi
+}
+
+# ---------------------------------------------------------------------------
+# Native host-OS resolution of a box name, with no proxy settings anywhere
+# (NET-009, with the client halves of NET-122 and NET-123).
+#
+# The session-start advisory (NET-122) must print on a host whose resolver is
+# not configured for the zone, and name the EXACT command that points it at
+# the daemon's zone answerer — this case runs the text it printed, verbatim,
+# not a reconstruction of it, so what the user would have copied is what is
+# proved. And session start must never prompt: this case drives `min session
+# activate` from a script with no answers to give, so the activate completing
+# at all is half the proof. The other half, where this host can run it: after
+# the command, a plain `getent hosts` — any process, through the host's
+# NATIVE resolver — resolves the session's name with every proxy variable
+# stripped, which is the whole point of pointing the resolver at the
+# answerer instead of exporting proxies (NET-009).
+#
+# NET-123's present arm is asserted from the daemon's own record: the
+# session-start bind probe ran at this create and picked the reserved local
+# range, not the 127.0.0.1 interim (on Linux the probe always succeeds — the
+# whole 127/8 is `lo`'s — so the interim arm itself is macOS-only and is
+# pinned by the minimald unit tests, with the CLI advisory carrying no
+# interim sentence on these lanes, asserted alongside). The probe record is
+# INFO, and the lane runs its daemon at warn, so this case (like the proxy
+# case after it, which is ordered LAST on purpose) restarts with its own
+# RUST_LOG first; no session is live here, and the restart proof pins that
+# they survive regardless.
+#
+# Lane gating, by observed fact as ever:
+#   * The advisory and its command assert on EVERY lane — the CLI detects the
+#     hook host-side, whatever side the daemon is on.
+#   * The daemon's probe record and the host half (run the command, resolve)
+#     are native-only: a VM lane's daemon and answerer live in the guest, so
+#     its log is guest-side (`hook_log_readable`) and its answerer is not
+#     this host's loopback. The KVM/macOS lanes assert the advisory; the
+#     native lane proves the whole path.
+#   * The host half needs `resolvectl`, `getent` and passwordless `sudo`, and
+#     a skip is only honest on a developer host (the proxy case's gate
+#     doctrine); a CI native lane that cannot run the command is a red lane.
+#   * A dev host that already routes the zone to THIS daemon's answerer sees
+#     the advisory correctly quiet (NET-122's only quiet state, once the
+#     interim is out of the picture and nothing blocks the command — a host
+#     whose lookups bypass resolved's stub is told the blocker even on a
+#     hook that routes, so it lands in the branch above); the resolution
+#     check below still runs there, and passing it is the assertion that
+#     the quiet was right.
+# ---------------------------------------------------------------------------
+proof_native_resolution_without_proxy_env() {
+  echo "::group::native min.internal resolution with no proxy settings (NET-009, NET-122, NET-123)"
+
+  # The daemon's file log, newest first (one file per calendar day).
+  native_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null \
+      | sort | tail -n1
+  }
+
+  NATIVE_NAME="e2e-native"
+  # What this run actually asserted, for the closing line — a degraded run
+  # must not claim the halves it skipped.
+  native_proved=""
+  # Set when the advisory named no command because this host's lookups
+  # bypass systemd-resolved's stub (NET-122's detection): the resolution
+  # check cannot pass on a host no command can configure.
+  native_bypassed=""
+  NATIVE_SEED_DIR="$(hook_mktemp /tmp/mnlnr.XXXXXX)"
+  hook_seed_preamble > "$NATIVE_SEED_DIR/minimal.toml"
+  mkdir "$NATIVE_SEED_DIR/.git"
+
+  # Restart with the daemon's rpc module at INFO, so this create's probe
+  # record is written, and the zone answerer at DEBUG, so its per-lookup
+  # lines are too — a resolution failure below can then say whether the
+  # query ever reached the answerer. The poll below re-spawns the daemon
+  # under it.
+  if hook_log_readable; then
+    mnl stop >/dev/null 2>&1 || true # a standalone run has no daemon yet
+    export RUST_LOG="warn,minimald::rpc=info,minimald::net::answerer=debug"
+  fi
+
+  # Warm the daemon and wait until its answerer is on record, so the
+  # advisory's trigger — the create response carrying the answerer port —
+  # cannot race the listener the daemon spawns beside it (the proxy case's
+  # degradation is this same race, read from the other end).
+  native_port=""
+  for _ in $(seq 1 40); do
+    native_port="$(mnl ls 2>/dev/null \
+      | sed -n 's/^ZONE ANSWERER: *listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | head -n1)"
+    [ -n "$native_port" ] && break
+    sleep 0.25
+  done
+  if [ -z "$native_port" ]; then
+    if [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; then
+      echo "::warning::native-resolution proof SKIPPED — this host's daemon never owned its zone answerer"
+      echo "  (a dev host running another minimald holds the ports; with no answerer port there"
+      echo "   is no command to name, and NET-122's advisory correctly stays quiet)"
+      rm -rf "$NATIVE_SEED_DIR"; NATIVE_SEED_DIR=""
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::the daemon's zone answerer never came up (no ZONE ANSWERER line in min ls)"
+    fail
+  fi
+
+  # NET-122: the advisory, on the activate's stderr. No prompt anywhere in
+  # the path — this script could not answer one.
+  native_err="$WORK/native-activate.err"
+  native_sid="$(cd "$NATIVE_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$NATIVE_NAME" 2>"$native_err")" || {
+    echo "::error::'min session activate' for the native-resolution proof failed"
+    echo "--- stderr ---"; cat "$native_err" 2>/dev/null || true
+    fail
+  }
+  native_sid="$(printf '%s\n' "$native_sid" | tail -n1 | tr -d '\r')"
+  echo "activated $NATIVE_NAME ($native_sid); answerer on 127.0.0.1:$native_port"
+
+  # The command the advisory named: the line after its lead-in, de-indented —
+  # exactly what a user would have copied off the terminal.
+  native_cmd="$(grep -A1 -F -- "Configure the host's resolver for the zone with:" \
+    "$native_err" 2>/dev/null | tail -n1 | sed 's/^  //')"
+
+  if [ -n "$native_cmd" ]; then
+    # The command must name this platform's mechanism and THIS daemon's
+    # answerer port, and be a command (sudo) the user runs, not one this
+    # session start ran for them.
+    case "$(uname -s)" in
+      Linux)
+        native_want_a="resolvectl"
+        native_want_b="127.0.0.1:$native_port"
+        ;;
+      Darwin)
+        native_want_a="/etc/resolver/min.internal"
+        native_want_b="port $native_port"
+        ;;
+      *)
+        native_want_a=""; native_want_b=""
+        ;;
+    esac
+    if [ -n "$native_want_a" ]; then
+      case "$native_cmd" in
+        *"$native_want_a"*) ;;
+        *)
+          echo "::error::the advisory's command does not name $native_want_a (got: '$native_cmd')"
+          echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
+          fail
+          ;;
+      esac
+      case "$native_cmd" in
+        *"$native_want_b"*) ;;
+        *)
+          echo "::error::the advisory's command does not name this answerer, $native_want_b (got: '$native_cmd')"
+          echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
+          fail
+          ;;
+      esac
+    fi
+    case "$native_cmd" in
+      sudo*) ;;
+      *) echo "::error::the advisory's command is not one the user runs (got: '$native_cmd')"; fail ;;
+    esac
+    echo "advisory named the exact command: $native_cmd"
+    native_proved="advised"
+
+    # NET-123's present arm, client side: a probe that found the reserved
+    # range adds no interim sentence to the advisory. On the lanes that run
+    # Linux daemons (native guest, or the Linux host of a VM lane) the
+    # probe always succeeds, so the word must be absent.
+    if [ "$(uname -s)" = Linux ] && grep -q -- interim "$native_err"; then
+      echo "::error::the advisory names the 127.0.0.1 interim where the probe found the reserved range"
+      echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
+      fail
+    fi
+  elif grep -q -- 'bypass systemd-resolved' "$native_err" 2>/dev/null; then
+    # An advisory that names no command: this host's lookups never reach
+    # systemd-resolved's stub, so the routing-domain command would
+    # configure nothing a host process consults — NET-122's detection says
+    # so instead of printing a dead command. Only a dev host can see this;
+    # a lane's lookups go through the stub, so CI must always get the
+    # command above.
+    native_bypassed=yes
+    echo "advisory said this host's lookups bypass systemd-resolved's stub (NET-122 detection):"
+    echo "  $(grep -F -- 'bypass systemd-resolved' "$native_err" 2>/dev/null | head -n1)"
+    if [ -n "${CI:-}" ] || [ -n "$E2E_VM" ]; then
+      echo "::error::this lane's host bypasses systemd-resolved's stub, so NET-009 cannot be proved on it"
+      echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
+      echo "--- /etc/resolv.conf ---"; cat /etc/resolv.conf 2>&1 || true
+      fail
+    fi
+    native_proved="advised-bypass"
+  else
+    # No advisory. NET-122's only quiet state is a hook that already routes
+    # this answerer's port with nothing blocking the command (the create
+    # carried the port — warmed above — and no Linux lane reports the
+    # interim), so this is a dev host that configured the zone against this
+    # daemon before. CI's fresh runners never see it, which is why it is an
+    # error there.
+    if [ -n "${CI:-}" ] || [ -n "$E2E_VM" ]; then
+      echo "::error::no advisory on the activate's stderr, and this lane's resolver is not configured for the zone (NET-122)"
+      echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
+      fail
+    fi
+    echo "::warning::no advisory printed — this host's resolver already routes the zone to this answerer (NET-122's quiet state)"
+    echo "  the resolution check below is then the assertion that the quiet was right"
+  fi
+
+  # NET-123's present arm, daemon side: the session-start probe record this
+  # create produced, with the surface it picked.
+  if hook_log_readable; then
+    native_probe=""
+    for _ in $(seq 1 20); do
+      native_probe="$(grep -h -- 'picked the publish surface' "$(native_log)" 2>/dev/null \
+        | grep -F -- "$native_sid" | tail -n1 || true)"
+      [ -n "$native_probe" ] && break
+      sleep 0.25
+    done
+    if [ -z "$native_probe" ]; then
+      echo "::error::no session-start loopback-probe record for $native_sid in the daemon log"
+      echo "--- daemon log (tail) ---"; tail -20 "$(native_log)" 2>/dev/null || true
+      fail
+    fi
+    echo "daemon log: $native_probe"
+    native_proved="${native_proved:+$native_proved, }probed"
+    case "$native_probe" in
+      *reserved-range*) ;;
+      *)
+        echo "::error::the session-start probe did not pick the reserved range (got: '$native_probe')"
+        fail
+        ;;
+    esac
+    if ! printf '%s' "$native_probe" | grep -Eq -- 'interim_loopback" *: *false'; then
+      echo "::error::the probe record does not read interim_loopback=false (got: '$native_probe')"
+      fail
+    fi
+  fi
+
+  # ---- the host half: run the command, then resolve with no proxy env -----
+  if [ -n "$E2E_VM" ]; then
+    echo "host half SKIPPED (VM-backed target: the answerer is guest-side; the native lane proves it)"
+  elif ! command -v resolvectl >/dev/null 2>&1 \
+       || ! command -v ip >/dev/null 2>&1 \
+       || ! command -v getent >/dev/null 2>&1 \
+       || ! sudo -n true >/dev/null 2>&1; then
+    if [ -z "${CI:-}" ]; then
+      echo "::warning::native-resolution host half SKIPPED — this host cannot run the advisory's command"
+      echo "  (needs resolvectl, ip, getent and passwordless sudo; CI's native lane has all four)"
+      echo "  asserted here: the advisory's exact command and the daemon's probe record above"
+    else
+      echo "::error::a CI native lane must be able to run the advisory's command (resolvectl, ip, getent, passwordless sudo)"
+      fail
+    fi
+  else
+    if [ -n "$native_cmd" ]; then
+      # Record the link BEFORE running the command, so a half-failed run
+      # still leaves the teardown a link to remove: the command creates
+      # the dedicated link and then configures DNS on it, so the creation
+      # can succeed while a later `resolvectl` step fails — and a teardown
+      # with no link recorded would skip the undo below and leave the link
+      # on a host the soak's next iteration expects to find as this one
+      # did. Undoing is the teardown's `resolvectl revert` on this link —
+      # restoring its DNS state, whatever this host had before the proof
+      # touched it — and `ip link del`, removing the dedicated link the
+      # command created.
+      NATIVE_REVERT_LINK="$(printf '%s\n' "$native_cmd" \
+        | sed -n 's/.*resolvectl dns \([^ ][^ ]*\) .*/\1/p')"
+      if [ -z "$NATIVE_REVERT_LINK" ]; then
+        echo "::error::could not find the link in the advisory's command, so it was not run — this run cannot undo a command it cannot name (got: '$native_cmd')"
+        echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
+        fail
+      fi
+      # Run the exact command the advisory printed — verbatim, as the user
+      # would have. Passwordless sudo is the gate above, so it cannot prompt.
+      if ! sh -c "$native_cmd" >"$WORK/native-cmd.out" 2>"$WORK/native-cmd.err"; then
+        echo "::error::the advisory's command did not run (are resolvectl and ip usable here?)"
+        echo "--- command ---"; echo "$native_cmd"
+        echo "--- output ---"; cat "$WORK/native-cmd.out" "$WORK/native-cmd.err" 2>/dev/null || true
+        fail
+      fi
+      echo "ran the advisory's command"
+    elif [ -n "$native_bypassed" ]; then
+      echo "no command to run: this host's lookups bypass systemd-resolved's stub, so no routing-domain command could reach them"
+    else
+      echo "no command to run (the advisory was quiet); the resolution check below is the assertion"
+    fi
+
+    if [ -n "$native_bypassed" ]; then
+      # NET-009's WHERE names a host whose native resolver is configured for
+      # the zone; a host whose lookups never reach resolved's stub cannot be
+      # one, and the advisory already said so — the check would fail for a
+      # fact the detection explained, not for a defect.
+      echo "resolution check SKIPPED — this host's lookups never reach systemd-resolved, so they cannot carry the zone"
+    else
+      # NET-009: any process on the host, through the host's NATIVE resolver,
+      # with every proxy variable stripped from its environment.
+      native_resolved="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+        -u ALL_PROXY -u all_proxy getent hosts "$NATIVE_NAME.min.internal" 2>/dev/null || true)"
+      if [ -z "$native_resolved" ]; then
+        echo "::error::$NATIVE_NAME.min.internal did not resolve on the host with no proxy settings"
+        # The two causes this could be, each answered by its own read below —
+        # all read-only, so nothing here can prompt:
+        #   1. whether host lookups reach resolved's stub at all — `getent`
+        #      uses the `dns` NSS module against /etc/resolv.conf, and a file
+        #      naming the upstream directly never travels through resolved,
+        #      so a per-link routing domain cannot apply to it;
+        #   2. whether the query reached the answerer and what it answered —
+        #      resolved's own verdict, and the answerer's log lines for this
+        #      very name (the case runs the daemon with the answerer at
+        #      DEBUG for exactly this).
+        # `resolvectl dns`'s Global line is printed in full too: nothing
+        # this script or the advisory's command runs can set a global server
+        # (every resolvectl verb is per-link, and a foreign resolv.conf loads
+        # with no port), so resolved.conf and its dropins — the only inputs
+        # that can — are dumped to name the source when one appears.
+        echo "--- /etc/resolv.conf ---"; cat /etc/resolv.conf 2>&1 || true
+        echo "--- nsswitch hosts ---"
+        grep -E '^[[:space:]]*hosts:' /etc/nsswitch.conf 2>&1 || true
+        echo "--- resolvectl domain ---"; resolvectl domain 2>&1 || true
+        echo "--- resolvectl dns ---"; resolvectl dns 2>&1 || true
+        echo "--- resolvectl query ---"
+        resolvectl query "$NATIVE_NAME.min.internal" 2>&1 || true
+        echo "--- resolved.conf and dropins ---"
+        cat /etc/systemd/resolved.conf /etc/systemd/resolved.conf.d/*.conf 2>&1 || true
+        if hook_log_readable; then
+          native_answers="$(grep -h -- 'zone-answerer' "$(native_log)" 2>/dev/null \
+            | grep -F -- "$NATIVE_NAME.min.internal" | tail -n20 || true)"
+          if [ -n "$native_answers" ]; then
+            echo "--- zone answerer: this query ---"
+            printf '%s\n' "$native_answers"
+          else
+            echo "--- zone answerer: no log line for this query — it never reached the answerer ---"
+            echo "  (the daemon log's last zone-answerer lines, for contrast:)"
+            grep -h -- 'zone-answerer' "$(native_log)" 2>/dev/null | tail -n5 || true
+          fi
+        fi
+        fail
+      fi
+      echo "resolved $NATIVE_NAME.min.internal with no proxy settings: $native_resolved"
+      case "$native_resolved" in
+        *127.0.0.1*|*127.0.64.*) ;;
+        *)
+          echo "::error::the name resolved outside the box zone's loopback (got: '$native_resolved')"
+          fail
+          ;;
+      esac
+
+      native_proved="${native_proved:+$native_proved, }resolved"
+    fi
+
+    if [ -n "$NATIVE_REVERT_LINK" ]; then
+      # Undo the whole command: `resolvectl revert` restores the link's
+      # DNS state, `ip link del` removes the dedicated link itself — the
+      # next iteration (the soak runs this script ten times) must find the
+      # host as this run did. The record is kept when a deletion fails, so
+      # the teardown retries it: this block must not clear the variable on
+      # a link it could not remove.
+      if sudo resolvectl revert "$NATIVE_REVERT_LINK" >/dev/null 2>&1; then
+        echo "reverted the routing domain on $NATIVE_REVERT_LINK"
+      else
+        echo "::warning::could not revert the routing domain on $NATIVE_REVERT_LINK (this host's resolver still carries it)"
+      fi
+      if sudo ip link del "$NATIVE_REVERT_LINK" >/dev/null 2>&1; then
+        echo "removed the dedicated link $NATIVE_REVERT_LINK"
+        NATIVE_REVERT_LINK=""
+      else
+        echo "::warning::could not remove the dedicated link $NATIVE_REVERT_LINK (this host still carries it)"
+      fi
+    fi
+  fi
+
+  mnl session destroy --force "$native_sid" >/dev/null 2>&1 || true
+  echo "native min.internal resolution with no proxy settings OK (${native_proved:-advisory race} — each printed)"
+  echo "::endgroup::"
 }
 
 # ---------------------------------------------------------------------------
@@ -5081,6 +6094,704 @@ echo "::group::retired surfaces gone (ssh-forward, login, :7655, direct-tcpip)"
 }
 
 # ---------------------------------------------------------------------------
+# Shared by the NET-049/NET-051 fresh-install KVM activation proofs and the
+# stock-install integration case: locate the lane's guest images, stage the
+# mock bucket the real install.sh installs from, write the stub downloaders,
+# run the installer into a fresh HOME, and drive the installed pair (activate,
+# UUID, listed) — then the start-record assertion below. What each proof keeps
+# for itself is policy: the arch it gates on, whether the switch is required
+# (fetch-or-fail) or optional (omit the row), which rows the installer's
+# output must carry, and how far the box is driven (activation only, or exec
+# and destroy too).
+# ---------------------------------------------------------------------------
+# Shared by the fresh-install VM proofs (the NET-049/NET-051 activation case
+# and the stock-install case below): the VM host daemon's start record must
+# exist and name the kernel, rootfs and initramfs it resolved — from the
+# installed data prefix of the home $1 was installed into — and, when $2 is
+# non-empty (the proof shipped a switch), that switch from the installed bin
+# dir. Runs INSIDE the caller's install-proof subshell, so every failure
+# `exit 1`s and the caller's `if ( ... )` turns the unwind into its own
+# `fail`; prints the record it matched.
+#
+# WHERE the record lives: an autospawned daemon is a detached supervisor,
+# which routes its tracing to the daily-rotated file sink under the state
+# base's logs dir (`minvmd.log*`, dated and unsuffixed — crates/minvmd/src/
+# main.rs). Its stderr — run.log, where a boot failure's diagnosis lands —
+# carries only what tracing does not. Both are searched, file sink first;
+# the first file that carries the record is the one that proves it.
+#
+# WHEN it lands: activate returns once the VM is serving, which can precede
+# the appender's first flush, and the dated file is created by the daemon's
+# own start — after the CLI's autospawn call returned. So the LOOKUP runs
+# inside the retry loop (it used to run once, before it, and grep whatever
+# it resolved there 20 times over) and the total wait is 20 s, well past
+# the seconds a first flush can take.
+fresh_vm_start_record_asserts_installed_images() {
+  local fsr_home="$1" fsr_switch="$2"
+  local fsr_rec fsr_log fsr_cand fsr_key fsr_want fsr_data
+  fsr_log_candidates() {
+    # Newest first: the dated file sorts after the unsuffixed name, and a
+    # later date after an earlier one.
+    find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null | sort -r
+    printf '%s\n' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/run.log"
+  }
+  fsr_rec=""
+  fsr_log=""
+  for _ in $(seq 1 40); do
+    while IFS= read -r fsr_cand; do
+      [ -f "$fsr_cand" ] || continue
+      fsr_rec="$(grep -h -- 'starting VM' "$fsr_cand" 2>/dev/null | tail -n1)"
+      [ -z "$fsr_rec" ] && continue
+      fsr_log="$fsr_cand"
+      break
+    done < <(fsr_log_candidates)
+    [ -n "$fsr_rec" ] && break
+    sleep 0.5
+  done
+  if [ -z "$fsr_rec" ]; then
+    echo "::error::no 'starting VM' record in any VM host daemon log after 20 s"
+    echo "--- paths searched (tail of each) ---"
+    while IFS= read -r fsr_cand; do
+      echo "--- $fsr_cand ---"
+      if [ -f "$fsr_cand" ]; then
+        tail -30 "$fsr_cand" 2>/dev/null || true
+      else
+        echo "(no such file)"
+      fi
+    done < <(fsr_log_candidates)
+    echo "--- log dir listing ---"
+    ls -la "$XDG_STATE_HOME/minimal/logs" 2>/dev/null || echo "(no log dir)"
+    exit 1
+  fi
+
+  # The file sink writes one flat JSON object per line (crates/mlog) with the
+  # record's own fields nested under "fields", in the subscriber's key order —
+  # alphabetical (a BTreeMap in json-subscriber), not the record's declaration
+  # order. So each field is matched on its own: one ordered pattern would pin
+  # an ordering the JSON layer does not promise.
+  for fsr_key in kernel rootfs initramfs switch; do
+    fsr_want="\"$fsr_key\":"
+    case "$fsr_rec" in
+      *"$fsr_want"*) ;;
+      *)
+        echo "::error::the VM host daemon start line does not name its $fsr_key"
+        echo "--- record ---"; printf '%s\n' "$fsr_rec"
+        exit 1
+        ;;
+    esac
+  done
+
+  # And the values are the point: with no MINVMD_* overrides, the daemon must
+  # have resolved each guest image from the installed data prefix — the same
+  # paths the install check verified the installer stamped — and the switch
+  # from the installed bin dir when the proof staged one.
+  fsr_data="$fsr_home/.local/share/minimal"
+  for fsr_pair in "kernel=$fsr_data/vmlinuz" "rootfs=$fsr_data/rootfs.img" \
+                  "initramfs=$fsr_data/initramfs.cpio"; do
+    fsr_key="${fsr_pair%%=*}"
+    fsr_want="\"$fsr_key\":\"${fsr_pair#*=}\""
+    case "$fsr_rec" in
+      *"$fsr_want"*) ;;
+      *)
+        echo "::error::the VM host daemon start line does not resolve its $fsr_key from the installed data prefix"
+        echo "--- record ---"; printf '%s\n' "$fsr_rec"
+        echo "--- expected ---"; printf '%s\n' "$fsr_want"
+        exit 1
+        ;;
+    esac
+  done
+  if [ -n "$fsr_switch" ]; then
+    fsr_want="\"switch\":\"$fsr_home/.local/bin/gvproxy-min\""
+    case "$fsr_rec" in
+      *"$fsr_want"*) ;;
+      *)
+        echo "::error::the VM host daemon start line does not resolve the switch from the installed bin dir"
+        echo "--- record ---"; printf '%s\n' "$fsr_rec"
+        echo "--- expected ---"; printf '%s\n' "$fsr_want"
+        exit 1
+        ;;
+    esac
+  fi
+  echo "VM host daemon start line ($fsr_log): $fsr_rec"
+}
+
+# ---------------------------------------------------------------------------
+# The mock-bucket install-and-drive half the VM proofs share.
+# ---------------------------------------------------------------------------
+
+# Locate the guest images the lane already built/fetched — the caller's
+# MINVMD_*_PATH overrides when set and present, else the justfile's .scratch
+# copies (the same sources every VM proof reads). Sets STAGED_KERNEL,
+# STAGED_ROOTFS and STAGED_INITRAMFS; the CALLER owns the availability check
+# and its skip message, because where the check sits is the caller's policy:
+# the stock-install case must skip before it would fetch a switch it cannot
+# use, the fresh-kvm proofs resolve their (optional) switch first.
+locate_vm_guest_images() {
+  if [ -n "${MINVMD_KERNEL_PATH:-}" ] && [ -f "$MINVMD_KERNEL_PATH" ]; then
+    STAGED_KERNEL="$MINVMD_KERNEL_PATH"
+  else
+    STAGED_KERNEL="$ROOT/.scratch/vmlinuz"
+  fi
+  if [ -n "${MINVMD_ROOTFS_PATH:-}" ] && [ -f "$MINVMD_ROOTFS_PATH" ]; then
+    STAGED_ROOTFS="$MINVMD_ROOTFS_PATH"
+  else
+    STAGED_ROOTFS="$ROOT/.scratch/rootfs.img"
+  fi
+  if [ -n "${MINVMD_INITRAMFS:-}" ] && [ -f "$MINVMD_INITRAMFS" ]; then
+    STAGED_INITRAMFS="$MINVMD_INITRAMFS"
+  else
+    STAGED_INITRAMFS="$ROOT/.scratch/initramfs.cpio"
+  fi
+}
+
+# Stage the mock bucket the real install.sh below installs from: the seed
+# project (a pinned minimal.toml plus a bare .git marker, so the headless
+# upload gate ships it), then every component a Linux release ships for the
+# arch — min, minvmd, the guest kernel, rootfs and initramfs, and, when $5 is
+# non-empty, the switch — the stable pointer, and the components manifest the
+# installer hashes. The caller owns the dirs (and creates them, because the
+# stock-install case's fetch below writes its own log under the root first).
+# $5 is the caller's SWITCH POLICY: the stock-install case resolves one or
+# fails (a switchless guest cannot mint a session — its in-guest package pull
+# has no other end — so a bucket without a switch would prove nothing), the
+# fresh-kvm proofs may ship none and the row is omitted.
+# Fails the run naming the missing binary when min/minvmd are not on PATH,
+# BEFORE anything is staged: a missing one must not surface later as "the
+# install failed" with the cause buried in the install log. A --provider
+# local-minvmd activation needs only these two on the host — the guest runs
+# minimald, not the host.
+stage_vm_mock_bucket() {
+  local smb_label="$1" smb_bucket="$2" smb_seed="$3" smb_arch="$4" smb_switch="$5"
+  local smb_h_minimal smb_h_minvmd smb_h_kernel smb_h_rootfs smb_h_initramfs smb_h_switch
+  hook_seed_preamble > "$smb_seed/minimal.toml"
+  mkdir "$smb_seed/.git"
+  if ! command -v min >/dev/null 2>&1 || ! command -v minvmd >/dev/null 2>&1; then
+    echo "::error::$smb_label requires min and minvmd on PATH"
+    fail
+  fi
+  cp "$(command -v min)"      "$smb_bucket/versions/v1/minimal-linux-$smb_arch"
+  cp "$(command -v minvmd)"   "$smb_bucket/versions/v1/minvmd-linux-$smb_arch"
+  cp "$STAGED_KERNEL"         "$smb_bucket/versions/v1/vmlinuz-$smb_arch"
+  cp "$STAGED_ROOTFS"         "$smb_bucket/versions/v1/rootfs-$smb_arch.img"
+  cp "$STAGED_INITRAMFS"      "$smb_bucket/versions/v1/initramfs-$smb_arch.cpio"
+  if [ -n "$smb_switch" ]; then
+    cp "$smb_switch"          "$smb_bucket/versions/v1/gvproxy-min-linux-$smb_arch"
+  fi
+  printf 'v1\n' >"$smb_bucket/stable"
+  smb_sha() { sha256sum "$1" | awk '{print $1}'; }
+  smb_h_minimal="$(smb_sha "$smb_bucket/versions/v1/minimal-linux-$smb_arch")"
+  smb_h_minvmd="$(smb_sha "$smb_bucket/versions/v1/minvmd-linux-$smb_arch")"
+  smb_h_kernel="$(smb_sha "$smb_bucket/versions/v1/vmlinuz-$smb_arch")"
+  smb_h_rootfs="$(smb_sha "$smb_bucket/versions/v1/rootfs-$smb_arch.img")"
+  smb_h_initramfs="$(smb_sha "$smb_bucket/versions/v1/initramfs-$smb_arch.cpio")"
+  if [ -n "$smb_switch" ]; then
+    smb_h_switch="$(smb_sha "$smb_bucket/versions/v1/gvproxy-min-linux-$smb_arch")"
+  fi
+  {
+    printf '# format: 1\n'
+    printf '# component   os      arch    version   sha256   kind   dest                 src\n'
+    printf '\n'
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      minimal linux "$smb_arch" v1 "$smb_h_minimal" file bin/min "versions/v1/minimal-linux-$smb_arch"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      minvmd linux "$smb_arch" v1 "$smb_h_minvmd" file bin/minvmd "versions/v1/minvmd-linux-$smb_arch"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      vmlinuz linux "$smb_arch" v1 "$smb_h_kernel" file data/vmlinuz "versions/v1/vmlinuz-$smb_arch"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      rootfs linux "$smb_arch" v1 "$smb_h_rootfs" file data/rootfs.img "versions/v1/rootfs-$smb_arch.img"
+    printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+      initramfs linux "$smb_arch" v1 "$smb_h_initramfs" file data/initramfs.cpio "versions/v1/initramfs-$smb_arch.cpio"
+    if [ -n "$smb_switch" ]; then
+      printf '%-12s %-7s %-7s %-9s %-64s %-6s %-20s %s\n' \
+        gvproxy-min linux "$smb_arch" v1 "$smb_h_switch" file bin/gvproxy-min "versions/v1/gvproxy-min-linux-$smb_arch"
+    fi
+  } >"$smb_bucket/versions/v1/components"
+}
+
+# The stub downloaders the installer resolves first on PATH: a fake curl
+# mapping the pinned mock-bucket host to the local dir (the same trick
+# install_test.sh uses, so the real installer runs unmodified and its own
+# HTTPS/TLS flags are accepted and ignored), and a wget that refuses, so the
+# downloader selection is deterministic.
+write_install_stubs() {
+  local wis_stubbin="$1" wis_bucket="$2" wis_bucket_host="$3"
+  cat >"$wis_stubbin/curl" <<STUB
+#!/bin/sh
+# Fake curl: map the pinned bucket host to this local dir.
+out= url=
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -o) out="\$2"; shift 2 ;;
+    https://*|http://*) url="\$1"; shift ;;
+    *) shift ;;
+  esac
+done
+[ -n "\$url" ] || { echo "stub curl: no url" >&2; exit 2; }
+rel="\${url#$wis_bucket_host/}"
+src="$wis_bucket/\$rel"
+[ -f "\$src" ] || { echo "stub curl: 404 \$url" >&2; exit 22; }
+if [ -n "\$out" ]; then cp "\$src" "\$out"; else cat "\$src"; fi
+STUB
+  chmod +x "$wis_stubbin/curl"
+  cat >"$wis_stubbin/wget" <<'STUB'
+#!/bin/sh
+echo "stub wget should not be used here" >&2
+exit 1
+STUB
+  chmod +x "$wis_stubbin/wget"
+}
+
+# A REAL scripts/install.sh run into the fresh HOME the caller made, off the
+# mock bucket, with no path overrides. Runs INSIDE the caller's install-proof
+# subshell, so a failed install `exit 1`s the subshell — naming the cause and
+# printing the installer's own log — and the caller's `if ( ... )` turns the
+# unwind into its own `fail`.
+#
+# XDG_DATA_HOME outranks HOME in both the installer's data-prefix resolution
+# (scripts/install.sh) and the daemon's image resolver
+# (crates/minvmd/src/image.rs), and the harness does not hermeticize it — a
+# host or CI that exports it would land the guest images in a different
+# prefix from the $home/.local/share/minimal the caller asserts, for the
+# install check below and the start-line values alike. A genuinely fresh
+# install has it unset, so drop it (this subshell only, like the
+# installed-pair env swap the drive helper's callers scope before the call).
+run_mock_bucket_install() {
+  local rmi_home="$1" rmi_bucket_host="$2" rmi_stubbin="$3" rmi_out="$4" rmi_label="$5"
+  unset XDG_DATA_HOME
+  # Fresh install into the throwaway home, no path overrides. The PATH change
+  # is intentionally scoped to this subshell (SC2031).
+  # shellcheck disable=SC2031
+  HOME="$rmi_home" MINIMAL_BIN="$rmi_home/.local/bin" \
+    PATH="$rmi_stubbin:$PATH" \
+    MINIMAL_OVERRIDE_INSTALLER_BUCKET="$rmi_bucket_host" \
+    sh "$ROOT/scripts/install.sh" >"$rmi_out" 2>&1 || {
+      echo "::error::$rmi_label"
+      echo "--- install log ---"; cat "$rmi_out" 2>/dev/null || true
+      exit 1
+    }
+}
+
+# Drive the INSTALLED pair. The caller's install-proof subshell has already
+# swapped HOME/MINIMAL_BIN/PATH to the installed prefixes and dropped every
+# MINVMD_* override — a swap the CALLER must make, because one made in here
+# would die with this helper's command-substitution subshell — so image and
+# switch resolution must come from the installed prefixes alone. Stops any
+# daemon under the harness's state base; then activates a VM box and checks
+# the outcome: the CLI's last stdout line is the new session's UUID, and
+# `min ls --raw` lists it. Prints the UUID on stdout — every diagnostic goes
+# to STDERR, so the capture keeps only the id. Returns nonzero on any
+# failure; the caller (in its install-proof subshell) unwinds with
+# `exit 1`, printing any extra diagnostics of its own first.
+#
+# The RUST_LOG filter rides on the ONE activate that autospawns the daemon:
+# the 'starting VM' record the start-record helper asserts on is INFO, and a
+# daemon's filter comes from RUST_LOG at autospawn (it inherits the CLI's
+# env), while this harness quiets the whole run to `warn` for output parsing —
+# which would drop the record before it reaches any sink. A command-local
+# assignment (never an export) so nothing leaks past the proof, and `minvmd`
+# is the daemon's crate, so the CLI's own stdout stays quiet and the
+# last-line UUID extraction keeps working.
+drive_installed_vm_pair() {
+  local dvp_seed="$1" dvp_name="$2" dvp_err="$3"
+  local dvp_activate_label="$4" dvp_ls_label="$5"
+  local dvp_sid
+  mnl stop --force >/dev/null 2>&1 || true
+  dvp_sid="$(cd "$dvp_seed" && RUST_LOG="warn,minvmd=info" mnl session activate . --no-prompt --name "$dvp_name" 2>"$dvp_err")" || {
+    echo "::error::$dvp_activate_label" >&2
+    echo "--- activate stderr ---" >&2
+    cat "$dvp_err" 1>&2 2>/dev/null || true
+    return 1
+  }
+  dvp_sid="$(printf '%s\n' "$dvp_sid" | tail -n1 | tr -d '\r')"
+  if ! printf '%s' "$dvp_sid" | grep -Eqx '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+    echo "::error::activate's last stdout line is not a session UUID: '$dvp_sid'" >&2
+    return 1
+  fi
+  if ! mnl ls --raw 2>/dev/null | grep -Fqx "$dvp_sid"; then
+    echo "::error::'min ls --raw' does not list $dvp_ls_label $dvp_sid" >&2
+    return 1
+  fi
+  printf '%s\n' "$dvp_sid"
+}
+proof_fresh_kvm_activate_local_minvmd_for_arch() {
+  local target_arch="$1"
+  if [ -z "$E2E_VM" ] || [ "$(uname -s)" != Linux ]; then
+    echo "fresh-install KVM activate ($target_arch) SKIPPED (VM-backed Linux lane only)"
+    return 0
+  fi
+  local host_arch
+  case "$(uname -m)" in
+    x86_64) host_arch=amd64 ;;
+    aarch64|arm64) host_arch=arm64 ;;
+    *)
+      echo "fresh-install KVM activate ($target_arch) SKIPPED (no release arch for $(uname -m))"
+      return 0
+      ;;
+  esac
+  if [ "$host_arch" != "$target_arch" ]; then
+    echo "fresh-install KVM activate ($target_arch) SKIPPED (host is $host_arch)"
+    return 0
+  fi
+  if [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; then
+    echo "fresh-install KVM activate ($target_arch) SKIPPED (no writable /dev/kvm)"
+    return 0
+  fi
+
+  echo "::group::fresh-install KVM activation ($target_arch) with local-minvmd (NET-049/NET-051)"
+
+  local fk_root fk_home fk_bucket fk_stubbin fk_out fk_seed
+  fk_root="$WORK/fresh-kvm-$target_arch"
+  fk_home="$fk_root/home"
+  fk_bucket="$fk_root/bucket"
+  fk_stubbin="$fk_root/stubbin"
+  fk_out="$fk_root/install.out"
+  fk_seed="$fk_root/seed"
+  mkdir -p "$fk_home" "$fk_bucket/versions/v1" "$fk_stubbin" "$fk_seed"
+
+  local fk_bucket_host="https://mock.invalid/minimal-fresh-kvm-$target_arch"
+
+  # Locate the guest images the lane already built/fetched (the shared
+  # helper reads the same MINVMD_*_PATH / .scratch sources).
+  locate_vm_guest_images
+
+  # The switch the fresh install may ship: the lane's env override or the
+  # justfile's .scratch copy — never a fetch. An install without a switch
+  # still proves the activation half (a --provider local-minvmd activation
+  # needs no switch), so the empty path downgrades to a switchless install;
+  # the assertions and the start-record check below wrap on it.
+  local fk_gvproxy
+  if [ -n "${MINVMD_GVPROXY_BIN:-}" ] && [ -x "$MINVMD_GVPROXY_BIN" ]; then
+    fk_gvproxy="$MINVMD_GVPROXY_BIN"
+  elif [ -x "$ROOT/.scratch/gvproxy" ]; then
+    fk_gvproxy="$ROOT/.scratch/gvproxy"
+  else
+    fk_gvproxy=""
+  fi
+
+  if [ ! -f "$STAGED_KERNEL" ] || [ ! -f "$STAGED_ROOTFS" ] || [ ! -f "$STAGED_INITRAMFS" ]; then
+    echo "fresh-install KVM activate ($target_arch) SKIPPED (guest images not available)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # Stage the mock bucket (the empty switch above omits the gvproxy-min row
+  # the stock install always ships) and the stub downloaders the installer
+  # resolves first on PATH.
+  stage_vm_mock_bucket \
+    "fresh-install KVM activate" \
+    "$fk_bucket" "$fk_seed" "$target_arch" "$fk_gvproxy"
+  write_install_stubs "$fk_stubbin" "$fk_bucket" "$fk_bucket_host"
+
+  if (
+    # A REAL install.sh run into the throwaway home, off the mock bucket
+    # (the shared helper owns the XDG_DATA_HOME drop and the install
+    # failure's diagnostics).
+    run_mock_bucket_install "$fk_home" "$fk_bucket_host" "$fk_stubbin" "$fk_out" \
+      "the fresh install (VM stack) failed"
+
+    [ -x "$fk_home/.local/bin/min" ] \
+      && [ -x "$fk_home/.local/bin/minvmd" ] || {
+      echo "::error::the fresh install did not ship min/minvmd"
+      tail -25 "$fk_out" 2>/dev/null || true
+      exit 1
+    }
+    [ -f "$fk_home/.local/share/minimal/vmlinuz" ] \
+      && [ -f "$fk_home/.local/share/minimal/rootfs.img" ] \
+      && [ -f "$fk_home/.local/share/minimal/initramfs.cpio" ] || {
+      echo "::error::the fresh install did not ship the guest images into the data prefix"
+      exit 1
+    }
+    if [ -n "$fk_gvproxy" ]; then
+      grep -qE 'switch-binary +verified +[^ ]*/bin/gvproxy-min$' "$fk_out" || {
+        echo "::error::the install output does not name the switch binary it verified"
+        tail -25 "$fk_out" 2>/dev/null || true
+        exit 1
+      }
+      [ -x "$fk_home/.local/bin/gvproxy-min" ] || {
+        echo "::error::the fresh install did not ship an executable gvproxy-min"
+        exit 1
+      }
+    fi
+
+    # NET-049/NET-051 observability: activate and list through the shared
+    # driver (the UUID the destroy below takes), then the VM host daemon's
+    # start log line must name the kernel, rootfs, initramfs and switch it
+    # resolved — from the installed prefix, with no MINVMD_* override
+    # anywhere (the assertion lives in the shared helper, which names where
+    # the record is searched and why).
+    #
+    # The installed-pair env swap is scoped to this subshell (SC2030/SC2031)
+    # and lives HERE, in the caller: a swap the driver made inside itself
+    # would die with its command-substitution subshell, and the destroy/stop
+    # below would run on the lane's pair.
+    # shellcheck disable=SC2030,SC2031
+    export HOME="$fk_home" MINIMAL_BIN="$fk_home/.local/bin" PATH="$fk_home/.local/bin:$PATH"
+    unset MINVMD_KERNEL_PATH MINVMD_ROOTFS_PATH MINVMD_INITRAMFS MINVMD_GVPROXY_BIN
+    fk_sid="$(drive_installed_vm_pair \
+      "$fk_seed" "e2e-fresh-kvm-$target_arch" "$fk_root/activate.err" \
+      "the installed pair failed to activate a session with local-minvmd and no image overrides" \
+      "the fresh-install KVM session")" || exit 1
+
+    fresh_vm_start_record_asserts_installed_images "$fk_home" "$fk_gvproxy"
+
+    mnl session destroy --force "$fk_sid" >/dev/null 2>&1 || true
+    mnl stop --force >/dev/null 2>&1 || true
+  ); then
+    :
+  else
+    fail
+  fi
+  echo "fresh-install KVM activation ($target_arch) OK"
+  echo "::endgroup::"
+}
+
+proof_fresh_linux_kvm_activate_local_minvmd() {
+  proof_fresh_kvm_activate_local_minvmd_for_arch amd64
+}
+
+proof_fresh_arm64_kvm_activate_local_minvmd() {
+  proof_fresh_kvm_activate_local_minvmd_for_arch arm64
+}
+
+# ---------------------------------------------------------------------------
+# The stock install runs VM boxes, end to end (the S14 integration case).
+# From a REAL scripts/install.sh run into a fresh HOME — the mock-bucket
+# install the fresh-kvm proofs use, shipping the VM stack the Linux releases
+# ship (min, minvmd, the guest kernel, rootfs and initramfs, and the switch) —
+# the INSTALLED pair must run a VM box through the user's whole path, with no
+# MINVMD_* override anywhere:
+#
+#   * the install places every component and says so; the pair it leaves
+#     behind is a stock one: the images in the installed data prefix, the
+#     switch in the installed bin dir (NET-048/NET-050's runtime half);
+#   * `min session activate --provider local-minvmd` boots the microVM and
+#     prints the new session — the activation's outcome, observed — and the
+#     session is listed;
+#   * a command run in the box (`min session exec`) returns its output: the
+#     bridge, the guest, and the session namespace all work from the
+#     installed pair alone (NET-049/NET-051 end to end, not just activation);
+#   * the VM host daemon's start record names the images and the switch it
+#     booted (the run's diagnostics), and destroying the session delists it.
+#
+#   The case prints the installed components on success and again whenever
+#   the activation or the exec fails: the installed pair's provenance is
+#   the first thing a reader needs when the stock minvmd will not boot.
+#
+# Lane gating, decided by where the proof's pieces actually run:
+#   * VM-backed Linux only, for the arch of the host (an arch without a
+#     release binary for this channel is skipped the same way): the proof
+#     boots a microVM, and the driving pair it installs is the one the
+#     lane's release would ship.
+#   * /dev/kvm must be present and writable: KVM is the isolation tier this
+#     proof is for, and a host without it cannot run a VM box at all.
+#   * the guest images, from the same sources the fresh-kvm proofs read.
+#   * the switch is REQUIRED, never skipped: a stock install ships
+#     gvproxy-min, and a switchless guest cannot mint a session (its
+#     in-guest package pull has no other end), so a bucket without a switch
+#     would prove nothing. MINVMD_GVPROXY_BIN, the justfile's .scratch
+#     copy, or the pinned fetch — and when the fetch itself fails the case
+#     fails, saying what a lane needs to run it.
+#
+# Ordered after the fresh-kvm activation proofs for the same reason they
+# are ordered where they are: the case swaps the driving pair to the
+# installed one and stops the daemon under the harness's state base before
+# it activates — both inside its own subshell, so nothing that shares the
+# lane's session may run beside it, and the lane env the later proofs see
+# is the one this script started with.
+proof_linux_stock_install_runs_vm_boxes() {
+  local sb_arch
+  if [ -z "$E2E_VM" ] || [ "$(uname -s)" != Linux ]; then
+    echo "stock-install VM boxes SKIPPED (VM-backed Linux lane only)"
+    return 0
+  fi
+  case "$(uname -m)" in
+    x86_64)        sb_arch=amd64 ;;
+    aarch64|arm64) sb_arch=arm64 ;;
+    *)
+      echo "stock-install VM boxes SKIPPED (no release arch for $(uname -m))"
+      return 0
+      ;;
+  esac
+  if [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; then
+    echo "stock-install VM boxes SKIPPED (no writable /dev/kvm)"
+    return 0
+  fi
+
+  echo "::group::stock install runs VM boxes end to end ($sb_arch, installed pair, KVM)"
+
+  local sb_root sb_home sb_bucket sb_stubbin sb_out sb_seed sb_name
+  local sb_gvproxy sb_bucket_host
+  sb_root="$WORK/stock-vm-$sb_arch"
+  sb_bucket_host="https://mock.invalid/minimal-stock-vm-$sb_arch"
+  sb_home="$sb_root/home"
+  sb_bucket="$sb_root/bucket"
+  sb_stubbin="$sb_root/stubbin"
+  sb_out="$sb_root/install.out"
+  sb_seed="$sb_root/seed"
+  sb_name="e2e-stock-vm-$sb_arch"
+  mkdir -p "$sb_home" "$sb_bucket/versions/v1" "$sb_stubbin" "$sb_seed"
+
+  # Locate the guest images the lane already built/fetched (the shared
+  # helper reads the same MINVMD_*_PATH / .scratch sources), and skip when
+  # they are not there — BEFORE the switch resolution below, so a lane
+  # without the images never pays for (or fails on) a gvproxy fetch it
+  # cannot use.
+  locate_vm_guest_images
+  if [ ! -f "$STAGED_KERNEL" ] || [ ! -f "$STAGED_ROOTFS" ] || [ ! -f "$STAGED_INITRAMFS" ]; then
+    echo "stock-install VM boxes SKIPPED (guest images not available)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The switch the stock install must ship: the lane's env override, the
+  # justfile's .scratch copy, or the pinned fetch — the same sources the
+  # loopback-publish proof reads, minus the skip: a lane that cannot ship a
+  # switch cannot run a box end to end, which is what this case exists for.
+  if [ -n "${MINVMD_GVPROXY_BIN:-}" ] && [ -x "$MINVMD_GVPROXY_BIN" ]; then
+    sb_gvproxy="$MINVMD_GVPROXY_BIN"
+  elif [ -x "$ROOT/.scratch/gvproxy" ]; then
+    sb_gvproxy="$ROOT/.scratch/gvproxy"
+  else
+    if ! "$ROOT/scripts/fetch-gvproxy.sh" "$sb_root/gvproxy" \
+        >"$sb_root/fetch-gvproxy.out" 2>&1; then
+      echo "::error::could not fetch the pinned gvproxy the stock install must ship (set MINVMD_GVPROXY_BIN or stage $ROOT/.scratch/gvproxy)"
+      cat "$sb_root/fetch-gvproxy.out" 2>/dev/null || true
+      fail
+    fi
+    sb_gvproxy="$sb_root/gvproxy"
+  fi
+
+  # Stage the mock bucket — every component a Linux release ships for this
+  # arch, switch REQUIRED, so the install under test IS the stock one — and
+  # the stub downloaders the installer resolves first on PATH.
+  stage_vm_mock_bucket \
+    "the stock-install case" \
+    "$sb_bucket" "$sb_seed" "$sb_arch" "$sb_gvproxy"
+  write_install_stubs "$sb_stubbin" "$sb_bucket" "$sb_bucket_host"
+
+  # The installed pair's provenance, in the installer's own words: printed
+  # after the install (observability) and again by every activate/exec
+  # failure below (the plan's "the case prints the install log") — when the
+  # stock minvmd will not boot, which components this install actually
+  # shipped is the first thing a reader needs.
+  sb_print_installed_components() {
+    echo "--- installed components ---"
+    grep -E '^  [a-z0-9-]+ +(installed|current|verified|skipped)' "$sb_out" 2>/dev/null \
+      || { echo "--- install log (tail) ---"; tail -25 "$sb_out" 2>/dev/null || true; }
+  }
+
+  if (
+    # A REAL install.sh run into the throwaway home, off the mock bucket
+    # (the shared helper owns the XDG_DATA_HOME drop and the install
+    # failure's diagnostics).
+    run_mock_bucket_install "$sb_home" "$sb_bucket_host" "$sb_stubbin" "$sb_out" \
+      "the stock install (VM stack) failed"
+
+    # Observability: what the stock install placed, in its own words (the
+    # helper prints it again on any activate/exec failure below).
+    sb_print_installed_components
+    for sb_comp in minvmd vmlinuz rootfs initramfs; do
+      grep -qE "^  $sb_comp +(installed|current)" "$sb_out" || {
+        echo "::error::the install output does not name $sb_comp as placed"
+        echo "--- install log (tail) ---"; tail -25 "$sb_out" 2>/dev/null || true
+        exit 1
+      }
+    done
+    # The switch row, beside the four image rows: the installer says which
+    # path it verified (NET-041), and a stock install must be the row that
+    # names the shipped gvproxy-min — the same grep the fresh-kvm proofs
+    # keep (the switch is REQUIRED here, so no skip branch around it).
+    grep -qE 'switch-binary +verified +[^ ]*/bin/gvproxy-min$' "$sb_out" || {
+      echo "::error::the install output does not name the switch binary it verified"
+      echo "--- install log (tail) ---"; tail -25 "$sb_out" 2>/dev/null || true
+      exit 1
+    }
+
+    # The VM stack is on disk where a stock install puts it.
+    [ -x "$sb_home/.local/bin/min" ] \
+      && [ -x "$sb_home/.local/bin/minvmd" ] || {
+      echo "::error::the stock install did not ship min/minvmd"
+      echo "--- install log (tail) ---"; tail -25 "$sb_out" 2>/dev/null || true
+      exit 1
+    }
+    [ -f "$sb_home/.local/share/minimal/vmlinuz" ] \
+      && [ -f "$sb_home/.local/share/minimal/rootfs.img" ] \
+      && [ -f "$sb_home/.local/share/minimal/initramfs.cpio" ] || {
+      echo "::error::the stock install did not ship the guest images into the data prefix"
+      exit 1
+    }
+    [ -x "$sb_home/.local/bin/gvproxy-min" ] || {
+      echo "::error::the stock install did not ship an executable gvproxy-min"
+      exit 1
+    }
+
+    # Activate, list: the shared driver, whose UUID the whole path below is
+    # driven by.
+    #
+    # The installed-pair env swap is scoped to this subshell (SC2030/SC2031)
+    # and lives HERE, in the caller: a swap the driver made inside itself
+    # would die with its command-substitution subshell, and the exec,
+    # destroy, ls and stop below would run on the lane's pair, not the
+    # installed one.
+    # shellcheck disable=SC2030,SC2031
+    export HOME="$sb_home" MINIMAL_BIN="$sb_home/.local/bin" PATH="$sb_home/.local/bin:$PATH"
+    unset MINVMD_KERNEL_PATH MINVMD_ROOTFS_PATH MINVMD_INITRAMFS MINVMD_GVPROXY_BIN
+    sb_sid="$(drive_installed_vm_pair \
+      "$sb_seed" "$sb_name" "$sb_root/activate.err" \
+      "the stock-installed pair failed to activate a VM box" \
+      "the stock-installed VM session")" || {
+      sb_print_installed_components
+      exit 1
+    }
+    echo "activation: the stock-installed pair brought up VM box '$sb_name' as session $sb_sid"
+
+    # End to end: a command run IN the box, over the bridge, from the
+    # installed pair alone. The cwd proves it ran in the session's mount
+    # namespace, not on the host (the session exec proof's own marker).
+    # shellcheck disable=SC2016 # $PWD must expand in the SESSION's shell, not here.
+    sb_exec="$(mnl session exec "$sb_sid" 'echo STOCK_VM_BOX_OK $PWD' 2>"$sb_root/exec.err")" || {
+      echo "::error::'min session exec' into the stock-installed VM box failed"
+      echo "--- exec stderr ---"; cat "$sb_root/exec.err" 2>/dev/null || true
+      sb_print_installed_components
+      exit 1
+    }
+    # The same substring match proof_session_exec uses (line ~678): the
+    # harness's contract for this command is "the marker is in the output",
+    # not byte equality — an exact compare breaks on a trailing banner line.
+    if [[ "$sb_exec" != *"STOCK_VM_BOX_OK /workbench"* ]]; then
+      echo "::error::the exec did not run in the box (expected 'STOCK_VM_BOX_OK /workbench')"
+      echo "--- exec stdout ---"; printf '%s\n' "$sb_exec"
+      echo "--- exec stderr ---"; cat "$sb_root/exec.err" 2>/dev/null || true
+      exit 1
+    fi
+    echo "end to end: the box answered its exec with: $sb_exec"
+
+    # And the box leaves when the user destroys it: delisted, not lingering.
+    mnl session destroy --force "$sb_sid" >/dev/null 2>&1 || {
+      echo "::error::could not destroy the stock-installed VM session $sb_sid"
+      exit 1
+    }
+    if mnl ls --raw 2>/dev/null | grep -Fqx "$sb_sid"; then
+      echo "::error::the stock-installed VM session survived its destroy"
+      exit 1
+    fi
+    echo "destroy: the box is gone from 'min ls'"
+
+    # Diagnostics: the VM host daemon's start record names the images and the
+    # switch it booted, resolved from the prefixes this install stamped.
+    fresh_vm_start_record_asserts_installed_images "$sb_home" "$sb_gvproxy"
+
+    mnl stop --force >/dev/null 2>&1 || true
+  ); then
+    :
+  else
+    fail
+  fi
+  echo "stock install runs VM boxes OK ($sb_arch: VM stack shipped, box activated, exec'd, destroyed delisted, images logged)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # Dispatch on the first argument: every proof in today's order when none is
 # given, or exactly the named one. The names are the proof functions' suffixes.
 case "${1:-}" in
@@ -5089,6 +6800,7 @@ case "${1:-}" in
     proof_session_exec
     proof_session_outbound_request
     proof_own_ip
+    proof_own_ip_egress_declared_and_enforced
     proof_task_run
     proof_hooks
     proof_skip_scaffold
@@ -5096,24 +6808,33 @@ case "${1:-}" in
     proof_restart
     proof_fresh_install_own_ip_ingress_publishes_loopback
     proof_network_posture_from_stock_install
+    proof_fresh_linux_kvm_activate_local_minvmd
+    proof_fresh_arm64_kvm_activate_local_minvmd
+    proof_linux_stock_install_runs_vm_boxes
+    proof_native_resolution_without_proxy_env
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
     proof_proxy_refuses_like_direct
     proof_retired_surfaces_gone
     ;;
-  lifecycle | session_exec | session_outbound_request | own_ip | task_run | hooks \
+  lifecycle | session_exec | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
-    | network_posture_from_stock_install \
+    | network_posture_from_stock_install | native_resolution_without_proxy_env \
     | hostnames_recover_and_two_daemons_route \
-    | min_internal_names_through_proxy | proxy_refuses_like_direct | retired_surfaces_gone)
+    | min_internal_names_through_proxy | proxy_refuses_like_direct | retired_surfaces_gone \
+    | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
+    | linux_stock_install_runs_vm_boxes)
     "proof_$1"
     ;;
   *)
     echo "usage: $0 [case]"
     echo "  no argument: every proof, in the whole-lane order"
-    echo "  cases: lifecycle session_exec session_outbound_request own_ip task_run hooks"
+    echo "  cases: lifecycle session_exec session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run hooks"
     echo "         skip_scaffold sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
-    echo "         network_posture_from_stock_install hostnames_recover_and_two_daemons_route"
+    echo "         network_posture_from_stock_install native_resolution_without_proxy_env"
+    echo "         fresh_linux_kvm_activate_local_minvmd fresh_arm64_kvm_activate_local_minvmd"
+    echo "         linux_stock_install_runs_vm_boxes"
+    echo "         hostnames_recover_and_two_daemons_route"
     echo "         min_internal_names_through_proxy proxy_refuses_like_direct retired_surfaces_gone"
     exit 2
     ;;

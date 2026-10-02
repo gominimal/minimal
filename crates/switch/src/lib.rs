@@ -11,6 +11,8 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
+pub mod loopback;
+
 /// MTU advertised to the switch and the tap devices. gvproxy's own default.
 pub const DEFAULT_MTU: u16 = 1500;
 
@@ -37,7 +39,7 @@ pub const DEFAULT_SUBNET: SwitchSubnet = SwitchSubnet {
 };
 
 /// The reserved local range published box addresses come from on the host's
-/// loopback: `127.64.0.0/24` (design §7.1) — a loopback block no stock host
+/// loopback: `127.0.64.0/24` (design §7.1) — a loopback block no stock host
 /// service claims, so a box published on the host answers there without
 /// colliding with the host's own `127.0.0.1` services.
 ///
@@ -46,7 +48,7 @@ pub const DEFAULT_SUBNET: SwitchSubnet = SwitchSubnet {
 /// the plan below and the answerer cannot drift on where published
 /// addresses live: the range the plan publishes from is, by construction,
 /// the range the zone answers.
-pub const RESERVED_LOCAL_RANGE: (Ipv4Addr, u8) = (Ipv4Addr::new(127, 64, 0, 0), 24);
+pub const RESERVED_LOCAL_RANGE: (Ipv4Addr, u8) = (Ipv4Addr::new(127, 0, 64, 0), 24);
 
 /// Prefix of the reserved local range slice each switch (one gvproxy) publishes
 /// its boxes at. A /27 is 32 addresses — 32 published boxes per switch — and a
@@ -795,7 +797,7 @@ mod tests {
         assert_eq!(plan.switch_subnet(), SwitchSubnet::default());
         assert_eq!(
             plan.reserved_local_range(),
-            (Ipv4Addr::new(127, 64, 0, 0), 24)
+            (Ipv4Addr::new(127, 0, 64, 0), 24)
         );
         // Box addresses self-allocated from the plan come from its switch
         // subnet, starting at the first allocatable host address — the same
@@ -808,15 +810,15 @@ mod tests {
         // subnet — the host switch every VM's boxes ride on.
         let host = plan.switch_slice(0).unwrap();
         assert_eq!(host.subnet(), SwitchSubnet::default());
-        assert_eq!(host.loopback().first(), Ipv4Addr::new(127, 64, 0, 0));
-        assert_eq!(host.loopback().last(), Ipv4Addr::new(127, 64, 0, 31));
-        assert!(host.loopback().contains(Ipv4Addr::new(127, 64, 0, 16)));
-        assert_eq!(host.loopback().to_string(), "127.64.0.0-127.64.0.31");
+        assert_eq!(host.loopback().first(), Ipv4Addr::new(127, 0, 64, 0));
+        assert_eq!(host.loopback().last(), Ipv4Addr::new(127, 0, 64, 31));
+        assert!(host.loopback().contains(Ipv4Addr::new(127, 0, 64, 16)));
+        assert_eq!(host.loopback().to_string(), "127.0.64.0-127.0.64.31");
         // A second daemon on the same host self-allocates the next switch: a
         // /24 carved from the plan's subnet, with its own slice to publish at.
         let second = plan.switch_slice(1).unwrap();
         assert_eq!(second.subnet().to_string(), "100.64.1.0/24");
-        assert_eq!(second.loopback().first(), Ipv4Addr::new(127, 64, 0, 32));
+        assert_eq!(second.loopback().first(), Ipv4Addr::new(127, 0, 64, 32));
         // The plan runs out of switches exactly when it runs out of slices.
         assert!(plan.switch_slice(plan.switch_capacity()).is_none());
     }

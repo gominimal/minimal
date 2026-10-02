@@ -20,6 +20,7 @@ ignore = [
 [licenses]
 unused-allowed-license = "deny"
 allow = [
+    "0BSD",
     "Apache-2.0 WITH LLVM-exception",
     "Apache-2.0",
     "BSD-2-Clause",
@@ -77,6 +78,8 @@ skip = [
     # nickel-lang-core -> malachite -> malachite-base
     # https://github.com/tweag/nickel/pull/2367
     { name = "itertools", version = "0.11.0" },
+    # smoltcp -> heapless 0.9, beside postcard's 0.7
+    { name = "heapless", version = "0.9.3" },
 ]
 deny = [
     # bitmaps is pinned below 3.2.0 in Cargo.lock because 3.2.x is affected by

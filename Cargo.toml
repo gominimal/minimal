@@ -205,6 +205,14 @@ sha2 = "0.11"
 shlex = "2.0"
 size = "0.5"
 smallvec = {version = "1.15", features = ["serde"]}
+# The userspace TCP/IP stack the Box Egress Proxy's host leg runs over
+# (`net::bep_host` in `minvmd`): Ethernet medium, IPv4, and the TCP/UDP/ICMP
+# sockets the proxy terminates, with the interface's address capacity pinned
+# to the leg's own address. Default features stay off: no IPv6 (the VM host
+# path is IPv4-only, NET-082), no DHCP/DNS/mDNS, no 6LoWPAN, and no phy
+# adapters — the frames arrive over the shuttle's channels, not a host
+# interface.
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-icmp", "iface-max-addr-count-4"] }
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 tar = "0.4"
 tempfile = "3.27"

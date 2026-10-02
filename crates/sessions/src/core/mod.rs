@@ -6,6 +6,7 @@ pub mod expansion;
 pub mod hooks;
 pub mod lifecyclehook;
 pub mod loadout;
+pub mod loopback;
 pub mod policy;
 pub mod primitives;
 pub mod source;

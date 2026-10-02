@@ -841,7 +841,7 @@ async fn policy_shows_effective_egress() {
     );
 
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -883,7 +883,7 @@ async fn policy_shows_effective_egress() {
         }
     };
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -916,7 +916,7 @@ async fn policy_shows_effective_egress() {
         }
     };
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::NoNet).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::NoNet, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert_eq!(
         text, "No network policy (NoNet)\n",
@@ -989,7 +989,7 @@ async fn policy_shows_deny_all_default() {
         "the in-force default for a bare own-address box is deny-all"
     );
     let mut out = Vec::new();
-    format_policy(&mut out, &in_force, sessions::NetworkMode::OwnIp).unwrap();
+    format_policy(&mut out, &in_force, sessions::NetworkMode::OwnIp, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("egress\n  deny all\n"),
@@ -1039,11 +1039,130 @@ async fn policy_shows_deny_all_default() {
     };
     assert_eq!(policy.egress, sessions::EffectiveEgress::AllowAll);
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("egress\n  allow all\n"),
         "a bare host-address box keeps the shipped allow-all:\n{text}"
+    );
+}
+
+/// `min session policy` shows the node-plane baseline set beside the box's
+/// rules (NET-130): the helper's built-in enumeration of the categories the
+/// in-VM daemon's own traffic may reach, one row per category, on an
+/// own-address box, headed by the posture the host-side gate decides the
+/// daemon's own fetches under — announced, the shipped posture, the run
+/// path's allow-all interim node row still decides those fetches, so the
+/// rows are what the set will bound, not what bounds them today; in force,
+/// it decides them whatever the box's own declaration resolves to. The set
+/// is shown where the fabric the helper gates is named — the microVM
+/// backend's plan — and nowhere it is not: a host-address box shares its
+/// host's namespace and has no switch fabric, and a backend with no
+/// host-side helper beside its switch (the native daemon's own per-daemon
+/// switch, a plan the reply does not carry) names no fabric either, so the
+/// block is left out there rather than printed from a plan the session does
+/// not attach to.
+#[test]
+fn policy_shows_baseline_set() {
+    // The deny-all resolution the rollout ends at (NET-075), rendered the
+    // way the command renders it: the box's own rules, and the helper's
+    // enumeration beside them — the microVM backend's fabric, the plan the
+    // helper's run path builds its registry and this set from.
+    let deny_all = sessions::EffectiveSessionPolicy {
+        egress: sessions::effective_egress(
+            None,
+            sessions::NetworkMode::OwnIp,
+            sessions::EgressDefaultPhase::InForce,
+            false,
+        ),
+        ingress: None,
+    };
+    let fabric = switch::SwitchSubnet::default();
+    let mut out = Vec::new();
+    format_policy(
+        &mut out,
+        &deny_all,
+        sessions::NetworkMode::OwnIp,
+        Some(fabric),
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("egress\n  deny all\n"),
+        "the box's own rules are shown:\n{text}"
+    );
+    // The posture is spelled beside the set, the way the daemon's start-up
+    // line spells it. The shipped posture is announced — the run path's
+    // allow-all interim node row still decides the daemon's own fetches — so
+    // the display must not present the rows as what bounds them. The flip of
+    // `NODE_BASELINE_PHASE` updates this assertion with the rest of the
+    // cutover.
+    assert!(
+        text.contains(
+            "node-plane baseline set (helper enumeration) — announced (node row's allow-all interim)"
+        ),
+        "the helper's baseline set is shown beside the box's rules, headed by the \
+         gate's announced posture:\n{text}"
+    );
+
+    // The rows are the enumeration the helper carries, one per category —
+    // the set the host-side gate decides the daemon's own frames by once the
+    // baseline is in force.
+    let baseline = minvmd::net::NodePlaneBaseline::built_in(fabric);
+    let rendered_baseline = baseline
+        .entries()
+        .iter()
+        .map(|entry| {
+            format!(
+                "  {}  {}",
+                entry.category().as_str(),
+                entry.endpoints().join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains(&rendered_baseline),
+        "the baseline rows are the enumeration's entries, one per category:\n{text}"
+    );
+    // Beside, not instead: the egress block comes first, the baseline set
+    // after it, the ingress block last.
+    let egress_at = text.find("egress").expect("the egress block renders");
+    let baseline_at = text
+        .find("node-plane baseline set")
+        .expect("the baseline set renders");
+    let ingress_at = text.find("ingress").expect("the ingress block renders");
+    assert!(
+        egress_at < baseline_at && baseline_at < ingress_at,
+        "the baseline set renders beside the rules, between egress and ingress:\n{text}"
+    );
+
+    // A host-address box has no switch fabric, so the baseline set has
+    // nothing to describe there — even with a fabric named.
+    let mut out = Vec::new();
+    format_policy(
+        &mut out,
+        &deny_all,
+        sessions::NetworkMode::HostNet,
+        Some(fabric),
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        !text.contains("node-plane baseline set"),
+        "a host-address box carries no baseline set:\n{text}"
+    );
+
+    // A backend with no helper beside its switch — the native daemon's own
+    // per-daemon switch, a plan the reply does not carry — names no fabric,
+    // and the set is left out rather than printed from the microVM plan the
+    // session does not attach to.
+    let mut out = Vec::new();
+    format_policy(&mut out, &deny_all, sessions::NetworkMode::OwnIp, None).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        !text.contains("node-plane baseline set"),
+        "an unnamed fabric carries no baseline set:\n{text}"
     );
 }
 
@@ -1628,6 +1747,7 @@ async fn create_pending_session(daemon: &common::TestDaemon, name: &str) -> Sess
         project_path: paths::HostAbsPath::try_new(project_path).unwrap(),
         network: sessions::NetworkMode::NoNet,
         policy: Default::default(),
+        box_addresses: None,
         hooks_enabled: true,
         attrs: Default::default(),
     };
@@ -1701,6 +1821,7 @@ async fn create_session_with(
         project_path,
         network,
         policy,
+        box_addresses: None,
         hooks_enabled: true,
         attrs: Default::default(),
     };
@@ -2002,4 +2123,86 @@ async fn net_forward_closes_with_session() {
         .expect("the forward task must not panic")
         .expect("the forward must exit cleanly");
     echo.abort();
+}
+
+// --- task run stdin pipe (gominimal/inbox#746) ---
+
+/// `min task run` must exit once the task exits, even when its stdin is a
+/// pipe whose writer stays open. The old bridge pumped stdin through
+/// `tokio::io::stdin()`, a blocking `read(0)` parked on tokio's blocking
+/// pool that `pump.abort()` cannot interrupt — so a held-open pipe kept the
+/// runtime alive forever after the task's exit status arrived. Driven
+/// through the compiled binary with the write end deliberately held open,
+/// so the assertion is on the process actually terminating.
+///
+/// Linux-only for the same reason as [`run_min`]: the spawned binary resolves
+/// the native `local-minimald` provider socket, which the harness daemon
+/// serves on a UDS; macOS resolves `local-minvmd` instead.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn task_run_exits_with_held_open_stdin_pipe() {
+    let (_daemon, args) = setup().await;
+    let minimal_dir = args
+        .minimal_dir
+        .as_ref()
+        .expect("setup points at a tempdir");
+
+    // A VCS root so the headless upload gate passes, and a declared echo
+    // task that exits on its own without reading stdin.
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "[tasks.e2e-echo]\necho = \"TASK_RUN_STDIN_OK\"\n",
+    )
+    .unwrap();
+
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["-C".as_ref(), project.path().as_os_str()])
+        .args(["task", "run", "e2e-echo"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the min binary should be invocable");
+
+    // Hold the write end open for the whole run: this is the pipe whose
+    // writer "stays open" in the report. Dropping it would EOF the child's
+    // stdin and mask the hang.
+    let _held_stdin = child.stdin.take().expect("stdin is piped");
+
+    let status = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait())
+        .await
+        .expect("min task run must exit even though its stdin pipe stays open")
+        .expect("waiting for min task run");
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(
+        &mut child.stdout.take().expect("stdout is piped"),
+        &mut stdout,
+    )
+    .await
+    .unwrap();
+    tokio::io::AsyncReadExt::read_to_end(
+        &mut child.stderr.take().expect("stderr is piped"),
+        &mut stderr,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        status.success(),
+        "task run must exit 0: stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&stdout).contains("TASK_RUN_STDIN_OK"),
+        "task output must stream back: stdout={}",
+        String::from_utf8_lossy(&stdout)
+    );
 }

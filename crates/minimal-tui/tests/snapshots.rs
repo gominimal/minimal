@@ -72,6 +72,7 @@ fn record(name: Option<&str>, network: NetworkMode) -> sessions::Record {
         project_path: paths::HostAbsPath::try_new("/src/api").unwrap(),
         network,
         policy: sessions::SessionPolicy::default(),
+        box_addresses: None,
         status: sessions::SessionStatus::Active,
         hooks_enabled: true,
         attrs: Default::default(),
