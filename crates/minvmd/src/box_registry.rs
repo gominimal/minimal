@@ -659,11 +659,14 @@ impl BoxRegistry {
     /// row goes with its connection. The bound the withdrawal keeps is
     /// NET-133's, keyed to the relay's end: the box's own shuttle
     /// connection, the one its frames travel by, is what the report rides
-    /// (and a row whose traffic never ends is never withdrawn). The thread
-    /// holds a clone of this registry, so it withdraws the same rows
-    /// every other handle sees, and it runs until the reports' senders are
-    /// all gone — the gate and every table handed out — because that is
-    /// when there is nothing left to withdraw.
+    /// (and a row whose traffic never ends is never withdrawn). The
+    /// thread holds a clone of this registry, so it withdraws the same
+    /// rows every other handle sees. That clone carries one of the
+    /// reports' senders — the very channel the thread drains — so the
+    /// senders are never all gone while the thread runs and `recv()`
+    /// never reports the channel dead: the loop cannot exit. The thread
+    /// is for the process's lifetime, which is the design's intent, and
+    /// nothing in teardown may rely on its exit.
     ///
     /// Idempotent by the take underneath: a second call finds no receiver
     /// and spawns nothing.
