@@ -61,6 +61,18 @@
 //! [`test_util`]'s box-side client and channel-wired lane for this crate's
 //! and `minvmd`'s tests.
 //!
+//! A socket in the pool is a lane onto the host for the box whose share
+//! holds it, so binding one is gated: **T69 is the only task that may
+//! bind a socket on the peer** — it carries the per-source caps and the
+//! pre-screen that holds a share before the stack assigns a listener —
+//! and not even T69 binds on a production boot yet. The credentialed-
+//! only gate rule (NET-145, T45, #1665) is still ahead, so the
+//! supervisor wires [`NoBoxes`] there: no row, no share, no socket, and
+//! a box's connection to the proxy's address is answered the way a
+//! stack with no listener answers it. Only the stand-in's own boot
+//! (`MINVMD_BEP_STUB`, a test/e2e surface) wires rows, and only where a
+//! lane asked for it.
+//!
 //! The peer is silent until spoken to. It originates no frame except in
 //! answer to one that addressed it — the ARP reply, the TCP reset for an
 //! unlistened port, the ICMP port-unreachable — and each of those goes to
@@ -88,7 +100,9 @@ use smoltcp::socket::tcp::SocketBuffer;
 use smoltcp::time::Duration as StackDuration;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address,
+    ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
+    HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, IpProtocol, Ipv4Address,
+    Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -254,6 +268,23 @@ pub trait BepBoxSource: Send + Sync {
     fn box_switch_addresses(&self) -> Vec<Ipv4Addr>;
 }
 
+/// A box source with no rows: the wiring that binds nothing. A socket in
+/// the pool is a lane onto the host for the box whose share holds it, so
+/// until the credentialed-only gate rule (NET-145, T45, #1665) decides who
+/// may reach one, a production boot hands the peer this source — no row,
+/// no share, no socket — and a box's connection to the proxy's address
+/// meets the stack's own reset, the answer an acceptor that is down is
+/// specified to give. The stand-in's own boot is the one wiring that
+/// registers rows, and it runs only where a lane asked for it.
+#[derive(Debug, Default)]
+pub struct NoBoxes;
+
+impl BepBoxSource for NoBoxes {
+    fn box_switch_addresses(&self) -> Vec<Ipv4Addr> {
+        Vec::new()
+    }
+}
+
 /// A channel-backed smoltcp [`Device`] over the switch's Ethernet lane.
 ///
 /// One unbounded channel in (frames arriving from the lane), one out (frames
@@ -391,7 +422,45 @@ impl smoltcp::phy::TxToken for BepTxToken {
 
 impl BepTxToken {
     fn send_out(&self, frame: Vec<u8>) {
-        let _ = self.tx.send(frame);
+        let _ = self.tx.send(aim_arp_requests_at_their_target(frame));
+    }
+}
+
+/// Aim an outbound ARP request at the one address it asks about, instead
+/// of the broadcast address smoltcp writes onto it: this peer's lane is a
+/// point-to-point socket to the switch, not a shared wire, and a
+/// broadcast frame is the one the switch forwards to every box on the
+/// plan — the one shape of frame the peer must never emit, since it
+/// addresses a box that never addressed it. The request still asks the
+/// same question (`who has target_protocol_addr`); only its own
+/// destination changes, to the switch-derived MAC of the only peer that
+/// can answer, and the answer it reads does not change at all.
+fn aim_arp_requests_at_their_target(mut frame: Vec<u8>) -> Vec<u8> {
+    if let Some(target) = arp_request_target(&frame)
+        && let Ok(mut eth) = EthernetFrame::new_checked(&mut frame)
+    {
+        eth.set_dst_addr(EthernetAddress(MacAddr::for_switch_ip(target).0));
+    }
+    frame
+}
+
+/// The address an outbound frame asks about, when the frame is an ARP
+/// request whose own Ethernet destination is the broadcast address —
+/// the frame smoltcp writes when it must re-resolve a neighbour, and
+/// the one shape of frame this peer must never put on the lane.
+fn arp_request_target(frame: &[u8]) -> Option<Ipv4Addr> {
+    let eth = EthernetFrame::new_checked(frame).ok()?;
+    if eth.dst_addr() != EthernetAddress::BROADCAST || eth.ethertype() != EthernetProtocol::Arp {
+        return None;
+    }
+    let packet = ArpPacket::new_checked(eth.payload()).ok()?;
+    match ArpRepr::parse(&packet).ok()? {
+        ArpRepr::EthernetIpv4 {
+            operation: ArpOperation::Request,
+            target_protocol_addr,
+            ..
+        } => Some(target_protocol_addr),
+        _ => None,
     }
 }
 
@@ -474,6 +543,34 @@ impl BepHost {
             self.device.enqueue(frame);
         }
         self.iface.poll(now, &mut self.device, &mut self.sockets);
+    }
+
+    /// Take every frame the lane has delivered, before the interface sees
+    /// any of them — the pre-screen's path: it rules on each frame and
+    /// queues back the ones the pool admits ([`BepHost::enqueue_inbound`])
+    /// before the interface's poll runs.
+    fn take_inbound(&mut self) -> VecDeque<Vec<u8>> {
+        let mut inbound = VecDeque::new();
+        std::mem::swap(&mut inbound, &mut self.device.pending);
+        while let Ok(frame) = self.device.rx.try_recv() {
+            inbound.push_back(frame);
+        }
+        inbound
+    }
+
+    /// Queue `frame` for the interface's next poll — what the pre-screen
+    /// does with every frame the pool admits, and what `poll`'s own
+    /// channel drain does.
+    fn enqueue_inbound(&mut self, frame: Vec<u8>) {
+        self.device.enqueue(frame);
+    }
+
+    /// Put `frame` straight onto the lane. The reset the pre-screen
+    /// answers a refused SYN with never enters the interface — no socket
+    /// exists to dispatch it — so it leaves on the same channel every
+    /// other outbound frame leaves on.
+    fn emit_frame(&mut self, frame: Vec<u8>) {
+        let _ = self.device.tx.send(frame);
     }
 
     /// Whether the lane feeding the stack has closed: every inbound sender
@@ -627,6 +724,7 @@ pub struct BepStack {
     next_ticket: u64,
     next_activation: u64,
     cap_warns: WarnThrottle,
+    row_warns: WarnThrottle,
     down_warns: WarnThrottle,
 }
 
@@ -656,6 +754,7 @@ impl BepStack {
             next_ticket: 0,
             next_activation: 0,
             cap_warns: WarnThrottle::default(),
+            row_warns: WarnThrottle::default(),
             down_warns: WarnThrottle::default(),
         }
     }
@@ -685,23 +784,31 @@ impl BepStack {
 
     /// One full turn of the pool at `now`. The order is the choreography:
     ///
-    /// 1. the stack's frames in, its answers out;
-    /// 2. the partition reconciled against the box source — shares added
+    /// 1. the inbound frames pre-screened: a SYN to [`PROXY_PORT`] whose
+    ///    source has no row, or already holds its cap's worth of
+    ///    sockets, is refused with a reset before the interface ever
+    ///    sees it — smoltcp assigns inbound SYNs to any listening socket
+    ///    in arrival order, so a box that opens more connections than
+    ///    its share in one turn would take a sibling's listener, and
+    ///    the sibling's same-turn SYN would meet no socket at all;
+    /// 2. the stack's frames in, its answers out;
+    /// 3. the partition reconciled against the box source — shares added
     ///    and withdrawn, a withdrawn row's live flows aborted;
-    /// 3. the dial answers taken: a live flow gets its pipes, a failed
+    /// 4. the dial answers taken: a live flow gets its pipes, a failed
     ///    dial aborts the socket — an acceptor that is down resets the
     ///    box's connection;
-    /// 4. the caps enforced on every active connection — a box past its
+    /// 5. the caps enforced on every active connection — a box past its
     ///    share loses the connection it opened last;
-    /// 5. the stack polled again, so every abort the turn issued sends
+    /// 6. the stack polled again, so every abort the turn issued sends
     ///    its reset while the aborted socket is still in the set;
-    /// 6. the per-slot service: new connections dialed to the acceptor,
+    /// 7. the per-slot service: new connections dialed to the acceptor,
     ///    live flows' bytes moved under their windows, and every finished
     ///    flow — closed by either side or aborted — returning its slot to
     ///    the pool with a fresh listening socket;
-    /// 7. the stack polled once more so everything the service queued
+    /// 8. the stack polled once more so everything the service queued
     ///    leaves inside the turn.
     pub fn poll(&mut self, now: Instant) {
+        self.prescreen(now);
         self.host.poll(now);
         self.reconcile();
         self.dispatch_dials(now);
@@ -709,6 +816,91 @@ impl BepStack {
         self.host.poll(now);
         self.service();
         self.host.poll(now);
+    }
+
+    /// Rule on the inbound frames before the interface sees them. The
+    /// pool's slots are anonymous once they are in the set, so the only
+    /// thing that keeps one box's burst out of a sibling's share is
+    /// refusing the burst before it reaches a listener — the pool's total
+    /// is the sum of the shares, and every SYN in one drain is decided
+    /// before any socket answers it.
+    ///
+    /// A connection-opening SYN to [`PROXY_PORT`] at the leg's address is
+    /// checked against its source's row: no row, no connection — the
+    /// box-side answer to a source the registry does not hold — and a
+    /// source that already holds [`BepWire::per_source_cap`] sockets
+    /// keeps only the ones it has. Every refusal is answered with a reset
+    /// the box's own stack accepts, and the warn it leaves in the log
+    /// names the source and the reason, one line per interval with the
+    /// count it suppressed. A retransmitted SYN of a connection the pool
+    /// already carries passes through — the socket that holds it answers,
+    /// and the cap does not count one connection twice.
+    ///
+    /// [`enforce_caps`] stays as the second line: a row withdrawn between
+    /// turns, and a connection the screen let past that a later turn
+    /// finds past its cap, are caught there.
+    fn prescreen(&mut self, now: Instant) {
+        // Facts first: each source's held connections, and the endpoints
+        // they came from — the socket set's borrow does not survive the
+        // refusals the pass may issue.
+        let mut held: std::collections::BTreeMap<Ipv4Addr, usize> =
+            std::collections::BTreeMap::new();
+        let mut taken: Vec<(Ipv4Addr, u16)> = Vec::new();
+        for slot in &self.slots {
+            let socket = self.host.sockets.get::<tcp::Socket>(slot.handle);
+            if socket.is_open()
+                && socket.state() != tcp::State::Listen
+                && let Some(remote) = socket.remote_endpoint()
+                && let IpAddress::Ipv4(addr) = remote.addr
+            {
+                *held.entry(addr).or_default() += 1;
+                taken.push((addr, remote.port));
+            }
+        }
+        let rows = self.boxes.box_switch_addresses();
+        let cap = self.wire.per_source_cap;
+        let leg_ip = self.host.ip();
+        let leg_mac = self.host.mac();
+        for frame in self.host.take_inbound() {
+            let Some(syn) = ScreenedSyn::parse(&frame, leg_ip) else {
+                self.host.enqueue_inbound(frame);
+                continue;
+            };
+            if taken.contains(&(syn.source, syn.source_port)) {
+                // A retransmit of a connection the pool already carries:
+                // the interface's socket answers it, and the cap does not
+                // count one connection twice.
+                self.host.enqueue_inbound(frame);
+                continue;
+            }
+            let share = held.get(&syn.source).copied().unwrap_or(0);
+            if !rows.contains(&syn.source) {
+                self.row_warns.hit(now, |suppressed| {
+                    tracing::warn!(
+                        source = %syn.source,
+                        suppressed,
+                        "box egress proxy: reset a connection from a source \
+                         with no registered row"
+                    );
+                });
+                self.host.emit_frame(syn.refused_reset(leg_ip, leg_mac));
+            } else if share >= cap {
+                self.cap_warns.hit(now, |suppressed| {
+                    tracing::warn!(
+                        source = %syn.source,
+                        live = share,
+                        cap,
+                        suppressed,
+                        "box egress proxy: reset a connection at the per-source cap"
+                    );
+                });
+                self.host.emit_frame(syn.refused_reset(leg_ip, leg_mac));
+            } else {
+                *held.entry(syn.source).or_default() += 1;
+                taken.push((syn.source, syn.source_port));
+                self.host.enqueue_inbound(frame);
+            }
+        }
     }
 
     /// Reconcile the pool against the box source: a new row adds its share
@@ -1060,6 +1252,109 @@ impl BepStack {
     }
 }
 
+/// One inbound SYN the pool rules on before the interface sees it: where
+/// it came from and the sequence number its reset must acknowledge.
+/// Anything else — not TCP, not to the leg's address at the proxy port, a
+/// segment that answers rather than opens — is not the pool's to refuse,
+/// and passes through untouched.
+struct ScreenedSyn {
+    /// The source the connection claims, the box's own switch address.
+    source: Ipv4Addr,
+    /// The source port, half of the endpoint a retransmit repeats.
+    source_port: u16,
+    /// The SYN's sequence number, for the acknowledgment the refusal's
+    /// reset carries: the SYN's own sequence plus one, the number the
+    /// box's stack is waiting to hear acknowledged.
+    seq: TcpSeqNumber,
+}
+
+impl ScreenedSyn {
+    /// Recognize the frame the pool rules on: a TCP segment to
+    /// [`PROXY_PORT`] at `leg_ip` that opens a connection — SYN set, no
+    /// ACK — whose checksum verifies the way the interface will demand of
+    /// everything it accepts. `None` for everything else, and the caller
+    /// passes those through.
+    fn parse(frame: &[u8], leg_ip: Ipv4Address) -> Option<Self> {
+        let eth = EthernetFrame::new_checked(frame).ok()?;
+        if eth.ethertype() != EthernetProtocol::Ipv4 {
+            return None;
+        }
+        let ip = Ipv4Packet::new_checked(eth.payload()).ok()?;
+        if ip.next_header() != IpProtocol::Tcp || ip.dst_addr() != leg_ip {
+            return None;
+        }
+        let source = ip.src_addr();
+        let destination = ip.dst_addr();
+        let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
+        let repr = TcpRepr::parse(
+            &tcp,
+            &IpAddress::Ipv4(source),
+            &IpAddress::Ipv4(destination),
+            &ChecksumCapabilities::default(),
+        )
+        .ok()?;
+        if repr.control != TcpControl::Syn
+            || repr.ack_number.is_some()
+            || repr.dst_port != PROXY_PORT
+        {
+            return None;
+        }
+        Some(Self {
+            source,
+            source_port: repr.src_port,
+            seq: repr.seq_number,
+        })
+    }
+
+    /// Build the reset the refusal answers this SYN with: the shape
+    /// smoltcp's own `rst_reply` gives — sequence zero, the SYN's
+    /// sequence plus one acknowledged, no window — so the box's stack
+    /// accepts it and closes rather than retrying a connection that will
+    /// never be answered. Addressed to the box's switch-derived MAC,
+    /// never to a broadcast.
+    fn refused_reset(&self, leg_ip: Ipv4Address, leg_mac: EthernetAddress) -> Vec<u8> {
+        let repr = TcpRepr {
+            src_port: PROXY_PORT,
+            dst_port: self.source_port,
+            control: TcpControl::Rst,
+            seq_number: TcpSeqNumber(0),
+            ack_number: Some(self.seq + 1),
+            window_len: 0,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            timestamp: None,
+            payload: &[],
+        };
+        let ip_repr = Ipv4Repr {
+            src_addr: leg_ip,
+            dst_addr: self.source,
+            next_header: IpProtocol::Tcp,
+            payload_len: repr.buffer_len(),
+            hop_limit: 64,
+        };
+        let len = EthernetFrame::<&[u8]>::buffer_len(ip_repr.buffer_len() + repr.buffer_len());
+        let mut buf = vec![0u8; len];
+        let mut frame = EthernetFrame::new_unchecked(&mut buf);
+        frame.set_dst_addr(EthernetAddress(MacAddr::for_switch_ip(self.source).0));
+        frame.set_src_addr(leg_mac);
+        frame.set_ethertype(EthernetProtocol::Ipv4);
+        let mut ip_packet = Ipv4Packet::new_unchecked(frame.payload_mut());
+        // The device declares full software checksums, so the frames it
+        // sends carry them: `emit` fills both under the default caps.
+        ip_repr.emit(&mut ip_packet, &ChecksumCapabilities::default());
+        let mut tcp_packet = TcpPacket::new_unchecked(ip_packet.payload_mut());
+        repr.emit(
+            &mut tcp_packet,
+            &IpAddress::Ipv4(leg_ip),
+            &IpAddress::Ipv4(self.source),
+            &ChecksumCapabilities::default(),
+        );
+        buf
+    }
+}
+
 /// Move one live flow's bytes for one turn: the box's bytes out of the
 /// socket and into the flow's channel while the channel has room, the
 /// acceptor's bytes the other way while the socket's transmit buffer does.
@@ -1176,7 +1471,11 @@ async fn dial_acceptor(
     let (read_half, write_half) = stream.into_split();
     let (to_proxy, to_proxy_rx) = channel::<Vec<u8>>(FLOW_CHANNEL_CAP);
     let (from_proxy_tx, from_proxy) = channel::<Vec<u8>>(FLOW_CHANNEL_CAP);
-    tokio::spawn(pump_to_acceptor(to_proxy_rx, write_half));
+    tokio::spawn(pump_to_acceptor(
+        to_proxy_rx,
+        write_half,
+        Arc::clone(&notify),
+    ));
     tokio::spawn(pump_from_acceptor(read_half, from_proxy_tx, notify));
     Ok(FlowEnds {
         to_proxy,
@@ -1184,12 +1483,18 @@ async fn dial_acceptor(
     })
 }
 
-/// Move the box's bytes to the acceptor. The channel closing is the box's
-/// half-close: the acceptor gets EOF. A write failure ends the pump — the
-/// stack learns the acceptor's half is gone when its channel send fails.
+/// Move the box's bytes to the acceptor, waking the stack after every
+/// write. The channel closing is the box's half-close: the acceptor gets
+/// EOF. A write failure ends the pump — the stack learns the acceptor's
+/// half is gone when its channel send fails. The wake is the point of
+/// the extra arm: the stack's service stops moving a flow's bytes while
+/// the channel is full, and only a poll it is woken into reopens the
+/// box's window — without this the drained channel waits out the
+/// `POLL_DELAY` tick to hand back its room.
 async fn pump_to_acceptor(
     mut from_stack: Receiver<Vec<u8>>,
     mut stream: tokio::net::unix::OwnedWriteHalf,
+    notify: Arc<Notify>,
 ) {
     while let Some(chunk) = from_stack.recv().await {
         if chunk.is_empty() {
@@ -1198,6 +1503,7 @@ async fn pump_to_acceptor(
         if stream.write_all(&chunk).await.is_err() || stream.flush().await.is_err() {
             return;
         }
+        notify.notify_one();
     }
     let _ = stream.shutdown().await;
 }
@@ -1626,6 +1932,11 @@ pub mod test_util {
         stack_in: UnboundedSender<Vec<u8>>,
         /// Frames out of the stack, fanned to every box.
         stack_out: UnboundedReceiver<Vec<u8>>,
+        /// Every frame the stack has sent onto the lane, in order — the
+        /// log the tests read to see what the peer emitted, addressed to
+        /// whom. The lane fans each frame out to every box anyway, so
+        /// keeping one is only the clone the fan-out already makes.
+        stack_out_log: Vec<Vec<u8>>,
         boxes: Vec<TestBox>,
         /// Frames into each box.
         box_in: Vec<UnboundedSender<Vec<u8>>>,
@@ -1648,6 +1959,7 @@ pub mod test_util {
                 stack: BepStack::new(device, subnet, wire, boxes),
                 stack_in: ends.inbound,
                 stack_out: ends.outbound,
+                stack_out_log: Vec::new(),
                 boxes: Vec::new(),
                 box_in: Vec::new(),
                 box_out: Vec::new(),
@@ -1689,18 +2001,34 @@ pub mod test_util {
             Instant::from_millis(self.clock_millis)
         }
 
+        /// Every frame the stack has sent onto the lane, in the order it
+        /// sent them — the record the silence tests read.
+        #[must_use]
+        pub fn stack_outbound(&self) -> &[Vec<u8>] {
+            &self.stack_out_log
+        }
+
         /// One turn: the boxes' queued frames to the stack, the stack's one
         /// poll — ingress, delivery, service, egress — its answers fanned
         /// to the boxes, each box's one poll.
         pub fn turn(&mut self) {
+            self.turn_by(10);
+        }
+
+        /// One turn whose stack clock advances `millis`: the shape of
+        /// [`turn`](Self::turn) for the expiries a ten-millisecond step
+        /// cannot reach — the neighbour cache's 60 s — with the boxes
+        /// riding the same jump.
+        pub fn turn_by(&mut self, millis: i64) {
             for out in &mut self.box_out {
                 while let Ok(frame) = out.try_recv() {
                     let _ = self.stack_in.send(frame);
                 }
             }
             self.stack.poll(Instant::from_millis(self.clock_millis));
-            self.clock_millis += 10;
+            self.clock_millis += millis;
             while let Ok(frame) = self.stack_out.try_recv() {
+                self.stack_out_log.push(frame.clone());
                 for b_in in &self.box_in {
                     let _ = b_in.send(frame.clone());
                 }
@@ -2173,7 +2501,7 @@ mod tests {
 
         let subnet = SwitchSubnet::default();
         let wire = BepWire::new(dir.path().join("proxy.sock"), [0u8; TOKEN_LEN]);
-        let peer = BepPeer::spawn(&sock, subnet, wire, Arc::new(EmptyBoxes))
+        let peer = BepPeer::spawn(&sock, subnet, wire, Arc::new(NoBoxes))
             .await
             .expect("peer spawns against a listening switch socket");
 
@@ -2240,7 +2568,7 @@ mod tests {
             &sock,
             SwitchSubnet::default(),
             BepWire::new(dir.path().join("proxy.sock"), [0u8; TOKEN_LEN]),
-            Arc::new(EmptyBoxes),
+            Arc::new(NoBoxes),
         )
         .await
         .expect("peer spawns against a listening switch socket");
@@ -2277,7 +2605,7 @@ mod tests {
             &sock,
             subnet,
             BepWire::new(dir.path().join("proxy.sock"), [0u8; TOKEN_LEN]),
-            Arc::new(EmptyBoxes),
+            Arc::new(NoBoxes),
         )
         .await
         .expect("peer spawns against a listening switch socket");
@@ -2342,15 +2670,6 @@ mod tests {
     impl BepBoxSource for TestBoxes {
         fn box_switch_addresses(&self) -> Vec<Ipv4Addr> {
             self.0.lock().unwrap().clone()
-        }
-    }
-
-    /// A box source with no rows: the pool holds nothing.
-    struct EmptyBoxes;
-
-    impl BepBoxSource for EmptyBoxes {
-        fn box_switch_addresses(&self) -> Vec<Ipv4Addr> {
-            Vec::new()
         }
     }
 
@@ -2644,10 +2963,14 @@ mod tests {
         assert_eq!(h.lane.pool_len(), cap);
     }
 
-    /// NET-132/T69: one box's exhaustion never starves a sibling. Box A
-    /// holds its cap's worth; its next connection is aborted — never
-    /// dialed, the slot it took returns to the pool — so box B's connection
-    /// is still delivered. The pool's total is the sum of the shares: A's
+    /// NET-132/T69: one box's exhaustion never starves a sibling — and
+    /// the burst has to land in one turn to prove it, because smoltcp
+    /// assigns inbound SYNs to any listening socket in arrival order:
+    /// box A opens three connections (its share is one) and box B opens
+    /// one, all before a single `step()`, so every SYN of the burst
+    /// reaches the stack in one drain. A's share is enforced before the
+    /// interface sees the burst — A's two extra SYNs are refused there —
+    /// so B's same-turn SYN still finds its own listener; A's
     /// exhaustion costs A alone.
     #[tokio::test]
     async fn one_boxs_exhaustion_never_starves_a_sibling() {
@@ -2663,12 +2986,14 @@ mod tests {
         let box_a = Ipv4Addr::from(subnet.first_ptask());
         let box_b = Ipv4Addr::from(subnet.first_ptask() + 1);
 
+        // The whole burst before a single turn: A opens cap + 2, B opens
+        // one. Every SYN leaves the boxes' stacks in one poll and
+        // reaches the stack's pre-screen in one drain.
         let a_first = h.lane.boxes_mut()[0].connect(proxy_ip, PROXY_PORT);
-        drive(&mut h.lane, 20).await;
         let a_second = h.lane.boxes_mut()[0].connect(proxy_ip, PROXY_PORT);
-        drive(&mut h.lane, 20).await;
+        let a_third = h.lane.boxes_mut()[0].connect(proxy_ip, PROXY_PORT);
         let b_first = h.lane.boxes_mut()[1].connect(proxy_ip, PROXY_PORT);
-        drive(&mut h.lane, 30).await;
+        drive(&mut h.lane, 40).await;
 
         // A holds its one connection; the answer came back to it.
         let answer = read_flow(&mut h.lane, 0, a_first, 8).await;
@@ -2676,17 +3001,25 @@ mod tests {
             answer.starts_with(b"source="),
             "A's admitted connection was delivered and answered"
         );
-        // A's second — past its cap — was reset.
+        // A's second and third — past its share, in the same turn as
+        // B's — were reset, never delivered.
         assert_eq!(
             h.lane.boxes()[0].flow_state(a_second),
             State::Closed,
             "A's connection past its share was reset"
         );
-        // B's connection still went through, from its own address.
+        assert_eq!(
+            h.lane.boxes()[0].flow_state(a_third),
+            State::Closed,
+            "A's second connection past its share was reset too"
+        );
+        // B's connection, opened in the same burst that exhausted A,
+        // still went through, from its own address: the pool's total is
+        // the sum of the shares, and A's burst never reached B's.
         let answer_b = read_flow(&mut h.lane, 1, b_first, 8).await;
         assert!(
             answer_b.starts_with(b"source="),
-            "B's connection was delivered and answered"
+            "B's same-turn connection was delivered and answered"
         );
         let accepted = h.acceptor.as_ref().expect("acceptor").accepted();
         assert_eq!(accepted.len(), 2, "one connection per admitted flow");
@@ -2921,6 +3254,119 @@ mod tests {
             answer.starts_with(b"source="),
             "the answer reached a box that half-closed at connect: {:?}",
             String::from_utf8_lossy(&answer)
+        );
+    }
+
+    /// NET-132/T69: the peer never emits a broadcast frame. The lane is a
+    /// point-to-point socket to the switch, not a shared wire, and a
+    /// broadcast Ethernet frame is the one the switch forwards to every
+    /// box on the plan — the one frame that addresses boxes which never
+    /// addressed the peer. The neighbour cache's 60-second entry makes
+    /// this reachable: a flow that goes quiet past that expiry must
+    /// re-resolve its neighbour, and the ARP request that re-resolves it
+    /// is aimed at the box it asks about — its switch-derived MAC —
+    /// never at the broadcast address smoltcp wrote onto it.
+    #[tokio::test]
+    async fn a_re_resolved_neighbour_is_aimed_not_broadcast() {
+        let subnet = SwitchSubnet::default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proxy_sock = dir.path().join("proxy.sock");
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let box_ip = Ipv4Addr::from(subnet.first_ptask());
+        let box_mac = EthernetAddress(MacAddr::for_switch_ip(box_ip).0);
+        let token = [0x5au8; TOKEN_LEN];
+
+        // The stand-in acceptor for this one flow: it answers at accept,
+        // then holds its next write until the test signals it — the
+        // write that lands after the neighbour entry has expired, which
+        // is the only reason the stack has to re-resolve.
+        let listener =
+            tokio::net::UnixListener::bind(&proxy_sock).expect("bind the stand-in acceptor");
+        let (late_tx, late_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("the delivery dials");
+            let mut head = [0u8; TOKEN_LEN + DELIVERY_HEADER_LEN];
+            stream
+                .read_exact(&mut head)
+                .await
+                .expect("token then header");
+            assert_eq!(&head[..TOKEN_LEN], &token[..], "this boot's token");
+            stream
+                .write_all(b"first\n")
+                .await
+                .expect("the answer at accept");
+            let _ = late_rx.await;
+            stream.write_all(b"late\n").await.expect("the late answer");
+            let mut sink = [0u8; 1024];
+            loop {
+                match stream.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        let boxes = TestBoxes::default();
+        boxes.register(box_ip);
+        let wire = BepWire::new(proxy_sock, token).with_per_source_cap(1);
+        let mut lane = test_util::TestLane::new(subnet, wire, Arc::new(boxes.clone()));
+        lane.add_box(box_ip);
+        drive(&mut lane, 2).await;
+        lane.boxes_mut()[0].arp_for(proxy_ip);
+        drive(&mut lane, 3).await;
+
+        let flow = lane.boxes_mut()[0].connect(proxy_ip, PROXY_PORT);
+        drive(&mut lane, 40).await;
+        let answer = read_flow(&mut lane, 0, flow, 8).await;
+        assert_eq!(answer, b"first\n", "the flow was delivered and answered");
+
+        // 62 seconds of silence, crossed in one turn: the neighbour entry
+        // (60 s from the box's last packet) expires underneath it.
+        lane.turn_by(62_000);
+        let mark = lane.stack_outbound().len();
+
+        late_tx.send(()).expect("the acceptor's connection is held");
+        drive(&mut lane, 40).await;
+
+        // The late answer reached the box, which took a re-resolution
+        // first — the expiry was real.
+        let late = read_flow(&mut lane, 0, flow, 8).await;
+        assert_eq!(late, b"late\n", "the re-resolved flow still delivers");
+
+        // Every frame the stack sent to do it is addressed to the box —
+        // the re-resolution's ARP request included — and none to the
+        // broadcast address.
+        let outbound = lane.stack_outbound();
+        assert!(
+            outbound.len() > mark,
+            "the stack re-resolved its neighbour and re-sent"
+        );
+        let mut saw_arp_request = false;
+        for frame in &outbound[mark..] {
+            let eth = EthernetFrame::new_checked(frame).expect("the stack sends ethernet");
+            assert_ne!(
+                eth.dst_addr(),
+                EthernetAddress::BROADCAST,
+                "the peer never emits a broadcast frame"
+            );
+            assert_eq!(
+                eth.dst_addr(),
+                box_mac,
+                "every frame is aimed at the box that addressed the peer"
+            );
+            if eth.ethertype() == EthernetProtocol::Arp {
+                let arp = ArpPacket::new_checked(eth.payload()).expect("an ARP packet");
+                assert_eq!(
+                    arp.operation(),
+                    ArpOperation::Request,
+                    "the re-resolution is a request"
+                );
+                saw_arp_request = true;
+            }
+        }
+        assert!(
+            saw_arp_request,
+            "the expired neighbour was re-resolved with an ARP request"
         );
     }
 
