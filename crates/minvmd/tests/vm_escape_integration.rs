@@ -65,19 +65,30 @@
 //!   switchless and the bound's landing edge does not exist to test, so under
 //!   `MINVMD_E2E=1` a switch that cannot be had fails the test; the skip is
 //!   only for a run without `MINVMD_E2E=1`.
+//!
+//! The VM is brought up through the supervisor path (`minvmd run --detach`,
+//! then `status --json` until Running, `stop` on drop): only `run` stands up
+//! the switch and the gate before the VMM child boots. The boxes' project
+//! file carries the pinned package source (`common::PKGS_UPSTREAM`), which
+//! the guest daemon fetches over the switch as node-plane traffic when the
+//! first exec launches a box; under `MINVMD_E2E=1` a failed fetch fails the
+//! test, its exec's stderr naming why.
 
 #![cfg(minvmd_libkrun)]
 
-use std::io::{BufRead, ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serial_test::serial;
+use sessions::core::decision::ItemDecision;
+use sessions::core::hooks::{HookResult, PolicyHooks, Unapproved};
+use sessions::core::policy::{HooksPolicy, PatchesPolicy, VarsPolicy};
 use tempfile::TempDir;
 
 mod common;
@@ -98,13 +109,20 @@ fn minvmd_bin() -> std::ffi::OsString {
     std::env::var_os("MINVMD_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_minvmd").into())
 }
 
-/// How long the harness waits for the `vm-up` (READY) line. The line comes
-/// only after `minvmd boot`'s own READY wait completes — 60 s by default, 150
-/// s under `just`, which exports `MINVMD_READY_TIMEOUT_SECS=150` for every
-/// recipe because a cold multi-GiB VM can run 40–70 s before pid-1 starts
-/// (the AGENTS.md boot footgun). This harness drives `boot --foreground` and
-/// must absorb that cold boot on its own, so it waits the justfile's 150 s.
-const BOOT_TIMEOUT: Duration = Duration::from_secs(150);
+/// `run --detach --timeout`: a cold multi-GiB VM can run 40–70 s before
+/// pid-1 starts (the AGENTS.md boot footgun), so this waits the justfile's
+/// 150 s.
+const DETACH_TIMEOUT_SECS: &str = "150";
+/// How long `status --json` may take to report Running after `run --detach`
+/// returns (it returns once the bridge UDS accepts, slightly ahead of the
+/// Starting -> Running write).
+const RUNNING_TIMEOUT: Duration = Duration::from_secs(90);
+/// Bound on any one `minvmd` subcommand (`run --detach`, `status`, `stop`) so
+/// a wedged daemon fails the test instead of hanging it.
+const SUBPROC_TIMEOUT: Duration = Duration::from_secs(180);
+/// How long a gate line may take to reach the supervisor's log file, which
+/// a non-blocking writer fills behind the gate.
+const LOG_DEADLINE: Duration = Duration::from_secs(5);
 /// How long one spoofed flow may take to produce its verdict: the ARP claim,
 /// the SYN, and the handshake across the real switch and the host listener.
 const FLOW_DEADLINE: Duration = Duration::from_secs(10);
@@ -151,114 +169,180 @@ fn e2e_enabled() -> Option<PathBuf> {
     gvproxy
 }
 
-/// A booted minimald guest VM, torn down on drop.
+/// A booted minimald guest VM under a detached supervisor, stopped on drop.
 struct Guest {
-    child: Child,
     sock_path: PathBuf,
     gate_sock: PathBuf,
-    /// Everything the daemon wrote to its stdout, shared with the reader
-    /// thread: the host-side gate's drop and interim lines live here, and are
-    /// the diagnostics this test prints and asserts on.
-    log: Arc<Mutex<String>>,
+    gvproxy: PathBuf,
     _state: TempDir,
 }
 
 impl Drop for Guest {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Panic-safe teardown: a failed assertion must not leak the detached
+        // supervisor, its VMM child, or its switch. Bounded, so a wedged
+        // daemon cannot hang the teardown either.
+        let _ = minvmd(self._state.path(), &self.gvproxy, &["stop"]);
+    }
+}
+
+/// Run one `minvmd` subcommand against the isolated state dir, bounded by
+/// [`SUBPROC_TIMEOUT`]. The env the VM needs (`MINVMD_VM_OWN_IP`,
+/// `MINVMD_GVPROXY_BIN`) is inherited by the detached supervisor and its VMM
+/// child, so it is set on every call. stdin is off the terminal, or libkrun's
+/// console setup stops the process group.
+#[expect(
+    clippy::let_underscore_must_use,
+    clippy::panic,
+    reason = "a wedged subcommand is killed best-effort, then fails the test"
+)]
+fn minvmd(state: &Path, gvproxy: &Path, args: &[&str]) -> Output {
+    let mut child = Command::new(minvmd_bin())
+        .args(args)
+        // HOME too, not just XDG_STATE_HOME: any `dirs`-based fallback that
+        // ignores XDG on macOS must also land in the tempdir.
+        .env("HOME", state)
+        .env("XDG_STATE_HOME", state)
+        .env("MINVMD_VM_OWN_IP", "1")
+        .env("MINVMD_GVPROXY_BIN", gvproxy)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning minvmd");
+    let deadline = Instant::now() + SUBPROC_TIMEOUT;
+    while child.try_wait().expect("polling minvmd").is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("minvmd {args:?} did not exit within {SUBPROC_TIMEOUT:?} (wedged daemon?)");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    child.wait_with_output().expect("collecting minvmd output")
+}
+
+/// Renders one JSON log record as `key=value` pairs, nested objects
+/// flattened, so the gate's fields read as they do on a console
+/// (`source=100.64.0.99 rule_matched=egress-unknown-source`).
+fn render_record(value: &serde_json_lenient::Value, out: &mut String) {
+    if let serde_json_lenient::Value::Object(map) = value {
+        for (key, value) in map {
+            match value {
+                serde_json_lenient::Value::Object(_) => render_record(value, out),
+                serde_json_lenient::Value::String(text) => {
+                    out.push_str(&format!("{key}={text} "));
+                }
+                other => out.push_str(&format!("{key}={other} ")),
+            }
+        }
     }
 }
 
 impl Guest {
-    /// Boots `minvmd boot --foreground` with minimald as the guest init and
-    /// blocks until the `vm-up` (READY) line, capturing the daemon's stdout
-    /// into the shared log, with `gvproxy` as the VM's switch. Panics on boot
-    /// timeout.
+    /// Boots the supervised VM with minimald as the guest init (`minvmd run
+    /// --detach`, which stands up the host gvproxy switch and the egress gate
+    /// before the VMM child boots) and polls `status --json` until Running.
+    /// Panics past the deadlines, quoting the supervisor's `run.log`.
     fn boot(gvproxy: &Path) -> Guest {
         let state = short_state_dir();
-        let sock_path = state
-            .path()
-            .join("minimal/providers/local-minvmd0/ssh.sock");
-        // The gate binds the socket beside the switch socket, which sits
-        // beside the bridge socket this path names.
-        let gate_sock = sock_path
-            .parent()
-            .expect("the bridge socket always has a parent")
-            .join("gvproxy-gate.sock");
-
-        let exe = minvmd_bin();
-        let mut child = Command::new(exe)
-            .args(["boot", "--foreground"])
-            .env("XDG_STATE_HOME", state.path())
-            .env("MINVMD_GVPROXY_BIN", gvproxy)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawning minvmd boot --foreground");
-
-        let stdout = child.stdout.take().expect("child stdout");
-        let log = Arc::new(Mutex::new(String::new()));
-        let (tx, rx) = std::sync::mpsc::channel::<bool>();
-        let log_for_reader = Arc::clone(&log);
-        std::thread::spawn(move || {
-            let mut reader = std::io::BufReader::new(stdout);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        if line.trim() == "vm-up" {
-                            let _ = tx.send(true);
-                            // Keep draining: the gate's lines land on the
-                            // same stdout for the rest of the VM's life.
-                        }
-                        log_for_reader
-                            .lock()
-                            .expect("log lock is held only across an append")
-                            .push_str(&line);
-                    }
-                    Err(_) => break,
-                }
-            }
-            let _ = tx.send(false);
-        });
-
-        if !rx.recv_timeout(BOOT_TIMEOUT).unwrap_or(false) {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "vm_escape_integration: no 'vm-up' within {} s; are \
-                 MINVMD_KERNEL_PATH/MINVMD_ROOTFS_PATH/MINVMD_INITRAMFS set correctly \
-                 (and libkrun >= 1.19.0)?",
-                BOOT_TIMEOUT.as_secs(),
-            );
-        }
-
-        Guest {
-            child,
-            sock_path,
-            gate_sock,
-            log,
+        let provider_dir = state.path().join("minimal/providers/local-minvmd0");
+        let guest = Guest {
+            sock_path: provider_dir.join("ssh.sock"),
+            // The gate binds the socket beside the switch socket, which sits
+            // beside the bridge socket.
+            gate_sock: provider_dir.join("gvproxy-gate.sock"),
+            gvproxy: gvproxy.to_path_buf(),
             _state: state,
+        };
+        let run = guest.minvmd(&["run", "--detach", "--timeout", DETACH_TIMEOUT_SECS]);
+        assert!(
+            run.status.success(),
+            "vm_escape_integration: minvmd run --detach failed: {}\n--- run.log ---\n{}\n\
+             are MINVMD_KERNEL_PATH/MINVMD_ROOTFS_PATH/MINVMD_INITRAMFS set correctly \
+             (and libkrun >= 1.19.0)?",
+            String::from_utf8_lossy(&run.stderr),
+            guest.run_log(),
+        );
+        let deadline = Instant::now() + RUNNING_TIMEOUT;
+        loop {
+            let status = guest.minvmd(&["status", "--json"]);
+            let status: serde_json_lenient::Value = serde_json_lenient::from_slice(&status.stdout)
+                .unwrap_or(serde_json_lenient::Value::Null);
+            if status.get("state").is_some_and(|s| s == "running")
+                && status.get("vmm_pid").is_some_and(|p| p.is_number())
+            {
+                return guest;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "vm_escape_integration: VM never reached Running within {RUNNING_TIMEOUT:?}; \
+                 last status: {status}\n--- run.log ---\n{}",
+                guest.run_log(),
+            );
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 
-    /// Whether `needle` has appeared in the daemon's stdout yet.
-    fn log_contains(&self, needle: &str) -> bool {
-        self.log
-            .lock()
-            .expect("log lock is held only across this read")
-            .contains(needle)
+    fn minvmd(&self, args: &[&str]) -> Output {
+        minvmd(self._state.path(), &self.gvproxy, args)
     }
 
-    /// The daemon's stdout lines that carry any of `needles` — the gate's own
+    /// The detached supervisor's stderr (boot-failure diagnosis), for panics.
+    fn run_log(&self) -> String {
+        let path = self
+            ._state
+            .path()
+            .join("minimal/providers/local-minvmd0/run.log");
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| format!("(no run.log at {}: {e})", path.display()))
+    }
+
+    /// The supervisor's tracing so far — where the host-side gate's drop and
+    /// interim lines land — one rendered record per line. A detached
+    /// supervisor writes JSON records to `<state>/minimal/logs/minvmd.log.*`.
+    fn log(&self) -> String {
+        let dir = self._state.path().join("minimal/logs");
+        let mut text = String::new();
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("minvmd.log")
+            {
+                continue;
+            }
+            let contents = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            for line in contents.lines() {
+                match serde_json_lenient::from_str(line) {
+                    Ok(record) => render_record(&record, &mut text),
+                    Err(_) => text.push_str(line),
+                }
+                text.push('\n');
+            }
+        }
+        text
+    }
+
+    /// Whether `needle` appears in the supervisor's log within
+    /// [`LOG_DEADLINE`].
+    fn log_contains(&self, needle: &str) -> bool {
+        let end = Instant::now() + LOG_DEADLINE;
+        loop {
+            if self.log().contains(needle) {
+                return true;
+            }
+            if Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// The supervisor's log lines that carry any of `needles` — the gate's own
     /// lines for the spoofed sources, as the test leaves them.
     fn log_lines(&self, needles: &[&str]) -> Vec<String> {
-        self.log
-            .lock()
-            .expect("log lock is held only across this read")
+        self.log()
             .lines()
             .filter(|line| needles.iter().any(|needle| line.contains(needle)))
             .map(std::string::ToString::to_string)
@@ -295,9 +379,10 @@ struct BoxSession {
 
 impl BoxSession {
     /// Opens one resident box: creates the session over the bridge UDS with
-    /// `network` and the declared egress policy, uploads a task-only
-    /// `minimal.toml` over SFTP so the loadout composes in one shot,
-    /// finalizes the record, and keeps the handle for execs.
+    /// `network` and the declared egress policy, uploads a `minimal.toml`
+    /// carrying the pinned package source over SFTP, composes the loadout
+    /// (gating whatever comes back pending), finalizes the record, and keeps
+    /// the handle for execs.
     async fn open(
         sock_path: &Path,
         network: sessions::NetworkMode,
@@ -412,8 +497,10 @@ impl BoxSession {
                 .id
         };
 
-        // A task-only `minimal.toml` over SFTP: the loadout composes from it
-        // in one shot, the same shape the session harness proves.
+        // The project's `minimal.toml` over SFTP. Its `[upstream]` is the
+        // package graph the box's sandbox resolves its baseline packages
+        // (`base`, `coreutils`, `socat`, `bash`) against when the first exec
+        // launches it; without one the box cannot launch at all.
         {
             let channel = handle
                 .channel_open_session()
@@ -434,8 +521,7 @@ impl BoxSession {
                 .create("/workbench/minimal.toml")
                 .await
                 .map_err(|e| format!("sftp create minimal.toml: {e}"))?;
-            // Task-only: no package graph, no sandbox needed for it.
-            let contents = "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n";
+            let contents = common::PKGS_UPSTREAM;
             file.write_all(contents.as_bytes())
                 .await
                 .map_err(|e| format!("sftp write minimal.toml: {e}"))?;
@@ -482,10 +568,8 @@ impl BoxSession {
                     .map_err(|e| format!("decode response: {e}"))?;
             match resp.ok() {
                 Some(ConfigureLoadoutResponse::Materialized) => {}
-                Some(ConfigureLoadoutResponse::Pending { .. }) => {
-                    return Err("ConfigureLoadout returned Pending; this test's mfile \
-                                gates nothing"
-                        .to_string());
+                Some(ConfigureLoadoutResponse::Pending { response }) => {
+                    submit_verdict(&mut handle, response).await?;
                 }
                 None => return Err("ConfigureLoadout returned an error".to_string()),
             }
@@ -527,8 +611,9 @@ impl BoxSession {
     }
 
     /// Runs one command in the box — the session's sandbox — and returns
-    /// `(stdout, exit_status)`.
-    async fn exec(&mut self, command: &str) -> Result<(String, Option<u32>), String> {
+    /// `(stdout, stderr, exit_status)`. The daemon reports a box that cannot
+    /// launch on stderr, so a nonzero exit's message carries its cause.
+    async fn exec(&mut self, command: &str) -> Result<(String, String, Option<u32>), String> {
         use russh::ChannelMsg;
 
         let mut channel = self
@@ -547,16 +632,126 @@ impl BoxSession {
         channel.eof().await.map_err(|e| format!("eof: {e}"))?;
 
         let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         let mut exit_status = None;
         while let Some(msg) = channel.wait().await {
             match msg {
                 ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+                ChannelMsg::ExtendedData { data, .. } => stderr.extend_from_slice(&data),
                 ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
                 ChannelMsg::Failure => return Err("exec request rejected (CHANNEL_FAILURE)".into()),
                 _ => {}
             }
         }
-        Ok((String::from_utf8_lossy(&stdout).into_owned(), exit_status))
+        Ok((
+            String::from_utf8_lossy(&stdout).into_owned(),
+            String::from_utf8_lossy(&stderr).into_owned(),
+            exit_status,
+        ))
+    }
+}
+
+/// Client-side gate for the pending items `ConfigureLoadout` routes back,
+/// answering the way the CLI's `--no-prompt` hook does for vars (allow once)
+/// and failing the test, naming the items, on any patch or hook: a box here
+/// declares none, and this harness cannot upload a patch's host file.
+struct NoPromptVars;
+
+impl PolicyHooks for NoPromptVars {
+    fn on_var_unapproved(
+        &self,
+        _policy: VarsPolicy,
+        items: &[Unapproved<'_, str>],
+    ) -> HookResult<VarsPolicy> {
+        HookResult::decided(vec![ItemDecision::AllowOnce; items.len()])
+    }
+
+    fn on_patch_unapproved(
+        &self,
+        _policy: PatchesPolicy,
+        items: &[Unapproved<'_, camino::Utf8Path>],
+    ) -> HookResult<PatchesPolicy> {
+        refuse_unexpected("patch", items)
+    }
+
+    fn on_hook_unapproved(
+        &self,
+        _policy: HooksPolicy,
+        items: &[Unapproved<'_, camino::Utf8Path>],
+    ) -> HookResult<HooksPolicy> {
+        refuse_unexpected("hook", items)
+    }
+}
+
+/// Fails the test naming every item in a domain the harness expects empty.
+#[expect(clippy::panic, reason = "an unexpected pending item fails the test")]
+fn refuse_unexpected<T, P>(domain: &str, items: &[Unapproved<'_, T>]) -> HookResult<P>
+where
+    T: ?Sized + std::fmt::Display,
+{
+    let named: Vec<String> = items
+        .iter()
+        .map(|item| format!("`{}` from {}", item.item(), item.source()))
+        .collect();
+    panic!(
+        "vm_escape_integration: unexpected pending {domain}(s): {}",
+        named.join(", ")
+    );
+}
+
+/// Gates a `Pending` `ConfigureLoadout` response with [`NoPromptVars`] and
+/// ships the verdict with `SubmitVerdict`, which composes the loadout.
+async fn submit_verdict(
+    handle: &mut russh::client::Handle<ClientHandler>,
+    response: sessions::wire::request::ContributionResponse,
+) -> Result<(), String> {
+    use minimald_rpc::{OneshotSshRpc, SubmitVerdict};
+    use sessions::wire::request::SessionStep;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    eprintln!(
+        "vm_escape_integration: ConfigureLoadout pending: {} vars, {} patches, {} hooks",
+        response.vars.len(),
+        response.patches.len(),
+        response.lifecycle_hooks.len(),
+    );
+    let (verdict, _policy) = sessions::client::handler::handle_response(
+        response,
+        &[],
+        sessions::core::policy::UserPolicy::empty(),
+        &NoPromptVars,
+        sessions::core::compose::ComposeOptions::default(),
+        &|name| std::env::var(name),
+    )
+    .map_err(|e| format!("gating pending items: {e}"))?;
+
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("open SubmitVerdict channel: {e}"))?;
+    channel
+        .request_subsystem(false, SubmitVerdict::NAME)
+        .await
+        .map_err(|e| format!("request_subsystem: {e}"))?;
+    let body =
+        serde_json_lenient::to_vec(&verdict).map_err(|e| format!("serialize verdict: {e}"))?;
+    let mut rpc = channel.into_stream();
+    rpc.write_all(&body)
+        .await
+        .map_err(|e| format!("write verdict: {e}"))?;
+    rpc.shutdown()
+        .await
+        .map_err(|e| format!("shutdown write half: {e}"))?;
+    let mut buf = Vec::new();
+    rpc.read_to_end(&mut buf)
+        .await
+        .map_err(|e| format!("read SubmitVerdict response: {e}"))?;
+    let resp: <SubmitVerdict as OneshotSshRpc>::Response = serde_json_lenient::from_slice(&buf)
+        .map_err(|e| format!("decode SubmitVerdict response: {e}"))?;
+    match resp.ok() {
+        Some(SessionStep::Materialized { .. }) => Ok(()),
+        Some(SessionStep::Fault { error }) => Err(format!("SubmitVerdict faulted: {error:?}")),
+        None => Err("SubmitVerdict returned an error".into()),
     }
 }
 
@@ -1140,11 +1335,15 @@ async fn vm_escape_bounded_to_resident_union() {
     const CAPEFF_COMMAND: &str = "while read -r k v; do case \"$k\" in CapEff*) \
                                   echo \"$v\";; esac; done < /proc/self/status";
     for (label, box_session) in [("box-a", &mut box_a), ("box-b", &mut box_b)] {
-        let (stdout, exit) = box_session
+        let (stdout, stderr, exit) = box_session
             .exec(CAPEFF_COMMAND)
             .await
             .unwrap_or_else(|e| panic!("vm_escape_integration: {label} CapEff exec: {e}"));
-        assert_eq!(exit, Some(0), "{label} CapEff read exited nonzero");
+        assert_eq!(
+            exit,
+            Some(0),
+            "{label} CapEff read exited nonzero; stderr: {stderr}"
+        );
         let caps = stdout
             .trim()
             .lines()
@@ -1172,14 +1371,14 @@ async fn vm_escape_bounded_to_resident_union() {
         ("box-b", &mut box_b, "own-b-reached"),
     ] {
         let command = format!("echo {marker} > /dev/tcp/{alias}/{port}");
-        let (_, exit) = box_session
+        let (_, stderr, exit) = box_session
             .exec(&command)
             .await
             .unwrap_or_else(|e| panic!("vm_escape_integration: {label} own probe: {e}"));
         assert_eq!(
             exit,
             Some(0),
-            "{label}'s own probe to {alias}:{port} failed"
+            "{label}'s own probe to {alias}:{port} failed; stderr: {stderr}"
         );
         assert!(
             listener.wait_for(marker, Duration::from_secs(10)),

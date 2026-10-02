@@ -33,6 +33,17 @@ pub fn skip_or_fail(harness: &str, reason: &str) {
     eprintln!("{harness}: SKIPPED: {reason}");
 }
 
+/// The pinned package source a harness's `minimal.toml` carries when its box
+/// must launch: a box's sandbox resolves the baseline packages against the
+/// project's package graph, so a project without `[upstream]` has no `base` to
+/// launch with. The guest daemon fetches it over the switch as node-plane
+/// traffic, which no box's egress rules govern.
+pub const PKGS_UPSTREAM: &str = r#"[upstream]
+repo = "https://github.com/gominimal/pkgs"
+branch = "main"
+locked_commit = "f4de33d06dada4edcf5076dded10e9c303cf597e"
+"#;
+
 /// The gvproxy switch binary a harness hands the minvmd it spawns as
 /// `MINVMD_GVPROXY_BIN`, or `None` when the harness should skip (neither the
 /// variable nor `MINVMD_E2E=1` is set).
