@@ -2019,12 +2019,23 @@ async fn relay_frames_to_switch(
         }
         // Whatever admitted the frame — the baseline set, a row's own rules
         // or the interim — the address it came from was live traffic on this
-        // connection, and this connection's end retires it.
+        // connection, and this connection's end retires it. The node plane's
+        // own address is the one exception: the row that decides its frames
+        // is the host's own registration for the VM's lifetime
+        // ([`BoxRegistry::register_node_namespace`], filed once at boot),
+        // not a box's row that goes with its shuttle connection (NET-133),
+        // and nothing would ever give the address its reach back — the
+        // announced interim reaches lease-run addresses only, and the plan
+        // keeps the node's address outside that run. So the drainer must
+        // never see it: one relay's end retiring the node's row would leave
+        // the daemon frameless and unpublishable for the rest of the VM's
+        // life, over a shuttle close its control path rode out.
         let src = match admitted {
             GateAdmit::Baseline | GateAdmit::Row => summary.source(),
             GateAdmit::Unregistered { src } => Some(src),
         };
         if let Some(src) = src
+            && src != baseline.node_addr()
             && !attributed.contains(&src)
         {
             attributed.push(src);
@@ -5885,22 +5896,21 @@ mod tests {
     }
 
     /// NET-133, at the table: a box's row is withdrawn within the
-    /// requirement's bound of its relay's end. The connection whose end
-    /// withdraws the row is the box's own shuttle connection — the one the
-    /// guest's relay opens per box and never reopens — so the withdrawal this
-    /// test proves is keyed to the relay's end, not to the box's own end:
-    /// creator-driven withdrawal at destroy is T66's (#1711), and lands with
-    /// it. The gate attributes every admitted frame's source to the
-    /// connection that carried it and files the report at the relay's end —
-    /// whatever ended it — and the registry's drainer withdraws a row per
-    /// reported address, so the namespace whose connection closed holds no
-    /// row after. Here that is immediate: the report rides the same close
-    /// that ended the traffic, far inside the bound the requirement names. A
-    /// re-attachment starts from a registration, not from a row whose
-    /// connection is gone; and the guest relay never reconnects a closed
-    /// shuttle connection, so the traffic was already down.
+    /// requirement's bound of its end. The bound's name is the box's end; the
+    /// event the table keys the withdrawal to is the box's own shuttle
+    /// connection — the one the guest's relay opens per box and never
+    /// reopens — ending, and creator-driven withdrawal at destroy is T66's
+    /// (#1711), landing with it. The gate attributes every admitted frame's
+    /// source to the connection that carried it and files the report at the
+    /// relay's end — whatever ended it — and the registry's drainer withdraws
+    /// a row per reported address, so the namespace whose connection closed
+    /// holds no row after. Here that is immediate: the report rides the same
+    /// close that ended the traffic, far inside the bound the requirement
+    /// names. A re-attachment starts from a registration, not from a row
+    /// whose connection is gone; and the guest relay never reconnects a
+    /// closed shuttle connection, so the traffic was already down.
     #[tokio::test]
-    async fn host_table_row_withdrawn_within_60s_of_relay_end() {
+    async fn host_table_row_withdrawn_within_60s_of_box_end() {
         let registry = BoxRegistry::new(SUBNET);
         tcp_lan_box(&registry, LEASE);
         registry.spawn_withdrawal_drainer();
@@ -5928,5 +5938,72 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// The node's own row outlives every relay that carried its frames. A
+    /// relay's end withdraws the rows of the boxes its connection carried —
+    /// a box's row goes with its shuttle connection (NET-133) — but the node
+    /// plane's row is the host's own registration for the VM's lifetime,
+    /// filed once at boot and never by a connection, so its end files no
+    /// report for it. Nothing would give the address its reach back if it
+    /// went: the announced interim reaches lease-run addresses only, and the
+    /// plan keeps the node's address outside that run — one relay's end
+    /// retiring it would leave the in-VM daemon frameless and unpublishable
+    /// for the rest of the VM's life, over a shuttle close its control path
+    /// rode out.
+    #[tokio::test]
+    async fn node_row_survives_the_relay_that_carried_its_frames() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let node = registry.register_node_namespace(7654, 7656);
+        registry.spawn_withdrawal_drainer();
+        let mut h = gate_over(registry).await;
+
+        // Node-plane traffic on the relay — the in-VM daemon's own frames,
+        // admitted by the node's row — beside the box's declared frame, the
+        // traffic the same connection attributes to it.
+        let node_frame = ipv4_frame(SUBNET.daemon_ip().octets(), 6, [10, 1, 2, 3], 80);
+        send_frame(&mut h.guest, &node_frame).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            node_frame,
+            "the node's frame reaches the switch by its row"
+        );
+        let box_frame = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
+        send_frame(&mut h.guest, &box_frame).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            box_frame,
+            "the box's frame reaches the switch by its row"
+        );
+
+        // The relay ends, whichever way a shuttle connection does.
+        h.guest.shutdown().await.expect("closing the guest's side");
+
+        // The box's row goes with its connection — the drainer withdrew it —
+        // and the node's row stands: its frames attributed nothing, so no
+        // report ever named its address.
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        while h.table.by_source(LEASE).is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the box's row outlived its shuttle connection past {DEADLINE:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            h.table.by_source(node.switch_addr().octets()).is_some(),
+            "the node's row stands after the relay that carried its frames ended"
+        );
+
+        // And the reach survives: the node's next connection carries its
+        // frames again, admitted by the row no report retired.
+        let (mut guest, mut switch) = connect_over(&h).await;
+        send_frame(&mut guest, &node_frame).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            node_frame,
+            "the node's frames still pass after the earlier relay's end"
+        );
     }
 }
