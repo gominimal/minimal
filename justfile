@@ -430,8 +430,22 @@ test-cross: (_need "cross" "cargo install cross --locked")
 #
 # Point this clone's git hooks at scripts/git-hooks (commit-msg = commitlint's local twin).
 hooks:
+    #!/usr/bin/env sh
+    set -eu
+    # Repointing core.hooksPath silently disables every hook in the old
+    # directory, so refuse while that directory holds live (non-.sample) hooks.
+    old=$(git config --get core.hooksPath || git rev-parse --git-path hooks)
+    if [ "$old" != scripts/git-hooks ] && [ -d "$old" ]; then
+        live=$(find "$old" -maxdepth 1 -type f ! -name '*.sample' | sort)
+        if [ -n "$live" ]; then
+            echo "hooks: $old holds hooks that core.hooksPath = scripts/git-hooks would stop running:" >&2
+            echo "$live" | sed 's/^/  /' >&2
+            echo "hooks: remove them, or chain scripts/git-hooks/commit-msg from $old/commit-msg instead" >&2
+            exit 1
+        fi
+    fi
     git config core.hooksPath scripts/git-hooks
-    @echo "hooks: core.hooksPath = scripts/git-hooks (commit-msg checks the message before each commit)"
+    echo "hooks: core.hooksPath = scripts/git-hooks (commit-msg checks the message before each commit)"
 
 # Not replicated: commitlint, the dogfood jobs, the installer lane (`just test-installer`).
 #
