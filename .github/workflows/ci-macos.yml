@@ -321,16 +321,6 @@ jobs:
                     --workspace-remap "$GITHUB_WORKSPACE" --profile vm \
                     --run-ignored all --no-tests=fail \
                     -E 'binary(krun_smoke_integration)'
-            - name: Fetch pinned gvproxy switch binary
-              # minvmd spawns this (gvproxy-darwin) as the host-side switch that
-              # provides the guest's egress (NAT + DNS). Without it minvmd boots
-              # the VM switchless (gvproxy resolution is best-effort and never
-              # errors), so the guest overlay has no other end and every egress —
-              # including the in-guest `pkgs` clone during session mint — dies
-              # with "Could not resolve host". Fetched here, ahead of the harness
-              # step, because harnesses that need the switch skip (and pass) when
-              # MINVMD_GVPROXY_BIN is unset; the session e2e below reuses the file.
-              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
             - name: VM integration harnesses (auto-discovered from the archive)
               # Run every full-boot harness the archive carries by the `_integration`
               # convention — `binary(/_integration$/)` minus the `_root_integration` harnesses
@@ -353,8 +343,6 @@ jobs:
                   MINVMD_ROOTFS_PATH: ${{ runner.temp }}/rootfs/rootfs.img
                   MINVMD_INITRAMFS: ${{ runner.temp }}/initramfs/initramfs.cpio
                   MINVMD_BOOT_LOG: ${{ runner.temp }}/boot.log
-                  MINVMD_GVPROXY_BIN: ${{ runner.temp }}/gvproxy
-                  MINVMD_VM_LANE: "1"
               run: |
                   export DYLD_FALLBACK_LIBRARY_PATH="$TESTBED/lib"
                   cargo-nextest nextest run \
@@ -395,6 +383,14 @@ jobs:
                   MINVMD_INITRAMFS: ${{ runner.temp }}/initramfs/initramfs.cpio
                   MINVMD_BOOT_LOG: ${{ runner.temp }}/boot-daemon.log
               run: ./scripts/minvmd-lifecycle.sh
+            - name: Fetch pinned gvproxy switch binary
+              # minvmd spawns this (gvproxy-darwin) as the host-side switch that
+              # provides the guest's egress (NAT + DNS). Without it minvmd boots
+              # the VM switchless (gvproxy resolution is best-effort and never
+              # errors), so the guest overlay has no other end and every egress —
+              # including the in-guest `pkgs` clone during session mint — dies
+              # with "Could not resolve host".
+              run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
             - name: Session e2e via the CLI (activate/exec/destroy; autospawns minvmd)
               # The unified session e2e (scripts/session-e2e.sh — the SAME
               # proof every target lane runs), here against the VM-backed

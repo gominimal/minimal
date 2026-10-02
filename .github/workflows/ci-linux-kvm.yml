@@ -335,17 +335,6 @@ jobs:
           arch: x86_64
           channel: unstable
 
-      - name: Fetch pinned gvproxy switch binary
-        # minvmd spawns this as the per-host-VM switch that provides the guest's
-        # egress (NAT + DNS). Without it minvmd boots the VM switchless
-        # (gvproxy resolution is best-effort and never errors), so the guest's
-        # overlay has no other end and every egress — including the in-guest
-        # `pkgs` clone during session mint — dies with "Could not resolve host".
-        # Fetched here, ahead of the harness step, because harnesses that need
-        # the switch skip (and pass) when MINVMD_GVPROXY_BIN is unset; the
-        # session e2e below reuses the same file.
-        run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
-
       - name: VM integration harnesses (auto-discovered)
         # Convention over enumeration: run every harness the archive carries by
         # the `_integration` suffix, so a new crates/minvmd/tests/*_integration.rs
@@ -361,8 +350,6 @@ jobs:
         # than run unprivileged here.
         env:
           MINVMD_BOOT_LOG: ${{ runner.temp }}/boot.log
-          MINVMD_GVPROXY_BIN: ${{ runner.temp }}/gvproxy
-          MINVMD_VM_LANE: "1"
         run: |
           cargo-nextest nextest run --archive-file "$TESTBED/nextest-archive.tar.zst" \
             --workspace-remap "$GITHUB_WORKSPACE" --profile vm \
@@ -394,6 +381,14 @@ jobs:
         env:
           MINVMD_BOOT_LOG: ${{ runner.temp }}/boot-daemon.log
         run: ./scripts/minvmd-lifecycle.sh
+
+      - name: Fetch pinned gvproxy switch binary
+        # minvmd spawns this as the per-host-VM switch that provides the guest's
+        # egress (NAT + DNS). Without it minvmd boots the VM switchless
+        # (gvproxy resolution is best-effort and never errors), so the guest's
+        # overlay has no other end and every egress — including the in-guest
+        # `pkgs` clone during session mint — dies with "Could not resolve host".
+        run: ./scripts/fetch-gvproxy.sh "$RUNNER_TEMP/gvproxy"
 
       - name: Session e2e via the CLI (activate/exec/destroy; autospawns minvmd)
         # The SAME unified proof every target lane runs (scripts/session-e2e.sh)
