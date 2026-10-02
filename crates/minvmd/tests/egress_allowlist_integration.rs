@@ -176,6 +176,11 @@ fn minvmd(state: &Path, args: &[&str]) -> Output {
         .env("HOME", state)
         .env("XDG_STATE_HOME", state)
         .env("MINVMD_VM_OWN_IP", "1")
+        // `--timeout` bounds only the detach poll; the VMM parent's guest
+        // READY wait reads this env (60 s default), and a cold boot can
+        // spend 40-70 s before pid-1, so pin it here rather than rely on
+        // the justfile's export reaching a bare `cargo nextest` run.
+        .env("MINVMD_READY_TIMEOUT_SECS", DETACH_TIMEOUT_SECS)
         .env("RUST_LOG", GUEST_LOG_FILTER)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
