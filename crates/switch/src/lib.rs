@@ -603,7 +603,10 @@ mod tests {
         let net = SwitchSubnet::default();
         assert_eq!(net.to_string(), "100.64.0.0/16");
         assert_eq!(net.gateway(), Ipv4Addr::new(100, 64, 0, 1));
-        assert_eq!(net.box_egress_proxy_address(), Ipv4Addr::new(100, 64, 255, 252));
+        assert_eq!(
+            net.box_egress_proxy_address(),
+            Ipv4Addr::new(100, 64, 255, 252)
+        );
         assert_eq!(net.bep_mac(), BEP_MAC);
         assert_eq!(BEP_MAC.to_string(), "52:54:00:40:ff:fc");
         assert_eq!(net.daemon_ip(), Ipv4Addr::new(100, 64, 255, 253));

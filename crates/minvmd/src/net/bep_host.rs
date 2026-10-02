@@ -8,8 +8,8 @@
 //! see [`egress_gate`]'s relay). The host kernel knows nothing of the switch
 //! subnet, so the leg terminates those frames itself: one smoltcp
 //! [`Interface`] over a channel-backed [`Device`], answering ARP for the leg's
-//! address (the proof the first test pins) and carrying the proxy's sockets
-//! once the proxy's own work lands.
+//! address, resetting TCP to unlistened proxy ports, and sending ICMP
+//! port-unreachable for UDP at the address.
 //!
 //! [`BepDevice`] is that [`Device`]: a pair of unbounded tokio channels, one
 //! raw Ethernet frame per message on each. [`BepDevice::pair`] hands the
@@ -19,16 +19,42 @@
 //! [`BepHost`] builds the interface over it: the leg's address on a
 //! [`SwitchSubnet`], its MAC derived the switch's way
 //! ([`MacAddr::for_switch_ip`]), stepped with [`BepHost::poll`].
+//!
+//! [`BepPeer`] dials the switch `-listen` socket once, upgrades the connection
+//! with the HyperKit `/connect` request, and runs the stack in a dedicated
+//! local task that is woken by inbound frames, by the outbound pump, and by a
+//! periodic `poll_delay`.
 
+use std::collections::VecDeque;
 use std::fmt;
+use std::io;
 use std::net::Ipv4Addr;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use smoltcp::iface::{Config as InterfaceConfig, Interface, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{
+    ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
+    HardwareAddress, IPV4_HEADER_LEN, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet,
+    Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket,
+};
 use switch::{DEFAULT_MTU, MacAddr, SwitchSubnet};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::task::JoinSet;
+
+/// The HTTP upgrade request that turns a gvproxy control socket connection
+/// into a raw Ethernet frame stream (the same head the guest shuttle uses).
+const CONNECT_REQUEST: &[u8] = b"POST /connect HTTP/1.0\r\nHost: localhost\r\n\r\n";
+
+/// Maximum interval between stack polls even when no traffic arrives, so smoltcp
+/// TCP timers still advance.
+const POLL_DELAY: Duration = Duration::from_millis(100);
 
 /// A channel-backed smoltcp [`Device`] over the switch's Ethernet lane.
 ///
@@ -40,6 +66,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 pub struct BepDevice {
     rx: UnboundedReceiver<Vec<u8>>,
     tx: UnboundedSender<Vec<u8>>,
+    /// Frames the host loop has admitted and wants the interface to process.
+    pending: VecDeque<Vec<u8>>,
 }
 
 /// The peer ends of a [`BepDevice`]'s channels: what feeds the stack and what
@@ -66,12 +94,20 @@ impl BepDevice {
             Self {
                 rx: inbound_rx,
                 tx: outbound_tx,
+                pending: VecDeque::new(),
             },
             BepDeviceEnds {
                 inbound: inbound_tx,
                 outbound: outbound_rx,
             },
         )
+    }
+
+    fn send_out(&self, frame: Vec<u8>) {
+        // A failed send means the leg's peer end is gone — the lane is closed
+        // and the frame has nowhere to go. Drop it rather than fail the poll;
+        // the lane's teardown is the leg's wiring's to log.
+        let _ = self.tx.send(frame);
     }
 }
 
@@ -86,8 +122,7 @@ impl Device for BepDevice {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // No buffered frame: nothing for the interface to process this poll.
-        let frame = self.rx.try_recv().ok()?;
+        let frame = self.pending.pop_front()?;
         Some((
             BepRxToken { frame },
             BepTxToken {
@@ -111,6 +146,12 @@ impl Device for BepDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
         caps.max_transmission_unit = usize::from(DEFAULT_MTU);
+        let mut checksum_caps = ChecksumCapabilities::default();
+        checksum_caps.ipv4 = Checksum::Both;
+        checksum_caps.tcp = Checksum::Both;
+        checksum_caps.udp = Checksum::Both;
+        checksum_caps.icmpv4 = Checksum::Both;
+        caps.checksum = checksum_caps;
         caps
     }
 }
@@ -120,7 +161,7 @@ pub struct BepRxToken {
     frame: Vec<u8>,
 }
 
-impl RxToken for BepRxToken {
+impl smoltcp::phy::RxToken for BepRxToken {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
@@ -135,17 +176,14 @@ pub struct BepTxToken {
     tx: UnboundedSender<Vec<u8>>,
 }
 
-impl TxToken for BepTxToken {
+impl smoltcp::phy::TxToken for BepTxToken {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
         let mut frame = vec![0u8; len];
         let result = f(&mut frame);
-        // A failed send means the leg's peer end is gone — the lane is closed
-        // and the frame has nowhere to go. Drop it rather than fail the poll;
-        // the lane's teardown is the leg's wiring's to log.
-        drop(self.tx.send(frame));
+        let _ = self.tx.send(frame);
         result
     }
 }
@@ -194,6 +232,8 @@ impl BepHost {
                 .push(IpCidr::new(IpAddress::Ipv4(ip), subnet.prefix()))
                 .expect("the leg holds one address and the interface's address capacity is four");
         });
+        // any_ip stays off: the interface owns this address and nothing else.
+        debug_assert!(!iface.any_ip());
         Self {
             device,
             iface,
@@ -215,18 +255,441 @@ impl BepHost {
         self.mac
     }
 
+    /// Send a gratuitous ARP announcement for the leg's address.
+    ///
+    /// The peer originates no frame unless addressed, but at attach it tells
+    /// the switch and any neighbors its MAC for the proxy address so inbound
+    /// frames can be addressed to it.
+    pub fn announce(&self) {
+        let repr = ArpRepr::EthernetIpv4 {
+            operation: ArpOperation::Request,
+            source_hardware_addr: self.mac,
+            source_protocol_addr: self.ip,
+            target_hardware_addr: EthernetAddress::BROADCAST,
+            target_protocol_addr: self.ip,
+        };
+        self.send_arp(repr, EthernetAddress::BROADCAST);
+    }
+
     /// Step the stack at `now`: process every buffered inbound frame, then
     /// emit whatever the interface has to send. Both drain to quiescence, so
     /// one call is one full turn of the stack.
     pub fn poll(&mut self, now: Instant) {
+        while let Ok(frame) = self.device.rx.try_recv() {
+            self.handle_frame(&frame);
+        }
         self.iface.poll(now, &mut self.device, &mut self.sockets);
+    }
+
+    fn handle_frame(&mut self, frame: &[u8]) {
+        let eth = match EthernetFrame::new_checked(frame) {
+            Ok(eth) => eth,
+            Err(_) => return,
+        };
+        let dst = eth.dst_addr();
+        if dst != self.mac && dst != EthernetAddress::BROADCAST {
+            return;
+        }
+
+        match eth.ethertype() {
+            EthernetProtocol::Arp => {
+                if let Ok(arp) = ArpPacket::new_checked(eth.payload())
+                    && let Ok(repr) = ArpRepr::parse(&arp)
+                {
+                    self.handle_arp(repr);
+                }
+            }
+            EthernetProtocol::Ipv4 => {
+                if let Ok(ip) = Ipv4Packet::new_checked(eth.payload())
+                    && let Ok(repr) = Ipv4Repr::parse(&ip, &ChecksumCapabilities::ignored())
+                {
+                    if repr.dst_addr != self.ip {
+                        // any_ip is off: traffic not for the proxy address
+                        // is dropped without a reply.
+                        return;
+                    }
+                    let src_mac = eth.src_addr();
+                    match repr.next_header {
+                        IpProtocol::Tcp => self.handle_tcp(src_mac, repr, ip.payload()),
+                        IpProtocol::Udp => self.handle_udp(src_mac, repr, ip.payload()),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_arp(&self, repr: ArpRepr) {
+        let (operation, target_protocol_addr, source_hardware_addr, source_protocol_addr) =
+            match repr {
+                ArpRepr::EthernetIpv4 {
+                    operation,
+                    target_protocol_addr,
+                    source_hardware_addr,
+                    source_protocol_addr,
+                    ..
+                } => (
+                    operation,
+                    target_protocol_addr,
+                    source_hardware_addr,
+                    source_protocol_addr,
+                ),
+                _ => return,
+            };
+        if operation != ArpOperation::Request || target_protocol_addr != self.ip {
+            return;
+        }
+        let reply = ArpRepr::EthernetIpv4 {
+            operation: ArpOperation::Reply,
+            source_hardware_addr: self.mac,
+            source_protocol_addr: self.ip,
+            target_hardware_addr: source_hardware_addr,
+            target_protocol_addr: source_protocol_addr,
+        };
+        self.send_arp(reply, source_hardware_addr);
+    }
+
+    fn handle_tcp(&self, src_mac: EthernetAddress, ip_repr: Ipv4Repr, tcp_payload: &[u8]) {
+        let tcp = match TcpPacket::new_checked(tcp_payload) {
+            Ok(tcp) => tcp,
+            Err(_) => return,
+        };
+        let seq = tcp.seq_number();
+        let ack = tcp.ack_number();
+        let (rst_seq, rst_ack, rst_ack_set) = if tcp.ack() {
+            (ack, TcpSeqNumber(0), false)
+        } else {
+            let len = tcp.payload().len() + if tcp.syn() || tcp.fin() { 1 } else { 0 };
+            (
+                TcpSeqNumber(0),
+                TcpSeqNumber(seq.0.wrapping_add(len as i32)),
+                true,
+            )
+        };
+        let rst = TcpRepr {
+            src_port: tcp.dst_port(),
+            dst_port: tcp.src_port(),
+            control: TcpControl::Rst,
+            seq_number: rst_seq,
+            ack_number: if rst_ack_set { Some(rst_ack) } else { None },
+            window_len: 0,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            timestamp: None,
+            payload: &[],
+        };
+        self.send_ip_packet(
+            src_mac,
+            ip_repr.src_addr,
+            IpProtocol::Tcp,
+            rst.header_len(),
+            |tcp_buf| {
+                let mut tcp_packet = TcpPacket::new_unchecked(tcp_buf);
+                rst.emit(
+                    &mut tcp_packet,
+                    &IpAddress::Ipv4(self.ip),
+                    &IpAddress::Ipv4(ip_repr.src_addr),
+                    &self.device.capabilities().checksum,
+                );
+            },
+        );
+        tracing::debug!(
+            src = %Ipv4Addr::from(u32::from_be_bytes(ip_repr.src_addr.octets())),
+            dst_port = tcp.dst_port(),
+            "sent TCP reset for unlistened proxy port"
+        );
+    }
+
+    fn handle_udp(&self, src_mac: EthernetAddress, ip_repr: Ipv4Repr, udp_payload: &[u8]) {
+        let udp = match UdpPacket::new_checked(udp_payload) {
+            Ok(udp) => udp,
+            Err(_) => return,
+        };
+        let src_port = udp.src_port();
+        let dst_port = udp.dst_port();
+        let original_ip_header_len = 20_usize;
+        let original_total_len = (original_ip_header_len + udp.len() as usize) as u16;
+        let original_src = ip_repr.src_addr;
+        let original_dst = self.ip;
+
+        // ICMP port-unreachable payload: original IPv4 header + first 8 bytes
+        // of the original datagram (the UDP header).
+        let returned_len = original_ip_header_len + 8;
+        self.send_ip_packet(
+            src_mac,
+            original_src,
+            IpProtocol::Icmp,
+            8 + returned_len,
+            |icmp_buf| {
+                // Type 3, code 3, checksum, unused = 4 zero bytes.
+                icmp_buf[0] = 3; // Destination Unreachable
+                icmp_buf[1] = 3; // Port Unreachable
+                icmp_buf[2] = 0;
+                icmp_buf[3] = 0;
+                icmp_buf[4..8].fill(0);
+
+                // Copy original IP header.
+                let mut orig_header = [0u8; 20];
+                {
+                    let mut orig_ip = Ipv4Packet::new_unchecked(&mut orig_header[..]);
+                    orig_ip.set_version(4);
+                    orig_ip.set_header_len(20);
+                    orig_ip.set_dscp(0);
+                    orig_ip.set_ecn(0);
+                    orig_ip.set_total_len(original_total_len);
+                    orig_ip.set_ident(0);
+                    orig_ip.clear_flags();
+                    orig_ip.set_more_frags(false);
+                    orig_ip.set_dont_frag(true);
+                    orig_ip.set_frag_offset(0);
+                    orig_ip.set_hop_limit(64);
+                    orig_ip.set_next_header(IpProtocol::Udp);
+                    orig_ip.set_src_addr(original_src);
+                    orig_ip.set_dst_addr(original_dst);
+                    orig_ip.fill_checksum();
+                }
+                icmp_buf[8..28].copy_from_slice(&orig_header);
+                // Copy first 8 bytes of original UDP datagram (the UDP header).
+                let udp_header_len = core::cmp::min(8, udp_payload.len());
+                icmp_buf[28..28 + udp_header_len].copy_from_slice(&udp_payload[..udp_header_len]);
+
+                // Compute ICMP checksum over the ICMP message.
+                let checksum = smoltcp::wire::checksum::data(icmp_buf);
+                let checksum = !checksum;
+                icmp_buf[2..4].copy_from_slice(&checksum.to_be_bytes());
+            },
+        );
+        tracing::debug!(
+            src = %Ipv4Addr::from(u32::from_be_bytes(original_src.octets())),
+            src_port,
+            dst_port,
+            "sent ICMP port-unreachable for UDP to proxy address"
+        );
+    }
+
+    fn send_arp(&self, repr: ArpRepr, dst_mac: EthernetAddress) {
+        let len = EthernetFrame::<&[u8]>::buffer_len(repr.buffer_len());
+        let mut buf = vec![0u8; len];
+        let mut frame = EthernetFrame::new_unchecked(&mut buf);
+        frame.set_dst_addr(dst_mac);
+        frame.set_src_addr(self.mac);
+        frame.set_ethertype(EthernetProtocol::Arp);
+        let mut packet = ArpPacket::new_unchecked(frame.payload_mut());
+        repr.emit(&mut packet);
+        self.device.send_out(buf);
+    }
+
+    fn send_ip_packet<F>(
+        &self,
+        dst_mac: EthernetAddress,
+        dst_ip: Ipv4Address,
+        protocol: IpProtocol,
+        payload_len: usize,
+        mut build_payload: F,
+    ) where
+        F: FnMut(&mut [u8]),
+    {
+        // Largest buffer we'll need for the payloads this peer emits.
+        let mut buf = vec![0u8; 14 + IPV4_HEADER_LEN + payload_len];
+        let mut frame = EthernetFrame::new_unchecked(&mut buf);
+        frame.set_dst_addr(dst_mac);
+        frame.set_src_addr(self.mac);
+        frame.set_ethertype(EthernetProtocol::Ipv4);
+
+        let ip_repr = Ipv4Repr {
+            src_addr: self.ip,
+            dst_addr: dst_ip,
+            next_header: protocol,
+            payload_len,
+            hop_limit: 64,
+        };
+        {
+            let mut ip_packet = Ipv4Packet::new_unchecked(frame.payload_mut());
+            ip_repr.emit(&mut ip_packet, &self.device.capabilities().checksum);
+        }
+        build_payload(&mut frame.payload_mut()[IPV4_HEADER_LEN..]);
+        self.device.send_out(buf);
+    }
+}
+
+/// A running Box Egress Proxy host peer.
+///
+/// It owns the upstream switch socket connection (the `POST /connect`
+/// upgrade), the channel-backed [`BepDevice`] that talks to the smoltcp
+/// [`BepHost`], the two flow pumps that move framed Ethernet between the socket
+/// and the device channels, and the dedicated local task that polls the stack.
+/// Dropping the handle aborts those tasks and closes the socket.
+#[derive(Debug)]
+#[must_use = "dropping BepPeer stops the host-side proxy stack"]
+pub struct BepPeer {
+    /// The stack poll task; aborting it stops the interface.
+    poll_task: tokio::task::JoinHandle<()>,
+    /// Pump tasks moving frames between socket and device channels.
+    pumps: JoinSet<()>,
+}
+
+impl Drop for BepPeer {
+    fn drop(&mut self) {
+        self.pumps.abort_all();
+        self.poll_task.abort();
+    }
+}
+
+impl BepPeer {
+    /// Start a peer for `subnet.box_egress_proxy_address()` on the switch
+    /// socket at `switch_sock`.
+    ///
+    /// The peer dials the switch, upgrades the connection with the HyperKit
+    /// `/connect` request, sends one gratuitous ARP, and then runs three
+    /// cooperating tasks:
+    ///
+    /// - a socket reader that reads length-framed Ethernet frames from the
+    ///   switch and feeds them into the stack's inbound channel;
+    /// - a socket writer that reads from the stack's outbound channel and
+    ///   writes length-framed Ethernet frames onto the switch;
+    /// - a dedicated local task that owns the smoltcp [`BepHost`] and polls it
+    ///   whenever inbound frames arrive, whenever the outbound pump has
+    ///   drained, and at least every [`POLL_DELAY`].
+    ///
+    /// Must be called inside a tokio runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the switch socket cannot be connected to.
+    pub async fn spawn(switch_sock: &Path, subnet: SwitchSubnet) -> io::Result<Self> {
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let proxy_mac = MacAddr::for_switch_ip(proxy_ip);
+
+        let mut stream = UnixStream::connect(switch_sock).await?;
+        stream.write_all(CONNECT_REQUEST).await?;
+        stream.flush().await?;
+
+        tracing::info!(
+            switch_socket = %switch_sock.display(),
+            proxy_ip = %proxy_ip,
+            proxy_mac = %proxy_mac,
+            "box egress proxy peer attached"
+        );
+
+        // The socket is split so the reader and writer can run independently;
+        // the stack poll task cannot own the `UnixStream` because the smoltcp
+        // `Interface` is not `Send`.
+        let (mut read_half, write_half) = stream.into_split();
+
+        // Channel-backed device: raw Ethernet frames in both directions. The
+        // reader/reader tasks are `Send`; the `BepHost` built around the device
+        // lives in the local poll task.
+        let (device, ends) = BepDevice::pair();
+        let inbound_tx = ends.inbound;
+        let mut outbound_rx = ends.outbound;
+
+        // Shared wake source: the reader calls `notify_one` after every frame
+        // it enqueues, and the writer calls `notify_one` whenever it drains a
+        // frame so the stack can make progress while the outbound channel has
+        // capacity. Because the channels are unbounded, the writer waking the
+        // poll task is the back-pressure substitute the spec asks for.
+        let notify = Arc::new(Notify::new());
+
+        let mut pumps = JoinSet::new();
+
+        // Pump 1: switch socket -> stack. Reads a 2-byte little-endian length,
+        // then that many frame bytes, and feeds the device.
+        let reader_notify = Arc::clone(&notify);
+        pumps.spawn(async move {
+            let mut len_buf = [0u8; 2];
+            loop {
+                match read_half.read(&mut len_buf).await {
+                    Ok(0) => return,
+                    Ok(2) => {}
+                    Ok(_) => {
+                        // A short length read means the socket is closing.
+                        return;
+                    }
+                    Err(_) => return,
+                }
+                let len = u16::from_le_bytes(len_buf) as usize;
+                if len == 0 || len > usize::from(DEFAULT_MTU) + 14 + 4 {
+                    // Malformed length; drop the connection.
+                    return;
+                }
+                let mut frame = vec![0u8; len];
+                if read_half.read_exact(&mut frame).await.is_err() {
+                    return;
+                }
+                if inbound_tx.send(frame).is_err() {
+                    // The poll task is gone.
+                    return;
+                }
+                reader_notify.notify_one();
+            }
+        });
+
+        // Pump 2: stack -> switch socket. Reads outbound frames, prefixes them
+        // with a 2-byte little-endian length, and writes them.
+        let writer_notify = Arc::clone(&notify);
+        pumps.spawn(async move {
+            let mut stream = write_half;
+            while let Some(frame) = outbound_rx.recv().await {
+                let len = frame.len() as u16;
+                if len == 0 {
+                    continue;
+                }
+                let mut buf = Vec::with_capacity(2 + frame.len());
+                buf.extend_from_slice(&len.to_le_bytes());
+                buf.extend_from_slice(&frame);
+                if stream.write_all(&buf).await.is_err() {
+                    return;
+                }
+                if stream.flush().await.is_err() {
+                    return;
+                }
+                writer_notify.notify_one();
+            }
+        });
+
+        // Poll task: the only task that owns the smoltcp `Interface`. It runs
+        // on the current-thread runtime so `BepHost` (which is not `Send`) can
+        // be held across `.await` points. We block_in_place in an async task
+        // that is itself `Send`, and pass frames through channels.
+        let poll_task = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime for BepHost");
+            rt.block_on(async move {
+                let mut host = BepHost::new(device, subnet, proxy_ip);
+                host.announce();
+                host.poll(Instant::from_millis(0));
+
+                let start = tokio::time::Instant::now();
+                let mut interval = tokio::time::interval(POLL_DELAY);
+                loop {
+                    tokio::select! {
+                        _ = notify.notified() => {}
+                        _ = interval.tick() => {}
+                    }
+                    while let Ok(frame) = host.device.rx.try_recv() {
+                        host.device.pending.push_back(frame);
+                    }
+                    let elapsed = start.elapsed().as_millis() as i64;
+                    host.poll(Instant::from_millis(elapsed));
+                }
+            });
+        });
+
+        Ok(Self { poll_task, pumps })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smoltcp::wire::{ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol};
+    use smoltcp::wire::{
+        ArpOperation, ArpPacket, EthernetFrame, EthernetProtocol, Icmpv4Packet, UdpRepr,
+    };
 
     /// One ARP request frame, as a box on the plan would send it: broadcast,
     /// from the asker's switch-derived MAC, asking who has `target_ip`.
@@ -252,10 +715,135 @@ mod tests {
         buf
     }
 
-    /// The skeleton's first proof: build an interface over an in-process
-    /// device and read its ARP reply. A box on the switch's plan asks who has
-    /// the leg's address; the stack answers for the address it was given,
-    /// from the switch-derived MAC, pointed back at the asker.
+    /// Build a minimal IPv4 frame carrying the given ethertype payload.
+    fn ip_frame(
+        src_mac: EthernetAddress,
+        dst_mac: EthernetAddress,
+        src_ip: Ipv4Address,
+        dst_ip: Ipv4Address,
+        protocol: IpProtocol,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let ip_repr = Ipv4Repr {
+            src_addr: src_ip,
+            dst_addr: dst_ip,
+            next_header: protocol,
+            payload_len: payload.len(),
+            hop_limit: 64,
+        };
+        let mut buf =
+            vec![0u8; EthernetFrame::<&[u8]>::buffer_len(ip_repr.buffer_len() + payload.len())];
+        let mut frame = EthernetFrame::new_unchecked(&mut buf);
+        frame.set_dst_addr(dst_mac);
+        frame.set_src_addr(src_mac);
+        frame.set_ethertype(EthernetProtocol::Ipv4);
+        let mut ip_packet = Ipv4Packet::new_unchecked(frame.payload_mut());
+        ip_repr.emit(&mut ip_packet, &ChecksumCapabilities::ignored());
+        // Fill IP header checksum explicitly since ignored caps skipped it.
+        ip_packet.fill_checksum();
+        ip_packet.payload_mut().copy_from_slice(payload);
+        buf
+    }
+
+    /// Build a TCP SYN from `src:src_port` to `dst:dst_port`.
+    fn tcp_syn(src_ip: Ipv4Addr, dst_ip: Ipv4Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
+        let src_mac = EthernetAddress(MacAddr::for_switch_ip(src_ip).0);
+        let dst_mac = EthernetAddress(MacAddr::for_switch_ip(dst_ip).0);
+        let repr = TcpRepr {
+            src_port,
+            dst_port,
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(1_000_000),
+            ack_number: None,
+            window_len: 1024,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            timestamp: None,
+            payload: &[],
+        };
+        let mut tcp_buf = vec![0u8; repr.buffer_len()];
+        let mut tcp = TcpPacket::new_unchecked(&mut tcp_buf);
+        repr.emit(
+            &mut tcp,
+            &IpAddress::Ipv4(src_ip),
+            &IpAddress::Ipv4(dst_ip),
+            &ChecksumCapabilities::ignored(),
+        );
+        ip_frame(src_mac, dst_mac, src_ip, dst_ip, IpProtocol::Tcp, &tcp_buf)
+    }
+
+    /// Build a UDP datagram from `src:src_port` to `dst:dst_port`.
+    fn udp_datagram(
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let src_mac = EthernetAddress(MacAddr::for_switch_ip(src_ip).0);
+        let dst_mac = EthernetAddress(MacAddr::for_switch_ip(dst_ip).0);
+        let repr = UdpRepr { src_port, dst_port };
+        let mut udp_buf = vec![0u8; 8 + payload.len()];
+        let mut udp = UdpPacket::new_unchecked(&mut udp_buf);
+        repr.emit(
+            &mut udp,
+            &IpAddress::Ipv4(src_ip),
+            &IpAddress::Ipv4(dst_ip),
+            payload.len(),
+            |buf| buf.copy_from_slice(payload),
+            &ChecksumCapabilities::ignored(),
+        );
+        ip_frame(src_mac, dst_mac, src_ip, dst_ip, IpProtocol::Udp, &udp_buf)
+    }
+
+    fn expect_one_arp_reply(
+        ends: &mut BepDeviceEnds,
+        host_mac: EthernetAddress,
+        host_ip: Ipv4Addr,
+        peer_mac: EthernetAddress,
+        peer_ip: Ipv4Addr,
+    ) {
+        let reply = ends.outbound.try_recv().expect("expected an ARP reply");
+        let frame = EthernetFrame::new_checked(&reply).expect("reply is ethernet");
+        assert_eq!(frame.dst_addr(), peer_mac);
+        assert_eq!(frame.src_addr(), host_mac);
+        assert_eq!(frame.ethertype(), EthernetProtocol::Arp);
+        let arp = ArpPacket::new_checked(frame.payload()).unwrap();
+        assert_eq!(
+            ArpRepr::parse(&arp).unwrap(),
+            ArpRepr::EthernetIpv4 {
+                operation: ArpOperation::Reply,
+                source_hardware_addr: host_mac,
+                source_protocol_addr: host_ip,
+                target_hardware_addr: peer_mac,
+                target_protocol_addr: peer_ip,
+            }
+        );
+    }
+
+    #[test]
+    fn proxy_address_answers_arp_from_the_host_stack() {
+        let subnet = SwitchSubnet::default();
+        let ip = subnet.box_egress_proxy_address();
+        let (device, mut ends) = BepDevice::pair();
+        let mut host = BepHost::new(device, subnet, ip);
+
+        let peer_ip = Ipv4Addr::from(subnet.first_ptask());
+        let peer_mac = EthernetAddress(MacAddr::for_switch_ip(peer_ip).0);
+        ends.inbound
+            .send(arp_request(peer_mac, peer_ip, ip))
+            .expect("send the ARP request into the device");
+        host.poll(Instant::from_millis(0));
+
+        expect_one_arp_reply(&mut ends, host.mac(), ip, peer_mac, peer_ip);
+        assert!(matches!(
+            ends.outbound.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
     #[test]
     fn host_stack_answers_arp_for_its_address() {
         let subnet = SwitchSubnet::default();
@@ -270,26 +858,175 @@ mod tests {
             .expect("send the ARP request into the device");
         host.poll(Instant::from_millis(0));
 
-        let reply = ends.outbound.try_recv().expect("the stack answered");
-        let frame = EthernetFrame::new_checked(&reply).expect("the reply is an Ethernet frame");
-        assert_eq!(frame.ethertype(), EthernetProtocol::Arp);
+        expect_one_arp_reply(&mut ends, host.mac(), ip, peer_mac, peer_ip);
+    }
+
+    #[test]
+    fn tcp_to_unlistened_proxy_port_is_reset() {
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let (device, mut ends) = BepDevice::pair();
+        let mut host = BepHost::new(device, subnet, proxy_ip);
+
+        let peer_ip = Ipv4Addr::from(subnet.first_ptask());
+        ends.inbound
+            .send(tcp_syn(peer_ip, proxy_ip, 1234, 443))
+            .expect("send TCP SYN");
+        host.poll(Instant::from_millis(0));
+
+        let reply = ends.outbound.try_recv().expect("expected a TCP reset");
+        let frame = EthernetFrame::new_checked(&reply).unwrap();
         assert_eq!(frame.src_addr(), host.mac());
-        assert_eq!(frame.dst_addr(), peer_mac);
-        let arp = ArpPacket::new_checked(frame.payload()).expect("the reply carries ARP");
+        let ip = Ipv4Packet::new_checked(frame.payload()).unwrap();
+        assert_eq!(ip.src_addr(), proxy_ip);
+        assert_eq!(ip.dst_addr(), peer_ip);
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(tcp.rst());
+        assert_eq!(tcp.dst_port(), 1234);
+        assert_eq!(tcp.src_port(), 443);
+    }
+
+    #[test]
+    fn udp_to_proxy_address_gets_port_unreachable() {
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let (device, mut ends) = BepDevice::pair();
+        let mut host = BepHost::new(device, subnet, proxy_ip);
+
+        let peer_ip = Ipv4Addr::from(subnet.first_ptask());
+        ends.inbound
+            .send(udp_datagram(peer_ip, proxy_ip, 1234, 53, b"query"))
+            .expect("send UDP datagram");
+        host.poll(Instant::from_millis(0));
+
+        let reply = ends.outbound.try_recv().expect("expected an ICMP reply");
+        let frame = EthernetFrame::new_checked(&reply).unwrap();
+        assert_eq!(frame.src_addr(), host.mac());
+        let ip = Ipv4Packet::new_checked(frame.payload()).unwrap();
+        assert_eq!(ip.src_addr(), proxy_ip);
+        assert_eq!(ip.dst_addr(), peer_ip);
+        let icmp = Icmpv4Packet::new_checked(ip.payload()).unwrap();
         assert_eq!(
-            ArpRepr::parse(&arp).expect("the reply parses as ARP"),
-            ArpRepr::EthernetIpv4 {
-                operation: ArpOperation::Reply,
-                source_hardware_addr: host.mac(),
-                source_protocol_addr: ip,
-                target_hardware_addr: peer_mac,
-                target_protocol_addr: peer_ip,
-            }
+            icmp.msg_type(),
+            smoltcp::wire::Icmpv4Message::DstUnreachable
         );
-        // One request, one reply: the stack emitted nothing else.
-        assert!(matches!(
-            ends.outbound.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
+        assert_eq!(icmp.msg_code(), 3); // port unreachable
+        assert!(icmp.verify_checksum());
+        // The returned data must carry the original IP header + UDP header.
+        let returned = icmp.data();
+        assert!(returned.len() >= 28);
+        let expected_dst = u32::from(proxy_ip).to_be_bytes();
+        assert_eq!(&returned[16..20], &expected_dst);
+        let expected_src_port = 1234u16.to_be_bytes();
+        let expected_dst_port = 53u16.to_be_bytes();
+        assert_eq!(&returned[20..22], &expected_src_port);
+        assert_eq!(&returned[22..24], &expected_dst_port);
+    }
+
+    #[test]
+    fn stack_peer_originates_frames_only_to_the_box_that_addressed_it() {
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let (device, mut ends) = BepDevice::pair();
+        let mut host = BepHost::new(device, subnet, proxy_ip);
+
+        let peer_a_ip = Ipv4Addr::from(subnet.first_ptask());
+        let peer_a_mac = EthernetAddress(MacAddr::for_switch_ip(peer_a_ip).0);
+        let peer_b_ip = Ipv4Addr::from(subnet.first_ptask() + 1);
+        let peer_b_mac = EthernetAddress(MacAddr::for_switch_ip(peer_b_ip).0);
+
+        // A asks for proxy ARP.
+        ends.inbound
+            .send(arp_request(peer_a_mac, peer_a_ip, proxy_ip))
+            .unwrap();
+        host.poll(Instant::from_millis(0));
+        let reply = ends.outbound.try_recv().unwrap();
+        let frame = EthernetFrame::new_checked(&reply).unwrap();
+        assert_eq!(frame.dst_addr(), peer_a_mac);
+        assert!(frame.ethertype() == EthernetProtocol::Arp);
+
+        // B asks for proxy ARP.
+        ends.inbound
+            .send(arp_request(peer_b_mac, peer_b_ip, proxy_ip))
+            .unwrap();
+        host.poll(Instant::from_millis(0));
+        let reply = ends.outbound.try_recv().unwrap();
+        let frame = EthernetFrame::new_checked(&reply).unwrap();
+        assert_eq!(frame.dst_addr(), peer_b_mac);
+        assert!(frame.ethertype() == EthernetProtocol::Arp);
+
+        // A sends a TCP SYN; the reply goes back to A, not B.
+        ends.inbound
+            .send(tcp_syn(peer_a_ip, proxy_ip, 1000, 80))
+            .unwrap();
+        host.poll(Instant::from_millis(0));
+        let reply = ends.outbound.try_recv().unwrap();
+        let frame = EthernetFrame::new_checked(&reply).unwrap();
+        assert_eq!(frame.dst_addr(), peer_a_mac);
+        assert!(frame.ethertype() == EthernetProtocol::Ipv4);
+
+        // A UDP from B to the proxy address goes back to B.
+        ends.inbound
+            .send(udp_datagram(peer_b_ip, proxy_ip, 1000, 53, b"x"))
+            .unwrap();
+        host.poll(Instant::from_millis(0));
+        let reply = ends.outbound.try_recv().unwrap();
+        let frame = EthernetFrame::new_checked(&reply).unwrap();
+        assert_eq!(frame.dst_addr(), peer_b_mac);
+        assert!(
+            matches!(
+                ends.outbound.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "no extra broadcast frames should be emitted"
+        );
+    }
+
+    /// NET-132: the host-side stack peer starts when the switch socket is ready
+    /// and its drop aborts the socket connection and the poll task. We stand in
+    /// for gvproxy with a bound listener that accepts the connect upgrade; the
+    /// peer dials it, sends the upgrade head, and then runs until dropped.
+    #[tokio::test]
+    async fn stack_peer_stops_with_the_switch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("switch.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind stand-in switch socket");
+
+        // Accept the peer's connection on a separate task so `spawn` completes.
+        let accept_fut = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("peer connected");
+            // The peer must send the HyperKit upgrade head verbatim.
+            let mut head = vec![0u8; super::CONNECT_REQUEST.len()];
+            stream
+                .read_exact(&mut head)
+                .await
+                .expect("read upgrade head");
+            assert_eq!(&head, super::CONNECT_REQUEST);
+            stream
+        });
+
+        let subnet = SwitchSubnet::default();
+        let peer = BepPeer::spawn(&sock, subnet)
+            .await
+            .expect("peer spawns against a listening switch socket");
+
+        // Wait for the acceptor to confirm the upgrade head was received; once it
+        // has, the connection is live from the peer's side. Dropping the peer
+        // must then close that connection, which the acceptor observes as EOF.
+        let mut accepted = accept_fut.await.expect("acceptor task completed");
+
+        drop(peer);
+
+        // Give the peer tasks a moment to be aborted and the socket closed.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // A read on the still-open accepted socket must now return EOF because
+        // the peer's side has gone away.
+        let mut buf = [0u8; 1];
+        let n = accepted
+            .read(&mut buf)
+            .await
+            .expect("read after peer drop should not error");
+        assert_eq!(n, 0, "peer socket must close when the peer is dropped");
     }
 }

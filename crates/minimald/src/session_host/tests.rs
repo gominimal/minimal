@@ -2109,6 +2109,7 @@ fn launcher_in(
         ))),
         policy: sessions::SessionPolicy::default(),
         own_address: None,
+        box_addresses: None,
         composition: None,
         session: crate::session::WeakSessionHandle::dangling(),
         // The tests here drive the session's own launches unless one sets
