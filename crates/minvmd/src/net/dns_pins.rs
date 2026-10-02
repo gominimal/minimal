@@ -65,9 +65,9 @@
 //! that ends their rows, NET-133), and a re-registered row starts a fresh
 //! entry — fail closed, until the box's own lookups pin again — so no
 //! declaration's answers can survive the row that declared them. The table
-//! is bounded per box by the shared per-name cap and the sweeps below, and
-//! per host by the plan's address run, the set of addresses a row can exist
-//! at.
+//! is bounded per box by the shared per-name cap, the shared flow cap and
+//! the sweeps below, and per host by the plan's address run, the set of
+//! addresses a row can exist at.
 //!
 //! ## What the host deliberately does not carry
 //!
@@ -92,7 +92,7 @@ use hickory_proto::op::{Message, MessageType};
 use hickory_proto::rr::RData;
 use sessions::core::egress::{
     self, DNS_ADMISSION_WINDOW, DNS_FLOW_IDLE_CAP, DNS_MAX_ADDRESSES_PER_NAME,
-    DNS_OUTSTANDING_QUERY_CAP, DNS_QUERY_EXPIRY, InfrastructureDenySet,
+    DNS_MAX_FLOWS_PER_BOX, DNS_OUTSTANDING_QUERY_CAP, DNS_QUERY_EXPIRY, InfrastructureDenySet,
 };
 use switch::SwitchSubnet;
 
@@ -125,12 +125,6 @@ const MAX_DATAGRAM: usize = 4096;
 /// that stopped resolving: `admit` already releases a name's own expired
 /// entries when it counts that name's cap.
 const ADMISSION_SWEEP_AT: usize = 4096;
-/// Sweep idle flows once the table crosses this many entries: the retention
-/// bound's *memory* half, reclaiming entries no frame ever comes back to
-/// look up. The *staleness* half is [`DNS_FLOW_IDLE_CAP`], checked at
-/// lookup, so this sweep only decides when the table is walked, never what
-/// it admits.
-const FLOW_SWEEP_AT: usize = 4096;
 
 /// The L4 addressing of a TCP/UDP-over-IPv4 frame, as extracted by
 /// [`parse_ipv4_l4`] — the one read the shared frame summary does not carry
@@ -335,7 +329,11 @@ struct BoxPins {
     admitted: Mutex<HashMap<[u8; 4], Admission>>,
     /// The flows the box opened through a pin — established while the window
     /// held, retained past it until the flow ends — each with the instant
-    /// its last frame rode it (the idle bound's clock).
+    /// its last frame rode it (the idle bound's clock). Bounded by the
+    /// shared per-box cap: a new flow that finds the table full is admitted
+    /// by the window alone and not retained, fail closed at the window's
+    /// edge, so a hostile relay holding one pin cannot grow the host
+    /// daemon's memory one flow at a time.
     flows: Mutex<HashMap<FlowKey, Instant>>,
     /// Whether the box's first-pin line has been written: the one `info`
     /// line per box the diagnostics read a DNS box's host-side decision by,
@@ -716,6 +714,14 @@ impl BoxPins {
     /// carries no close signal to read, ever gets. `pkt` is `None` for a
     /// frame with no L4 header to read: no ports, no flow identity, so only
     /// the window can admit it.
+    ///
+    /// The flows a box holds are bounded by the shared per-box cap: at it,
+    /// the entries idle past the shared idle cap are swept, and a new flow
+    /// that still finds the table full is admitted by the window its first
+    /// frame is inside and not retained — fail closed at the window's edge,
+    /// the only place the refusal bites — so a hostile relay holding one pin
+    /// cannot grow the host daemon's memory one flow at a time, while every
+    /// flow already recorded keeps its retention.
     fn admits(&self, dst: [u8; 4], pkt: Option<&L4Packet>, now: Instant) -> bool {
         let Some(pkt) = pkt else {
             return self.admits_destination(dst, now);
@@ -748,9 +754,10 @@ impl BoxPins {
                 }
                 // Idle past the cap: the flow is reclaimed here, at the
                 // lookup of the frame that would have ridden it — not by
-                // the sweep alone, which never runs under 4096 entries — and
-                // the frame falls through to the window, which is what
-                // decides whether the box may open this flow again.
+                // the sweep at the table's cap alone, which runs only once
+                // the box has filled it — and the frame falls through to
+                // the window, which is what decides whether the box may
+                // open this flow again.
                 Some(_) => {
                     flows.remove(&key);
                 }
@@ -769,10 +776,28 @@ impl BoxPins {
             .flows
             .lock()
             .expect("the DNS flow table's lock is held only across this insert");
-        flows.insert(key, now);
-        if flows.len() > FLOW_SWEEP_AT {
+        if flows.len() >= DNS_MAX_FLOWS_PER_BOX {
+            // The retention bound's memory half, run at the cap: the
+            // entries no frame has come back to look up are reclaimed
+            // first, so the cap is spent on live flows.
             flows.retain(|_, seen| now.duration_since(*seen) < DNS_FLOW_IDLE_CAP);
         }
+        if flows.len() >= DNS_MAX_FLOWS_PER_BOX {
+            // Still at the cap: the frame rides the window it is inside, and
+            // its flow is not retained — fail closed at the window's edge,
+            // the only place the refusal bites, since past the window the
+            // destination is refused where a recorded flow's retention would
+            // have carried it.
+            tracing::debug!(
+                switch_addr = %self.record.switch_addr(),
+                namespace = %self.record.name(),
+                cap = DNS_MAX_FLOWS_PER_BOX,
+                "the box's flow table is at its cap; admitting this frame by \
+                 the window alone and retaining no flow for it"
+            );
+            return true;
+        }
+        flows.insert(key, now);
         true
     }
 }
@@ -1075,7 +1100,7 @@ pub(crate) mod tests {
     use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS, SVCB};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
     use sessions::EgressPolicy;
-    use sessions::core::egress::DNS_ADMISSION_WINDOW;
+    use sessions::core::egress::{DNS_ADMISSION_WINDOW, DNS_MAX_FLOWS_PER_BOX};
     use switch::SwitchSubnet;
 
     use super::{DnsPins, IPPROTO_TCP, TCP_FIN, udp_datagram};
@@ -1839,6 +1864,96 @@ pub(crate) mod tests {
             pins.admits_frame(&second, answer.octets(), Some(&flow), past),
             "the flow the replacement row established rides past its window, \
              as the replaced row's did for it"
+        );
+    }
+
+    /// The flow table is bounded per box (the architecture review's
+    /// condition): a box holds at most [`DNS_MAX_FLOWS_PER_BOX`] flows open
+    /// through its pins at once, so a hostile relay holding one pin cannot
+    /// grow the host daemon's memory one flow at a time. At the cap a new
+    /// flow's first frame is still admitted inside the window — bounding the
+    /// table narrows no frame the pin already grants — but the flow is not
+    /// retained: fail closed at the window's edge, past which its
+    /// destination is refused, where a recorded flow's retention would have
+    /// carried it. The flows recorded before the cap cost nothing of what
+    /// they earned: one of them still rides past the window, idle inside the
+    /// shared cap.
+    #[test]
+    fn the_flow_table_is_bounded_per_box() {
+        let registry = BoxRegistry::new(SUBNET);
+        dns_box(
+            &registry,
+            "weather",
+            LEASE,
+            vec!["example.com".to_string()],
+            Vec::new(),
+        );
+        let table = registry.table();
+        let record = table
+            .by_source(LEASE)
+            .expect("the published box's row is held");
+        let pins = DnsPins::new(SUBNET);
+        let limiter = DropLimiter::new();
+        let now = Instant::now();
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        resolve(
+            &pins,
+            &table,
+            LEASE,
+            "example.com",
+            &[answer],
+            &limiter,
+            now,
+        );
+
+        // The flow recorded before the cap — the retention the box earned by
+        // using what its answer named — and the rest of the cap spent on
+        // distinct flows to the same pinned address: one SYN per source
+        // port, each its own flow identity.
+        let flow = |src_port: u16| {
+            l4_of(&tcp_frame(
+                Ipv4Addr::from(LEASE),
+                src_port,
+                answer,
+                443,
+                0x02, // SYN: a flow's opening segment
+            ))
+        };
+        let first = flow(40_000);
+        assert!(
+            pins.admits_frame(&record, answer.octets(), Some(&first), now),
+            "the first flow through the pin is established"
+        );
+        for port in 1..DNS_MAX_FLOWS_PER_BOX {
+            let port = u16::try_from(40_000 + port).expect("the test's source port fits a u16");
+            assert!(
+                pins.admits_frame(&record, answer.octets(), Some(&flow(port)), now),
+                "each distinct flow through the pin is established and recorded"
+            );
+        }
+
+        // The cap is spent. The next new flow's first frame is still admitted
+        // — the window holds — but the flow is not retained, so past the
+        // window its destination is refused where a recorded flow's
+        // retention would have carried it.
+        let past_cap_port =
+            u16::try_from(40_000 + DNS_MAX_FLOWS_PER_BOX).expect("the port fits a u16");
+        let past_cap = flow(past_cap_port);
+        assert!(
+            pins.admits_frame(&record, answer.octets(), Some(&past_cap), now),
+            "at the cap a new flow's first frame is still admitted inside \
+             the window"
+        );
+        let past = now + DNS_ADMISSION_WINDOW + Duration::from_secs(1);
+        assert!(
+            !pins.admits_frame(&record, answer.octets(), Some(&past_cap), past),
+            "the flow the cap refused to retain ends with the window: past \
+             its edge the destination is refused"
+        );
+        assert!(
+            pins.admits_frame(&record, answer.octets(), Some(&first), past),
+            "a flow recorded before the cap keeps its retention: the box's \
+             established flow still rides past the window"
         );
     }
 

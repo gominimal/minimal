@@ -105,6 +105,18 @@ pub const DNS_MAX_ADDRESSES_PER_NAME: usize = 32;
 /// cap, reading it here.
 pub const DNS_FLOW_IDLE_CAP: Duration = Duration::from_hours(24);
 
+/// How many flows one box holds open through its pins at once, fail closed
+/// at the cap: a new flow that finds the table full is admitted by the
+/// window its first frame is inside and not retained — so its retention
+/// ends with the window rather than past it, and the flows already
+/// recorded keep refreshing as they do. Idle entries are swept before the
+/// cap is spent, so what it bounds is live flows. The bound is the
+/// host-side table's alone — its entries are the host daemon's memory,
+/// which a hostile relay holding one pin must not grow one flow at a time,
+/// where the in-VM precision copy's growth is contained by the VM an
+/// escapee already controls.
+pub const DNS_MAX_FLOWS_PER_BOX: usize = 4096;
+
 /// How many of one box's DNS queries the host-side admission table holds
 /// outstanding at once, fail closed: a query past the cap is not recorded,
 /// so no reply can ever match it, and no answer of the box's can pin. The
