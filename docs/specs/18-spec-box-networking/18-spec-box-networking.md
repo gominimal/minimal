@@ -623,6 +623,15 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minimald joined_process_refuses_namespace_bypass_families
     <!-- S10a/AC3; prose 53; event-driven; a seal set only at box start does not reach a process the daemon injects from outside -->
+  - IF a path other than `socket(2)` or `socketpair(2)` would create such a socket for a process in a box, `io_uring` included, THEN THE SYSTEM SHALL refuse that path to the box.
+    tier:   T0
+    verify: cargo nextest run -p sandbox2 box_io_uring_socket_refused
+    <!-- S10a/AC3; prose 53; unwanted; the SHALL above names every socket, not every `socket(2)`: a socket an `io_uring` operation creates reaches the same families, so the seal refuses the creating path (`io_uring_setup`) inside the box; the published profile for box processes (architecture AT9, open gap 2) is a default-deny syscall allowlist, which refuses a new socket-creating path by construction, and on a VM-backed host a `socket_create` LSM hook keyed on the box's cgroup, which decides every creation path at once; guest-local vsock is removed from the guest kernel as well, so no reach survives a seal that fails -->
+
+- **NET-139** WHILE the daemon is VM-hosted THE SYSTEM SHALL accept a vsock connection to its RPC listener only from peer CID 2 (`VMADDR_CID_HOST`), deciding at accept before any request byte is read, and SHALL refuse every other CID with one rate-limited audited line naming the peer CID.
+  tier:     T0
+  verify:   cargo nextest run -p minimald vsock_rpc_refuses_non_host_cid
+  <!-- S10a/AC3; prose 53; state-driven; the vsock channel into a VM is host→guest only (architecture.md line 1531; spec 01 line 181 already has the READY marker on CID 2 port 7350); local trust rides the host-side helper's UDS authentication, never the transport (lines 1187 and 757); a guest-local peer — loopback CID 1, the VM's own CID, or any sibling — is not the host and is refused whatever the seal's state (NET-137); `Auth::Local` over vsock therefore means "the host-side helper authenticated this peer", nothing more -->
 
 - **NET-084** IF a frame on the egress relay carries a source address other than the box's lease THEN THE SYSTEM SHALL reject it.
   tier:     T2
@@ -1111,7 +1120,7 @@ daemon does, and the attribute that makes that gap visible to policy is EHE's.
   disabled, the host-side gate as the one writer toward the switch from a
   host-authored table, and the namespace-bypass seal on every box
   ([design §4.3 rule 0 and §8][design])
-  covered by: NET-081, NET-082, NET-083, NET-084, NET-085, NET-130, NET-137, NET-138
+  covered by: NET-081, NET-082, NET-083, NET-084, NET-085, NET-130, NET-137, NET-138, NET-139
 - **Invariant:** THE SYSTEM SHALL present each box to the node-local Box Egress
   Proxy from its own source address, and no other process from a box's.
   enforced by: the relay's source-address check, a proxy leg that keeps the
