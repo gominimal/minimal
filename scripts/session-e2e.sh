@@ -4946,11 +4946,45 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
   # The stand-in acceptor is a daemon-side flag: the daemon this case's
   # activations autospawn must inherit it, so stop whatever daemon an
   # earlier case left on this host and let the activation below spawn one
-  # carrying it.
+  # carrying it. "Whatever daemon" is both, the pair teardown stops: the
+  # session daemon `min stop` reaches — and, on a VM lane, the host daemon
+  # `minvmd stop` does, which is the one whose environment the flag must
+  # reach. The MAC and ARP cases above leave a minvmd running with no
+  # stub flag, an autospawn that finds it serves this case's boxes with no
+  # stand-in at the socket, and the case dies in a box's blank answer
+  # instead of naming the cause.
   mnl stop --force >/dev/null 2>&1 || true
+  if [ -n "$E2E_VM" ]; then
+    minvmd stop >/dev/null 2>&1 || true
+  fi
   export MINVMD_BEP_STUB=1
 
-  local proxy_ip proxy_port bepb_sid_a bepb_sid_b bepb_ip_a bepb_ip_b
+  # This case's failures must name the host daemon's own log, which the
+  # global fail() cannot: its tail pass matches `*.log`, and the
+  # autospawned minvmd — a detached supervisor — writes a daily-rotated
+  # `minvmd.log.<date>` whose dated name no `*.log` pattern reaches. The
+  # fresh-install proof names the same sink; newest first, the dated
+  # name sorts after the unsuffixed one, a later date after an earlier.
+  bep_host_log_tail() {
+    local f
+    f="$(find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
+      | sort -r | head -n1)"
+    if [ -n "$f" ]; then
+      echo "--- minvmd log ($f) tail ---"
+      tail -60 "$f" 2>/dev/null || true
+    else
+      echo "--- minvmd log: none (no minvmd.log* under $XDG_STATE_HOME/minimal/logs) ---"
+    fi
+  }
+  # Every failure path below: drop the flag this case exported, name the
+  # daemon's log, then the global diagnostics.
+  bep_fail() {
+    unset MINVMD_BEP_STUB
+    bep_host_log_tail
+    fail
+  }
+
+  local proxy_ip proxy_port bepb_sid_a bepb_sid_b bepb_ip_a bepb_ip_b bep_sock bep_wait
   proxy_ip="100.64.255.252"
   proxy_port="8118"
 
@@ -4965,18 +4999,35 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
     --name e2e-bep-box-a --network own_ip 2>"$WORK/bep-box-a.err")" || {
     echo "::error::'min session activate --network own_ip' failed for the proxy-source case's box A"
     cat "$WORK/bep-box-a.err" 2>/dev/null || true
-    unset MINVMD_BEP_STUB
-    fail
+    bep_fail
   }
   bepb_sid_a="$(printf '%s\n' "$bepb_sid_a" | tail -n1 | tr -d '\r')"
   bepb_sid_b="$(cd "$BEPB_SEED_DIR_B" && mnl session activate . --no-prompt \
     --name e2e-bep-box-b --network own_ip 2>"$WORK/bep-box-b.err")" || {
     echo "::error::'min session activate --network own_ip' failed for the proxy-source case's box B"
     cat "$WORK/bep-box-b.err" 2>/dev/null || true
-    unset MINVMD_BEP_STUB
-    fail
+    bep_fail
   }
   bepb_sid_b="$(printf '%s\n' "$bepb_sid_b" | tail -n1 | tr -d '\r')"
+
+  # The stand-in's socket is the one host-side fact the flag buys: the
+  # daemon binds it at boot — only under MINVMD_BEP_STUB — at the path
+  # beside the switch socket. Assert it exists before any box probes the
+  # proxy's address: a daemon that came up without the flag binds none,
+  # and failing here names the cause and the daemon's own log, instead of
+  # a box's blank answer far below. Activation above waited out the
+  # daemon's boot, so the socket should be there at once; the wait bounds
+  # only a slow bind.
+  bep_sock="$XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-bep.sock"
+  bep_wait=0
+  until [ -S "$bep_sock" ]; do
+    bep_wait=$((bep_wait + 1))
+    if [ "$bep_wait" -gt 15 ]; then
+      echo "::error::the host daemon bound no stand-in socket at $bep_sock — the daemon this case's activation autospawned did not carry MINVMD_BEP_STUB, or died before the wiring that binds one"
+      bep_fail
+    fi
+    sleep 1
+  done
 
   # Each box's lease address — the source its connection must be presented
   # from — read from the box's own view, like the MAC case above reads its
@@ -4986,8 +5037,7 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
     >"$WORK/bep-box-a-fib.out" 2>"$WORK/bep-box-a-fib.err"; then
     echo "::error::could not read /proc/net/fib_trie from box A"
     cat "$WORK/bep-box-a-fib.err" 2>/dev/null || true
-    unset MINVMD_BEP_STUB
-    fail
+    bep_fail
   fi
   bepb_ip_a="$(awk '/\|--/ { addr = $2 }
                     /\/32 host LOCAL/ && addr !~ /^127\./ { print addr; exit }' \
@@ -4995,15 +5045,13 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
   if [ -z "$bepb_ip_a" ]; then
     echo "::error::could not determine box A's switch address from /proc/net/fib_trie"
     echo "--- fib_trie ---"; cat "$WORK/bep-box-a-fib.out" 2>/dev/null || true
-    unset MINVMD_BEP_STUB
-    fail
+    bep_fail
   fi
   if ! mnl session exec "$bepb_sid_b" sh -c 'cat /proc/net/fib_trie' \
     >"$WORK/bep-box-b-fib.out" 2>"$WORK/bep-box-b-fib.err"; then
     echo "::error::could not read /proc/net/fib_trie from box B"
     cat "$WORK/bep-box-b-fib.err" 2>/dev/null || true
-    unset MINVMD_BEP_STUB
-    fail
+    bep_fail
   fi
   bepb_ip_b="$(awk '/\|--/ { addr = $2 }
                     /\/32 host LOCAL/ && addr !~ /^127\./ { print addr; exit }' \
@@ -5011,8 +5059,7 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
   if [ -z "$bepb_ip_b" ]; then
     echo "::error::could not determine box B's switch address from /proc/net/fib_trie"
     echo "--- fib_trie ---"; cat "$WORK/bep-box-b-fib.out" 2>/dev/null || true
-    unset MINVMD_BEP_STUB
-    fail
+    bep_fail
   fi
 
   # socat carries the probe, as in the cases above (a launcher baseline
@@ -5029,24 +5076,21 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
   # /dev/null and leave this case's greps with nothing to read.
   mnl session exec "$bepb_sid_a" 'test -x /usr/bin/socat' >/dev/null 2>&1 || {
     echo "::error::box A has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"
-    unset MINVMD_BEP_STUB
-    fail
+    bep_fail
   }
   mnl session exec "$bepb_sid_a" \
     "printf '' | /usr/bin/socat -t 10 - TCP:$proxy_ip:$proxy_port,connect-timeout=15" \
     >"$WORK/bep-box-a-answer.out" 2>"$WORK/bep-box-a-answer.err" || {
     echo "::error::box A's connection to the proxy's address did not complete"
     cat "$WORK/bep-box-a-answer.err" 2>/dev/null || true
-    unset MINVMD_BEP_STUB
-    fail
+    bep_fail
   }
   mnl session exec "$bepb_sid_b" \
     "printf '' | /usr/bin/socat -t 10 - TCP:$proxy_ip:$proxy_port,connect-timeout=15" \
     >"$WORK/bep-box-b-answer.out" 2>"$WORK/bep-box-b-answer.err" || {
     echo "::error::box B's connection to the proxy's address did not complete"
     cat "$WORK/bep-box-b-answer.err" 2>/dev/null || true
-    unset MINVMD_BEP_STUB
-    fail
+    bep_fail
   }
 
   # Each answer names its own box's lease address as the source and the
@@ -5059,27 +5103,23 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
       echo "::error::the proxy did not see box $box's connection from its own switch address ($box_ip)"
       echo "--- answer ---"; cat "$WORK/bep-box-$box-answer.out" 2>/dev/null || true
       echo "--- stderr ---"; cat "$WORK/bep-box-$box-answer.err" 2>/dev/null || true
-      unset MINVMD_BEP_STUB
-      fail
+      bep_fail
     fi
     if ! grep -q -- "destination=$proxy_ip:$proxy_port" "$WORK/bep-box-$box-answer.out"; then
       echo "::error::box $box's answer does not name the proxy's address as the destination"
       echo "--- answer ---"; cat "$WORK/bep-box-$box-answer.out" 2>/dev/null || true
-      unset MINVMD_BEP_STUB
-      fail
+      bep_fail
     fi
   done
   if grep -q -- "source=$bepb_ip_b:" "$WORK/bep-box-a-answer.out"; then
     echo "::error::box A's connection was presented from box B's address ($bepb_ip_b)"
     cat "$WORK/bep-box-a-answer.out" 2>/dev/null || true
-    unset MINVMD_BEP_STUB
-    fail
+    bep_fail
   fi
   if grep -q -- "source=$bepb_ip_a:" "$WORK/bep-box-b-answer.out"; then
     echo "::error::box B's connection was presented from box A's address ($bepb_ip_a)"
     cat "$WORK/bep-box-b-answer.out" 2>/dev/null || true
-    unset MINVMD_BEP_STUB
-    fail
+    bep_fail
   fi
 
   mnl session destroy --force "$bepb_sid_a" >/dev/null 2>&1 || true
