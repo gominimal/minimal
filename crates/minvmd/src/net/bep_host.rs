@@ -20,6 +20,20 @@
 //! [`SwitchSubnet`], its MAC derived the switch's way
 //! ([`MacAddr::for_switch_ip`]), stepped with [`BepHost::poll`].
 //!
+//! The peer speaks only when spoken to. It originates no unsolicited frame —
+//! no gratuitous ARP, no ARP probe, nothing on an idle lane — and every frame
+//! it does send is an answer to the box that addressed it: an ARP reply for
+//! its address, a TCP reset for a segment no socket holds, an ICMP
+//! port-unreachable for a UDP datagram at the address. The smoltcp feature set
+//! this workspace builds with excludes `proto-ipv6`, so the interface has no
+//! IPv6 neighbour discovery either: no neighbour solicitation, no router
+//! solicitation, no multicast listener discovery can leave it.
+//!
+//! No socket is bound here. The interface polls an empty [`SocketSet`]: this
+//! task terminates nothing above the network layer, and **T69 is the only task
+//! that may bind a socket on the peer** — it carries the per-source caps and
+//! the gate rule before it does.
+//!
 //! [`BepPeer`] dials the switch `-listen` socket once, upgrades the connection
 //! with the HyperKit `/connect` request, and runs the stack in a dedicated
 //! local task that is woken by inbound frames, by the outbound pump, and by a
@@ -191,8 +205,10 @@ impl smoltcp::phy::TxToken for BepTxToken {
 /// The host leg's stack: one smoltcp [`Interface`] over a channel-backed
 /// [`BepDevice`], holding the leg's address on the switch's plan.
 ///
-/// Built by [`BepHost::new`], stepped by [`BepHost::poll`]. The sockets the
-/// proxy terminates come later, when the proxy's own work adds them; the set
+/// Built by [`BepHost::new`], stepped by [`BepHost::poll`]. The socket set is
+/// empty and stays empty in this task: the peer terminates nothing above the
+/// network layer, and T69 is the only task that may bind a socket on the peer,
+/// carrying the per-source caps and the gate rule before it does. The set
 /// exists here so the interface has something to poll against from the first
 /// frame on.
 pub struct BepHost {
@@ -253,22 +269,6 @@ impl BepHost {
     #[must_use]
     pub fn mac(&self) -> EthernetAddress {
         self.mac
-    }
-
-    /// Send a gratuitous ARP announcement for the leg's address.
-    ///
-    /// The peer originates no frame unless addressed, but at attach it tells
-    /// the switch and any neighbors its MAC for the proxy address so inbound
-    /// frames can be addressed to it.
-    pub fn announce(&self) {
-        let repr = ArpRepr::EthernetIpv4 {
-            operation: ArpOperation::Request,
-            source_hardware_addr: self.mac,
-            source_protocol_addr: self.ip,
-            target_hardware_addr: EthernetAddress::BROADCAST,
-            target_protocol_addr: self.ip,
-        };
-        self.send_arp(repr, EthernetAddress::BROADCAST);
     }
 
     /// Step the stack at `now`: process every buffered inbound frame, then
@@ -549,8 +549,10 @@ impl BepPeer {
     /// socket at `switch_sock`.
     ///
     /// The peer dials the switch, upgrades the connection with the HyperKit
-    /// `/connect` request, sends one gratuitous ARP, and then runs three
-    /// cooperating tasks:
+    /// `/connect` request, and then runs three cooperating tasks. It announces
+    /// nothing: the switch steers frames to the peer's derived MAC
+    /// ([`MacAddr::for_switch_ip`]) without a round trip, so the peer waits to
+    /// be asked — see the module docs for the frames it answers with.
     ///
     /// - a socket reader that reads length-framed Ethernet frames from the
     ///   switch and feeds them into the stack's inbound channel;
@@ -668,7 +670,6 @@ impl BepPeer {
                 .expect("current-thread runtime for BepHost");
             rt.block_on(async move {
                 let mut host = BepHost::new(device, subnet, proxy_ip);
-                host.announce();
                 host.poll(Instant::from_millis(0));
 
                 let start = tokio::time::Instant::now();
@@ -1048,5 +1049,75 @@ mod tests {
             .await
             .expect("read after peer drop should not error");
         assert_eq!(n, 0, "peer socket must close when the peer is dropped");
+    }
+
+    /// NET-132: the peer is silent until addressed. A stand-in switch socket
+    /// accepts the upgrade and holds the lane open; the peer, attached and
+    /// polled across several poll periods, must write nothing at all — no
+    /// gratuitous ARP, no ARP probe, no keepalive. Every frame it sends is an
+    /// answer, and nothing has asked it anything.
+    #[tokio::test]
+    async fn idle_peer_emits_no_frames() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("switch.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind stand-in switch socket");
+
+        // Accept the upgrade, then hold the lane open and collect every byte
+        // the peer writes after the upgrade head.
+        let accept_fut = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("peer connected");
+            let mut head = vec![0u8; super::CONNECT_REQUEST.len()];
+            stream
+                .read_exact(&mut head)
+                .await
+                .expect("read upgrade head");
+            assert_eq!(&head, super::CONNECT_REQUEST);
+            let mut written = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => written.extend_from_slice(&buf[..n]),
+                    Err(_) => break,
+                }
+            }
+            written
+        });
+
+        let peer = BepPeer::spawn(&sock, SwitchSubnet::default())
+            .await
+            .expect("peer spawns against a listening switch socket");
+
+        // Several poll periods must pass with nothing to answer: the poll loop
+        // wakes at least every POLL_DELAY, so this window covers every periodic
+        // wake the stack has, with slack for a loaded runner.
+        tokio::time::sleep(POLL_DELAY * 5 + Duration::from_millis(250)).await;
+
+        // Dropping the peer closes the lane, which ends the collector above.
+        drop(peer);
+        let written = accept_fut.await.expect("acceptor task completed");
+        assert!(
+            written.is_empty(),
+            "an idle peer emitted {} bytes without being addressed",
+            written.len()
+        );
+    }
+
+    /// NET-132: the peer terminates nothing above the network layer. The
+    /// interface polls an empty `SocketSet` — no TCP, UDP, or ICMP socket is
+    /// bound, so the reset and the port-unreachable the tests above pin are
+    /// the stack's own answers, not a listener's. T69 is the only task that
+    /// may bind a socket on the peer, and it carries the per-source caps and
+    /// the gate rule before it does.
+    #[test]
+    fn peer_binds_no_socket() {
+        let subnet = SwitchSubnet::default();
+        let (device, _ends) = BepDevice::pair();
+        let host = BepHost::new(device, subnet, subnet.box_egress_proxy_address());
+        assert_eq!(
+            host.sockets.iter().count(),
+            0,
+            "the peer binds no socket; T69 is the only task that may"
+        );
     }
 }

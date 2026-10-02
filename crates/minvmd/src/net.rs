@@ -1080,6 +1080,112 @@ mod tests {
         assert!(yaml.contains("{}"));
     }
 
+    /// NET-132: one source for the run's end. The last PTask address and the
+    /// proxy's own address both come from the `switch` crate's plan, and every
+    /// consumer here reads them there — the lease run the registry hands box
+    /// addresses out of, the gate's answer to which sources the plan could
+    /// ever have handed out, and the static-lease pool the rendered switch
+    /// config serves. The three are pinned against each other here, so moving
+    /// the run's end or the proxy address fails this test instead of leaving a
+    /// consumer behind. `minimald`'s mirror of the same run — its
+    /// self-allocation reserve, the run's lower half — is pinned by its own
+    /// test against the same `switch` crate, and the switch crate's own test
+    /// pins the proxy address out of gvproxy's NAT and virtual-IP tables.
+    #[test]
+    fn lease_run_gate_run_and_rendered_pool_agree() {
+        let subnet = SwitchSubnet::default();
+        let first = Ipv4Addr::from(subnet.first_ptask());
+        let last = Ipv4Addr::from(subnet.last_ptask());
+
+        // The reserved run above the lease pool, in order: the proxy address
+        // the host-side peer owns (NET-132), the daemon's own tap, and the
+        // host alias gvproxy NATs — all above the run's end, all from the one
+        // plan.
+        assert!(
+            u32::from(last) < u32::from(subnet.box_egress_proxy_address()),
+            "the proxy address sits above the lease pool"
+        );
+        assert!(u32::from(subnet.box_egress_proxy_address()) < u32::from(subnet.daemon_ip()));
+        assert!(u32::from(subnet.daemon_ip()) < u32::from(subnet.host_alias()));
+
+        // The gate's run: the one set of sources the plan could ever hand a
+        // box — both ends of the lease run inside it, every reserved address
+        // and everything off the subnet outside it.
+        let registry = crate::box_registry::BoxRegistry::new(subnet);
+        let table = registry.table();
+        assert!(
+            table.is_allocatable(first.octets()),
+            "the run's first address is a source the gate's run admits"
+        );
+        assert!(
+            table.is_allocatable(last.octets()),
+            "the run's last address is a source the gate's run admits"
+        );
+        for outside in [
+            subnet.network(),
+            subnet.gateway(),
+            subnet.box_egress_proxy_address(),
+            subnet.daemon_ip(),
+            subnet.host_alias(),
+            subnet.broadcast(),
+            Ipv4Addr::new(203, 0, 113, 7),
+        ] {
+            assert!(
+                !table.is_allocatable(outside.octets()),
+                "the gate's run never admits the reserved {outside}"
+            );
+        }
+
+        // The lease book's range: the registry hands a registered box an
+        // address from the same run — inside its ends, never a reserved one.
+        for name in ["web", "db"] {
+            let row = registry
+                .register_client_box(crate::box_registry::ClientBoxSpec {
+                    name: name.to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                })
+                .expect("the default plan has hand-out addresses");
+            let handed = row.switch_addr();
+            assert!(
+                first <= handed && handed <= last,
+                "the lease book hands {handed} from inside the plan's run"
+            );
+        }
+
+        // The rendered pool: the config's static-lease table carries exactly
+        // the addresses it is handed — the run's own ends here — on the same
+        // subnet, and none of the reserved run above it. The lease map is the
+        // tail of the rendered YAML (`dhcpStaticLeases:` is its last key), so
+        // the alias's own NAT and DNS lines do not read as leases.
+        let pool = [
+            (first, MacAddr::for_switch_ip(first)),
+            (last, MacAddr::for_switch_ip(last)),
+        ];
+        let yaml = render_gvproxy_config(subnet, &pool);
+        assert!(yaml.contains(&format!("subnet: \"{subnet}\"")));
+        let lease_map = yaml
+            .split("dhcpStaticLeases:\n")
+            .nth(1)
+            .expect("the rendered config carries a static-lease map");
+        for (ip, mac) in pool {
+            assert!(lease_map.contains(&format!("    \"{ip}\": \"{mac}\"")));
+        }
+        for reserved in [subnet.daemon_ip(), subnet.host_alias()] {
+            assert!(
+                !lease_map.contains(&format!("\"{reserved}\"")),
+                "{reserved} is reserved, never a lease in the rendered pool"
+            );
+        }
+        // The proxy address is nowhere in the config at all: not a lease, not
+        // a virtual IP, not translated — the peer owns it, and the switch
+        // crate's own test pins the same from the other side.
+        assert!(
+            !yaml.contains(&format!("\"{}\"", subnet.box_egress_proxy_address())),
+            "the proxy address is the peer's, never gvproxy's"
+        );
+    }
+
     #[test]
     fn write_config_creates_parent_and_file() {
         let dir = tempfile::TempDir::new().expect("tempdir");
