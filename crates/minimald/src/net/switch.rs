@@ -3474,14 +3474,16 @@ pub(crate) mod tests {
 
         // The flood: one more refused SYN than the window pays for, then a
         // second peer's connection behind it — answered only if the budget
-        // is the source's, not the box's.
+        // is the source's, not the box's. Every frame rides the relay's own
+        // framing, one length prefix per frame.
         let flood = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 9999);
         let other = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, OTHER_PEER, 9999);
-        let mut framed = Vec::with_capacity(2 + flood.len());
-        framed.extend_from_slice(&(flood.len() as u16).to_le_bytes());
+        let mut framed = Vec::with_capacity((2 + flood.len()) * (RESET_PER_WINDOW as usize + 4));
         for _ in 0..RESET_PER_WINDOW + 3 {
+            framed.extend_from_slice(&(flood.len() as u16).to_le_bytes());
             framed.extend_from_slice(&flood);
         }
+        framed.extend_from_slice(&(other.len() as u16).to_le_bytes());
         framed.extend_from_slice(&other);
         harness.switch.write_all(&framed).await.unwrap();
 
