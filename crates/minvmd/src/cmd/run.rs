@@ -41,17 +41,41 @@ pub fn run(detach: bool, timeout_secs: Option<u64>) -> Result<()> {
     }
     let timeout_secs = timeout_secs.unwrap_or(DEFAULT_DETACH_TIMEOUT_SECS);
 
-    // One line per VM start, naming the VM and its state directory
-    // (NET-052). Only the process that will actually supervise the VM logs
-    // it: a `--detach` caller re-execs `minvmd run` (without `--detach`) for
-    // the real start, so the line is written once, by the process that owns
-    // the boot.
+    // One line per VM start, naming the VM, its state directory (NET-052), and
+    // the boot images + switch it resolved (NET-049/NET-051). Only the process
+    // that will actually supervise the VM logs it: a `--detach` caller re-execs
+    // `minvmd run` (without `--detach`) for the real start, so the line is
+    // written once, by the process that owns the boot.
+    //
+    // When resolution fails the supervisor below fails on the same missing
+    // images, so no VM boots — do not emit the resolved-images line with empty
+    // paths (it would name nothing while claiming a start). The start record
+    // still exists, at WARN, carrying the reason instead.
     if !detach {
-        tracing::info!(
-            vm = %crate::state::vm_name(),
-            state_dir = %crate::state::provider_dir().display(),
-            "starting VM"
-        );
+        let switch = crate::image::resolve_gvproxy_path();
+        let switch_str = if switch.exists() {
+            switch.display().to_string()
+        } else {
+            "not found".to_string()
+        };
+        match crate::image::resolve_boot_images() {
+            Ok((kernel, rootfs, initramfs)) => tracing::info!(
+                vm = %crate::state::vm_name(),
+                state_dir = %crate::state::provider_dir().display(),
+                kernel = %kernel.display(),
+                rootfs = %rootfs.display(),
+                initramfs = %initramfs.display(),
+                switch = %switch_str,
+                "starting VM"
+            ),
+            Err(e) => tracing::warn!(
+                vm = %crate::state::vm_name(),
+                state_dir = %crate::state::provider_dir().display(),
+                switch = %switch_str,
+                error = %e,
+                "starting VM with unresolved boot images"
+            ),
+        }
     }
 
     #[cfg(minvmd_libkrun)]
@@ -76,9 +100,12 @@ fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
     // caller so the user sees the error directly, even under --detach.
     crate::cmd::ensure_hypervisor_accessible()?;
     // Likewise the sun_path limit: libkrun aborts on an over-long UDS path
-    // deep in the VMM child; catch it here with a clear error instead.
+    // deep in the VMM child; catch it here with a clear error instead. The
+    // egress gate's socket (NET-081) is bridged by the same mechanism the
+    // switch socket is, so it carries the same limit.
     crate::sock::check_uds_path_len(&crate::sock::resolve_uds_path()?)?;
     crate::sock::check_uds_path_len(&crate::net::resolve_switch_sock()?)?;
+    crate::sock::check_uds_path_len(&crate::net::resolve_gate_sock()?)?;
 
     if detach {
         return run_detach(timeout_secs);
@@ -279,7 +306,7 @@ fn run_foreground() -> Result<()> {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::cmd::MARKER_SOCK_ENV;
-    use crate::image::{resolve_kernel_path, resolve_rootfs_path};
+    use crate::image::resolve_boot_images;
     use crate::lifecycle::{Action, Lifecycle, next_state};
     use crate::state::{StartingGuard, State, StateDir};
 
@@ -292,8 +319,8 @@ fn run_foreground() -> Result<()> {
 
     // Fail-fast: resolve paths before touching lifecycle state.
     // (UDS path lengths were already checked in `run_supervisor`.)
-    let _kernel = resolve_kernel_path().context("resolving kernel path")?;
-    let _rootfs = resolve_rootfs_path().context("resolving rootfs path")?;
+    let (_kernel, _rootfs, _initramfs) =
+        resolve_boot_images().context("resolving boot image paths")?;
 
     let state_dir = StateDir::new(StateDir::default_path()).context("opening state dir")?;
 
@@ -385,12 +412,89 @@ fn run_foreground() -> Result<()> {
         .set_nonblocking(false)
         .context("setting listener to blocking")?;
 
+    // The host-side table of published namespaces (NET-138): the rows the
+    // egress gate (NET-081) decides every frame leaving the VM by, filled in
+    // this process on the host — never from anything the guest says. Held for
+    // the supervisor's lifetime as the registration surface (the client-driven
+    // path is a later task); published here with the one row the host itself
+    // can name: the guest node's own namespace, the daemon's root-netns tap,
+    // whose reach is the allow-all interim until the node-plane baseline set is
+    // enumerated (NET-130). Its address is this host's derivation from the
+    // registry's subnet, and the switch is configured with that same subnet
+    // below — one value handed to both, so the row's lease and the switch's
+    // address plan cannot drift apart. The daemon therefore keeps the egress
+    // it had before the gate existed, its own package fetches above all.
+    //
+    // An own-address box's lease is not a row this process can name: the guest
+    // daemon's own allocator mints it inside the VM, so no host-side process
+    // knows it — not this supervisor, and not the CLI that asked for the box.
+    // Until the creator-side registration (T66, #1711) supplies those rows,
+    // such a source is what the gate's announced interim is for: an address
+    // inside the plan's lease block but held by no row is admitted — with a
+    // warn naming T66 on every admit — so an own-address box keeps the egress
+    // it had before the gate existed, while everything outside the block, and
+    // every row that *is* published, stays exactly as decided.
+    //
+    // What that admits, said plainly: under the interim the host-side gate
+    // cannot attribute a frame to the box it came from unless a row holds the
+    // address, so a box with restrictive rules can be escaped by sourcing
+    // frames from any unregistered in-block address — NET-081's host-side
+    // guarantee is deferred to T66 until its rows land and its flip of
+    // `UNREGISTERED_SOURCE_PHASE` (egress_gate) puts the per-box default in
+    // force. Every admit under the interim is rate-limited-warned, so a
+    // diagnostic bundle's daemon log tail shows a host running it.
+    // `UNREGISTERED_SOURCE_PHASE` (egress_gate) is the constant T66 flips.
+    let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+    // The node's own ports are resolved once before the VM boots — the
+    // operator's override (`MINVMD_NODE_*_PORT` in this supervisor's env) or
+    // the default-first probe, so a VM sharing a host with a native daemon
+    // still lands on the default proxy port when it is free — and the one
+    // resolved pair is written twice: handed to the guest through the VMM
+    // child's env onto the kernel command line, and declared as the node
+    // row's own publishes. The daemon's setup publishes them at its address
+    // (NET-025); the pair it publishes is the pair the guest binds.
+    let node_ports =
+        assign_node_ports().context("assigning the node's proxy and answerer ports")?;
+    boxes.register_node_namespace(node_ports.proxy_port(), node_ports.answerer_port());
+    // A box's row goes with its shuttle connection: the gate reports which
+    // addresses each relay carried at the relay's end, and this drainer thread
+    // applies the reports for the life of the process (NET-133).
+    boxes.spawn_withdrawal_drainer();
+
+    // The host-side door to the box table (T66): the control socket the
+    // activating client registers an own-address box on and reads its
+    // allocated switch and loopback addresses from — the addresses the
+    // create request then carries, so the in-VM daemon attaches with the
+    // handed one. Bound before the guest boots, so a session activated
+    // against this VM can only ever be handed an address this table holds.
+    // Best-effort at startup, like the switch above: a bind failure is
+    // warned and the VM still boots — a registration then degrades to the
+    // gate's announced interim, exactly as against a supervisor predating
+    // the socket — rather than failing a boot the client could still
+    // activate against.
+    let _control = crate::control::resolve_control_sock()
+        .and_then(|sock_path| crate::control::spawn(sock_path, boxes.clone()))
+        .inspect_err(|error| {
+            tracing::warn!(
+                %error,
+                "failed to bind the box-registration control socket; own-address \
+                 activations will not be handed addresses (the egress gate's \
+                 announced interim applies)"
+            );
+        })
+        .ok();
+
     // Spawn + supervise the host gvproxy switch before the VMM child boots, so
-    // its `-listen` switch socket exists when libkrun dials it for the guest
-    // shuttle. The guest's root netns (the daemon) attaches a primary tap for
-    // egress, and own-IP PTasks attach further taps; both
-    // are L2 clients on this one switch. The handle lives for the VM's lifetime
-    // and stops gvproxy on drop (after the VMM child exits below).
+    // its `-listen` switch socket exists when the gate relays into it for the
+    // guest shuttle. The switch runtime starts the gate on the socket beside
+    // the switch socket — the one libkrun bridges the shuttle's vsock port to
+    // — before reporting ready, so the guest that boots next can only reach
+    // the switch through it, decided per source address against `boxes`.
+    // The guest's root netns (the daemon) attaches a primary tap for egress,
+    // and own-IP PTasks attach further taps; both are L2 clients on this one
+    // switch, both through the gate. The handle lives for the VM's lifetime
+    // and stops gvproxy on drop (after the VMM child exits below), taking the
+    // gate with it.
     //
     // Best-effort: when the gvproxy binary is absent (e.g. the boot/session e2e
     // lanes that exercise only the vsock bridge) we warn and boot without
@@ -403,13 +507,27 @@ fn run_foreground() -> Result<()> {
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
             crate::sock::remove_stale_socket(&switch_sock)
                 .context("removing stale switch socket")?;
+            // The gate binds the socket beside the switch socket, so a stale
+            // file from a prior run must go or the bind fails EEXIST — the
+            // same discipline the switch socket gets.
+            let gate_sock =
+                crate::net::resolve_gate_sock().context("resolving egress gate socket")?;
+            crate::sock::remove_stale_socket(&gate_sock)
+                .context("removing stale egress gate socket")?;
             match crate::net::HostGvproxy::spawn(
                 binary,
                 switch_sock,
                 crate::net::DEFAULT_DATAPATH_CHECK_INTERVAL,
+                &boxes,
             ) {
                 Ok(gvproxy) => {
-                    tracing::info!(pid = gvproxy.pid(), "host gvproxy switch up");
+                    let subnet = boxes.subnet();
+                    tracing::info!(
+                        pid = gvproxy.pid(),
+                        proxy_ip = %subnet.box_egress_proxy_address(),
+                        proxy_mac = %subnet.bep_mac(),
+                        "host gvproxy switch up; box egress proxy peer started",
+                    );
                     Some(gvproxy)
                 }
                 // An own-IP VM cannot work without the switch: fail loudly. A
@@ -464,6 +582,21 @@ fn run_foreground() -> Result<()> {
     alive_lock.inherit_into(&mut cmd);
     let mut child = cmd
         .env(MARKER_SOCK_ENV, &marker_sock_path)
+        // The node ports travel to the guest through the VMM child's env: the
+        // child is a separate process (like the marker socket path), and its
+        // backend appends them to the kernel command line, where the kernel
+        // hands unrecognized `KEY=VALUE` tokens to init as env vars. The
+        // explicit `.env` also shadows any inherited operator override under
+        // the same names, so the child carries exactly this resolution — the
+        // same pair the node row registered.
+        .env(
+            crate::vm::NODE_PROXY_PORT_ENV,
+            node_ports.proxy_port().to_string(),
+        )
+        .env(
+            crate::vm::NODE_ANSWERER_PORT_ENV,
+            node_ports.answerer_port().to_string(),
+        )
         .spawn()
         .with_context(|| format!("spawning VMM child: {}", exe.display()))?;
 
@@ -629,6 +762,114 @@ fn run_foreground() -> Result<()> {
     Ok(())
 }
 
+/// The node's proxy and answerer ports, assigned by the VM host before the VM
+/// boots: default-first, so a VM sharing a host with a native daemon still
+/// lands on the defaults when they are free and only falls to OS-assigned
+/// ports when the defaults are actually held.
+// Only `run_foreground` calls these, and it needs libkrun; without it the
+// crate is a runtime-bailing stub, but the tests below still cover this on
+// every target.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NodePorts {
+    proxy: u16,
+    answerer: u16,
+}
+
+impl NodePorts {
+    /// The hostname proxy's TCP port the guest daemon binds as handed (NET-025).
+    #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+    pub(crate) fn proxy_port(&self) -> u16 {
+        self.proxy
+    }
+
+    /// The zone answerer's UDP port the guest daemon binds as handed (NET-025).
+    #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+    pub(crate) fn answerer_port(&self) -> u16 {
+        self.answerer
+    }
+}
+
+/// The defaults the assignment probes first. They mirror the native daemon's
+/// own defaults (`DEFAULT_EGRESS_PROXY_PORT` in minimald's `net/proxy.rs`,
+/// `ANSWERER_PORT` in its `net/answerer.rs`): `minvmd` does not depend on the
+/// daemon, so the values are pinned here beside the constants they mirror.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const NODE_DEFAULT_PROXY_PORT: u16 = 7654;
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const NODE_DEFAULT_ANSWERER_PORT: u16 = 7656;
+
+/// Assigns both node ports: TCP for the proxy, UDP for the answerer. The
+/// operator's override ([`crate::vm::NODE_PROXY_PORT_ENV`] /
+/// [`crate::vm::NODE_ANSWERER_PORT_ENV`] set in this supervisor's own env)
+/// wins over the probe, and the one resolved pair is what both the guest
+/// handoff (the VMM child's env) and the node row's own publishes are
+/// written from — handed == registered, never two resolutions.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn assign_node_ports() -> Result<NodePorts> {
+    let proxy = match node_port_override(crate::vm::NODE_PROXY_PORT_ENV)? {
+        Some(proxy) => proxy,
+        None => assign_node_port(NODE_DEFAULT_PROXY_PORT, false)?,
+    };
+    let answerer = match node_port_override(crate::vm::NODE_ANSWERER_PORT_ENV)? {
+        Some(answerer) => answerer,
+        None => assign_node_port(NODE_DEFAULT_ANSWERER_PORT, true)?,
+    };
+    Ok(NodePorts { proxy, answerer })
+}
+
+/// Reads one operator override for a node port off this supervisor's env —
+/// the same names the child transport decodes, and [`run`] rewrites the
+/// resolved values under them before spawning the VMM child, so the child's
+/// decode sees exactly this resolution. `Ok(None)` when the variable is
+/// absent — the default-first probe decides. A present value that does not
+/// parse, or parses to `0`, fails here at the supervisor naming the variable
+/// and the value, never a fallback to selection that would publish a pair
+/// different from the one the operator pinned.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn node_port_override(name: &'static str) -> Result<Option<u16>> {
+    let Some(raw) = std::env::var(name).ok() else {
+        return Ok(None);
+    };
+    match raw.trim().parse::<u16>() {
+        Ok(0) => Err(anyhow::anyhow!(
+            "environment variable {name} carries {raw:?}: 0 is not a port to pin; \
+             unset the variable to let the assignment pick one"
+        )),
+        Ok(port) => Ok(Some(port)),
+        Err(_) => Err(anyhow::anyhow!(
+            "environment variable {name} carries {raw:?}, which is not a port"
+        )),
+    }
+}
+
+/// Assigns one node port by probing: bind the preferred port to check the
+/// host has it free, release the probe again, and let the OS pick when the
+/// preferred port is already held. The probe releases its socket, so between
+/// the assignment and the guest's bind inside the VM the port could still be
+/// taken by another process — a lost race the guest's own log tail shows
+/// (a handed port never silently moves, NET-024).
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn assign_node_port(preferred: u16, udp: bool) -> Result<u16> {
+    use anyhow::Context as _;
+    let probe = |port: u16| -> std::io::Result<u16> {
+        if udp {
+            let socket = std::net::UdpSocket::bind(("0.0.0.0", port))?;
+            Ok(socket.local_addr()?.port())
+        } else {
+            let listener = std::net::TcpListener::bind(("0.0.0.0", port))?;
+            Ok(listener.local_addr()?.port())
+        }
+    };
+    match probe(preferred) {
+        Ok(assigned) => Ok(assigned),
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            probe(0).context("the node's default port is held and no OS-assigned port is available")
+        }
+        Err(error) => Err(error).context("probing the node's default port"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(not(minvmd_libkrun))]
@@ -731,5 +972,107 @@ mod tests {
             super::classify_detach_poll(false, Some(exited(1)), true, Some(i32::MAX as u32), false),
             super::DetachPoll::Keep
         ));
+    }
+
+    #[test]
+    fn node_port_assigned_on_host_and_handed_to_daemon() {
+        // A port the test holds is busy: the assignment falls through to an
+        // OS-assigned port rather than failing the boot over a shared-host
+        // conflict — the case of a native daemon and a VM on one host. The
+        // hold is on the wildcard address the assigner itself probes, so the
+        // collision is one every host agrees on: a specific-address hold
+        // collides with a wildcard probe on Linux and not everywhere else.
+        let held = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let busy = held.local_addr().unwrap().port();
+        let assigned = super::assign_node_port(busy, false).unwrap();
+        assert_ne!(assigned, busy, "a held port is not assigned as-is");
+        assert!(assigned != 0, "the fallback is a real port");
+
+        // A port the test just released is free again: the default-first
+        // probe assigns it as asked — the case the session e2e's hardcoded
+        // default proxy port depends on. Released on the wildcard the probe
+        // addresses, like the hold above.
+        let freed = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let free = freed.local_addr().unwrap().port();
+        drop(freed);
+        assert_eq!(
+            super::assign_node_port(free, false).unwrap(),
+            free,
+            "a free port is assigned as asked"
+        );
+
+        // The answerer's probe is the same default-first over UDP, held on
+        // the same wildcard the UDP probe addresses.
+        let held_udp = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+        let busy_udp = held_udp.local_addr().unwrap().port();
+        let assigned_udp = super::assign_node_port(busy_udp, true).unwrap();
+        assert_ne!(
+            assigned_udp, busy_udp,
+            "a held UDP port is not assigned as-is"
+        );
+
+        // The supervisor assigns both ports as a pair and hands them to the
+        // guest: whatever the host picked, each is a real port the guest can
+        // bind as handed (the cmdline and bind halves are the vm.rs and
+        // minimald tests of the same name).
+        let ports = super::assign_node_ports().unwrap();
+        assert!(
+            ports.proxy_port() != 0 && ports.answerer_port() != 0,
+            "both node ports are assigned"
+        );
+
+        // The operator's override resolves the pair, and the one resolved
+        // pair is written twice from the same value: handed to the guest
+        // through the VMM child's env, and declared as the node row's own
+        // publishes. Pinned here through the override env, so the assertion
+        // can name both carries of the same values — handed == registered.
+        let previous = (
+            std::env::var(crate::vm::NODE_PROXY_PORT_ENV).ok(),
+            std::env::var(crate::vm::NODE_ANSWERER_PORT_ENV).ok(),
+        );
+        unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, "17901") };
+        unsafe { std::env::set_var(crate::vm::NODE_ANSWERER_PORT_ENV, "17902") };
+        let pinned = super::assign_node_ports().unwrap();
+        assert_eq!(pinned.proxy_port(), 17901, "the override is the resolution");
+        assert_eq!(
+            pinned.answerer_port(),
+            17902,
+            "the override is the resolution"
+        );
+        let registry = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+        let node = registry.register_node_namespace(pinned.proxy_port(), pinned.answerer_port());
+        assert_eq!(
+            node.admitted_ports(),
+            [17901, 17902],
+            "the row publishes the pair the guest is handed"
+        );
+
+        // The override's own garbage fails at the supervisor, naming the
+        // variable and the value — never a fallback to selection that would
+        // hand the guest a pair different from the one the operator pinned.
+        unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, "no-port-here") };
+        let err = super::assign_node_ports().unwrap_err().to_string();
+        assert!(
+            err.contains("MINVMD_NODE_PROXY_PORT") && err.contains("no-port-here"),
+            "an undecodable override names the variable and the value, got: {err}"
+        );
+        unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, "0") };
+        let err = super::assign_node_ports().unwrap_err().to_string();
+        assert!(
+            err.contains("not a port to pin"),
+            "a zero override is refused, got: {err}"
+        );
+        match &previous.0 {
+            Some(previous) => unsafe {
+                std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, previous)
+            },
+            None => unsafe { std::env::remove_var(crate::vm::NODE_PROXY_PORT_ENV) },
+        }
+        match &previous.1 {
+            Some(previous) => unsafe {
+                std::env::set_var(crate::vm::NODE_ANSWERER_PORT_ENV, previous)
+            },
+            None => unsafe { std::env::remove_var(crate::vm::NODE_ANSWERER_PORT_ENV) },
+        }
     }
 }

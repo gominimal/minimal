@@ -450,8 +450,8 @@ fn kernel_release(banner: &str) -> Option<&str> {
 /// The kernel boot line as it may travel: key-scrubbed exactly as a process
 /// argv is.
 ///
-/// The guest boot line today is `console=hvc0` plus an optional forwarded
-/// `RUST_LOG=<filter>`, and nothing secret can reach it — minvmd rejects a
+/// The guest boot line today is `console=hvc0 ipv6.disable=1` plus an optional
+/// forwarded `RUST_LOG=<filter>`, and nothing secret can reach it — minvmd rejects a
 /// value with whitespace and documents the invariant, because `/proc/cmdline`
 /// is world-readable inside the guest. But that is an invariant about *this
 /// machine*, and the bundle leaves it: a boot parameter added later that

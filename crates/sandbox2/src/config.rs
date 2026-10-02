@@ -187,6 +187,80 @@ impl WdSetup {
     }
 }
 
+/// The classifier leaf a box is placed in: the cgroup its egress verdict is
+/// decided on (NET-079, design §4.1), and the one no process of the box may
+/// leave or let another box join.
+///
+/// A *path*, not a kernel handle. The daemon creates the leaf before the
+/// spawn; the box's first process joins it in its own pre-exec closure,
+/// *before* it unshares the cgroup namespace, so the leaf becomes the
+/// namespace's root — the cgroup every view the box can ever mount starts at,
+/// and the only one it can reach. This option is how the rest of the sandbox
+/// learns the box has one: the launch log names the leaf, and the sandbox
+/// binds the leaf's tree into the box so the join has a path to write.
+///
+/// The path is resolved in the *daemon's* namespaces, where the leaf is
+/// created; inside the box it is reached through the tree bound at the
+/// conventional cgroup mountpoint — see [`Self::tree_root`] and
+/// [`Self::relative_dir`], which name the two halves of that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifierLeaf {
+    /// The leaf's directory in the daemon's classifier tree, e.g.
+    /// `<tree>/boxes/<box-id>`.
+    dir: PathBuf,
+}
+
+impl ClassifierLeaf {
+    /// A leaf at `dir`, e.g. `<tree>/boxes/<box-id>`.
+    #[must_use]
+    pub fn new<P: Into<PathBuf>>(dir: P) -> Self {
+        Self { dir: dir.into() }
+    }
+
+    /// The leaf's directory in the daemon's classifier tree.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The leaf's `cgroup.procs`: writing a pid here moves that process into
+    /// the leaf. A box's first process writes its own in its pre-exec
+    /// closure, before it unshares the cgroup namespace; an injected process
+    /// writes its own before it joins the box's namespaces, where the root's
+    /// own `cgroup.procs` is no longer writable.
+    #[must_use]
+    pub fn procs(&self) -> PathBuf {
+        self.dir.join("cgroup.procs")
+    }
+
+    /// The tree this leaf belongs to — `dir`'s parent's parent, since every
+    /// leaf is `<tree>/<BOXES_DIR>/<box-id>`. The daemon resolves the leaf
+    /// through it, and the sandbox binds *it* into the box at the
+    /// conventional cgroup mountpoint, so the box's own join goes through the
+    /// tree it is a leaf of — which the box then covers, so no process it
+    /// runs is left a cgroup path at all.
+    #[must_use]
+    pub fn tree_root(&self) -> PathBuf {
+        self.dir
+            .parent()
+            .and_then(Path::parent)
+            .map_or_else(|| self.dir.clone(), Path::to_path_buf)
+    }
+
+    /// The leaf's path under its [`tree_root`](Self::tree_root) —
+    /// `<BOXES_DIR>/<box-id>`. The box joins its leaf through the tree bound
+    /// at the conventional mountpoint, so this is the one spelling of the
+    /// leaf that resolves *inside* the box, before its cgroup namespace is
+    /// unshared onto the leaf.
+    #[must_use]
+    pub fn relative_dir(&self) -> PathBuf {
+        self.dir
+            .strip_prefix(self.tree_root())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| self.dir.clone())
+    }
+}
+
 /// Describes the setup of a sandbox.
 #[derive(Debug)]
 pub struct Config {
@@ -253,6 +327,23 @@ pub struct Config {
     /// Suffix marker to identify the process in the names of temp files/directories. Defaults
     /// to the PID when not set.
     pub daemon_id: Option<String>,
+
+    /// The classifier leaf this box is placed in, when the host has one for
+    /// it. See [`ClassifierLeaf`]: set by the daemon (which creates the leaf
+    /// and moves the box's processes into it), `None` on a host that cannot
+    /// decide per box — where the box runs unenforced rather than being
+    /// refused (NET-079's exception).
+    pub classifier_leaf: Option<ClassifierLeaf>,
+
+    /// Whether the box's classifier cover is forced onto its tmpfs fallback —
+    /// the branch the design takes only where the kernel refuses the
+    /// read-only cgroup2 mount of the namespace root. A test knob
+    /// ([`Self::with_forced_cover_fallback`]), never set in production: on a
+    /// host whose kernel does mount cgroup2 inside a box's user namespace, it
+    /// is the only way to exercise the recorded-fallback branch
+    /// deterministically — the branch every launch takes on a host whose
+    /// kernel refuses that mount.
+    pub(crate) force_cover_fallback: bool,
 }
 
 /// A command to be run in the sandbox.
@@ -432,6 +523,8 @@ impl Config {
             },
             cpu_weight: None,
             daemon_id: None,
+            classifier_leaf: None,
+            force_cover_fallback: false,
         }
     }
 
@@ -572,6 +665,30 @@ impl Config {
     /// Sets the identifier for the process/daemon doing the build.
     pub fn with_daemon_id(mut self, id: String) -> Self {
         self.daemon_id = Some(id);
+        self
+    }
+
+    /// Places this box in `leaf`, its classifier leaf: the cgroup its egress
+    /// verdict is decided on (NET-079).
+    ///
+    /// The daemon creates the leaf before the spawn and sets this so the
+    /// sandbox layer can keep the host's cgroup mount out of the box's mount
+    /// namespace and name the leaf in the launch log. The placement itself —
+    /// writing the box's processes into [`ClassifierLeaf::procs`] — stays with
+    /// the daemon, which owns the pids to move and the leaf's lifetime.
+    pub fn with_classifier_leaf(mut self, leaf: ClassifierLeaf) -> Self {
+        self.classifier_leaf = Some(leaf);
+        self
+    }
+
+    /// Forces a leaf-bearing box's cover onto its recorded tmpfs fallback,
+    /// skipping the design's read-only cgroup2 mount of the namespace root.
+    /// Test-only, so a host whose kernel *does* allow that mount can still
+    /// exercise the fallback branch deterministically: the branch the box
+    /// tests assert per cover, split by the cover the box reports it took.
+    #[cfg(test)]
+    pub(crate) fn with_forced_cover_fallback(mut self) -> Self {
+        self.force_cover_fallback = true;
         self
     }
 
@@ -856,6 +973,39 @@ mod tests {
             synth_number(own_group, 2, "the group entry's gid"),
             BOX_GID,
             "the synthesized group entry must name the gid every box execs as"
+        );
+    }
+
+    /// The classifier leaf option carries the leaf's `cgroup.procs` path — the
+    /// file a pid is written to, to move it into the leaf — and is off unless
+    /// the daemon sets it, so a host that cannot decide per box keeps
+    /// launching boxes (NET-079's exception) rather than refusing them.
+    #[test]
+    fn a_classifier_leaf_names_its_procs_file_and_is_opt_in() {
+        assert!(
+            session_config().classifier_leaf.is_none(),
+            "a box with no leaf configured must launch as it did before the \
+             classifier existed"
+        );
+
+        let config = session_config().with_classifier_leaf(ClassifierLeaf::new(
+            "/sys/fs/cgroup/minimald.slice/boxes/b1",
+        ));
+        let leaf = config
+            .classifier_leaf
+            .as_ref()
+            .expect("with_classifier_leaf sets the option");
+
+        assert_eq!(
+            leaf.dir(),
+            Path::new("/sys/fs/cgroup/minimald.slice/boxes/b1"),
+            "the leaf's directory is the placement the daemon created"
+        );
+        assert_eq!(
+            leaf.procs(),
+            Path::new("/sys/fs/cgroup/minimald.slice/boxes/b1/cgroup.procs"),
+            "the leaf's migration target is its own cgroup.procs, so the \
+             daemon and an injected process write the same file"
         );
     }
 }
