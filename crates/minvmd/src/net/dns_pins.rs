@@ -2150,8 +2150,13 @@ pub(crate) mod tests {
         // The match consumes the question: a replay of the same reply answers
         // nothing and refreshes nothing — the window the first reply opened is
         // the only one the address holds, and past its edge the pin is gone,
-        // where a replay that pinned would have opened a fresh one.
-        let past = now + DNS_ADMISSION_WINDOW + Duration::from_secs(1);
+        // where a replay that pinned would have opened a fresh one. The
+        // replay arrives while the question is still outstanding — inside the
+        // shared query expiry — so it would match and pin again if the first
+        // match had not consumed the entry; replayed past the expiry, the
+        // assertion would pass refused by the expiry rather than by the
+        // consume, and prove nothing.
+        let replayed_at = now + Duration::from_secs(10);
         observe(
             &pins,
             &table,
@@ -2159,8 +2164,9 @@ pub(crate) mod tests {
             "example.com",
             &[answer],
             &limiter,
-            past,
+            replayed_at,
         );
+        let past = now + DNS_ADMISSION_WINDOW + Duration::from_secs(1);
         assert!(
             !pins.admits_frame(&record, answer.octets(), None, past),
             "a replay of the same reply pins nothing more: the window it \
