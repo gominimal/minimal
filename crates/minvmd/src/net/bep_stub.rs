@@ -506,8 +506,10 @@ mod tests {
         let registry = crate::box_registry::BoxRegistry::new(subnet);
 
         // The supervisor wires the peer before any client box exists: the
-        // node's own row is the one fact the host can name at boot.
-        registry.register_node_namespace();
+        // node's own row is the one fact the host can name at boot, holding
+        // the default port pair it hands the guest when nothing overrides it
+        // (cmd/run.rs resolves the same pair at VM boot).
+        registry.register_node_namespace(7654, 7656);
         let dir = tempfile::tempdir().expect("tempdir");
         let proxy_sock = dir.path().join("bep-stub.sock");
         let token = [0x5au8; TOKEN_LEN];
