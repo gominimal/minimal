@@ -1633,7 +1633,7 @@ impl Ptask {
         }
 
         let gate = SessionGate::for_session(lease.ip.to_string(), lease.ip, policy, subnet);
-        let relay = attach_to_switch(fd, api_sock, Some(gate), lease.ip, subnet)
+        let relay = attach_to_switch(fd, api_sock, Some(std::sync::Arc::new(gate)), lease.ip, subnet)
             .await
             .expect("attach tap to switch");
 

@@ -1482,6 +1482,8 @@ pub(crate) mod tests {
                 dst: SocketAddrV4::new(PINNED, 443),
                 proto: crate::net::switch::IPPROTO_UDP,
                 tcp_flags: 0,
+                seq: 0,
+                ack: 0,
             },
             PINNED.octets(),
         );
@@ -1610,6 +1612,8 @@ pub(crate) mod tests {
                 dst: SocketAddrV4::new(PINNED, 443),
                 proto: crate::net::switch::IPPROTO_TCP,
                 tcp_flags: ACK,
+                seq: 0,
+                ack: 0,
             },
             PINNED.octets(),
         );
