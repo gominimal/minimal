@@ -4257,16 +4257,20 @@ $(grep -h -- 'zone-answerer' "$host_answerer_cand" 2>/dev/null || true)"
   host_answerer_expect_a host.min.internal 127.0.0.1
 
   # One live VM box name (NET-125): a box's row is registered at its
-  # session's activation, and the warm-up above took the daemon — and with
-  # it the table — down, so mint one. The address its name must answer with
-  # is read from the daemon's own zone-table dump (zone.json, the view the
-  # answerer answers from, the file a diagnostic bundle carries), because
-  # the host authored it: the CLI's activation hands it to the session, the
+  # session's activation, and the row is the own-address registration's —
+  # a host-address box shares the node's own row and registers none, so
+  # `zone.json` would never hold `e2e-answerer.min.internal` — hence
+  # `--network own_ip`, ahead of whatever else the lane's activate args
+  # carry. The warm-up above took the daemon — and with it the table —
+  # down, so mint one. The address its name must answer with is read from
+  # the daemon's own zone-table dump (zone.json, the view the answerer
+  # answers from, the file a diagnostic bundle carries), because the host
+  # authored it: the CLI's activation hands it to the session, the
   # daemon's allocation drew it, and the e2e has no other source of truth
   # for it.
   local answerer_session="e2e-answerer"
   # shellcheck disable=SC2086
-  (cd "$PROJECT_DIR" && mnl session activate . --name "$answerer_session" ${E2E_ACTIVATE_ARGS:-}) \
+  (cd "$PROJECT_DIR" && mnl session activate . --name "$answerer_session" --network own_ip ${E2E_ACTIVATE_ARGS:-}) \
     >"$WORK/answerer-activate.out" 2>"$WORK/answerer-activate.err" \
     || { echo "::error::could not activate a session to give the zone a live box row"
          echo "--- activate stderr ---"; cat "$WORK/answerer-activate.err" 2>/dev/null || true
