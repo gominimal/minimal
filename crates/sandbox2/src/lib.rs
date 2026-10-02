@@ -966,6 +966,23 @@ pub mod classifier {
         )
     }
 
+    /// Makes one level of the classifier layout, taking `AlreadyExists` as
+    /// success: more than one hand builds the layout — the installer's,
+    /// a previous daemon's, this entry's own on a restart — and a level is
+    /// owed exactly one maker, so an entry that finds one made is not an
+    /// error to report but the common case to build on. Every other errno is
+    /// the caller's, unchanged: a `NotFound` is a parent this entry could not
+    /// make, a `PermissionDenied` a tree this account has no privilege over.
+    fn make_cgroup(dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir(dir).or_else(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+    }
+
     /// Moves this process into `root`'s [`DAEMON_LEAF`], as the daemon does at
     /// startup: its own traffic then leaves from a leaf of its own (NET-080),
     /// never classed with a box's, and the daemon sits in a *sibling* of every
@@ -991,50 +1008,40 @@ pub mod classifier {
     /// itself under the design's own cover — can name the limit a box's
     /// verdict is decided on.
     pub fn enter_daemon_leaf(root: &Path) -> std::io::Result<()> {
-        // The cohort first, then both of its subtrees: a box leaf is now a
-        // grandchild of the cohort, so the subtree its verdict picks must
-        // exist before the launch that places it — and `create_dir` makes
-        // no parent, so the cohort the subtrees live in is this entry's to
-        // build too. The guest's pid 1 boots into a tree with nothing in
-        // it, and it is the one entry that has the privilege to make the
-        // whole layout. Already-there is the common case (the installer
-        // made them, or a previous daemon did).
+        // The layout, top down: the tree root, the cohort, both of its
+        // subtrees, then this daemon's own leaf. `create_dir` makes no
+        // parent, so each level is made only once the one above it stands —
+        // and the guest's pid 1, the one entry that has the privilege to
+        // build any of it, boots into a cgroup2 with nothing in it,
+        // `minimald.slice` included: the installer is the only other maker
+        // of that root, and natively this account cannot make it, so a root
+        // that is not there is the guest's to build and a native host's to
+        // be left outside. Already-there is the common case everywhere else
+        // (the installer made the root, a previous daemon made the rest).
+        make_cgroup(root)?;
         let mut tree = vec![root.join(BOXES_DIR)];
         for dir in &tree {
-            std::fs::create_dir(dir).or_else(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            })?;
+            make_cgroup(dir)?;
         }
         for subtree in [config::DENY_DIR, config::ALLOW_DIR] {
             let dir = root.join(BOXES_DIR).join(subtree);
-            std::fs::create_dir(&dir).or_else(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            })?;
+            make_cgroup(&dir)?;
             tree.push(dir);
         }
         let daemon = daemon_leaf(root);
-        std::fs::create_dir(&daemon).or_else(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        })?;
+        make_cgroup(&daemon)?;
         // Over a stand-in tree (a test's) this writes a plain file; over a
         // real tree the kernel takes `+memory` as a subtree_control command
         // and may refuse it — a host without the memory controller, or one
         // that has it threaded off, still gets its boxes placed. The cohort
         // comes first and the subtrees after it: over a real tree a
         // controller reaches a cgroup only once the cgroup above it has
-        // enabled it, so the cascade order is the only one that works.
+        // enabled it, so the cascade order is the only one that works. The
+        // tree root is not in the cascade and must not be: this process is
+        // still a member of it until the `place_pid` below moves it out, and
+        // a controller enabled on a cgroup that holds a process makes its
+        // children `domain invalid` — the daemon's own leaf among them, the
+        // very cgroup this entry exists to take.
         for dir in &tree {
             if let Err(e) = std::fs::write(dir.join("cgroup.subtree_control"), "+memory\n")
                 && e.kind() != std::io::ErrorKind::NotFound

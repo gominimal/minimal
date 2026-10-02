@@ -1768,13 +1768,25 @@ fn daemon_enters_its_own_leaf() {
     );
 
     // And the one daemon that builds the tree itself — the guest's pid 1, on
-    // the cgroup2 it mounted — makes both directories where there was
+    // the cgroup2 it mounted — makes the whole layout where there was
     // nothing, and then reports the stand-in's one gap as what it is: no
     // kernel made the `cgroup.procs` its entry writes into, so the write
     // says the leaf is missing, which over a real tree it never is. Nothing
     // boxes into a tree the entry could not enter.
+    //
+    // The root is a path that does not exist yet, because that is the
+    // guest's actual shape: a cgroup2 mounted with nothing in it, whose
+    // `minimald.slice` no other hand makes — the installer is a native
+    // host's, and inside the VM there is nobody to run it. An entry that
+    // made only the levels below the root would fail on the first one and
+    // leave the guest with no tree at all, which is the state every
+    // host-address box there is refused on.
     let bare = tempfile::tempdir().expect("a bare stand-in tree, nothing installed in it");
-    let entry = sandbox2::classifier::enter_daemon_leaf(bare.path())
+    let slice = std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+        .file_name()
+        .expect("the tree root is a path with a name");
+    let root = bare.path().join(slice);
+    let entry = sandbox2::classifier::enter_daemon_leaf(&root)
         .expect_err("over a bare stand-in no kernel made the daemon leaf's cgroup.procs");
     assert_eq!(
         entry.kind(),
@@ -1782,13 +1794,27 @@ fn daemon_enters_its_own_leaf() {
         "the entry's write is a migration into a leaf that must already hold \
          its kernel-made files: a missing one is a missing leaf"
     );
+    let cohort = root.join(sandbox2::classifier::BOXES_DIR);
+    for (dir, level) in [
+        (root.as_path(), "the tree root"),
+        (cohort.as_path(), "the cohort the subtrees live in"),
+        (
+            cohort.join(sandbox2::config::DENY_DIR).as_path(),
+            "the deny subtree",
+        ),
+        (
+            cohort.join(sandbox2::config::ALLOW_DIR).as_path(),
+            "the allow subtree",
+        ),
+    ] {
+        assert!(
+            dir.is_dir(),
+            "the pid-1 entry builds {level} where it has the privilege to: {}",
+            dir.display()
+        );
+    }
     assert!(
-        bare.path().join(sandbox2::classifier::BOXES_DIR).is_dir(),
-        "the pid-1 entry builds the cohort directory where it has the \
-         privilege to"
-    );
-    assert!(
-        sandbox2::classifier::daemon_leaf(bare.path()).is_dir(),
+        sandbox2::classifier::daemon_leaf(&root).is_dir(),
         "the pid-1 entry builds its own leaf where it has the privilege to"
     );
 }
