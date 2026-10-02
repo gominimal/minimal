@@ -770,6 +770,43 @@ fn log_refusal(host: Option<&str>, reason: &str, status: &str) {
     }
 }
 
+/// Spawns a one-shot loopback backend that answers every connection with a
+/// fixed `200 OK` and closes, returning the port it listens on. Test-only:
+/// this module's own tests use it for the routes a request names, and the
+/// rpc module's tests use it to drive one request through the daemon's own
+/// proxy (NET-019's daemon-side proof).
+#[cfg(test)]
+pub(crate) async fn spawn_backend() -> u16 {
+    let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = backend.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = backend.accept().await {
+            tokio::spawn(async move {
+                let mut scratch = [0u8; 1024];
+                let _ = sock.read(&mut scratch).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                // `sock` drops here, closing the upstream side.
+            });
+        }
+    });
+    port
+}
+
+/// Drives the proxy with a `GET` carrying `Host: <authority>` and returns
+/// the raw response the client read back. Test-only, shared with the rpc
+/// module's tests for the reason [`spawn_backend`] is.
+#[cfg(test)]
+pub(crate) async fn proxy_get(proxy_addr: SocketAddr, authority: &str) -> String {
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let request = format!("GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+    client.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.unwrap();
+    String::from_utf8_lossy(&response).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,37 +826,6 @@ mod tests {
         proxied_request_verdict,
     };
     use crate::test_harness::CaptureWriter;
-
-    /// Spawns a one-shot loopback backend that answers every connection with a
-    /// fixed `200 OK` and closes, returning the port it listens on.
-    async fn spawn_backend() -> u16 {
-        let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let port = backend.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = backend.accept().await {
-                tokio::spawn(async move {
-                    let mut scratch = [0u8; 1024];
-                    let _ = sock.read(&mut scratch).await;
-                    let _ = sock
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                        .await;
-                    // `sock` drops here, closing the upstream side.
-                });
-            }
-        });
-        port
-    }
-
-    /// Drives the proxy with a `GET` carrying `Host: <authority>` and returns
-    /// the raw response the client read back.
-    async fn proxy_get(proxy_addr: SocketAddr, authority: &str) -> String {
-        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-        let request = format!("GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n");
-        client.write_all(request.as_bytes()).await.unwrap();
-        let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
-        String::from_utf8_lossy(&response).into_owned()
-    }
 
     /// Proof artifact 1 (registry/proxy routing contract): a `HostNet` PTask's
     /// `Host:` header routes through the proxy to its registered target; after
@@ -857,6 +863,88 @@ mod tests {
         assert!(
             not_found.contains("502 Bad Gateway"),
             "expected a gateway error after deregister, got: {not_found}"
+        );
+    }
+
+    /// NET-019: supersession is a verdict about what a client *reports*, not
+    /// about what the proxy does. Once the native condition holds — the
+    /// answerer bound (the daemon's half, the one fact its replies carry)
+    /// and the reserved local range present on this host — a request
+    /// through the proxy still routes: a client that captured
+    /// `HTTP(S)_PROXY` at activation keeps working, which is why the
+    /// verdict never stops the proxy.
+    ///
+    /// The answerer half is the daemon's own driver, driven to serving the
+    /// way startup drives it; the port it records on the state is the
+    /// record the replies' `answerer_bound` projects. The range half is
+    /// this host's real probe. The daemon-side test
+    /// (`name_surface_reported_when_both_deployed` in `rpc`) drives both
+    /// listeners through the daemon's RPC replies beside its own log line;
+    /// this one isolates the other half: the proxy's real `serve` loop and
+    /// a real route, after the condition has already come to hold.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn proxy_keeps_serving_after_supersession() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::time::Duration;
+
+        use tempfile::TempDir;
+
+        // A state the answerer's driver records its bind on, the way the
+        // daemon's start path does.
+        let dir = TempDir::new().unwrap();
+        let state =
+            crate::server::ServerStateHandle::new(crate::server::test_config(dir.path()), None)
+                .await
+                .unwrap();
+
+        // The answerer's half: the daemon's own driver, serving the zone on
+        // a free loopback port, its port recorded — the record the replies'
+        // `answerer_bound` carries.
+        let compressed =
+            crate::server::RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20));
+        crate::server::retry_zone_answerer_until_serving(
+            state.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            compressed,
+        )
+        .await;
+        let answerer_port = state
+            .zone_answerer_port()
+            .await
+            .expect("the answerer's driver records the port it bound");
+        assert_ne!(
+            answerer_port, 0,
+            "the recorded answerer port is the bind the replies report as bound"
+        );
+
+        // The published-address half: the real probe over the reserved
+        // range, whose presence is what a native host's loopback carries.
+        let range_present = crate::net::loopback::probe().present();
+        assert!(
+            range_present,
+            "the reserved local range must be present on this host for the native condition \
+             to hold here"
+        );
+
+        // And the proxy still serves beside it: the same route answers a
+        // request naming the host, through the same serve loop it always ran.
+        let backend_port = spawn_backend().await;
+        let shared = Arc::new(RwLock::new(HostnameRegistry::new("dev", false)));
+        shared
+            .write()
+            .unwrap()
+            .register_host_net(SessionId::nil(), "web");
+        let router = Router::new(Arc::clone(&shared), proxied_request_verdict);
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve(proxy, router));
+
+        let routed = proxy_get(proxy_addr, &format!("web.min.internal:{backend_port}")).await;
+        assert!(
+            routed.contains("200 OK"),
+            "the native condition holds — answerer bound on {answerer_port}, range present — \
+             and the proxy still routes: {routed}"
         );
     }
 

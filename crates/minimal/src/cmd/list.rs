@@ -309,7 +309,35 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // is exactly what will go on using hostnames that no longer resolve — and
     // stdout stays clean for the parser either way.
     warn_if_hostname_routing_down(resp.hostname_routing_unavailable.as_deref(), "min ls");
-    format_ls(&mut std::io::stdout(), &args, &resp)?;
+
+    // NET-018's verdict — which surface a box name resolves through on
+    // this host — from the one function both verbs share (`resolver`). The
+    // three facts it reads are this host's resolver hook (with the
+    // stub-bypass blocker that says whether host lookups consult what the
+    // hook configures), the daemon's answerer-bound report, and the
+    // reserved range on this host's own loopback; native DNS is live only
+    // when all three hold. Nothing prints when the daemon's answerer is
+    // not bound — the port lines below already tell that story. The
+    // detection runs only in the modes that can print the verdict:
+    // `--json` and `--raw` are machine-readable-only and never carry the
+    // line, so they pay no resolver read. The answerer is bound on
+    // every current daemon, so every human-mode list does read the host —
+    // the line is this verb's status, so it stays where the user looks
+    // for it — but at the list's own deadline, not the session start's:
+    // the read runs under the same one-second deadline this list's own
+    // host-side subprocess probes carry (the git probes above), paid once
+    // by the two queries it runs together, so a wedged systemd-resolved
+    // costs `min ls` that one second — never the ten its queries could
+    // add — and the verdict a slow read loses is the proxy's, the arm
+    // that cannot strand the user (NET-019 keeps the proxy serving). The
+    // daemon's own view of this host's resolver is not a thing that
+    // exists, so the host's half is the host's to read.
+    let surface = if args.json || args.raw {
+        None
+    } else {
+        crate::resolver::live_name_surface(resp.zone_answerer_port, resp.answerer_bound).await
+    };
+    format_ls(&mut std::io::stdout(), &args, &resp, surface)?;
     Ok(())
 }
 
@@ -353,10 +381,16 @@ pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>, command: &str)
 /// Format the session list for the given output mode. Split from
 /// [`cmd_ls`] so integration tests can capture output into a buffer
 /// instead of stdout.
+///
+/// `surface` is NET-018's verdict — which surface a box name resolves
+/// through on this host, as [`cmd_ls`] computed it from the one function
+/// both verbs share — printed on the `NAME SURFACE` line when the daemon's
+/// answerer is bound at all.
 pub fn format_ls(
     out: &mut impl std::io::Write,
     args: &LsArgs,
     resp: &minimald_rpc::ListSessionsResponse,
+    surface: Option<crate::resolver::LiveSurface>,
 ) -> Result<(), anyhow::Error> {
     if args.json {
         let json = serde_json_lenient::to_string_pretty(resp)
@@ -407,6 +441,20 @@ pub fn format_ls(
             writeln!(
                 out,
                 "ZONE ANSWERER:   listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal"
+            )?;
+        }
+        // NET-018: say which of the two surfaces is live — the one verdict
+        // both verbs share ([`resolver::live_name_surface`]). `None` — the
+        // daemon's answerer not bound — prints nothing: the two port lines
+        // above already tell that story, and the advisory the activation
+        // path prints (NET-122) says how to get from one surface to the
+        // other. `--raw` and `--json` stay machine-readable-only, as for
+        // the ports.
+        if let Some(surface) = surface {
+            writeln!(
+                out,
+                "NAME SURFACE:    {}",
+                crate::resolver::name_surface_line(surface, resp.hostname_proxy_port)
             )?;
         }
         if resp.hostname_proxy_port.is_some() || resp.zone_answerer_port.is_some() {
