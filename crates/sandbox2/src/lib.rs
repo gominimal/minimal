@@ -863,35 +863,16 @@ pub mod classifier {
             .map(str::to_string)
     }
 
-    /// The account this daemon runs as: the daemon knows its own uid, and
-    /// the *name* is what a person types after the installer's `--user`, so
-    /// it is looked up rather than guessed. A uid with no account — a
-    /// container running a bare uid — is the `None` the hint below names
-    /// its fallback for.
-    #[cfg(target_os = "linux")]
-    #[must_use]
-    pub fn own_account() -> Option<String> {
-        nix::unistd::User::from_uid(nix::unistd::getuid())
-            .ok()
-            .flatten()
-            .map(|user| user.name)
-    }
-
     /// The command a person runs on this host to give this daemon a
-    /// classifier tree: the installer takes the account the daemon runs as,
-    /// and the hint spells the whole command so the advisory that carries it
-    /// never has to name a placeholder for the one thing the daemon knows.
+    /// classifier tree: the hint points at the documented privileged setup
+    /// step rather than naming a script path that a stock install does not
+    /// ship.
     #[cfg(target_os = "linux")]
     #[must_use]
     pub fn install_hint() -> String {
-        match own_account() {
-            Some(account) => {
-                format!("sudo scripts/install-host-classifier.sh --user {account}")
-            }
-            None => "sudo scripts/install-host-classifier.sh --user \
-                 <the account this daemon runs as>"
-                .to_string(),
-        }
+        "see https://minimal.sh/docs/host-classifier for the privileged \
+         setup step"
+            .to_string()
     }
 
     /// Moves this process into `root`'s [`DAEMON_LEAF`], as the daemon does at

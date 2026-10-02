@@ -29,6 +29,7 @@ use crate::sessions::SessionControl;
 use sessions::NetworkMode;
 use sessions::keys::{ChordMatcher, FeedOutcome, KeyAction, SessionKeys};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 mod pty;
 
@@ -2855,6 +2856,11 @@ fn unenforced_placement_notice() -> String {
     )
 }
 
+/// Whether the pty advisory has already been printed in this daemon run.
+/// The log record stays per-launch; only the terminal banner is gated to
+/// once per daemon lifetime so a second session start prints nothing.
+static PTY_ADVISORY_PRINTED: AtomicBool = AtomicBool::new(false);
+
 /// Moves the box's container supervisor into its classifier leaf, now that
 /// it exists.
 ///
@@ -3170,7 +3176,7 @@ impl SessionLauncher for SandboxLauncher {
             // unplaced host-address box never gets this far, its launch
             // being refused (design §7.1). And never on a hook launch: its
             // pty is read by nobody, and a hook run is not a session start.
-            if advise {
+            if advise && !PTY_ADVISORY_PRINTED.swap(true, Ordering::Relaxed) {
                 let notice = unenforced_placement_notice();
                 // The same write the shell fallback notice uses, for the
                 // same reasons: onto the pty's slave, best-effort, CRLF —
