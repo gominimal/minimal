@@ -368,8 +368,9 @@ async fn finish_own_ip_attach(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeSet, HashMap};
     use std::io::{Read as _, Write as _};
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -377,8 +378,8 @@ mod tests {
     use sandbox2::NetGuard as _;
     use switch::MacAddr;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tokio::net::{UnixListener, UnixStream};
-    use tokio::sync::{Mutex, mpsc};
+    use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+    use tokio::sync::{Mutex, mpsc, oneshot};
 
     use crate::net::PtaskLease;
     use crate::net::SwitchClient;
@@ -388,6 +389,20 @@ mod tests {
     use crate::net::provider::network_for;
     use crate::test_harness::CaptureWriter;
     use sessions::BoxAddresses;
+
+    /// The fake gvproxy's answer for a request it serves happily.
+    fn ok() -> (u16, String) {
+        (200, String::new())
+    }
+
+    /// One `"key":"value"` string field of a JSON body — the stand-ins' own
+    /// read of the forwarder verbs' requests.
+    fn json_string_field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+        body.split(&format!("\"{key}\":\""))
+            .nth(1)?
+            .split('"')
+            .next()
+    }
 
     /// Reads one control request off `sock` — its head up to the
     /// end-of-head marker, then exactly its `Content-Length` body — and
@@ -899,18 +914,18 @@ mod tests {
 
     /// The gvproxy stand-in the NET-121 proofs drive `complete_own_ip_attach`
     /// against: every control request is read in full, answered with the
-    /// status `decide` picks for `(path, body)`, and recorded as
-    /// `(path, body)` on `events` in arrival order — the order the attach's
-    /// binds and registrations happened in. The `/connect` upgrade is
-    /// hijacked the way the real switch hijacks it: no response is written,
-    /// and the upgraded stream is handed to the test, which becomes the
-    /// switch side of the box's relay for as long as it holds it.
+    /// status and reason body `decide` picks for `(path, body)`, and recorded
+    /// as `(path, body)` on `events` in arrival order — the order the
+    /// attach's binds and registrations happened in. The `/connect` upgrade
+    /// is hijacked the way the real switch hijacks it: no response is
+    /// written, and the upgraded stream is handed to the test, which becomes
+    /// the switch side of the box's relay for as long as it holds it.
     ///
     /// Abort the returned handle when the test is done; the fake accepts
     /// until then.
     fn spawn_control_channel_deciding(
         path: PathBuf,
-        decide: impl Fn(&str, &str) -> u16 + Send + Sync + 'static,
+        decide: impl Fn(&str, &str) -> (u16, String) + Send + Sync + 'static,
         events: mpsc::Sender<(String, String)>,
         handed: mpsc::Sender<UnixStream>,
     ) -> tokio::task::JoinHandle<()> {
@@ -938,34 +953,29 @@ mod tests {
                     .unwrap_or_default()
                     .to_string();
                 let body = String::from_utf8_lossy(&body).into_owned();
-                let status = decide(&request_path, &body);
-                let reason = if status == 200 {
-                    "OK"
-                } else {
-                    "Internal Server Error"
+                let (status, reason_body) = decide(&request_path, &body);
+                let reason = match status {
+                    200..=299 => "OK",
+                    403 => "Forbidden",
+                    404 => "Not Found",
+                    500 => "Internal Server Error",
+                    _ => "Answered",
                 };
-                sock.write_all(
-                    format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                let mut response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n\r\n",
+                    reason_body.len()
                 )
-                .await
-                .expect("the fake gvproxy must answer");
+                .into_bytes();
+                response.extend_from_slice(reason_body.as_bytes());
+                sock.write_all(&response)
+                    .await
+                    .expect("the fake gvproxy must answer");
                 events
                     .send((request_path, body))
                     .await
                     .expect("the test is still collecting the control requests");
             }
         })
-    }
-
-    /// Reads one 2-byte-LE-framed frame the relay put on the handed stream —
-    /// the switch side's view of what left the box, resets included.
-    async fn read_framed_stream(sock: &mut UnixStream) -> std::io::Result<Vec<u8>> {
-        let mut len_buf = [0u8; 2];
-        sock.read_exact(&mut len_buf).await?;
-        let n = u16::from_le_bytes(len_buf) as usize;
-        let mut frame = vec![0u8; n];
-        sock.read_exact(&mut frame).await?;
-        Ok(frame)
     }
 
     /// Writes one frame to the switch side of the relay, framed the way
@@ -1068,6 +1078,82 @@ mod tests {
         }
     }
 
+    /// Three declared ports — one more than any one attach can bind before a
+    /// refusal — so a proof can show the rollback of a half-bound box: two
+    /// bound, the third refused, and the two unbound with it.
+    fn declared_three_ports() -> sessions::SessionPolicy {
+        sessions::SessionPolicy {
+            ingress: Some(sessions::IngressPolicy {
+                port_mappings: vec![
+                    sessions::PortMapping {
+                        external_port: 8080,
+                        internal_port: 80,
+                        proto: sessions::IpProto::Tcp,
+                    },
+                    sessions::PortMapping {
+                        external_port: 9090,
+                        internal_port: 90,
+                        proto: sessions::IpProto::Tcp,
+                    },
+                    sessions::PortMapping {
+                        external_port: 7070,
+                        internal_port: 70,
+                        proto: sessions::IpProto::Tcp,
+                    },
+                ],
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+            egress: None,
+        }
+    }
+
+    /// One failed-bind scenario's pieces: the control path its stand-in
+    /// listens on, the registry the box's name would publish in, the
+    /// reporter that would report it, and the relay's own two ends — the
+    /// box's half held for its life, never read, so the box stays reachable
+    /// for as long as the scenario runs — everything but the fake that
+    /// answers and the attach itself.
+    struct AttachScenario {
+        control_path: PathBuf,
+        registry: Arc<std::sync::RwLock<dns::HostnameRegistry>>,
+        reporter: crate::net::provider::OwnAddressReporter,
+        tap_fd: std::os::fd::OwnedFd,
+        _box_end: std::fs::File,
+    }
+
+    /// Builds one scenario inside `dir`, on its own `socket`, so a test can
+    /// drive two attaches without one's traffic landing on the other's
+    /// stand-in or registry.
+    fn attach_scenario(dir: &tempfile::TempDir, socket: &str) -> AttachScenario {
+        let control_path = dir.path().join(socket);
+        let registry = Arc::new(std::sync::RwLock::new(dns::HostnameRegistry::new(
+            "aaaa1", true,
+        )));
+        let reporter = crate::net::provider::OwnAddressReporter::new(
+            Arc::clone(&registry),
+            sessions::SessionId::nil(),
+        );
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `socketpair` with a valid domain/type either returns -1
+        // (checked) or fills `fds` with two fresh descriptors.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair: {}", std::io::Error::last_os_error());
+        // SAFETY: each fd in `fds` is a fresh, valid, owned descriptor just
+        // returned by socketpair.
+        let tap_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: each fd in `fds` is a fresh, valid, owned descriptor just
+        // returned by socketpair.
+        let box_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        AttachScenario {
+            control_path,
+            registry,
+            reporter,
+            tap_fd,
+            _box_end: box_end,
+        }
+    }
+
     /// Reads control events until `want` requests on `path` have arrived.
     async fn collect_until(
         events: &mut mpsc::Receiver<(String, String)>,
@@ -1121,7 +1207,7 @@ mod tests {
         let (events_tx, mut events_rx) = mpsc::channel(64);
         let (handed_tx, _handed_rx) = mpsc::channel(4);
         let fake =
-            spawn_control_channel_deciding(control_path.clone(), |_, _| 200, events_tx, handed_tx);
+            spawn_control_channel_deciding(control_path.clone(), |_, _| ok(), events_tx, handed_tx);
         let switch = vm_host_switch();
         let registry = Arc::new(std::sync::RwLock::new(dns::HostnameRegistry::new(
             "aaaa1", true,
@@ -1214,63 +1300,131 @@ mod tests {
         fake.abort();
     }
 
-    /// NET-121's sub 2: a declared port whose forwarder cannot bind is
-    /// *reported* — the failed bind says its own warn line, with the port and
-    /// the reason the switch gave — and the attach fails, so neither the
-    /// name nor any substitute address is ever published for it: no
-    /// registration reaches the switch, the registry holds no route, and the
-    /// binds that did succeed are rolled back.
+    /// NET-121's sub 2, both shapes of a bind that did not land:
+    ///
+    /// A *gate refusal* — the switch answering an expose with a refusal, the
+    /// way the session gate answers a port the box's row does not declare —
+    /// is a failed bind exactly like a bind that errored: the attach fails,
+    /// neither the name nor any substitute address is published for the
+    /// refused port, and the refusal's own reason reaches the caller beside
+    /// the port, in the returned error and in the warn line.
+    ///
+    /// And either shape rolls the whole half back: the ports that *did* bind
+    /// are unexposed before the attach gives up, so a half-bound box holds
+    /// nothing — the rollback is asserted per shape, not by extrapolating
+    /// from one port's.
     #[tokio::test]
     async fn failed_forwarder_bind_is_reported_not_substituted() {
+        const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
         let capture = crate::test_harness::captured_log();
         let dir = tempfile::TempDir::new().unwrap();
-        let control_path = dir.path().join("gvproxy.sock");
-        let (events_tx, mut events_rx) = mpsc::channel(64);
+
+        // Shape one: the gate refuses the third of three declared ports,
+        // with the reason a real gate refusal carries.
+        let refused = attach_scenario(&dir, "gvproxy.sock");
+        let (refused_events_tx, mut refused_events_rx) = mpsc::channel(64);
         let (handed_tx, _handed_rx) = mpsc::channel(4);
-        // The fake refuses `:9090`'s expose the way the real forwarder
-        // answers a bind failure, and answers everything else.
-        let fake = spawn_control_channel_deciding(
-            control_path.clone(),
+        let refused_fake = spawn_control_channel_deciding(
+            refused.control_path.clone(),
             |path, body| {
-                if path == "/services/forwarder/expose" && body.contains("127.0.0.1:9090") {
-                    500
+                if path == "/services/forwarder/expose" && body.contains("127.0.0.1:7070") {
+                    (403, "port 7070 is not declared on this row".to_string())
                 } else {
-                    200
+                    ok()
                 }
             },
-            events_tx,
+            refused_events_tx,
             handed_tx,
         );
-        let switch = vm_host_switch();
-        let registry = Arc::new(std::sync::RwLock::new(dns::HostnameRegistry::new(
-            "aaaa1", true,
-        )));
-        let reporter = crate::net::provider::OwnAddressReporter::new(
-            Arc::clone(&registry),
-            sessions::SessionId::nil(),
-        );
-        let policy = declared_two_ports();
-
-        let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: `socketpair` with a valid domain/type either returns -1
-        // (checked) or fills `fds` with two fresh descriptors.
-        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
-        assert_eq!(rc, 0, "socketpair: {}", std::io::Error::last_os_error());
-        // SAFETY: each fd in `fds` is a fresh, valid, owned descriptor just
-        // returned by socketpair.
-        let tap_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
-        // SAFETY: each fd in `fds` is a fresh, valid, owned descriptor just
-        // returned by socketpair.
-        let _box_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
-
+        let refused_switch = vm_host_switch();
+        let refused_policy = declared_three_ports();
         let err = match crate::net::gvproxy_network::complete_own_ip_attach(
-            &switch,
-            tap_fd,
-            ControlChannel::Unix(control_path),
-            Ipv4Addr::new(100, 64, 0, 9),
+            &refused_switch,
+            refused.tap_fd,
+            ControlChannel::Unix(refused.control_path.clone()),
+            LEASE,
             "web",
-            Some(&policy),
-            Some(&reporter),
+            Some(&refused_policy),
+            Some(&refused.reporter),
+            false,
+        )
+        .await
+        {
+            Ok(_) => panic!("a refused bind must fail the attach like a failed one"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("7070")
+                && err.to_string().contains("not declared on this row"),
+            "the refusal names its port and carries the reason the gate gave: {err}"
+        );
+
+        // Every declared port was attempted — the refusal is answered, not
+        // anticipated — and both binds that landed are rolled back with it:
+        // a half-bound box holds nothing.
+        let events = collect_until(&mut refused_events_rx, "/services/forwarder/unexpose", 2).await;
+        assert_eq!(
+            locals_of(&events, "/services/forwarder/expose"),
+            vec!["127.0.0.1:8080", "127.0.0.1:9090", "127.0.0.1:7070"],
+            "all three binds were attempted: {events:?}"
+        );
+        assert_eq!(
+            locals_of(&events, "/services/forwarder/unexpose"),
+            vec!["127.0.0.1:8080", "127.0.0.1:9090"],
+            "the binds that succeeded are rolled back with the refused one: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|(p, _)| p == "/services/dns/add"),
+            "a refused bind publishes no name: {events:?}"
+        );
+        let held = refused
+            .registry
+            .read()
+            .expect("registry lock")
+            .zone_entry("web.min.internal", &[]);
+        assert_eq!(
+            held,
+            crate::net::dns::ZoneEntry::Absent,
+            "no substitute address stands in for the refused bind: {held:?}"
+        );
+        // The refusal is the log's own fact, said per port: the declared
+        // number, and the reason the gate gave, in the same warn line.
+        let log = capture.contents();
+        assert!(
+            log.contains("binding declared ingress port failed")
+                && log.contains("port=7070")
+                && log.contains("port 7070 is not declared on this row"),
+            "the refused bind says its line with the port and the reason: {log}"
+        );
+        refused_fake.abort();
+
+        // Shape two: a bind that errors — the real forwarder answering a
+        // bind failure — fails the attach the same way, on its own ports.
+        let failed = attach_scenario(&dir, "gvproxy-2.sock");
+        let (failed_events_tx, mut failed_events_rx) = mpsc::channel(64);
+        let (handed_tx, _handed_rx) = mpsc::channel(4);
+        let failed_fake = spawn_control_channel_deciding(
+            failed.control_path.clone(),
+            |path, body| {
+                if path == "/services/forwarder/expose" && body.contains("127.0.0.1:9090") {
+                    (500, String::new())
+                } else {
+                    ok()
+                }
+            },
+            failed_events_tx,
+            handed_tx,
+        );
+        let failed_switch = vm_host_switch();
+        let failed_policy = declared_two_ports();
+        let err = match crate::net::gvproxy_network::complete_own_ip_attach(
+            &failed_switch,
+            failed.tap_fd,
+            ControlChannel::Unix(failed.control_path.clone()),
+            LEASE,
+            "web",
+            Some(&failed_policy),
+            Some(&failed.reporter),
             false,
         )
         .await
@@ -1283,12 +1437,9 @@ mod tests {
             "the failure names the bind that failed: {err}"
         );
 
-        // What reached the switch: both exposes, then the rollback of the
-        // one that succeeded. No registration, ever.
-        let mut events = Vec::new();
-        while let Ok(event) = events_rx.try_recv() {
-            events.push(event);
-        }
+        // Both binds attempted, the one that landed rolled back, and no
+        // registration — the same shape the refusal proved, on its own ports.
+        let events = collect_until(&mut failed_events_rx, "/services/forwarder/unexpose", 1).await;
         assert_eq!(
             locals_of(&events, "/services/forwarder/expose"),
             vec!["127.0.0.1:8080", "127.0.0.1:9090"],
@@ -1303,12 +1454,8 @@ mod tests {
             !events.iter().any(|(p, _)| p == "/services/dns/add"),
             "a failed bind publishes no name: {events:?}"
         );
-
-        // And no route in the registry: the name the box's declaration
-        // wanted is held by nothing — looked up as the full zone name the
-        // registry answers, so the assertion is about the route the attach
-        // never reported, not a name nothing ever held.
-        let held = registry
+        let held = failed
+            .registry
             .read()
             .expect("registry lock")
             .zone_entry("web.min.internal", &[]);
@@ -1317,41 +1464,331 @@ mod tests {
             crate::net::dns::ZoneEntry::Absent,
             "no substitute address stands in for the failed bind: {held:?}"
         );
-
-        // The failure is the log's own fact: one warn per failed bind, with
-        // the port and the reason.
         let log = capture.contents();
         assert!(
-            log.contains("binding declared ingress port failed")
-                && log.contains("port=9090")
-                && log.contains("error="),
-            "the failed bind says its line with the port and the reason: {log}"
+            log.contains("binding declared ingress port failed") && log.contains("port=9090"),
+            "the failed bind says its line with the port: {log}"
         );
-        fake.abort();
+        failed_fake.abort();
     }
 
-    /// NET-121's sub 1: a declared port's ingress revoked ends its
-    /// connections at once. The proof drives a whole handshake through the
-    /// relay the attach built — the client connects, the box answers — then
-    /// revokes the port: the connection's reset is on the switch side before
-    /// the unexpose finishes, a further connection attempt to the port is
-    /// refused with a reset and never reaches the box, and the forwarder's
-    /// unbind reaches the switch. A port no forwarder was bound for is
-    /// refused by name.
-    #[tokio::test]
-    async fn ingress_revocation_unbinds_forwarder_and_terminates_connections() {
-        const CLIENT: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 50);
-        const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
+    /// A forwarding stand-in: the gvproxy a host-side client can actually
+    /// talk to. An expose binds a real host TCP listener at the `local` the
+    /// attach named; an unexpose drops that listener and confirms it is gone
+    /// *before* the answer goes back, so a revocation that returned has
+    /// really unbound the port; and the `/connect` upgrade is driven the
+    /// way the real switch drives its half of the relay — a host connection
+    /// becomes a leg with its own source port and a fresh SYN toward the
+    /// box's `remote`, the frames that come back are answered (a SYN-ACK
+    /// earns the handshake's last ACK), and a reset closes the leg's host
+    /// socket, the way the real forwarder ends its side of a connection the
+    /// box terminated.
+    ///
+    /// Every frame the stand-in reads off the relay is copied to
+    /// `switch_frames`, in arrival order, for the proof to inspect.
+    ///
+    /// The order the daemon's revocation takes — the gate's reset queued
+    /// before the unexpose request is written — cannot be shown as one wire
+    /// order by a stand-in that sees the relay and the control channel as
+    /// two connections, so each half is pinned where it is observable: the
+    /// reset is read off the relay and only its arrival closes the host
+    /// socket, and the unexpose is answered only after the listener is
+    /// confirmed dropped.
+    fn spawn_forwarder_gvproxy(
+        path: PathBuf,
+        events: mpsc::Sender<(String, String)>,
+        switch_frames: mpsc::Sender<Vec<u8>>,
+    ) -> tokio::task::JoinHandle<()> {
+        // One live forward by its `local` address: the channel that tells
+        // its accept loop to drop its listener.
+        let forwards: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<oneshot::Sender<()>>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        // Accepted host sockets, on their way to the switch side with the
+        // box-side address their forward targets.
+        let (accepted_tx, accepted_rx) = mpsc::channel(4);
+        let mut accepted_rx = Some(accepted_rx);
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok((head, body)) = read_request_head_and_body(&mut sock).await else {
+                    return;
+                };
+                if head.starts_with("POST /connect") {
+                    // The real switch hijacks the connection and writes no
+                    // response; this stand-in *is* the switch side from here
+                    // on.
+                    if let Some(accepted_rx) = accepted_rx.take() {
+                        tokio::spawn(switch_side(sock, switch_frames.clone(), accepted_rx));
+                    }
+                    continue;
+                }
+                let request_path = head
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let body = String::from_utf8_lossy(&body).into_owned();
+                // The stand-in's own answers: a forward it can bind answers
+                // 200; a bind that fails answers 500 — a failed bind, which
+                // the attach reports; an unexpose for a forward it holds
+                // drops the listener first, and one it does not hold
+                // answers 404, the real switch's answer for a name it
+                // never bound.
+                let (status, reason_body) = match (request_path.as_str(), body.as_str()) {
+                    ("/services/forwarder/expose", _) => {
+                        let local = json_string_field(&body, "local").unwrap_or_default();
+                        let remote = json_string_field(&body, "remote").unwrap_or_default();
+                        let bind = local.rsplit_once(':').and_then(|(host, port)| {
+                            Some((host.parse::<IpAddr>().ok()?, port.parse::<u16>().ok()?))
+                        });
+                        let target = remote.rsplit_once(':').and_then(|(ip, port)| {
+                            Some((ip.parse::<Ipv4Addr>().ok()?, port.parse::<u16>().ok()?))
+                        });
+                        match (bind, target) {
+                            (Some((host, port)), Some(target)) => {
+                                match TcpListener::bind((host, port)).await {
+                                    Ok(bound) => {
+                                        let (stop_tx, stop_rx) = mpsc::channel(1);
+                                        forwards
+                                            .lock()
+                                            .expect("the stand-in's forwards lock")
+                                            .insert(local.to_string(), stop_tx);
+                                        let accepted_tx = accepted_tx.clone();
+                                        tokio::spawn(async move {
+                                            let mut stop_rx = stop_rx;
+                                            let stopped: Option<oneshot::Sender<()>> = loop {
+                                                tokio::select! {
+                                                    accepted = bound.accept() => {
+                                                        match accepted {
+                                                            Ok((socket, _)) => {
+                                                                if accepted_tx
+                                                                    .send((socket, target))
+                                                                    .await
+                                                                    .is_err()
+                                                                {
+                                                                    break None;
+                                                                }
+                                                            }
+                                                            Err(_) => break None,
+                                                        }
+                                                    }
+                                                    confirm = stop_rx.recv() => {
+                                                        break confirm;
+                                                    }
+                                                }
+                                            };
+                                            drop(bound);
+                                            if let Some(confirm) = stopped {
+                                                let _ = confirm.send(());
+                                            }
+                                        });
+                                        ok()
+                                    }
+                                    Err(_) => (500, "bind failed".to_string()),
+                                }
+                            }
+                            _ => (500, "malformed forward request".to_string()),
+                        }
+                    }
+                    ("/services/forwarder/unexpose", _) => {
+                        let local = json_string_field(&body, "local").unwrap_or_default();
+                        let stop = forwards
+                            .lock()
+                            .expect("the stand-in's forwards lock")
+                            .remove(local);
+                        match stop {
+                            Some(stop) => {
+                                let (confirm_tx, confirm_rx) = oneshot::channel();
+                                if stop.send(confirm_tx).await.is_ok() {
+                                    let _ = confirm_rx.await;
+                                }
+                                ok()
+                            }
+                            None => (404, "no forward bound for that local".to_string()),
+                        }
+                    }
+                    _ => ok(),
+                };
+                let reason = match status {
+                    200..=299 => "OK",
+                    404 => "Not Found",
+                    500 => "Internal Server Error",
+                    _ => "Answered",
+                };
+                let mut response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n\r\n",
+                    reason_body.len()
+                )
+                .into_bytes();
+                response.extend_from_slice(reason_body.as_bytes());
+                sock.write_all(&response)
+                    .await
+                    .expect("the forwarding stand-in must answer");
+                events
+                    .send((request_path, body))
+                    .await
+                    .expect("the test is still collecting the control requests");
+            }
+        })
+    }
+
+    /// The switch side of the relay, as the forwarding stand-in drives it:
+    /// every accepted host socket becomes a leg with its own source port,
+    /// whose SYN rides the relay toward the box; the box's answers are
+    /// completed (a SYN-ACK earns the last ACK) and its resets end the
+    /// leg — closing the host socket, which is where the client's
+    /// connection ends.
+    async fn switch_side(
+        mut sock: UnixStream,
+        frames: mpsc::Sender<Vec<u8>>,
+        mut accepted: mpsc::Receiver<(TcpStream, (Ipv4Addr, u16))>,
+    ) {
+        // The leg's own address — the source gvproxy's forward legs speak
+        // from, on the box's own reserved range.
+        const LEG_SOURCE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 50);
+        const FIRST_LEG_PORT: u16 = 40000;
+        const LEG_ISN: u32 = 1000;
         const SYN: u8 = 0x02;
         const ACK: u8 = 0x10;
+        const RST: u8 = 0x04;
+
+        // The legs' host sockets, by the leg's source port.
+        let mut live: HashMap<u16, TcpStream> = HashMap::new();
+        let mut next_leg_port = FIRST_LEG_PORT;
+        // The relay's frames, buffered: a read can straddle a frame's
+        // length header, so the loop takes whole frames out of the buffer
+        // and keeps the rest for the next read.
+        let mut buffered: Vec<u8> = Vec::new();
+        let mut scratch = [0u8; 4096];
+        loop {
+            tokio::select! {
+                accepted = accepted.recv() => {
+                    let Some((socket, (remote_ip, remote_port))) = accepted else {
+                        break;
+                    };
+                    let leg_port = next_leg_port;
+                    next_leg_port += 1;
+                    live.insert(leg_port, socket);
+                    let syn = tcp_segment(
+                        (LEG_SOURCE, leg_port),
+                        (remote_ip, remote_port),
+                        LEG_ISN,
+                        0,
+                        SYN,
+                    );
+                    write_framed_stream(&mut sock, &syn)
+                        .await
+                        .expect("the leg's SYN rides the relay");
+                }
+                read = sock.read(&mut scratch) => {
+                    let Ok(n) = read else { break };
+                    buffered.extend_from_slice(&scratch[..n]);
+                    while let Some(frame) = take_framed(&mut buffered) {
+                        frames
+                            .send(frame.clone())
+                            .await
+                            .expect("the proof still collects the relay's frames");
+                        let destination_port = u16::from_be_bytes([frame[36], frame[37]]);
+                        if !live.contains_key(&destination_port) {
+                            continue;
+                        }
+                        let flags = frame[47];
+                        if flags & RST != 0 {
+                            // The box's connection was terminated at the
+                            // gate: the forwarder closes its half, and the
+                            // host-side client's connection ends.
+                            live.remove(&destination_port);
+                            continue;
+                        }
+                        if flags & SYN != 0 && flags & ACK != 0 {
+                            // The box answered the leg's SYN: complete the
+                            // handshake on the leg's side.
+                            let source_ip =
+                                Ipv4Addr::new(frame[26], frame[27], frame[28], frame[29]);
+                            let source_port =
+                                u16::from_be_bytes([frame[34], frame[35]]);
+                            let sequence =
+                                u32::from_be_bytes([frame[38], frame[39], frame[40], frame[41]]);
+                            let ack = tcp_segment(
+                                (LEG_SOURCE, destination_port),
+                                (source_ip, source_port),
+                                LEG_ISN + 1,
+                                sequence + 1,
+                                ACK,
+                            );
+                            write_framed_stream(&mut sock, &ack)
+                                .await
+                                .expect("the leg completes the handshake");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Takes one length-framed frame out of `buffered`, if a whole one is
+    /// there — the switch side's own read, which must survive reads that
+    /// straddle a frame's header.
+    fn take_framed(buffered: &mut Vec<u8>) -> Option<Vec<u8>> {
+        let len = u16::from_le_bytes([*buffered.first()?, *buffered.get(1)?]) as usize;
+        let frame = buffered.get(2..2 + len)?.to_vec();
+        buffered.drain(..2 + len);
+        Some(frame)
+    }
+
+    /// NET-121's sub 1, proved from the host-side client's view: a declared
+    /// port's ingress revoked ends the client's connection at once and
+    /// refuses the next one.
+    ///
+    /// The stand-in gvproxy binds real host listeners for the attach's
+    /// exposes, so the client here is a real socket on the host loopback —
+    /// not a frame the test writes into the relay. The connection is driven
+    /// end to end (the client connects, the stand-in opens the client's leg
+    /// through the relay, the test plays the box's half of the handshake),
+    /// and then the port is revoked while the box stays up.
+    ///
+    /// What the revocation owes the client, and what this asserts: the
+    /// connection it held *ends* — an EOF or a reset, within the bound
+    /// below, never a hang — because the gate terminated the flow it had
+    /// tracked: the reset rides the flow's own sequence pair, is addressed
+    /// to the leg, and is the last thing the relay ever says, with nothing
+    /// further reaching the box. And the next connect to the port is
+    /// *refused* — a connection refused, not an accepted-then-dropped —
+    /// because the forwarder's unexpose really dropped the host listener
+    /// before the revocation returned.
+    ///
+    /// The order the daemon takes — the gate's reset, then the unexpose —
+    /// cannot be shown as one wire order by a stand-in that sees the relay
+    /// and the control channel as two connections, so each half is pinned
+    /// where it is observable: the reset is read off the relay (and only
+    /// its arrival closes the client's socket), and the unexpose is answered
+    /// only after the listener is confirmed dropped.
+    #[tokio::test]
+    async fn ingress_revocation_unbinds_forwarder_and_terminates_connections() {
+        const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
+        // The leg's address — the same the stand-in's `switch_side` speaks
+        // from, so the assertions below can name it.
+        const LEG_SOURCE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 50);
+        const LEG_PORT: u16 = 40000;
+        const LEG_ISN: u32 = 1000;
+        const HOST_PORT: u16 = 48080;
+        const SYN: u8 = 0x02;
+        const ACK: u8 = 0x10;
+        const RST: u8 = 0x04;
+        // The bound the revocation owes the client its connection's end
+        // within — long enough that only a hang, not a scheduling hiccup,
+        // overruns it.
+        const REVOCATION_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
         let capture = crate::test_harness::captured_log();
         let dir = tempfile::TempDir::new().unwrap();
         let control_path = dir.path().join("gvproxy.sock");
         let (events_tx, mut events_rx) = mpsc::channel(64);
-        let (handed_tx, mut handed_rx) = mpsc::channel(4);
-        let fake =
-            spawn_control_channel_deciding(control_path.clone(), |_, _| 200, events_tx, handed_tx);
+        let (frames_tx, mut frames_rx) = mpsc::channel(64);
+        let fake = spawn_forwarder_gvproxy(control_path.clone(), events_tx, frames_tx);
         let switch = vm_host_switch();
         let registry = Arc::new(std::sync::RwLock::new(dns::HostnameRegistry::new(
             "aaaa1", true,
@@ -1360,11 +1797,11 @@ mod tests {
             Arc::clone(&registry),
             sessions::SessionId::nil(),
         );
-        // One declared port: host :8080 forwards to the box's :80.
+        // One declared port: host :48080 forwards to the box's :80.
         let policy = sessions::SessionPolicy {
             ingress: Some(sessions::IngressPolicy {
                 port_mappings: vec![sessions::PortMapping {
-                    external_port: 8080,
+                    external_port: HOST_PORT,
                     internal_port: 80,
                     proto: sessions::IpProto::Tcp,
                 }],
@@ -1397,88 +1834,115 @@ mod tests {
             false,
         )
         .await
-        .expect("the attach completes against the stand-in");
+        .expect("the attach completes against the forwarding stand-in");
         // The attach's own traffic first: the binds and the registrations.
         let _attach_events = collect_until(&mut events_rx, "/services/dns/add", 2).await;
 
-        // The switch side of the box's relay, hijacked from the control
-        // upgrade.
-        let mut switch_end = handed_rx
-            .recv()
+        // A host-side client connects to the declared port — a real socket
+        // on the host loopback, at the address the forwarder bound.
+        let mut client = TcpStream::connect((IpAddr::from(Ipv4Addr::LOCALHOST), HOST_PORT))
             .await
-            .expect("the attach upgrades exactly one control connection");
+            .expect("the bound port admits a host-side client");
 
-        // A client connects to the declared port: its SYN is admitted by the
-        // ingress gate and reaches the box.
-        let syn = tcp_segment((CLIENT, 40000), (LEASE, 80), 1000, 0, SYN);
-        write_framed_stream(&mut switch_end, &syn)
+        // The forwarder opens the client's leg through the relay: the box
+        // sees a SYN from the leg's own address, at the port's declared
+        // number.
+        let syn = read_box_end_frame(&box_end)
             .await
-            .expect("the switch accepts the client's SYN");
-        let reached = read_box_end_frame(&box_end)
-            .await
-            .expect("the declared port admits the connection");
-        assert_eq!(reached, syn, "the SYN reaches the box unchanged");
+            .expect("the client's connection reaches the box");
+        assert_eq!(
+            syn,
+            tcp_segment((LEG_SOURCE, LEG_PORT), (LEASE, 80), LEG_ISN, 0, SYN),
+            "the forwarder's leg SYN arrives from the leg's own address"
+        );
 
-        // The box answers: its SYN-ACK rides the relay back to the switch.
-        let syn_ack = tcp_segment((LEASE, 80), (CLIENT, 40000), 5000, 1001, SYN | ACK);
-        box_end.write_all(&syn_ack).unwrap();
-        let answered = read_framed_stream(&mut switch_end)
+        // The box answers, and the leg completes the handshake: the
+        // connection is established, and the gate has the flow tracked.
+        box_end
+            .write_all(&tcp_segment(
+                (LEASE, 80),
+                (LEG_SOURCE, LEG_PORT),
+                5000,
+                LEG_ISN + 1,
+                SYN | ACK,
+            ))
+            .unwrap();
+        let leg_ack = read_box_end_frame(&box_end)
             .await
-            .expect("the box's answer rides the relay");
-        assert_eq!(answered, syn_ack, "the SYN-ACK reaches the client");
-
-        // The client completes the handshake, and the box confirms: the
-        // connection is established and held by the forwarder's port.
-        let client_ack = tcp_segment((CLIENT, 40000), (LEASE, 80), 1001, 5001, ACK);
-        write_framed_stream(&mut switch_end, &client_ack)
-            .await
-            .expect("the switch accepts the handshake's last leg");
-        let confirmed = read_box_end_frame(&box_end)
-            .await
-            .expect("the box sees the connection established");
-        assert_eq!(confirmed, client_ack);
+            .expect("the leg completes the handshake");
+        assert_eq!(
+            leg_ack,
+            tcp_segment((LEG_SOURCE, LEG_PORT), (LEASE, 80), LEG_ISN + 1, 5001, ACK),
+            "the handshake's last leg rides the relay"
+        );
 
         // The revocation: the port's ingress is withdrawn while the box
         // stays up.
         guard
-            .revoke_ingress(8080)
+            .revoke_ingress(HOST_PORT)
             .await
             .expect("the declared port's forwarder unbinds");
 
-        // The connection the port held is terminated: its reset — built from
-        // the last packet the gate saw of the flow, so it rides the flow's
-        // own sequence pair — is on the switch side.
-        let reset = read_framed_stream(&mut switch_end)
+        // The client's connection ends within the bound: an EOF — the
+        // forwarder closing its half of a connection the gate terminated —
+        // or the reset itself; never a hang, and never data.
+        let ended = tokio::time::timeout(REVOCATION_BOUND, client.read(&mut [0u8; 1]))
             .await
-            .expect("the revoked port's connection is terminated at once");
-        assert_reset_terminated(&reset, (LEASE, 80), (CLIENT, 40000), 5001, 1001);
+            .expect("the revoked port ends the client's connection within the bound");
+        match ended {
+            Ok(0) => {}
+            Ok(n) => panic!("the revoked connection delivered {n} bytes, not an end"),
+            Err(e) => assert!(
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ),
+                "the revoked connection ended with an error that is not a reset: {e}"
+            ),
+        }
+
+        // The next connect to the port is refused — the listener is gone,
+        // not a forwarder that accepts and drops.
+        let refused = TcpStream::connect((IpAddr::from(Ipv4Addr::LOCALHOST), HOST_PORT)).await;
+        assert!(
+            matches!(&refused, Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused),
+            "a revoked port refuses new connections instead of accepting them: {refused:?}"
+        );
+
+        // The reset that ended the connection is the gate's, not the box's:
+        // built from the flow the gate had tracked — the flow's own sequence
+        // pair, addressed to the leg — and the last thing the relay said.
+        let reset = loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), frames_rx.recv())
+                .await
+                .expect("the gate's reset rides the relay")
+                .expect("the switch side keeps tapping the relay's frames");
+            let destination_port = u16::from_be_bytes([frame[36], frame[37]]);
+            if frame[47] & RST != 0 && destination_port == LEG_PORT {
+                break frame;
+            }
+        };
+        assert_reset_terminated(
+            &reset,
+            (LEASE, 80),
+            (LEG_SOURCE, LEG_PORT),
+            5001,
+            LEG_ISN + 1,
+        );
         assert!(
             box_end_is_silent(&box_end),
-            "the reset is the switch's refusal, not the box's: nothing else \
+            "the reset is the gate's refusal, not the box's: nothing else \
              was forwarded"
         );
 
-        // And the port stays refused: a fresh connection attempt to it is
-        // answered with a reset at the gate and never reaches the box.
-        let retry = tcp_segment((CLIENT, 40001), (LEASE, 80), 2000, 0, SYN);
-        write_framed_stream(&mut switch_end, &retry)
-            .await
-            .expect("the switch accepts the retry");
-        let refused = read_framed_stream(&mut switch_end)
-            .await
-            .expect("a revoked port refuses instantly");
-        assert_reset_terminated(&refused, (LEASE, 80), (CLIENT, 40001), 0, 2001);
-        assert!(
-            box_end_is_silent(&box_end),
-            "a revoked port's connection attempt never reaches the box"
-        );
-
         // The unbind reached the switch: the forwarder's unexpose is on the
-        // control channel.
+        // control channel, at the same `local` it bound — and by the time
+        // the revocation returned, the host listener was already dropped,
+        // which is what makes the connect above a refusal.
         let events = collect_until(&mut events_rx, "/services/forwarder/unexpose", 1).await;
         assert_eq!(
             locals_of(&events, "/services/forwarder/unexpose"),
-            vec!["127.0.0.1:8080"],
+            vec![format!("{}:{HOST_PORT}", Ipv4Addr::LOCALHOST)],
             "the revoked port's forwarder is unbound: {events:?}"
         );
 
@@ -1487,7 +1951,7 @@ mod tests {
         let log = capture.contents();
         assert!(
             log.contains("unbinding ingress forwarder")
-                && log.contains("port=8080")
+                && log.contains(&format!("port={HOST_PORT}"))
                 && log.contains("terminated=1"),
             "the revocation says what it ended: {log}"
         );
@@ -1500,6 +1964,89 @@ mod tests {
         assert!(
             err.to_string().contains("9999"),
             "the refusal names the port it was asked for: {err}"
+        );
+        fake.abort();
+    }
+
+    /// NET-121's `local` is the box's handed host loopback address (T66):
+    /// a box whose registration the VM host daemon completed hands its
+    /// host loopback address in with the launch, and the attach's exposes
+    /// name exactly that address and the declared port — never `127.0.0.1`,
+    /// the node's shared interim a box without a handed address falls back
+    /// to (NET-123), and never an address the daemon picked for itself.
+    /// The same address comes off again at teardown: what was bound where
+    /// it was named is unbound there too.
+    ///
+    /// The daemon's own registration is the in-guest zone only; host-OS
+    /// name publication belongs to the host-side creator whose row handed
+    /// the address in — and this proof's registry row stands for that row.
+    #[tokio::test]
+    async fn local_is_the_handed_loopback_address() {
+        const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
+        // The host loopback address the box's registration handed it — the
+        // row's own slice of the reserved local range (T66).
+        const HANDED: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 9);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let scenario = attach_scenario(&dir, "gvproxy.sock");
+        // The host-side registration's row: the box's own address, published
+        // by the same stable id the reporter reads back — what `session`'s
+        // finalize does for a handed box, standing in for the host-side
+        // creator that owns the row.
+        scenario
+            .registry
+            .write()
+            .expect("registry lock")
+            .publish_own_address(
+                sessions::SessionId::nil(),
+                "web",
+                HANDED,
+                BTreeSet::from([8080u16, 9090]),
+            );
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (handed_tx, _handed_rx) = mpsc::channel(4);
+        let fake = spawn_control_channel_deciding(
+            scenario.control_path.clone(),
+            |_, _| ok(),
+            events_tx,
+            handed_tx,
+        );
+        let switch = vm_host_switch();
+        let policy = declared_two_ports();
+
+        let guard = match crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            scenario.tap_fd,
+            ControlChannel::Unix(scenario.control_path.clone()),
+            LEASE,
+            "web",
+            Some(&policy),
+            Some(&scenario.reporter),
+            false,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(e) => panic!("the attach completes at the handed address: {e}"),
+        };
+        let events = collect_until(&mut events_rx, "/services/dns/add", 1).await;
+
+        // The binds name the handed address and the declared ports — never
+        // `127.0.0.1`, and never a port number the daemon substituted.
+        assert_eq!(
+            locals_of(&events, "/services/forwarder/expose"),
+            vec![format!("{HANDED}:8080"), format!("{HANDED}:9090")],
+            "every bind names the handed loopback address: {events:?}"
+        );
+
+        // Teardown unbinds at the same address it bound: the handed
+        // address is the forward's for its whole life, not just its bind.
+        Box::new(guard).teardown().await;
+        let unbound = collect_until(&mut events_rx, "/services/forwarder/unexpose", 2).await;
+        assert_eq!(
+            locals_of(&unbound, "/services/forwarder/unexpose"),
+            vec![format!("{HANDED}:8080"), format!("{HANDED}:9090")],
+            "teardown unbinds every forwarder at the handed address: {unbound:?}"
         );
         fake.abort();
     }
