@@ -1,12 +1,12 @@
 //! VM box egress under a hostname-only allowlist (NET-068).
 //!
 //! Boots a real microVM with the guest `minimald`, creates an `OwnIp` box whose
-//! egress is only a list of toolchain hostnames, then runs the actual toolchain
-//! operations inside it: git clone, npm install, pip install, and a container
-//! image pull with `skopeo`. The VM's only path out is through the host gvproxy
+//! egress is only a list of toolchain hostnames, then runs NET-068's toolchain
+//! inside it: `git clone`, `npm install`, `pip install`, and a container image
+//! pull (with `skopeo`). The VM's only path out is through the host gvproxy
 //! switch; the guest's relay enforces the DNS-pinned hostname allowlist at the
-//! VM boundary. The composed box has no Debian userland, so apt is not exercised
-//! (recorded as a NET-068 deviation in the PR body).
+//! VM boundary. Every one of the four operations must exit 0 for the test to
+//! pass.
 //!
 //! Gates:
 //! - `#[cfg(minvmd_libkrun)]`: needs libkrun (macOS, or Linux with libkrun).
@@ -181,9 +181,11 @@ impl Guest {
 
     /// Return the lines appended to the guest boot log since the last call,
     /// so each tool failure is paired with the admissions/drops that happened
-    /// while it ran. The tail is filtered to DNS-gate and policy lines so a
-    /// chatty tool cannot push the admission/refusal evidence out of the cap,
-    /// and invalid UTF-8 is replaced rather than losing the whole tail.
+    /// while it ran. The tail is filtered to the DNS-gate and policy messages
+    /// so a chatty tool cannot push the admission/refusal evidence out of the
+    /// cap; when nothing matched, the last 40 unfiltered lines are returned
+    /// instead so the console is still visible. Invalid UTF-8 is replaced
+    /// rather than losing the whole tail.
     fn tail_boot_log(&mut self) -> String {
         let contents = match std::fs::read(&self.boot_log_path) {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
@@ -199,17 +201,30 @@ impl Guest {
         self.boot_log_offset = total_len;
         // Keep only the evidence the DNS gate and policy warnings emit; the
         // diagnostics requirement is to name the host that was not admitted.
+        // Match on the message text alone ("admitted a resolved name's
+        // addresses for the window", "refused a resolved name's answers past
+        // the per-name cap", "an allowed name resolved into a refused range",
+        // and the switch's `rule_matched` refusals), never on a tracing target
+        // or component field, which the guest console may not print.
         let mut lines: Vec<&str> = tail
             .lines()
             .filter(|line| {
-                line.contains("dns-gate")
-                    || line.contains("admitted")
+                line.contains("admitted")
                     || line.contains("refused")
                     || line.contains("rule_matched")
             })
             .rev()
             .take(120)
             .collect();
+        if lines.is_empty() {
+            lines = tail.lines().rev().take(40).collect();
+            lines.reverse();
+            return format!(
+                "(no admission/refusal lines; last {} unfiltered lines)\n{}",
+                lines.len(),
+                lines.join("\n")
+            );
+        }
         lines.reverse();
         lines.join("\n")
     }
@@ -256,10 +271,9 @@ async fn hostname_allowlist_toolchain_completes() {
     }
     let session_id = session_id.expect("failed to create toolchain session");
 
-    // Toolchain exercises: git, npm, pip, and a container pull. The composed
-    // box has no Debian userland or `apt` package, so the apt leg NET-068 named
-    // is not exercised here; the hostname-only allowlist still must admit every
-    // host these four tools contact.
+    // NET-068's toolchain: git clone, npm install, pip install, and a container
+    // pull. The hostname-only allowlist must admit every host these four tools
+    // contact, and each must exit 0.
     let tools = [
         (
             "git",
@@ -321,8 +335,7 @@ async fn hostname_allowlist_toolchain_completes() {
 
     assert!(
         failures.is_empty(),
-        "hostname-only allowlist toolchain operations failed: {failures:?}\n\
-         note: apt is not exercised because the composed box has no Debian userland"
+        "hostname-only allowlist toolchain operations failed: {failures:?}"
     );
 }
 

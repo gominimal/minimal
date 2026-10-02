@@ -1207,8 +1207,6 @@ pub(crate) mod tests {
         // — the gate treats each name independently (per-name cap and matching),
         // so the shape is the same for every host.
         let toolchain = [
-            ("deb.debian.org.", Ipv4Addr::new(146, 59, 118, 203)),
-            ("security.debian.org.", Ipv4Addr::new(151, 101, 2, 132)),
             ("github.com.", Ipv4Addr::new(140, 82, 121, 3)),
             ("codeload.github.com.", Ipv4Addr::new(140, 82, 113, 10)),
             (

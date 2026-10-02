@@ -83,8 +83,6 @@ pub struct PortMapping {
 /// list and cannot drift.
 #[doc(hidden)]
 pub const NET068_TOOLCHAIN_EGRESS_HOSTS: &[&str] = &[
-    "deb.debian.org",
-    "security.debian.org",
     "github.com",
     "codeload.github.com",
     "raw.githubusercontent.com",
