@@ -308,23 +308,31 @@ const DROP_WARN_MAX_TRACKED_PAIRS: usize = 1024;
 const UNKNOWN_SOURCE_RULE: &str = "egress-unknown-source";
 
 /// The rule name for a frame headed to the switch's own address — the plan's
-/// gateway — on a port that is neither the resolver's (the one carve-out the
-/// frame rules admit there) nor a port the frame's source namespace declares
-/// as its own exposure. The switch's control surface is not a destination a
-/// box's egress rules decide (design §4.1, §7.1): whatever a box's rules
-/// allow, nothing at the gateway answers a box but its resolver and its own
-/// published reach, and a frame naming any other port there points at the
-/// switch itself — refused before any row or phase is consulted, in force in
-/// every phase, so no interim and no row can ever admit it.
+/// gateway — that is not a resolver query: TCP or UDP to the resolver's port
+/// is the one carve-out the frame rules admit there, and everything else —
+/// any other port, any other protocol, ICMP included — points at the switch
+/// itself. The switch's control surface is not a destination a box's egress
+/// rules decide (design §4.1, §7.1): whatever a box's rules allow, nothing at
+/// the gateway answers a box but its resolver — a box's admitted ports are
+/// its own ingress, reached on its own address, never a flow to the gateway —
+/// so the frame is refused before any row or phase is consulted, in force in
+/// every phase, and no interim and no row can ever admit it.
 const SWITCH_CONTROL_RULE: &str = "egress-switch-control-surface";
 
 /// The port the resolver carve-out is keyed to at the gateway (NET-079):
-/// DNS. The switch's control-surface refusal excepts the resolver's port and
-/// nothing else of its own: a frame that falls past the exception is still
-/// decided by the row or the phase behind it, so the exception admits
-/// nothing on its own — a deny-all box's non-carve-out frame to the gateway
-/// is refused by its row as it would be anywhere else.
+/// DNS, over UDP or TCP (a query falls back to TCP on truncation, so the
+/// carve-out is by address and port, not protocol). The switch's
+/// control-surface refusal excepts the resolver's port and nothing else: a
+/// frame that falls past the exception is still decided by the row or the
+/// phase behind it, so the exception admits nothing on its own — a deny-all
+/// box's resolver frame to the gateway is refused by its row as it would be
+/// anywhere else.
 const RESOLVER_PORT: u16 = 53;
+
+/// The two IPv4 protocols a resolver query travels over: UDP, and TCP when
+/// the answer is truncated. A frame to the gateway in any other protocol has
+/// no resolver to be headed for, whatever its L4 bytes say.
+const RESOLVER_PROTOCOLS: [u8; 2] = [6, 17];
 
 /// The rule name for the interim's admitted-unregistered source: a frame
 /// whose source is an address the plan could hand to a box but no published
@@ -2255,9 +2263,8 @@ enum GateAdmit {
 /// verdict's own family drops decide them, under any rules, fail-closed.
 ///
 /// One destination no row or phase decides either: the switch's own address
-/// ([`SWITCH_CONTROL_RULE`]), refused on every port but the resolver's and the
-/// source namespace's declared exposures, before the row's decision and the
-/// interim, in every phase.
+/// ([`SWITCH_CONTROL_RULE`]), refused for everything but TCP or UDP to the
+/// resolver's port, before the row's decision and the interim, in every phase.
 fn gate_verdict(
     summary: &FrameSummary,
     table: &BoxTable,
@@ -2280,28 +2287,32 @@ fn gate_verdict(
     }
     // The switch's own address is a control surface, not a destination a
     // box's egress rules decide (design §4.1, §7.1). Every frame from a box
-    // to the gateway — the address the resolver answers at, and the only one
-    // gvproxy serves from inside the fabric — is refused on every port but
-    // the resolver's and the source namespace's declared exposures, whatever
-    // the rows and the phase would say about the rest of the frame: the
-    // check sits before the row's decision and before the interim, so no
-    // allow-all row and no announced concession can admit a frame at the
-    // switch's own address, and it reads no phase at all, so it binds
-    // unchanged when the per-box default binds. The exceptions fall through
-    // to the decision behind this check — the row's own rules or the phase —
-    // which still decides them, so the resolver's carve-out and a declared
-    // exposure admit exactly what they admitted before, and the refusal
-    // adds a ceiling without moving any floor.
-    let record = table.by_source(src);
+    // to the gateway — the address the resolver answers at, and the one
+    // gvproxy's API listens on — is refused unless it is TCP or UDP to the
+    // resolver's port, whatever the rows and the phase would say about the
+    // rest of the frame: any other port, and any other protocol (ICMP has no
+    // port to carve out by), points at the switch itself. A row's admitted
+    // ports are no exception — they are the box's own ingress, what others
+    // reach on the box's address through the switch's forwarders, and no
+    // box-to-gateway flow at them exists. The check sits before the row's
+    // decision and before the interim, so no allow-all row and no announced
+    // concession can admit a frame at the switch's own address, and it reads
+    // no phase at all, so it binds unchanged when the per-box default binds.
+    // The resolver carve-out falls through to the decision behind this check
+    // — the row's own rules or the phase — which still decides it, so the
+    // carve-out admits exactly what it admitted before, and the refusal adds
+    // a ceiling without moving any floor.
     if summary.destination() == Some(table.gateway()) {
         let dst_port = summary.destination_port();
-        let declared_exposure = record
-            .as_ref()
-            .is_some_and(|record| record.admitted_ports().contains(&dst_port));
-        if dst_port != RESOLVER_PORT && !declared_exposure {
+        let resolver_query = summary
+            .protocol()
+            .is_some_and(|proto| RESOLVER_PROTOCOLS.contains(&proto))
+            && dst_port == RESOLVER_PORT;
+        if !resolver_query {
             return Err(GateDrop::SwitchControlSurface { src, dst_port });
         }
     }
+    let record = table.by_source(src);
     // The namespace that holds the source decides its frames by its own
     // compiled rules — the shared verdict, unchanged, now made outside where
     // nothing inside can change it. One drop class defers to the in-guest
@@ -2357,10 +2368,9 @@ enum GateDrop {
         /// The source address no namespace holds.
         src: [u8; 4],
     },
-    /// The frame named the switch's own address on a port that is neither the
-    /// resolver's nor the source namespace's declared exposure: the switch's
-    /// control surface is not a destination a box's egress rules decide
-    /// ([`SWITCH_CONTROL_RULE`]).
+    /// The frame named the switch's own address and was not a TCP or UDP
+    /// query to the resolver's port: the switch's control surface is not a
+    /// destination a box's egress rules decide ([`SWITCH_CONTROL_RULE`]).
     SwitchControlSurface {
         /// The source address the frame wore.
         src: [u8; 4],
@@ -2531,7 +2541,7 @@ impl DropLimiter {
                     rule_matched = SWITCH_CONTROL_RULE,
                     "dropped a frame to the switch's own address; its control surface is not \
                      a destination a box's egress rules decide, and nothing answers a box \
-                     there but its resolver and its own declared exposures",
+                     there but its resolver",
                 );
                 true
             }
@@ -3298,29 +3308,30 @@ mod tests {
 
     /// The switch's own address is a control surface, not a destination a
     /// box's egress rules decide (design §4.1, §7.1): a frame from a box to
-    /// the gateway on a port that is neither the resolver's nor one of the
-    /// box's declared exposures is dropped at the host-side gate, whatever
-    /// the box's rules allow — an absent `egress` section's allow-all
-    /// program and a declared allow-all section both — and the drop says so,
-    /// rate-limited, naming the box's address and the port. The resolver's
-    /// port still answers: DNS to the gateway reaches the switch for both
-    /// boxes. The check binds under the shipped announced phase and is not
-    /// gated on a row: an unregistered in-plan source's frame at the gateway
-    /// is refused too, where the interim would admit it anywhere else.
+    /// the gateway that is not a TCP or UDP query to the resolver's port is
+    /// dropped at the host-side gate, whatever the box's rules allow — an
+    /// absent `egress` section's allow-all program and a declared allow-all
+    /// section both — and the drop says so, rate-limited, naming the box's
+    /// address and the port. The resolver's port still answers, over UDP and
+    /// over TCP alike: DNS to the gateway reaches the switch for both boxes.
+    /// A protocol with no port — ICMP — is refused with the rest. The check
+    /// binds under the shipped announced phase and is not gated on a row: an
+    /// unregistered in-plan source's frame at the gateway is refused too,
+    /// where the interim would admit it anywhere else.
     ///
     /// The port the refusals name is the shape of the switch's control
-    /// surface as a box would reach for it — gvproxy serves its API on the
-    /// host-side unix socket only, and nothing else of the switch answers at
-    /// the gateway, so the refusal is keyed to the address and every port
-    /// but the two the design excepts; the test's port stands for whichever
-    /// port the API could ever be probed on.
+    /// surface as a box would reach for it — gvproxy's API listens on the
+    /// gateway address, so the refusal is keyed to the address and every
+    /// port but the resolver's; the test's port stands for whichever port
+    /// the API could ever be probed on.
     #[tokio::test]
     async fn box_cannot_reach_switch_api() {
         // Two boxes whose rules allow everything: one whose declaration
         // carries no `egress` section — the allow-all program
         // [`sessions::core::egress::EgressRules::from_policy`] compiles for
         // an absent one — and one whose `egress` section allows all
-        // explicitly. Neither row admits the gateway.
+        // explicitly. Neither row admits the gateway; the admitted ports are
+        // each box's own ingress, which the gateway refusal never consults.
         let registry = BoxRegistry::new(SUBNET);
         let bare = [100, 64, 0, 9];
         let open = [100, 64, 0, 10];
@@ -3356,11 +3367,16 @@ mod tests {
         expect_silence(&mut h.switch).await;
 
         // The resolver's port still answers, for a box with no egress
-        // section and for a box with an allow-all one alike.
+        // section and for a box with an allow-all one alike, over UDP and
+        // over the TCP a truncated answer falls back to.
         let bare_dns = ipv4_frame(bare, 17, SUBNET.gateway().octets(), 53);
         let open_dns = ipv4_frame(open, 17, SUBNET.gateway().octets(), 53);
+        let bare_dns_tcp = ipv4_frame(bare, 6, SUBNET.gateway().octets(), 53);
+        let open_dns_tcp = ipv4_frame(open, 6, SUBNET.gateway().octets(), 53);
         send_frame(&mut h.guest, &bare_dns).await;
         send_frame(&mut h.guest, &open_dns).await;
+        send_frame(&mut h.guest, &bare_dns_tcp).await;
+        send_frame(&mut h.guest, &open_dns_tcp).await;
         assert_eq!(
             expect_frame(&mut h.switch).await,
             bare_dns,
@@ -3371,26 +3387,27 @@ mod tests {
             open_dns,
             "the allow-all box's resolver frame reaches the switch"
         );
-
-        // And the box's declared exposures are its own to use: the bare
-        // box's frame to the gateway on the port its row declares passes the
-        // refusal, decided by its allow-all rules behind it, while the open
-        // box's frame to the same port — a port its row does not declare —
-        // is refused like any other.
-        let bare_exposure = ipv4_frame(bare, 6, SUBNET.gateway().octets(), 8080);
-        let open_probe_port = ipv4_frame(open, 6, SUBNET.gateway().octets(), 8080);
-        send_frame(&mut h.guest, &bare_exposure).await;
-        send_frame(&mut h.guest, &open_probe_port).await;
-        send_frame(&mut h.guest, &marker).await;
         assert_eq!(
             expect_frame(&mut h.switch).await,
-            bare_exposure,
-            "the declared exposure passes the refusal"
+            bare_dns_tcp,
+            "the no-egress-section box's TCP resolver frame reaches the switch"
         );
         assert_eq!(
             expect_frame(&mut h.switch).await,
+            open_dns_tcp,
+            "the allow-all box's TCP resolver frame reaches the switch"
+        );
+
+        // A protocol with no port to carve out by is refused with the rest:
+        // ICMP from a registered allow-all box to the gateway never arrives,
+        // and the marker behind it does.
+        let icmp_probe = ipv4_frame(bare, 1, SUBNET.gateway().octets(), 0);
+        send_frame(&mut h.guest, &icmp_probe).await;
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
             marker,
-            "the open box's undeclared port at the gateway is refused"
+            "the ICMP probe at the gateway is refused"
         );
         expect_silence(&mut h.switch).await;
 
@@ -5226,11 +5243,10 @@ mod tests {
         );
 
         // The switch's own address is not a row's or the phase's to decide:
-        // a frame to the gateway on a port that is neither the resolver's nor
-        // the source's declared exposure is refused under either phase,
-        // whatever the rows hold — the gateway is a control surface, and the
-        // interim that would admit this source anywhere else never sees the
-        // frame. Port 443 names nothing this row declares.
+        // a frame to the gateway that is not a resolver query is refused
+        // under either phase, whatever the rows hold — the gateway is a
+        // control surface, and the interim that would admit this source
+        // anywhere else never sees the frame.
         let surface = summarize(&ipv4_frame(LEASE, 6, SUBNET.gateway().octets(), 443));
         assert_eq!(
             gate_verdict(&surface, &table, &baseline, UNREGISTERED_SOURCE_PHASE),
@@ -5281,17 +5297,17 @@ mod tests {
             gate_verdict(&resolver, &table, &baseline, UNREGISTERED_SOURCE_PHASE),
             Ok(GateAdmit::Row)
         ));
-        // A declared exposure passes the refusal too, and is decided by the
-        // row behind it like any other frame: this row allows `10.0.0.0/8`
-        // only, so the gateway is an undeclared destination to it — the
-        // refusal added a ceiling without moving the row's own floor.
-        let exposure = summarize(&ipv4_frame(LEASE, 6, SUBNET.gateway().octets(), 8080));
+        // A row's admitted ports are no carve-out: they are the box's own
+        // ingress, reached on its own address, and a frame to the gateway at
+        // one of them (this row admits 8080) is refused like any other port
+        // there — the row is never consulted.
+        let ingress_port = summarize(&ipv4_frame(LEASE, 6, SUBNET.gateway().octets(), 8080));
         assert_eq!(
-            gate_verdict(&exposure, &table, &baseline, UNREGISTERED_SOURCE_PHASE),
-            Err(GateDrop::Verdict(DropReason::UndeclaredSubnet {
-                dst: SUBNET.gateway().octets(),
-                proto: 6,
-            }))
+            gate_verdict(&ingress_port, &table, &baseline, UNREGISTERED_SOURCE_PHASE),
+            Err(GateDrop::SwitchControlSurface {
+                src: LEASE,
+                dst_port: 8080
+            })
         );
 
         // A source no row holds is the phase's to decide, and the plan decides

@@ -808,9 +808,10 @@ impl BoxTable {
     /// resolver answers at ([`SwitchSubnet::dns_server`], which is the same
     /// address) — as the octet array a frame's destination is compared by.
     /// The one destination inside the fabric that is a control surface, not
-    /// a destination a box's egress rules decide: the gate refuses a frame
-    /// headed here on any port but the resolver's and the source row's
-    /// declared exposures, before any row or phase is consulted.
+    /// a destination a box's egress rules decide: the gate refuses every
+    /// frame headed here but a TCP or UDP query to the resolver's port,
+    /// before any row or phase is consulted — a row's admitted ports are its
+    /// own ingress, never a flow to the gateway.
     #[must_use]
     pub fn gateway(&self) -> [u8; 4] {
         self.subnet.gateway().octets()
