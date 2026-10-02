@@ -17,7 +17,6 @@
 //! hang).
 
 use serde::Serialize;
-#[cfg(any(test, not(target_os = "macos")))]
 use std::net::Ipv4Addr;
 use std::time::Duration;
 use switch::loopback::RangeProbe;
@@ -34,7 +33,6 @@ pub(crate) const ZONE: &str = "min.internal";
 /// link keeps its servers, domains and default-route flag untouched — a
 /// link that exists for the zone alone is what keeps `resolvectl dns`'s
 /// replace-semantics from ever reaching the host's upstream resolution.
-#[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const ZONE_LINK: &str = "minzone0";
 
 /// The address [`ZONE_LINK`] carries, as a `/32` of global scope: the
@@ -54,7 +52,6 @@ pub(crate) const ZONE_LINK: &str = "minzone0";
 /// sets is configuration nothing consults: the state the native lane's
 /// `getent` failed on before this address existed. A `/32` routes nowhere
 /// beyond the address itself.
-#[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const ZONE_LINK_ADDR: Ipv4Addr = Ipv4Addr::new(100, 127, 255, 254);
 
 /// The reserved local range the daemon publishes per-box addresses from and
@@ -68,8 +65,49 @@ pub(crate) use switch::RESERVED_LOCAL_RANGE;
 /// The resolver file the advisory's command writes on macOS. `nameserver`
 /// plus `port` is the format the loopback-alias spike verified against
 /// mDNSResponder (docs/spikes/2026-09-22-macos-loopback-alias.md).
-#[cfg(any(test, target_os = "macos"))]
 pub(crate) const RESOLVER_FILE: &str = "/etc/resolver/min.internal";
+
+/// The label of the LaunchDaemon unit the macOS advisory command installs
+/// beside the resolver file: the boot-time service that re-applies the
+/// reserved local range at every boot (design §7.1's privileged step,
+/// NET-123's macOS half). The unit's plist, its program, and the custody
+/// checks over both, all name these three constants — one definition beside
+/// the command that writes them, so the installed unit, the advisory that
+/// reinstalls it, and the bundle that reads it cannot drift apart.
+pub(crate) const RANGE_UNIT_LABEL: &str = "dev.minimal.local-range";
+
+/// The root-owned path the unit's program is installed at, inside the
+/// system-managed helper directory — a path no user can write (`/Library` is
+/// root-owned, and the custody walk below verifies every component of it).
+pub(crate) const RANGE_PROGRAM_PATH: &str =
+    "/Library/PrivilegedHelperTools/dev.minimal.local-range";
+
+/// The root-owned path the unit's plist is installed at: the plist launchd
+/// scans at boot, which is what makes the range re-apply at every one.
+pub(crate) const RANGE_PLIST_PATH: &str = "/Library/LaunchDaemons/dev.minimal.local-range.plist";
+
+/// The range program's template
+/// ([`reserve-local-range.sh`](resolver/reserve-local-range.sh)): a `/bin/sh`
+/// script whose [`RANGE_ALIAS_PLACEHOLDER`] line is replaced at command time
+/// with one absolute-path `ifconfig` alias per usable host address of
+/// [`RESERVED_LOCAL_RANGE`]. The rendered program reads no argument, no
+/// environment variable and no file.
+const RANGE_PROGRAM_TEMPLATE: &str = include_str!("resolver/reserve-local-range.sh");
+
+/// The line of [`RANGE_PROGRAM_TEMPLATE`] the render replaces.
+const RANGE_ALIAS_PLACEHOLDER: &str = "@RANGE_ALIASES@";
+
+/// The unit's plist, as the command writes it: label [`RANGE_UNIT_LABEL`],
+/// ProgramArguments the root-owned program path alone, `RunAtLoad` true, no
+/// `KeepAlive`, no `UserName` (it runs as root), no environment variables.
+const RANGE_UNIT_PLIST: &str = include_str!("resolver/dev.minimal.local-range.plist");
+
+/// The heredoc delimiters the command carries the two files' bytes under.
+/// Distinctive enough that no rendered byte can close one early: the
+/// program's lines are `ifconfig` aliases and the plist's are XML, and
+/// neither can spell these.
+const RANGE_PROGRAM_HEREDOC: &str = "MINIMAL_RANGE_PROGRAM_EOF";
+const RANGE_PLIST_HEREDOC: &str = "MINIMAL_RANGE_PLIST_EOF";
 
 /// `/etc/resolv.conf`: the file every host process's lookup reads (through
 /// the `dns` NSS module), and so the one that must name resolved's stub for
