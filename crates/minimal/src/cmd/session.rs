@@ -149,10 +149,7 @@ pub(crate) async fn vm_host_answerer_status(
     let sock_path = vm_host_control_sock(global)?;
     let read = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
-        control_request_with_vm_host(
-            &sock_path,
-            minimald_rpc::BoxControlRequest::AnswererStatus,
-        ),
+        control_request_with_vm_host(&sock_path, minimald_rpc::BoxControlRequest::AnswererStatus),
     )
     .await;
     match read {
@@ -740,9 +737,7 @@ pub(crate) async fn activate_session(
             }
             None => (created.zone_answerer_port, created.answerer_bound, false),
         };
-    if held_no_channel
-        && let Some(answerer_port) = answerer_port
-    {
+    if held_no_channel && let Some(answerer_port) = answerer_port {
         // NET-138's warning, at every session start — TTY and non-TTY: it
         // rides stderr unconditionally, because the first lookup that
         // fails is the one it explains, and a piped activate is as owed
@@ -2783,9 +2778,11 @@ mod tests {
         let old_dir = tempfile::TempDir::new().unwrap();
         let old_provider = old_dir.path().join("providers").join("local-minvmd0");
         std::fs::create_dir_all(&old_provider).unwrap();
-        let _old_requests =
-            fake_vm_host(old_provider.join("control.sock"), r#"{"error":"unknown verb"}"#.to_string())
-                .await;
+        let _old_requests = fake_vm_host(
+            old_provider.join("control.sock"),
+            r#"{"error":"unknown verb"}"#.to_string(),
+        )
+        .await;
         let old = GlobalArgs {
             provider: Some(Provider::LocalMinvmd),
             minimal_dir: Some(old_dir.path().to_path_buf()),

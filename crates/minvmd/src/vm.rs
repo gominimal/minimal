@@ -468,9 +468,7 @@ fn node_proxy_port_from_env() -> Result<Option<u16>, crate::error::VmError> {
 /// Decodes a handed node proxy port from its raw env value. A value that does
 /// not decode fails the boot naming the variable and the value.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn node_proxy_port_from_raw(
-    proxy: Option<&str>,
-) -> Result<Option<u16>, crate::error::VmError> {
+fn node_proxy_port_from_raw(proxy: Option<&str>) -> Result<Option<u16>, crate::error::VmError> {
     let Some(raw) = proxy else {
         return Ok(None);
     };

@@ -370,12 +370,7 @@ mod tests {
     /// the test closes the test's view of the socket.
     fn spawn_server(
         dir: &std::path::Path,
-    ) -> std::io::Result<(
-        PathBuf,
-        JoinHandle<()>,
-        BoxRegistry,
-        AnswererStatus,
-    )> {
+    ) -> std::io::Result<(PathBuf, JoinHandle<()>, BoxRegistry, AnswererStatus)> {
         let sock_path = dir.join(CONTROL_SOCK_FILE);
         let boxes = BoxRegistry::new(SUBNET);
         let answerer = AnswererStatus::starting();
@@ -443,7 +438,8 @@ mod tests {
     fn box_addresses_allocated_on_host_and_handed_to_daemon() {
         let capture = server_capture();
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let (sock_path, _server, _boxes, _answerer) = spawn_server(dir.path()).expect("server binds");
+        let (sock_path, _server, _boxes, _answerer) =
+            spawn_server(dir.path()).expect("server binds");
 
         // The first registration is handed the hand-out run's first switch
         // address — the plan's PTask run above the daemon's self-allocation
@@ -650,7 +646,8 @@ mod tests {
 
         let capture = server_capture();
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let (sock_path, _server, registry, _answerer) = spawn_server(dir.path()).expect("server binds");
+        let (sock_path, _server, registry, _answerer) =
+            spawn_server(dir.path()).expect("server binds");
 
         // The registering client holds the pair the registration hands
         // back — the destroy-side proof it is the row's creator.

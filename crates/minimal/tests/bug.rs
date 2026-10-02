@@ -482,8 +482,7 @@ async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
     // answerer answered from, under the name the daemon writes — the
     // bundle carries the table itself, not just its name in the dir
     // listing.
-    let zone_table =
-        "[\n  {\n    \"name\": \"web.min.internal\",\n    \"address\": \"127.0.64.9\",\n    \"live\": true\n  }\n]";
+    let zone_table = "[\n  {\n    \"name\": \"web.min.internal\",\n    \"address\": \"127.0.64.9\",\n    \"live\": true\n  }\n]";
     std::fs::write(provider.join(minvmd::diag::ZONE_TABLE_FILE), zone_table).unwrap();
     // boot.log deliberately absent — recorded as a skip, not an error.
     // A native provider instance carries no zone dump either: same skip.
@@ -542,8 +541,11 @@ async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
     assert!(
         skipped.iter().any(|s| {
             s["what"]
-                == format!("providers/local-minimald0/{}", minvmd::diag::ZONE_TABLE_FILE)
-                    && s["reason"] == "absent"
+                == format!(
+                    "providers/local-minimald0/{}",
+                    minvmd::diag::ZONE_TABLE_FILE
+                )
+                && s["reason"] == "absent"
         }),
         "a provider instance with no zone dump records its absence the \
          same way a missing log does: {skipped:?}"

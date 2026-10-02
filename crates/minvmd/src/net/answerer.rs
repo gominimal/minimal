@@ -64,8 +64,8 @@ use std::time::Duration;
 use hickory_proto::op::{Message, MessageType, Metadata, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{A, SOA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
-use serde::{Deserialize, Serialize};
 use minimald_rpc::ZoneAnswererStatus;
+use serde::{Deserialize, Serialize};
 
 use sessions::core::zone_answer::{self, ZoneRow, ZoneView};
 
@@ -1694,9 +1694,7 @@ mod tests {
         let holder_status_probe = holder_status.clone();
         std::thread::Builder::new()
             .name("test-zone-holder".to_string())
-            .spawn(move || {
-                acquire_loop_at(holder_registry, port, holder_channel, holder_status)
-            })
+            .spawn(move || acquire_loop_at(holder_registry, port, holder_channel, holder_status))
             .expect("the holder's thread spawns");
 
         // The channel is bound before the serve loop starts, so the first
@@ -1749,7 +1747,8 @@ mod tests {
             assert_eq!(
                 reply.metadata.response_code,
                 ResponseCode::NoError,
-                "{} registered with the holder", row.name
+                "{} registered with the holder",
+                row.name
             );
             assert_eq!(
                 a_answer(&reply),
@@ -1828,9 +1827,7 @@ mod tests {
         let second_status_probe = second_status.clone();
         std::thread::Builder::new()
             .name("test-zone-registrant".to_string())
-            .spawn(move || {
-                acquire_loop_at(second, port, second_channel, second_status)
-            })
+            .spawn(move || acquire_loop_at(second, port, second_channel, second_status))
             .expect("the second daemon's thread spawns");
         assert_eq!(
             await_status(

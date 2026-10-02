@@ -1850,9 +1850,8 @@ fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
     .unwrap();
     let holder_ls = String::from_utf8(out).unwrap();
     assert!(
-        holder_ls.contains(
-            "ZONE ANSWERER:   answered by the VM host daemon (single-operator interim)"
-        ),
+        holder_ls
+            .contains("ZONE ANSWERER:   answered by the VM host daemon (single-operator interim)"),
         "the list names who answers the zone on a VM-backed host: {holder_ls}"
     );
     assert!(

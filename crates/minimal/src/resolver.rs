@@ -1208,10 +1208,7 @@ fn answerer_bound_blocking(port: u16) -> bool {
     let Ok(socket) = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)) else {
         return false;
     };
-    if socket
-        .set_read_timeout(Some(ANSWERER_PROBE_BOUND))
-        .is_err()
-    {
+    if socket.set_read_timeout(Some(ANSWERER_PROBE_BOUND)).is_err() {
         return false;
     }
     let query = host_row_query();
@@ -1255,9 +1252,9 @@ fn reply_answers_host_row(reply: &Message) -> bool {
         && reply.answers.iter().any(|record| {
             record.record_type() == RecordType::A
                 && matches!(
-                &record.data,
-                RData::A(A(address)) if *address == std::net::Ipv4Addr::LOCALHOST
-            )
+                    &record.data,
+                    RData::A(A(address)) if *address == std::net::Ipv4Addr::LOCALHOST
+                )
         })
 }
 
@@ -1589,8 +1586,8 @@ mod tests {
             "a silent port is not a bound answerer"
         );
         // A free port: the query's datagram has nothing to reach.
-        let probe = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .expect("the probe binds");
+        let probe =
+            std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("the probe binds");
         let free = probe.local_addr().expect("the port is named").port();
         drop(probe);
         assert!(

@@ -454,8 +454,7 @@ fn run_foreground() -> Result<()> {
     // child's env onto the kernel command line, and declared as the node
     // row's own publish. The daemon's setup publishes it at its address
     // (NET-025); the port it publishes is the port the guest binds.
-    let node_proxy_port =
-        assign_node_proxy_port().context("assigning the node's proxy port")?;
+    let node_proxy_port = assign_node_proxy_port().context("assigning the node's proxy port")?;
     boxes.register_node_namespace(node_proxy_port);
     // A box's row goes with its shuttle connection: the gate reports which
     // addresses each relay carried at the relay's end, and this drainer thread
@@ -484,7 +483,9 @@ fn run_foreground() -> Result<()> {
     // supervisor predating the socket — rather than failing a boot the
     // client could still activate against.
     let _control = crate::control::resolve_control_sock()
-        .and_then(|sock_path| crate::control::spawn(sock_path, boxes.clone(), answerer_status.clone()))
+        .and_then(|sock_path| {
+            crate::control::spawn(sock_path, boxes.clone(), answerer_status.clone())
+        })
         .inspect_err(|error| {
             tracing::warn!(
                 %error,
@@ -508,11 +509,9 @@ fn run_foreground() -> Result<()> {
     // moment the VM does — best-effort at startup, like the control socket:
     // a thread that could not spawn is warned and the VM still boots, its
     // names then answering from whatever daemon holds the port.
-    if let Err(error) = crate::net::answerer::spawn(
-        boxes.clone(),
-        DEFAULT_ANSWERER_PORT,
-        answerer_status,
-    ) {
+    if let Err(error) =
+        crate::net::answerer::spawn(boxes.clone(), DEFAULT_ANSWERER_PORT, answerer_status)
+    {
         tracing::warn!(
             %error,
             "failed to start the zone answerer; this VM's box names answer only from \
