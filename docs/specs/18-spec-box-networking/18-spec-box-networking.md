@@ -661,7 +661,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-133** WHEN a box is created on a host running a node-local Box Egress Proxy THE SYSTEM SHALL give the proxy, from the host-side creator outside the VM and before the box's first connection, an attachment naming the box by its box id, with its addressing and the source address it arrives from.
   tier:     T0
   verify:   cargo nextest run -p minvmd proxy_attachment_given_before_first_connection
-  <!-- event-driven; design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the local analogue of the feed's `bep` audience, a v1 conformance requirement; the facts come from outside the VM escape boundary and never from the in-VM daemon, which an escapee controls; the proxy attributes a connection only to a live box it holds an attachment for; host-address boxes share one attachment as their cohort (NET-078); the attachment is the box's NET-138 row, withdrawn with it -->
+  <!-- event-driven; design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the local analogue of the feed's `bep` audience, a v1 conformance requirement; the facts come from outside the VM escape boundary and never from the in-VM daemon, which an escapee controls; the proxy attributes a connection only to a live box it holds an attachment for; host-address boxes share one attachment as their cohort (NET-078); on a VM-backed host the attachment is the box's NET-138 row, withdrawn with it -->
   - IF the in-VM daemon reports an address-to-box fact THEN THE SYSTEM SHALL keep it out of the proxy's attachments.
     tier:   T0
     verify: cargo nextest run -p minvmd proxy_attachment_never_sourced_from_guest
@@ -898,7 +898,7 @@ is superseded only when host-OS resolution and published addresses are both
 deployed on that host, and identity plays no part in the condition. Allocation
 from the reserved range is host-global, arbitrated through the answerer's
 authenticated channel, and no daemon self-assigns (design §7.1); that is why
-NET-010's no-collision property ranges over every daemon on the host and why
+NET-010's no-collision property ranges over every allocator on the host and why
 NET-027 and NET-059 can route two daemons' names at once. Host-address boxes
 mirror their node's address instead (NET-129), which is why NET-010 ranges over
 own-address and `none` boxes only: same-port collisions on a shared address are
