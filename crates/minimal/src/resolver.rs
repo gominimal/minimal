@@ -858,8 +858,7 @@ pub(crate) fn advisory_at(
     // staying quiet on the daemon's interim flag, which on a VM-backed
     // host reads the guest's loopback — always present — and not the host
     // the names resolve on.
-    if hook.routes(port) && !interim && !matches!(range_present, Some(false)) && blocker.is_none()
-    {
+    if hook.routes(port) && !interim && !matches!(range_present, Some(false)) && blocker.is_none() {
         return None;
     }
     let mut facts = Vec::new();
