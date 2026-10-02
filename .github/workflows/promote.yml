@@ -38,9 +38,9 @@ on:
                 default: false
 
 env:
-    # Single source of truth for the gate's approver allowlist.
-    # Comma-separated, no spaces (the polling step splits on `,`).
-    APPROVERS: bryan-minimal,evanspearman,jessie-minimal,jtnkminimal,Max-minimal,mitodrummer,msample,norrietaylor
+    # The gate's approvers are the members of this team of the repository's
+    # owner, read once when the gate opens.
+    APPROVER_TEAM: minimalists
 
 jobs:
     gate:
@@ -53,10 +53,44 @@ jobs:
         outputs:
             issue_url: ${{ steps.issue.outputs.url }}
         steps:
+            # Reading a team's members needs the org `members` permission, which
+            # the default GITHUB_TOKEN lacks. A short-lived gominimal-aw-bot
+            # token carries only that permission (org standard — App tokens over
+            # PATs, see gominimal/min-aw ADR-0002).
+            - name: Mint team-read token (gominimal-aw-bot)
+              id: team-token
+              uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3 # zizmor: ignore[github-app] members:read is an org permission, so the token cannot be narrowed to repositories
+              with:
+                  app-id: ${{ vars.AW_BOT_APP_ID }}
+                  private-key: ${{ secrets.AW_BOT_PRIVATE_KEY }}
+                  owner: gominimal
+                  permission-members: read
+
+            # Fails the gate when the team cannot be read or has no one else in
+            # it: no approver list means no promotion.
+            - name: Resolve approvers
+              id: approvers
+              env:
+                  GH_TOKEN: ${{ steps.team-token.outputs.token }}
+                  ORG: ${{ github.repository_owner }}
+                  INITIATOR: ${{ github.triggering_actor }}
+              run: |
+                  set -euo pipefail
+                  MEMBERS=$(gh api --paginate "orgs/${ORG}/teams/${APPROVER_TEAM}/members?per_page=100" --jq '.[].login' \
+                    | tr '[:upper:]' '[:lower:]' | sort -u)
+                  INITIATOR_LC=$(printf '%s' "$INITIATOR" | tr '[:upper:]' '[:lower:]')
+                  LIST=$(printf '%s\n' "$MEMBERS" | grep -vx "$INITIATOR_LC" | paste -sd, - || true)
+                  if [ -z "$LIST" ]; then
+                    echo "::error::no approvers: @${ORG}/${APPROVER_TEAM} has no member besides the initiator"
+                    exit 1
+                  fi
+                  echo "list=${LIST}" >> "$GITHUB_OUTPUT"
+
             - name: Open approval issue
               id: issue
               env:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  APPROVERS: ${{ steps.approvers.outputs.list }}
                   REPO: ${{ github.repository }}
                   WORKFLOW: ${{ github.workflow }}
                   RUN_NUMBER: ${{ github.run_number }}
@@ -85,7 +119,7 @@ jobs:
                   Comment **\`approved\`** to proceed or **\`denied\`** to cancel.
                   Closing this issue without an approval comment counts as denial.
 
-                  Approver list (initiator excluded at runtime):
+                  Approvers (members of @${REPO%%/*}/${APPROVER_TEAM}, initiator excluded):
                   ${APPROVERS//,/, }"
 
                   URL=$(gh issue create \
@@ -113,6 +147,7 @@ jobs:
             - name: Wait for approver decision
               env:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  APPROVERS: ${{ steps.approvers.outputs.list }}
                   ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
                   REPO: ${{ github.repository }}
                   # triggering_actor reflects the user who triggered THIS run (incl. reruns),
@@ -122,11 +157,7 @@ jobs:
               run: |
                   set -euo pipefail
 
-                  INITIATOR_LC=$(printf '%s' "$INITIATOR" | tr '[:upper:]' '[:lower:]')
-                  ALLOWED_JSON=$(printf '%s' "$APPROVERS" | tr ',' '\n' \
-                    | tr '[:upper:]' '[:lower:]' \
-                    | grep -vx "$INITIATOR_LC" \
-                    | jq -R . | jq -s .)
+                  ALLOWED_JSON=$(printf '%s' "$APPROVERS" | tr ',' '\n' | jq -R . | jq -s .)
 
                   echo "Polling issue #${ISSUE_NUMBER}. Allowed approvers (initiator ${INITIATOR} excluded):"
                   echo "$ALLOWED_JSON" | jq -r '.[]'
