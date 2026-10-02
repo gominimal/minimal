@@ -894,19 +894,29 @@ mod tests {
 
     #[test]
     fn allocator_exhausts_a_tiny_subnet() {
-        // /29 => 8 addresses; network, gateway, daemon, host-alias, broadcast
-        // reserved, leaving exactly three allocatable hosts (.2 through .4).
-        // The run splits at its midpoint, so this daemon's reserve is .2
-        // alone and the host's hand-out run is .3 and .4 — exhaustion is
-        // explicit on each side, with no wrap and no reuse.
+        // /29 => 8 addresses; network, gateway, proxy, daemon, host-alias,
+        // broadcast reserved, leaving exactly two allocatable hosts (.2 and
+        // .3). The run splits at its midpoint, so this daemon's reserve is .2
+        // alone and the host's hand-out run is .3 alone — exhaustion is
+        // explicit on each side, with no wrap and no reuse. The proxy's
+        // address (.4, `broadcast - 3`) is infrastructure above the run, so
+        // it is refused as a handed address, exactly as one past the run
+        // would be.
         let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
+        assert_eq!(
+            subnet.box_egress_proxy_address(),
+            Ipv4Addr::new(10, 0, 0, 4)
+        );
         let mut a = IpAllocator::new(subnet);
         assert_eq!(a.allocate().unwrap().ip, Ipv4Addr::new(10, 0, 0, 2));
         assert!(matches!(a.allocate(), Err(NetError::SubnetExhausted(_))));
         // The reserve bounds only the daemon's draws: the run's remainder is
         // still there for the host's hand-outs, none of them ever drawn.
         a.hand(Ipv4Addr::new(10, 0, 0, 3)).unwrap();
-        a.hand(Ipv4Addr::new(10, 0, 0, 4)).unwrap();
+        assert!(matches!(
+            a.hand(Ipv4Addr::new(10, 0, 0, 4)),
+            Err(NetError::HandedAddressOutsidePlan { .. })
+        ));
         assert!(matches!(
             a.hand(Ipv4Addr::new(10, 0, 0, 3)),
             Err(NetError::HandedAddressCollision { .. })
@@ -940,8 +950,8 @@ mod tests {
             "both sub-runs are inside the plan's PTask run, and neither is empty"
         );
         // A tiny subnet splits in half, so both sides keep at least one
-        // address: a /29's three PTask addresses give the reserve .2 and the
-        // hand-out run .3 and .4.
+        // address: a /29's two PTask addresses give the reserve .2 and the
+        // hand-out run .3 alone (the proxy at .4 sits above the run).
         let tiny = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
         assert_eq!(
             self_allocation_run(tiny),
