@@ -46,9 +46,21 @@ const DEFAULT_VM_LABEL: &str = "vm";
 /// The sidebar label a VM's provider group carries: the VM's own name, so
 /// two VMs show as two groups an operator can tell apart. The default VM
 /// keeps its historic label (see [`DEFAULT_VM_LABEL`]).
+///
+/// A VM whose own name *is* one of the two reserved labels — `host` and
+/// `vm` are both valid VM names — would take the identity of the provider
+/// that label already belongs to: the dashboard keys its refresh, attach,
+/// and saved state by label alone, and [`connect_missing`] skips any
+/// candidate whose label a connected provider carries, so the VM's boxes
+/// would never reach the provider list. Such a name is escaped into the
+/// VM side's own namespace (`vm:host`, `vm:vm`), which no VM name can
+/// spell — [`paths::validate_vm_name`] admits no colon — so no two
+/// providers ever share a label.
 fn vm_label(vm: &str) -> String {
     if vm == paths::DEFAULT_VM_NAME {
         DEFAULT_VM_LABEL.to_string()
+    } else if vm == HOST_LABEL || vm == DEFAULT_VM_LABEL {
+        format!("{DEFAULT_VM_LABEL}:{vm}")
     } else {
         vm.to_string()
     }
@@ -57,7 +69,9 @@ fn vm_label(vm: &str) -> String {
 /// A reachable daemon the TUI lists sessions from.
 pub struct Provider {
     /// Sidebar group label: `host` for the host daemon, `vm` for the default
-    /// VM, a named VM's own name for each of those.
+    /// VM, a named VM's own name for each of those — except a name that
+    /// would collide with one of those two identities, which is namespaced
+    /// (see [`vm_label`]).
     pub label: String,
     /// The daemon's SSH socket, retained for attach and for background
     /// tasks that need their own connection.
@@ -567,6 +581,56 @@ mod tests {
             candidates.len(),
             unique.len(),
             "one socket must never be probed twice: {candidates:?}"
+        );
+    }
+
+    /// A VM named `host` or `vm` — both valid per
+    /// [`paths::validate_vm_name`] — must not take the identity of the
+    /// group those labels already belong to: the dashboard keys its
+    /// refresh, attach, and saved state by label alone, and
+    /// [`connect_missing`] skips any candidate whose label a connected
+    /// provider carries, so a verbatim label would keep the VM's boxes
+    /// from ever reaching the provider list once the host daemon (or the
+    /// default VM) is connected. The escape is the VM side's namespace,
+    /// which no VM name can spell, so both keep their own candidate and
+    /// every candidate keeps a label no other candidate carries.
+    #[test]
+    fn vms_named_for_the_reserved_labels_keep_their_own_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("providers/local-minvmd0");
+        for vm in ["host", "vm"] {
+            std::fs::create_dir_all(provider.join(vm)).unwrap();
+        }
+        let candidates = probe_candidates(Some(dir.path()));
+        let label_at = |sock: &std::path::Path| -> Option<String> {
+            candidates
+                .iter()
+                .find(|(_, s)| s == sock)
+                .map(|(label, _)| label.clone())
+        };
+        assert_eq!(
+            label_at(&provider.join("ssh.sock")).as_deref(),
+            Some("vm"),
+            "the default VM keeps its own historic label: {candidates:?}"
+        );
+        assert_eq!(
+            label_at(&provider.join("host").join("ssh.sock")).as_deref(),
+            Some("vm:host"),
+            "a VM named `host` must not take the host daemon's label: {candidates:?}"
+        );
+        assert_eq!(
+            label_at(&provider.join("vm").join("ssh.sock")).as_deref(),
+            Some("vm:vm"),
+            "a VM named `vm` must not take the default VM's label: {candidates:?}"
+        );
+        let unique_labels: std::collections::HashSet<_> =
+            candidates.iter().map(|(label, _)| label.clone()).collect();
+        assert_eq!(
+            candidates.len(),
+            unique_labels.len(),
+            "every candidate keeps a label no other candidate carries — the \
+             label is the identity `connect_missing` and the dashboard resolve \
+             providers by: {candidates:?}"
         );
     }
 }
