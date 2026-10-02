@@ -320,11 +320,18 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // not bound — the port lines below already tell that story. The
     // detection runs only in the modes that can print the verdict:
     // `--json` and `--raw` are machine-readable-only and never carry the
-    // line, so they pay no resolver read — and the answerer is bound on
-    // every current daemon, so every human-mode list does read the host,
-    // which is the read the line is for. The daemon's own view of this
-    // host's resolver is not a thing that exists, so the host's half is
-    // the host's to read.
+    // line, so they pay no resolver read. The answerer is bound on
+    // every current daemon, so every human-mode list does read the host —
+    // the line is this verb's status, so it stays where the user looks
+    // for it — but at the list's own deadline, not the session start's:
+    // the read runs under the same one-second deadline this list's own
+    // host-side subprocess probes carry (the git probes above), paid once
+    // by the two queries it runs together, so a wedged systemd-resolved
+    // costs `min ls` that one second — never the ten its queries could
+    // add — and the verdict a slow read loses is the proxy's, the arm
+    // that cannot strand the user (NET-019 keeps the proxy serving). The
+    // daemon's own view of this host's resolver is not a thing that
+    // exists, so the host's half is the host's to read.
     let surface = if args.json || args.raw {
         None
     } else {

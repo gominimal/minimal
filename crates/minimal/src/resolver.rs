@@ -580,70 +580,145 @@ pub(crate) fn stub_bypass_blocker(
     ))
 }
 
-/// How long one `resolvectl` query may run before detection gives up on
-/// it. A healthy systemd-resolved answers in milliseconds, but a wedged
-/// one — or its D-Bus bus — blocks the call indefinitely, and the session
-/// start this detection runs inside must neither prompt nor hang
-/// (NET-123); a query that outlives the bound reads as absent, the arm
-/// the advisory is safe under, instead of wedging the activate. Generous
-/// on purpose: a loaded host's slow-but-healthy query must not misread.
-#[cfg(not(target_os = "macos"))]
+/// How long the detection's two `resolvectl` queries may take between
+/// them before detection gives up on both: the deadline is the *pair's*,
+/// paid once — the queries run together ([`host_detection`]), so a wedged
+/// systemd-resolved costs the verb that reads this one wait, not one wait
+/// per query. A healthy systemd-resolved answers in milliseconds, but a
+/// wedged one — or its D-Bus bus — blocks each call indefinitely, and the
+/// session start this deadline was sized for must neither prompt nor hang
+/// (NET-123); a query the deadline outlives reads as absent, the arm the
+/// advisory is safe under, instead of wedging the activate. Generous on
+/// purpose: a loaded host's slow-but-healthy query must not misread. The
+/// queries this bounds run on Linux; macOS's detection is one file read
+/// that carries no deadline.
 const RESOLVECTL_BOUND: Duration = Duration::from_secs(5);
 
+/// The same deadline sized for the verb that must not wait:
+/// [`ls_detection`] — `min ls`'s form of the same detection — reads under
+/// this one. The list is the most frequently-invoked verb, run in loops
+/// and from shell prompts, and its read of the host's resolver must stay
+/// a status read, not a wait, so this is the deadline the list's own
+/// host-side subprocess probes already carry (`minimal-client`'s
+/// `GIT_PROBE_TIMEOUT`: "a list response must stay fast even when a
+/// session's project sits on a wedged filesystem"). A wedged
+/// systemd-resolved costs a `min ls` this one second — not the session
+/// start's five, and not ten when its two queries each pay that five —
+/// and a read the deadline outlives reads as absent, which is the
+/// proxy's arm: the verdict that cannot strand the user (NET-019 keeps
+/// the proxy serving), and the verdict a wedged resolver genuinely
+/// leaves. The queries this bounds run on Linux; macOS's detection is one
+/// file read that carries no deadline.
+const LIST_RESOLVECTL_BOUND: Duration = Duration::from_secs(1);
+
 /// One read-only query of `program`, or `None` when the binary is missing,
-/// the call failed, it outlived `bound`, or its output is not UTF-8.
-/// Reading through systemd-resolved's read API writes nothing, so it
-/// cannot prompt. `kill_on_drop` reaps the query the bound abandons, so a
-/// wedged call leaves no process behind on the host it hung.
+/// the call failed, or its output is not UTF-8. Reading through
+/// systemd-resolved's read API writes nothing, so it cannot prompt.
+/// `kill_on_drop` reaps a query the caller's deadline abandons — the
+/// deadline itself is the caller's, over the pair of queries
+/// [`host_detection`] makes — so a wedged call leaves no process behind
+/// on the host it hung.
 #[cfg(any(test, not(target_os = "macos")))]
-async fn bounded_query(program: &str, args: &[&str], bound: Duration) -> Option<String> {
-    let query = tokio::process::Command::new(program)
+async fn query(program: &str, args: &[&str]) -> Option<String> {
+    let output = tokio::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
-        .output();
-    let output = match tokio::time::timeout(bound, query).await {
-        Ok(output) => output.ok()?,
-        Err(_outlived_the_bound) => return None,
-    };
+        .output()
+        .await;
+    let output = output.ok()?;
     if !output.status.success() {
         return None;
     }
     String::from_utf8(output.stdout).ok()
 }
 
-/// One read-only `resolvectl` query, or `None` when the binary is missing,
-/// the call failed, it outlived [`RESOLVECTL_BOUND`], or its output is not
-/// UTF-8. Reading through systemd-resolved's read API writes nothing, so
-/// it cannot prompt.
-#[cfg(not(target_os = "macos"))]
-async fn resolvectl(args: &[&str]) -> Option<String> {
-    bounded_query("resolvectl", args, RESOLVECTL_BOUND).await
+/// [`query`] under `bound`: the form the deadline's mechanism is tested
+/// in. The production reads run the pair under one deadline instead
+/// ([`host_detection`]); this stays the seam that proves the mechanism —
+/// a call that outlives its bound reads as absent and leaves nothing
+/// behind on the host it hung.
+#[cfg(all(test, not(target_os = "macos")))]
+async fn bounded_query(program: &str, args: &[&str], bound: Duration) -> Option<String> {
+    // A query that outlived its bound reads as absent.
+    tokio::time::timeout(bound, query(program, args))
+        .await
+        .unwrap_or_default()
+}
+
+/// The query program a test installed in place of `resolvectl`, when one is
+/// installed. A wedged `resolvectl`, or a slow-but-healthy one, is not a
+/// state this host can be put in, so the tests that need one write a
+/// stand-in script and install its path here — the same stand-in discipline
+/// the daemon's tests use for their loopback probe. Process-global: under
+/// libtest the tests of one binary share a process, so the tests that use
+/// it hold the stand-in mutex in the tests module below for the whole
+/// install→assert→clear window; the other detection readers assert on no
+/// particular arm, so a stand-in they read by accident is a slower pass,
+/// not a wrong one.
+#[cfg(all(test, not(target_os = "macos")))]
+static QUERY_STANDIN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The program the detection's queries run: `resolvectl`, or the stand-in
+/// a test installed.
+#[cfg(all(test, not(target_os = "macos")))]
+fn query_program() -> String {
+    QUERY_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .unwrap_or_else(|| "resolvectl".to_string())
 }
 
 /// Reads the host's current hook state (NET-122's detection proper) and the
 /// reason no zone command would reach this host's lookups, when there is one.
-/// Detection is read-only and never prompts: two `resolvectl` queries —
-/// each bounded by [`RESOLVECTL_BOUND`], so a wedged systemd-resolved
-/// reads as absent rather than hanging the activate — and three file reads
-/// on Linux, one file read on macOS.
+/// Detection is read-only and never prompts: on Linux, two `resolvectl`
+/// queries under one [`RESOLVECTL_BOUND`] deadline — run together, so the
+/// deadline is paid once, and a wedged systemd-resolved reads as absent
+/// rather than hanging the activate — and three file reads; on macOS, one
+/// file read.
 pub(crate) async fn session_detection() -> (Hook, Option<String>) {
-    host_detection().await
+    host_detection(RESOLVECTL_BOUND).await
+}
+
+/// [`session_detection`] at [`LIST_RESOLVECTL_BOUND`], the deadline the
+/// list's read carries: `min ls` is the most frequently-invoked verb, so
+/// the same host state it reads must not make it a wait — the verdict a
+/// wedged systemd-resolved leaves is decided inside this one second, and
+/// it is the proxy's arm, the one that cannot strand the user, so the
+/// worst a wedged resolver costs a list is a second, never the session
+/// start's five.
+async fn ls_detection() -> (Hook, Option<String>) {
+    host_detection(LIST_RESOLVECTL_BOUND).await
 }
 
 #[cfg(target_os = "macos")]
-async fn host_detection() -> (Hook, Option<String>) {
+async fn host_detection(_bound: Duration) -> (Hook, Option<String>) {
     // macOS's resolver consults the resolver file directly — there is no
-    // stub for host lookups to bypass, so nothing can block the command.
+    // stub for host lookups to bypass, so nothing can block the command,
+    // and the one read this makes carries no deadline to bound.
     (host_hook().await, None)
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn host_detection() -> (Hook, Option<String>) {
-    let domain = resolvectl(&["domain"]).await;
-    let dns = resolvectl(&["dns"]).await;
+async fn host_detection(bound: Duration) -> (Hook, Option<String>) {
+    // The queries' program: the stand-in a test installed, else
+    // `resolvectl` itself.
+    #[cfg(test)]
+    let program = query_program();
+    #[cfg(not(test))]
+    let program = "resolvectl".to_string();
+    // Both queries under the one deadline, run together: the deadline is
+    // the pair's, paid once, so a wedged systemd-resolved costs the verb
+    // that reads this one wait — not one per query — and a pair that
+    // outlives it reads as absent, both queries reaped where they hang.
+    let (domain, dns) = tokio::time::timeout(bound, async {
+        tokio::join!(query(&program, &["domain"]), query(&program, &["dns"]))
+    })
+    .await
+    .unwrap_or((None, None));
     let resolv_conf = tokio::fs::read_to_string(RESOLV_CONF).await.ok();
     let nsswitch = tokio::fs::read_to_string(NSSWITCH_CONF).await.ok();
     let resolve_module = resolve_module_installed().await;
@@ -957,11 +1032,14 @@ pub(crate) async fn live_name_surface_at(
 
 /// [`live_name_surface_at`] with the detection this verb reads itself —
 /// `min ls`'s form: the list has no session-start advisory to share a
-/// read with, so the same bounded, read-only detection runs here, and
-/// only when the daemon's answerer is bound (the cheap half the reply
-/// carries). The answerer is bound on every current daemon, so this read
-/// is not one only rare hosts pay: `cmd_ls` runs it in the modes that
-/// print the verdict alone, which is where the read belongs.
+/// read with, so the same bounded, read-only detection runs here — at
+/// [`ls_detection`]'s [`LIST_RESOLVECTL_BOUND`], the list's deadline, not
+/// the session start's, because the list is the most frequently-invoked
+/// verb and its read must stay a status read — and only when the daemon's
+/// answerer is bound (the cheap half the reply carries). The answerer is
+/// bound on every current daemon, so this read is not one only rare hosts
+/// pay: `cmd_ls` runs it in the modes that print the verdict alone, which
+/// is where the read belongs.
 pub(crate) async fn live_name_surface(
     zone_answerer_port: Option<u16>,
     answerer_bound: bool,
@@ -969,7 +1047,7 @@ pub(crate) async fn live_name_surface(
     if zone_answerer_port.is_none() || !answerer_bound {
         return None;
     }
-    let detection = session_detection().await;
+    let detection = ls_detection().await;
     live_name_surface_at(&detection, zone_answerer_port, answerer_bound).await
 }
 
@@ -1818,10 +1896,10 @@ mod tests {
         assert!(json.contains("\"port\": 15353"), "{json}");
     }
 
-    // The bound on every `resolvectl` read: a wedged systemd-resolved — or
-    // its D-Bus bus — blocks the call indefinitely, and the activate that
-    // awaits it must neither prompt nor hang (NET-123). A call past its
-    // bound reads as absent, the arm the advisory is safe under.
+    // The mechanism under the detection's deadlines: a wedged
+    // systemd-resolved — or its D-Bus bus — blocks the call indefinitely,
+    // and no verb that reads it may hang (NET-123). A call past its bound
+    // reads as absent, the arm the advisory is safe under.
     #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn a_query_outliving_its_bound_reads_absent_instead_of_hanging() {
@@ -1851,5 +1929,124 @@ mod tests {
                 .is_none(),
             "a missing binary must read as absent"
         );
+    }
+
+    // NET-018's list read, and the deadline it carries — the round's
+    // deliberate answer to the question the list's frequency asks: `min ls`
+    // is the most frequently-invoked verb, run in loops and from shell
+    // prompts, and the session start's generous deadline was never a choice
+    // a list made. The two halves of the answer, each made testable by the
+    // query stand-in: a wedged resolver costs the list one deadline, not a
+    // hang, and the deadline is the pair's — paid once by the two queries
+    // that run under it together, not once per query.
+    //
+    /// Serializes the window in which a query stand-in is installed: the
+    /// stand-in is process-global (`query_program`), so under libtest —
+    /// where every test in this binary shares one process — a detection
+    /// driven by another test would read it too. Nextest runs each test
+    /// in its own process; the mutex keeps the in-process runner as safe.
+    #[cfg(not(target_os = "macos"))]
+    static QUERY_STANDIN_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// One stand-in `resolvectl`: `script` written executable into a fresh
+    /// tempdir and installed as the detection's query program. Dropping the
+    /// guard clears the install and the script together; hold the stand-in
+    /// mutex for the whole install→assert window, because the slot is
+    /// process-global.
+    #[cfg(not(target_os = "macos"))]
+    struct QueryStandin {
+        _script: tempfile::TempDir,
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    impl Drop for QueryStandin {
+        fn drop(&mut self) {
+            *QUERY_STANDIN.lock().unwrap() = None;
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn install_query_standin(script: &str) -> QueryStandin {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("a dir for the stand-in script");
+        let path = dir.path().join("resolvectl");
+        std::fs::write(&path, script).expect("the stand-in script to write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in script to be made executable");
+        *QUERY_STANDIN.lock().unwrap() = Some(path.to_string_lossy().into_owned());
+        QueryStandin { _script: dir }
+    }
+
+    /// The review's host, spelled out: a systemd-resolved wedged hard
+    /// enough that both queries hang — the exact case the deadline exists
+    /// for. The list still answers, inside its own one-second deadline and
+    /// not the session start's five, and the verdict it prints is the
+    /// proxy's — the arm a wedged resolver genuinely leaves, and the one
+    /// that cannot strand the user, because the proxy keeps serving
+    /// (NET-019).
+    // The window is held across the awaited read on purpose: the stand-in
+    // it installs is the point of the test.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the stand-in window must span the awaited read it stands in for"
+    )]
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn a_wedged_resolver_costs_the_list_one_deadline_not_a_hang() {
+        let _standin_window = QUERY_STANDIN_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let standin = install_query_standin("#!/bin/sh\nsleep 30\n");
+        let started = std::time::Instant::now();
+        let surface = live_name_surface(Some(15353), true).await;
+        assert_eq!(
+            surface,
+            Some(LiveSurface::Proxy),
+            "a wedged resolver leaves the proxy's arm — after {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < LIST_RESOLVECTL_BOUND * 3,
+            "the list's read must give up at its own deadline, not the session \
+             start's: {:?} against the deadline {:?}",
+            started.elapsed(),
+            LIST_RESOLVECTL_BOUND
+        );
+        drop(standin);
+    }
+
+    /// The deadline is the pair's, paid once: two queries that each answer
+    /// in 600 ms — slow but healthy, faster than the deadline — read whole
+    /// under the one second the list allows, because they run together. A
+    /// pair run one after the other instead would lose the second query to
+    /// the same deadline (it starts at 600 ms and the deadline fires at
+    /// 1 s), and a hook that reads takes both queries' facts together —
+    /// the routing domain from `domain`, the 127.0.0.1:<port> server from
+    /// `dns` — so the hook that routes is the proof both landed.
+    // The window is held across the awaited read on purpose: the stand-in
+    // it installs is the point of the test.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the stand-in window must span the awaited read it stands in for"
+    )]
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn the_lists_two_queries_run_under_one_deadline() {
+        let _standin_window = QUERY_STANDIN_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let standin = install_query_standin(
+            "#!/bin/sh\nsleep 0.6\n\
+             if [ \"$1\" = domain ]; then \
+             printf 'Global Domains: ~.\\nLink 2 (enp3s0): ~min.internal\\n'\nelse \
+             printf 'Global: 10.0.0.1\\nLink 2 (enp3s0): 127.0.0.1:15353\\n'\nfi\n",
+        );
+        let (hook, _) = ls_detection().await;
+        assert!(
+            hook.routes(15353),
+            "both queries must read within the one deadline — run together, not \
+             one after the other: {hook:?}"
+        );
+        drop(standin);
     }
 }
