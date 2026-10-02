@@ -670,6 +670,18 @@ pub(crate) async fn activate_session(
     {
         eprintln!("{advisory}");
     }
+    // NET-018: when the daemon reports native DNS as the live name surface,
+    // say so at the moment the user is about to rely on the names — and say
+    // the proxy's half with it (NET-019): the `HTTP(S)_PROXY` recipes this
+    // activation prints keep working beside native DNS, so nothing already
+    // captured goes stale. The proxy verdict prints nothing (the daemon's
+    // reason and remedy have their own lines); the advisory above is what
+    // says how to point the host's resolver at the answerer, and the two
+    // compose: the surface says where names answer from, the advisory how to
+    // reach it from this host's resolver.
+    if created.name_surface == minimald_rpc::NameSurface::Native {
+        eprintln!("{}", native_name_surface_line(created.hostname_proxy_port));
+    }
     let id = created.id;
 
     // The coming-change notice (NET-076), printed while the deny-all egress

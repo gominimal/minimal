@@ -350,6 +350,27 @@ pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>, command: &str)
     }
 }
 
+/// NET-018's report: the line `min ls` and `min session activate` print when
+/// the daemon reports native DNS as the live name surface — both halves of
+/// the condition it measures (its answerer serving, the reserved range
+/// present) are deployed on the host this daemon serves. `proxy_port` is the
+/// port the same reply carries, when the proxy came up: NET-019 keeps it
+/// serving beside native DNS, and the line says so, because a client that
+/// captured `HTTP(S)_PROXY` at activation keeps routing through it — the
+/// export does not go stale when the surface changes. Pure, so both verbs
+/// print the same words and tests assert them without capturing output.
+#[must_use]
+pub fn native_name_surface_line(proxy_port: Option<u16>) -> String {
+    let proxy_half = match proxy_port {
+        Some(port) => format!("; the hostname proxy still serves on 127.0.0.1:{port}"),
+        None => "; the hostname proxy still serves".to_string(),
+    };
+    format!(
+        "native DNS is the live name surface · <name>.min.internal answers from \
+         the zone answerer and each box's own reserved-range address{proxy_half}"
+    )
+}
+
 /// Format the session list for the given output mode. Split from
 /// [`cmd_ls`] so integration tests can capture output into a buffer
 /// instead of stdout.
@@ -407,6 +428,18 @@ pub fn format_ls(
             writeln!(
                 out,
                 "ZONE ANSWERER:   listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal"
+            )?;
+        }
+        // NET-018: say which of the two surfaces is live, when the daemon
+        // reports native DNS. The proxy verdict prints nothing: the two port
+        // lines above already tell that story, and the advisory activate
+        // prints (NET-122) is what says how to get from one to the other.
+        // `--raw` and `--json` stay machine-readable-only, as for the ports.
+        if resp.name_surface == minimald_rpc::NameSurface::Native {
+            writeln!(
+                out,
+                "NAME SURFACE:    {}",
+                native_name_surface_line(resp.hostname_proxy_port)
             )?;
         }
         if resp.hostname_proxy_port.is_some() || resp.zone_answerer_port.is_some() {

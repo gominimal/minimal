@@ -48,6 +48,7 @@ fn ls_shows_shared_resource_pool() {
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
+        name_surface: minimald_rpc::NameSurface::Proxy,
         resource_pool: Some(ResourcePool {
             cpu_cores: 8,
             memory_bytes: 16 * 1024 * 1024 * 1024,
@@ -86,6 +87,7 @@ fn ls_table_exposes_project_path_and_status() {
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
+        name_surface: minimald_rpc::NameSurface::Proxy,
         resource_pool: None,
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
@@ -1602,6 +1604,111 @@ async fn min_prints_discovered_proxy_port() {
     );
 }
 
+/// NET-018: where host-OS resolution and published addresses are both
+/// deployed, `min ls` and `min session activate` say native DNS is the live
+/// name surface — and say the proxy's half with it (NET-019): the line names
+/// the port an `HTTP(S)_PROXY` export points at, so what activation printed
+/// before keeps working beside the verdict, and nothing a client captured
+/// goes stale when the surface changes.
+///
+/// Both halves of the condition are brought up the way the daemon's start
+/// path brings them — the proxy and the answerer driven to serving on
+/// OS-selected ports — and the reserved local range is present on this Linux
+/// host's loopback, the native host the condition names. Driven through the
+/// compiled binary so the assertion is on what the user actually sees; the
+/// reply itself is checked first so a daemon that stopped filling the field
+/// fails as the field, not as the wording.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn activate_and_ls_report_native_surface() {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use minimald::server::{
+        RetryBackoff, retry_hostname_proxy_until_serving, retry_zone_answerer_until_serving,
+    };
+    use minimald_rpc::ListSessions;
+
+    let (daemon, args) = setup().await;
+    let compressed = RetryBackoff::new(
+        std::time::Duration::from_millis(5),
+        std::time::Duration::from_millis(40),
+    );
+    tokio::join!(
+        retry_hostname_proxy_until_serving(
+            daemon.server.state.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            compressed,
+        ),
+        retry_zone_answerer_until_serving(
+            daemon.server.state.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            compressed,
+        ),
+    );
+
+    // Both halves deployed: the daemon reports native DNS as the live
+    // surface, and the port the proxy's half of the line names.
+    let mut client = connect_daemon(&args).await.unwrap();
+    let resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    let port = resp
+        .hostname_proxy_port
+        .expect("the proxy must report the port it landed on");
+    assert_eq!(
+        resp.name_surface,
+        minimald_rpc::NameSurface::Native,
+        "an answerer serving on a range-present host makes native DNS the live surface"
+    );
+
+    // `min ls` says it, beside the port lines it already prints.
+    let out = run_min(&args, &["ls"]).await;
+    let ls_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        ls_stdout.contains("NAME SURFACE:    native DNS is the live name surface"),
+        "`min ls` must report the live name surface, got: {ls_stdout}"
+    );
+    assert!(
+        ls_stdout.contains(&format!(
+            "the hostname proxy still serves on 127.0.0.1:{port}"
+        )),
+        "the surface line must say the proxy keeps serving, and where: {ls_stdout}"
+    );
+
+    // `min session activate` says the same thing, at the moment the user is
+    // about to rely on the names — and before the upload and the loadout, so
+    // the line is not lost above a failed activate's output.
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+    let activate_stderr = run_min_stderr(
+        &args,
+        &[
+            "session",
+            "activate",
+            project.path().to_str().unwrap(),
+            "--name",
+            "native-surface",
+            "--sync",
+            "tarball",
+            "--no-prompt",
+        ],
+    )
+    .await;
+    assert!(
+        activate_stderr.contains("native DNS is the live name surface"),
+        "activate must report the live name surface, got: {activate_stderr}"
+    );
+    assert!(
+        activate_stderr.contains(&format!(
+            "the hostname proxy still serves on 127.0.0.1:{port}"
+        )),
+        "activate's line must say the proxy keeps serving, and where: {activate_stderr}"
+    );
+}
+
 // --- retired surfaces (NET-109 / NET-110) ---
 
 /// No build of the daemon carries the retired mTLS reverse proxy, its
@@ -1708,6 +1815,7 @@ fn session_list_decodes_without_mtls_field() {
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
+        name_surface: minimald_rpc::NameSurface::Proxy,
         resource_pool: None,
         sessions: vec![],
     };
