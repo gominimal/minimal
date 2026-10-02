@@ -4959,6 +4959,25 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
   fi
   export MINVMD_BEP_STUB=1
 
+  # The filter the daemon this case autospawns will read its log at. The
+  # lane runs the whole script under `warn,minimald::exec=info`, and the
+  # daemon builds its own EnvFilter from that value — which drops every
+  # INFO record from minvmd's own modules, so the peer-up line the gate
+  # below waits for can never appear and the case fails every lane that
+  # runs it, and it drops the per-delivered-connection DEBUG record the
+  # box-egress pool writes, so the log tail a failure prints would be
+  # mute about the one surface this case exists to observe. Widen the
+  # filter for this case's daemon only — it is spawned after this point —
+  # keeping the CLI's modules at warn so the session-id extraction every
+  # proof uses is untouched, and restore it on every exit (bep_fail and
+  # the OK tail below) so no later case inherits it. The stand-in's
+  # refusals and the pool's cap resets are WARN and surface either way;
+  # it is the peer-up line and the delivered line that need this. The
+  # widened value rides the guest's kernel boot line too, where it only
+  # names host-side modules, so the guest daemon's records are unchanged.
+  bep_rust_log0="${RUST_LOG:-}"
+  export RUST_LOG="warn,minimald::exec=info,minvmd=info,switch::bep_host=debug"
+
   # This case's failures must name the host daemon's own log, which the
   # global fail() cannot: its tail pass matches `*.log`, and the
   # autospawned minvmd — a detached supervisor — writes a daily-rotated
@@ -4995,10 +5014,15 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
       echo "--- minvmd log: none (no minvmd.log* under $XDG_STATE_HOME/minimal/logs) ---"
     fi
   }
-  # Every failure path below: drop the flag this case exported, name the
-  # daemon's log, then the global diagnostics.
+  # Every failure path below: drop the flag and the widened filter this
+  # case exported, name the daemon's log, then the global diagnostics.
   bep_fail() {
     unset MINVMD_BEP_STUB
+    if [ -n "${bep_rust_log0:-}" ]; then
+      export RUST_LOG="$bep_rust_log0"
+    else
+      unset RUST_LOG
+    fi
     bep_host_log_tail
     fail
   }
@@ -5106,14 +5130,18 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
   # (A switch that will not come up under this case's flag now fails the
   # daemon's boot outright, so an activation that got this far means a
   # daemon that started one — but assert it from the daemon's own log
-  # rather than trust the bind; if the line never appears, the tail
-  # below names the spawn that failed.) The log line is this case's
-  # daemon's: bep_case_log scopes out every earlier daemon's identical
-  # `host gvproxy switch up`.
+  # rather than trust the bind; if a line never appears, the tail
+  # below names the spawn that failed.) Both lines the gate waits for are
+  # this case's daemon's own records: the stand-in's is written only under
+  # MINVMD_BEP_STUB — the flag's receipt in the daemon's voice, not just
+  # the socket file the wait above saw — and the switch's proves the peer
+  # came up behind it; bep_case_log scopes out every earlier daemon's
+  # identical lines.
   bep_peer_seen=0
   bep_wait=0
   while [ "$bep_wait" -le 15 ]; do
-    if bep_case_log | grep -q 'host gvproxy switch up; box egress proxy peer started'; then
+    if bep_case_log | grep -q 'box egress proxy stand-in acceptor up' \
+      && bep_case_log | grep -q 'host gvproxy switch up; box egress proxy peer started'; then
       bep_peer_seen=1
       break
     fi
@@ -5130,7 +5158,7 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
     sleep 1
   done
   if [ "$bep_peer_seen" -ne 1 ]; then
-    echo "::error::the daemon's log never said the box egress proxy peer started (waited ${bep_wait}s for 'host gvproxy switch up' among this case's lines)"
+    echo "::error::the daemon's log never named its box egress proxy surface (waited ${bep_wait}s among this case's lines for 'box egress proxy stand-in acceptor up' and 'host gvproxy switch up; box egress proxy peer started')"
     bep_fail
   fi
 
@@ -5239,6 +5267,11 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
   BEPB_SEED_DIR_A=""
   BEPB_SEED_DIR_B=""
   unset MINVMD_BEP_STUB
+  if [ -n "${bep_rust_log0:-}" ]; then
+    export RUST_LOG="$bep_rust_log0"
+  else
+    unset RUST_LOG
+  fi
   echo "proxy sees each VM box by its switch address OK (box A from $bepb_ip_a, box B from $bepb_ip_b)"
   echo "::endgroup::"
 }
