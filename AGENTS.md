@@ -24,11 +24,18 @@ The workspace builds `min`, `mip`, `minimald`, and `minvmd`:
 
 The CLI reference overview is [docs/reference/cli.md](docs/reference/cli.md).
 
-## Crate map
+## Workspace crates
 
-The crates are grouped by plane in
-[docs/architecture.md](docs/architecture.md) §0 and listed with roles in §3.
-`ls crates/` lists the current set.
+Run `just crates` to print the workspace's crates with their descriptions. Use
+it when you need to know which crate is responsible for something, or where a
+change belongs.
+
+[docs/architecture.md](docs/architecture.md) §0 splits the crates into core
+crates and the product surface, and §3 adds which plane each crate belongs to
+(build, session, shared).
+
+When you change a crate's scope, update its `Cargo.toml` description too, so
+this information stays current.
 
 ## Platform matrix
 
@@ -81,11 +88,11 @@ mac-buildable (see the comments in `.github/workflows/ci-macos.yml`).
   Homebrew (`brew install slp/krun/libkrun`) for the VM recipes (`just up`,
   `just test-vm`, `just e2e`); `jq`, `zstd`, and `cpio` (`brew install jq zstd
   cpio`) for the `artifacts`/`initramfs` scripts those recipes run.
-- **python3**, on any host running `just e2e` / `just e2e-native`: the session
-  e2e drives its interactive attaches through a real pty
-  ([scripts/e2e-attach-pty.py](scripts/e2e-attach-pty.py)), because only a tty
-  can answer the session-exit prompt. Stdlib only — no packages to install —
-  but the interpreter must be on `PATH`.
+- **python3**, on any host: `just crates` runs it (stdlib only). The session e2e
+  needs it too, because its interactive attaches run through a real pty
+  ([scripts/e2e-attach-pty.py](scripts/e2e-attach-pty.py)). Only a tty can
+  answer the session-exit prompt. No packages to install, but the interpreter
+  must be on `PATH`.
 
 ## justfile recipes
 
@@ -192,7 +199,7 @@ proves, `nightly` ships.
   [docs/ci-strategy.md](docs/ci-strategy.md).
 - **Do not restate an inventory.** Counts and lists of crates, workflows,
   binaries, and recipes are wrong as soon as one changes. Link to the document
-  that owns the list, or give the command that prints it (`ls crates/`,
+  that owns the list, or give the command that prints it (`just crates`,
   `ls .github/workflows/`, `just --list`). The prose rules reject a stated
   count (`inventory.StatedCount`).
 
