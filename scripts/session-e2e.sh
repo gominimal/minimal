@@ -4293,7 +4293,7 @@ s.close()' "$1"
       tail -20 "${recover_vmd_log:-<no minvmd log>}" 2>/dev/null || true
       fail
     fi
-    echo "minvmd warned $(( "$(now_ms)" - recover_t0 )) ms after the socket disappeared"
+    echo "minvmd warned $(( $(now_ms) - recover_t0 )) ms after the socket disappeared"
     echo "minvmd log: $recover_lost_record"
 
     # Put the datapath back before anything else runs on this VM — a lane
