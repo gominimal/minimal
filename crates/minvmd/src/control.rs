@@ -13,6 +13,13 @@
 //! pair echoed back. One connection, one request line in, one reply line
 //! out.
 //!
+//! The socket also serves the read-only status read: a line asking
+//! `answerer_status` answers the machine's zone-answerer state (see
+//! [`minimald_rpc::ZoneAnswererStatus`]) — the host fact the CLI surfaces at
+//! session start and on `min ls`, read here rather than through the in-VM
+//! daemon because a guest relaying a host fact is forgeable from inside the
+//! escape boundary. The read touches no row and mutates nothing.
+//!
 //! The socket lives beside the daemon's ssh socket in the provider-instance
 //! dir and is created with the same 0700-dir / 0600-socket posture the
 //! bridge socket gets ([`crate::sock`]): only the same user may reach the
@@ -46,6 +53,7 @@ use minimald_rpc::{
 };
 
 use crate::box_registry::{BoxRegistry, ClientBoxSpec};
+use crate::net::answerer::AnswererStatus;
 
 /// The control socket's file name inside the provider-instance dir, beside
 /// `paths::SSH_SOCK_FILE`. Deliberately not in the `paths` crate: that crate
@@ -71,15 +79,20 @@ pub fn resolve_control_sock() -> std::io::Result<PathBuf> {
 }
 
 /// Bind the control socket at `sock_path` and serve box control requests
-/// — registrations and their withdrawals — against `boxes` on a dedicated
-/// thread, whose handle the caller holds for as long as the daemon lives.
+/// — registrations, their withdrawals, and the answerer-status read —
+/// against `boxes` on a dedicated thread, whose handle the caller holds for
+/// as long as the daemon lives.
 ///
 /// The bind happens on the calling thread so its failure surfaces to the
 /// supervisor's own startup error handling; only the accept loop moves to
 /// the thread. The socket gets the bridge socket's posture: path-length
 /// check (libkrun aborts on over-long socket paths), a 0700 parent dir, a
 /// stale socket removed, and 0600 on the socket itself.
-pub fn spawn(sock_path: PathBuf, boxes: BoxRegistry) -> std::io::Result<JoinHandle<()>> {
+pub fn spawn(
+    sock_path: PathBuf,
+    boxes: BoxRegistry,
+    answerer: AnswererStatus,
+) -> std::io::Result<JoinHandle<()>> {
     crate::sock::check_uds_path_len(&sock_path)?;
     crate::sock::prepare_socket_dir(&sock_path)?;
     crate::sock::remove_stale_socket(&sock_path)?;
@@ -87,17 +100,18 @@ pub fn spawn(sock_path: PathBuf, boxes: BoxRegistry) -> std::io::Result<JoinHand
     crate::sock::enforce_socket_permissions(&sock_path)?;
     std::thread::Builder::new()
         .name("minvmd-control".to_string())
-        .spawn(move || accept_loop(listener, boxes))
+        .spawn(move || accept_loop(listener, boxes, answerer))
 }
 
 /// Accept and serve box control requests until the daemon exits. One
 /// connection at a time: a request is a row's map write or removal, served
-/// serially so the table sees its requests in arrival order.
-fn accept_loop(listener: UnixListener, boxes: BoxRegistry) {
+/// serially so the table sees its requests in arrival order — and the
+/// status read rides the same serial turn.
+fn accept_loop(listener: UnixListener, boxes: BoxRegistry, answerer: AnswererStatus) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = serve_connection(stream, &boxes) {
+                if let Err(error) = serve_connection(stream, &boxes, &answerer) {
                     tracing::debug!(error = %error, "box control connection failed");
                 }
             }
@@ -107,7 +121,11 @@ fn accept_loop(listener: UnixListener, boxes: BoxRegistry) {
 }
 
 /// Serve one request: read the line, dispatch the verb, answer.
-fn serve_connection(stream: UnixStream, boxes: &BoxRegistry) -> std::io::Result<()> {
+fn serve_connection(
+    stream: UnixStream,
+    boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
+) -> std::io::Result<()> {
     let mut stream = stream;
     stream.set_read_timeout(Some(REGISTER_READ_TIMEOUT))?;
     let Some(line) = read_request_line(&mut stream)? else {
@@ -123,7 +141,7 @@ fn serve_connection(stream: UnixStream, boxes: &BoxRegistry) -> std::io::Result<
             return write_reply(&mut stream, &BoxControlReply::Error { error });
         }
     };
-    serve_request(&mut stream, boxes, request)
+    serve_request(&mut stream, boxes, answerer, request)
 }
 
 /// Dispatch one parsed request to its verb and write its one reply line.
@@ -131,15 +149,25 @@ fn serve_connection(stream: UnixStream, boxes: &BoxRegistry) -> std::io::Result<
 /// The verb dispatch is where the wire's parse refusal pays off: a line
 /// that names no verb this build knows never reaches the table at all, so
 /// a skewed client cannot make a withdraw look like a register (the
-/// [`minimald_rpc::BoxControlRequest`] docs carry that corner).
+/// [`minimald_rpc::BoxControlRequest`] docs carry that corner). The one
+/// read-only verb — the answerer's status — touches no row and mutates
+/// nothing: it answers the state the acquisition loop last wrote, under
+/// the same socket posture every verb here is served under (the v1 trust
+/// is the 0600 socket itself, with no peer-credential check on a
+/// connection).
 fn serve_request(
     stream: &mut UnixStream,
     boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
     request: BoxControlRequest,
 ) -> std::io::Result<()> {
     match request {
         BoxControlRequest::Register(request) => register_and_reply(stream, boxes, request),
         BoxControlRequest::Withdraw(request) => withdraw_and_reply(stream, boxes, request),
+        BoxControlRequest::AnswererStatus => {
+            let reply = BoxControlReply::Status(answerer.get());
+            write_reply(stream, &reply)
+        }
     }
 }
 
@@ -300,6 +328,7 @@ mod tests {
 
     use minimald_rpc::{
         BoxControlReply, BoxControlRequest, RegisterBoxRequest, WithdrawBoxRequest,
+        ZoneAnswererStatus,
     };
     use switch::SwitchSubnet;
 
@@ -335,15 +364,22 @@ mod tests {
     /// Spawns the control server on a temp path over a fresh registry and
     /// returns (path, handle keeping the server thread identified, the
     /// registry the server serves — the same rows a gate the test brings up
-    /// later shares). The thread outlives the test the way a daemon's does;
-    /// the temp dir's drop after the test closes the test's view of the
-    /// socket.
+    /// later shares — and the answerer status the read-only verb answers
+    /// from, the same cell the daemon's acquisition loop writes). The thread
+    /// outlives the test the way a daemon's does; the temp dir's drop after
+    /// the test closes the test's view of the socket.
     fn spawn_server(
         dir: &std::path::Path,
-    ) -> std::io::Result<(PathBuf, JoinHandle<()>, BoxRegistry)> {
+    ) -> std::io::Result<(
+        PathBuf,
+        JoinHandle<()>,
+        BoxRegistry,
+        AnswererStatus,
+    )> {
         let sock_path = dir.join(CONTROL_SOCK_FILE);
         let boxes = BoxRegistry::new(SUBNET);
-        let handle = spawn(sock_path.clone(), boxes.clone())?;
+        let answerer = AnswererStatus::starting();
+        let handle = spawn(sock_path.clone(), boxes.clone(), answerer.clone())?;
         // Wait until the socket accepts rather than racing the bind.
         for _ in 0..500 {
             if TestStream::connect(&sock_path).is_ok() {
@@ -351,7 +387,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        Ok((sock_path, handle, boxes))
+        Ok((sock_path, handle, boxes, answerer))
     }
 
     /// A client that writes the request and reads the reply line back,
@@ -390,6 +426,9 @@ mod tests {
             BoxControlReply::Error { error } => {
                 panic!("a valid request is answered with addresses, refused with {error}")
             }
+            BoxControlReply::Status(status) => {
+                panic!("a registration is answered with addresses, got the status {status:?}")
+            }
         }
     }
 
@@ -404,7 +443,7 @@ mod tests {
     fn box_addresses_allocated_on_host_and_handed_to_daemon() {
         let capture = server_capture();
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let (sock_path, _server, _boxes) = spawn_server(dir.path()).expect("server binds");
+        let (sock_path, _server, _boxes, _answerer) = spawn_server(dir.path()).expect("server binds");
 
         // The first registration is handed the hand-out run's first switch
         // address — the plan's PTask run above the daemon's self-allocation
@@ -611,7 +650,7 @@ mod tests {
 
         let capture = server_capture();
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let (sock_path, _server, registry) = spawn_server(dir.path()).expect("server binds");
+        let (sock_path, _server, registry, _answerer) = spawn_server(dir.path()).expect("server binds");
 
         // The registering client holds the pair the registration hands
         // back — the destroy-side proof it is the row's creator.
@@ -654,6 +693,9 @@ mod tests {
             }
             BoxControlReply::Error { error } => {
                 panic!("the creator's withdrawal is answered with the pair, refused with {error}")
+            }
+            BoxControlReply::Status(status) => {
+                panic!("a withdrawal is answered with the pair, got the status {status:?}")
             }
         }
         assert!(
@@ -723,6 +765,9 @@ mod tests {
                 BoxControlReply::Addresses(..) => {
                     panic!("a foreign pair's withdrawal must be refused, got addresses")
                 }
+                BoxControlReply::Status(status) => {
+                    panic!("a withdrawal must be refused, got the status {status:?}")
+                }
             }
         }
         assert!(
@@ -750,6 +795,9 @@ mod tests {
             }
             BoxControlReply::Error { error } => {
                 panic!("no row at the address is success, refused with {error}")
+            }
+            BoxControlReply::Status(status) => {
+                panic!("a repeat withdrawal echoes the pair, got the status {status:?}")
             }
         }
 
@@ -833,6 +881,70 @@ mod tests {
         assert!(
             !logged.contains("egress-unregistered-source"),
             "the in-force arm fires no interim line, got: {logged}"
+        );
+    }
+    /// The read-only verb: the socket answers the answerer's state — the
+    /// last state the daemon's acquisition loop wrote, starting with the
+    /// pre-acquisition `starting` — over the same connection shape every
+    /// other verb is served on, and the read leaves the table untouched:
+    /// rows published before it are still published after, and a
+    /// registration still answers addresses around it.
+    #[test]
+    fn answerer_state_is_read_over_the_control_socket() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, registry, answerer) =
+            spawn_server(dir.path()).expect("server binds");
+
+        // Before the acquisition loop's first pass, the read answers the
+        // pre-acquisition state — the one the CLI treats as "nothing to
+        // say yet" rather than a verdict.
+        let reply = control(&sock_path, &BoxControlRequest::AnswererStatus)
+            .expect("the status read is answered");
+        assert_eq!(
+            reply,
+            BoxControlReply::Status(ZoneAnswererStatus::Starting),
+            "the read answers the cell the daemon starts with"
+        );
+
+        // Every state the acquisition loop can leave the machine's
+        // answerer in answers verbatim, on the same socket, one request
+        // line in and one reply line out.
+        let port = 7_656;
+        for state in [
+            ZoneAnswererStatus::Holder { port },
+            ZoneAnswererStatus::Registered { port },
+            ZoneAnswererStatus::PortHeldNoChannel { port },
+        ] {
+            answerer.set(state);
+            let reply = control(&sock_path, &BoxControlRequest::AnswererStatus)
+                .expect("the status read is answered");
+            assert_eq!(
+                reply,
+                BoxControlReply::Status(state),
+                "the read answers the state the loop last wrote"
+            );
+        }
+
+        // The read mutates nothing: a row published before it is still
+        // published after, and the next registration is still answered
+        // with addresses.
+        let web = handed(
+            register(
+                &sock_path,
+                &RegisterBoxRequest {
+                    name: "web".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                },
+            )
+            .expect("a registration still answers around the read"),
+        );
+        assert!(
+            registry
+                .table()
+                .by_source(web.switch_address.octets())
+                .is_some(),
+            "the read-only verb leaves the row the registration published"
         );
     }
 }

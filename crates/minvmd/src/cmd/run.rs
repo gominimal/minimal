@@ -462,19 +462,29 @@ fn run_foreground() -> Result<()> {
     // applies the reports for the life of the process (NET-133).
     boxes.spawn_withdrawal_drainer();
 
+    // The answerer's state — the host fact the CLI surfaces at session
+    // start and on `min ls` — created here so both halves that move it can
+    // share it: the acquisition loop writes it at every pass (holder,
+    // registered, or a port held by a process with no channel), and the
+    // control socket below reads it for the read-only status verb. Starting
+    // is its pre-acquisition value, and the CLI treats it as "nothing to
+    // say yet" rather than a verdict.
+    let answerer_status = crate::net::answerer::AnswererStatus::starting();
+
     // The host-side door to the box table (T66): the control socket the
-    // activating client registers an own-address box on and reads its
-    // allocated switch and loopback addresses from — the addresses the
-    // create request then carries, so the in-VM daemon attaches with the
-    // handed one. Bound before the guest boots, so a session activated
-    // against this VM can only ever be handed an address this table holds.
-    // Best-effort at startup, like the switch above: a bind failure is
-    // warned and the VM still boots — a registration then degrades to the
-    // gate's announced interim, exactly as against a supervisor predating
-    // the socket — rather than failing a boot the client could still
-    // activate against.
+    // activating client registers an own-address box on, reads its
+    // allocated switch and loopback addresses from, and asks for the
+    // answerer's state — the read that never goes through the in-VM
+    // daemon, because a guest relaying a host fact is forgeable from
+    // inside the escape boundary. Bound before the guest boots, so a
+    // session activated against this VM can only ever be handed an address
+    // this table holds. Best-effort at startup, like the switch above: a
+    // bind failure is warned and the VM still boots — a registration then
+    // degrades to the gate's announced interim, exactly as against a
+    // supervisor predating the socket — rather than failing a boot the
+    // client could still activate against.
     let _control = crate::control::resolve_control_sock()
-        .and_then(|sock_path| crate::control::spawn(sock_path, boxes.clone()))
+        .and_then(|sock_path| crate::control::spawn(sock_path, boxes.clone(), answerer_status.clone()))
         .inspect_err(|error| {
             tracing::warn!(
                 %error,
@@ -498,7 +508,11 @@ fn run_foreground() -> Result<()> {
     // moment the VM does — best-effort at startup, like the control socket:
     // a thread that could not spawn is warned and the VM still boots, its
     // names then answering from whatever daemon holds the port.
-    if let Err(error) = crate::net::answerer::spawn(boxes.clone(), DEFAULT_ANSWERER_PORT) {
+    if let Err(error) = crate::net::answerer::spawn(
+        boxes.clone(),
+        DEFAULT_ANSWERER_PORT,
+        answerer_status,
+    ) {
         tracing::warn!(
             %error,
             "failed to start the zone answerer; this VM's box names answer only from \

@@ -65,6 +65,7 @@ use hickory_proto::op::{Message, MessageType, Metadata, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{A, SOA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use serde::{Deserialize, Serialize};
+use minimald_rpc::ZoneAnswererStatus;
 
 use sessions::core::zone_answer::{self, ZoneRow, ZoneView};
 
@@ -915,22 +916,72 @@ fn zone_rows(registry: &BoxRegistry) -> Vec<RegisteredRow> {
 
 // ── the start ────────────────────────────────────────────────────────────────
 
+/// The answerer's state as the control socket's status read serves it
+/// (NET-138's interim surfaced at session start and on `min ls`): what the
+/// acquisition loop last decided the machine's answerer is — this daemon
+/// holding the port, another VM host daemon holding it with this table's
+/// rows registered with it, or the port held by a process with no channel —
+/// written by the loop at every pass and read where the CLI asks for it.
+///
+/// The status says where to look and who holds the port; whether the
+/// answerer is *live* at the named port is the client's own A query for
+/// `host.min.internal` to prove — the row the answerer itself holds —
+/// because a host fact the host's client reads itself is the only one
+/// inside the escape boundary's trust. The state before the loop's first
+/// pass is [`ZoneAnswererStatus::Starting`]: the daemon has not said which
+/// it is, and a read that lands there prints nothing, the arm that cannot
+/// misreport.
+#[derive(Debug, Clone)]
+pub struct AnswererStatus(Arc<Mutex<ZoneAnswererStatus>>);
+
+impl AnswererStatus {
+    /// A status whose acquisition loop has not run yet.
+    #[must_use]
+    pub fn starting() -> Self {
+        Self(Arc::new(Mutex::new(ZoneAnswererStatus::Starting)))
+    }
+
+    /// The state the acquisition loop last wrote.
+    #[must_use]
+    pub fn get(&self) -> ZoneAnswererStatus {
+        *self
+            .0
+            .lock()
+            .expect("the answerer status lock is never held across a panic")
+    }
+
+    /// The acquisition loop's own writer: called at every pass, with the
+    /// state that pass left the machine's answerer in.
+    pub(crate) fn set(&self, status: ZoneAnswererStatus) {
+        *self
+            .0
+            .lock()
+            .expect("the answerer status lock is never held across a panic") = status;
+    }
+}
+
 /// Starts the host answerer: binds the machine's answerer port on the host
 /// loopback and serves the zone from `registry`'s table, or — when the port
 /// is held by another VM host daemon on this machine — registers
 /// `registry`'s zone rows with that holder over the answerer channel and
-/// answers nothing itself. One background thread, for the daemon's
-/// lifetime, the way the control socket serves; a thread the host could not
-/// spare is the only failure returned, because a held port is the normal
-/// multi-VM case, not an error to fail a boot over.
+/// answers nothing itself. Every pass the acquisition takes writes the
+/// state it left the machine in to `status`, the one place the control
+/// socket's status read serves it from. One background thread, for the
+/// daemon's lifetime, the way the control socket serves; a thread the host
+/// could not spare is the only failure returned, because a held port is
+/// the normal multi-VM case, not an error to fail a boot over.
 ///
 /// # Errors
 ///
 /// Returns the OS error when the thread cannot be spawned.
-pub fn spawn(registry: BoxRegistry, port: u16) -> io::Result<std::thread::JoinHandle<()>> {
+pub fn spawn(
+    registry: BoxRegistry,
+    port: u16,
+    status: AnswererStatus,
+) -> io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("minvmd-zone-answerer".to_string())
-        .spawn(move || acquire_loop(registry, port))
+        .spawn(move || acquire_loop(registry, port, status))
 }
 
 /// Acquires the machine's answerer port and serves it, or registers with
@@ -948,14 +999,14 @@ pub fn spawn(registry: BoxRegistry, port: u16) -> io::Result<std::thread::JoinHa
 /// is not a holder — a native daemon, or a foreign process with no channel
 /// socket — is warned once and retried at the same cadence: the zone
 /// answers from that holder alone, and this daemon answers nothing.
-fn acquire_loop(registry: BoxRegistry, port: u16) {
-    acquire_loop_at(registry, port, resolve_channel_sock());
+fn acquire_loop(registry: BoxRegistry, port: u16, status: AnswererStatus) {
+    acquire_loop_at(registry, port, resolve_channel_sock(), status);
 }
 
 /// The acquisition over a named channel socket, so the whole holder and
 /// registrant machinery is drivable where the channel is not the machine's
 /// own (the test below runs two daemons on one temporary channel).
-fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf) {
+fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: AnswererStatus) {
     // Subscribed before the first bind attempt, so no change lands unpinged
     // in the window before the port is decided. The holder drops it: its
     // own table answers live, so it has nothing to re-register, and the
@@ -970,6 +1021,7 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf) {
                 let addr = socket
                     .local_addr()
                     .map_or_else(|_| format!("127.0.0.1:{port}"), |addr| addr.to_string());
+                status.set(ZoneAnswererStatus::Holder { port });
                 tracing::info!(
                     component = COMPONENT,
                     listener = %addr,
@@ -1017,42 +1069,46 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf) {
                 };
                 let first = held.is_some() && !warned;
                 match outcome {
-                    Ok(()) if first => {
-                        warned = true;
-                        tracing::info!(
-                            component = COMPONENT,
-                            holder = %channel.display(),
-                            rows = rows.len(),
-                            "the zone answerer's port is held by another VM host daemon; \
-                             registered this table's zone rows with it and answer nothing here"
-                        );
-                    }
                     Ok(()) => {
-                        tracing::debug!(
-                            component = COMPONENT,
-                            holder = %channel.display(),
-                            rows = rows.len(),
-                            "re-registered this table's zone rows with the holder"
-                        );
-                    }
-                    Err(error) if !warned => {
-                        warned = true;
-                        tracing::warn!(
-                            component = COMPONENT,
-                            port,
-                            %error,
-                            channel = %channel.display(),
-                            "the zone answerer's port is held and the holder's channel did \
-                             not answer (a native minimald or a foreign process holds it); \
-                             this VM's box names are not answered on the host"
-                        );
+                        status.set(ZoneAnswererStatus::Registered { port });
+                        if first {
+                            warned = true;
+                            tracing::info!(
+                                component = COMPONENT,
+                                holder = %channel.display(),
+                                rows = rows.len(),
+                                "the zone answerer's port is held by another VM host daemon; \
+                                 registered this table's zone rows with it and answer nothing here"
+                            );
+                        } else {
+                            tracing::debug!(
+                                component = COMPONENT,
+                                holder = %channel.display(),
+                                rows = rows.len(),
+                                "re-registered this table's zone rows with the holder"
+                            );
+                        }
                     }
                     Err(error) => {
-                        tracing::debug!(
-                            component = COMPONENT,
-                            %error,
-                            "the holder's channel still did not answer"
-                        );
+                        status.set(ZoneAnswererStatus::PortHeldNoChannel { port });
+                        if !warned {
+                            warned = true;
+                            tracing::warn!(
+                                component = COMPONENT,
+                                port,
+                                %error,
+                                channel = %channel.display(),
+                                "the zone answerer's port is held and the holder's channel did \
+                                 not answer (a native minimald or a foreign process holds it); \
+                                 this VM's box names are not answered on the host"
+                            );
+                        } else {
+                            tracing::debug!(
+                                component = COMPONENT,
+                                %error,
+                                "the holder's channel still did not answer"
+                            );
+                        }
                     }
                 }
                 // The wait belongs at the end of a pass that did not take
@@ -1209,6 +1265,26 @@ mod tests {
             assert!(
                 Instant::now() < deadline,
                 "{what}: nothing answered within 10 s"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Waits until `probe` — one status read per try — reports a state the
+    /// acquisition has decided, failing the test on `what` when the deadline
+    /// passes. The acquisition's first pass is asynchronous from the thread
+    /// spawn that starts it; every state after it is already decided when
+    /// the call that made it so returns.
+    fn await_status(probe: impl Fn() -> ZoneAnswererStatus, what: &str) -> ZoneAnswererStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = probe();
+            if status != ZoneAnswererStatus::Starting {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: the status never left `starting` within 10 s"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -1606,12 +1682,18 @@ mod tests {
         drop(probe);
 
         // The holder: its acquisition loop takes the port, holds the channel
-        // beside it, and serves the zone from its own table.
+        // beside it, and serves the zone from its own table. Its status cell
+        // stays observable here — a clone rides into the thread, this one is
+        // asserted on below.
         let (holder_registry, holder_web) = web_registry();
         let holder_channel = channel.clone();
+        let holder_status = AnswererStatus::starting();
+        let holder_status_probe = holder_status.clone();
         std::thread::Builder::new()
             .name("test-zone-holder".to_string())
-            .spawn(move || acquire_loop_at(holder_registry, port, holder_channel))
+            .spawn(move || {
+                acquire_loop_at(holder_registry, port, holder_channel, holder_status)
+            })
             .expect("the holder's thread spawns");
 
         // The channel is bound before the serve loop starts, so the first
@@ -1721,6 +1803,78 @@ mod tests {
             a_answer(&reply),
             holder_web,
             "the holder's own table still answers after a registrant exited"
+        );
+
+        // The holder's own status cell says what its loop decided the
+        // machine's answerer is: this daemon, holding the port — the state
+        // the control socket serves to the verbs that surface it.
+        assert_eq!(
+            holder_status_probe.get(),
+            ZoneAnswererStatus::Holder { port },
+            "the holder reports itself holding the machine's answerer port"
+        );
+
+        // And the second daemon's own acquisition loop — the way `run`
+        // starts it, not the manual registration above — reports the state
+        // it finds the machine in: another VM host daemon holds the port and
+        // this table's rows answer through it. Its own registration keeps
+        // the second VM's box name answering after the manual one exited,
+        // which is the re-registration the loop's change pings ride.
+        let second_channel = channel.clone();
+        let second_status = AnswererStatus::starting();
+        let second_status_probe = second_status.clone();
+        std::thread::Builder::new()
+            .name("test-zone-registrant".to_string())
+            .spawn(move || {
+                acquire_loop_at(second, port, second_channel, second_status)
+            })
+            .expect("the second daemon's thread spawns");
+        assert_eq!(
+            await_status(
+                || second_status_probe.get(),
+                "the second daemon never said what the machine's answerer is"
+            ),
+            ZoneAnswererStatus::Registered { port },
+            "a daemon whose port is held by another VM host daemon reports its \
+             rows answering through the holder"
+        );
+        let reply = query(port, "peer.min.internal.", RecordType::A)
+            .expect("the second daemon's own registration answers");
+        assert_eq!(
+            a_answer(&reply),
+            second_web,
+            "the second daemon's own registration keeps its box name answering"
+        );
+    }
+
+    /// A port held by a process with no channel — a native minimald, a
+    /// foreign process — is the state the acquisition must name rather than
+    /// paper over: the status says the port is held with nothing this VM's
+    /// names answer through, which is what the CLI surfaces as "this VM's
+    /// names are not answered on the host; the proxy remains the surface".
+    #[test]
+    fn a_port_held_with_no_channel_reports_it() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        // The channel is never bound: nothing answers a registration, the
+        // shape of a native daemon's or a foreign process's hold.
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        // The machine's answerer port, held by this test and nothing else.
+        let held = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the hold binds loopback");
+        let port = held.local_addr().expect("the hold names its port").port();
+        let (registry, _) = web_registry();
+        let status = AnswererStatus::starting();
+        let probe = status.clone();
+        std::thread::Builder::new()
+            .name("test-zone-answerer-no-channel".to_string())
+            .spawn(move || acquire_loop_at(registry, port, channel, status))
+            .expect("the answerer's thread spawns");
+        assert_eq!(
+            await_status(
+                || probe.get(),
+                "the answerer never said why this VM's names answer nothing"
+            ),
+            ZoneAnswererStatus::PortHeldNoChannel { port },
+            "a port held by a process with no channel is named as exactly that"
         );
     }
 }
