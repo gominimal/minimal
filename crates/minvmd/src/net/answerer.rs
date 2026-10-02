@@ -567,10 +567,10 @@ fn origin_for(peer: SocketAddr) -> zone_answer::Origin {
 /// but `minimum` is inert; all of them carry the shared decision's TTL
 /// ceiling so no number the answerer emits exceeds NET-126's bound.
 fn zone_soa() -> Record {
-    let apex = Name::from_utf8(format!("{}.", zone_answer::ZONE_APEX))
-        .expect("the zone apex parses");
-    let mname = Name::from_utf8(format!("ns.{}.", zone_answer::ZONE_APEX))
-        .expect("the SOA mname parses");
+    let apex =
+        Name::from_utf8(format!("{}.", zone_answer::ZONE_APEX)).expect("the zone apex parses");
+    let mname =
+        Name::from_utf8(format!("ns.{}.", zone_answer::ZONE_APEX)).expect("the SOA mname parses");
     let rname = Name::from_utf8(format!("hostmaster.{}.", zone_answer::ZONE_APEX))
         .expect("the SOA rname parses");
     // `SOA` is `#[non_exhaustive]`, so the constructor is the only way in.
@@ -805,32 +805,34 @@ impl Registration {
     /// holder's ack: a registration that did not land is not held, and the
     /// error tells the caller to connect again.
     fn send(&mut self, rows: Vec<RegisteredRow>) -> io::Result<()> {
-        let mut line = serde_json_lenient::to_string(&RegistrationRequest { rows }).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("zone registration did not serialize: {error}"),
-            )
-        })?;
+        let mut line =
+            serde_json_lenient::to_string(&RegistrationRequest { rows }).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("zone registration did not serialize: {error}"),
+                )
+            })?;
         line.push('\n');
         self.stream.write_all(line.as_bytes())?;
         self.stream.flush()?;
         let _ = self.stream.set_read_timeout(Some(REGISTER_READ_TIMEOUT));
         let reply_line = read_line(&mut self.stream)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "the holder closed"))?;
-        let reply: RegistrationReply = serde_json_lenient::from_str(reply_line.trim()).map_err(
-            |error| {
+        let reply: RegistrationReply =
+            serde_json_lenient::from_str(reply_line.trim()).map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("the holder's reply did not parse: {error}"),
                 )
-            },
-        )?;
+            })?;
         if reply.ok {
             Ok(())
         } else {
             Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
-                reply.error.unwrap_or_else(|| "the holder refused the registration".to_string()),
+                reply
+                    .error
+                    .unwrap_or_else(|| "the holder refused the registration".to_string()),
             ))
         }
     }
@@ -941,8 +943,7 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf) {
                 // registers must be the row a lookup is answered by, which
                 // two tables could never promise.
                 let registered = Arc::new(RegisteredTables::new());
-                let answerer =
-                    HostAnswerer::new(registry.clone(), Arc::clone(&registered));
+                let answerer = HostAnswerer::new(registry.clone(), Arc::clone(&registered));
                 // The channel is how other VM host daemons' tables reach
                 // these answers; a bind failure is warned and served
                 // around — the zone still answers, from this table alone.
@@ -1113,10 +1114,7 @@ mod tests {
     /// The answerer over `own`, with its registered tables filled by
     /// `install` — the rows a co-resident daemon would have filed over the
     /// channel.
-    fn answerer_over(
-        own: BoxRegistry,
-        install: impl FnOnce(&RegisteredTables),
-    ) -> HostAnswerer {
+    fn answerer_over(own: BoxRegistry, install: impl FnOnce(&RegisteredTables)) -> HostAnswerer {
         let registered = Arc::new(RegisteredTables::new());
         install(&registered);
         HostAnswerer::new(own, registered)
@@ -1163,10 +1161,7 @@ mod tests {
     /// serve loop and a registrant's EOF are the two genuinely asynchronous
     /// turns these tests wait on; everything else is already decided when
     /// the call that made it so returns.
-    fn await_answer(
-        probe: impl Fn() -> Option<Message>,
-        what: &str,
-    ) -> Message {
+    fn await_answer(probe: impl Fn() -> Option<Message>, what: &str) -> Message {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(reply) = probe() {
@@ -1185,7 +1180,11 @@ mod tests {
         let [record] = &reply.answers[..] else {
             panic!("an A answer holds exactly one record");
         };
-        assert_eq!(record.record_type(), RecordType::A, "the answer is an A record");
+        assert_eq!(
+            record.record_type(),
+            RecordType::A,
+            "the answer is an A record"
+        );
         let RData::A(A(address)) = &record.data else {
             panic!("the answer is an A record");
         };
@@ -1292,7 +1291,10 @@ mod tests {
         )
         .expect("an in-zone lookup is answered");
         assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
-        assert!(reply.answers.is_empty(), "NXDOMAIN carries no answer record");
+        assert!(
+            reply.answers.is_empty(),
+            "NXDOMAIN carries no answer record"
+        );
         assert!(
             reply.metadata.authoritative,
             "the zone's own negative is authoritative"
@@ -1553,8 +1555,7 @@ mod tests {
         let registration =
             register_rows(&channel, zone_rows(&second)).expect("the holder accepts the table");
 
-        let reply =
-            query(port, "peer.min.internal.", RecordType::A).expect("the holder answers");
+        let reply = query(port, "peer.min.internal.", RecordType::A).expect("the holder answers");
         assert_eq!(
             reply.metadata.response_code,
             ResponseCode::NoError,

@@ -155,10 +155,7 @@ mod tests {
 
         let registry = BoxRegistry::new(switch::DEFAULT_SUBNET);
         write_table(&registry).expect("an empty table writes");
-        assert!(
-            dumped().is_empty(),
-            "a fresh table's dump names no rows"
-        );
+        assert!(dumped().is_empty(), "a fresh table's dump names no rows");
 
         let web = registry.register(BoxRegistration::new(
             "web",
@@ -210,9 +207,7 @@ mod tests {
         assert!(registry.withdraw(web.switch_addr()).is_some());
         write_table(&registry).expect("a withdrawn table writes");
         assert!(
-            !dumped()
-                .iter()
-                .any(|row| row.name == "web.min.internal"),
+            !dumped().iter().any(|row| row.name == "web.min.internal"),
             "a withdrawn namespace's row is gone from the dump"
         );
     }
