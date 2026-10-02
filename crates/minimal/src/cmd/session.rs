@@ -670,21 +670,6 @@ pub(crate) async fn activate_session(
     {
         eprintln!("{advisory}");
     }
-
-    // NET-079's classifier advisory, also only ever printed — the daemon
-    // decides whether its host can decide a host-address box's egress
-    // verdict per box and reports the cause, and the note names that cause
-    // and the state it leaves the box in (unenforced, whatever its
-    // declaration says). The exact command that installs the classifier's
-    // privileged step is printed only when that step is the cause — the
-    // other cause (a host that cannot confine a box) is not cleared by
-    // installing anything, so the command stays out of the note. Never a
-    // prompt: the session starts either way, because a host-address box
-    // runs unenforced on such a host rather than refused (see
-    // [`classifier_advisory`]).
-    if let Some(advisory) = created.classifier.as_ref() {
-        eprintln!("{}", classifier_advisory(advisory));
-    }
     let id = created.id;
 
     // The coming-change notice (NET-076), printed while the deny-all egress
@@ -1454,35 +1439,6 @@ pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'
         ),
         sessions::EgressDefaultPhase::InForce => None,
     }
-}
-
-/// NET-079's classifier advisory: the note `min session activate` prints at
-/// session start when the daemon's host cannot decide a host-address box's
-/// egress verdict per box — the state the box runs unenforced in, whatever
-/// its declaration says. Pure over what the daemon reported, so the note is
-/// pinned as data: the cause is named, the state it leaves the box in is
-/// named, and the exact command that ends the cause is printed only when the
-/// missing step is the cause — a host that cannot confine a box is told what
-/// is wrong, never told to run an install that would change nothing.
-///
-/// An advisory, never a prompt: nothing here asks a question or waits on an
-/// answer, and running the command it names (with any privilege prompt of
-/// its own) is the person's act — the session starts either way, because
-/// the box runs unenforced rather than refused (NET-079's exception).
-pub fn classifier_advisory(advisory: &minimald_rpc::ClassifierAdvisory) -> String {
-    let mut note = format!(
-        "note: this host cannot decide a host-address box's egress verdict \
-         per box: {}. Host-address boxes here run with the host's address and \
-         no egress verdict of their own, so a box's egress declaration is not \
-         enforced",
-        advisory.cause
-    );
-    if let Some(command) = &advisory.install_command {
-        note.push_str(". Install the classifier's privileged step with:\n  ");
-        note.push_str(command);
-    }
-    note.push('.');
-    note
 }
 
 /// Render a session's effective policy as its rules: the egress the gate
@@ -2650,64 +2606,6 @@ mod tests {
             requests.lock().unwrap().len(),
             1,
             "no VM host to withdraw from, no withdrawal"
-        );
-    }
-
-    #[test]
-    fn activate_prints_classifier_advisory() {
-        // NET-079: session start names the cause when the host cannot
-        // decide a host-address box's egress verdict per box, names the
-        // state it leaves the box in (unenforced, whatever its declaration
-        // says), and carries the exact install command only when the
-        // missing step is the cause — the other cause is not cleared by
-        // installing anything. An advisory, never a prompt: no note asks
-        // a question.
-        let step_missing = minimald_rpc::ClassifierAdvisory {
-            cause: "the classifier's privileged step is not installed".to_string(),
-            install_command: Some(
-                "sudo scripts/install-host-classifier.sh --user runner".to_string(),
-            ),
-        };
-        let note = classifier_advisory(&step_missing);
-        assert!(
-            note.contains("the classifier's privileged step is not installed"),
-            "the cause is named: {note}"
-        );
-        assert!(
-            note.contains("sudo scripts/install-host-classifier.sh --user runner"),
-            "the step being the cause is the one case the command is printed for: {note}"
-        );
-        assert!(
-            note.contains("not enforced"),
-            "the state the box runs in is named: {note}"
-        );
-        assert!(
-            !note.contains('?'),
-            "an advisory never asks a question: {note}"
-        );
-
-        // The host that cannot confine a box is told what is wrong, never
-        // told to run an install that would change nothing.
-        let cannot_confine = minimald_rpc::ClassifierAdvisory {
-            cause: "no delegating cgroup v2 mount covers the classifier tree".to_string(),
-            install_command: None,
-        };
-        let note = classifier_advisory(&cannot_confine);
-        assert!(
-            note.contains("no delegating cgroup v2 mount covers the classifier tree"),
-            "the cause is named: {note}"
-        );
-        assert!(
-            !note.contains("install-host-classifier"),
-            "the install command is not named for a cause it does not clear: {note}"
-        );
-        assert!(
-            note.contains("not enforced"),
-            "the state the box runs in is named either way: {note}"
-        );
-        assert!(
-            !note.contains('?'),
-            "an advisory never asks a question: {note}"
         );
     }
 }
