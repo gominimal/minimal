@@ -12,13 +12,29 @@
 //! Every pin is an answer the box's own query received, and nothing else.
 //! The gate's ingress leg hands the table each DNS reply *on its way to the
 //! guest* — a frame from the resolver Minimal owns for the box, toward the
-//! box's switch address — and only a reply answering a name the row declared
-//! ([`BoxRecord::allow_dns_hosts`]) pins, only its A records, and only for
-//! the box it was addressed to. The table never resolves anything itself: a
-//! pin exists because the box asked and something answered, which is what
-//! makes the pinned set the box's own answers and nothing wider — whatever a
-//! relay replaced inside the VM would do with the frames behind it, the
-//! destinations they may ride are the ones the box's own answers named.
+//! box's switch address — and that is the one entrance: a reply-shaped frame
+//! on the guest→switch leg is decided as any other frame and pins nothing,
+//! whatever address it wears. Three conditions then decide a reply at that
+//! entrance. It must be from the row's *own* resolver, asserted once at the
+//! row's intake ([`DnsPins::entry`]): the resolver is a plan-derived
+//! constant, so a row naming any other one — an in-guest address, an
+//! upstream reached through NAT, or nothing but a drift between the table's
+//! plan and the registry's — is refused its entry and logged, and no reply
+//! can ever pin for it. It must answer one of the box's own outstanding
+//! queries: the egress leg records each question the switch received — its
+//! name, transaction id and source port, bounded by the shared cap and
+//! expiry — and a reply matches by all three and then consumes its entry,
+//! so an unsolicited or mismatched reply passes through unpinned, and a
+//! replay of a matched one pins nothing more. And only the answer chain
+//! pins: the chain starts at the question name, follows the CNAME records
+//! in the answer section, and takes the A records whose owner is on it —
+//! the authority and additional sections, a record owned by a name off the
+//! chain, and every type but A (AAAA never pins in v1) are read past. The
+//! table never resolves anything itself: a pin exists because the box asked
+//! and something answered, which is what makes the pinned set the box's own
+//! answers and nothing wider — whatever a relay replaced inside the VM
+//! would do with the frames behind it, the destinations they may ride are
+//! the ones the box's own answers named.
 //!
 //! The answers pass the rebinding intersection
 //! ([`egress::rebinding_intersection`]) before they enter: each one is
@@ -76,7 +92,7 @@ use hickory_proto::op::{Message, MessageType};
 use hickory_proto::rr::RData;
 use sessions::core::egress::{
     self, DNS_ADMISSION_WINDOW, DNS_FLOW_IDLE_CAP, DNS_MAX_ADDRESSES_PER_NAME,
-    InfrastructureDenySet,
+    DNS_OUTSTANDING_QUERY_CAP, DNS_QUERY_EXPIRY, InfrastructureDenySet,
 };
 use switch::SwitchSubnet;
 
@@ -262,10 +278,27 @@ struct FlowKey {
     dst_port: u16,
 }
 
+/// The identity of one of the box's outstanding DNS queries — the three
+/// things a reply must answer to pin: the transaction id of the exchange, the
+/// port the query left from (which the reply's destination port must name),
+/// and the question, normalized as the declared names are. The box's own
+/// lease is the one address the entry holds, so the id and the port pair are
+/// what tells two lookups apart.
+#[derive(Hash, PartialEq, Eq)]
+struct QueryKey {
+    /// The DNS transaction id: the one field of an exchange a reply echoes.
+    txid: u16,
+    /// The query's source port, which its reply's destination port names.
+    src_port: u16,
+    /// The question the box asked, in the form the declared names match in.
+    name: String,
+}
+
 /// One box's host-side admission state, built from its row and keyed by the
 /// row's switch address: the names the row declared (normalized to the form
 /// DNS names are matched in), the infrastructure deny set its answers are
-/// intersected with, and the admitted addresses and flows themselves. Holds
+/// intersected with, the box's outstanding questions a reply must answer, and
+/// the admitted addresses and flows themselves. Holds
 /// the row it was built from, both to read its rules without a second table
 /// and to prove it is still the row the table holds — a re-registration
 /// replaces the entry rather than trusting a newer declaration with an older
@@ -288,6 +321,14 @@ struct BoxPins {
     /// grant, and the refusal its answer earns is this table's to say,
     /// once, rate-limited (see the module doc).
     infrastructure: InfrastructureDenySet,
+    /// The box's outstanding DNS queries to its resolver — the questions the
+    /// switch received, each with the instant it was asked for the shared
+    /// expiry — which a reply must answer to pin ([`QueryKey`]). Bounded by
+    /// the shared cap: past it a question is not recorded and its reply
+    /// pins nothing, fail closed, and expired entries are swept at the
+    /// insert that would share their map, the same no-timer discipline the
+    /// admitted addresses keep.
+    outstanding: Mutex<HashMap<QueryKey, Instant>>,
     /// The addresses admitted by resolution, each with the name that
     /// admitted it — the per-name cap counts by owner — and the instant its
     /// window ends.
@@ -330,22 +371,104 @@ impl BoxPins {
                 record.egress().resolver(),
                 subnet.host_alias().octets(),
             ),
+            outstanding: Mutex::new(HashMap::new()),
             admitted: Mutex::new(HashMap::new()),
             flows: Mutex::new(HashMap::new()),
             logged_first_pin: AtomicBool::new(false),
         }
     }
 
+    /// The egress leg's half of the reply matching: one DNS query the box
+    /// sent its resolver — a datagram the switch received, or the reply it
+    /// answers pins nothing — held outstanding under its [`QueryKey`] with
+    /// the instant it was observed, for the shared expiry.
+    ///
+    /// The bounds are the table's own, read from [`sessions::core::egress`]
+    /// with the rest of the numbers: an expired entry is swept here, at the
+    /// insert that would share its map — the same no-timer discipline the
+    /// admitted addresses keep — and past the shared cap a new question is
+    /// not recorded, fail closed, so no reply can ever match it and a box
+    /// cannot grow the table one question at a time. A question re-sent — a
+    /// resolver stack's retry, the same key — refreshes its own window
+    /// rather than spending the cap a second time.
+    ///
+    /// Quiet by design, like the reply half: a datagram that is not a
+    /// query, not parseable, or carrying no question is not recorded — no
+    /// question, nothing to answer.
+    fn record_query(&self, pkt: &L4Packet, datagram: &[u8], now: Instant) {
+        if datagram.len() > MAX_DATAGRAM {
+            tracing::debug!(
+                switch_addr = %self.record.switch_addr(),
+                namespace = %self.record.name(),
+                n = datagram.len(),
+                "ignoring an oversized DNS query at the host-side admission table"
+            );
+            return;
+        }
+        let message = match Message::from_vec(datagram) {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::debug!(
+                    switch_addr = %self.record.switch_addr(),
+                    namespace = %self.record.name(),
+                    %error,
+                    "passing an unparseable DNS query through unrecorded on the host"
+                );
+                return;
+            }
+        };
+        if message.metadata.message_type != MessageType::Query {
+            return;
+        }
+        let Some(question) = message.queries.first() else {
+            return;
+        };
+        let key = QueryKey {
+            txid: message.metadata.id,
+            src_port: pkt.src.port(),
+            name: normalized(&question.name().to_lowercase().to_string()),
+        };
+        let mut outstanding = self
+            .outstanding
+            .lock()
+            .expect("the outstanding-query table's lock is held only across this update");
+        outstanding.retain(|_, at| now.duration_since(*at) < DNS_QUERY_EXPIRY);
+        if outstanding.len() >= DNS_OUTSTANDING_QUERY_CAP && !outstanding.contains_key(&key) {
+            tracing::debug!(
+                switch_addr = %self.record.switch_addr(),
+                namespace = %self.record.name(),
+                name = %key.name,
+                cap = DNS_OUTSTANDING_QUERY_CAP,
+                "not recording a question past the outstanding-query cap; its reply pins nothing"
+            );
+            return;
+        }
+        outstanding.insert(key, now);
+    }
+
     /// The ingress side, NET-066 and NET-067: observes one DNS reply the
     /// switch returned toward this box, and when it is a reply from the
-    /// box's own resolver answering a query for a name the row declared,
-    /// splits its A answers by the rebinding intersection — the survivors
-    /// are admitted for the window, each refusal logs the name and the
-    /// answer through the gate's limiter in the shared refusal format.
+    /// box's own resolver answering one of the box's own outstanding
+    /// queries for a name the row declared, splits its answer chain's A
+    /// records by the rebinding intersection — the survivors are admitted
+    /// for the window, each refusal logs the name and the answer through
+    /// the gate's limiter in the shared refusal format.
+    ///
+    /// The reply must answer an outstanding query — the same transaction
+    /// id, the port the query left from, the same question ([`QueryKey`])
+    /// — and the match consumes its entry, so a replay of a matched reply
+    /// answers nothing and pins nothing more, while an unsolicited or
+    /// mismatched reply passes through to the box unpinned. And only the
+    /// answer chain pins: the chain starts at the question name and follows
+    /// the CNAME records in the answer section, so an A record pins exactly
+    /// when its owner is a name on that chain — the sections the chain
+    /// never walks (authority, additional) and the types v1 never admits
+    /// (AAAA, SVCB, HTTPS) are read past.
     ///
     /// Every failure mode is quiet by design: a datagram that is not from
-    /// the resolver, not a reply, not parseable, or carrying no question
-    /// (there is no name to match) pins nothing, and the reply itself is
+    /// the resolver, not a reply, not parseable, not answering the box's
+    /// own question, or carrying no question (there is no name to match)
+    /// pins nothing, and the reply itself is
     /// never kept from the box — resolution is honest; it is the *connection*
     /// to a refused address that is not admitted.
     fn observe(&self, pkt: &L4Packet, datagram: &[u8], limiter: &DropLimiter, now: Instant) {
@@ -389,14 +512,51 @@ impl BoxPins {
         if !self.names.contains(&asked) {
             return;
         }
-        // The addresses the name resolved to: every A record in the answer
-        // section, whatever record owns them.
+        // The box's own question, answered: the reply must match an
+        // outstanding entry by all three of its identity's facts, and the
+        // match consumes the entry — so a second copy of the same reply
+        // answers nothing, and a reply to a question the box never asked,
+        // or asked long enough ago that its window passed, passes through
+        // unpinned like any unsolicited one.
+        let key = QueryKey {
+            txid: message.metadata.id,
+            src_port: pkt.dst.port(),
+            name: asked.clone(),
+        };
+        let answered = self
+            .outstanding
+            .lock()
+            .expect("the outstanding-query table's lock is held only across this match")
+            .remove(&key)
+            .is_some_and(|at| now.duration_since(at) < DNS_QUERY_EXPIRY);
+        if !answered {
+            return;
+        }
+        // Only the answer chain pins: the chain starts at the question name
+        // and follows the CNAME records in the answer section — a target is
+        // on the chain when the record naming it is owned by a name already
+        // on it — and an A record pins exactly when its owner is on the
+        // chain, walked in the order the reply carried it. Everything else
+        // in the reply is read past: a record owned by a name off the chain,
+        // the authority and additional sections (never walked), and every
+        // type but A — AAAA never pins in v1 (NET-136), and SVCB and HTTPS
+        // name alternative endpoints, which are not the answer the box
+        // asked for.
+        let mut chain = HashSet::with_capacity(1 + message.answers.len());
+        chain.insert(asked.clone());
         let answers: Vec<[u8; 4]> = message
             .answers
             .iter()
-            .filter_map(|record| match &record.data {
-                RData::A(address) => Some(address.0.octets()),
-                _ => None,
+            .filter_map(|record| {
+                let owner = normalized(&record.name.to_lowercase().to_string());
+                match &record.data {
+                    RData::A(address) if chain.contains(&owner) => Some(address.0.octets()),
+                    RData::CNAME(cname) if chain.contains(&owner) => {
+                        chain.insert(normalized(&cname.0.to_lowercase().to_string()));
+                        None
+                    }
+                    _ => None,
+                }
             })
             .collect();
         // A zone name here is a declaration the in-VM gate treats as the
@@ -641,6 +801,14 @@ struct Inner {
     /// only for an address a row was published at, and only while that row
     /// is the one the entry was built from.
     boxes: Mutex<HashMap<[u8; 4], Arc<BoxPins>>>,
+    /// The rows whose resolver mismatch has been said, keyed by the row's
+    /// switch address and holding the record the refusal was logged for —
+    /// the dedupe behind "log the refusal", so a row refused its entry says
+    /// so once, however many frames and replies arrive for it, while a
+    /// *replacement* row at the same address — a new record — is judged and
+    /// logged again. Cleared beside the entries at [`DnsPins::retire`],
+    /// the same lifetime.
+    refused: Mutex<HashMap<[u8; 4], Arc<BoxRecord>>>,
     /// How many frames the gate admitted because a live pin named the
     /// destination (the observability counter: what the host-side decision
     /// passed).
@@ -661,6 +829,7 @@ impl DnsPins {
             inner: Arc::new(Inner {
                 subnet,
                 boxes: Mutex::new(HashMap::new()),
+                refused: Mutex::new(HashMap::new()),
                 admitted_by_pin: AtomicU64::new(0),
                 refused_for_want_of_pin: AtomicU64::new(0),
             }),
@@ -673,8 +842,25 @@ impl DnsPins {
     /// under another declaration, because a re-registration can widen a row
     /// as readily as narrow it and the newest declaration's answers are the
     /// only ones that may pin for it.
+    ///
+    /// The entrance's own guard comes first (the architecture review's
+    /// condition): a row's resolver is the plan's — the registry compiles it
+    /// from the subnet it was built for, so a row naming any other one, an
+    /// in-guest address or an upstream reached through NAT, can only be a
+    /// drift between this table's plan and the registry's — and such a row
+    /// is refused its entry and logged ([`Self::refuse_resolver`]), so
+    /// nothing can ever pin for it and its undeclared destinations stay the
+    /// host's drops. Without the assertion the `src == row.resolver` check
+    /// [`BoxPins::observe`] decides by would be a grant the row's own bytes
+    /// make, and a forged reply wearing whatever address the row named
+    /// would pin through it.
     fn entry(&self, record: &Arc<BoxRecord>) -> Option<Arc<BoxPins>> {
         if record.allow_dns_hosts().is_empty() {
+            return None;
+        }
+        let plan_resolver = self.inner.subnet.dns_server().octets();
+        if record.egress().resolver() != plan_resolver {
+            self.refuse_resolver(record, plan_resolver);
             return None;
         }
         let key = record.switch_addr().octets();
@@ -693,12 +879,44 @@ impl DnsPins {
         }
     }
 
+    /// Says a refused row's resolver mismatch, once per row: the row whose
+    /// resolver is not the plan's own is logged the first time the table sees
+    /// it, naming the box, the resolver the row names and the plan's own —
+    /// the line a host reads to learn the admission table and the registry
+    /// were built for different plans, the only way a row can name a foreign
+    /// resolver — and every later sight of the same row is silent. A new
+    /// record at the same address is a new row and says so again.
+    fn refuse_resolver(&self, record: &Arc<BoxRecord>, plan_resolver: [u8; 4]) {
+        let key = record.switch_addr().octets();
+        let mut refused = self
+            .inner
+            .refused
+            .lock()
+            .expect("the refused-row table's lock is held only across this update");
+        if refused
+            .get(&key)
+            .is_some_and(|seen| Arc::ptr_eq(seen, record))
+        {
+            return;
+        }
+        refused.insert(key, Arc::clone(record));
+        tracing::warn!(
+            source = %record.switch_addr(),
+            namespace = %record.name(),
+            resolver = %Ipv4Addr::from(record.egress().resolver()),
+            plan_resolver = %Ipv4Addr::from(plan_resolver),
+            "refused a DNS admission entry for a row whose resolver is not the \
+             plan's own; its undeclared destinations stay the host's drops",
+        );
+    }
+
     /// The ingress leg's half of the table: one DNS reply the switch
     /// returned toward a box — a frame the relay has already parsed as an
     /// IPv4+UDP datagram — observed on its way to the guest, so the pins it
     /// sets are the answers the box's own lookup received. A datagram
     /// addressed to an address no row holds pins nothing, and neither does
-    /// one for a row that declared no names: there is no entry to fill.
+    /// one for a row that declared no names or one whose resolver the table
+    /// refused: there is no entry to fill.
     ///
     /// The pre-check is the port the reply was served from: ingress UDP is
     /// mostly not DNS — the answers to a box's own datagrams arrive from
@@ -726,6 +944,39 @@ impl DnsPins {
             return;
         };
         entry.observe(pkt, datagram, limiter, now);
+    }
+
+    /// The egress leg's half of the table: one DNS query a box sent its
+    /// resolver — a frame the relay has already parsed as an IPv4+UDP
+    /// datagram and the gate has already admitted to the switch — recorded
+    /// as that box's outstanding question, so the reply that answers it is
+    /// the only kind that can ever pin. A datagram addressed anywhere but
+    /// the plan's resolver at the DNS port is ignored **here**, before the
+    /// row is looked up: the reply-matching state holds the box's own
+    /// lookups and nothing else's, the same cheap pre-check the ingress
+    /// leg keeps. A query over TCP is never recorded — the UDP datagram is
+    /// the one DNS path v1 carries and the one a reply can pin by — and a
+    /// query from a source no row holds records nothing either.
+    pub(crate) fn observe_query(
+        &self,
+        table: &BoxTable,
+        pkt: &L4Packet,
+        datagram: &[u8],
+        now: Instant,
+    ) {
+        if pkt.proto != IPPROTO_UDP
+            || pkt.dst.port() != DNS_PORT
+            || pkt.dst.ip().octets() != table.gateway()
+        {
+            return;
+        }
+        let Some(record) = table.by_source(pkt.src.ip().octets()) else {
+            return;
+        };
+        let Some(entry) = self.entry(&record) else {
+            return;
+        };
+        entry.record_query(pkt, datagram, now);
     }
 
     /// The verdict's pin arm: whether the gate may lift the row's
@@ -758,7 +1009,10 @@ impl DnsPins {
     /// carried: the same event that withdraws their rows (the relay's
     /// attribution, filed beside the withdrawal report, NET-133) retires
     /// their pins, so an entry never outlives the connection its box's
-    /// answers rode. A re-attachment re-registers the row, and the next
+    /// answers rode — and the rows the table refused their entries, whose
+    /// mismatch was said once, go with them, so a row that arrives at the
+    /// address next says so again rather than inheriting its predecessor's
+    /// silence. A re-attachment re-registers the row, and the next
     /// reply rebuilds the entry — fail closed, until the box's own lookups
     /// pin again: nothing inside the VM can hand the box its old grants
     /// back.
@@ -768,8 +1022,14 @@ impl DnsPins {
             .boxes
             .lock()
             .expect("the admission table's lock is held only across this retire");
+        let mut refused = self
+            .inner
+            .refused
+            .lock()
+            .expect("the refused-row table's lock is held only across this retire");
         for src in sources {
             boxes.remove(src);
+            refused.remove(src);
         }
     }
 
@@ -806,12 +1066,13 @@ pub(crate) mod tests {
     //! honest IPv4 and UDP lengths throughout, because [`udp_datagram`]
     //! refuses any frame whose claimed lengths do not bound its payload.
 
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
-    use hickory_proto::rr::rdata::A;
+    use hickory_proto::rr::rdata::svcb::{IpHint, SvcParamKey, SvcParamValue};
+    use hickory_proto::rr::rdata::{A, AAAA, CNAME, HTTPS, SVCB};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
     use sessions::EgressPolicy;
     use sessions::core::egress::DNS_ADMISSION_WINDOW;
@@ -904,11 +1165,14 @@ pub(crate) mod tests {
         f
     }
 
-    /// A standard DNS query datagram for `name` (the same wire a resolver
-    /// stack sends, built with the parser the table reads it with).
+    /// A standard DNS query datagram for `name`, carrying the id of the
+    /// exchange its reply below answers (the same wire a resolver stack
+    /// sends, built with the parser the table reads it with): the reply
+    /// matching reads the id, so a query and the reply it expects share
+    /// one.
     pub(crate) fn dns_query(name: &str) -> Vec<u8> {
         let qname = Name::from_utf8(name).expect("query name parses");
-        let mut msg = Message::query();
+        let mut msg = Message::new(0x522a, MessageType::Query, OpCode::Query);
         msg.add_query(Query::query(qname, RecordType::A));
         msg.to_vec().expect("query encodes")
     }
@@ -916,14 +1180,58 @@ pub(crate) mod tests {
     /// A DNS reply datagram from the resolver: the id of a real exchange, the
     /// question echoed, and one A record per `answer`.
     pub(crate) fn dns_response(name: &str, answers: &[Ipv4Addr]) -> Vec<u8> {
+        dns_response_with(0x522a, name, answers)
+    }
+
+    /// A DNS reply datagram like [`dns_response`], carrying `id` as the
+    /// exchange's — the one field a reply that does not answer the box's own
+    /// question gets wrong.
+    fn dns_response_with(id: u16, name: &str, answers: &[Ipv4Addr]) -> Vec<u8> {
         let qname = Name::from_utf8(name).expect("the query name parses");
-        let mut response = Message::response(0x522a, OpCode::Query);
+        let mut response = Message::response(id, OpCode::Query);
         response.metadata.message_type = MessageType::Response;
         response.add_query(Query::query(qname.clone(), RecordType::A));
         for address in answers {
             response.add_answer(Record::from_rdata(qname.clone(), 60, RData::A(A(*address))));
         }
         response.to_vec().expect("the reply encodes")
+    }
+
+    /// A DNS reply datagram from the resolver, with the records the test
+    /// built — owners, sections and types its own — the shape the answer
+    /// chain is read from. The question is echoed for `qname`, `answers` go
+    /// in the answer section and `additionals` in the additional section.
+    fn dns_reply(qname: &str, answers: Vec<Record>, additionals: Vec<Record>) -> Vec<u8> {
+        let qname = Name::from_utf8(qname).expect("the query name parses");
+        let mut response = Message::response(0x522a, OpCode::Query);
+        response.metadata.message_type = MessageType::Response;
+        response.add_query(Query::query(qname, RecordType::A));
+        for record in answers {
+            response.add_answer(record);
+        }
+        for record in additionals {
+            response.add_additional(record);
+        }
+        response.to_vec().expect("the reply encodes")
+    }
+
+    /// One A record for `owner`, the answer a chain walk pins by.
+    fn a_record(owner: &str, address: Ipv4Addr) -> Record {
+        Record::from_rdata(
+            Name::from_utf8(owner).expect("the record's owner parses"),
+            60,
+            RData::A(A(address)),
+        )
+    }
+
+    /// One CNAME record: `owner` names `target`, the link the chain walk
+    /// follows.
+    fn cname_record(owner: &str, target: &str) -> Record {
+        Record::from_rdata(
+            Name::from_utf8(owner).expect("the record's owner parses"),
+            60,
+            RData::CNAME(CNAME(Name::from_utf8(target).expect("the record's target parses"))),
+        )
     }
 
     /// The box every pure proof below is decided for: `namespace`'s names
@@ -946,6 +1254,23 @@ pub(crate) mod tests {
                     deny_subnets: (!deny.is_empty()).then_some(deny),
                 }),
         );
+    }
+
+    /// Records one query the box sent its resolver for `name` — the egress
+    /// leg's half, driven directly so the reply matching is testable with no
+    /// sockets: from the box, on its lookup's own source port, to the plan's
+    /// resolver, in the datagram shape the relay hands the table.
+    fn lookup(pins: &DnsPins, table: &BoxTable, lease: [u8; 4], name: &str, now: Instant) {
+        let query = udp_payload_frame(
+            Ipv4Addr::from(lease),
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &dns_query(name),
+        );
+        let (pkt, datagram) =
+            udp_datagram(&query).expect("the test's query frame parses as the egress leg parses it");
+        pins.observe_query(table, &pkt, datagram, now);
     }
 
     /// Observes one reply the switch returned toward `lease`, answering
@@ -971,6 +1296,57 @@ pub(crate) mod tests {
         let (pkt, datagram) = udp_datagram(&reply)
             .expect("the test's reply frame parses as the relay's ingress leg parses it");
         pins.observe_reply(table, &pkt, datagram, limiter, now);
+    }
+
+    /// Drives one full exchange — the box's own question recorded on the
+    /// egress leg, then the reply the resolver returned, observed on the
+    /// ingress leg — so the tests that prove what a reply pins stand on the
+    /// same two legs the relay drives.
+    fn resolve(
+        pins: &DnsPins,
+        table: &BoxTable,
+        lease: [u8; 4],
+        name: &str,
+        answers: &[Ipv4Addr],
+        limiter: &DropLimiter,
+        now: Instant,
+    ) {
+        lookup(pins, table, lease, name, now);
+        observe(pins, table, lease, name, answers, limiter, now);
+    }
+
+    /// Observes one reply the resolver returned toward `lease` — the raw
+    /// datagram the test built — on the ingress leg: for the replies whose
+    /// records the stock helpers cannot spell.
+    fn observe_datagram(
+        pins: &DnsPins,
+        table: &BoxTable,
+        lease: [u8; 4],
+        reply: &[u8],
+        limiter: &DropLimiter,
+        now: Instant,
+    ) {
+        let frame =
+            udp_payload_frame(SUBNET.dns_server(), 53, Ipv4Addr::from(lease), 40000, reply);
+        let (pkt, datagram) =
+            udp_datagram(&frame).expect("the test's reply frame parses as the relay's ingress leg parses it");
+        pins.observe_reply(table, &pkt, datagram, limiter, now);
+    }
+
+    /// Drives one exchange whose reply the test built itself — the query
+    /// recorded on the egress leg, then the raw reply datagram observed on
+    /// the ingress leg.
+    fn resolve_reply(
+        pins: &DnsPins,
+        table: &BoxTable,
+        lease: [u8; 4],
+        name: &str,
+        reply: &[u8],
+        limiter: &DropLimiter,
+        now: Instant,
+    ) {
+        lookup(pins, table, lease, name, now);
+        observe_datagram(pins, table, lease, reply, limiter, now);
     }
 
     /// The table admits exactly the answers the box's own lookup received,
@@ -1030,7 +1406,7 @@ pub(crate) mod tests {
         // The box's own lookup: the query is the box's, and the reply is the
         // one it received — two addresses, both public.
         let second = Ipv4Addr::new(93, 184, 216, 35);
-        observe(
+        resolve(
             &pins,
             &table,
             LEASE,
@@ -1060,7 +1436,7 @@ pub(crate) mod tests {
         // A reply answering a name the row did not declare pins nothing for
         // it: the grant is the declaration's own.
         let undeclared = Ipv4Addr::new(192, 0, 2, 9);
-        observe(
+        resolve(
             &pins,
             &table,
             LEASE,
@@ -1095,7 +1471,7 @@ pub(crate) mod tests {
         // A reply toward another box pins that box — under the normalized form
         // of its own declaration — and only it.
         let others_answer = Ipv4Addr::new(192, 0, 2, 10);
-        observe(
+        resolve(
             &pins,
             &table,
             other,
@@ -1120,7 +1496,7 @@ pub(crate) mod tests {
         let burst: Vec<Ipv4Addr> = (0..33u8)
             .map(|i| Ipv4Addr::new(198, 51, 100, 100 + i))
             .collect();
-        observe(&pins, &table, LEASE, "cap.example", &burst, &limiter, now);
+        resolve(&pins, &table, LEASE, "cap.example", &burst, &limiter, now);
         assert!(
             pins.admits_frame(
                 &record,
@@ -1206,7 +1582,7 @@ pub(crate) mod tests {
         let denied = Ipv4Addr::new(10, 9, 9, 7);
         let metadata = Ipv4Addr::new(169, 254, 169, 254);
         let loopback = Ipv4Addr::new(127, 0, 0, 1);
-        observe(
+        resolve(
             &pins,
             &table,
             LEASE,
@@ -1236,7 +1612,7 @@ pub(crate) mod tests {
         // is heard because its key is its own.
         let denied_again = Ipv4Addr::new(10, 9, 9, 8);
         for _ in 0..3 {
-            observe(
+            resolve(
                 &pins,
                 &table,
                 LEASE,
@@ -1247,7 +1623,7 @@ pub(crate) mod tests {
             );
         }
         let others_denied = Ipv4Addr::new(10, 9, 9, 9);
-        observe(
+        resolve(
             &pins,
             &table,
             LEASE,
@@ -1379,7 +1755,7 @@ pub(crate) mod tests {
         // a pin inside the window, and a flow that rides past it — the
         // retention the row earned by using what its answer named.
         let answer = Ipv4Addr::new(93, 184, 216, 34);
-        observe(
+        resolve(
             &pins,
             &table,
             LEASE,
@@ -1441,7 +1817,7 @@ pub(crate) mod tests {
         // Until its own lookup pins again: the replacement row's own answer
         // admits for it — the same address, the same flow, both earned
         // rather than inherited.
-        observe(
+        resolve(
             &pins,
             &table,
             LEASE,
@@ -1463,6 +1839,452 @@ pub(crate) mod tests {
             "the flow the replacement row established rides past its window, \
              as the replaced row's did for it"
         );
+    }
+
+    /// The entrance's own guard (the architecture review's condition): a row
+    /// whose resolver is not the plan the table was built for can only be a
+    /// drift — the registry compiles every row's resolver from its own
+    /// subnet, so a row naming another one, an in-guest address or an
+    /// upstream reached through NAT, was built for a different plan — and
+    /// such a row is refused its entry and says so once, naming the box, the
+    /// resolver the row names and the plan's own. Nothing can ever pin for
+    /// it: without the guard the `src == row.resolver` check the reply's pin
+    /// decides by would be a grant the row's own bytes make, and a forged
+    /// reply wearing the address the row named would pin through it.
+    #[test]
+    fn a_row_whose_resolver_is_not_the_plans_own_is_refused() {
+        let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
+        // The registry a drifted row can only come from: built for another
+        // plan, it compiles this row's resolver from that plan's own
+        // address, while the box the row holds sits in the table's plan.
+        let foreign = SwitchSubnet::new(Ipv4Addr::new(100, 65, 0, 0), 24)
+            .expect("the test's second plan is a valid prefix");
+        let registry = BoxRegistry::new(foreign);
+        dns_box(
+            &registry,
+            "weather",
+            LEASE,
+            vec!["example.com".to_string()],
+            Vec::new(),
+        );
+        let table = registry.table();
+        let record = table
+            .by_source(LEASE)
+            .expect("the drifted row is held by the registry that built it");
+        let pins = DnsPins::new(SUBNET);
+        let limiter = DropLimiter::new();
+        let now = Instant::now();
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+
+        // The full exchange the row's own bytes would answer, on both legs:
+        // the row never earns its entry — the reply leg's sight of it is the
+        // refusal — so nothing is recorded for it and nothing pins.
+        resolve(&pins, &table, LEASE, "example.com", &[answer], &limiter, now);
+        assert!(
+            !pins.admits_frame(&record, answer.octets(), None, now),
+            "a row whose resolver is not the plan's own pins nothing"
+        );
+        let refused = "refused a DNS admission entry for a row whose resolver is not the \
+                      plan's own";
+        let logged = log.contents();
+        assert!(
+            logged.contains(refused)
+                && logged.contains("source=100.64.0.9")
+                && logged.contains("namespace=weather")
+                && logged.contains("resolver=100.65.0.1")
+                && logged.contains("plan_resolver=100.64.0.1"),
+            "the refusal names the box, the resolver the row names and the \
+             plan's own, got: {logged}"
+        );
+
+        // A later sight of the same row is silent — the refusal is said once
+        // per row, not once per reply — while a row the plan does own, in the
+        // same table, still pins for its own answers: the guard refuses the
+        // drift and nothing else.
+        resolve(&pins, &table, LEASE, "example.com", &[answer], &limiter, now);
+        let home = BoxRegistry::new(SUBNET);
+        let other = [100, 64, 0, 10];
+        dns_box(
+            &home,
+            "other",
+            other,
+            vec!["example.com".to_string()],
+            Vec::new(),
+        );
+        let home_table = home.table();
+        let home_record = home_table
+            .by_source(other)
+            .expect("the plan's own row is held");
+        resolve(
+            &pins,
+            &home_table,
+            other,
+            "example.com",
+            &[answer],
+            &limiter,
+            now,
+        );
+        assert!(
+            pins.admits_frame(&home_record, answer.octets(), None, now),
+            "a row whose resolver is the plan's own still pins"
+        );
+        let logged = log.contents();
+        assert_eq!(
+            logged.matches(refused).count(),
+            1,
+            "the refusal is said once per row, not once per sight: {logged}"
+        );
+    }
+
+    /// The reply matching (the architecture review's condition): only a reply
+    /// that answers one of the box's own outstanding queries pins — the same
+    /// question, the same transaction id, and the port the query left from —
+    /// and the match consumes its entry, so a replay of a matched reply
+    /// answers nothing. A well-formed reply the box never asked for, and one
+    /// that gets the id wrong, pass through to the box unpinned — and spend
+    /// nothing: the question they failed to answer stays answered by the
+    /// reply that eventually does.
+    #[test]
+    fn only_a_reply_to_the_boxs_own_outstanding_query_pins() {
+        let registry = BoxRegistry::new(SUBNET);
+        dns_box(
+            &registry,
+            "weather",
+            LEASE,
+            vec!["example.com".to_string()],
+            Vec::new(),
+        );
+        let table = registry.table();
+        let record = table
+            .by_source(LEASE)
+            .expect("the published box's row is held");
+        let pins = DnsPins::new(SUBNET);
+        let limiter = DropLimiter::new();
+        let now = Instant::now();
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+
+        // A well-formed reply for a declared name, from the resolver, with no
+        // query outstanding: the box never asked, so it pins nothing — the
+        // reply still reaches the box, and it is the connection to the answer
+        // that stays unadmitted.
+        observe(&pins, &table, LEASE, "example.com", &[answer], &limiter, now);
+        assert!(
+            !pins.admits_frame(&record, answer.octets(), None, now),
+            "a reply the box never asked for pins nothing"
+        );
+
+        // The box's own question, recorded on the egress leg: a reply that
+        // gets the transaction id wrong answers nothing — and does not spend
+        // the question either, which the reply that gets it right still
+        // answers.
+        lookup(&pins, &table, LEASE, "example.com", now);
+        let mismatched = udp_payload_frame(
+            SUBNET.dns_server(),
+            53,
+            Ipv4Addr::from(LEASE),
+            40000,
+            &dns_response_with(0x522b, "example.com", &[answer]),
+        );
+        let (pkt, datagram) = udp_datagram(&mismatched)
+            .expect("the test's mismatched reply parses as the ingress leg parses it");
+        pins.observe_reply(&table, &pkt, datagram, &limiter, now);
+        assert!(
+            !pins.admits_frame(&record, answer.octets(), None, now),
+            "a reply with a mismatched transaction id pins nothing"
+        );
+        observe(&pins, &table, LEASE, "example.com", &[answer], &limiter, now);
+        assert!(
+            pins.admits_frame(&record, answer.octets(), None, now),
+            "the mismatched reply spent nothing: the reply that answers the \
+             question pins"
+        );
+
+        // The match consumes the question: a replay of the same reply answers
+        // nothing and refreshes nothing — the window the first reply opened is
+        // the only one the address holds, and past its edge the pin is gone,
+        // where a replay that pinned would have opened a fresh one.
+        let past = now + DNS_ADMISSION_WINDOW + Duration::from_secs(1);
+        observe(&pins, &table, LEASE, "example.com", &[answer], &limiter, past);
+        assert!(
+            !pins.admits_frame(&record, answer.octets(), None, past),
+            "a replay of the same reply pins nothing more: the window it \
+             would have refreshed ended"
+        );
+    }
+
+    /// Only the answer chain pins (the architecture review's condition): the
+    /// chain starts at the question name and follows the CNAME records in
+    /// the answer section, and an A record pins exactly when its owner is a
+    /// name on it. Everything else in the reply is read past — a record
+    /// owned by a name off the chain, the sections the chain never walks
+    /// (authority, additional), and every type but A: an AAAA never pins in
+    /// v1 (NET-136), and SVCB and HTTPS name alternative endpoints, whose
+    /// hints are not the answer the box asked for.
+    #[test]
+    fn only_the_answers_chain_pins() {
+        let registry = BoxRegistry::new(SUBNET);
+        dns_box(
+            &registry,
+            "weather",
+            LEASE,
+            vec![
+                "example.com".to_string(),
+                "chain.example".to_string(),
+                "unaffiliated.example".to_string(),
+                "extra.example".to_string(),
+                "typed.example".to_string(),
+            ],
+            Vec::new(),
+        );
+        let table = registry.table();
+        let record = table
+            .by_source(LEASE)
+            .expect("the published box's row is held");
+        let pins = DnsPins::new(SUBNET);
+        let limiter = DropLimiter::new();
+        let now = Instant::now();
+
+        // The real answer beside a record no chain reaches: an A owned by a
+        // name the reply never linked to the question pins nothing, however
+        // public its address — the box's answers are its own, not a
+        // neighbour's.
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        let unrelated = Ipv4Addr::new(1, 2, 3, 4);
+        resolve_reply(
+            &pins,
+            &table,
+            LEASE,
+            "example.com",
+            &dns_reply(
+                "example.com",
+                vec![
+                    a_record("example.com", answer),
+                    a_record("evil.example", unrelated),
+                ],
+                Vec::new(),
+            ),
+            &limiter,
+            now,
+        );
+        assert!(
+            pins.admits_frame(&record, answer.octets(), None, now),
+            "the answer owned by the name the box asked for pins"
+        );
+        assert!(
+            !pins.admits_frame(&record, unrelated.octets(), None, now),
+            "an A record owned by a name off the answer chain pins nothing"
+        );
+
+        // A CNAME chain: the question's name aliases to another, and the A
+        // record that answers the alias is the answer the box received — the
+        // chain walk follows the link, and the A pins.
+        let aliased = Ipv4Addr::new(198, 51, 100, 7);
+        resolve_reply(
+            &pins,
+            &table,
+            LEASE,
+            "chain.example",
+            &dns_reply(
+                "chain.example",
+                vec![
+                    cname_record("chain.example", "alias.example"),
+                    a_record("alias.example", aliased),
+                ],
+                Vec::new(),
+            ),
+            &limiter,
+            now,
+        );
+        assert!(
+            pins.admits_frame(&record, aliased.octets(), None, now),
+            "the A record at the end of a CNAME chain pins: the chain walked \
+             the link to it"
+        );
+
+        // A reply whose only A record is owned by a name off the chain pins
+        // nothing at all: the chain never reached the owner, so the record is
+        // read past — fail closed.
+        let stray = Ipv4Addr::new(203, 0, 113, 77);
+        resolve_reply(
+            &pins,
+            &table,
+            LEASE,
+            "unaffiliated.example",
+            &dns_reply(
+                "unaffiliated.example",
+                vec![a_record("evil.example", stray)],
+                Vec::new(),
+            ),
+            &limiter,
+            now,
+        );
+        assert!(
+            !pins.admits_frame(&record, stray.octets(), None, now),
+            "a reply whose every A record is off the chain pins nothing"
+        );
+
+        // The additional section never enters the chain: its records are
+        // read past beside a real answer, and the address one carries —
+        // glue, or the smuggle — never becomes a pin.
+        let extra = Ipv4Addr::new(198, 51, 100, 23);
+        let smuggled = Ipv4Addr::new(192, 0, 2, 66);
+        resolve_reply(
+            &pins,
+            &table,
+            LEASE,
+            "extra.example",
+            &dns_reply(
+                "extra.example",
+                vec![a_record("extra.example", extra)],
+                vec![a_record("smuggled.example", smuggled)],
+            ),
+            &limiter,
+            now,
+        );
+        assert!(
+            pins.admits_frame(&record, extra.octets(), None, now),
+            "the answer in the answer section pins"
+        );
+        assert!(
+            !pins.admits_frame(&record, smuggled.octets(), None, now),
+            "an A record in the additional section pins nothing"
+        );
+
+        // The types v1 never admits: an AAAA record — here in the v4-mapped
+        // form, the only shape whose address a pin could even hold — and an
+        // SVCB and an HTTPS record, each carrying an ipv4hint, the v4
+        // address an alternative endpoint is reached at. The real answer
+        // beside them still pins; none of the typed records' addresses ever
+        // does.
+        let typed = Name::from_utf8("typed.example").expect("the typed owner parses");
+        let endpoint = Name::from_utf8("svc.example").expect("the svcb target parses");
+        let svcb = RData::SVCB(SVCB::new(
+            1,
+            endpoint.clone(),
+            vec![(
+                SvcParamKey::Ipv4Hint,
+                SvcParamValue::Ipv4Hint(IpHint(vec![A(Ipv4Addr::new(5, 6, 7, 8))])),
+            )],
+        ));
+        let https = RData::HTTPS(HTTPS(SVCB::new(
+            1,
+            endpoint,
+            vec![(
+                SvcParamKey::Ipv4Hint,
+                SvcParamValue::Ipv4Hint(IpHint(vec![A(Ipv4Addr::new(6, 7, 8, 9))])),
+            )],
+        )));
+        let hinted = Record::from_rdata(typed.clone(), 60, svcb);
+        let secure = Record::from_rdata(typed.clone(), 60, https);
+        let v6_mapped = Record::from_rdata(
+            typed.clone(),
+            60,
+            RData::AAAA(AAAA(Ipv6Addr::new(
+                0, 0, 0, 0, 0, 0xffff, 0x0102, 0x0304,
+            ))),
+        );
+        let typed_answer = Ipv4Addr::new(198, 51, 100, 67);
+        resolve_reply(
+            &pins,
+            &table,
+            LEASE,
+            "typed.example",
+            &dns_reply(
+                "typed.example",
+                vec![
+                    a_record("typed.example", typed_answer),
+                    hinted,
+                    secure,
+                    v6_mapped,
+                ],
+                Vec::new(),
+            ),
+            &limiter,
+            now,
+        );
+        assert!(
+            pins.admits_frame(&record, typed_answer.octets(), None, now),
+            "the real answer beside the typed records still pins"
+        );
+        for refused in [
+            Ipv4Addr::new(1, 2, 3, 4), // the AAAA record's v4-mapped address
+            Ipv4Addr::new(5, 6, 7, 8), // the SVCB record's ipv4hint
+            Ipv4Addr::new(6, 7, 8, 9), // the HTTPS record's ipv4hint
+        ] {
+            assert!(
+                !pins.admits_frame(&record, refused.octets(), None, now),
+                "a typed record's address never pins: the chain walk admits A \
+                 records only"
+            );
+        }
+    }
+
+    /// The completed infrastructure deny set (the architecture review's
+    /// condition, on NET-067's own): an answer that names this host's space
+    /// — `0.0.0.0` means the host itself — a multicast group, the broadcast
+    /// address or the reserved block it ends in is refused, whatever allowed
+    /// name asked for it, and each refusal is said in the shared format
+    /// under its own key: the name, the answer and the rule.
+    #[test]
+    fn host_window_refuses_this_host_multicast_broadcast_and_reserved_answers() {
+        let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
+        let registry = BoxRegistry::new(SUBNET);
+        // Two names, because the refusal line's key is the name: this host's
+        // own address and a multicast group, each refused under its own.
+        dns_box(
+            &registry,
+            "weather",
+            LEASE,
+            vec!["example.com".to_string(), "other.example".to_string()],
+            Vec::new(),
+        );
+        let table = registry.table();
+        let record = table
+            .by_source(LEASE)
+            .expect("the published box's row is held");
+        let pins = DnsPins::new(SUBNET);
+        let limiter = DropLimiter::new();
+        let now = Instant::now();
+
+        let this_host = Ipv4Addr::UNSPECIFIED;
+        let multicast = Ipv4Addr::new(224, 0, 0, 1);
+        resolve(&pins, &table, LEASE, "example.com", &[this_host], &limiter, now);
+        resolve(&pins, &table, LEASE, "other.example", &[multicast], &limiter, now);
+        for refused in [this_host, multicast] {
+            assert!(
+                !pins.admits_frame(&record, refused.octets(), None, now),
+                "an answer inside the completed infrastructure set never \
+                 became a pin"
+            );
+        }
+        let logged = log.contents();
+        for expected in [
+            "an allowed name resolved into a refused range",
+            "name=\"example.com\"",
+            "answer=0.0.0.0",
+            "rule_matched=\"dns-rebinding-infrastructure\"",
+            "name=\"other.example\"",
+            "answer=224.0.0.1",
+        ] {
+            assert!(
+                logged.contains(expected),
+                "the refusal names {expected}, got: {logged}"
+            );
+        }
+
+        // The rest of the completed set — the reserved block and broadcast
+        // itself — refuses as quietly, on the same leg.
+        for (name, refused) in [
+            ("example.com", Ipv4Addr::new(240, 0, 0, 1)),
+            ("other.example", Ipv4Addr::new(255, 255, 255, 255)),
+        ] {
+            resolve(&pins, &table, LEASE, name, &[refused], &limiter, now);
+            assert!(
+                !pins.admits_frame(&record, refused.octets(), None, now),
+                "the {name} answer inside the completed infrastructure set \
+                 never became a pin"
+            );
+        }
     }
 
     /// The L4 addressing of one of the frames above, as the gate's egress leg

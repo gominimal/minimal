@@ -373,7 +373,12 @@ const INFRASTRUCTURE_RULE: &str = "egress-infrastructure-destination";
 /// host alias is local reach inside the node's own block), refuses or admits
 /// the whole fabric plane by whether the name is a box-zone name (a frame has
 /// no name, and the plane's one admitted slice is the node's own block), and
-/// keeps its ranges private. The constants are the same, spelled as ranges.
+/// keeps its ranges private. The constants overlap without coinciding: the
+/// answer side's set carries the four ranges that complete it — this-host
+/// space, multicast, broadcast, and the reserved block the broadcast address
+/// ends in — for answers alone, where the frame rule refuses a frame by its
+/// own facts (a multicast or this-host destination is already outside the
+/// row's declared reach, and the plane and RFC 1918 arms decide the rest).
 struct InfrastructureRanges {
     /// Refused under every row: link-local and the metadata services living
     /// in it, and loopback space.
@@ -2462,6 +2467,21 @@ async fn relay_frames_to_switch(
         framed.extend_from_slice(&(n as u16).to_le_bytes());
         framed.extend_from_slice(&frame[..n]);
         switch.write_all(&framed).await?;
+        // The reply matching's other half: the box's own DNS query, one the
+        // gate just admitted to the switch, is recorded as that box's
+        // outstanding question, so the reply that answers it is the only kind
+        // that can ever pin (the question, the id and the port the query left
+        // from — [`dns_pins::DnsPins::observe_query`]). The pre-check is the
+        // ingress leg's own shape: UDP is most of a box's traffic and DNS a
+        // sliver of it, so the datagram is read only for a frame headed to
+        // the resolver's port — and only for a frame the gate admitted, which
+        // is why this sits after the write.
+        if dns_pins::is_ipv4_udp(&frame[..n])
+            && l4.as_ref().is_some_and(|l4| l4.dst.port() == RESOLVER_PORT)
+            && let Some((query, datagram)) = dns_pins::udp_datagram(&frame[..n])
+        {
+            pins.observe_query(table, &query, datagram, Instant::now());
+        }
     }
 }
 
@@ -4248,18 +4268,135 @@ mod tests {
         );
     }
 
-    /// The proof of the decision's whole point, against the adversary it is
-    /// for: the relay inside the VM subverted to carry a box's frames to any
-    /// destination it likes. The guest end here plays that hostile relay —
-    /// it writes whatever frames it chooses — and the host gate still drops
-    /// every destination the box's own answers did not pin, whatever
-    /// neighbourhood they live in, while the pinned destination passes; an
-    /// answer that resolved into the row's deny set or the infrastructure set
-    /// is refused before it can become one (NET-067, in the shared refusal
-    /// format, at the host), and the reply it came in still reaches the box
-    /// — resolution is honest, the *connection* is not admitted.
+    /// The pin table's single entrance (the architecture review's condition):
+    /// a reply-shaped frame on the guest→switch leg pins nothing. The
+    /// egress leg is the gate's, and every frame the relay inside the VM
+    /// writes is decided like any other — so the forge a subverted relay
+    /// would try, a reply wearing the resolver's own address and port, is
+    /// the host's drop before the switch ever sees it: the plan never leases
+    /// the gateway, so no row holds the address the frame claims. The box's
+    /// answers can only enter through the ingress leg — the replies the
+    /// switch itself returned toward it — and the reach the forge would
+    /// have bought is not there.
     #[tokio::test]
-    async fn hostile_relay_reaches_only_the_pinned_answers() {
+    async fn a_reply_forged_on_the_guest_side_pins_nothing() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    allow_subnets: Some(vec!["203.0.113.0/24".to_string()]),
+                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                    deny_subnets: None,
+                }),
+        );
+        let mut h = gate_over(registry).await;
+
+        // The box's own lookup first, so the forge is proven against a table
+        // that does pin: the query reaches the switch, the reply reaches the
+        // box, and the answer becomes the box's pin.
+        let query = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(LEASE),
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query("example.com"),
+        );
+        send_frame(&mut h.guest, &query).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            query,
+            "the box's own query reaches the switch, byte for byte"
+        );
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        let reply = dns_pins::tests::udp_payload_frame(
+            SUBNET.dns_server(),
+            53,
+            Ipv4Addr::from(LEASE),
+            40000,
+            &dns_pins::tests::dns_response("example.com", &[answer]),
+        );
+        send_frame(&mut h.switch, &reply).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            reply,
+            "the reply reaches the box in full"
+        );
+        wait_for_log(&h.log, "filled the box's host-side DNS admission table").await;
+
+        // The forge: a reply the relay inside the VM writes itself, wearing
+        // the resolver's address and port, answering the box's declared name
+        // with a public address nothing else would let it reach. It never
+        // reaches the switch — the source it claims is the plan's own
+        // gateway, an address no row holds, so the gate drops it as an
+        // unknown source's frame — and a frame the switch never received
+        // pins nothing.
+        let forged_answer = Ipv4Addr::new(192, 0, 2, 50);
+        let forged = dns_pins::tests::udp_payload_frame(
+            SUBNET.dns_server(),
+            53,
+            Ipv4Addr::from(LEASE),
+            40000,
+            &dns_pins::tests::dns_response("example.com", &[forged_answer]),
+        );
+        send_frame(&mut h.guest, &forged).await;
+        let marker = ipv4_frame(LEASE, 6, [203, 0, 113, 7], 443);
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the forged reply never reached the switch; the marker did"
+        );
+        expect_silence(&mut h.switch).await;
+        wait_for_log(&h.log, "egress-unknown-source").await;
+
+        // And the forge bought no reach: the address it named is still the
+        // host's drop, under the arm a real answer would have lifted it by —
+        // the pin the forge would have written is not there.
+        let to_forged = ipv4_frame(LEASE, 6, forged_answer.octets(), 443);
+        send_frame(&mut h.guest, &to_forged).await;
+        let second_marker = ipv4_frame(LEASE, 6, [203, 0, 113, 8], 443);
+        send_frame(&mut h.guest, &second_marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            second_marker,
+            "the address the forged reply named stays the host's drop; the \
+             second marker did"
+        );
+        wait_for_log(&h.log, "egress-undeclared-subnet").await;
+        assert_eq!(
+            h.pins.refused_for_want_of_pin(),
+            1,
+            "the frame to the forged answer consulted the pin arm and was \
+             refused: no pin was ever written for it"
+        );
+        assert_eq!(
+            h.pins.admitted_by_pin(),
+            0,
+            "nothing was admitted by a pin in this exchange: the box's own \
+             answer was never used"
+        );
+    }
+
+    /// The proof of the decision's whole point, against the adversary it is
+    /// for, per registered row: the relay inside the VM subverted to carry a
+    /// box's frames to any destination it likes, on a row the host holds. The
+    /// guest end here plays that hostile relay — it writes whatever frames it
+    /// chooses — and the host gate still drops every destination the box's
+    /// own answers did not pin, whatever neighbourhood they live in, while
+    /// the pinned destination passes; an answer that resolved into the row's
+    /// deny set or the infrastructure set is refused before it can become one
+    /// (NET-067, in the shared refusal format, at the host), and the reply it
+    /// came in still reaches the box — resolution is honest, the
+    /// *connection* is not admitted. The row is registered, which is what
+    /// scopes the proof: the box's frames carry a source a published row
+    /// holds. A relay sourcing from an address no row holds is the
+    /// unregistered-source case, #1790's, not this task's — there the interim
+    /// phase (`Announced`) still admits in-plan lease-run sources, and the
+    /// row-less reach it leaves is what that task retires.
+    #[tokio::test]
+    async fn hostile_relay_on_a_registered_row_reaches_only_pinned_answers() {
         let registry = BoxRegistry::new(SUBNET);
         registry.register(
             BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
@@ -4304,11 +4441,25 @@ mod tests {
         );
         wait_for_log(&h.log, "filled the box's host-side DNS admission table").await;
 
-        // The same name resolves into refused ranges — the row's own deny
-        // set, and the metadata service — and the host refuses each answer
-        // before it can become a pin, in the shared refusal format; the
-        // reply itself is not held back: the box heard its resolution, and
-        // the connection to it is the part that was not admitted.
+        // The same name resolves again — the box's own retransmission, a
+        // fresh question the egress leg records — because a reply can only
+        // pin as the answer to one of the box's own outstanding queries: the
+        // first reply consumed the first question, and without a second one
+        // there would be nothing outstanding for the refused answers to
+        // answer, and nothing to refuse.
+        send_frame(&mut h.guest, &query).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            query,
+            "the box's retransmitted query reaches the switch too"
+        );
+
+        // The retransmitted question resolves into refused ranges — the
+        // row's own deny set, and the metadata service — and the host refuses
+        // each answer before it can become a pin, in the shared refusal
+        // format; the reply itself is not held back: the box heard its
+        // resolution, and the connection to it is the part that was not
+        // admitted.
         let hostile_reply = dns_pins::tests::udp_payload_frame(
             SUBNET.dns_server(),
             53,
