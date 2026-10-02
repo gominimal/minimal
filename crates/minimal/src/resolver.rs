@@ -19,7 +19,6 @@
 use serde::Serialize;
 #[cfg(any(test, not(target_os = "macos")))]
 use std::net::Ipv4Addr;
-#[cfg(any(test, not(target_os = "macos")))]
 use std::time::Duration;
 use switch::loopback::RangeProbe;
 
