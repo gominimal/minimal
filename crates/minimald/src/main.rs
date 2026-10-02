@@ -677,6 +677,32 @@ async fn async_main() -> Result<(), MainError> {
         ),
     }
 
+    // NET-079: the start-time fact this daemon answers every create with —
+    // whether this host can decide a host-address box's egress verdict per
+    // box, and why not when it cannot. Read once here, because the facts it
+    // rests on (the covering cgroup2, the delegated subtrees, the loaded
+    // table's marker) change only when a person acts on this host, and
+    // recorded so the create response and session start advise with the
+    // same cause. The one info line a host that cannot decide per box owes
+    // names the cause, so the daemon's log carries what a session's start is
+    // about to tell the person in the terminal — and stays quiet on a host
+    // that decides, which is not a state to report.
+    let classifier_decision = minimald::net::classifier::decide(
+        tree_root,
+        sandbox2::classifier::own_mountinfo().as_deref(),
+        guest::is_microvm_daemon(),
+    );
+    if let Some(cause) = classifier_decision.cause() {
+        tracing::info!(
+            tree = sandbox2::classifier::TREE_ROOT,
+            cause = cause.detail(),
+            host_ip_enforcement = "none",
+            "this host cannot decide a host-address box's egress verdict \
+             per box, so its host-address boxes run unenforced"
+        );
+    }
+    minimald::net::classifier::record(classifier_decision);
+
     // R1.5/R1.6: when the microVM config requested a data volume
     // (`mk_mount_state_volume`), format-on-first-boot + mount it and, on success,
     // relocate cache + state onto it so builds hardlinking from the cache stay on

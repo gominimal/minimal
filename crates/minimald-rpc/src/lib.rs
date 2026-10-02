@@ -623,6 +623,61 @@ pub struct CreateSessionResponse {
     /// `None` prints the notice exactly as this reply's older readers did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_all_opt_out: Option<bool>,
+    /// The classifier advisory (NET-079): why this daemon's host cannot
+    /// decide a host-address box's egress verdict per box, when it cannot —
+    /// see [`ClassifierAdvisory`]. `None` when it can, when this session is
+    /// not host-address, and from a daemon that predates the field, whose
+    /// sessions ran unenforced without being told so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier: Option<ClassifierAdvisory>,
+    /// Whether this session's host-address box has its egress verdict
+    /// decided per box on the daemon's host — the machine attribute a
+    /// listing or a spec shows as `egress enforcement per_box` / `none`
+    /// (NET-079). `none` is the state the advisory names: the box runs with
+    /// the host's address and no verdict of its own, whatever its
+    /// declaration says, and the attribute outlives the activate message —
+    /// it is the host's start-time fact, not this message's.
+    ///
+    /// `None` for a none box or an own-address box, which has no host
+    /// address to decide on, and from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_enforcement: Option<EgressEnforcement>,
+}
+
+/// Why a daemon's host cannot decide a host-address box's egress verdict
+/// per box (NET-079) — the advisory a session start prints, carried on the
+/// create reply the activation path already holds.
+///
+/// A fact, never a prompt: `cause` names the state in words, and
+/// `install_command` names the exact command that ends it *when one can* —
+/// the classifier step's install, and only for the cause that step
+/// clears. A host that cannot confine a box gets the cause alone, because
+/// running the installer on it would leave the cause standing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClassifierAdvisory {
+    /// The cause, spelled for a person.
+    pub cause: String,
+    /// The exact command that ends the cause, present only when one can:
+    /// the classifier step's install, for the missing step. Absent for a
+    /// cause no command clears — a host that cannot confine a box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_command: Option<String>,
+}
+
+/// Whether a host-address box's egress verdict is decided per box on the
+/// daemon's host (NET-079) — the attribute a listing or a spec spells in
+/// the machine form below, and the state a deny-all box runs unenforced in
+/// when the host cannot decide.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EgressEnforcement {
+    /// The host decides per box: the box's verdict is decided on a
+    /// classifier leaf of its own, in the subtree its declaration picked.
+    #[serde(rename = "per_box")]
+    PerBox,
+    /// The host cannot decide per box: the box runs with the host's address
+    /// and no egress verdict of its own, whatever its declaration says.
+    #[serde(rename = "none")]
+    None,
 }
 
 impl OneshotSshRpc for CreateSession {

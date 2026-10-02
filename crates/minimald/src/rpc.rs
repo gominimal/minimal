@@ -271,6 +271,11 @@ async fn serve_create_session(
             // the manager consumes it, and the stored record's egress is what
             // the counts below report beside the "session created" line.
             let egress_counts = EgressRuleCounts::of(&req.config.policy);
+            // NET-079: the network mode, read off the config for the same
+            // reason — the classifier's advisory and the per-box enforcement
+            // attribute are host-address facts, so only a `HostNet` create
+            // carries them.
+            let host_address = req.config.network == minimald_rpc::NetworkMode::HostNet;
 
             Ok(match mngr.create_session(req.config, ssh_username).await {
                 Ok(id) => {
@@ -294,6 +299,34 @@ async fn serve_create_session(
                     // flag on the reply is what tells the client to surface
                     // the naming advisory again (NET-122).
                     let interim_loopback = session_start_loopback_probe(&id).await;
+                    // NET-079: the classifier's start-time fact about this
+                    // host, carried on the reply the activation path already
+                    // holds and scoped to the one box it is about — the
+                    // host-address session. The advisory names the cause a
+                    // host that cannot decide per box has, with the install
+                    // command only when the missing step is that cause, and
+                    // the enforcement attribute records the state either
+                    // way: a host-address box that cannot be decided per box
+                    // shows `none`, the fact a listing or a spec reads,
+                    // which outlives this message.
+                    let decision = crate::net::classifier::recorded();
+                    let (classifier, egress_enforcement) = if host_address {
+                        (
+                            decision
+                                .cause()
+                                .map(|cause| minimald_rpc::ClassifierAdvisory {
+                                    cause: cause.detail().to_string(),
+                                    install_command: cause.install_command(),
+                                }),
+                            Some(if decision.can_decide_per_box() {
+                                minimald_rpc::EgressEnforcement::PerBox
+                            } else {
+                                minimald_rpc::EgressEnforcement::None
+                            }),
+                        )
+                    } else {
+                        (None, None)
+                    };
                     Errorable::Ok(minimald_rpc::CreateSessionResponse {
                         id,
                         daemon_version: Some(OWN_VERSION.to_string()),
@@ -307,6 +340,8 @@ async fn serve_create_session(
                         // notice (NET-076) can stay off a deployment that has
                         // already chosen to keep the shipped default.
                         deny_all_opt_out: Some(s.deny_all_opt_out().await),
+                        classifier,
+                        egress_enforcement,
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
