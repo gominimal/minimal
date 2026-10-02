@@ -3996,6 +3996,7 @@ dependencies = [
  "diagnostics",
  "dirs",
  "hex",
+ "hickory-proto",
  "inquire",
  "mctx",
  "mfile",

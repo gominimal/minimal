@@ -100,6 +100,14 @@ async fn register_box_with_vm_host(
         minimald_rpc::BoxControlReply::Error { error } => {
             anyhow::bail!("the VM host daemon refused the box registration: {error}")
         }
+        // The reply shapes are disjoint, so this arm is a daemon speaking
+        // another verb's answer to a register — not an address pair either
+        // way, so the registration did not happen.
+        minimald_rpc::BoxControlReply::Status(status) => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with its                  answerer status {status:?}; the registration did not happen"
+            )
+        }
     }
 }
 
@@ -120,6 +128,40 @@ pub(crate) fn vm_host_control_sock(global: &GlobalArgs) -> Option<std::path::Pat
     ssh_sock
         .parent()
         .map(|dir| dir.join(minvmd::control::CONTROL_SOCK_FILE))
+}
+
+/// The machine's zone-answerer state, read from the VM host daemon's
+/// control socket (NET-138) — the read-only status verb, over the same
+/// socket the box rows ride, so the posture (a 0600 socket in the provider
+/// dir, the connection's own reach) is the one every other verb is served
+/// under.
+///
+/// Never read through the in-VM daemon: a guest relaying a host fact is
+/// forgeable from inside the escape boundary, so the CLI asks the host
+/// daemon that owns the fact. `None` — nothing to surface — when this
+/// invocation is not on a VM-backed host, the socket is not there, the
+/// deadline passes, or the daemon predates the verb and refuses the line:
+/// each is the same honest silence a daemon still bringing its answerer up
+/// gets, and the verbs print nothing they cannot prove.
+pub(crate) async fn vm_host_answerer_status(
+    global: &GlobalArgs,
+) -> Option<minimald_rpc::ZoneAnswererStatus> {
+    let sock_path = vm_host_control_sock(global)?;
+    let read = tokio::time::timeout(
+        BOX_CONTROL_TIMEOUT,
+        control_request_with_vm_host(
+            &sock_path,
+            minimald_rpc::BoxControlRequest::AnswererStatus,
+        ),
+    )
+    .await;
+    match read {
+        Ok(Ok(minimald_rpc::BoxControlReply::Status(status))) => Some(status),
+        // Any other reply — a refusal from a daemon that predates the verb,
+        // a line that did not parse — is a daemon that cannot answer the
+        // question; say nothing rather than guessing the machine's state.
+        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => None,
+    }
 }
 
 /// Withdraws the box's host row (T66) when the session that registered it
@@ -189,6 +231,17 @@ pub(crate) async fn withdraw_box_row(
                     %error,
                     "the VM host daemon refused the box row withdrawal; the row \
                      stays published"
+                );
+            }
+            // A status reply is another verb's answer on a wire whose
+            // reply shapes are disjoint: the row asked for was not
+            // withdrawn, so say so and leave it published.
+            minimald_rpc::BoxControlReply::Status(status) => {
+                tracing::warn!(
+                    box = %name,
+                    status = ?status,
+                    "the VM host daemon answered the box row withdrawal with its \
+                     answerer status; the row stays published"
                 );
             }
         },
@@ -657,46 +710,89 @@ pub(crate) async fn activate_session(
         created.hostname_routing_unavailable.as_deref(),
         "min session activate",
     );
-    // NET-122/NET-123: the naming advisory, printed once per session start —
-    // after the create, and re-surfaced when the daemon reports this session
-    // at the 127.0.0.1 interim because its session-start bind probe found
-    // the reserved range absent. It only ever names the command that
-    // points the host's resolver at the answerer; running it (and any
-    // privilege prompt it carries) is the user's act, never the session
-    // start's. One read of this host's resolver state decides both this and
-    // the surface verdict below it, so the two lines cannot disagree about
-    // one host.
+    // NET-122/NET-123/NET-138: the naming lines, printed once per session
+    // start — after the create, and re-surfaced when the daemon reports this
+    // session at the 127.0.0.1 interim because its session-start bind
+    // probe found the reserved range absent. The advisory only ever names
+    // the command that points the host's resolver at the answerer; running
+    // it (and any privilege prompt it carries) is the user's act, never the
+    // session start's. One read of this host's resolver state decides the
+    // advisory and the surface verdict below it, so the two lines cannot
+    // disagree about one host.
     //
-    // Both lines are the answerer's port's to print: the advisory has no
-    // command to name without one, the verdict no answerer whose surface to
-    // decide, so a create that reports none — the answerer still coming up,
-    // or a daemon that predates the field — prints neither and reads
-    // nothing. That keeps the no-port activate the zero-cost start it was
-    // before either line read this host: the detection below is two
-    // `resolvectl` queries under a five-second bound, and a wedged
-    // systemd-resolved must not be waited out for lines that cannot print
-    // from it.
-    if let Some(answerer_port) = created.zone_answerer_port {
+    // On a VM-backed host the answerer is the VM host daemon's (NET-138):
+    // the in-VM daemon starts none, so the port and the bound proof come
+    // from the host — the state read over minvmd's control socket (never
+    // through the in-VM daemon, because a guest relaying a host fact is
+    // forgeable from inside the escape boundary) and this CLI's own A
+    // query for the host's row at the port that read named, the proof the
+    // answerer is live rather than merely reported held. A native host
+    // keeps the daemon's own report. `held_no_channel` is the machine fact
+    // that ends the question: a port held by a process no channel reaches
+    // means this VM's names are not answered on the host whatever this
+    // host's hook and range say, so neither is read and the warning says
+    // the fact instead of the advisory.
+    let (answerer_port, answerer_bound, held_no_channel) =
+        match vm_host_answerer_status(global).await {
+            Some(status) => {
+                let read = crate::resolver::host_answerer_read(status).await;
+                (read.port, read.answerer_bound, read.held_no_channel)
+            }
+            None => (created.zone_answerer_port, created.answerer_bound, false),
+        };
+    if held_no_channel
+        && let Some(answerer_port) = answerer_port
+    {
+        // NET-138's warning, at every session start — TTY and non-TTY: it
+        // rides stderr unconditionally, because the first lookup that
+        // fails is the one it explains, and a piped activate is as owed
+        // the fact as an interactive one.
+        eprintln!(
+            "{}",
+            crate::resolver::port_held_no_channel_warning(answerer_port)
+        );
+        // The verdict is the proxy's by the status's own word, without
+        // reading the hook or the range: both could only misreport native
+        // for a port no daemon answers, and the arm that cannot strand the
+        // user is the proxy's (NET-019 keeps it serving). Logged as the
+        // same session-start record the native arm logs, with the fact
+        // that decided it.
+        tracing::info!(
+            surface = ?crate::resolver::LiveSurface::Proxy,
+            held_no_channel = true,
+            answerer_bound = false,
+            answerer_port = answerer_port,
+            "session start decided the live name surface for this host"
+        );
+        eprintln!(
+            "{}",
+            crate::resolver::name_surface_line(
+                crate::resolver::LiveSurface::Proxy,
+                created.hostname_proxy_port,
+            )
+        );
+    } else if let Some(answerer_port) = answerer_port {
         let detection = crate::resolver::session_detection().await;
         // NET-018: name the live surface at the moment the user is about to
         // rely on the names — decided in the one function both verbs share
         // (`resolver`), from the same detection the advisory reads: this
         // host's hook (and the stub-bypass blocker that says whether its
-        // lookups consult what the hook configures), the daemon's
-        // answerer-bound report, and the reserved range on this host's own
-        // loopback. Decided before the advisory prints only so the range
-        // its read holds can be the advisory's too — one probe, one host —
-        // while the printed order stays the advisory's and then the
-        // surface's. `None` — the answerer not bound — prints nothing: no
-        // native surface to name, and the ports and the advisory have told
-        // the proxy's story. The proxy's half is said with the native arm
-        // either way (NET-019): the `HTTP(S)_PROXY` recipes this activation
-        // prints keep working beside native DNS, so nothing already
-        // captured goes stale.
+        // lookups consult what the hook configures), the answerer-bound
+        // proof this start holds — the daemon's report on a native host,
+        // this CLI's own query on a VM-backed one — and the reserved range
+        // on this host's own loopback. Decided before the advisory prints
+        // only so the range its read holds can be the advisory's too — one
+        // probe, one host — while the printed order stays the advisory's
+        // and then the surface's. `None` — the answerer not bound — prints
+        // nothing: no native surface to name, and the ports and the
+        // advisory have told the proxy's story. The proxy's half is said
+        // with the native arm either way (NET-019): the `HTTP(S)_PROXY`
+        // recipes this activation prints keep working beside native DNS,
+        // so nothing already captured goes stale.
         let surface_verdict = crate::resolver::live_name_surface_with_range_at(
             &detection,
             Some(answerer_port),
-            created.answerer_bound,
+            answerer_bound,
         )
         .await;
         // The advisory shares that verdict's range read: the daemon's
@@ -732,7 +828,7 @@ pub(crate) async fn activate_session(
                 surface = ?verdict.surface,
                 hook_routes = detection.0.routes(answerer_port),
                 blocker = ?detection.1,
-                answerer_bound = created.answerer_bound,
+                answerer_bound = answerer_bound,
                 range_present = ?verdict.range_present,
                 "session start decided the live name surface for this host"
             );
@@ -2613,6 +2709,92 @@ mod tests {
         assert!(
             refused.to_string().contains("address plan is exhausted"),
             "the refusal surfaces with its reason: {refused}"
+        );
+    }
+
+    /// NET-138's status read: the machine's zone-answerer state is read
+    /// from the VM host daemon's control socket — the read-only verb, the
+    /// one request that names no row — and every way that read cannot be
+    /// made is the same silence: a native host has no VM host daemon to
+    /// ask, an absent socket no daemon to answer, and a daemon that
+    /// predates the verb refuses the line it cannot parse. The verbs print
+    /// nothing from a silence; this pins that they get one.
+    #[tokio::test]
+    async fn the_answerer_status_is_read_from_the_vm_host_alone() {
+        // The served shape: the state parses back as itself over the line
+        // protocol the registrations ride — built with the wire types so
+        // the reply cannot drift from what the daemon sends.
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let sock_path = provider_dir.join("control.sock");
+        let reply = serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Status(
+            minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
+        ))
+        .expect("the status reply serializes");
+        let requests = fake_vm_host(sock_path.clone(), reply).await;
+        let global = GlobalArgs {
+            provider: Some(Provider::LocalMinvmd),
+            minimal_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert_eq!(
+            vm_host_answerer_status(&global).await,
+            Some(minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 }),
+            "the state the daemon answered is the state the read returns"
+        );
+        {
+            let seen = requests.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one status read, one request");
+            let request: minimald_rpc::BoxControlRequest =
+                serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type");
+            assert!(
+                matches!(request, minimald_rpc::BoxControlRequest::AnswererStatus),
+                "the read is the read-only verb, naming no row: {}",
+                seen[0]
+            );
+        }
+
+        // A native host asks nothing: there is no VM host daemon to read
+        // the machine's state from.
+        let native = GlobalArgs::default();
+        assert_eq!(
+            vm_host_answerer_status(&native).await,
+            None,
+            "a native host has no VM host daemon to ask"
+        );
+
+        // A VM-backed host with no socket is the same silence.
+        let absent_dir = tempfile::TempDir::new().unwrap();
+        let absent = GlobalArgs {
+            provider: Some(Provider::LocalMinvmd),
+            minimal_dir: Some(absent_dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert_eq!(
+            vm_host_answerer_status(&absent).await,
+            None,
+            "no socket answers, so no state is claimed"
+        );
+
+        // And a daemon that predates the verb refuses the line it cannot
+        // parse — the wire's version corner, answered with the same
+        // silence rather than a guessed state.
+        let old_dir = tempfile::TempDir::new().unwrap();
+        let old_provider = old_dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&old_provider).unwrap();
+        let _old_requests =
+            fake_vm_host(old_provider.join("control.sock"), r#"{"error":"unknown verb"}"#.to_string())
+                .await;
+        let old = GlobalArgs {
+            provider: Some(Provider::LocalMinvmd),
+            minimal_dir: Some(old_dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert_eq!(
+            vm_host_answerer_status(&old).await,
+            None,
+            "a refusal from a daemon that predates the verb is silence, not a state"
         );
     }
 

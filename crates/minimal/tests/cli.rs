@@ -72,6 +72,7 @@ fn ls_shows_shared_resource_pool() {
         },
         &resp,
         None,
+        None,
     )
     .unwrap();
 
@@ -109,6 +110,7 @@ fn ls_table_exposes_project_path_and_status() {
         },
         &resp,
         None,
+        None,
     )
     .unwrap();
 
@@ -141,6 +143,7 @@ async fn ls_empty() {
         },
         &resp,
         None,
+        None,
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
@@ -162,6 +165,7 @@ async fn ls_raw_empty() {
             json: false,
         },
         &resp,
+        None,
         None,
     )
     .unwrap();
@@ -187,6 +191,7 @@ async fn ls_json_empty() {
             json: true,
         },
         &resp,
+        None,
         None,
     )
     .unwrap();
@@ -217,6 +222,7 @@ async fn ls_json_with_sessions() {
             json: true,
         },
         &resp,
+        None,
         None,
     )
     .unwrap();
@@ -250,6 +256,7 @@ async fn ls_raw_with_sessions() {
             json: false,
         },
         &resp,
+        None,
         None,
     )
     .unwrap();
@@ -1775,6 +1782,7 @@ async fn activate_and_ls_report_native_surface() {
         },
         &resp,
         Some(resolver::LiveSurface::Native),
+        None,
     )
     .unwrap();
     let native_ls = String::from_utf8(native_out).unwrap();
@@ -1801,6 +1809,134 @@ async fn activate_and_ls_report_native_surface() {
     assert!(
         native_ls.contains(&activate_words),
         "`min ls` and activate print the same native words: {native_ls} vs {activate_words}"
+    );
+}
+
+// --- the VM-backed host's answerer lines (NET-138) ---
+
+/// `min ls` on a VM-backed host: the daemon behind the list reports no
+/// answerer of its own (a VM's daemon starts none), so the ZONE ANSWERER
+/// line prints from the state the VM host daemon's control socket
+/// answered — saying the zone is answered by the VM host daemon and naming
+/// the holder — while `--json` and `--raw` stay machine-readable-only, the
+/// native daemon's own line keeps its place on a native host, and the
+/// pre-acquisition state prints nothing and forces no blank line. Pinned
+/// here as a pure formatting call because the session e2e greps a real
+/// host's `min ls` for exactly this line.
+#[test]
+fn ls_names_the_vm_host_daemon_as_the_zone_answerer() {
+    let resp = ListSessionsResponse {
+        daemon_version: None,
+        hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
+        answerer_bound: false,
+        resource_pool: None,
+        sessions: Vec::new(),
+    };
+
+    // The lone-holder shape: this VM's minvmd holds the port.
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+        Some(resolver::LiveSurface::Native),
+        Some(minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 }),
+    )
+    .unwrap();
+    let holder_ls = String::from_utf8(out).unwrap();
+    assert!(
+        holder_ls.contains(
+            "ZONE ANSWERER:   answered by the VM host daemon (single-operator interim)"
+        ),
+        "the list names who answers the zone on a VM-backed host: {holder_ls}"
+    );
+    assert!(
+        holder_ls.contains("this VM's minvmd holds it on 127.0.0.1:7656 (UDP)"),
+        "the line names this VM's minvmd as the holder: {holder_ls}"
+    );
+    // The verdict beside it: the query proved the answerer live and this
+    // host's facts held, so the surface the CLI computed prints through —
+    // the same `NAME SURFACE` line the native host's list carries.
+    assert!(
+        holder_ls.contains("NAME SURFACE:    native DNS is the live name surface"),
+        "the VM-host verdict rides the list like a native one: {holder_ls}"
+    );
+    assert!(
+        holder_ls.contains("\n\nNo active sessions."),
+        "the answerer lines are separated from the list body by a blank line: {holder_ls}"
+    );
+
+    // The no-channel shape: the holder is a process no channel reaches, so
+    // the line says the names are not answered on the host and must not
+    // claim the VM host daemon answers them.
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+        Some(resolver::LiveSurface::Proxy),
+        Some(minimald_rpc::ZoneAnswererStatus::PortHeldNoChannel { port: 7_656 }),
+    )
+    .unwrap();
+    let held_ls = String::from_utf8(out).unwrap();
+    assert!(
+        held_ls.contains("ZONE ANSWERER:   not answered on the host"),
+        "a port held by a process no channel reaches is not an answered zone: {held_ls}"
+    );
+    assert!(
+        !held_ls.contains("answered by the VM host daemon (single-operator interim)"),
+        "the no-channel arm must not claim an answer: {held_ls}"
+    );
+    assert!(
+        held_ls.contains("NAME SURFACE:    the hostname proxy is the live name surface"),
+        "the no-channel verdict reads the proxy: {held_ls}"
+    );
+
+    // `--raw` is machine-readable-only: the host fact rides no pipeline.
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: true,
+            json: false,
+        },
+        &resp,
+        None,
+        Some(minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 }),
+    )
+    .unwrap();
+    let raw_ls = String::from_utf8(out).unwrap();
+    assert!(
+        !raw_ls.contains("ZONE ANSWERER"),
+        "a raw list carries no answerer line: {raw_ls}"
+    );
+
+    // The pre-acquisition state prints no line — and, because nothing
+    // printed, forces no blank line either.
+    let mut out = Vec::new();
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+        None,
+        Some(minimald_rpc::ZoneAnswererStatus::Starting),
+    )
+    .unwrap();
+    let starting_ls = String::from_utf8(out).unwrap();
+    assert_eq!(
+        starting_ls, "No active sessions.\n",
+        "a status with nothing to say yet prints nothing: {starting_ls}"
     );
 }
 

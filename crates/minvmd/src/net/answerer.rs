@@ -553,7 +553,10 @@ const OWN_TABLE: &str = "this host's own table";
 /// for this name at the reported port that proves the answerer serves) and
 /// the session e2e's dig both read it. A registration for it from any node
 /// is refused, like every name the answerer holds first.
-const HOST_NAME: &str = "host.min.internal";
+///
+/// Public so the CLI's query asks for the name this answerer holds — one
+/// definition, so the question and the answer cannot drift apart.
+pub const HOST_NAME: &str = "host.min.internal";
 
 /// The source the answerer's own [`HOST_NAME`] row keeps its name under in
 /// the fold: the keeper a refused registration's warn names.

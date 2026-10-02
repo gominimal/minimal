@@ -332,12 +332,29 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // that cannot strand the user (NET-019 keeps the proxy serving). The
     // daemon's own view of this host's resolver is not a thing that
     // exists, so the host's half is the host's to read.
+    // NET-138: on a VM-backed host the answerer whose surface this is is
+    // the VM host daemon's — the daemon behind this list starts none, so
+    // its reply reports no answerer and the facts come from the host. The
+    // status is read over minvmd's control socket, never through the
+    // in-VM daemon (a guest relaying a host fact is forgeable from inside
+    // the escape boundary), and the liveness proof is this CLI's own A
+    // query at the port that read named. Read in the modes that can print
+    // it, like the detection below it: `--json` and `--raw` are
+    // machine-readable-only and pay no host read, socket or query either
+    // one.
+    let vm_answerer = if args.json || args.raw {
+        None
+    } else {
+        crate::cmd::session::vm_host_answerer_status(global).await
+    };
     let surface = if args.json || args.raw {
         None
+    } else if let Some(status) = vm_answerer {
+        crate::resolver::vm_host_name_surface(status).await
     } else {
         crate::resolver::live_name_surface(resp.zone_answerer_port, resp.answerer_bound).await
     };
-    format_ls(&mut std::io::stdout(), &args, &resp, surface)?;
+    format_ls(&mut std::io::stdout(), &args, &resp, surface, vm_answerer)?;
     Ok(())
 }
 
@@ -386,11 +403,20 @@ pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>, command: &str)
 /// through on this host, as [`cmd_ls`] computed it from the one function
 /// both verbs share — printed on the `NAME SURFACE` line when the daemon's
 /// answerer is bound at all.
+///
+/// `vm_answerer` is the machine's zone-answerer state on a VM-backed host
+/// (NET-138), as [`cmd_ls`] read it from the VM host daemon's control
+/// socket: when the daemon behind this list reports no answerer of its own
+/// — a VM-backed host's daemon starts none — the `ZONE ANSWERER` line
+/// prints from it instead, saying the zone is answered by the VM host
+/// daemon and naming the holder. `None`, the native shape, prints the
+/// daemon's own line exactly as before.
 pub fn format_ls(
     out: &mut impl std::io::Write,
     args: &LsArgs,
     resp: &minimald_rpc::ListSessionsResponse,
     surface: Option<crate::resolver::LiveSurface>,
+    vm_answerer: Option<minimald_rpc::ZoneAnswererStatus>,
 ) -> Result<(), anyhow::Error> {
     if args.json {
         let json = serde_json_lenient::to_string_pretty(resp)
@@ -437,11 +463,17 @@ pub fn format_ls(
                 "HOSTNAME PROXY:  listening on 127.0.0.1:{port} · <name>.min.internal routes through it"
             )?;
         }
+        // The VM host daemon's line is computed once here, because the
+        // blank line below rides on what printed, not on what was read:
+        // the pre-acquisition state prints no line and forces no blank one.
+        let vm_answerer_line = vm_answerer.and_then(crate::resolver::vm_host_answerer_line);
         if let Some(answerer) = resp.zone_answerer_port {
             writeln!(
                 out,
                 "ZONE ANSWERER:   listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal"
             )?;
+        } else if let Some(line) = &vm_answerer_line {
+            writeln!(out, "ZONE ANSWERER:   {line}")?;
         }
         // NET-018: say which of the two surfaces is live — the one verdict
         // both verbs share ([`resolver::live_name_surface`]). `None` — the
@@ -457,7 +489,10 @@ pub fn format_ls(
                 crate::resolver::name_surface_line(surface, resp.hostname_proxy_port)
             )?;
         }
-        if resp.hostname_proxy_port.is_some() || resp.zone_answerer_port.is_some() {
+        if resp.hostname_proxy_port.is_some()
+            || resp.zone_answerer_port.is_some()
+            || vm_answerer_line.is_some()
+        {
             writeln!(out)?;
         }
     }
