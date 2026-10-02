@@ -43,13 +43,10 @@ minimald-rpc.workspace = true
 # The JSON file-log layer both daemons write through, so the on-disk log format
 # has one definition (Unit 4).
 mlog.workspace = true
-# Shared gvproxy-switch primitives (subnet/MAC/`-config` rendering) used by `net`.
-switch.workspace = true
-# The userspace TCP/IP stack the Box Egress Proxy's host leg runs over
-# (`net::bep_host`): the leg terminates box connections on the switch subnet
-# in-process, so the proxy's listener address never needs a host-kernel
-# interface.
-smoltcp.workspace = true
+# Shared gvproxy-switch primitives (subnet/MAC/`-config` rendering) used by
+# `net`, with the Box Egress Proxy's host-side stack peer (`switch::bep_host`,
+# NET-132) that `net` starts beside the switch.
+switch = { workspace = true, features = ["stack-peer"] }
 # Async gvproxy switch supervision in `net`: the background exit-detection task
 # and the async `stop()` teardown run on the tokio runtime the networking layer
 # mandates (no blocking I/O in async context).
