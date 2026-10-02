@@ -663,24 +663,33 @@ pub(crate) async fn activate_session(
     // the reserved range absent. It only ever names the command that
     // points the host's resolver at the answerer; running it (and any
     // privilege prompt it carries) is the user's act, never the session
-    // start's.
-    if let Some(advisory) =
+    // start's. Kept, not just printed: the advisory is this host's half of
+    // NET-018's condition — it prints only when the host's resolver is not
+    // pointed at the answerer, or something keeps a configured hook from
+    // reaching host lookups — so the surface line below decides from it.
+    let name_advisory =
         crate::resolver::session_advisory(created.zone_answerer_port, created.interim_loopback)
-            .await
-    {
+            .await;
+    if let Some(advisory) = &name_advisory {
         eprintln!("{advisory}");
     }
-    // NET-018: when the daemon reports native DNS as the live name surface,
-    // say so at the moment the user is about to rely on the names — and say
-    // the proxy's half with it (NET-019): the `HTTP(S)_PROXY` recipes this
-    // activation prints keep working beside native DNS, so nothing already
-    // captured goes stale. The proxy verdict prints nothing (the daemon's
-    // reason and remedy have their own lines); the advisory above is what
-    // says how to point the host's resolver at the answerer, and the two
-    // compose: the surface says where names answer from, the advisory how to
-    // reach it from this host's resolver.
-    if created.name_surface == minimald_rpc::NameSurface::Native {
-        eprintln!("{}", native_name_surface_line(created.hostname_proxy_port));
+    // NET-018: name the live surface at the moment the user is about to rely
+    // on the names — decided from the daemon's verdict *and* this host's
+    // half, so the line and the advisory above cannot disagree on the page:
+    // a daemon that says native knows only its answerer serving and the
+    // range present on the loopback *it* sits on — the guest's on a
+    // VM-backed host, always present — so on a host whose resolver it cannot
+    // see, the names still route only through the proxy, and that is what
+    // the line says. The proxy's half is said with it either way (NET-019):
+    // the `HTTP(S)_PROXY` recipes this activation prints keep working
+    // beside native DNS, so nothing already captured goes stale. A daemon
+    // that says the proxy prints nothing — its reason and remedy have their
+    // own lines.
+    if let Some(surface) = reported_name_surface(created.name_surface, name_advisory.is_none()) {
+        eprintln!(
+            "{}",
+            name_surface_line(surface, created.hostname_proxy_port)
+        );
     }
     let id = created.id;
 

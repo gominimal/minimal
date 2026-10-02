@@ -71,6 +71,7 @@ fn ls_shows_shared_resource_pool() {
             json: false,
         },
         &resp,
+        false,
     )
     .unwrap();
 
@@ -107,6 +108,7 @@ fn ls_table_exposes_project_path_and_status() {
             json: false,
         },
         &resp,
+        false,
     )
     .unwrap();
 
@@ -138,6 +140,7 @@ async fn ls_empty() {
             json: false,
         },
         &resp,
+        false,
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
@@ -159,6 +162,7 @@ async fn ls_raw_empty() {
             json: false,
         },
         &resp,
+        false,
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
@@ -183,6 +187,7 @@ async fn ls_json_empty() {
             json: true,
         },
         &resp,
+        false,
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
@@ -212,6 +217,7 @@ async fn ls_json_with_sessions() {
             json: true,
         },
         &resp,
+        false,
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
@@ -244,6 +250,7 @@ async fn ls_raw_with_sessions() {
             json: false,
         },
         &resp,
+        false,
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
@@ -1342,25 +1349,82 @@ async fn setup_opted_out() -> (
 // runs the real retry loop against it, and reads what `min ls` and
 // `min session activate` print while the proxy is down and after it recovers.
 
+/// Builds the compiled `min` the way [`run_min`] runs it: the harness
+/// daemon's `--minimal-dir`, an empty `--config-dir` (the developer's own
+/// loadouts and policy stay out of the run), `--no-input`, plus `extra` as
+/// the command. The tempdir holds that `--config-dir` — it must outlive the
+/// child it is spelled into, so the caller keeps the pair.
+#[cfg(target_os = "linux")]
+fn min_command(args: &GlobalArgs, extra: &[&str]) -> (tokio::process::Command, tempfile::TempDir) {
+    let minimal_dir = args
+        .minimal_dir
+        .as_ref()
+        .expect("setup points at a tempdir");
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"));
+    command
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(extra);
+    (command, config_dir)
+}
+
 /// Runs the compiled `min` with the harness daemon's `--minimal-dir`, an empty
 /// `--config-dir` (the developer's own loadouts and policy stay out of the
 /// run), and `--no-input`, plus `extra` as the command, and returns its
 /// captured output.
 #[cfg(target_os = "linux")]
 async fn run_min(args: &GlobalArgs, extra: &[&str]) -> std::process::Output {
-    let minimal_dir = args
-        .minimal_dir
-        .as_ref()
-        .expect("setup points at a tempdir");
-    let config_dir = tempfile::TempDir::new().unwrap();
-    tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
-        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
-        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
-        .arg("--no-input")
-        .args(extra)
+    let (mut command, _config_dir) = min_command(args, extra);
+    command
         .output()
         .await
         .expect("the min binary should be invocable")
+}
+
+/// [`run_min`] with `dir` put first on the child's `PATH`: the child sees
+/// whatever stand-ins the caller planted there ahead of the host's own
+/// commands — the name-surface test plants a `resolvectl` that answers the
+/// reads its half of the decision makes, so the host's half reads configured
+/// without this test touching the host's resolver.
+#[cfg(target_os = "linux")]
+async fn run_min_with_path(
+    args: &GlobalArgs,
+    extra: &[&str],
+    dir: &std::path::Path,
+) -> std::process::Output {
+    let (mut command, _config_dir) = min_command(args, extra);
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    command.env("PATH", format!("{}:{inherited}", dir.display()));
+    command
+        .output()
+        .await
+        .expect("the min binary should be invocable")
+}
+
+/// A stand-in `resolvectl` answering the two reads the host's detection makes
+/// of it, the way a configured host's does: one link carrying `~min.internal`
+/// as its routing domain and the daemon's answerer as its DNS server, so the
+/// detected hook routes to `answerer_port`. Nothing else answers — any other
+/// subcommand prints nothing, the way `resolvectl` itself does.
+#[cfg(target_os = "linux")]
+fn fake_resolvectl_dir(answerer_port: u16) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::TempDir::new().expect("a tempdir for the stand-in resolvectl");
+    let script = dir.path().join("resolvectl");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  domain) printf 'Link 2 (minzone0): ~min.internal\\n' ;;\n  \
+             dns) printf 'Link 2 (minzone0): 127.0.0.1:{answerer_port}\\n' ;;\nesac\n"
+        ),
+    )
+    .expect("the stand-in resolvectl should be writable");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("the stand-in resolvectl should be executable");
+    dir
 }
 
 /// [`run_min`]'s stderr — the warning path's tests read what the user sees.
@@ -1605,19 +1669,28 @@ async fn min_prints_discovered_proxy_port() {
 }
 
 /// NET-018: where host-OS resolution and published addresses are both
-/// deployed, `min ls` and `min session activate` say native DNS is the live
-/// name surface — and say the proxy's half with it (NET-019): the line names
-/// the port an `HTTP(S)_PROXY` export points at, so what activation printed
-/// before keeps working beside the verdict, and nothing a client captured
-/// goes stale when the surface changes.
+/// deployed on the host, `min ls` and `min session activate` say native DNS
+/// is the live name surface — and say the proxy's half with it (NET-019):
+/// the line names the port an `HTTP(S)_PROXY` export points at, so what
+/// activation printed before keeps working beside the verdict, and nothing
+/// a client captured goes stale when the surface changes.
 ///
-/// Both halves of the condition are brought up the way the daemon's start
-/// path brings them — the proxy and the answerer driven to serving on
-/// OS-selected ports — and the reserved local range is present on this Linux
-/// host's loopback, the native host the condition names. Driven through the
-/// compiled binary so the assertion is on what the user actually sees; the
-/// reply itself is checked first so a daemon that stopped filling the field
-/// fails as the field, not as the wording.
+/// The daemon's half is brought up the way its start path brings it — the
+/// proxy and the answerer driven to serving on OS-selected ports, the
+/// reserved local range present on this Linux host's loopback — and the
+/// reply is checked first so a daemon that stopped filling the field fails
+/// as the field, not as the wording. The host's half then decides what is
+/// printed from the native verdict, and both of its outcomes are covered:
+/// the negative case runs both verbs through the compiled binary on a host
+/// with no hook (this one), where the proxy must be named as the live
+/// surface and the native words must not be printed; the positive case puts
+/// a stand-in `resolvectl` first on `min ls`'s `PATH`, one that answers the
+/// reads detection makes of it exactly the way a configured host's does, so
+/// `ls` says native. Activate's native arm is asserted on the pure decision
+/// beside those: its gate is the advisory, whose other reads —
+/// `/etc/resolv.conf` and the `hosts:` chain — are host files no stand-in
+/// can stand in for, so the binary's arm there depends on the host it runs
+/// on while the decision it prints from does not.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn activate_and_ls_report_native_surface() {
@@ -1646,36 +1719,46 @@ async fn activate_and_ls_report_native_surface() {
         ),
     );
 
-    // Both halves deployed: the daemon reports native DNS as the live
-    // surface, and the port the proxy's half of the line names.
+    // The daemon's half, deployed: the reply carries the native verdict, the
+    // port the proxy's half of the line names, and the port the host's hook
+    // would have to route to.
     let mut client = connect_daemon(&args).await.unwrap();
     let resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
     let port = resp
         .hostname_proxy_port
         .expect("the proxy must report the port it landed on");
+    let answerer_port = resp
+        .zone_answerer_port
+        .expect("the answerer must report the port it landed on");
     assert_eq!(
         resp.name_surface,
         minimald_rpc::NameSurface::Native,
-        "an answerer serving on a range-present host makes native DNS the live surface"
+        "an answerer serving on a range-present host makes native DNS the daemon's verdict"
     );
 
-    // `min ls` says it, beside the port lines it already prints.
+    // The host's half, absent: the verdict alone is not the condition —
+    // NET-018's WHERE is the host's, and a daemon inside a VM-backed host's
+    // guest says native from a loopback the host never consults — so both
+    // verbs name the proxy as the live surface, with where it serves, and
+    // neither prints the native words.
     let out = run_min(&args, &["ls"]).await;
     let ls_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
-        ls_stdout.contains("NAME SURFACE:    native DNS is the live name surface"),
-        "`min ls` must report the live name surface, got: {ls_stdout}"
+        ls_stdout.contains("NAME SURFACE:    the hostname proxy is the live name surface"),
+        "`min ls` must report the proxy as the live surface on a hook-less host, got: {ls_stdout}"
     );
     assert!(
-        ls_stdout.contains(&format!(
-            "the hostname proxy still serves on 127.0.0.1:{port}"
-        )),
-        "the surface line must say the proxy keeps serving, and where: {ls_stdout}"
+        ls_stdout.contains(&format!("routes through it on 127.0.0.1:{port}")),
+        "the surface line must name where the proxy serves: {ls_stdout}"
+    );
+    assert!(
+        !ls_stdout.contains("native DNS is the live name surface"),
+        "a host with no hook must not be told native DNS is live: {ls_stdout}"
     );
 
-    // `min session activate` says the same thing, at the moment the user is
-    // about to rely on the names — and before the upload and the loadout, so
-    // the line is not lost above a failed activate's output.
+    // `min session activate`, at the moment the user is about to rely on the
+    // names — and before the upload and the loadout, so the line is not lost
+    // above a failed activate's output.
     let project = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
@@ -1698,14 +1781,69 @@ async fn activate_and_ls_report_native_surface() {
     )
     .await;
     assert!(
-        activate_stderr.contains("native DNS is the live name surface"),
-        "activate must report the live name surface, got: {activate_stderr}"
+        activate_stderr.contains("the hostname proxy is the live name surface"),
+        "activate must report the proxy as the live surface on a hook-less host, got: {activate_stderr}"
     );
     assert!(
-        activate_stderr.contains(&format!(
+        activate_stderr.contains(&format!("routes through it on 127.0.0.1:{port}")),
+        "activate's line must name where the proxy serves: {activate_stderr}"
+    );
+    assert!(
+        !activate_stderr.contains("native DNS is the live name surface"),
+        "a host with no hook must not be told native DNS is live: {activate_stderr}"
+    );
+
+    // The host's half, present: a stand-in `resolvectl` first on the child's
+    // `PATH` answers the reads detection makes of it exactly the way a
+    // configured host's does, so `ls` says native — and says the proxy's half
+    // beside it, with the port it serves on (NET-019): what activation
+    // printed before keeps working.
+    let stand_in = fake_resolvectl_dir(answerer_port);
+    let out = run_min_with_path(&args, &["ls"], stand_in.path()).await;
+    let ls_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        ls_stdout.contains("NAME SURFACE:    native DNS is the live name surface"),
+        "`min ls` must report native DNS when the host's hook routes to the answerer, got: {ls_stdout}"
+    );
+    assert!(
+        ls_stdout.contains(&format!(
             "the hostname proxy still serves on 127.0.0.1:{port}"
         )),
-        "activate's line must say the proxy keeps serving, and where: {activate_stderr}"
+        "the surface line must say the proxy keeps serving, and where: {ls_stdout}"
+    );
+
+    // Activate's native arm, on the pure decision the line prints from, and
+    // the wording of the arm with no port to name: a daemon that reports no
+    // proxy port is one whose proxy is not serving, and the line says so
+    // rather than claiming it serves.
+    assert_eq!(
+        reported_name_surface(minimald_rpc::NameSurface::Native, true),
+        Some(minimald_rpc::NameSurface::Native),
+        "a native verdict on a configured host is the native surface"
+    );
+    assert_eq!(
+        reported_name_surface(minimald_rpc::NameSurface::Native, false),
+        Some(minimald_rpc::NameSurface::Proxy),
+        "a native verdict on a hook-less host is the proxy surface"
+    );
+    assert_eq!(
+        reported_name_surface(minimald_rpc::NameSurface::Proxy, true),
+        None,
+        "a proxy verdict prints nothing: its reason and remedy have their own lines"
+    );
+    assert_eq!(
+        reported_name_surface(minimald_rpc::NameSurface::Proxy, false),
+        None,
+        "a proxy verdict prints nothing whatever the host's half reads"
+    );
+    let not_serving = name_surface_line(minimald_rpc::NameSurface::Native, None);
+    assert!(
+        not_serving.contains("the hostname proxy is not serving"),
+        "a daemon with no proxy port is one whose proxy is not serving: {not_serving}"
+    );
+    assert!(
+        !not_serving.contains("still serves"),
+        "with no port to name, the line must not claim the proxy serves: {not_serving}"
     );
 }
 

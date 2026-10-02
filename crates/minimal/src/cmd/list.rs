@@ -309,7 +309,27 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // is exactly what will go on using hostnames that no longer resolve — and
     // stdout stays clean for the parser either way.
     warn_if_hostname_routing_down(resp.hostname_routing_unavailable.as_deref(), "min ls");
-    format_ls(&mut std::io::stdout(), &args, &resp)?;
+
+    // NET-018's host half: whether this host's resolver is pointed at the
+    // daemon's answerer. Read only when the daemon's verdict can be native,
+    // so a proxy-verdict host pays no detection — the same read-only,
+    // bounded reads the activate advisory runs (see `resolver`). The verdict
+    // and this fact decide the `NAME SURFACE` line together
+    // ([`reported_name_surface`]); the daemon's own view of this host's
+    // resolver is not a thing that exists.
+    let host_resolver_configured = match (resp.name_surface, resp.zone_answerer_port) {
+        (minimald_rpc::NameSurface::Native, Some(port)) => {
+            let (hook, _) = crate::resolver::session_detection().await;
+            hook.routes(port)
+        }
+        _ => false,
+    };
+    format_ls(
+        &mut std::io::stdout(),
+        &args,
+        &resp,
+        host_resolver_configured,
+    )?;
     Ok(())
 }
 
@@ -350,34 +370,81 @@ pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>, command: &str)
     }
 }
 
-/// NET-018's report: the line `min ls` and `min session activate` print when
-/// the daemon reports native DNS as the live name surface — both halves of
-/// the condition it measures (its answerer serving, the reserved range
-/// present) are deployed on the host this daemon serves. `proxy_port` is the
-/// port the same reply carries, when the proxy came up: NET-019 keeps it
-/// serving beside native DNS, and the line says so, because a client that
-/// captured `HTTP(S)_PROXY` at activation keeps routing through it — the
-/// export does not go stale when the surface changes. Pure, so both verbs
-/// print the same words and tests assert them without capturing output.
+/// The surface the CLI reports as live for `*.min.internal` (NET-018): the
+/// daemon's verdict — what *it* can see, its box-zone answerer serving and
+/// the reserved range present on the loopback it sits on — combined with the
+/// host's half only a client on the host can read, `host_resolver_configured`
+/// here: whether this host's resolver is pointed at that answerer's port. The
+/// daemon's `Native` alone is not the condition — on a VM-backed host its
+/// probe is the guest's, always present, and a host whose resolver was never
+/// configured resolves nothing natively, whatever the daemon answers — so
+/// the two must agree before native DNS is said to be live; a daemon that
+/// says native on an unconfigured host is a host whose names still route
+/// only through the proxy, and that is what this reports.
+///
+/// `None` — nothing to print — when the daemon reports the proxy: that is
+/// the surface that shipped first, the port lines and the NET-122 advisory
+/// already tell its story, and this report is for the moment the two
+/// surfaces could be mistaken for each other. Pure, so both verbs decide
+/// identically and tests assert the table.
 #[must_use]
-pub fn native_name_surface_line(proxy_port: Option<u16>) -> String {
+pub fn reported_name_surface(
+    daemon: minimald_rpc::NameSurface,
+    host_resolver_configured: bool,
+) -> Option<minimald_rpc::NameSurface> {
+    match daemon {
+        minimald_rpc::NameSurface::Native => Some(if host_resolver_configured {
+            minimald_rpc::NameSurface::Native
+        } else {
+            minimald_rpc::NameSurface::Proxy
+        }),
+        minimald_rpc::NameSurface::Proxy => None,
+    }
+}
+
+/// NET-018's report: the line `min ls` and `min session activate` print
+/// naming the surface [`reported_name_surface`] decided is live. `proxy_port`
+/// is the port the same reply carries, when the proxy came up: NET-019 keeps
+/// it serving beside native DNS, and the line says so, because a client that
+/// captured `HTTP(S)_PROXY` at activation keeps routing through it — the
+/// export does not go stale when the surface changes. With no port the
+/// proxy is down, and the line says that in the daemon's own words rather
+/// than claiming it still serves. Pure, so both verbs print the same words
+/// and tests assert them without capturing output.
+#[must_use]
+pub fn name_surface_line(surface: minimald_rpc::NameSurface, proxy_port: Option<u16>) -> String {
     let proxy_half = match proxy_port {
         Some(port) => format!("; the hostname proxy still serves on 127.0.0.1:{port}"),
-        None => "; the hostname proxy still serves".to_string(),
+        None => "; the hostname proxy is not serving".to_string(),
     };
-    format!(
-        "native DNS is the live name surface · <name>.min.internal answers from \
-         the zone answerer and each box's own reserved-range address{proxy_half}"
-    )
+    match surface {
+        minimald_rpc::NameSurface::Native => format!(
+            "native DNS is the live name surface · <name>.min.internal answers from \
+             the zone answerer and each box's own reserved-range address{proxy_half}"
+        ),
+        minimald_rpc::NameSurface::Proxy => match proxy_port {
+            Some(port) => format!(
+                "the hostname proxy is the live name surface · <name>.min.internal \
+                 routes through it on 127.0.0.1:{port}"
+            ),
+            None => "the hostname proxy is the live name surface; it is not serving".to_string(),
+        },
+    }
 }
 
 /// Format the session list for the given output mode. Split from
 /// [`cmd_ls`] so integration tests can capture output into a buffer
 /// instead of stdout.
+///
+/// `host_resolver_configured` is the host's half of NET-018's condition —
+/// whether this host's resolver is pointed at the daemon's answerer, as
+/// [`cmd_ls`] read it — beside the daemon's verdict the response carries.
+/// The two decide the `NAME SURFACE` line ([`reported_name_surface`]).
 pub fn format_ls(
     out: &mut impl std::io::Write,
     args: &LsArgs,
     resp: &minimald_rpc::ListSessionsResponse,
+    host_resolver_configured: bool,
 ) -> Result<(), anyhow::Error> {
     if args.json {
         let json = serde_json_lenient::to_string_pretty(resp)
@@ -430,16 +497,20 @@ pub fn format_ls(
                 "ZONE ANSWERER:   listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal"
             )?;
         }
-        // NET-018: say which of the two surfaces is live, when the daemon
-        // reports native DNS. The proxy verdict prints nothing: the two port
-        // lines above already tell that story, and the advisory activate
-        // prints (NET-122) is what says how to get from one to the other.
-        // `--raw` and `--json` stay machine-readable-only, as for the ports.
-        if resp.name_surface == minimald_rpc::NameSurface::Native {
+        // NET-018: say which of the two surfaces is live, decided from the
+        // daemon's verdict and the host's own resolver state. Nothing prints
+        // for the daemon's proxy verdict — the two port lines above already
+        // tell that story, and the advisory activate prints (NET-122) says
+        // how to get from one to the other — but a daemon that says native on
+        // a host whose resolver is not pointed at the answerer is a host whose
+        // names still route only through the proxy, and the line must say
+        // that, not the verdict. `--raw` and `--json` stay
+        // machine-readable-only, as for the ports.
+        if let Some(surface) = reported_name_surface(resp.name_surface, host_resolver_configured) {
             writeln!(
                 out,
                 "NAME SURFACE:    {}",
-                native_name_surface_line(resp.hostname_proxy_port)
+                name_surface_line(surface, resp.hostname_proxy_port)
             )?;
         }
         if resp.hostname_proxy_port.is_some() || resp.zone_answerer_port.is_some() {
