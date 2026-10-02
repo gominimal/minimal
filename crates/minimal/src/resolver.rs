@@ -1351,7 +1351,7 @@ mod tests {
             !native_surface_at(&routes, port, true, false, blocker),
             "a host without the reserved range has no published addresses to resolve"
         );
-        // The reviewer's host, spelled out: the routing-domain hook is
+        // A dead hook: the routing-domain hook is
         // configured — it routes — but the stub-bypass blocker says no host
         // process's lookups consult what it configures, so it is dead
         // configuration and the verdict must not be native on its word.
@@ -1387,7 +1387,7 @@ mod tests {
             Some(LiveSurface::Proxy),
             "a host whose resolver does not route the zone prints the proxy as live"
         );
-        // The reviewer's host: a routing hook whose stub-bypass blocker
+        // A dead hook: a routing hook whose stub-bypass blocker
         // makes it configuration no host process consults — the proxy, and
         // both verbs must read it, never native on the hook's word alone.
         let blocked = (routing_hook(), Some("lookups bypass resolved".to_string()));
@@ -1930,8 +1930,8 @@ mod tests {
         );
     }
 
-    // NET-018's list read, and the deadline it carries — the round's
-    // deliberate answer to the question the list's frequency asks: `min ls`
+    // NET-018's list read, and the deadline it carries, sized for the
+    // list's frequency: `min ls`
     // is the most frequently-invoked verb, run in loops and from shell
     // prompts, and the session start's generous deadline was never a choice
     // a list made. The two halves of the answer, each made testable by the
@@ -1976,7 +1976,7 @@ mod tests {
         QueryStandin { _script: dir }
     }
 
-    /// The review's host, spelled out: a systemd-resolved wedged hard
+    /// A wedged resolver: a systemd-resolved wedged hard
     /// enough that both queries hang — the exact case the deadline exists
     /// for. The list still answers, inside its own one-second deadline and
     /// not the session start's five, and the verdict it prints is the

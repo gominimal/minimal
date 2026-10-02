@@ -1632,7 +1632,7 @@ async fn min_prints_discovered_proxy_port() {
 /// `/etc/resolv.conf` and the `hosts:` chain directly, host files no PATH
 /// stand-in can stand in for, so what a stand-in `resolvectl` proves
 /// depends on the host it runs on. The decision is pure, so its table —
-/// the native arm, and the reviewer's case that must not print native on a
+/// the native arm, and the dead-hook case that must not print native on a
 /// hook no host process consults — lives beside the function in
 /// `resolver`'s tests, where every arm runs on every host. `resolver`'s own
 /// Linux test `activate_and_ls_report_native_surface_verdict_on_host` runs
