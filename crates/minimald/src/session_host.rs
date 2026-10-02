@@ -2360,6 +2360,17 @@ pub(crate) struct SandboxLauncher {
     /// otherwise make undrivable; production sets it from the same
     /// constant every path reads.
     pub(crate) classifier_root: std::path::PathBuf,
+    /// The mount table this launch reads the classifier tree's facts over,
+    /// as `/proc/self/mountinfo` spells it: `None` — every production path
+    /// and the start-up check alike — reads the daemon's own, live. A field
+    /// for the same reason [`Self::classifier_root`] is one: the two facts
+    /// of one launch answer over one tree and one mount table, and a
+    /// host's own mount table covers no stand-in tree, so a launch driven
+    /// over one would read every fact as unconfined and never reach the
+    /// placement it was driven to test. The field names which table
+    /// answers, it never fabricates one — no client or box input reaches
+    /// it, and production passes `None`.
+    pub(crate) classifier_mountinfo: Option<String>,
 }
 
 /// Reaps a freshly-spawned sandbox process if the launch is abandoned
@@ -2499,7 +2510,7 @@ impl Drop for BoxLeafGuard {
 ///
 /// The tree has to be *real* first — on this host's cgroup2, and in the
 /// guest with `nsdelegate` — or the leaf this function would create decides
-/// nothing while looking placed; see [`refuses_unenforced_host_address_box`]
+/// nothing while looking placed; see [`refused_unenforced_host_address_box`]
 /// for the guest, where that state refuses a host-address launch instead of
 /// running it unenforced.
 ///
@@ -2524,17 +2535,14 @@ impl Drop for BoxLeafGuard {
 /// sessions in one leaf would decide both their verdicts together.
 async fn create_session_leaf(
     root: &std::path::Path,
+    mountinfo: Option<&str>,
     guest: bool,
     session_id: &sessions::SessionId,
     session_name: &str,
     verdict: sandbox2::config::Verdict,
     can_decide_per_box: bool,
 ) -> io::Result<Option<sandbox2::config::ClassifierLeaf>> {
-    if !sandbox2::classifier::tree_is_real(
-        root,
-        sandbox2::classifier::own_mountinfo().as_deref(),
-        guest,
-    ) {
+    if !sandbox2::classifier::tree_is_real(root, mountinfo, guest) {
         tracing::info!(
             session = session_name,
             tree = sandbox2::classifier::TREE_ROOT,
@@ -2859,8 +2867,11 @@ fn say_closure_line(line: &str, session: &str) -> bool {
     false
 }
 
-/// Whether a host-address box this guest cannot give a verdict of its own
-/// must be refused rather than launched unenforced.
+/// Whether a host-address box this host cannot give a verdict of its own
+/// must be refused rather than launched unenforced, and with what words:
+/// the gate and the refusal are decided in one place, because the one
+/// thing worse than either alone is a gate that said "refused" for words
+/// that spell what the box did instead.
 ///
 /// In the guest — this daemon being the microVM's pid 1 — the tree and the
 /// table were this daemon's own boot's work, so there is no privileged step
@@ -2871,41 +2882,115 @@ fn say_closure_line(line: &str, session: &str) -> bool {
 /// image; the second is the interim, guest-side classifier enforcement not
 /// being available yet. Both are refused, each with the error that says
 /// which it is (design §7.1). An allow box needs no verdict enforced, so a
-/// guest that places it runs it. Natively the same states are the
-/// deployment exception instead — NET-079's advisory posture, never a
-/// refusal.
+/// guest that places it runs it.
 ///
-/// Pure over its inputs, so the gate is pinned where it is written.
-fn refuses_unenforced_host_address_box(
+/// Natively, NET-079's exception stands for every state this host can still
+/// fix from itself: the step not installed, a tree no cgroup2 with
+/// `nsdelegate` confines, a box that declares no verdict to enforce. Those
+/// run unenforced, and the record and notice below say so. The exception
+/// stops where the box's own declaration becomes the thing this host cannot
+/// honour — a *placed* deny-all box over one of the two probe causes: a
+/// table whose marker vouches for a refusal the probe did not read
+/// (`TableNotEffective`), and a table whose effect could not be read at all
+/// (`ProbeUnreadable`). Running that box would promise a refusal nothing
+/// here is making, so the launch refuses it and names the cause, because
+/// natively both halves are this host's to fix and the words are what tell
+/// a person which one. Both causes arise only over a tree the step already
+/// installed — the marker and the delegated subtrees gate the probe — so
+/// the refusal is a placed box's, never an unplaced one's: a host that
+/// cannot place a box has nothing decided-looking to refuse, and it keeps
+/// the advisory.
+///
+/// Pure over its inputs, so the gate and its words are pinned where they
+/// are written.
+fn refused_unenforced_host_address_box(
     guest: bool,
     network_mode: NetworkMode,
     verdict: sandbox2::config::Verdict,
     placed: bool,
-    can_decide_per_box: bool,
-) -> bool {
-    guest
-        && matches!(network_mode, NetworkMode::HostNet)
-        && (!placed || (verdict == sandbox2::config::Verdict::Deny && !can_decide_per_box))
+    decision: Option<&crate::net::classifier::Decision>,
+) -> Option<String> {
+    // Only a host-address box has a verdict the classifier could decide, and
+    // only its launch reads a decision — the two facts are one, so the mode
+    // check and the read are the same check, and a launch that read nothing
+    // refuses nothing here.
+    if !matches!(network_mode, NetworkMode::HostNet) {
+        return None;
+    }
+    // The guest's unplaced box needs no decision read to refuse: there is no
+    // tree to decide anything in, and that is the ground itself.
+    if guest && !placed {
+        return Some(
+            "this guest has no classifier tree to place a host-address \
+             box in: its cgroup2 is not mounted with nsdelegate, so the \
+             box's verdict could not be decided and the box was refused \
+             rather than run unenforced (broken guest image)"
+                .to_string(),
+        );
+    }
+    let decision = decision?;
+    if guest {
+        if verdict == sandbox2::config::Verdict::Deny && !decision.can_decide_per_box() {
+            return Some(
+                "this guest has not loaded the classifier table, so a \
+                 deny-all box's connections would not be refused: the box's \
+                 declaration promises a verdict nothing here refuses yet, \
+                 and the box was refused rather than run unenforced \
+                 (guest-side classifier enforcement is not available yet)"
+                    .to_string(),
+            );
+        }
+        return None;
+    }
+    if placed && verdict == sandbox2::config::Verdict::Deny {
+        return match decision.cause() {
+            Some(crate::net::classifier::Cause::TableNotEffective) => Some(format!(
+                "this host's classifier table is marked loaded but its refusal \
+                 is not in force, so a deny-all box's connections would not be \
+                 refused: the box's declaration promises a verdict nothing here \
+                 enforces, and the box was refused rather than run unenforced \
+                 (the table's refusal is not in force — {} reloads it)",
+                sandbox2::classifier::install_hint()
+            )),
+            Some(crate::net::classifier::Cause::ProbeUnreadable) => Some(
+                "this host's classifier table's effect could not be read, so \
+                 whether a deny-all box's connections would be refused is \
+                 unknown: the box's declaration promises a verdict this host \
+                 cannot prove, and the box was refused rather than run \
+                 unenforced (the table's effect could not be read — this \
+                 daemon's log carries the probe's own failure)"
+                    .to_string(),
+            ),
+            // Everything else natively is the state this host can still fix
+            // from itself — the step not installed, a tree that cannot
+            // confine — or a host that decides, whose refusal no gate makes.
+            // Those keep NET-079's exception, and the record and notice
+            // below say what they run instead.
+            _ => None,
+        };
+    }
+    None
 }
 
 /// Whether a launch whose host-address box was not placed in a classifier
 /// leaf, or was placed on a host that cannot decide per box, advises about
 /// that state.
 ///
-/// The counterpart of [`refuses_unenforced_host_address_box`]: an unenforced
+/// The counterpart of [`refused_unenforced_host_address_box`]: an unenforced
 /// host-address box is the advisory posture on *either* kind of host —
 /// natively NET-079's exception, in the guest the interim's own state — so
 /// every *session* launch the record says `none` for says so, once per
 /// launch like the resolver advisory it is modelled on (design §7.1), never
-/// once per daemon. The guest's refusals stand untouched beside it: a box
-/// the guest cannot place is refused and advises nothing (the refusal is
-/// that state's surface), and so is a deny-all box on a table the guest has
-/// not loaded — the interim is the *other* host-address boxes' state, the
-/// ones that need no verdict enforced to run, and the ruling's ask is that
-/// their state be said at every session start, not left as a daemon log
-/// line alone. What this predicate does not carry is the launch's audience
-/// — a launch minted for lifecycle hooks advises nobody (a hook run is not
-/// a session start), which the launch itself folds in over
+/// once per daemon. The refusals stand untouched beside it: a box the guest
+/// cannot place is refused and advises nothing (the refusal is that state's
+/// surface), and so is a deny-all box on a table the guest has not loaded,
+/// and natively a deny-all box over either probe cause — the advisory is the
+/// *other* host-address boxes' state, the ones that need no verdict
+/// enforced to run, and the ruling's ask is that their state be said at
+/// every session start, not left as a daemon log line alone. What this
+/// predicate does not carry is the launch's audience — a launch minted for
+/// lifecycle hooks advises nobody (a hook run is not a session start),
+/// which the launch itself folds in over
 /// [`SandboxLauncher::for_hooks`]. Pure over its inputs, so the gate is
 /// pinned where it is written.
 fn advises_unenforced_placement(enforcement: Option<HostIpEnforcement>) -> bool {
@@ -2993,6 +3078,9 @@ impl SessionLauncher for SandboxLauncher {
         // The classifier tree this daemon places boxes in, moved out before
         // the rest of `self` is consumed (see the field's doc).
         let classifier_root = self.classifier_root;
+        // The mount table the launch's classifier facts answer over, moved
+        // out with it (see the field's doc).
+        let classifier_mountinfo = self.classifier_mountinfo;
         let net_switch = self.net_switch;
         let own_address = self.own_address;
         let box_addresses = self.box_addresses;
@@ -3044,26 +3132,32 @@ impl SessionLauncher for SandboxLauncher {
         // runs on the blocking pool, and only a host-address launch reads
         // one: no other mode has a verdict the cgroup decides, and the one
         // over the same `classifier_root` the box is placed into, so both
-        // halves of this launch answer over one tree.
-        let (leaf, can_decide_per_box) = if matches!(network_mode, NetworkMode::HostNet) {
+        // halves of this launch answer over one tree and one mount table.
+        // The whole decision is kept, not only its verdict bit: the refusal
+        // and the advice below say which box they are for out of the cause
+        // that produced it, so the launch's words and the start-up line
+        // name the same ground.
+        let (leaf, decision) = if matches!(network_mode, NetworkMode::HostNet) {
             let root = classifier_root.clone();
-            let can_decide_per_box = tokio::task::spawn_blocking(move || {
-                crate::net::classifier::recorded(&root).can_decide_per_box()
+            let mountinfo = classifier_mountinfo.clone();
+            let decision = tokio::task::spawn_blocking(move || {
+                crate::net::classifier::decide_now(&root, mountinfo.as_deref(), guest)
             })
             .await
             .map_err(io::Error::other)?;
             let leaf = create_session_leaf(
                 &classifier_root,
+                classifier_mountinfo.as_deref(),
                 guest,
                 &session_id,
                 &session_name,
                 classifier_verdict,
-                can_decide_per_box,
+                decision.can_decide_per_box(),
             )
             .await?;
-            (leaf, can_decide_per_box)
+            (leaf, Some(decision))
         } else {
-            (None, false)
+            (None, None)
         };
         let mut leaf_guard = leaf.clone().map(BoxLeafGuard::new);
 
@@ -3073,59 +3167,47 @@ impl SessionLauncher for SandboxLauncher {
         // force — so a leaf placed on a host whose table is not loaded is
         // recorded as the unenforced state it is, and the refusal and the
         // advice below read the one decision.
-        let enforcement = host_ip_enforcement(network_mode, leaf.as_ref(), can_decide_per_box);
+        let enforcement = host_ip_enforcement(
+            network_mode,
+            leaf.as_ref(),
+            decision.as_ref().is_some_and(|d| d.can_decide_per_box()),
+        );
 
-        // A host-address box this guest cannot give a verdict of its own
-        // is refused in the guest — the one place a missing tree is a
-        // broken image rather than a deployment state, and the one place
-        // there is no installer to run (design §7.1): a box that cannot be
+        // A host-address box this host cannot give a verdict of its own is
+        // refused where the box's own declaration is the thing that cannot
+        // be honoured — never for a state a person could still fix from the
+        // host itself. In the guest that is every state: the tree and the
+        // table were the image's own boot's work, and there is no installer
+        // to run inside a microVM (design §7.1) — a box that cannot be
         // placed has no leaf to decide on at all, and a deny-all box whose
         // table is not loaded would run placed while nothing refuses its
-        // connections — a verdict that looks decided and is not. That
-        // second ground is the interim, not an image fault — guest-side
-        // classifier enforcement is not available yet — so its refusal
-        // names the interim, while the unplaceable tree names the broken
-        // image it is. Natively the same states run the box unenforced
-        // and say so in the log instead (NET-079's exception). A refused
+        // connections, a verdict that looks decided and is not. The first
+        // refusal names the broken image it is; the second names the
+        // interim, guest-side classifier enforcement not being available
+        // yet. Natively the same states keep NET-079's exception — the box
+        // runs unenforced and the log says so — except the one state where
+        // the step's own install is standing behind a refusal that is not
+        // in force: a deny-all box placed on either probe cause, refused
+        // rather than run on a refusal nothing here is making. A refused
         // box never reaches the advisory below — the refusal is the only
-        // thing that launch says; the interim's advisory is for the
-        // host-address boxes that run, the ones a verdict has nothing to
-        // enforce in yet.
-        if refuses_unenforced_host_address_box(
+        // thing that launch says; the advisory is for the host-address
+        // boxes that run, the ones a verdict has nothing to enforce in
+        // yet.
+        if let Some(refusal) = refused_unenforced_host_address_box(
             guest,
             network_mode,
             classifier_verdict,
             leaf.is_some(),
-            can_decide_per_box,
+            decision.as_ref(),
         ) {
-            let (ground, refusal) = if leaf.is_none() {
-                (
-                    "a broken guest image",
-                    "this guest has no classifier tree to place a host-address \
-                     box in: its cgroup2 is not mounted with nsdelegate, so the \
-                     box's verdict could not be decided and the box was refused \
-                     rather than run unenforced (broken guest image)",
-                )
-            } else {
-                (
-                    "guest-side classifier enforcement is not available yet",
-                    "this guest has not loaded the classifier table, so a \
-                     deny-all box's connections would not be refused: the box's \
-                     declaration promises a verdict nothing here refuses yet, \
-                     and the box was refused rather than run unenforced \
-                     (guest-side classifier enforcement is not available yet)",
-                )
-            };
             tracing::error!(
                 session = %session_name,
                 network_mode = ?network_mode,
                 tree = %classifier_root.display(),
                 placed = leaf.is_some(),
-                "refusing a host-address box this guest cannot decide an \
-                 egress verdict for: its cgroup2 tree is missing or mounted \
-                 without namespace delegation, or the daemon cannot place a \
-                 process in it, or the image never loaded the table that \
-                 refuses a deny-all box's connections — {ground}"
+                refusal = %refusal,
+                "refusing a host-address box this host cannot decide an \
+                 egress verdict for"
             );
             return Err(io::Error::other(refusal));
         }

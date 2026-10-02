@@ -718,9 +718,11 @@ async fn async_main() -> Result<(), MainError> {
     // for a host that cannot confine a box, a probe that could not read the
     // table, or a guest whose image never loaded the table — and says what
     // this host does with the boxes, because the two hosts answer it
-    // differently: natively the exception runs them unenforced, never
-    // refused, while the guest refuses — the deny-all box on a table that
-    // is not loaded, every box on a tree that cannot confine — so the
+    // differently: natively the step's and the mount's causes keep the
+    // exception and run the boxes unenforced, while the two probe causes
+    // refuse the deny-all box rather than run it on a refusal nothing
+    // enforces — and the guest refuses more, the deny-all box on a table
+    // that is not loaded, every box on a tree that cannot confine — so the
     // daemon's log carries what a session's start is about to tell the
     // person in the terminal, and stays quiet on a host that decides, which
     // is not a state to report.

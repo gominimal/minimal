@@ -2688,6 +2688,10 @@ impl Session {
             // The classifier tree the privileged step installs natively and
             // the guest's own boot mounts; see the field's doc.
             classifier_root: std::path::PathBuf::from(sandbox2::classifier::TREE_ROOT),
+            // The mount table the launch's classifier facts answer over is
+            // the daemon's own, read live on every launch; see the field's
+            // doc.
+            classifier_mountinfo: None,
         })
     }
 
