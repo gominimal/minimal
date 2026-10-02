@@ -1204,6 +1204,11 @@ const ANSWERER_PROBE_BOUND: Duration = Duration::from_millis(250);
 
 /// [`answerer_bound_at`]'s blocking half: one query datagram out, one
 /// bounded reply window, the answer decoded and judged.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "recv_from's length is bounded by the buffer it filled, so the \
+              slice is the reply and no more"
+)]
 fn answerer_bound_blocking(port: u16) -> bool {
     let Ok(socket) = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)) else {
         return false;
