@@ -1635,6 +1635,8 @@ fn switch_rows_of(rows: &[Arc<BoxRecord>], dictionary: &mut Vec<String>) -> Opti
 /// Renders one record for a warn line: the port as a port, the name as the
 /// name the decision's dictionary held — truncated to the bound a refused
 /// head's target is named at, so a hostile name cannot shout a line long.
+/// The cut lands on a char boundary: the name is a guest's bytes, and a
+/// multi-byte character straddling the bound must not panic the warn path.
 fn render_record(record: Record, dictionary: &[String]) -> String {
     match record {
         Record::Port(port) => format!("port {port}"),
@@ -1643,7 +1645,7 @@ fn render_record(record: Record, dictionary: &[String]) -> String {
             |name| {
                 let mut named = format!("name {name:?}");
                 if named.len() > MAX_NAMED_TARGET {
-                    named.truncate(MAX_NAMED_TARGET);
+                    named.truncate(named.floor_char_boundary(MAX_NAMED_TARGET));
                 }
                 named
             },
@@ -3208,9 +3210,9 @@ mod tests {
         AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb, DROP_WARN_MAX_TRACKED_PAIRS,
         DROP_WARN_MIN_INTERVAL, DropLimiter, EgressGate, GateAdmit, GateDrop, GuestSource,
         GuestSpeak, HANDSHAKE_TIMEOUT, MAX_HEAD, MAX_LIVE_RELAYS, MAX_NAMED_TARGET,
-        PublishedForwards, UNDECLARED_PUBLISH_RECORD_RULE, UNDECLARED_RETRACT_RULE,
+        PublishedForwards, Record, UNDECLARED_PUBLISH_RECORD_RULE, UNDECLARED_RETRACT_RULE,
         UNREGISTERED_PUBLISH_RULE, UNREGISTERED_SOURCE_PHASE, UNREGISTERED_SOURCE_RULE,
-        UnregisteredSourcePhase, WarnDecision, accept_loop, gate_verdict, max_frame,
+        UnregisteredSourcePhase, WarnDecision, accept_loop, gate_verdict, max_frame, render_record,
         serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
@@ -6173,6 +6175,40 @@ mod tests {
             "stale windows make room; a new source gets its own line again"
         );
         assert_eq!(windows(), 1, "the stale windows were pruned, not kept");
+    }
+
+    /// A rendered name is cut to the naming bound on a char boundary: the
+    /// dictionary's name is a guest's bytes, and a cut that lands inside a
+    /// multi-byte character would panic the warn path on exactly the name a
+    /// hostile guest would choose. Every run length is tried, so the bound
+    /// falls on every byte of the trailing character at least once.
+    #[test]
+    fn render_record_cuts_names_on_a_char_boundary() {
+        let dictionary = |name: String| vec![name];
+        // The two shapes a reviewer would reach for first: 63 ASCII bytes
+        // then a 3-byte character, and exactly 64 bytes of 2-byte characters.
+        let mut names = vec![format!("{}日", "x".repeat(63)), "é".repeat(32)];
+        // And every ASCII run length up to the bound, so some run puts the
+        // cut inside the 3-byte character whatever the render's prefix adds.
+        names.extend((0..=MAX_NAMED_TARGET).map(|run| format!("{}日", "x".repeat(run))));
+        names.extend((1..=MAX_NAMED_TARGET).map(|run| "é".repeat(run)));
+        for name in names {
+            let bytes = name.len();
+            let named = render_record(Record::Name(0), &dictionary(name));
+            assert!(
+                named.len() <= MAX_NAMED_TARGET,
+                "a {bytes}-byte name renders to at most the bound, got {} bytes",
+                named.len()
+            );
+            assert!(
+                named.starts_with("name \""),
+                "the render keeps the name's prefix: {named:?}"
+            );
+            assert!(
+                std::str::from_utf8(named.as_bytes()).is_ok(),
+                "a cut render is valid UTF-8: {named:?}"
+            );
+        }
     }
 
     /// NET-081's publish half, refused and said so: an expose at a published
