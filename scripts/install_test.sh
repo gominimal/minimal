@@ -1497,6 +1497,238 @@ case_installer_switch_binary_executable() {
     cp "$root/good-components" "$mock/versions/v1/components"   # restore
 }
 
+# --- NET-079: the host classifier tree --------------------------------------
+# install-host-classifier.sh is the privileged step that lays out the cgroup
+# tree minimald and its boxes are placed in, on a native host. CI cannot mount
+# cgroup2, so the case drives the script against a stand-in mount table through
+# its MINIMAL_OVERRIDE_CGROUP_MOUNTINFO seam, with a stubbed `chown` recording
+# its own argv, over a tree rooted in a temp dir: what is pinned is the
+# decision sequence a root run would take on the real mount — refuse an
+# undelegated hierarchy, refuse another namespace's view, delegate the slice
+# and both leaves it lays out whole (each directory plus cgroup.procs,
+# cgroup.threads and cgroup.subtree_control), and leave the cgroup2 mount root
+# above the slice root-owned. The one fact the stand-in cannot stand in for is
+# the kernel: it makes a cgroup's files at mkdir and dissolves them with the
+# cgroup at rmdir, so the case drops the modeled ones wherever a real rmdir
+# would have taken the cgroup too.
+case_host_classifier_tree_installed() {
+    command -v bash >/dev/null 2>&1 || {
+        echo "install_test: bash not found; skipping host_classifier_tree_installed" >&2
+        return 0
+    }
+    hc="$here/install-host-classifier.sh"
+    if [ ! -f "$hc" ]; then bad "install-host-classifier.sh is missing"; return 0; fi
+
+    cg="$root/cg"                      # the stand-in cgroup2 mountpoint
+    tree="$cg/minimald.slice"          # the tree the script installs
+    me="$(id -un)"
+
+    # Stand-in mount tables. Field 4 is the mount's root within the
+    # filesystem: "/" in the host's initial cgroup namespace, something else
+    # inside a container that mounts cgroup2 into its own — the case the
+    # script must refuse, or the tree would be created inside that namespace.
+    printf '38 30 0:25 / %s rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,nsdelegate\n' "$cg" >"$root/mi-on"
+    printf '38 30 0:25 / %s rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw\n' "$cg" >"$root/mi-off"
+    printf '38 30 0:25 /inner %s rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw,nsdelegate\n' "$cg" >"$root/mi-nested"
+    printf '38 30 0:26 / %s rw,relatime - ext4 /dev/root rw\n' "$root" >"$root/mi-none"
+
+    # A recording chown stub: delegation is the point of the install, and on
+    # the stand-in filesystem the caller owns the files anyway, so the case
+    # reads what the script chowned rather than inferring it from their owner.
+    # It records and exits 0 without exec'ing the real chown: on the host this
+    # script installs on that chown runs as root, which CI's unprivileged
+    # lanes cannot stage, and where it lives is host-specific (/usr/bin on
+    # Linux, /usr/sbin on macOS), so exec'ing it would break the macOS lane
+    # while asserting nothing the case needs — the recorded argv is the whole
+    # delegation decision.
+    hcbin="$root/hcbin"; mkdir -p "$hcbin"
+    chown_calls="$root/chown.calls"; : >"$chown_calls"
+    cat >"$hcbin/chown" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >>"$CHOWN_CALLS"
+STUB
+    chmod +x "$hcbin/chown"
+
+    # run_hc <label> <mountinfo> [args...] ; sets rc, captures output in $OUT.
+    run_hc() {
+        label="$1"; mi="$2"; shift 2
+        OUT="$root/hc.$label"
+        set +e
+        env -i \
+            PATH="$hcbin:/usr/bin:/bin" \
+            CHOWN_CALLS="$chown_calls" \
+            MINIMAL_OVERRIDE_CGROUP_MOUNTINFO="$mi" \
+            bash "$hc" --root "$tree" "$@" </dev/null >"$OUT" 2>&1
+        rc=$?
+        set -e
+    }
+
+    # drop_cgroup_files <cgroup-dir> — what the kernel does at rmdir on the
+    # real mount: a cgroup's cgroup.procs, cgroup.threads and
+    # cgroup.subtree_control belong to the cgroup and go with it, while the
+    # stand-in is a plain directory that keeps them and would make every
+    # rmdir below fail for the stand-in's own reason, not the one pinned.
+    drop_cgroup_files() {
+        rm -f "$1/cgroup.procs" "$1/cgroup.threads" "$1/cgroup.subtree_control"
+    }
+
+    # --- Before the install: --check reports the missing tree, makes nothing.
+    run_hc pre_check "$root/mi-on" --check --user "$me"
+    check 1 "$rc" "check exits 1 before the tree exists"
+    want_ok "check names the tree it cannot find" grep -q "does not exist" "$OUT"
+    want_ok "check advises the install, not a re-check" grep -q "install it: sudo" "$OUT"
+    want_err "check creates nothing" test -e "$tree"
+
+    # --- Refusals: every one of them dies before a directory is made.
+    run_hc no_nsdelegate "$root/mi-off" --user "$me"
+    check 1 "$rc" "install dies on a cgroup2 mount without nsdelegate"
+    want_ok "the refusal names nsdelegate" grep -q "nsdelegate" "$OUT"
+    want_err "an undelegated hierarchy gets no tree" test -e "$tree"
+
+    run_hc unmounted "$root/mi-none" --user "$me"
+    check 1 "$rc" "install dies when no cgroup2 mount covers the tree"
+    want_ok "the refusal names the hierarchy it needs" grep -q "cgroup2 mount" "$OUT"
+
+    run_hc nested_ns "$root/mi-nested" --user "$me"
+    check 1 "$rc" "install dies inside another cgroup namespace's view"
+    want_ok "the refusal names the namespace" grep -q "another cgroup namespace" "$OUT"
+
+    run_hc nested_check "$root/mi-nested" --check --user "$me"
+    check 1 "$rc" "check reports the namespace view too"
+    want_ok "check names the mount's root within it" grep -q "root /inner" "$OUT"
+
+    run_hc no_owner "$root/mi-on"
+    check 1 "$rc" "install dies without an account to delegate to"
+    want_ok "the refusal asks for --user" grep -q -- "--user NAME" "$OUT"
+
+    run_hc root_owner "$root/mi-on" --user root
+    check 1 "$rc" "install refuses to delegate to root"
+    want_ok "the refusal says what delegating to root means" \
+        grep -q "same as not delegating" "$OUT"
+
+    run_hc bogus_owner "$root/mi-on" --user no-such-account-net079
+    check 1 "$rc" "install dies for an unknown account"
+    want_ok "the refusal names the account" grep -q "no such account" "$OUT"
+    want_err "a bad account still creates nothing" test -e "$tree"
+
+    # --- The install: the slice, its two leaves, and the whole v2 contract
+    # delegated to the account minimald runs as.
+    run_hc install "$root/mi-on" --user "$me"
+    check 0 "$rc" "install exits 0 on a delegated cgroup2 mount"
+    want_ok "the daemon leaf exists" test -d "$tree/daemon"
+    want_ok "the box cohort exists"   test -d "$tree/boxes"
+    want_ok "install names the tree it laid out"   grep -q "installed the classifier tree" "$OUT"
+    want_ok "install names the delegated account" grep -q "delegated to" "$OUT"
+    want_ok "install names the contract it delegated" grep -q "v2 contract" "$OUT"
+    want_ok "install says what a daemon in the slice does per launch, not on its next start" \
+        grep -q "once minimald is in the slice, each box it launches" "$OUT"
+    want_ok "the slice's cgroup.procs is there for the daemon to write" \
+        test -e "$tree/cgroup.procs"
+    want_ok "the daemon leaf's cgroup.procs is there for --pid to write" \
+        test -e "$tree/daemon/cgroup.procs"
+    # Delegation handed over each cgroup whole — its directory plus
+    # cgroup.procs, cgroup.threads and cgroup.subtree_control, because a
+    # migration into a leaf needs write access to the common ancestor's
+    # cgroup.procs, and that ancestor is the slice itself — and never
+    # reached above the slice: a box runs as the daemon's uid, so a mount
+    # root owned by that account is every cgroup on the host.
+    _o="$(id -u):$(id -g)"
+    _want=""
+    for _cg in "" "/daemon" "/boxes"; do
+        for _f in cgroup.procs cgroup.threads cgroup.subtree_control; do
+            _want="$_want$_o $tree$_cg/$_f "
+        done
+        _want="$_want$_o $tree$_cg "
+    done
+    # One recorded call per line, compared as one line: the file is the stub's
+    # ledger, not a shell variable, so fold it rather than word-split it.
+    _got="$(awk '{printf "%s%s", sep, $0; sep = " "}' "$chown_calls")"
+    check "${_want% }" "$_got" \
+        "delegation reached the slice and both leaves whole, never above the slice"
+
+    run_hc installed_check "$root/mi-on" --check --user "$me"
+    check 0 "$rc" "check exits 0 once the tree is installed"
+    want_ok "check reports the delegation it verified" grep -q "delegated:" "$OUT"
+    want_ok "check names the contract it verified" grep -q "cgroup.threads" "$OUT"
+    want_ok "check says what stays root-owned" grep -q "stays root-owned" "$OUT"
+
+    # --- Uninstall: the tree comes away whole — but a leaf the script did not
+    # place (a live session's) stops it rather than tearing the box down. The
+    # kernel dissolves a cgroup's own files with it, so the case drops the
+    # modeled ones first and the rmdir rehearsed is the real one.
+    drop_cgroup_files "$tree"
+    drop_cgroup_files "$tree/daemon"
+    drop_cgroup_files "$tree/boxes"
+    run_hc uninstall "$root/mi-on" --uninstall
+    check 0 "$rc" "uninstall removes the installed tree"
+    want_err "uninstall leaves no tree behind" test -e "$tree"
+
+    run_hc reinstalled "$root/mi-on" --user "$me"
+    check 0 "$rc" "install over an existing tree exits 0"
+
+    # --- --pid: the daemon's first hop into the slice is the one migration
+    # the delegated account cannot make itself — the common ancestor of the
+    # cgroup a daemon starts in and the slice is the root-owned hierarchy
+    # root — so the installer offers to make it for the running daemon.
+    run_hc place "$root/mi-on" --pid "$$"
+    check 0 "$rc" "--pid places the running daemon in its leaf"
+    want_ok "the daemon leaf holds exactly that pid" \
+        grep -qx "$$" "$tree/daemon/cgroup.procs"
+    want_ok "the placement names the leaf it wrote" grep -q "placed .* in .*daemon" "$OUT"
+    want_ok "the placement says it takes effect on the next launch, not the next start" \
+        grep -q "per launch" "$OUT"
+    want_ok "the placement says a plain restart loses it" \
+        grep -q "Delegate=yes unit" "$OUT"
+
+    run_hc place_dead "$root/mi-on" --pid 999999999
+    check 1 "$rc" "--pid dies for a process that does not exist"
+    want_ok "the refusal names the pid it could not find" \
+        grep -q "no process 999999999" "$OUT"
+
+    run_hc place_nonnumeric "$root/mi-on" --pid not-a-pid
+    check 1 "$rc" "--pid dies for a pid that is not one"
+    want_ok "the refusal asks for a numeric process id" \
+        grep -q "numeric process id" "$OUT"
+
+    drop_cgroup_files "$tree"
+    drop_cgroup_files "$tree/daemon"
+    drop_cgroup_files "$tree/boxes"
+    mkdir "$tree/boxes/a-session"
+    run_hc uninstall_live "$root/mi-on" --uninstall
+    check 1 "$rc" "uninstall dies while a box leaf survives"
+    want_ok "the refusal says what is holding the tree" grep -q "stop minimald" "$OUT"
+    want_ok "the live leaf survives the refused uninstall" test -d "$tree/boxes/a-session"
+    rm -rf "$tree"   # the sweep this case alone owns; the refused uninstall could not
+
+    # --- --pid with no tree to place into names the step that is missing.
+    run_hc place_no_tree "$root/mi-on" --pid "$$"
+    check 1 "$rc" "--pid dies when the tree is not installed"
+    want_ok "the refusal names the install it still needs" \
+        grep -q "is not installed" "$OUT"
+
+    # --- --help prints the script's own header as its usage.
+    run_hc help "$root/mi-on" --help
+    check 0 "$rc" "--help exits 0"
+    want_ok "usage shows the sudo form" grep -q "sudo scripts/install-host-classifier.sh" "$OUT"
+    want_ok "usage shows the unprivileged --check" grep -q -- "--check" "$OUT"
+    want_ok "usage shows the --pid step" grep -q -- "--pid PID" "$OUT"
+
+    # --- Without the rehearsal seam the script demands root, like the other
+    # privileged loaders; nothing is created either way.
+    OUT="$root/hc.rootcheck"
+    set +e
+    env -i PATH="/usr/bin:/bin" bash "$hc" --root "$tree" --user "$me" </dev/null >"$OUT" 2>&1
+    rc=$?
+    set -e
+    want_err "an unprivileged real-host run creates nothing" test -e "$tree"
+    if [ "$(id -u)" -eq 0 ]; then
+        ok "root check skipped: this harness already runs as root"
+    else
+        check 1 "$rc" "an unprivileged real-host run dies"
+        want_ok "the refusal asks for sudo" grep -q "must run as root" "$OUT"
+    fi
+}
+
 # --- NET-048 / NET-050: Linux amd64 and arm64 releases ship the VM stack -----
 # The proof is the release components table itself: every Linux architecture
 # carries minvmd, the guest kernel, initramfs, rootfs image, and the switch.
@@ -1573,6 +1805,7 @@ case_for() {
         uninstall)                          case_uninstall ;;
         gvproxy_rename_migration)           case_gvproxy_rename_migration ;;
         installer_switch_binary_executable) case_installer_switch_binary_executable ;;
+        host_classifier_tree_installed)  case_host_classifier_tree_installed ;;
         linux_amd64_manifest_ships_vm_stack) case_linux_amd64_manifest_ships_vm_stack ;;
         linux_arm64_manifest_ships_vm_stack) case_linux_arm64_manifest_ships_vm_stack ;;
         *)
@@ -1587,6 +1820,7 @@ case "${1:-}" in
             target_validation prefix_resolution install_record daemon_stop \
             shell_integration darwin_dequarantine uninstall \
             gvproxy_rename_migration installer_switch_binary_executable \
+            host_classifier_tree_installed \
             linux_amd64_manifest_ships_vm_stack linux_arm64_manifest_ships_vm_stack; do
             case_for "$_c"
         done
