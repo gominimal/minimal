@@ -525,8 +525,13 @@ impl BepHost {
 #[derive(Debug)]
 #[must_use = "dropping BepPeer stops the host-side proxy stack"]
 pub struct BepPeer {
-    /// The stack poll task; aborting it stops the interface.
+    /// The stack poll task. It runs on a blocking thread, which `abort` cannot
+    /// stop, so the loop watches `stop` and returns when the sender drops.
     poll_task: tokio::task::JoinHandle<()>,
+    /// Dropped by `Drop`: the poll loop exits when this closes. Without it the
+    /// runtime that spawned the peer waits forever for the blocking task at
+    /// shutdown, which is how the switch runtime hung at stop.
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
     /// Pump tasks moving frames between socket and device channels.
     pumps: JoinSet<()>,
 }
@@ -534,6 +539,7 @@ pub struct BepPeer {
 impl Drop for BepPeer {
     fn drop(&mut self) {
         self.pumps.abort_all();
+        drop(self.stop.take());
         self.poll_task.abort();
     }
 }
@@ -654,6 +660,7 @@ impl BepPeer {
         // on the current-thread runtime so `BepHost` (which is not `Send`) can
         // be held across `.await` points. We block_in_place in an async task
         // that is itself `Send`, and pass frames through channels.
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
         let poll_task = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -670,9 +677,18 @@ impl BepPeer {
                     tokio::select! {
                         _ = notify.notified() => {}
                         _ = interval.tick() => {}
+                        // The peer was dropped: leave the loop so the runtime
+                        // that spawned this blocking task can shut down.
+                        _ = &mut stop_rx => break,
                     }
-                    while let Ok(frame) = host.device.rx.try_recv() {
-                        host.device.pending.push_back(frame);
+                    loop {
+                        match host.device.rx.try_recv() {
+                            Ok(frame) => host.device.pending.push_back(frame),
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                            // The reader pump is gone and no frame will ever
+                            // arrive: the interface has nothing left to serve.
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
+                        }
                     }
                     let elapsed = start.elapsed().as_millis() as i64;
                     host.poll(Instant::from_millis(elapsed));
@@ -680,7 +696,11 @@ impl BepPeer {
             });
         });
 
-        Ok(Self { poll_task, pumps })
+        Ok(Self {
+            poll_task,
+            stop: Some(stop_tx),
+            pumps,
+        })
     }
 }
 
