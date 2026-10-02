@@ -105,7 +105,8 @@ async fn register_box_with_vm_host(
         // way, so the registration did not happen.
         minimald_rpc::BoxControlReply::Status(status) => {
             anyhow::bail!(
-                "the VM host daemon answered the box registration with its                  answerer status {status:?}; the registration did not happen"
+                "the VM host daemon answered the box registration with its \
+                 answerer status {status:?}; the registration did not happen"
             )
         }
     }
