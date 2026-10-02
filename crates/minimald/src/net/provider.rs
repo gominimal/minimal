@@ -708,6 +708,31 @@ mod tests {
             "never through the host's own resolver: it forwards any name upstream"
         );
 
+        // The carve-out the table itself enforces for that resolver: the
+        // installer's rendered table retargets the deny subtree's DNS
+        // lookups — the one port a box cannot be refused on, or nothing it
+        // asks ever resolves — onto the answerer's address and port, so the
+        // one destination a deny-all box's connections are admitted to is
+        // the one its resolver really is. Read off the step's own
+        // `--print-ruleset` output, so what is pinned is what a host loads.
+        // 53 is DNS, spelled here because the constant that owns it
+        // (`dns_gate::DNS_PORT`) is private to its module.
+        let ruleset = crate::net::classifier::rendered_ruleset();
+        let dstnat = crate::net::classifier::chain_rules(&ruleset, "dstnat");
+        let dnat = format!(
+            "socket cgroupv2 level 3 \"minimald.slice/boxes/deny\" \
+             ip daddr {} udp dport 53 dnat ip to {}:{}",
+            crate::net::classifier::ANSWERER_ADDRESS,
+            crate::net::classifier::ANSWERER_ADDRESS,
+            crate::net::answerer::ANSWERER_PORT,
+        );
+        assert_eq!(
+            dstnat,
+            [dnat.as_str()],
+            "the table retargets the deny subtree's DNS onto the answerer, and \
+             does nothing else at dstnat: the carve-out is one DNAT rule"
+        );
+
         // A box that is not deny-all inherits the host's resolver: no verdict
         // of its own, no carve-out to be routed through.
         let plain = network_for(NetworkMode::HostNet, &native, "s", None, None, None)
