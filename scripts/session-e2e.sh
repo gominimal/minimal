@@ -4076,22 +4076,28 @@ proof_native_resolution_without_proxy_env() {
 # answers the zone itself, and the case above proves that. Both halves read
 # the way a person reads them:
 #
-#   * The in-VM daemon owns no answerer (NET-138): on a VM-backed host the
-#     zone is the host's to answer, so the guest daemon starts no answerer
-#     and publishes none through the forwarder — `min ls` carries no ZONE
-#     ANSWERER line for a VM session to point a resolver at.
-#   * The VM host daemon's answerer answers a zone name on the host, and dig
-#     reads the wire a host resolver would. The name is the node's own
-#     namespace row — the row the VM host daemon authors itself at start,
-#     host-side, before any session exists — so the proof holds on every VM
-#     lane, including ones that exercise only the vsock bridge; the row's
-#     address is the host loopback, and the answer carries the short TTL the
-#     zone's clients are promised (NET-126). The port is the one the
-#     answerer's own start record names: the listener it holds, or the
-#     machine's answerer port when another VM host daemon holds it and this
-#     table's rows answer through it.
+#   * `min ls` names the VM host daemon as the zone's answerer (NET-138): on
+#     a VM-backed host the zone is the host's to answer, the guest daemon
+#     starts no answerer, and the CLI reads the host answerer's state from
+#     minvmd's control socket — never through the guest — and prints the
+#     ZONE ANSWERER line from it: answered by the VM host daemon, naming the
+#     holder.
+#   * The VM host daemon's answerer answers real zone names on the host, and
+#     dig reads the wire a host resolver would, at the port the answerer's
+#     own start record names — the listener it holds, or the machine's
+#     answerer port when another VM host daemon holds it and this table's
+#     rows answer through it:
+#       - `host.min.internal`, the row the answerer itself holds (NET-003's
+#         host half), answering the host loopback;
+#       - one live VM box's name, answering the host-loopback address the
+#         host authored for that box (NET-125), within the short TTL the
+#         zone's clients are promised (NET-126) — the box's own row, because
+#         the node's row no longer travels the answerer channel (a second
+#         VM's would be refused by construction);
+#       - an unknown name, answered NXDOMAIN with the zone's SOA (NET-126),
+#         not dropped.
 #
-# A VM lane that cannot produce the answer FAILS, not skips: this case is the
+# A VM lane that cannot produce the answers FAILS, not skips: this case is the
 # box zone's whole story on those lanes.
 # ---------------------------------------------------------------------------
 proof_native_resolution_from_host_answerer_on_vm_host() {
@@ -4102,16 +4108,11 @@ proof_native_resolution_from_host_answerer_on_vm_host() {
   echo "::group::native min.internal resolution from the VM host daemon's answerer (NET-124..NET-128, NET-138)"
 
   # dig, the wire a host resolver reads. A lane without it cannot assert this
-  # case's subject at all — a red lane in CI, an honest skip on a dev host
-  # (the gate doctrine every host half in this script uses).
+  # case's subject at all, so a VM lane that lacks it fails: this proof never
+  # skips past the box zone's story on the lane the story is about.
   if ! command -v dig >/dev/null 2>&1; then
-    if [ -n "${CI:-}" ]; then
-      echo "::error::a CI VM lane must have dig to read the host answerer's answer"
-      fail
-    fi
-    echo "::warning::host-answerer resolution SKIPPED — no dig on this host to read the answerer's wire with"
-    echo "::endgroup::"
-    return 0
+    echo "::error::a VM lane must have dig to read the host answerer's answers"
+    fail
   fi
 
   # Warm the lane: `min ls` is the call that autospawns the VM host daemon —
@@ -4134,26 +4135,24 @@ proof_native_resolution_from_host_answerer_on_vm_host() {
     fail
   fi
 
-  # NET-138, the in-VM half. Capture-then-grep, never `mnl ls | grep`: grep's
-  # early exit SIGPIPEs the CLI.
+  # NET-138, the host half as the CLI surfaces it: `min ls` reads the
+  # answerer's state from the VM host daemon's control socket and names the
+  # zone's answerer — the in-VM daemon owns none. Capture-then-grep, never
+  # `mnl ls | grep`: grep's early exit SIGPIPEs the CLI.
   host_answerer_ls="$(mnl ls 2>/dev/null || true)"
-  if printf '%s\n' "$host_answerer_ls" | grep -q -- 'ZONE ANSWERER'; then
-    echo "::error::the in-VM daemon still names a zone answerer in min ls — on a VM-backed host it must start none (NET-138)"
+  if ! printf '%s\n' "$host_answerer_ls" \
+      | grep -qF -- 'ZONE ANSWERER:   answered by the VM host daemon (single-operator interim)'; then
+    echo "::error::min ls does not name the VM host daemon as the zone's answerer — the line the CLI reads from minvmd's control socket is missing"
     echo "--- min ls ---"; printf '%s\n' "$host_answerer_ls"
     fail
   fi
-  echo "the in-VM daemon owns no answerer: min ls carries no ZONE ANSWERER line (NET-138)"
+  echo "min ls names the VM host daemon as the zone's answerer (NET-138):"
+  printf '%s\n' "$host_answerer_ls" | grep -- 'ZONE ANSWERER' | sed 's/^/  /'
 
   # The VM host daemon's own log candidates, newest first: the answerer is a
   # host process, so its start record sits beside the daemon's in minvmd's
   # file log; the detached supervisor's run.log is the fallback (the fsr
-  # case's candidate list). No `-maxdepth` on the find: BSD find (the macOS
-  # lane) rejects it as an unknown primary, and with that error swallowed
-  # the candidate list would read only run.log — which carries no tracing
-  # records — and the case would fail as though the daemon had said nothing.
-  # The logs dir is flat (dated files, pruned in place), so the recursion
-  # costs nothing; the plain find is the same idiom `recover_minvmd_log`
-  # below already runs on this lane.
+  # case's candidate list).
   host_answerer_log_candidates() {
     find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log*' -type f 2>/dev/null | sort -r
     printf '%s\n' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/run.log"
@@ -4194,19 +4193,14 @@ $(grep -h -- 'zone-answerer' "$host_answerer_cand" 2>/dev/null || true)"
     host_answerer_port=7656
     echo "another VM host daemon on this machine holds the answerer port; this VM's rows answer through it at 127.0.0.1:$host_answerer_port"
   elif printf '%s\n' "$host_answerer_records" | grep -qF -- "this VM's box names are not answered on the host"; then
-    # The port is held by a daemon with no channel (a native minimald, a
+    # The port is held by a process no channel reaches (a native minimald, a
     # foreign process): this VM's names genuinely do not answer on the host,
-    # so there is no answer to read — on a lane that is the defect this case
-    # exists to catch; on a dev host sharing its machine with a native daemon
-    # it is that machine's honest state.
-    if [ -n "${CI:-}" ]; then
-      echo "::error::the VM host daemon's answerer could not take the machine's port (a daemon with no channel holds it), so this VM's box names are not answered on the host"
-      printf '%s\n' "$host_answerer_records" | grep -F -- 'zone-answerer' | tail -n5
-      fail
-    fi
-    echo "::warning::host-answerer resolution SKIPPED — this machine's answerer port is held by a daemon with no channel, so this VM's box names are not answered on the host"
-    echo "::endgroup::"
-    return 0
+    # so there is no answer to read — the defect this case exists to catch,
+    # on a CI lane and a dev host alike: a VM lane whose names do not answer
+    # is red, never quietly skipped past.
+    echo "::error::the VM host daemon's answerer could not take the machine's port (a process with no channel holds it), so this VM's box names are not answered on the host"
+    printf '%s\n' "$host_answerer_records" | grep -F -- 'zone-answerer' | tail -n5
+    fail
   else
     echo "::error::no zone-answerer start record in the VM host daemon's log after 20 s — the answerer neither holds the port nor says why it cannot"
     echo "--- minvmd log (zone-answerer lines) ---"
@@ -4218,42 +4212,116 @@ $(grep -h -- 'zone-answerer' "$host_answerer_cand" 2>/dev/null || true)"
     fail
   fi
 
-  # The node's own namespace row — the name the VM host daemon authors at
-  # start — must answer at the host loopback, within the short TTL.
-  host_answerer_name="minimald.min.internal"
-  host_answerer_reply="$(dig +time=2 +tries=1 +noall +answer "@127.0.0.1" \
-    -p "$host_answerer_port" "$host_answerer_name" A 2>/dev/null || true)"
-  if [ -z "$host_answerer_reply" ]; then
-    echo "::error::$host_answerer_name did not answer at 127.0.0.1:$host_answerer_port on the host"
-    echo "--- dig (no answer) ---"
-    dig +time=2 +tries=1 "@127.0.0.1" -p "$host_answerer_port" "$host_answerer_name" A 2>&1 || true
-    echo "--- minvmd log (zone-answerer lines, tail) ---"
-    printf '%s\n' "$host_answerer_records" | grep -F -- 'zone-answerer' | tail -n5
-    fail
-  fi
-  echo "dig @127.0.0.1 -p $host_answerer_port $host_answerer_name A:"
-  printf '%s\n' "$host_answerer_reply" | sed 's/^/  /'
-
-  # One A record at the node row's loopback address, within the short TTL.
-  # Parsed field-wise (dig pads its columns, so no literal substring).
-  if ! printf '%s\n' "$host_answerer_reply" \
-      | awk '$4 == "A" && $5 == "127.0.0.1" { found = 1 } END { exit !found }'; then
-    echo "::error::the answer is not the node row's loopback address (got: '$host_answerer_reply')"
-    fail
-  fi
-  host_answerer_ttl="$(printf '%s\n' "$host_answerer_reply" | awk '$4 == "A" { print $2; exit }')"
-  case "$host_answerer_ttl" in
-    ''|*[!0-9]*)
-      echo "::error::could not read the answer's TTL (got: '$host_answerer_ttl')"
+  # One A query at the answerer's port, asserted field-wise (dig pads its
+  # columns, so no literal substring): one A record at the expected address,
+  # within the short TTL the zone promises (a withdrawn box stops resolving
+  # fast). The name and the address it must carry are the caller's — the
+  # host's own row, then a live box's.
+  host_answerer_expect_a() {
+    # $1: the name to ask for. $2: the A address the answer must carry.
+    local name="$1" address="$2" reply ttl
+    reply="$(dig +time=2 +tries=1 +noall +answer "@127.0.0.1" \
+      -p "$host_answerer_port" "$name" A 2>/dev/null || true)"
+    if [ -z "$reply" ]; then
+      echo "::error::$name did not answer at 127.0.0.1:$host_answerer_port on the host"
+      echo "--- dig (no answer) ---"
+      dig +time=2 +tries=1 "@127.0.0.1" -p "$host_answerer_port" "$name" A 2>&1 || true
+      echo "--- minvmd log (zone-answerer lines, tail) ---"
+      printf '%s\n' "$host_answerer_records" | grep -F -- 'zone-answerer' | tail -n5
       fail
-      ;;
-  esac
-  if [ "$host_answerer_ttl" -gt 15 ]; then
-    echo "::error::the answer's TTL is $host_answerer_ttl s — the zone's answers are promised short (≤ 15 s), so a withdrawn box stops resolving fast"
+    fi
+    echo "dig @127.0.0.1 -p $host_answerer_port $name A:"
+    printf '%s\n' "$reply" | sed 's/^/  /'
+    if ! printf '%s\n' "$reply" \
+        | awk -v want="$address" '$4 == "A" && $5 == want { found = 1 } END { exit !found }'; then
+      echo "::error::$name's answer is not the expected $address (got: '$reply')"
+      fail
+    fi
+    ttl="$(printf '%s\n' "$reply" | awk '$4 == "A" { print $2; exit }')"
+    case "$ttl" in
+      ''|*[!0-9]*)
+        echo "::error::could not read $name's answer TTL (got: '$ttl')"
+        fail
+        ;;
+    esac
+    if [ "$ttl" -gt 15 ]; then
+      echo "::error::$name's answer TTL is $ttl s — the zone's answers are promised short (≤ 15 s), so a withdrawn box stops resolving fast"
+      fail
+    fi
+    echo "$name answers $address at 127.0.0.1:$host_answerer_port (TTL ${ttl}s)"
+  }
+
+  # NET-003's host half, the row that proves the answerer on the wire is
+  # this zone's: a foreign process squatting the port would not answer the
+  # host's own name with 127.0.0.1.
+  host_answerer_expect_a host.min.internal 127.0.0.1
+
+  # One live VM box name (NET-125): a box's row is registered at its
+  # session's activation, and the warm-up above took the daemon — and with
+  # it the table — down, so mint one. The address its name must answer with
+  # is read from the daemon's own zone-table dump (zone.json, the view the
+  # answerer answers from, the file a diagnostic bundle carries), because
+  # the host authored it: the CLI's activation hands it to the session, the
+  # daemon's allocation drew it, and the e2e has no other source of truth
+  # for it.
+  local answerer_session="e2e-answerer"
+  # shellcheck disable=SC2086
+  (cd "$PROJECT_DIR" && mnl session activate . --name "$answerer_session" ${E2E_ACTIVATE_ARGS:-}) \
+    >"$WORK/answerer-activate.out" 2>"$WORK/answerer-activate.err" \
+    || { echo "::error::could not activate a session to give the zone a live box row"
+         echo "--- activate stderr ---"; cat "$WORK/answerer-activate.err" 2>/dev/null || true
+         fail; }
+  answerer_box="${answerer_session}.min.internal"
+  zone_dump="$XDG_STATE_HOME/minimal/providers/local-minvmd0/zone.json"
+  answerer_expected=""
+  for _ in $(seq 1 40); do
+    answerer_expected="$(python3 -c '
+import json, sys
+for row in json.load(open(sys.argv[1])):
+    if row.get("name") == sys.argv[2] and row.get("live"):
+        print(row.get("address") or "")
+        break
+' "$zone_dump" "$answerer_box" 2>/dev/null || true)"
+    [ -n "$answerer_expected" ] && break
+    sleep 0.5
+  done
+  if [ -z "$answerer_expected" ]; then
+    echo "::error::the zone-table dump names no live row for $answerer_box — the box's host row never published"
+    echo "--- $zone_dump ---"; cat "$zone_dump" 2>/dev/null || echo "(absent)"
     fail
   fi
+  echo "the zone dump holds $answerer_box at $answerer_expected"
+  # The row reaches the port's holder on the registry's change ping — the
+  # same event that rewrote the dump — so on a machine whose answerer is
+  # another daemon the answer can trail the dump by a poll. Wait for the
+  # answer to be the row's, then let the assert above carry the TTL and the
+  # printed evidence.
+  for _ in $(seq 1 40); do
+    if dig +time=2 +tries=1 +noall +answer "@127.0.0.1" -p "$host_answerer_port" \
+        "$answerer_box" A 2>/dev/null \
+        | awk -v want="$answerer_expected" '$4 == "A" && $5 == want { found = 1 } END { exit !found }'; then
+      break
+    fi
+    sleep 0.5
+  done
+  host_answerer_expect_a "$answerer_box" "$answerer_expected"
+  # The row is this proof's to withdraw — destroying the session withdraws
+  # it (T66) — so the lane is left as it was found.
+  mnl session destroy --force "$answerer_session" >/dev/null 2>&1 || true
 
-  echo "native min.internal resolution from the VM host daemon's answerer OK (no in-VM answerer, host answers at 127.0.0.1:$host_answerer_port, TTL ${host_answerer_ttl}s)"
+  # An unknown name (NET-126): the zone's negatives say NXDOMAIN and carry
+  # the SOA, not a silent drop, which a host resolver would read as a
+  # server failure rather than an absent box.
+  host_answerer_nx="$(dig +time=2 +tries=1 +noall +comments "@127.0.0.1" \
+    -p "$host_answerer_port" "no-such-box-e2e.min.internal" A 2>/dev/null || true)"
+  if ! printf '%s\n' "$host_answerer_nx" | grep -q 'status: NXDOMAIN'; then
+    echo "::error::an unknown box name did not answer NXDOMAIN at 127.0.0.1:$host_answerer_port"
+    echo "--- dig (comments) ---"; printf '%s\n' "$host_answerer_nx"
+    fail
+  fi
+  echo "an unknown box name answers NXDOMAIN (the SOA-carrying negative)"
+
+  echo "native min.internal resolution from the VM host daemon's answerer OK (min ls names the VM host daemon, the host row and a live box answer at 127.0.0.1:$host_answerer_port, unknown names NXDOMAIN)"
   echo "::endgroup::"
 }
 
