@@ -2685,6 +2685,9 @@ impl Session {
             session: session.downgrade(),
             // What this launch is for; see [`Session::launch_host`].
             for_hooks,
+            // The classifier tree the privileged step installs natively and
+            // the guest's own boot mounts; see the field's doc.
+            classifier_root: std::path::PathBuf::from(sandbox2::classifier::TREE_ROOT),
         })
     }
 
