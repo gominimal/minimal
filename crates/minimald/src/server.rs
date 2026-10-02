@@ -998,22 +998,28 @@ async fn start_host_proxies(
         RetryBackoff::production(),
     ));
 
-    // The box-zone answerer (UDP), beside the hostname proxy: the loopback
-    // answerer the host's resolver is routed to for `*.min.internal`
-    // (design §7.1, NET-009). Same bind rule as the proxies — and the same
-    // configured/default/selected port treatment — and the same publish on a
-    // VM host — over UDP, which is how the host resolver's datagrams travel.
-    // The on-machine gate is the answerer's own: loopback peers natively,
-    // and in a VM the host-local switch fabric the gvproxy forwarder rides
-    // (NET-006).
-    let answerer_scope = if in_microvm {
-        AnswerScope::Microvm {
-            subnet: crate::net::DEFAULT_SUBNET,
-        }
-    } else {
-        AnswerScope::Native
-    };
-    let answerer = ZoneAnswerer::new(state.sessions_manager().await.hostnames(), answerer_scope);
+    // The box-zone answerer (UDP), beside the hostname proxy — on a native
+    // host only: the loopback answerer the host's resolver is routed to for
+    // `*.min.internal` (design §7.1, NET-009). Same bind rule as the proxies
+    // and the same configured/default/selected port treatment; the on-machine
+    // gate is the answerer's own (loopback peers, NET-006).
+    //
+    // A daemon inside a microVM starts no answerer and publishes none
+    // through the forwarder: on a VM-backed host the zone is the VM host
+    // daemon's to answer — `minvmd`'s host answerer serves it on the host
+    // loopback from the host-authored table (NET-138), the same semantics
+    // over the same shared decision — and an in-guest answerer behind the
+    // switch would only shadow it. The in-VM daemon's registry answers
+    // nothing, `min ls` carries no answerer port for a VM session to point
+    // a resolver at, and the hostname proxy above (which in-guest routing
+    // does depend on) keeps serving exactly as before.
+    if in_microvm {
+        return;
+    }
+    let answerer = ZoneAnswerer::new(
+        state.sessions_manager().await.hostnames(),
+        AnswerScope::Native,
+    );
     tokio::spawn(drive_answerer_until_serving(
         state.clone(),
         answerer,
@@ -2486,6 +2492,113 @@ mod tests {
         );
         drive.abort();
         drop(probe);
+    }
+
+    /// T65 (NET-009 on a VM host): a VM-hosted daemon starts no zone answerer
+    /// and publishes none through the forwarder. The zone on a VM-backed host
+    /// is the VM host daemon's to answer — `minvmd`'s host answerer serves it
+    /// on the host loopback, from the host-authored table (NET-138) — so an
+    /// in-guest answerer behind the switch would only shadow it. What must
+    /// stay is the *other* half of `start_host_proxies`: the hostname proxy
+    /// starts in a microVM exactly as before.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn vm_hosted_daemon_starts_no_answerer() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        use hickory_proto::rr::RecordType;
+
+        use crate::net::answerer::encode_query;
+
+        // A free UDP port the daemon is configured to put its answerer on —
+        // the handed-answerer port a VM-hosted daemon used to bind before the
+        // host answerer took the zone. Reserved here only to learn a free
+        // number, then released: if the daemon starts an answerer despite its
+        // deployment model, it is this port it binds and answers on, which is
+        // exactly what the datagram below would find.
+        let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let configured = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = TempDir::new().unwrap();
+        let state = ServerStateHandle::new(
+            Config {
+                in_microvm: true,
+                zone_answerer_port: Some(configured),
+                ..test_config(&dir)
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The real startup path, the way a VM-hosted `Server::run` takes it.
+        start_host_proxies(&state, true, None, Some(configured)).await;
+
+        // The positive control: the hostname proxy's half ran — its listen
+        // address bindable line is the first thing the VM startup logs, well
+        // before the host publish this harness has no gvproxy to answer. What
+        // changed is the answerer, not the daemon's whole proxy half.
+        let mut proxy_bound = false;
+        for _ in 0..200 {
+            if buf.contents().contains("egress proxy listen address is bindable") {
+                proxy_bound = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            proxy_bound,
+            "the hostname proxy must start in a microVM as before, got: {}",
+            buf.contents()
+        );
+
+        // The answerer never does: no line of its component — not a bind, not
+        // a retry, not a serving — and its discovery field, the one `min ls`
+        // prints its ZONE ANSWERER line from, stays empty for a window the
+        // native startup fills it in within its first bind attempt.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            state.zone_answerer_port().await,
+            None,
+            "a VM-hosted daemon reports no zone answerer: the host answerer owns the zone"
+        );
+        assert!(
+            !buf.contents().contains("zone-answerer"),
+            "no zone-answerer line may appear in a VM-hosted daemon's log, got: {}",
+            buf.contents()
+        );
+
+        // And nothing listens for zone datagrams on the port it was
+        // configured to take: a query sent there gets no reply at all — no
+        // rcode, no error, nothing — which is the port's state a VM host's
+        // host answerer finds when it takes it.
+        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+        socket
+            .send_to(
+                &encode_query("web.min.internal.", RecordType::A),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), configured),
+            )
+            .unwrap();
+        let mut reply = [0u8; 512];
+        match socket.recv_from(&mut reply) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut => {}
+            outcome => panic!(
+                "the daemon must answer nothing in the zone's place on a VM host, got: {outcome:?}"
+            ),
+        }
     }
 
     /// T63 (NET-025): the pid-1 boot reads its handed ports fail-closed and
