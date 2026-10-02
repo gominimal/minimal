@@ -22,6 +22,27 @@
 //! keeps the default-block posture of finding #2. Every relay — gated or not,
 //! the daemon's own included — also carries the lease it was attached with,
 //! and rejects any frame whose source is not it (NET-084).
+//!
+//! The ingress leg's *refusals* — an unpublished port's (NET-014) and a revoked
+//! port's (NET-121) — are answered, not dropped: a bare TCP SYN to a port the
+//! box does not publish is answered with a reset so the connecting peer fails
+//! at once instead of timing out. That refusal covers **TCP** only (design
+//! §7.1 line 248, v1): a UDP datagram has no connection to refuse, so it stays
+//! a drop, and the UDP analogue of the reset is not asked for by anything this
+//! module implements.
+//!
+//! The refusal carries both bounds a source-fed channel needs: the resets ride
+//! a **bounded** channel ([`RESET_CHANNEL_CAPACITY`]) that this module's legs
+//! feed and the switch-side writer drains, so no box's flood grows the
+//! daemon's memory — the excess is dropped, never queued — and each source
+//! draws from a per-window refusal budget ([`ResetBudget`]), so the flooder
+//! degrades to the timeout the reset replaced while nobody else does, with one
+//! audited line per source per window. The resets themselves are built only
+//! from state the gate holds ([`SessionGate::refuse_tcp_segment`]): a bare SYN
+//! is answered the way a kernel refuses a connection, and a connection the
+//! gate ended is reset from the sequence pair it tracked — never from the
+//! numbers an arriving segment claims, and always addressed to that segment's
+//! source.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Read, Write};
@@ -487,9 +508,12 @@ where
 
 /// Writes the gate's synthesized resets to the switch, framed the way every
 /// frame leaves a relay: 2-byte little-endian length, then the frame. Ends
-/// when the gate's last holder drops its reset sender.
+/// when the gate's last holder drops its reset sender. The channel is bounded
+/// ([`RESET_CHANNEL_CAPACITY`]): the writer drains it at the switch's own
+/// pace, and the gate — never this task — decides what a full bound costs (a
+/// dropped reset, never a queued one).
 async fn write_resets<W>(
-    mut resets: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    mut resets: tokio::sync::mpsc::Receiver<Vec<u8>>,
     sock: Arc<tokio::sync::Mutex<W>>,
 ) -> io::Result<()>
 where
@@ -922,9 +946,9 @@ pub struct SessionGate {
     /// passes only if it matches a live outbound flow in `conntrack`.
     udp_allowed: HashSet<u16>,
     /// TCP internal ports whose ingress has been revoked after publish
-    /// (NET-121): the gate admits them no longer — every packet still
-    /// touching one is answered with a reset and never forwarded, so the
-    /// connections the revoked forwarder held end at the gate instead of
+    /// (NET-121): the gate admits them no longer — every packet still touching
+    /// one is refused ([`Self::refuse_tcp_segment`]) and never forwarded, so
+    /// the connections the revoked forwarder held end at the gate instead of
     /// riding on past it. Interior-mutable because revocation arrives after
     /// the gate is shared.
     revoked: Mutex<HashSet<u16>>,
@@ -934,16 +958,32 @@ pub struct SessionGate {
     /// sequence for the connection it belongs to, so the reset the revocation
     /// sends is read by a quiet peer at once. Swept like [`UdpConntrack`].
     inbound_flows: Mutex<HashMap<InboundFlowKey, (Instant, InboundFlowTail)>>,
+    /// The flows a revocation has already terminated, each with the tail it was
+    /// reset from, kept for [`TERMINATED_FLOW_TTL`] so a segment the ended
+    /// connection still sends is answered from the state the gate **tracked** —
+    /// the self-healing second reset — and never from numbers the arriving
+    /// segment carries, which a spoofing peer chooses (see
+    /// [`SessionGate::refuse_tcp_segment`]). Swept like [`UdpConntrack`].
+    terminated_flows: Mutex<HashMap<InboundFlowKey, (Instant, InboundFlowTail)>>,
+    /// The per-source budget the refusals are drawn against: a reset is
+    /// synthesized for a source only while it has window budget left, so a
+    /// box flooding SYNs at this box's ports cannot spend the daemon's memory
+    /// or the reset channel on its own refusals ([`ResetBudget`]).
+    reset_budget: ResetBudget,
     /// The resets this gate's legs synthesize — a refused SYN's (NET-014), a
     /// revoked port's, a revocation's terminations — handed to the egress leg
     /// and written to the switch, the only leg that holds the switch's write
-    /// half. Unbounded: a refusal must never be dropped for want of buffer
-    /// space, and refused connections are rare beside forwarded frames.
-    resets: mpsc::UnboundedSender<Vec<u8>>,
+    /// half. **Bounded** ([`RESET_CHANNEL_CAPACITY`]): the channel is fed by
+    /// frames other boxes originate, so an unbounded one would let a single
+    /// box grow the daemon's memory at will; the per-source budget
+    /// ([`ResetBudget`]) is what keeps a well-behaved source's refusals inside
+    /// it, and a send past the bound is dropped — the flooder degrades to a
+    /// timeout, nobody else does.
+    resets: mpsc::Sender<Vec<u8>>,
     /// The receiving half of [`Self::resets`], taken by the relay's spawn —
     /// once, and never again: a clone that spawns a second relay on this gate
     /// finds the slot empty and spawns none.
-    resets_rx: Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>>,
+    resets_rx: Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
     /// Outbound-UDP flow tracker, shared between the relay legs so a reply to
     /// the PTask's own UDP egress (DNS, QUIC, …) is allowed back in — and an
     /// undeclared datagram, or one the relay answered itself (NET-136), cannot
@@ -1011,13 +1051,17 @@ impl SessionGate {
         // the gate, its receiving half leaves it when the relay's spawn takes
         // it, and a gate that never spawns a relay — a policy-level caller —
         // just accumulates nothing, because nothing sends into a channel whose
-        // gate was never attached.
-        let (resets, resets_rx) = mpsc::unbounded_channel();
+        // gate was never attached. Bounded, and a send past the bound is
+        // dropped (see the field doc): the per-source budget is what keeps a
+        // legitimate source inside it.
+        let (resets, resets_rx) = mpsc::channel(RESET_CHANNEL_CAPACITY);
         Self {
             allowed: declared_ingress_ports(Some(policy), sessions::IpProto::Tcp),
             udp_allowed: declared_ingress_ports(Some(policy), sessions::IpProto::Udp),
             revoked: Mutex::new(HashSet::new()),
             inbound_flows: Mutex::new(HashMap::new()),
+            terminated_flows: Mutex::new(HashMap::new()),
+            reset_budget: ResetBudget::default(),
             resets,
             resets_rx: Mutex::new(Some(resets_rx)),
             conntrack: Arc::new(UdpConntrack::default()),
@@ -1046,7 +1090,7 @@ impl SessionGate {
 
     /// Takes the receiving half of the gate's reset channel — once, at the
     /// relay's spawn, so the leg that writes to the switch owns it alone.
-    fn take_resets(&self) -> Option<mpsc::UnboundedReceiver<Vec<u8>>> {
+    fn take_resets(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
         self.resets_rx
             .lock()
             .expect("gate reset-receiver lock poisoned")
@@ -1102,7 +1146,8 @@ impl SessionGate {
     /// Revokes `port`'s ingress (NET-121): the gate admits it no longer, and
     /// every connection it held is terminated — each recorded flow is answered
     /// with a reset built from the last packet the gate saw of it, and every
-    /// packet that still arrives for the port is refused with a reset instead
+    /// packet that still arrives for the port is refused — answered where the
+    /// gate holds state to answer from, silent where it holds none — instead
     /// of being forwarded. Returns the number of held connections terminated,
     /// for the revocation's log line.
     pub(crate) fn revoke_port(&self, port: u16) -> usize {
@@ -1117,29 +1162,110 @@ impl SessionGate {
             return 0;
         }
         let now = Instant::now();
-        let drained: Vec<InboundFlowTail> = {
+        let drained: Vec<(InboundFlowKey, InboundFlowTail)> = {
             let mut flows = self
                 .inbound_flows
                 .lock()
                 .expect("gate inbound-flow lock poisoned");
             let drained = flows
                 .extract_if(|key, _| key.2 == port)
-                .map(|(_, (_, tail))| tail)
+                .map(|(key, (_, tail))| (key, tail))
                 .collect();
             flows.retain(|_, (seen, _)| now.duration_since(*seen) < INBOUND_FLOW_TTL);
             drained
         };
-        for tail in &drained {
+        let terminated = drained.len();
+        // The revocation's own resets are the gate's own doing, not a source's:
+        // they draw no per-source budget, and a full channel drops them like
+        // any other — a well-behaved revocation is one reset per held flow.
+        // Each ended flow keeps its tail in the terminated table, so a segment
+        // the connection still sends after its reset is answered from the
+        // state the gate tracked rather than left to time out (see
+        // [`Self::refuse_tcp_segment`]).
+        {
+            let mut ended = self
+                .terminated_flows
+                .lock()
+                .expect("gate terminated-flow lock poisoned");
+            for (key, tail) in &drained {
+                ended.insert(*key, (now, *tail));
+            }
+            if ended.len() > TERMINATED_FLOW_SWEEP_AT {
+                ended.retain(|_, (seen, _)| now.duration_since(*seen) < TERMINATED_FLOW_TTL);
+            }
+        }
+        for (_, tail) in &drained {
             self.send_reset(rst_from_flow(tail));
         }
-        drained.len()
+        terminated
+    }
+
+    /// Answers one inbound TCP segment the gate refuses — a SYN to a port the
+    /// box's declaration does not publish (NET-014) or any segment to a port
+    /// whose ingress was revoked (NET-121) — with a reset on the switch side,
+    /// subject to the two bounds a source-fed channel needs:
+    ///
+    /// - the **per-source budget** ([`ResetBudget`]): a source that has spent
+    ///   its window's refusals gets no more until the window rolls, so one
+    ///   box's flood cannot spend the gate's resets on itself. The flooder
+    ///   degrades to a timeout; nobody else does.
+    /// - the **channel's bound** ([`RESET_CHANNEL_CAPACITY`]): a send past it is
+    ///   dropped rather than queued, so no burst of refusals grows the
+    ///   daemon's memory.
+    ///
+    /// The reset's shape follows RFC 793 §3.4, and is built from state the gate
+    /// holds, never from numbers the arriving segment carries:
+    ///
+    /// - a bare SYN is answered with RST|ACK from sequence zero, acknowledging
+    ///   the SYN — `SYN.seq + 1` — the kernel's own connection-refused shape,
+    ///   which a connecting peer's half-open socket reads as the refusal it is.
+    /// - a segment of an established connection is answered only when the gate
+    ///   holds that connection's tail — the revocation's terminated table — and
+    ///   then from the sequence pair it tracked, which is in the peer's window
+    ///   by construction. A segment of a flow the gate holds **nothing** for is
+    ///   answered with no reset at all: the arriving segment's own sequence
+    ///   numbers are its sender's claim, and a spoofed one would let any box
+    ///   make this box emit a reset carrying an attacker-chosen sequence to a
+    ///   spoofed victim. The reset is always addressed to the frame's source
+    ///   (`rst_frame` swaps the observed packet's own addresses), so a refusal
+    ///   can never be steered at a third party.
+    ///
+    /// Returns whether a reset was queued.
+    fn refuse_tcp_segment(&self, frame: &[u8], pkt: &L4Packet) -> bool {
+        if !self.reset_budget.admit(*pkt.src.ip(), &self.label) {
+            return false;
+        }
+        let syn = pkt.tcp_flags & 0x02 != 0;
+        let ack = pkt.tcp_flags & 0x10 != 0;
+        let reset = if syn && !ack {
+            rst_reply_frame(frame, pkt)
+        } else {
+            // The flow the segment belongs to: the gate's own record of a
+            // connection it admitted and then ended. `None` — a flow nothing
+            // holds, or one whose tail has expired — is answered with nothing.
+            let key: InboundFlowKey = (*pkt.src.ip(), pkt.src.port(), pkt.dst.port());
+            self.terminated_flows
+                .lock()
+                .expect("gate terminated-flow lock poisoned")
+                .get(&key)
+                .filter(|(seen, _)| Instant::now().duration_since(*seen) < TERMINATED_FLOW_TTL)
+                .map(|(_, tail)| rst_from_flow(tail))
+        };
+        match reset {
+            Some(reset) => {
+                self.send_reset(reset);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Hands a synthesized reset to the leg that writes to the switch. The
-    /// channel is unbounded, and its receiver is only ever dropped when the
-    /// gate itself is — so a send cannot fail while this gate's relay lives.
+    /// channel is bounded and its receiver is only ever dropped when the gate
+    /// itself is — so a send fails only on the bound, and the excess reset is
+    /// dropped there: never queued, never retried, never held.
     fn send_reset(&self, frame: Vec<u8>) {
-        let _ = self.resets.send(frame);
+        let _ = self.resets.try_send(frame);
     }
 
     /// The inbound-gate decision for one Ethernet frame: `Some((proto, dst_port,
@@ -1611,6 +1737,110 @@ const INBOUND_FLOW_TTL: Duration = Duration::from_secs(300);
 /// memory under a burst of distinct flows without a background timer.
 const INBOUND_FLOW_SWEEP_AT: usize = 4096;
 
+/// TTL for the tail of a flow a revocation terminated — the state the gate
+/// answers the ended connection's own stragglers from (see
+/// [`SessionGate::refuse_tcp_segment`]). The window only has to outlive the
+/// packets a connection's peer sends after the reset — retransmits and
+/// keepalives, seconds at most — and past it the flow is held by nothing, so
+/// its segments join the silent drop.
+const TERMINATED_FLOW_TTL: Duration = Duration::from_secs(60);
+/// Sweep expired terminated tails once the table crosses this many entries,
+/// bounding memory the same way [`INBOUND_FLOW_SWEEP_AT`] does.
+const TERMINATED_FLOW_SWEEP_AT: usize = 4096;
+
+/// Capacity of the channel the gate hands its resets to the switch-side writer
+/// on. It is **bounded** on purpose: the channel is fed by packets other
+/// boxes send, so an unbounded one lets a single box grow the daemon's memory
+/// by making the gate refuse a flood. Past the bound a reset is dropped, never
+/// queued — the flooder degrades to a timeout, nobody else does, and a
+/// well-behaved revocation is one reset per held flow, far under the cap.
+const RESET_CHANNEL_CAPACITY: usize = 256;
+
+/// How long one window of the per-source reset budget ([`ResetBudget`]) lasts.
+/// A source that has spent its window's refusals waits for the next window,
+/// so the budget is a rate, not a lifetime quota.
+const RESET_WINDOW: Duration = Duration::from_secs(1);
+
+/// How many refusals one source may spend per [`RESET_WINDOW`] before the gate
+/// stops answering it until the window rolls: far above what a peer with a
+/// real reason to reconnect needs, far below what a flood spends.
+const RESET_PER_WINDOW: u32 = 16;
+
+/// The per-source budget the gate's refusals are drawn against (NET-014,
+/// NET-121): a map of source address to the window it is spending in. A source
+/// that has spent [`RESET_PER_WINDOW`] refusals in the current window gets no
+/// more until the window rolls — one box's flood cannot spend the gate's
+/// resets on itself — and the first refusal a window refuses is logged once,
+/// as the audit line that names the flooder. Swept like [`UdpConntrack`]:
+/// only once the table crosses [`RESET_BUDGET_SWEEP_AT`], so the steady state
+/// costs one map lookup per refusal.
+#[derive(Debug)]
+struct ResetBudget {
+    /// How long one window lasts: [`RESET_WINDOW`] in production, shrunk by
+    /// the proofs that cannot wait a second to watch a window roll.
+    window: Duration,
+    spent: Mutex<HashMap<Ipv4Addr, (Instant, u32, bool)>>,
+}
+
+/// Sweep exhausted per-source windows once the budget table crosses this many
+/// entries, bounding memory under a burst of spoofed sources.
+const RESET_BUDGET_SWEEP_AT: usize = 4096;
+
+impl Default for ResetBudget {
+    fn default() -> Self {
+        Self {
+            window: RESET_WINDOW,
+            spent: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl ResetBudget {
+    /// Narrows the window — the test hook for the proofs that need a window
+    /// to roll inside a test, the DNS gate's admission-window hook's twin.
+    #[cfg(test)]
+    fn shrink_window(&mut self, window: Duration) {
+        self.window = window;
+    }
+
+    /// Whether the gate may spend one more refusal on `source` this window.
+    /// `label` names the session the gate belongs to, so the audit line names
+    /// the flooder's target too.
+    fn admit(&self, source: Ipv4Addr, label: &str) -> bool {
+        let now = Instant::now();
+        let window = self.window;
+        let mut spent = self.spent.lock().expect("ResetBudget mutex poisoned");
+        if spent.len() > RESET_BUDGET_SWEEP_AT {
+            spent.retain(|_, (seen, _, _)| now.duration_since(*seen) < window);
+        }
+        let (_, count, warned) = {
+            let entry = spent.entry(source).or_insert((now, 0, false));
+            // A fresh window for a source the table already holds: its old
+            // spend lapses, and with it the suppression line's
+            // once-per-window.
+            if now.duration_since(entry.0) >= window {
+                *entry = (now, 0, false);
+            }
+            entry
+        };
+        if *count >= RESET_PER_WINDOW {
+            if !*warned {
+                *warned = true;
+                tracing::warn!(
+                    source = %source,
+                    session = label,
+                    limit = RESET_PER_WINDOW,
+                    window_ms = window.as_millis() as u64,
+                    "stopping TCP resets for a source that spent its window's refusals"
+                );
+            }
+            return false;
+        }
+        *count += 1;
+        true
+    }
+}
+
 /// The identity of a tracked inbound TCP flow: source address and port, and
 /// the destination port it was admitted to. The destination address is the
 /// relay's own lease, fixed for every flow it carries.
@@ -1621,7 +1851,9 @@ type InboundFlowKey = (Ipv4Addr, u16, u16);
 /// sequence and acknowledgement numbers, its flags and the payload length it
 /// actually carried. A revocation builds the flow's terminating reset from
 /// exactly these numbers, so the reset rides the flow's own pair and a
-/// quiet peer reads it in-window.
+/// quiet peer reads it in-window. All plain values, so `Copy` — a revocation
+/// moves its flows' tails into the terminated table without cloning ceremony.
+#[derive(Clone, Copy)]
 struct InboundFlowTail {
     src_mac: [u8; 6],
     dst_mac: [u8; 6],
@@ -2011,7 +2243,11 @@ where
         let tcp = parse_ipv4_l4(&frame[..n]).filter(|pkt| pkt.proto == IPPROTO_TCP);
         // NET-121: an ingress port the policy revoked is refused on the spot —
         // the gate answers with a reset and forwards nothing, whether the
-        // forwarder's listener still stands or not. A reset that lands
+        // forwarder's listener still stands or not. A new connection gets the
+        // kernel's refusal shape; a segment of one the gate had to end is
+        // answered from the flow the gate tracked, and a segment of a flow it
+        // holds nothing for — a spoofed one — is answered with no reset at all
+        // ([`SessionGate::refuse_tcp_segment`]). A reset that lands
         // out-of-window is answered by the peer with a challenge ACK, and the
         // next segment that connection sends yields an in-window reset, so the
         // termination is self-healing.
@@ -2019,9 +2255,7 @@ where
             && let Some(pkt) = &tcp
             && gate.port_revoked(pkt.dst.port())
         {
-            if let Some(reset) = rst_reply_frame(&frame[..n], pkt) {
-                gate.send_reset(reset);
-            }
+            gate.refuse_tcp_segment(&frame[..n], pkt);
             gate.limiter.warn(
                 &gate.label,
                 Direction::Ingress,
@@ -2058,9 +2292,8 @@ where
         {
             if proto == sessions::IpProto::Tcp
                 && let Some(pkt) = &tcp
-                && let Some(reset) = rst_reply_frame(&frame[..n], pkt)
             {
-                gate.send_reset(reset);
+                gate.refuse_tcp_segment(&frame[..n], pkt);
             }
             gate.limiter.warn(
                 &gate.label,
@@ -2341,6 +2574,9 @@ pub(crate) mod tests {
     /// shared with the DNS gate's tests.
     pub(crate) const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
     const PEER: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 5);
+    /// The second peer of the per-source-budget proofs: a source the
+    /// flooding peer beside it must not silence.
+    const OTHER_PEER: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 6);
 
     #[test]
     fn gate_drops_unsolicited_udp_to_undeclared_port() {
@@ -2992,6 +3228,295 @@ pub(crate) mod tests {
             u16::from_be_bytes([reset[50], reset[51]]),
             checksum,
             "the checksum is one the box's kernel verifies"
+        );
+    }
+
+    /// [`tcp_frame`] with the sequence and acknowledgement numbers an
+    /// established flow's segments carry — the numbers the gate's recorded
+    /// tail reads, and the ones the revocation's terminating reset rides.
+    fn tcp_segment_with_numbers(
+        flags: u8,
+        src: Ipv4Addr,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+    ) -> Vec<u8> {
+        let mut frame = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, flags, src, dst_port);
+        frame[38..42].copy_from_slice(&seq.to_be_bytes());
+        frame[42..46].copy_from_slice(&ack.to_be_bytes());
+        frame
+    }
+
+    /// The one declared ingress of the reset-shape and revocation proofs:
+    /// host `:8080` forwarding to the box's `:80`.
+    fn declared_ingress_80() -> sessions::SessionPolicy {
+        sessions::SessionPolicy {
+            ingress: Some(sessions::IngressPolicy {
+                port_mappings: vec![sessions::PortMapping {
+                    external_port: 8080,
+                    internal_port: 80,
+                    proto: sessions::IpProto::Tcp,
+                }],
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+            egress: None,
+        }
+    }
+
+    /// Asserts `reset` is the termination of the flow the gate recorded a
+    /// tail for — `(PEER, 40000) → (LEASE, 80)` — riding that tail's own
+    /// sequence pair (`seq` what the flow's peer expects next of the box,
+    /// `ack` what the box acknowledged of the peer's stream), with the tuple
+    /// swapped so the reset is addressed to the segment's source and a
+    /// checksum the receiver's kernel verifies.
+    fn assert_reset_terminates_flow(reset: &[u8], seq: u32, ack: u32) {
+        assert_eq!(reset.len(), 14 + 20 + 20, "an Ethernet + IPv4 + TCP reset");
+        assert_eq!(
+            &reset[12..14],
+            &ETHERTYPE_IPV4.to_be_bytes(),
+            "EtherType IPv4"
+        );
+        assert_eq!(reset[23], IPPROTO_TCP, "the refused transport");
+        let source = (
+            Ipv4Addr::new(reset[26], reset[27], reset[28], reset[29]),
+            u16::from_be_bytes([reset[34], reset[35]]),
+        );
+        let destination = (
+            Ipv4Addr::new(reset[30], reset[31], reset[32], reset[33]),
+            u16::from_be_bytes([reset[36], reset[37]]),
+        );
+        assert_eq!(source, (LEASE, 80), "the reset speaks for the box's port");
+        assert_eq!(
+            destination,
+            (PEER, 40000),
+            "the reset is addressed to the segment's source"
+        );
+        assert_eq!(
+            u32::from_be_bytes([reset[38], reset[39], reset[40], reset[41]]),
+            seq,
+            "the reset rides the sequence pair the gate tracked"
+        );
+        assert_eq!(
+            u32::from_be_bytes([reset[42], reset[43], reset[44], reset[45]]),
+            ack,
+            "the reset acknowledges what the gate tracked"
+        );
+        assert_eq!(reset[47], 0x14, "RST|ACK: a termination");
+        let mut segment = [0u8; 20];
+        segment.copy_from_slice(&reset[34..54]);
+        segment[16..18].fill(0);
+        assert_eq!(
+            u16::from_be_bytes([reset[50], reset[51]]),
+            tcp_checksum(&segment, LEASE, PEER),
+            "the checksum is one the receiver's kernel verifies"
+        );
+    }
+
+    /// The gate's two reset shapes (NET-014, NET-121, RFC 793 §3.4), and the
+    /// one non-shape a spoofing peer must find: a reset is built only from
+    /// state the gate holds. A bare SYN is refused the way a kernel refuses a
+    /// connection — RST|ACK from sequence zero, acknowledging the SYN — a
+    /// connection the gate ended is reset from the sequence pair the gate
+    /// tracked for it, in the peer's window by construction, and a segment of
+    /// a flow the gate holds nothing for is answered with no reset at all:
+    /// its own numbers are its sender's claim, never this box's answer.
+    #[test]
+    fn refused_resets_carry_the_two_shapes_and_only_held_flows() {
+        let gate = SessionGate::for_session(
+            LEASE.to_string(),
+            LEASE,
+            &declared_ingress_80(),
+            SwitchSubnet::default(),
+        );
+        let mut resets = gate
+            .take_resets()
+            .expect("a gate's reset channel is taken exactly once");
+
+        // Shape one: a bare SYN to an unpublished port, answered with the
+        // kernel's own connection-refused shape, addressed to the SYN's
+        // source.
+        let syn = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 9999);
+        let syn_pkt = parse_ipv4_l4(&syn).expect("the SYN parses");
+        assert!(gate.refuse_tcp_segment(&syn, &syn_pkt));
+        let refused = resets
+            .try_recv()
+            .expect("the refused SYN is answered at once");
+        assert_reset_refuses(&refused, &syn);
+
+        // The flow the gate will hold a tail for: an established connection
+        // to the declared port, recorded the way the relay records every
+        // admitted segment.
+        let established = tcp_segment_with_numbers(ACK, PEER, 80, 1001, 5001);
+        let established_pkt = parse_ipv4_l4(&established).expect("the segment parses");
+        gate.record_inbound(&established_pkt, &established);
+
+        // Shape two: the revocation terminates that flow with a reset riding
+        // the sequence pair the gate tracked for it.
+        assert_eq!(gate.revoke_port(80), 1, "the recorded flow is terminated");
+        let terminated = resets
+            .try_recv()
+            .expect("the revocation answers the flow it held");
+        assert_reset_terminates_flow(&terminated, 5001, 1001);
+
+        // The ended connection's own straggler — a segment carrying numbers
+        // the gate never tracked — is answered from the same tail, so the
+        // self-healing reset stays in the window the gate watched.
+        let straggler = tcp_segment_with_numbers(ACK, PEER, 80, 2001, 6001);
+        let straggler_pkt = parse_ipv4_l4(&straggler).expect("the straggler parses");
+        assert!(gate.refuse_tcp_segment(&straggler, &straggler_pkt));
+        let healed = resets
+            .try_recv()
+            .expect("the ended connection's straggler is answered");
+        assert_eq!(
+            healed, terminated,
+            "the self-healing reset rides the tracked tail, never the straggler's numbers"
+        );
+
+        // A segment of a flow the gate holds nothing for — the spoofed
+        // straggler — is answered with no reset at all, so this box can never
+        // be made to emit a reset carrying a spoofed sequence to a victim.
+        let spoofed = tcp_segment_with_numbers(ACK, OTHER_PEER, 80, 0xdead_beef, 0xfeed_face);
+        let spoofed_pkt = parse_ipv4_l4(&spoofed).expect("the segment parses");
+        assert!(!gate.refuse_tcp_segment(&spoofed, &spoofed_pkt));
+        assert!(
+            resets.try_recv().is_err(),
+            "no reset is built for a flow the gate holds nothing for"
+        );
+    }
+
+    /// The reset channel is bounded: a gate whose switch-side writer is not
+    /// draining still answers — the send past the bound is dropped, never
+    /// queued, never blocking — so no box's flood can grow the daemon's
+    /// memory through it. Exactly the channel's capacity arrives; the excess
+    /// is gone.
+    #[test]
+    fn the_reset_channel_is_bounded_and_the_excess_is_dropped() {
+        let gate = SessionGate::for_session(
+            LEASE.to_string(),
+            LEASE,
+            &declared_ingress_80(),
+            SwitchSubnet::default(),
+        );
+        let mut resets = gate
+            .take_resets()
+            .expect("a gate's reset channel is taken exactly once");
+
+        for _ in 0..RESET_CHANNEL_CAPACITY + 32 {
+            gate.send_reset(vec![0u8; 54]);
+        }
+        let mut held = 0;
+        while resets.try_recv().is_ok() {
+            held += 1;
+        }
+        assert_eq!(
+            held, RESET_CHANNEL_CAPACITY,
+            "the channel holds its bound and drops the rest"
+        );
+    }
+
+    /// The per-source refusal budget: one source spends its window's refusals
+    /// and then waits for the window to roll — degrading alone, while a
+    /// second source in the same window is still answered — and the first
+    /// refused-over attempt says one audited line per window, not one per
+    /// refusal.
+    #[test]
+    fn the_reset_budget_spends_per_source_and_says_one_line_per_window() {
+        let capture = crate::test_harness::captured_log();
+        let mut budget = ResetBudget::default();
+        // A window short enough to watch it roll inside a test.
+        budget.shrink_window(Duration::from_millis(50));
+        let flooder = Ipv4Addr::new(100, 64, 0, 77);
+        let quiet = Ipv4Addr::new(100, 64, 0, 78);
+
+        for _ in 0..RESET_PER_WINDOW {
+            assert!(budget.admit(flooder, "box"), "the window opens with budget");
+        }
+        // Past the cap the flooder is refused its resets until the window
+        // rolls — and the refusal says one line per window, not one per
+        // refused attempt.
+        for _ in 0..4 {
+            assert!(
+                !budget.admit(flooder, "box"),
+                "the flooder has spent its window's refusals"
+            );
+        }
+        assert_eq!(
+            capture.contents().matches("stopping TCP resets").count(),
+            1,
+            "one audited line per source per window: {}",
+            capture.contents()
+        );
+
+        // Nobody else pays for the flood: a second source in the same window
+        // is still answered.
+        assert!(budget.admit(quiet, "box"), "the flooder degrades alone");
+
+        // The window rolls and the flooder's budget returns with it.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            budget.admit(flooder, "box"),
+            "a new window opens the flooder's budget again"
+        );
+    }
+
+    /// NET-014's refusal, bounded end to end: a peer that floods the box's
+    /// unpublished ports is answered until its window's refusals are spent
+    /// and then degrades to the timeout the reset replaced — while another
+    /// peer's connection in the same window is still refused at once, so the
+    /// flood costs its source alone. The flood's own line says it once.
+    #[tokio::test]
+    async fn refused_resets_are_budgeted_per_source() {
+        let capture = crate::test_harness::captured_log();
+        let mut harness = spawn_test_relay_with(&declared_ingress_80(), |gate| {
+            gate.reset_budget.shrink_window(Duration::from_millis(120));
+        });
+
+        // The flood: one more refused SYN than the window pays for, then a
+        // second peer's connection behind it — answered only if the budget
+        // is the source's, not the box's.
+        let flood = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 9999);
+        let other = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, OTHER_PEER, 9999);
+        let mut framed = Vec::with_capacity(2 + flood.len());
+        framed.extend_from_slice(&(flood.len() as u16).to_le_bytes());
+        for _ in 0..RESET_PER_WINDOW + 3 {
+            framed.extend_from_slice(&flood);
+        }
+        framed.extend_from_slice(&other);
+        harness.switch.write_all(&framed).await.unwrap();
+
+        // Read the relay's answers until the second peer's reset arrives: the
+        // flood's answers all precede it on the wire, so what came before it
+        // is everything the flood was ever owed.
+        let mut flood_resets = 0usize;
+        let mut other_reset = None;
+        for _ in 0..RESET_PER_WINDOW + 8 {
+            let frame =
+                tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                    .await
+                    .expect("the relay answers within the test's bound")
+                    .expect("the switch side stays open");
+            let destination = Ipv4Addr::new(frame[30], frame[31], frame[32], frame[33]);
+            if destination == PEER {
+                flood_resets += 1;
+            } else if destination == OTHER_PEER {
+                other_reset = Some(frame);
+                break;
+            }
+        }
+        assert!(
+            other_reset.is_some(),
+            "another peer's refused connection is still answered behind the flood"
+        );
+        assert_eq!(
+            flood_resets, RESET_PER_WINDOW as usize,
+            "the flooder spent exactly its window's refusals, then degraded to a timeout"
+        );
+        assert_eq!(
+            capture.contents().matches("stopping TCP resets").count(),
+            1,
+            "the flood is audited once: {}",
+            capture.contents()
         );
     }
 
