@@ -26,13 +26,16 @@ The CLI reference overview is [docs/reference/cli.md](docs/reference/cli.md).
 
 ## Workspace crates
 
-Run `just crates` to print the workspace's crates with their descriptions. Each
-description lives in that crate's `Cargo.toml`, so the list cannot drift from
-the code. Use it when you need to know which crate is responsible for
-something, or where a change belongs.
-[docs/architecture.md](docs/architecture.md) §3 adds which plane each crate
-belongs to (build, session, shared), and §0 explains those groupings and the
-product surface.
+Run `just crates` to print the workspace's crates with their descriptions. Use
+it when you need to know which crate is responsible for something, or where a
+change belongs.
+
+[docs/architecture.md](docs/architecture.md) §0 splits the crates into core
+crates and the product surface, and §3 adds which plane each crate belongs to
+(build, session, shared).
+
+When you change a crate's scope, update its `Cargo.toml` description too, so
+this information stays current.
 
 ## Platform matrix
 
