@@ -506,6 +506,48 @@ pub(crate) fn warn_if_hostname_routing_down(reason: Option<&str>, command: &str)
     }
 }
 
+/// The session-start twin of `min ls`'s routing line (NET-026 on the activate
+/// surface): one line telling the operator the port this daemon's
+/// `<name>.min.internal` names route through — the address a PAC file or an
+/// `HTTP(S)_PROXY` export has to point at, which is not a constant on a host
+/// where a port was taken.
+///
+/// That is the case the line exists for: a VM whose proposed host port the
+/// host already held walks to a host port of its own (NET-059) — a boot with
+/// no handed port, since a handed one is pinned and keeps proposing the port
+/// it was given — and a native daemon whose default is busy asks the OS for a
+/// free one (NET-025). Either way the port the recipes assume is not the one
+/// in use, so a walked port must never be a log line alone: the daemon
+/// reports the port it is *reachable* on, and the session that just started
+/// prints it here beside the routing line `min ls` prints for the same VM.
+///
+/// `vm` is the VM the line names: the selected one on the VM backend, where
+/// each VM publishes its own proxy on the host and the name is which port is
+/// whose on a two-VM host. `None` on the native backend, which hosts no VMs,
+/// so the line reads exactly as `min ls`'s single-daemon routing line does.
+#[must_use]
+pub fn hostname_proxy_start_line(vm: Option<&str>, port: u16) -> String {
+    match vm {
+        Some(vm) => format!(
+            "HOSTNAME PROXY:  VM {vm} listening on 127.0.0.1:{port} · \
+             <name>.min.internal routes through it"
+        ),
+        None => format!(
+            "HOSTNAME PROXY:  listening on 127.0.0.1:{port} · \
+             <name>.min.internal routes through it"
+        ),
+    }
+}
+
+/// The VM a session-start routing line names: the selected VM on the VM
+/// backend, where the session that just started landed on one VM of several
+/// and its proxy port is that VM's, and nothing on the native backend, whose
+/// one daemon hosts no VMs to name.
+#[must_use]
+pub fn hostname_proxy_start_vm(global: &GlobalArgs) -> Option<&'static str> {
+    global.use_minvmd().then(client::vm_name)
+}
+
 /// Format the session list for the given output mode. Split from
 /// [`cmd_ls`] so integration tests can capture output into a buffer
 /// instead of stdout.

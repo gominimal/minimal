@@ -657,6 +657,22 @@ pub(crate) async fn activate_session(
         created.hostname_routing_unavailable.as_deref(),
         "min session activate",
     );
+    // The other routing fact the create reply carries: the port this daemon's
+    // hostnames route through, printed where the session started — the same
+    // fact `min ls` prints on its routing line. NET-026's discovery on this
+    // surface; and the report a port has to carry when it is *not* the one the
+    // recipes assume — a VM whose host port the host already held walked to
+    // one of its own (NET-059), a native daemon whose default was busy asked
+    // the OS for a free one (NET-025) — so a walked port is never a log line
+    // alone. Absent while the proxy is still coming up, or from a daemon that
+    // predates the field: nothing to print for it then, exactly as in `min
+    // ls`.
+    if let Some(port) = created.hostname_proxy_port {
+        eprintln!(
+            "{}",
+            hostname_proxy_start_line(hostname_proxy_start_vm(global), port)
+        );
+    }
     // NET-122/NET-123: the naming advisory, printed once per session start —
     // after the create, and re-surfaced when the daemon reports this session
     // at the 127.0.0.1 interim because its session-start bind probe found
