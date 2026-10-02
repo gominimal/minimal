@@ -38,16 +38,21 @@
 //! does not, so the marker is the advisory's fact and the probe's is the
 //! verdict. The probe runs at daemon start and again before each
 //! host-address launch, because a table can go away between them. A host
-//! that decides nothing per box runs its host-address boxes unenforced,
-//! never refused (NET-079's exception), with the cause named at session
-//! start and the install command printed only when a command can end the
-//! cause. The guest is the one exception to that exception: its daemon is
-//! the only one that could have made its image load the table, so until it
-//! does, a deny-all host-address box is refused rather than run on a
-//! refusal that is not there (design §7.1) — and no installer exists for a
-//! person to run, so none is named; its other host-address boxes run
-//! unenforced like any host's and say so per launch, in the interim's
-//! words.
+//! that decides nothing per box runs its host-address boxes unenforced
+//! (NET-079's exception), with the cause named at session start and the
+//! install command printed only when a command can end the cause — except
+//! the one state where the box's own declaration is the thing this host
+//! cannot honour: a deny-all box over either probe cause — the table not
+//! refusing, or its effect unreadable — would run placed and looking
+//! decided while nothing refuses it, so the launch refuses it on either
+//! kind of host, and its other host-address boxes run unenforced and say
+//! so per launch. The guest refuses on the same ground plus its own: its
+//! daemon is the only one that could have made its image load the table,
+//! so until it does, a deny-all host-address box is refused rather than
+//! run on a refusal that is not there (design §7.1) — and no installer
+//! exists for a person to run, so none is named; its other host-address
+//! boxes run unenforced like any host's and say so per launch, in the
+//! interim's words.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -121,15 +126,22 @@ pub enum Cause {
     /// probe's deadline. A marker survives a reboot whose reload failed or
     /// a flush; a refusal does not, and the refusal is the fact a `per_box`
     /// record rests on (design §7.4), so the marker alone decides nothing
-    /// here. Reloading the table ends it, so the install command is named.
+    /// here. A deny-all host-address box over this cause is refused on
+    /// either kind of host: its declaration promises a refusal this host is
+    /// not making, and it must not run looking decided while nothing
+    /// refuses it. Reloading the table ends it, so the install command is
+    /// named.
     TableNotEffective,
     /// The table's effect could not be read: the daemon's own control-leg
     /// connection to the probe's listener failed, or no probe child could be
     /// placed in a deny leaf — so whether the table is refusing is unknown,
     /// and an unknown effect is not a verdict (the probe reports the least
-    /// it can prove, never the most it can guess). No command is named
-    /// because none is known to end it: the cause says what failed to be
-    /// read, and a person reading it decides what to look at.
+    /// it can prove, never the most it can guess). A deny-all host-address
+    /// box over this cause is refused on either kind of host: an unproven
+    /// refusal is not one, and the box's declaration must not run on it.
+    /// No command is named because none is known to end it: the cause says
+    /// what failed to be read, and a person reading it decides what to look
+    /// at.
     ProbeUnreadable,
 }
 
@@ -166,38 +178,48 @@ impl Cause {
     /// What this daemon does with a host-address box on this cause, spelled
     /// for the cause's own host: the half of the start-up line that must say
     /// what the next launch will actually do, because the two hosts answer
-    /// a host that cannot decide per box differently. Natively every cause
-    /// is the requirement's own exception (NET-079) — the box runs
-    /// unenforced, never refused on this ground. In the guest the tree and
-    /// the table were the image's own to build: a tree that cannot confine
-    /// a box leaves nothing to place one in, so every host-address box is
-    /// refused, and on a table that is not loaded — guest-side enforcement
-    /// not being available yet — a deny-all box is refused rather than run
-    /// on a refusal that is not there, while every other box needs no
-    /// verdict enforced and runs.
+    /// a host that cannot decide per box differently. In the guest the tree
+    /// and the table were the image's own to build: a tree that cannot
+    /// confine a box leaves nothing to place one in, so every host-address
+    /// box is refused, and on a table that is not loaded — guest-side
+    /// enforcement not being available yet — a deny-all box is refused
+    /// rather than run on a refusal that is not there, while every other
+    /// box needs no verdict enforced and runs.
     ///
-    /// [`Cause::StepNotInstalled`] is the one cause this cannot arise as in
-    /// a guest ([`decide`] maps the missing step to the guest's own cause),
-    /// so it takes the deny-all spelling with
-    /// [`Cause::GuestTableNotLoaded`]; the two probe causes can arise on
-    /// either kind of host and take the same spelling for the same reason —
-    /// a deny-all box must not run on a refusal that is not in force, and
-    /// a box that needs no verdict enforced still runs. The match stays
+    /// Natively, the causes the step or the host's own mount can end keep
+    /// the requirement's own exception (NET-079): the boxes run unenforced
+    /// and the launch's record says so. [`Cause::GuestTableNotLoaded`]
+    /// cannot arise natively ([`decide`] spells the same state
+    /// [`Cause::StepNotInstalled`] there), so it takes the state's native
+    /// meaning. The two probe causes are the exception's one limit — the
+    /// one state where the box's own declaration is the thing this host
+    /// cannot honour: a deny-all box placed in a leaf whose table is not
+    /// refusing, or whose effect could not be read, would run looking
+    /// decided while nothing refuses it, so the launch refuses it and the
+    /// boxes that need no verdict enforced still run. The match stays
     /// exhaustive over causes, never claiming a host kind that cannot
     /// produce it.
     pub fn host_ip_box_outcome(self, guest: bool) -> &'static str {
-        if !guest {
-            return "its host-address boxes run unenforced";
+        if guest {
+            return match self {
+                Self::CannotConfine => {
+                    "its host-address boxes are refused: it cannot place one in a \
+                     leaf that confines"
+                }
+                Self::StepNotInstalled
+                | Self::GuestTableNotLoaded
+                | Self::TableNotEffective
+                | Self::ProbeUnreadable => {
+                    "its deny-all host-address boxes are refused and its other \
+                     host-address boxes run unenforced"
+                }
+            };
         }
         match self {
-            Self::CannotConfine => {
-                "its host-address boxes are refused: it cannot place one in a \
-                 leaf that confines"
+            Self::StepNotInstalled | Self::CannotConfine | Self::GuestTableNotLoaded => {
+                "its host-address boxes run unenforced"
             }
-            Self::StepNotInstalled
-            | Self::GuestTableNotLoaded
-            | Self::TableNotEffective
-            | Self::ProbeUnreadable => {
+            Self::TableNotEffective | Self::ProbeUnreadable => {
                 "its deny-all host-address boxes are refused and its other \
                  host-address boxes run unenforced"
             }
@@ -433,6 +455,22 @@ impl Reading {
         Self::Refused(observations.to_vec())
     }
 
+    /// Every leg the probe ran, with what each met — the evidence behind
+    /// the reading, so a test can read the leg itself (a stand-in tree with
+    /// no table connects on every family it bound) and not only the reading
+    /// the legs settle. An inconclusive reading ran no leg it can vouch
+    /// for: its control connection failed or no child was placed, so it
+    /// names no evidence. No production surface reads a leg on its own —
+    /// the reading is what they answer with — so the accessor is the
+    /// tests'.
+    #[cfg(test)]
+    pub(crate) fn legs(&self) -> Vec<(Family, Observed)> {
+        match self {
+            Self::Refused(legs) | Self::NotRefused { families: legs, .. } => legs.clone(),
+            Self::Inconclusive { .. } => Vec::new(),
+        }
+    }
+
     /// The probe's own record, one line naming every family it read and
     /// what the leg there met, errno included — the evidence, spelled once
     /// so the decision that logs it and a bundle's tail agree by
@@ -441,11 +479,11 @@ impl Reading {
         match self {
             Self::Refused(families) => format!(
                 "the table refused the probe out of a deny leaf on every family read ({})",
-                Self::legs(families)
+                Self::leg_names(families)
             ),
             Self::NotRefused { because, families } => format!(
                 "the table did not refuse the probe: {because} ({})",
-                Self::legs(families)
+                Self::leg_names(families)
             ),
             Self::Inconclusive { because } => {
                 format!("the table's effect could not be read: {because}")
@@ -454,7 +492,7 @@ impl Reading {
     }
 
     /// The per-family tail of the record.
-    fn legs(families: &[(Family, Observed)]) -> String {
+    fn leg_names(families: &[(Family, Observed)]) -> String {
         families
             .iter()
             .map(|(family, observed)| format!("{} {}", family.name(), observed.describe()))
@@ -703,8 +741,16 @@ unsafe fn probe_child(
             let mut to: libc::sockaddr_in = unsafe { std::mem::zeroed() };
             to.sin_family = libc::AF_INET as libc::sa_family_t;
             to.sin_port = port.to_be();
+            // `s_addr` is the address in the machine's own byte order, and
+            // `INADDR_LOOPBACK` is the literal `0x7f000001` — written into
+            // `s_addr` as-is on a little-endian host it is 1.0.0.127, the
+            // wire order of 127.0.0.1's bytes reversed, so the leg connects
+            // to an address nothing listens on and reads as a timeout. The
+            // v6 arm builds its address from the address type's own octets;
+            // this arm does the same, which is `INADDR_LOOPBACK` after
+            // `htonl`.
             to.sin_addr = libc::in_addr {
-                s_addr: libc::INADDR_LOOPBACK,
+                s_addr: u32::from_ne_bytes(Ipv4Addr::LOCALHOST.octets()),
             };
             // SAFETY: `connect(2)` reads the `sockaddr_in` filled in above.
             unsafe {
@@ -954,25 +1000,11 @@ pub(crate) fn decide(
 }
 
 /// [`decide`] with its probe attached: the decision the daemon reads, over
-/// its own tree, mount table, and host kind. The probe binds a listener,
-/// forks a child, and waits, so an async caller runs it on the blocking
-/// pool.
+/// the tree, mount table, and host kind its caller names for it — the
+/// daemon's own in every production path. The probe binds a listener, forks
+/// a child, and waits, so an async caller runs it on the blocking pool.
 pub fn decide_now(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision {
     decide(root, mountinfo, guest, || read_filter(root))
-}
-
-/// The decision a host-address box's launch answers against, read fresh:
-/// start's own reading is not kept, because a table can go away between it
-/// and the launch — the way a marker outlives the table it vouched for, a
-/// start reading would outlive its probe. Read over the same
-/// `classifier_root` the box is placed into, so the two halves of one
-/// launch answer over one tree.
-pub(crate) fn recorded(root: &Path) -> Decision {
-    decide_now(
-        root,
-        sandbox2::classifier::own_mountinfo().as_deref(),
-        crate::guest::is_microvm_daemon(),
-    )
 }
 
 /// Whether the cohort's two subtrees are there as the step delegates them:
@@ -1629,23 +1661,36 @@ mod tests {
     /// The cause names what happens to a host-address box on the host it was
     /// decided on — the half of the start-up line that must match what the
     /// next launch actually does, because the two hosts answer a host that
-    /// cannot decide per box differently. Natively every cause is NET-079's
-    /// own exception: the box runs unenforced, never refused on this ground.
-    /// The guest refuses instead, and its two grounds say so differently:
-    /// a tree that cannot confine a box leaves nothing to place one in, so
-    /// every host-address box is refused, while a table that is not loaded —
-    /// guest-side enforcement not being available yet — refuses the deny-all
-    /// box, whose declaration promises a verdict nothing would enforce, and
-    /// runs every other, which needs no verdict enforced. The two probe
-    /// causes take the guest's deny-all spelling for the same reason: a
-    /// refusal that is not in force, or one the host could not see, is not
-    /// a verdict to run a deny-all box on. Pinned as data, the same
-    /// spelling the start-up line renders.
+    /// cannot decide per box differently. The step's and the mount's causes
+    /// keep NET-079's exception on either kind of host's *other* grounds —
+    /// natively they run the boxes unenforced, never refusing them on this
+    /// ground — while the two probe causes are the one state where the
+    /// box's own declaration is the thing the host cannot honour, on either
+    /// kind of host: a refusal that is not in force, or one the host could
+    /// not see, is not a verdict to run a deny-all box on, so the deny-all
+    /// box is refused and every other — which needs no verdict enforced —
+    /// runs. The guest refuses more: a tree that cannot confine a box leaves
+    /// nothing to place one in, so every host-address box is refused, and
+    /// the interim's table refuses the deny-all box with the guest's own
+    /// words. Pinned as data, the same spelling the start-up line renders.
     #[test]
     fn the_cause_names_what_happens_to_the_box_on_each_host() {
         for (cause, why) in [
             (Cause::StepNotInstalled, "a host without the step"),
             (Cause::CannotConfine, "a host that cannot confine a box"),
+            (
+                Cause::GuestTableNotLoaded,
+                "a native host, which cannot read this cause (decide spells \
+                 the same state StepNotInstalled there)",
+            ),
+        ] {
+            assert_eq!(
+                cause.host_ip_box_outcome(false),
+                "its host-address boxes run unenforced",
+                "natively, {why} is the exception, never a refusal"
+            );
+        }
+        for (cause, why) in [
             (
                 Cause::TableNotEffective,
                 "a host whose marker survived its table",
@@ -1654,8 +1699,10 @@ mod tests {
         ] {
             assert_eq!(
                 cause.host_ip_box_outcome(false),
-                "its host-address boxes run unenforced",
-                "natively, {why} is the exception, never a refusal"
+                "its deny-all host-address boxes are refused and its other \
+                 host-address boxes run unenforced",
+                "natively, {why} refuses the deny-all box rather than run it \
+                 on a refusal nothing is making, and runs the rest"
             );
         }
         assert_eq!(
@@ -1851,8 +1898,40 @@ mod tests {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
         let root = tree.path();
         installed_cohort(root);
+        // The probe's own reading, taken before any decision is built over
+        // it: behind no table every leg the probe ran must have connected —
+        // 127.0.0.1's leg included — and must have connected with the leg's
+        // own answer, not the deadline's. A leg that cannot reach its
+        // listener reads as `TimedOut`, settles the same `TableNotEffective`,
+        // and stays invisible in the decision; the leg itself is the fact
+        // that shows the probe placed its child where it meant to and the
+        // child reached the address it was handed — a v4 leg that built its
+        // address in the wrong byte order read exactly that way, and no
+        // decision over its reading could see it.
+        let began = std::time::Instant::now();
+        let reading = read_filter(root);
+        let elapsed = began.elapsed();
+        let legs = reading.legs();
+        assert!(
+            legs.contains(&(Family::V4, Observed::Connected)),
+            "the leg on 127.0.0.1 connects behind no table: {legs:?}"
+        );
+        for (family, observed) in &legs {
+            assert_eq!(
+                *observed,
+                Observed::Connected,
+                "every family the probe bound — {} among them — connects \
+                 behind no table: {legs:?}",
+                family.name()
+            );
+        }
+        assert!(
+            elapsed < PROBE_DEADLINE,
+            "the probe ends with its legs' answers, not with the deadline: \
+             {elapsed:?} for {legs:?}"
+        );
         let decision = decide(root, Some(&mountinfo(root, true)), false, || {
-            read_filter(root)
+            reading.clone()
         });
         assert!(
             !decision.can_decide_per_box(),
@@ -1886,7 +1965,18 @@ mod tests {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
         let root = tree.path();
         installed_cohort(root);
-        let first = recorded(root);
+        // The reading a launch takes, over the daemon's own facts — its tree,
+        // its mount table, its host kind — nothing kept anywhere between two
+        // readings, because the fact a marker vouched for outlived the table
+        // it vouched against.
+        let read = || {
+            decide_now(
+                root,
+                sandbox2::classifier::own_mountinfo().as_deref(),
+                crate::guest::is_microvm_daemon(),
+            )
+        };
+        let first = read();
         assert!(
             !first.can_decide_per_box(),
             "a tree the host's own mount table does not cover decides nothing \
@@ -1899,10 +1989,246 @@ mod tests {
              test would like it to"
         );
         assert_eq!(
-            recorded(root),
+            read(),
             first,
             "nothing is kept between readings: the fact is the tree's own, \
              re-read per launch"
+        );
+    }
+
+    /// The loaded table's name, the installer's spelling of it: the daemon
+    /// reads only its marker, so this is the proof's own name for what it
+    /// loads and removes.
+    const TABLE_NAME: &str = "minimal_class";
+
+    /// The host's live cgroup2 mount for the proof below: the deepest mount
+    /// in the daemon's own mount table that is the hierarchy itself (its
+    /// namespace root is `/`, so it is not another cgroup namespace's view)
+    /// and carries `nsdelegate` — the two facts the installer's own
+    /// `verify_mount` demands of the tree it lays out.
+    fn live_cgroup2_mount() -> Option<std::path::PathBuf> {
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+        let mut mount: Option<(usize, std::path::PathBuf)> = None;
+        for line in mountinfo.lines() {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let Some(sep) = fields.iter().position(|field| *field == "-") else {
+                continue;
+            };
+            if fields.len() < sep + 4 || fields[sep + 1] != "cgroup2" {
+                continue;
+            }
+            let options = fields[sep + 3];
+            if fields[3] != "/" || !options.split(',').any(|option| option == "nsdelegate") {
+                continue;
+            }
+            if mount
+                .as_ref()
+                .is_none_or(|(depth, _)| fields[4].len() > *depth)
+            {
+                mount = Some((fields[4].len(), fields[4].into()));
+            }
+        }
+        mount.map(|(_, mountpoint)| mountpoint)
+    }
+
+    /// A non-root account to delegate the scratch tree to: the install
+    /// refuses to delegate to root (that would hand every box the account
+    /// that owns the tree), so the proof takes the first human-range account
+    /// in the password database — the account a development host's daemon
+    /// runs as.
+    fn delegate_account() -> Option<String> {
+        let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+        passwd.lines().find_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            let uid: u32 = fields.get(2)?.parse().ok()?;
+            let name = fields.first()?;
+            (1000..=60000).contains(&uid).then(|| name.to_string())
+        })
+    }
+
+    /// The proof's own artifacts, removed on the way out however the proof
+    /// ended: the table first (it outlives the cgroups it is keyed on), then
+    /// the scratch tree with `rmdir`, never a remove-all — on a real
+    /// cgroup2 these are cgroups, and the kernel's own refusal to remove
+    /// one that still holds a process is the guard wanted here (the probe's
+    /// child is reaped and its leaf gone before this runs, so the tree is
+    /// empty).
+    struct ScratchInstall {
+        root: PathBuf,
+    }
+
+    impl Drop for ScratchInstall {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("nft")
+                .args(["delete", "table", "inet", TABLE_NAME])
+                .status();
+            for dir in [
+                self.root.join(sandbox2::classifier::TABLE_MARKER),
+                self.root
+                    .join(sandbox2::classifier::BOXES_DIR)
+                    .join(sandbox2::config::DENY_DIR),
+                self.root
+                    .join(sandbox2::classifier::BOXES_DIR)
+                    .join(sandbox2::config::ALLOW_DIR),
+                self.root.join(sandbox2::classifier::BOXES_DIR),
+                sandbox2::classifier::daemon_leaf(&self.root),
+                self.root.clone(),
+            ] {
+                let _ = std::fs::remove_dir(&dir);
+            }
+        }
+    }
+
+    /// The loaded table's live refusal, read the way a deny-all box's
+    /// connections meet it: the installer's own `nft -f` transaction laid out
+    /// over a scratch delegated tree on this host's real cgroup2, and
+    /// [`read_filter`] reading it — the observed errno per family, `reject
+    /// with icmpx admin-prohibited` as EHOSTUNREACH over IPv4 loopback and
+    /// EACCES over IPv6. The stand-in trees above pin the decision's
+    /// reading of a reading; this one proves a reading itself, over the
+    /// only artifact that can produce it — and closes with the decision
+    /// that rests on it, read live over the tree it was proved on.
+    ///
+    /// `#[ignore]`d, and declined with a printed reason on a host that
+    /// cannot run it: it needs root (the install chowns the tree and loads
+    /// the table), `nft`, both loopback families, and a cgroup2 mounted
+    /// with `nsdelegate` — and it never runs over a host's own install: a
+    /// tree at [`sandbox2::classifier::TREE_ROOT`] or an already-loaded
+    /// `minimal_class` table is that host's, not this proof's to replace.
+    /// Run it with `sudo just test-ignored` on a Linux host with nftables;
+    /// no CI lane runs it.
+    #[test]
+    #[ignore = "needs root + nft + a live cgroup2; run by `just test-ignored`; declines over a host's own install"]
+    fn the_installers_table_refuses_the_probe_over_a_scratch_tree() {
+        // SAFETY: geteuid has no failure modes or preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!(
+                "skipping the_installers_table_refuses_the_probe_over_a_scratch_tree: \
+                 the install this proof runs needs root to delegate the \
+                 scratch tree and load the table (try: sudo just test-ignored)"
+            );
+            return;
+        }
+        if std::process::Command::new("nft")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!(
+                "skipping the_installers_table_refuses_the_probe_over_a_scratch_tree: \
+                 no nft on this host — the install's nftables transaction is \
+                 the artifact under proof (apt install nftables)"
+            );
+            return;
+        }
+        if std::process::Command::new("nft")
+            .args(["list", "table", "inet", TABLE_NAME])
+            .output()
+            .is_ok_and(|out| out.status.success())
+        {
+            eprintln!(
+                "skipping the_installers_table_refuses_the_probe_over_a_scratch_tree: \
+                 a table named {TABLE_NAME} is already loaded — this proof \
+                 never replaces a host's own table"
+            );
+            return;
+        }
+        if std::path::Path::new(sandbox2::classifier::TREE_ROOT).exists() {
+            eprintln!(
+                "skipping the_installers_table_refuses_the_probe_over_a_scratch_tree: \
+                 a classifier tree is already installed at {} — this proof \
+                 never runs over a host's own install",
+                sandbox2::classifier::TREE_ROOT
+            );
+            return;
+        }
+        let Some(mountpoint) = live_cgroup2_mount() else {
+            eprintln!(
+                "skipping the_installers_table_refuses_the_probe_over_a_scratch_tree: \
+                 no cgroup2 mounted with nsdelegate on this host — the \
+                 install's verify_mount would refuse the scratch tree, and a \
+                 tree on a mount without it confines nothing"
+            );
+            return;
+        };
+        let Some(account) = delegate_account() else {
+            eprintln!(
+                "skipping the_installers_table_refuses_the_probe_over_a_scratch_tree: \
+                 no non-root account to delegate the scratch tree to (the \
+                 install refuses to delegate to root)"
+            );
+            return;
+        };
+        // Both loopback families, because the proof reads one errno from
+        // each: a host with no IPv6 loopback would read its V4 leg alone,
+        // and that is the host's own state, not a failed refusal.
+        if let Err(cause) = std::net::TcpListener::bind("[::1]:0") {
+            eprintln!(
+                "skipping the_installers_table_refuses_the_probe_over_a_scratch_tree: \
+                 no IPv6 loopback on this host ({cause}), so the V6 leg it \
+                 reads EACCES from cannot be read"
+            );
+            return;
+        }
+
+        // The scratch tree, under the host's own cgroup2 so the loaded
+        // rules are keyed on a path this host's probe can enter — named by
+        // this proof, never the daemon's slice.
+        let scratch = mountpoint.join(format!("minimald-proof-{}", std::process::id()));
+        let _install = ScratchInstall {
+            root: scratch.clone(),
+        };
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/install-host-classifier.sh");
+        let installed = std::process::Command::new("bash")
+            .arg(script)
+            .arg("--root")
+            .arg(&scratch)
+            .arg("--user")
+            .arg(account)
+            .arg("--cohort-address")
+            .arg(TEST_COHORT_ADDRESS)
+            .arg("--node-plane-address")
+            .arg(TEST_NODE_PLANE_ADDRESS)
+            .output()
+            .expect("running the privileged step over the scratch tree");
+        assert!(
+            installed.status.success(),
+            "the install lays out the scratch tree and loads its table: {}{}",
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr),
+        );
+
+        // The reading: the table's refusal as the probe's legs met it, one
+        // errno per family — the two loopbacks the decision's proofs name.
+        let reading = read_filter(&scratch);
+        let legs = reading.legs();
+        assert!(
+            matches!(reading, Reading::Refused(_)),
+            "the loaded table refuses the probe out of the deny subtree, got: {}",
+            reading.record()
+        );
+        assert_eq!(
+            legs.iter().find(|(family, _)| *family == Family::V4),
+            Some(&(Family::V4, Observed::Refused(libc::EHOSTUNREACH))),
+            "IPv4 loopback reads the rejection as EHOSTUNREACH: {}",
+            reading.record()
+        );
+        assert_eq!(
+            legs.iter().find(|(family, _)| *family == Family::V6),
+            Some(&(Family::V6, Observed::Refused(libc::EACCES))),
+            "IPv6 loopback reads the same rejection as EACCES: {}",
+            reading.record()
+        );
+
+        // And the decision that rests on it: over the scratch tree the
+        // daemon's own facts — its mount table, the step's subtrees and
+        // marker, the refusal just read — say this host decides per box.
+        let mountinfo = sandbox2::classifier::own_mountinfo();
+        let decision = decide_now(&scratch, mountinfo.as_deref(), false);
+        assert!(
+            decision.can_decide_per_box(),
+            "the fresh decision over the installed scratch tree reads per box: {decision:?}"
         );
     }
 }
