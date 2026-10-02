@@ -645,14 +645,18 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minvmd vm_escape_bounded_to_resident_union
   <!-- S10a/AC4; prose 54; feature+unwanted; the union bound is design §4.3 rule 0 and §8; un-enrolled, the baseline set is NET-130's -->
 
-- **NET-132** WHERE the host is VM-backed and runs a node-local Box Egress Proxy THE SYSTEM SHALL deliver a box's connection to the proxy at the switch's host-gateway address with the box's own switch address as its source.
+- **NET-132** WHERE the host is VM-backed and runs a node-local Box Egress Proxy THE SYSTEM SHALL deliver a box's connection to the proxy at the proxy's own infrastructure address on the switch, beside the gateway, with the box's own switch address as its source.
   tier:     T0
   verify:   ./scripts/session-e2e.sh proxy_sees_each_vm_box_by_its_switch_address
-  <!-- design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the machine-internal path MUST preserve each box's own source address, a v1 conformance requirement of the un-enrolled profile; a node-local BEP's steered destination is its address on the switch's host-gateway; a leg that translated every box to the host's loopback would give the proxy one source for every box and every host process, and the Box Egress Proxy document's cross-box and host-shell refusals rest on the source; the host-gateway address follows the switch's subnet -->
+  <!-- design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the machine-internal path MUST preserve each box's own source address, a v1 conformance requirement of the un-enrolled profile; a node-local BEP's steered destination is the BEP's own address on the host side of the switch (design §7.1 line 240), a second infrastructure address beside the gateway rather than the gateway itself, because the gateway address terminates in the switch's own stack, which cannot hand a connection off; a leg that translated every box to the host's loopback would give the proxy one source for every box and every host process, and the Box Egress Proxy document's cross-box and host-shell refusals rest on the source; the host-gateway address follows the switch's subnet -->
   - IF a process outside every box connects to the proxy's listener THEN THE SYSTEM SHALL present it from no box's address.
     tier:   T0
     verify: cargo nextest run -p minvmd host_process_never_arrives_from_a_box_address
     <!-- unwanted; what lets the proxy refuse a connection from the host shell -->
+  - WHERE the host is VM-backed THE SYSTEM SHALL hold the switch's infrastructure addresses, the gateway and the proxy peer, at the top of each node block below the broadcast address and outside the PTask lease run, with one source for the run's end that the lease book, the gate's run, and the rendered switch configuration all read.
+    tier:   T0
+    verify: cargo nextest run -p minvmd lease_run_gate_run_and_rendered_pool_agree
+    <!-- design §7.1 working value; ubiquitous; the same plan-wide carve-out shape as the resolver-hook reservation above: a lease minted at the proxy's address would collide with the peer, its publishes refused as out of run and its frames answered by the peer, so the run's end is derived once, in the switch crate, and never recomputed by a consumer; this binds the enrolled allocator when it lands -->
 
 - **NET-133** WHEN a box is created on a host running a node-local Box Egress Proxy THE SYSTEM SHALL give the proxy, from the host-side creator outside the VM and before the box's first connection, an attachment naming the box by its box id, with its addressing and the source address it arrives from.
   tier:     T0
