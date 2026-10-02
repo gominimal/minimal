@@ -1332,7 +1332,7 @@ mod tests {
     /// session-start one mirrors (NET-123).
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn live_surface_is_native_where_all_three_facts_hold() {
+    async fn activate_and_ls_report_native_surface_verdict_on_host() {
         let port = 15353;
         assert_eq!(
             live_name_surface_at(&(routing_hook(), None), Some(port), true).await,

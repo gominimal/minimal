@@ -699,8 +699,9 @@ pub(crate) async fn activate_session(
         // (see the daemon's `log_live_name_surface`), so the surface this
         // host's own reads decided — and the three facts behind it, with
         // the range as the one fact only this read holds — is logged here,
-        // at the start that printed it, for the bundle a support engineer
-        // tails beside the daemon's line. Logged, never printed: the line
+        // at the start that printed it, beside the daemon's line. `min`
+        // filters at `warn` unless `RUST_LOG` is set, so the line is visible
+        // under `RUST_LOG=info`. Logged, never printed: the line
         // below is the user's. `min ls` does not log its verdict — a list
         // re-reads the host every run, and the record that matters is the
         // one at the starts that rely on the names.

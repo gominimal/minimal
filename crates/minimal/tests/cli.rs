@@ -1353,7 +1353,7 @@ async fn setup_opted_out() -> (
 /// `--config-dir` (the developer's own loadouts and policy stay out of the
 /// run), and `--no-input`, plus `extra` as the command, and returns its
 /// captured output. The tempdir holding that `--config-dir` lives until the
-/// function returns, so the child it is spelled into outlives it.
+/// function returns, so it outlives the child it is spelled into.
 #[cfg(target_os = "linux")]
 async fn run_min(args: &GlobalArgs, extra: &[&str]) -> std::process::Output {
     let minimal_dir = args
@@ -1634,9 +1634,10 @@ async fn min_prints_discovered_proxy_port() {
 /// depends on the host it runs on. The decision is pure, so its table —
 /// the native arm, and the reviewer's case that must not print native on a
 /// hook no host process consults — lives beside the function in
-/// `resolver`'s tests, where every arm runs on every host (`resolver`'s
-/// own Linux test additionally runs the positive arm against a real host
-/// loopback, where the range always reads present).
+/// `resolver`'s tests, where every arm runs on every host. `resolver`'s own
+/// Linux test `activate_and_ls_report_native_surface_verdict_on_host` runs
+/// the positive arm against a real host loopback, where the range always
+/// reads present, and shares this test's name so the verify line runs both.
 ///
 /// The positive arm's *words* run here as the in-process arm: the binary
 /// cannot reach them on this host, because the verdict reads the host's own
