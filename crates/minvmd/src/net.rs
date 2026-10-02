@@ -58,10 +58,11 @@
 //! gate lives and dies with the switch runtime it was started on.
 //!
 //! The Box Egress Proxy's host leg is separate from all of that
-//! (`bep_host`, NET-132): a userspace smoltcp stack over a channel-backed
-//! device, standing in for the proxy's listener on the switch's plan. It is
-//! declared here and wired into the leg that carries a box's connection to
-//! the proxy's listener when the proxy's own work lands.
+//! (`switch::bep_host`, NET-132): a userspace smoltcp stack over a
+//! channel-backed device, standing in for the proxy's listener on the
+//! switch's plan. The switch runtime starts it once the switch socket is up
+//! and stops it with the switch; the leg that carries a box's connection to
+//! the proxy's listener is wired when the proxy's own work lands.
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -87,8 +88,7 @@ mod shuttle;
 pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_gate_sock, resolve_switch_sock};
 mod baseline;
 pub use baseline::{NodeBaselinePhase, NodePlaneBaseline};
-pub(crate) mod bep_host;
-pub use bep_host::{BepDevice, BepDeviceEnds, BepHost, BepPeer};
+pub use switch::{BepDevice, BepDeviceEnds, BepHost, BepPeer};
 
 /// Default time to wait for gvproxy to exit on SIGTERM before escalating to
 /// SIGKILL.

@@ -4198,7 +4198,6 @@ dependencies = [
  "serde_json_lenient",
  "serial_test",
  "sessions",
- "smoltcp",
  "switch",
  "sysinfo",
  "tempfile",
@@ -7147,7 +7146,10 @@ checksum = "b7401a30af6cb5818bb64852270bb722533397edcfc7344954a38f420819ece2"
 name = "switch"
 version = "0.0.1"
 dependencies = [
+ "smoltcp",
  "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

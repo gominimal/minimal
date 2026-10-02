@@ -5,8 +5,8 @@
 //! leg's address on the switch's plan (NET-134); the connection arrives as
 //! Ethernet frames over the switch's L2 lane, whose bytes cross the shuttle
 //! length-framed (the 2-byte little-endian prefix the switch socket speaks —
-//! see [`egress_gate`]'s relay). The host kernel knows nothing of the switch
-//! subnet, so the leg terminates those frames itself: one smoltcp
+//! the framing `minvmd`'s egress gate relays). The host kernel knows nothing
+//! of the switch subnet, so the leg terminates those frames itself: one smoltcp
 //! [`Interface`] over a channel-backed [`Device`], answering ARP for the leg's
 //! address, resetting TCP to unlistened proxy ports, and sending ICMP
 //! port-unreachable for UDP at the address.
@@ -15,7 +15,7 @@
 //! raw Ethernet frame per message on each. [`BepDevice::pair`] hands the
 //! caller the [`BepDeviceEnds`] to feed frames in through and take frames out
 //! of; the length framing between those edges and the byte stream is the
-//! stream reader's and writer's job, as it is in [`egress_gate`]'s relay.
+//! stream reader's and writer's job, as it is in the egress gate's relay.
 //! [`BepHost`] builds the interface over it: the leg's address on a
 //! [`SwitchSubnet`], its MAC derived the switch's way
 //! ([`MacAddr::for_switch_ip`]), stepped with [`BepHost::poll`].
@@ -24,6 +24,13 @@
 //! with the HyperKit `/connect` request, and runs the stack in a dedicated
 //! local task that is woken by inbound frames, by the outbound pump, and by a
 //! periodic `poll_delay`.
+//!
+//! The module is behind the `stack-peer` cargo feature, off by default: it
+//! lives in this crate so that both daemons can link it, but the in-VM
+//! `minimald` build, which links the crate for the configuration renderer,
+//! pulls in neither smoltcp nor tokio for it. `minvmd` enables the feature
+//! and wires the peer beside the switch; wiring it natively into `minimald`
+//! is a later task (NET-133's native case).
 //!
 //! The peer is silent until spoken to. It originates no frame except in
 //! answer to one that addressed it — the ARP reply, the TCP reset, the ICMP
@@ -48,6 +55,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::{DEFAULT_MTU, MacAddr, SwitchSubnet};
 use smoltcp::iface::{Config as InterfaceConfig, Interface, SocketSet};
 use smoltcp::phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
@@ -56,7 +64,6 @@ use smoltcp::wire::{
     HardwareAddress, IPV4_HEADER_LEN, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Packet,
     Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket,
 };
-use switch::{DEFAULT_MTU, MacAddr, SwitchSubnet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::Notify;
