@@ -20,13 +20,13 @@
 //! plumbing: [`PolicyWarnLimiter`], whose rate limit is keyed by box and
 //! rule, and [`Proto`], the transport a dropped frame is logged under.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-use std::collections::HashMap;
 
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -169,6 +169,13 @@ pub struct PortForwarder {
     mapping: ExposedMapping,
     internal_port: u16,
     gate: Option<Arc<super::switch::SessionGate>>,
+    /// Whether this forwarder's ingress was revoked already — set by
+    /// [`Self::revoke`] once its unbind has *succeeded*, so a revocation that
+    /// failed at the switch stays unrevoked and both a retry and the
+    /// teardown's unexpose still have work to do. `Arc`-shared because the
+    /// forwarder is cloned onto the guard's list and every clone must agree
+    /// on whether the forward stands.
+    revoked: Arc<AtomicBool>,
 }
 
 impl PortForwarder {
@@ -192,6 +199,15 @@ impl PortForwarder {
         self.internal_port
     }
 
+    /// Whether this forwarder's ingress was revoked already: its unbind ran
+    /// and succeeded, so no forward stands at its `local` any more, and
+    /// neither a second revocation nor the teardown's unexpose has anything
+    /// left to ask of the switch.
+    #[must_use]
+    pub fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
+
     /// Unbinds the forwarder (NET-121): the gate refuses its port from here
     /// on — terminating the connections it holds — and the switch unexposes
     /// the forward. The gate first, so no new connection can cross the gap
@@ -199,22 +215,52 @@ impl PortForwarder {
     /// refused port is answered by the box, not left hanging at a listener
     /// that no longer exists.
     ///
+    /// `keep_admitted` names the internal ports that must stay admitted
+    /// because another *live* forwarder still forwards to them — the shape
+    /// two mappings make when both publish the same in-box port. The gate
+    /// refuses by internal port alone (a box's inbound frames carry no trace
+    /// of which external forward they arrived through), so a revocation whose
+    /// internal port is in the set *withholds* the gate's termination rather
+    /// than end a sibling forwarder's connections with it: the unbind is this
+    /// port's whole effect while the sibling stands, and the port's
+    /// connections end when the last forwarder to it is revoked — the first
+    /// moment they can be told apart at all.
+    ///
     /// # Errors
     ///
     /// The unexpose error, after the termination has run: the caller decides
     /// whether a failed unbind stops its path.
-    pub async fn revoke(&self, control: &ControlChannel) -> io::Result<()> {
+    pub async fn revoke(
+        &self,
+        control: &ControlChannel,
+        keep_admitted: &HashSet<u16>,
+    ) -> io::Result<()> {
         let (host, external_port) = self.host_port().unwrap_or(("", 0));
         if let Some(gate) = &self.gate {
-            let terminated = gate.revoke_port(self.internal_port());
-            tracing::info!(
-                host,
-                port = external_port,
-                internal_port = self.internal_port(),
-                terminated,
-                reason = "ingress revoked",
-                "unbinding ingress forwarder"
-            );
+            if keep_admitted.contains(&self.internal_port) {
+                // A live sibling forwarder still maps another external port
+                // to this internal port: terminating here would end its
+                // connections with this port's, and the gate cannot tell the
+                // two apart. Withheld, and said so — the log tail names each
+                // revocation with its port and its reason (NET-121).
+                tracing::info!(
+                    host,
+                    port = external_port,
+                    internal_port = self.internal_port(),
+                    reason = "internal port still served by another forwarder",
+                    "unbinding ingress forwarder"
+                );
+            } else {
+                let terminated = gate.revoke_port(self.internal_port());
+                tracing::info!(
+                    host,
+                    port = external_port,
+                    internal_port = self.internal_port(),
+                    terminated,
+                    reason = "ingress revoked",
+                    "unbinding ingress forwarder"
+                );
+            }
         }
         let req = UnexposeRequest {
             local: self.mapping.local.clone(),
@@ -228,6 +274,10 @@ impl PortForwarder {
                     reason = "ingress revoked",
                     "unbound ingress forwarder"
                 );
+                // Marked only now, when the switch has really dropped the
+                // forward: an unbind that failed leaves the forward standing,
+                // so a retry — and the teardown's unexpose — still have work.
+                self.revoked.store(true, Ordering::Release);
                 Ok(())
             }
             Err(e) => {
@@ -282,6 +332,7 @@ pub async fn apply_ingress(
                 },
                 internal_port: mapping.internal_port,
                 gate: gate.cloned(),
+                revoked: Arc::new(AtomicBool::new(false)),
             }),
             Err(e) => {
                 // The failed bind is the failure's own fact, said where it
@@ -310,9 +361,15 @@ pub async fn apply_ingress(
 /// rest still attempted, since teardown runs on the session-end path where there
 /// is no caller left to propagate to. A bound forward that comes down says one
 /// info line (NET-121), naming the port it unbound — the unbind half of the
-/// per-forwarder bind/unbind pair the daemon log carries.
+/// per-forwarder bind/unbind pair the daemon log carries. A forward a
+/// revocation already unbound is skipped: the switch holds no forward at its
+/// `local` any more, and asking again would read as a teardown failure that
+/// is none.
 pub async fn remove_ingress(control: &ControlChannel, bound: &[PortForwarder]) {
     for forwarder in bound {
+        if forwarder.is_revoked() {
+            continue;
+        }
         let (host, external_port) = forwarder.host_port().unwrap_or(("", 0));
         let req = UnexposeRequest {
             local: forwarder.mapping.local.clone(),

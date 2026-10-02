@@ -60,20 +60,26 @@ impl OwnIpGuard {
     /// Revokes one declared port's ingress (NET-121): unbinds the
     /// forwarder(s) bound for `external_port` — terminating the connections
     /// they hold through the box's gate, then unexposing — and leaves the
-    /// box's other declared ports alone. The entry point the policy layer
-    /// drives when a port's ingress is withdrawn while the box stays up.
+    /// box's other declared ports alone. That includes a sibling forwarder
+    /// that shares this port's *internal* port: the gate refuses by internal
+    /// port alone, so a shared port's gate termination is withheld while the
+    /// sibling stands (see [`PortForwarder::revoke`]) and its connections end
+    /// when the last forwarder to the port goes. The entry point the policy
+    /// layer drives when a port's ingress is withdrawn while the box stays
+    /// up.
     ///
     /// # Errors
     ///
-    /// `NotFound` when no forwarder was bound for `external_port` — the port
-    /// the call names was never declared, or its bind failed — naming the
-    /// port either way; the unexpose error when the forwarder's own unbind
-    /// failed.
+    /// `NotFound` when no live forwarder is bound for `external_port` — the
+    /// port the call names was never declared, its bind failed, or its
+    /// ingress was revoked already — naming the port either way; the unexpose
+    /// error when the forwarder's own unbind failed.
     #[allow(dead_code)] // No policy-update trigger drives this yet; the NET-121 proof does.
     pub(crate) async fn revoke_ingress(&self, external_port: u16) -> io::Result<()> {
         let matching: Vec<&PortForwarder> = self
             .exposed
             .iter()
+            .filter(|forwarder| !forwarder.is_revoked())
             .filter(|forwarder| {
                 forwarder
                     .host_port()
@@ -86,9 +92,29 @@ impl OwnIpGuard {
                 format!("no forwarder bound for external port {external_port}"),
             ));
         }
+        // The internal ports that must stay admitted: each one a live
+        // forwarder of a *different* external port still delivers to. A
+        // revocation withholds the gate's termination for these — the gate
+        // refuses a port by its internal number alone, so revoking here would
+        // end a sibling forwarder's connections with this port's — and lets
+        // the unbind be the revoked port's whole effect while the sibling
+        // stands. The matching forwarders cannot appear here: two live
+        // forwards cannot bind the same `host:port`, so no live forwarder of
+        // another external port shares one with them.
+        let keep_admitted: std::collections::HashSet<u16> = self
+            .exposed
+            .iter()
+            .filter(|forwarder| !forwarder.is_revoked())
+            .filter(|forwarder| {
+                forwarder
+                    .host_port()
+                    .is_none_or(|(_, port)| port != external_port)
+            })
+            .map(|forwarder| forwarder.internal_port())
+            .collect();
         let mut last_err = None;
         for forwarder in matching {
-            if let Err(e) = forwarder.revoke(&self.control).await {
+            if let Err(e) = forwarder.revoke(&self.control, &keep_admitted).await {
                 last_err = Some(e);
             }
         }
@@ -1968,6 +1994,383 @@ mod tests {
         fake.abort();
     }
 
+    /// NET-121's scoping, proved where the wire shows it: revoking one
+    /// external port ends *only* that port, never the connections of a
+    /// sibling forwarder publishing a different external port to the same
+    /// in-box port — `48080:80` beside `48081:80`, a declaration nothing
+    /// forbids. The gate refuses by *internal* port alone, because a box's
+    /// inbound frames carry no trace of which external forward they arrived
+    /// through, so the guard withholds the gate's termination while a live
+    /// sibling still serves the internal port and the unbind is the revoked
+    /// port's whole effect.
+    ///
+    /// What that means on the wire, and what this asserts: the revoked
+    /// port's listener drops at once (the next connect is refused) while
+    /// its own established connection is left standing — the one honest
+    /// residual of a shared internal port, since the gate cannot attribute
+    /// it to the revoked forwarder without ending the sibling's with it;
+    /// the sibling's connection is untouched, and a *new* connection
+    /// through the sibling still reaches the box, which is exactly what an
+    /// unscoped gate revocation would have made impossible; and revoking
+    /// the sibling in turn — the last forwarder to the internal port —
+    /// terminates every connection the port holds: the sibling's, the
+    /// later connection's, and the revoked forwarder's leftover alike.
+    #[tokio::test]
+    async fn revoke_terminates_only_the_named_external_ports_connections() {
+        const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
+        // The leg's address — the same the stand-in's `switch_side` speaks
+        // from, so the assertions below can name it. Legs are numbered from
+        // 40000 in accept order: the two handshakes take the first two, a
+        // later connection the third.
+        const LEG_SOURCE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 50);
+        const LEG_ISN: u32 = 1000;
+        // Host ports no other proof in this module claims: the proofs run
+        // as parallel processes on one host, and the stand-in binds these
+        // for real.
+        const REVOKED_PORT: u16 = 48180;
+        const SIBLING_PORT: u16 = 48181;
+        const INTERNAL_PORT: u16 = 80;
+        const RST: u8 = 0x04;
+        // The bound the last revocation owes every live connection its end
+        // within — long enough that only a hang, not a scheduling hiccup,
+        // overruns it.
+        const REVOCATION_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+        // The window a withheld termination stays quiet in: far longer than
+        // a reset the code did emit would take to reach the client.
+        const QUIET_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+        let capture = crate::test_harness::captured_log();
+        let dir = tempfile::TempDir::new().unwrap();
+        let control_path = dir.path().join("gvproxy.sock");
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (frames_tx, mut frames_rx) = mpsc::channel(64);
+        let fake = spawn_forwarder_gvproxy(control_path.clone(), events_tx, frames_tx);
+        let switch = vm_host_switch();
+        let registry = Arc::new(std::sync::RwLock::new(dns::HostnameRegistry::new(
+            "aaaa1", true,
+        )));
+        let reporter = crate::net::provider::OwnAddressReporter::new(
+            Arc::clone(&registry),
+            sessions::SessionId::nil(),
+        );
+        // Two declared ports, one in-box port: the shape that makes a
+        // revocation's scoping observable.
+        let policy = sessions::SessionPolicy {
+            ingress: Some(sessions::IngressPolicy {
+                port_mappings: vec![
+                    sessions::PortMapping {
+                        external_port: REVOKED_PORT,
+                        internal_port: INTERNAL_PORT,
+                        proto: sessions::IpProto::Tcp,
+                    },
+                    sessions::PortMapping {
+                        external_port: SIBLING_PORT,
+                        internal_port: INTERNAL_PORT,
+                        proto: sessions::IpProto::Tcp,
+                    },
+                ],
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+            egress: None,
+        };
+
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `socketpair` with a valid domain/type either returns -1
+        // (checked) or fills `fds` with two fresh descriptors.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair: {}", std::io::Error::last_os_error());
+        // SAFETY: each fd in `fds` is a fresh, valid, owned descriptor just
+        // returned by socketpair.
+        let tap_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: each fd in `fds` is a fresh, valid, owned descriptor just
+        // returned by socketpair.
+        let box_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+
+        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            tap_fd,
+            ControlChannel::Unix(control_path),
+            LEASE,
+            "web",
+            Some(&policy),
+            Some(&reporter),
+            false,
+        )
+        .await
+        .expect("the attach completes against the forwarding stand-in");
+        // The attach's own traffic first: the two binds and the registrations.
+        let _attach_events = collect_until(&mut events_rx, "/services/dns/add", 2).await;
+
+        // A client through each external port, both handshakes completed —
+        // two legs of one internal port, both tracked by the gate.
+        let mut first_client =
+            TcpStream::connect((IpAddr::from(Ipv4Addr::LOCALHOST), REVOKED_PORT))
+                .await
+                .expect("the first declared port admits a host-side client");
+        let mut sibling_client =
+            TcpStream::connect((IpAddr::from(Ipv4Addr::LOCALHOST), SIBLING_PORT))
+                .await
+                .expect("the sibling port admits a host-side client");
+        // The legs' handshakes interleave on the box end; both are completed
+        // before the revocation, so the gate holds a tail for each. The
+        // first leg to complete is the first port's — the connects were
+        // awaited in order — the second the sibling's.
+        let [(first_leg, first_isn), (sibling_leg, sibling_isn)] =
+            complete_leg_handshakes(&box_end, LEASE, LEG_SOURCE, INTERNAL_PORT, LEG_ISN, 2)
+                .await
+                .try_into()
+                .expect("two handshakes complete");
+        assert_ne!(first_leg, sibling_leg, "each connection is its own leg");
+
+        // The first revocation: the revoked port's forwarder unbinds, and
+        // the sibling's connection must not end with it.
+        guard
+            .revoke_ingress(REVOKED_PORT)
+            .await
+            .expect("the first declared port's forwarder unbinds");
+
+        // The revoked port's listener is gone: the next connect is refused,
+        // not accepted and dropped.
+        let refused = TcpStream::connect((IpAddr::from(Ipv4Addr::LOCALHOST), REVOKED_PORT)).await;
+        assert!(
+            matches!(&refused, Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused),
+            "the revoked port's listener is gone: {refused:?}"
+        );
+
+        // Neither established connection ends — the sibling's, and the
+        // revoked port's own leftover alike: no reset was emitted for
+        // either leg. (That the revoked port's connection survives is the
+        // honest residual of a shared internal port: ending it here would
+        // end the sibling's with it. It ends when the last forwarder to the
+        // port goes, which is the first moment the two can be told apart.)
+        for client in [&mut first_client, &mut sibling_client] {
+            let quiet = tokio::time::timeout(QUIET_WINDOW, client.read(&mut [0u8; 1])).await;
+            assert!(
+                quiet.is_err(),
+                "the first revocation terminates no connection it does not name: \
+                 a reset or an end arrived within the quiet window"
+            );
+        }
+
+        // A new connection through the *sibling* still reaches the box: the
+        // internal port stays admitted, so the sibling's forwards keep
+        // crossing the gate. An unscoped revocation would have refused this
+        // SYN at the gate — reset back at the leg, nothing to the box.
+        let mut later_client =
+            TcpStream::connect((IpAddr::from(Ipv4Addr::LOCALHOST), SIBLING_PORT))
+                .await
+                .expect("the sibling's listener still admits a host-side client");
+        let [(later_leg, later_isn)] =
+            complete_leg_handshakes(&box_end, LEASE, LEG_SOURCE, INTERNAL_PORT, LEG_ISN, 1)
+                .await
+                .try_into()
+                .expect("the later handshake completes");
+        assert!(
+            later_leg > sibling_leg,
+            "the later connection is its own leg, not a reused one"
+        );
+
+        // The first revocation's unbind is on the control channel, at the
+        // `local` the revoked forwarder bound — and it is the only one so
+        // far.
+        let events = collect_until(&mut events_rx, "/services/forwarder/unexpose", 1).await;
+        assert_eq!(
+            locals_of(&events, "/services/forwarder/unexpose"),
+            vec![format!("{}:{REVOKED_PORT}", Ipv4Addr::LOCALHOST)],
+            "the revoked port's forwarder is unbound: {events:?}"
+        );
+
+        // The log names the first revocation's reason: the port, and the
+        // sibling its termination was withheld for.
+        let log = capture.contents();
+        assert!(
+            log.contains("internal port still served by another forwarder")
+                && log.contains(&format!("port={REVOKED_PORT}")),
+            "the withheld revocation says why it terminated nothing: {log}"
+        );
+
+        // The second revocation: the last forwarder to the internal port.
+        // Now the gate's termination runs, and every connection the port
+        // holds ends — the sibling's, the later one's, and the revoked
+        // forwarder's leftover alike.
+        guard
+            .revoke_ingress(SIBLING_PORT)
+            .await
+            .expect("the sibling's forwarder unbinds");
+        for client in [&mut first_client, &mut sibling_client, &mut later_client] {
+            let ended = tokio::time::timeout(REVOCATION_BOUND, client.read(&mut [0u8; 1]))
+                .await
+                .expect("the last forwarder's revocation ends every connection the port holds");
+            match ended {
+                Ok(0) => {}
+                Ok(n) => panic!("the revoked connection delivered {n} bytes, not an end"),
+                Err(e) => assert!(
+                    matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ),
+                    "the revoked connection ended with an error that is not a reset: {e}"
+                ),
+            }
+        }
+
+        // The terminating resets ride the relay to each of the three legs —
+        // the gate held a tail for every one, and none is left unanswered.
+        // Each rides its own connection's numbers: the box's sequence beside
+        // the handshake that opened it, the leg's beside its own.
+        let legs = [
+            (first_leg, first_isn),
+            (sibling_leg, sibling_isn),
+            (later_leg, later_isn),
+        ];
+        let mut reset_legs: BTreeSet<u16> = BTreeSet::new();
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), frames_rx.recv())
+                .await
+                .expect("the gate's resets ride the relay")
+                .expect("the switch side keeps tapping the relay's frames");
+            if frame[47] & RST != 0 {
+                let leg_port = u16::from_be_bytes([frame[36], frame[37]]);
+                let &(_, box_isn) = legs
+                    .iter()
+                    .find(|(port, _)| *port == leg_port)
+                    .unwrap_or_else(|| {
+                        panic!("a reset for a leg that never connected: {leg_port}")
+                    });
+                assert_reset_terminated(
+                    &frame,
+                    (LEASE, INTERNAL_PORT),
+                    (LEG_SOURCE, leg_port),
+                    box_isn + 1,
+                    LEG_ISN + 1,
+                );
+                reset_legs.insert(leg_port);
+            }
+            if reset_legs.len() == legs.len() {
+                break;
+            }
+        }
+
+        // The second unbind is the sibling's, at its own `local`.
+        let events = collect_until(&mut events_rx, "/services/forwarder/unexpose", 1).await;
+        assert_eq!(
+            locals_of(&events, "/services/forwarder/unexpose"),
+            vec![format!("{}:{SIBLING_PORT}", Ipv4Addr::LOCALHOST)],
+            "the sibling's forwarder is unbound: {events:?}"
+        );
+
+        // The log names the second revocation's full effect: the port and
+        // every connection it ended.
+        let log = capture.contents();
+        assert!(
+            log.contains("terminated=3") && log.contains(&format!("port={SIBLING_PORT}")),
+            "the last revocation says what it ended: {log}"
+        );
+
+        // The revoked-already port has nothing left to revoke: the refusal
+        // names it.
+        let err = guard
+            .revoke_ingress(REVOKED_PORT)
+            .await
+            .expect_err("a revoked port has no live forwarder to revoke");
+        assert!(
+            err.to_string().contains("48180"),
+            "the refusal names the port it was asked for: {err}"
+        );
+
+        // Teardown asks the switch for nothing more: both forwards were
+        // unbound by their revocations, and a second unexpose would read as
+        // a teardown failure that is none.
+        Box::new(guard).teardown().await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            events_rx.try_recv().is_err(),
+            "teardown unexposes nothing a revocation already unbound"
+        );
+        fake.abort();
+    }
+
+    /// Plays the box's half of the forward legs' handshakes, one frame at a
+    /// time off the box end the stand-in's `switch_side` drives — the legs'
+    /// SYNs and completing ACKs interleave in whatever order the accepts
+    /// produced, so the handshake is dispatched rather than assumed: each
+    /// leg's bare SYN is answered with a SYN|ACK at the next of the box's
+    /// sequence numbers (its own per-connection space), and each completing
+    /// ACK closes its leg's handshake. Returns each completed leg's source
+    /// port beside the box sequence its handshake opened at, in completion
+    /// order — the leg port is what the gate keys its recorded flow by.
+    ///
+    /// `internal_port` is the port the forwards target, the port every SYN
+    /// is aimed at.
+    async fn complete_leg_handshakes(
+        box_end: &std::fs::File,
+        lease: Ipv4Addr,
+        leg_source: Ipv4Addr,
+        internal_port: u16,
+        leg_isn: u32,
+        want: usize,
+    ) -> Vec<(u16, u32)> {
+        const SYN: u8 = 0x02;
+        const ACK: u8 = 0x10;
+        let mut answered: Vec<(u16, u32)> = Vec::new();
+        let mut completed: Vec<(u16, u32)> = Vec::new();
+        while completed.len() < want {
+            let frame = read_box_end_frame(box_end)
+                .await
+                .expect("the legs' handshakes ride the relay");
+            let leg_port = u16::from_be_bytes([frame[34], frame[35]]);
+            let flags = frame[47];
+            if flags & SYN != 0 && flags & ACK == 0 {
+                assert_eq!(
+                    (
+                        Ipv4Addr::new(frame[26], frame[27], frame[28], frame[29]),
+                        Ipv4Addr::new(frame[30], frame[31], frame[32], frame[33]),
+                        u16::from_be_bytes([frame[36], frame[37]])
+                    ),
+                    (leg_source, lease, internal_port),
+                    "the leg's SYN comes from the leg and is aimed at the box's declared port"
+                );
+                let box_isn = 5000 + 1000 * u32::try_from(answered.len()).unwrap();
+                // `std::io::Write` is implemented for `&File` as well, so
+                // the box's half is writable through the shared borrow this
+                // helper takes.
+                (&*box_end)
+                    .write_all(&tcp_segment(
+                        (lease, internal_port),
+                        (leg_source, leg_port),
+                        box_isn,
+                        leg_isn + 1,
+                        SYN | ACK,
+                    ))
+                    .unwrap();
+                answered.push((leg_port, box_isn));
+            } else if flags & ACK != 0 {
+                let &(_, box_isn) = answered
+                    .iter()
+                    .find(|(port, _)| *port == leg_port)
+                    .unwrap_or_else(|| {
+                        panic!("a completing ACK for a leg the box never answered: {leg_port}")
+                    });
+                assert_eq!(
+                    frame,
+                    tcp_segment(
+                        (leg_source, leg_port),
+                        (lease, internal_port),
+                        leg_isn + 1,
+                        box_isn + 1,
+                        ACK
+                    ),
+                    "the handshake's last leg rides the relay"
+                );
+                completed.push((leg_port, box_isn));
+            } else {
+                panic!("an unexpected frame on the box end: {frame:02x?}");
+            }
+        }
+        completed
+    }
+
     /// NET-121's `local` is the box's handed host loopback address (T66):
     /// a box whose registration the VM host daemon completed hands its
     /// host loopback address in with the launch, and the attach's exposes
@@ -2081,5 +2484,11 @@ mod tests {
         assert_eq!(read_seq, seq, "the reset rides the flow's sequence pair");
         assert_eq!(read_ack, ack);
         assert_eq!(frame[47], 0x14, "RST|ACK: a termination, not an answer");
+        // The checksum, verified the way the leg's kernel verifies it: the
+        // wire's own fold over the RFC 793 pseudo-header and the segment —
+        // never the builder's arithmetic recomputed, which would inherit any
+        // byte-order mistake the builder made and turn this termination into
+        // a peer-side timeout the requirement exists to remove.
+        crate::net::switch::tests::assert_tcp_checksum_verifies_on_the_wire(frame);
     }
 }
