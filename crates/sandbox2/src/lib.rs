@@ -935,18 +935,26 @@ pub mod classifier {
     }
 
     /// The command a person runs on this host to give this daemon a
-    /// classifier tree: the installer takes the account the daemon runs as,
-    /// and the hint spells the whole command so the advisory that carries it
-    /// never has to name a placeholder for the one thing the daemon knows.
+    /// classifier tree: the installer takes the account the daemon runs as
+    /// and the two source identities the classification rests on (NET-078 —
+    /// what the boxes cohort leaves as, and what the rest of the slice
+    /// leaves as; the step refuses to render one without the other, so a
+    /// hint that named neither is a command the step itself refuses). The
+    /// hint spells the whole command, so the advisory that carries it never
+    /// has to name a placeholder for the one thing the daemon knows — only
+    /// for the two things this host does.
     #[cfg(target_os = "linux")]
     #[must_use]
     pub fn install_hint() -> String {
         match own_account() {
-            Some(account) => {
-                format!("sudo scripts/install-host-classifier.sh --user {account}")
-            }
+            Some(account) => format!(
+                "sudo scripts/install-host-classifier.sh --user {account} \
+                 --cohort-address <cohort address> --node-plane-address \
+                 <node-plane address>"
+            ),
             None => "sudo scripts/install-host-classifier.sh --user \
-                 <the account this daemon runs as>"
+                 <the account this daemon runs as> --cohort-address \
+                 <cohort address> --node-plane-address <node-plane address>"
                 .to_string(),
         }
     }
@@ -4137,6 +4145,28 @@ mod tests {
             !classifier::tree_is_real(tree, None, false),
             "a host whose mount table cannot be read has no tree to check"
         );
+    }
+
+    /// The install hint names every argument the installer requires of a
+    /// person (NET-078): the account the daemon runs as — the one thing the
+    /// daemon knows and would otherwise make the reader look up — and the
+    /// two source identities, which the step refuses to render one of
+    /// without the other, so a hint without them is a command the installer
+    /// itself refuses. Pinned as data: the daemon's start-up warn line, the
+    /// native unenforced notice and `Cause::StepNotInstalled`'s command all
+    /// carry this string, and the installer's own `--check` hint names the
+    /// same two flags, so the two spellings cannot drift apart unseen.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_hint_names_the_installers_required_identities() {
+        let hint = classifier::install_hint();
+        assert!(
+            hint.contains("install-host-classifier.sh"),
+            "the hint names the privileged step's install: {hint}"
+        );
+        for flag in ["--cohort-address", "--node-plane-address"] {
+            assert!(hint.contains(flag), "the hint names {flag}: {hint}");
+        }
     }
 
     /// The files the kernel makes when a cgroup is created, modelled over a
