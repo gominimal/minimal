@@ -1,9 +1,10 @@
 //! Daemon-facing RPC for the TUI: provider discovery, refresh, and the
 //! session actions, all over the [`minimal_client`] transport.
 //!
-//! A "provider" is a reachable daemon socket: the host `minimald` and the
-//! `minvmd` microVM backend serve independent sockets, and both can be up
-//! at once on Linux. On macOS only the VM path exists.
+//! A "provider" is a reachable daemon socket: the host `minimald`'s own, plus
+//! one per VM on the `minvmd` microVM backend — the default VM's and every
+//! named VM's, each under its own state dir. On Linux all of them can be up
+//! at once; on macOS only the VM side exists.
 
 use std::path::{Path, PathBuf};
 
@@ -28,14 +29,36 @@ const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// and the next rediscovery pass will try again.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
-/// The canonical providers in probe order: label plus whether to resolve
-/// the microVM backend's socket.
-const PROBES: &[(&str, bool)] = &[("host", false), ("vm", true)];
+/// The provider kinds in probe order: `false` resolves the host `minimald`'s
+/// own socket, `true` the microVM backend's — which is one socket *per VM*
+/// (see [`probe_candidates`]), not one.
+const PROBES: &[bool] = &[false, true];
+
+/// The sidebar group label the host `minimald`'s provider carries.
+const HOST_LABEL: &str = "host";
+
+/// The sidebar group label the default VM's provider carries. A named VM's
+/// group carries the VM's own name; the default VM keeps this one because
+/// it is the identity every saved dashboard state has ever recorded
+/// ([`state::DashState`]) and the one `provider_rank` orders first among VMs.
+const DEFAULT_VM_LABEL: &str = "vm";
+
+/// The sidebar label a VM's provider group carries: the VM's own name, so
+/// two VMs show as two groups an operator can tell apart. The default VM
+/// keeps its historic label (see [`DEFAULT_VM_LABEL`]).
+fn vm_label(vm: &str) -> String {
+    if vm == paths::DEFAULT_VM_NAME {
+        DEFAULT_VM_LABEL.to_string()
+    } else {
+        vm.to_string()
+    }
+}
 
 /// A reachable daemon the TUI lists sessions from.
 pub struct Provider {
-    /// Sidebar group label (`host` / `vm`).
-    pub label: &'static str,
+    /// Sidebar group label: `host` for the host daemon, `vm` for the default
+    /// VM, a named VM's own name for each of those.
+    pub label: String,
     /// The daemon's SSH socket, retained for attach and for background
     /// tasks that need their own connection.
     pub sock: std::path::PathBuf,
@@ -58,24 +81,43 @@ pub struct ProviderData {
     pub sessions: Vec<minimald_rpc::ListSessionsEntry>,
 }
 
-/// The probe list as `(label, socket)` candidates. Two probes can resolve
-/// to one socket — on macOS both provider kinds map to the minvmd state
-/// dir — so dedupe by path and keep the later (more specific) label;
-/// otherwise one daemon would be discovered twice and list every session
-/// twice.
-fn probe_candidates(minimal_dir: Option<&Path>) -> Vec<(&'static str, PathBuf)> {
-    let mut candidates: Vec<(&'static str, PathBuf)> = Vec::new();
-    for &(label, use_minvmd) in PROBES {
-        let Ok(sock) = minimal_client::resolve_socket_path(minimal_dir, use_minvmd) else {
-            continue;
-        };
-        if let Some(existing) = candidates.iter_mut().find(|(_, s)| *s == sock) {
-            existing.0 = label;
+/// The probe list as `(label, socket)` candidates, in probe order. The host
+/// `minimald`'s socket is one probe; the microVM backend's is one per VM —
+/// the default VM's plus every named VM's own directory (NET-052), so a
+/// dashboard on a two-VM host shows both VMs' boxes under their own groups.
+/// Two probes can resolve to one socket — on macOS the host kind maps to the
+/// minvmd state dir — so dedupe by path and keep the later (more specific)
+/// label; otherwise one daemon would be discovered twice and list every
+/// session twice.
+fn probe_candidates(minimal_dir: Option<&Path>) -> Vec<(String, PathBuf)> {
+    let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+    for &vm_side in PROBES {
+        if !vm_side {
+            let Ok(sock) = minimal_client::resolve_socket_path(minimal_dir, false) else {
+                continue;
+            };
+            push_candidate(&mut candidates, HOST_LABEL.to_string(), sock);
             continue;
         }
-        candidates.push((label, sock));
+        let Ok(vms) = minimal_client::enumerate_vm_sockets(minimal_dir, true) else {
+            continue;
+        };
+        for vm in vms {
+            push_candidate(&mut candidates, vm_label(&vm.vm), vm.sock);
+        }
     }
     candidates
+}
+
+/// One candidate, deduped by socket path: two probes can resolve to one
+/// socket — on macOS the host kind maps to the minvmd state dir — so keep the
+/// later (more specific) label and never list one daemon twice.
+fn push_candidate(candidates: &mut Vec<(String, PathBuf)>, label: String, sock: PathBuf) {
+    if let Some(existing) = candidates.iter_mut().find(|(_, s)| *s == sock) {
+        existing.0 = label;
+        return;
+    }
+    candidates.push((label, sock));
 }
 
 /// Probe both known socket paths and connect to each reachable daemon.
@@ -166,7 +208,7 @@ pub async fn refresh(provider: &mut Provider) -> Result<ProviderData, anyhow::Er
     // so fill each session's git context host-side before rendering.
     minimal_client::fill_git_info(&mut sessions).await;
     Ok(ProviderData {
-        label: provider.label.to_string(),
+        label: provider.label.clone(),
         version: version.version,
         sessions,
     })
@@ -485,6 +527,47 @@ mod tests {
         std::fs::write(dir.path().join(mfile::MFILE_NAME), "not valid toml = =").unwrap();
         let path = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
         assert!(resolve_upload_root(&path).is_err());
+    }
+
+    /// NET-057's TUI half: the probe list covers every VM — the default one
+    /// under its historic `vm` label, every named VM under its own name and
+    /// socket — beside the host daemon's probe. And no socket is ever probed
+    /// twice: on macOS the host kind resolves the minvmd state dir, where it
+    /// collapses into the default VM's entry and keeps the more specific
+    /// label, so a daemon would never list its sessions in two groups.
+    #[test]
+    fn probes_every_named_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = dir.path().join("providers/local-minvmd0");
+        for vm in ["alpha", "beta"] {
+            std::fs::create_dir_all(provider.join(vm)).unwrap();
+        }
+        let candidates = probe_candidates(Some(dir.path()));
+        let label_at = |sock: &std::path::Path| -> Option<String> {
+            candidates
+                .iter()
+                .find(|(_, s)| s == sock)
+                .map(|(label, _)| label.clone())
+        };
+        assert_eq!(
+            label_at(&provider.join("ssh.sock")).as_deref(),
+            Some("vm"),
+            "the default VM is probed under its historic label: {candidates:?}"
+        );
+        for vm in ["alpha", "beta"] {
+            assert_eq!(
+                label_at(&provider.join(vm).join("ssh.sock")).as_deref(),
+                Some(vm),
+                "{vm} has a state dir, so its socket is probed: {candidates:?}"
+            );
+        }
+        let unique: std::collections::HashSet<_> =
+            candidates.iter().map(|(_, s)| s.clone()).collect();
+        assert_eq!(
+            candidates.len(),
+            unique.len(),
+            "one socket must never be probed twice: {candidates:?}"
+        );
     }
 }
 
