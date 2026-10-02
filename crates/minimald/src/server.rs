@@ -2548,7 +2548,10 @@ mod tests {
         // changed is the answerer, not the daemon's whole proxy half.
         let mut proxy_bound = false;
         for _ in 0..200 {
-            if buf.contents().contains("egress proxy listen address is bindable") {
+            if buf
+                .contents()
+                .contains("egress proxy listen address is bindable")
+            {
                 proxy_bound = true;
                 break;
             }
