@@ -460,7 +460,7 @@ impl BoxRegistry {
             .egress
             .as_ref()
             .and_then(|policy| policy.allow_dns_hosts.as_ref())
-            .map(|hosts| hosts.clone())
+            .cloned()
             .unwrap_or_default();
         let resolves_names = !dns_hosts.is_empty();
         let record = Arc::new(BoxRecord {

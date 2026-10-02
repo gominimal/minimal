@@ -79,7 +79,7 @@ const DNS_PORT: u16 = 53;
 /// record that departure at the constant's use site; what the floor buys
 /// (covering the gap between resolution and use) is covered for
 /// established flows by [`DNS_FLOW_IDLE_CAP`] below.
-pub const DNS_ADMISSION_WINDOW: Duration = Duration::from_secs(5 * 60);
+pub const DNS_ADMISSION_WINDOW: Duration = Duration::from_mins(5);
 
 /// Design §5.3's cap on one name's admitted addresses, at most this many
 /// at once, fail closed: a reply whose A records run past the cap has its
@@ -99,7 +99,7 @@ pub const DNS_MAX_ADDRESSES_PER_NAME: usize = 32;
 /// window's edge. It is also the only release a UDP flow ever gets, UDP
 /// carrying no close signal to read. Both admission tables hold the same
 /// cap, reading it here.
-pub const DNS_FLOW_IDLE_CAP: Duration = Duration::from_secs(24 * 60 * 60);
+pub const DNS_FLOW_IDLE_CAP: Duration = Duration::from_hours(24);
 
 /// Which L2 family a frame belongs to — the first fact the verdict needs,
 /// because three of the four families are decided without any rules.

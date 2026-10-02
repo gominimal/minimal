@@ -765,7 +765,7 @@ impl EgressGate {
     /// # Errors
     ///
     /// Returns the I/O error if the gate socket cannot be bound.
-    pub fn spawn(
+    pub(crate) fn spawn(
         gate_sock: PathBuf,
         switch_sock: PathBuf,
         table: BoxTable,
@@ -2360,6 +2360,13 @@ async fn relay_guest_to_switch(
     clippy::indexing_slicing,
     reason = "every `frame[..n]` is bounded by the `n > frame.len()` rejection above"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the two socket halves, the table, the DNS admission table, the baseline, the \
+              limiter, the phase and the attribution are each a distinct input to every \
+              frame the loop decides; grouping them would name the bundle without naming \
+              the members"
+)]
 async fn relay_frames_to_switch(
     guest: &mut Prefixed<OwnedReadHalf>,
     switch: &mut OwnedWriteHalf,
@@ -2736,7 +2743,7 @@ fn gate_verdict(
             if matches!(reason, DropReason::UndeclaredSubnet { .. })
                 && record.resolves_names()
                 && pins.admits_frame(
-                    record,
+                    &record,
                     summary.destination().unwrap_or_default(),
                     l4,
                     Instant::now(),
@@ -5700,6 +5707,7 @@ mod tests {
             gate_end,
             switch_sock.clone(),
             table,
+            dns_pins::DnsPins::new(SUBNET),
             NodePlaneBaseline::built_in(SUBNET),
             Arc::new(DropLimiter::new()),
             Arc::new(PublishedForwards::new()),
@@ -5784,6 +5792,7 @@ mod tests {
             gate_end,
             switch_sock.clone(),
             table,
+            dns_pins::DnsPins::new(SUBNET),
             NodePlaneBaseline::built_in(SUBNET),
             Arc::new(DropLimiter::new()),
             Arc::new(PublishedForwards::new()),
@@ -5867,6 +5876,7 @@ mod tests {
                 gate_end,
                 switch_sock.clone(),
                 table.clone(),
+                dns_pins::DnsPins::new(SUBNET),
                 NodePlaneBaseline::built_in(SUBNET),
                 Arc::new(DropLimiter::new()),
                 Arc::new(PublishedForwards::new()),
@@ -5945,6 +5955,7 @@ mod tests {
             ScriptedGuests(script),
             switch_sock.to_path_buf(),
             table.clone(),
+            dns_pins::DnsPins::new(SUBNET),
             NodePlaneBaseline::built_in(SUBNET),
             Arc::new(DropLimiter::new()),
             Arc::new(PublishedForwards::new()),
@@ -6196,6 +6207,7 @@ mod tests {
                 ScriptedGuests(script),
                 switch_sock.clone(),
                 table,
+                dns_pins::DnsPins::new(SUBNET),
                 NodePlaneBaseline::built_in(SUBNET),
                 Arc::new(DropLimiter::new()),
                 Arc::new(PublishedForwards::new()),
@@ -6696,6 +6708,11 @@ mod tests {
         /// One spoofed attempt: summarizes the frame exactly as the gate's
         /// relay would hand it over, decides it with [`gate_verdict`], and
         /// records the verdict under the decision's own name.
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "the decision's own inputs, one per parameter, spelled out so the \
+                      attempts below read as the attempts they are"
+        )]
         fn decide(
             table: &BoxTable,
             baseline: &NodePlaneBaseline,

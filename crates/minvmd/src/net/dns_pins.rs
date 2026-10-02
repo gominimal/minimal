@@ -68,7 +68,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -282,14 +282,12 @@ struct BoxPins {
     names: HashSet<String>,
     /// The infrastructure deny set the intersection subtracts from every
     /// answer (design §5.3, NET-067), built from the row's own resolver and
-    /// the subnet's host alias the way the in-VM gate builds its own.
+    /// the subnet's host alias the way the in-VM gate builds its own. The
+    /// host alias the set carries is what a `host.min.internal` reply
+    /// resolves into: a row that declared the name is asking for its
+    /// grant, and the refusal its answer earns is this table's to say,
+    /// once, rate-limited (see the module doc).
     infrastructure: InfrastructureDenySet,
-    /// The subnet's host-alias address — the answer the zone's host row
-    /// (`host.min.internal`, NET-003) carries inside a box. The row's reply
-    /// is not skipped here (see the module doc): a row that declared the
-    /// name is asking for its grant, and the refusal its answer earns is
-    /// this table's to say, once, rate-limited.
-    host_alias: [u8; 4],
     /// The addresses admitted by resolution, each with the name that
     /// admitted it — the per-name cap counts by owner — and the instant its
     /// window ends.
@@ -300,8 +298,12 @@ struct BoxPins {
     flows: Mutex<HashMap<FlowKey, Instant>>,
     /// Whether the box's first-pin line has been written: the one `info`
     /// line per box the diagnostics read a DNS box's host-side decision by,
-    /// at the first answer that landed, never again.
-    logged_first_pin: bool,
+    /// at the first answer that landed, never again. An `AtomicBool` because
+    /// the entry it belongs to is shared behind an `Arc`: `admit` takes
+    /// `&self`, like every method on it, and the swap below is the write —
+    /// returning whether this admission was the first, so two replies
+    /// racing in the same window still write the line exactly once.
+    logged_first_pin: AtomicBool,
 }
 
 /// A DNS wire name in the form the row's declared names are matched in:
@@ -328,10 +330,9 @@ impl BoxPins {
                 record.egress().resolver(),
                 subnet.host_alias().octets(),
             ),
-            host_alias: subnet.host_alias().octets(),
             admitted: Mutex::new(HashMap::new()),
             flows: Mutex::new(HashMap::new()),
-            logged_first_pin: false,
+            logged_first_pin: AtomicBool::new(false),
         }
     }
 
@@ -505,7 +506,7 @@ impl BoxPins {
         if admitted_now.is_empty() {
             return;
         }
-        if !self.logged_first_pin {
+        if !self.logged_first_pin.swap(true, Ordering::Relaxed) {
             tracing::info!(
                 switch_addr = %self.record.switch_addr(),
                 namespace = %self.record.name(),
@@ -514,7 +515,6 @@ impl BoxPins {
                  destinations are decided on the host, against the answers its own \
                  lookups received"
             );
-            self.logged_first_pin = true;
         }
         let addresses: Vec<Ipv4Addr> = admitted_now.iter().copied().map(Ipv4Addr::from).collect();
         tracing::debug!(
@@ -763,12 +763,22 @@ impl DnsPins {
 
     /// How many frames the gate admitted because a live pin named the
     /// destination.
+    ///
+    /// Test-facing, like the in-VM gate's window-shrinkers: the counter is
+    /// the table's own state, maintained at the decision in every build,
+    /// and these two readers exist so a test can assert what the decision
+    /// counted — nothing in the daemon's log or control surface reads a
+    /// running total yet.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn admitted_by_pin(&self) -> u64 {
         self.inner.admitted_by_pin.load(Ordering::Relaxed)
     }
 
-    /// How many frames the gate refused for want of a pin.
+    /// How many frames the gate refused for want of a pin — the same
+    /// counter's other half: what the host-side decision dropped where the
+    /// deferral this table replaced would have passed the frame on.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn refused_for_want_of_pin(&self) -> u64 {
         self.inner.refused_for_want_of_pin.load(Ordering::Relaxed)
@@ -1203,10 +1213,14 @@ pub(crate) mod tests {
             );
         }
 
-        // Each refusal says so once, in the shared format: the name, the
-        // answer and the rule, rate-limited per box per name per rule — so
-        // the burst below, one reply repeated for the same name, adds no
-        // second line, while the second name's own refusal is heard.
+        // Each refusal says so in the shared format — the name, the answer
+        // and the rule — once per box per name per rule per interval, the
+        // in-VM gate's own bucket (the answer is the line's field, never
+        // part of its key, so a hostile resolver cannot spend the limit one
+        // address at a time): the loopback answer here shares the metadata
+        // answer's key and is silent, the burst below shares the denied
+        // range's and is silent under it, and the second name's own refusal
+        // is heard because its key is its own.
         let denied_again = Ipv4Addr::new(10, 9, 9, 8);
         for _ in 0..3 {
             observe(
@@ -1248,16 +1262,24 @@ pub(crate) mod tests {
             );
         }
         assert_eq!(
+            logged.matches("answer=127.0.0.1").count(),
+            0,
+            "the loopback refusal shares the metadata answer's key — one name, one rule, \
+             inside the interval — so it is silent, not a second line: {logged}"
+        );
+        assert_eq!(
             logged.matches("answer=10.9.9.8").count(),
-            1,
-            "the repeated burst is one rate-limited line, not one per answer: {logged}"
+            0,
+            "the repeated burst adds no line under the key the first refusal already \
+             spent: one rate-limited line per name per rule, not one per answer: {logged}"
         );
         assert_eq!(
             logged
                 .matches("an allowed name resolved into a refused range")
                 .count(),
-            5,
-            "one line per refused answer per name and rule, no more: {logged}"
+            3,
+            "one line per name and rule — the denied range, the infrastructure range, \
+             and the second name's own — and no more: {logged}"
         );
         assert!(
             logged.contains("answer=10.9.9.9"),
