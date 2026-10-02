@@ -2889,6 +2889,13 @@ fn write_hosts(rootfs: &Path, hosts: &[network::HostEntry]) -> Result<(), Error>
     if !body.is_empty() && !body.ends_with('\n') {
         body.push('\n');
     }
+    // On a VM host the guest kernel boots with ipv6.disable=1, but the base
+    // image's /etc/hosts still carries IPv6 entries.  Resolvers that hand out
+    // ::1 for localhost cause programs to fail with EAFNOSUPPORT.  Strip
+    // those entries when the kernel has no IPv6 stack.
+    if ipv6_disabled() {
+        body = strip_ipv6_hosts_entries(&body);
+    }
     for entry in hosts {
         if hosts_entry_present(&body, entry) {
             continue;
@@ -2901,6 +2908,57 @@ fn write_hosts(rootfs: &Path, hosts: &[network::HostEntry]) -> Result<(), Error>
         Err(e) => return Err(Error::IO("replacing /etc/hosts", etc_hosts.clone(), e)),
     }
     fs::write(&etc_hosts, body).map_err(|e| Error::IO("writing /etc/hosts", etc_hosts, e))
+}
+
+/// Whether the kernel has no IPv6 stack.  On Linux this is signalled by an
+/// absent or empty `/proc/net/if_inet6`; on other platforms IPv6 is always
+/// assumed available (the caller is Linux-only in practice).
+fn ipv6_disabled() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        match fs::read("/proc/net/if_inet6") {
+            Ok(data) => data.is_empty(),
+            Err(_) => true,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Strip lines from `body` that are IPv6 entries — `::1` localhost, the
+/// `ip6-*` aliases, and the `ff02::` multicast entries that a base image
+/// ships but a VM guest with `ipv6.disable=1` cannot use.
+fn strip_ipv6_hosts_entries(body: &str) -> String {
+    let kept: Vec<&str> = body
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                return true;
+            }
+            let lower = trimmed.to_lowercase();
+            let fields: Vec<&str> = lower.split_whitespace().collect();
+            if fields.is_empty() {
+                return true;
+            }
+            // IPv6 addresses start with a hex digit and contain ':'.
+            let is_v6_addr =
+                fields[0].starts_with(|c: char| c.is_ascii_hexdigit()) && fields[0].contains(':');
+            if is_v6_addr {
+                return false;
+            }
+            // Also catch lines where the address is IPv4 but the name is an
+            // ip6-* alias (some base images ship these).
+            !fields.iter().any(|f| f.starts_with("ip6-"))
+        })
+        .collect();
+    if kept.is_empty() {
+        String::new()
+    } else {
+        kept.join("\n") + "\n"
+    }
 }
 
 /// Whether `body` already answers `entry` — a line whose whitespace-separated
@@ -3231,6 +3289,27 @@ mod tests {
             fs::read_to_string(&cache).unwrap(),
             "127.0.0.1\tlocalhost\n",
             "the package cache file must be untouched"
+        );
+    }
+
+    /// A VM guest boots with `ipv6.disable=1`, but its base image's
+    /// `/etc/hosts` still ships IPv6 entries.  Stripping them keeps resolvers
+    /// from handing out `::1` for `localhost`, which makes programs fail with
+    /// `EAFNOSUPPORT`.  IPv4 entries, comments, and blank lines survive.
+    #[test]
+    fn strip_ipv6_hosts_entries_drops_only_ipv6() {
+        let shipped = "\
+127.0.0.1\tlocalhost
+::1\tlocalhost ip6-localhost ip6-loopback
+ff02::1\tip6-allnodes
+ff02::2\tip6-allrouters
+# a comment
+127.0.1.1\thostname
+";
+        let stripped = strip_ipv6_hosts_entries(shipped);
+        assert_eq!(
+            stripped, "127.0.0.1\tlocalhost\n# a comment\n127.0.1.1\thostname\n",
+            "IPv6 entries removed, IPv4 and comments kept"
         );
     }
 
