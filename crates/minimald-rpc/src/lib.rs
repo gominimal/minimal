@@ -18,7 +18,8 @@ pub mod taskenv;
 pub mod trace;
 
 pub use sessions::{
-    DynamicIngress, EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy,
+    BoxAddresses, DynamicIngress, EffectiveEgress, EffectiveSessionPolicy, EgressPolicy,
+    IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy,
 };
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
@@ -384,6 +385,15 @@ pub struct SessionConfig {
     /// Per-session networking policy (egress + ingress).
     #[serde(default)]
     pub policy: SessionPolicy,
+    /// The addresses the VM host daemon handed this box's registration
+    /// (T66), when the activating client registered one: its switch
+    /// address, which the in-VM daemon attaches with instead of drawing
+    /// its own, and its published loopback address. `None` for every other
+    /// activation — a host that is not minvmd-backed, a box that is not
+    /// own-address — and the daemon then attaches exactly as it always
+    /// has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_addresses: Option<BoxAddresses>,
     /// Whether the session runs the lifecycle hooks composed into it.
     /// Cleared by `min session activate --no-hooks`, and persisted onto
     /// the session record so the later attach/detach/destroy
@@ -402,6 +412,118 @@ pub struct SessionConfig {
 /// `#[serde(default)]`.
 fn default_hooks_enabled() -> bool {
     true
+}
+
+/// The wire types of the VM host daemon's box control socket (T66): the
+/// one door a client has to the host-side box table (NET-138).
+///
+/// On a minvmd-backed host, `min session activate` opens this socket — a
+/// UDS beside the daemon's ssh socket in the provider's state dir — writes
+/// one [`BoxControlRequest`] line of JSON — a registration when the box is
+/// created, a withdrawal when the session that registered it is destroyed
+/// or its activation fails — and reads one [`BoxControlReply`] line back.
+/// Nothing else crosses it: the session RPCs are the daemon crate's
+/// HTTP-shaped socket, and the box's switch and loopback addresses come
+/// from here so the daemon's create request can carry them (see
+/// [`SessionConfig`]).
+///
+/// These types live here rather than in `minvmd` because both ends depend
+/// on this crate — the activating client and the host daemon — and the
+/// protocol must not drift between them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisterBoxRequest {
+    /// The box's name — the session name the following create request
+    /// carries, so the host-side row and the session identify the same box.
+    /// A box's id on the host is its name.
+    pub name: String,
+    /// The external ports the box's ingress rules admit, as the client
+    /// expanded them. The host row holds the expanded ports rather than the
+    /// rules so the rule grammar stays the client's: the attaching side
+    /// reaches ports without re-parsing declarations.
+    #[serde(default)]
+    pub ingress_ports: Vec<u16>,
+    /// The box's egress policy, as the client expanded it. Absent means the
+    /// allow-all default — the same meaning the create request's policy
+    /// carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressPolicy>,
+}
+
+/// The withdrawal a destroyed session's client sends for the row its
+/// activation registered: the name the row went by and the pair the
+/// registration handed back. The pair is the proof that the withdrawer is
+/// the row's creator — a row is its registering side's to withdraw (NET-138),
+/// and no other client holds the pair, which no session record but the
+/// creator's carries.
+///
+/// Withdrawal answers [`BoxControlReply::Addresses`] echoing the pair back
+/// when the row is gone. The daemon answers a row already withdrawn — or a
+/// daemon restarted since the registration — the same way: no row at the
+/// named switch address is the goal state either way, so the withdrawal
+/// succeeds. A row that *is* published there under a different name or pair
+/// is refused with [`BoxControlReply::Error`]: the requesting client is not
+/// its creator, and no client may remove another box's row.
+///
+/// The addresses themselves are spent for good by design — the host's
+/// allocation cursors never regress — so a withdrawal ends a row's
+/// admissions without ever returning its addresses to the plan.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WithdrawBoxRequest {
+    /// The name the row to withdraw was registered under.
+    pub name: String,
+    /// The switch address the registration handed back, which keys the row
+    /// in the host table.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The loopback address the registration handed back, which the pair
+    /// proof checks against the row's own.
+    pub loopback_address: std::net::Ipv4Addr,
+}
+
+/// The one request line the control socket takes: which verb the client
+/// wants, `register` or `withdraw`, tagged in the line itself.
+///
+/// The tag is the version corner, and it leans the safe way. A daemon that
+/// predates a verb cannot parse the tagged line and refuses it — and an old
+/// CLI's registration, untagged, fails the new daemon's parse the same way,
+/// so the daemon is autospawned by the CLI from the same install and the
+/// mixed-version pair is the corner, not the rule. Without the tag, dispatch
+/// ordered register-then-withdraw would parse a withdraw line on a daemon
+/// that predates the verb as a *spurious registration* — the line's extra
+/// fields ignored, a row with no ports and an allow-all policy filling in,
+/// spending a finite hand-out address — which is worse than the refusal:
+/// the registering side's row stays published either way, but only the
+/// refusal leaves no new fact on the host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+pub enum BoxControlRequest {
+    /// Register the box's declaration: allocate the box's addresses on the
+    /// host and fill the row the egress gate decides by.
+    Register(RegisterBoxRequest),
+    /// Withdraw the row a registration filled: the destroyed or failed
+    /// session's creator presenting the pair the registration handed back.
+    Withdraw(WithdrawBoxRequest),
+}
+
+/// The addresses a successful registration hands back
+/// ([`sessions::BoxAddresses`]): the box's switch address and its published
+/// loopback address, both allocated on the host from the address plan the
+/// host switch serves — the same pair the create request carries so the
+/// in-VM daemon attaches with it.
+///
+/// The one reply line the control socket answers either verb with: the
+/// handed addresses, or the reason the verb did not happen. A registration
+/// hands the allocated pair back; a withdrawal echoes the pair it withdrew
+/// by, so the client can check the daemon meant the row it asked about.
+/// Untagged so the reply stays one flat JSON object either way.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum BoxControlReply {
+    /// The verb succeeded: a registration's allocated addresses, or a
+    /// withdrawal's echo of the pair the row went by.
+    Addresses(BoxAddresses),
+    /// The verb failed: `error` is a sentence naming why, for the client to
+    /// warn with.
+    Error { error: String },
 }
 
 /// The request for a [`CreateSession`] RPC.
@@ -470,6 +592,37 @@ pub struct CreateSessionResponse {
     /// daemon's ports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone_answerer_port: Option<u16>,
+    /// Whether the daemon's session-start bind probe found the reserved local
+    /// range absent — the interim verdict, true when this session is on the
+    /// shared `127.0.0.1` interim rather than the range (NET-123).
+    ///
+    /// A client that reads `true` surfaces the naming advisory again
+    /// (NET-122): a session on the interim is a fact nothing else shows.
+    /// The interim ends when the range is installed on the host — on macOS
+    /// the root-held boot step design §7.1 folds into the same advisory
+    /// command, not yet part of the command the client renders.
+    /// `false` from a daemon that predates
+    /// the field is the safe read — nothing downstream is gated on it; the
+    /// advisory a client prints from its own host-resolver detection is not,
+    /// and the [`Self::daemon_version`] gate already refuses a daemon that
+    /// old.
+    #[serde(default)]
+    pub interim_loopback: bool,
+    /// Whether the serving daemon opted out of the deny-all egress default
+    /// (NET-077). The rollout's one fact the client cannot know from its
+    /// own build: the phase is a build-time constant both sides share
+    /// ([`sessions::EGRESS_DEFAULT_PHASE`]), but the opt-out is set on the
+    /// daemon alone. Carried here — on the reply the activation path
+    /// already holds — so `min session activate` can keep its coming-change
+    /// notice (NET-076) off a deployment that has already chosen to keep
+    /// the shipped default: the notice's remedy names the very flag an
+    /// opted-out daemon runs, and would tell it to do what it has done.
+    ///
+    /// `None` from a daemon that predates the field — and a daemon that
+    /// predates it cannot have the opt-out flag either, so a client reading
+    /// `None` prints the notice exactly as this reply's older readers did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_all_opt_out: Option<bool>,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -774,10 +927,11 @@ impl OneshotSshRpc for AbortSession {
 // ---------------------------------------------------------------------------
 // Networking policy types (Unit 2: egress, ingress, dynamic port mapping).
 //
-// `PortMapping`, `EgressPolicy`, `IngressPolicy`, and `SessionPolicy` are
-// defined in `sessions` and re-exported above, so the only live per-session
-// store (`sessions::Record`) can carry the policy configured at launch without
-// a `sessions` → `minimald-rpc` dependency cycle. The RPC method types below
+// `PortMapping`, `EgressPolicy`, `IngressPolicy`, `SessionPolicy`, and the
+// effective halves (`EffectiveEgress`, `EffectiveSessionPolicy`) are defined
+// in `sessions` and re-exported above, so the only live per-session store
+// (`sessions::Record`) can carry the policy configured at launch without a
+// `sessions` → `minimald-rpc` dependency cycle. The RPC method types below
 // stay here, where the wire contract lives.
 // ---------------------------------------------------------------------------
 
@@ -796,6 +950,34 @@ impl OneshotSshRpc for GetSessionPolicy {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionPolicy");
     type Request<'a> = GetSessionPolicyRequest;
     type Response = Errorable<SessionPolicy>;
+}
+
+/// An RPC to read the *effective* networking policy for a session: the same
+/// record [`GetSessionPolicy`] serves, with its egress half resolved to what
+/// the gate enforces (NET-075) — the answer `min session policy` renders.
+///
+/// A separate response rather than a field on [`SessionPolicy`], so the
+/// strict declaration a client reads back stays exactly what the box was
+/// launched with: the deny-all default (NET-074) reaches the client as
+/// `deny_all` in this response without rewriting the record. The daemon
+/// answers it, not the client, because the inputs are the daemon's own
+/// facts — the rollout phase its build ships and its opt-out flag
+/// (NET-077) — which no client can know.
+pub struct GetEffectiveSessionPolicy;
+
+/// Request for the [`GetEffectiveSessionPolicy`] RPC: the same lookup as
+/// [`GetSessionPolicyRequest`], over the same record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GetEffectiveSessionPolicyRequest {
+    Name(String),
+    Id(SessionId),
+}
+
+impl OneshotSshRpc for GetEffectiveSessionPolicy {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetEffectiveSessionPolicy");
+    type Request<'a> = GetEffectiveSessionPolicyRequest;
+    type Response = Errorable<EffectiveSessionPolicy>;
 }
 
 /// An RPC to list the lifecycle hooks composed into a session, and where
@@ -1344,6 +1526,13 @@ mod tests {
                 project_path: paths::HostAbsPath::try_new("/home/u/proj").unwrap(),
                 network: NetworkMode::OwnIp,
                 policy: SessionPolicy::default(),
+                // The non-`None` shape of the handed addresses: a fixture
+                // leaving it `None` would round-trip green even if the
+                // field never reached the wire.
+                box_addresses: Some(BoxAddresses {
+                    switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+                    loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+                }),
                 // The non-default (`--no-hooks`): `true` is the serde
                 // default, so a fixture using it would round-trip green
                 // even if the field never reached the wire.
@@ -1430,14 +1619,56 @@ mod tests {
             hostname_routing_unavailable: None,
             hostname_proxy_port: None,
             zone_answerer_port: None,
+            // The interim flag survives the wire: the re-advise a client
+            // prints on it (NET-123) must not be able to silently drop off.
+            interim_loopback: true,
+            deny_all_opt_out: None,
         };
         assert_eq!(round_trip(&resp), resp);
+    }
+
+    /// The opt-out a daemon reports on its create reply (NET-077) survives
+    /// the wire both ways, and is *absent* — not `false` — when the daemon
+    /// has not set it, so a daemon that keeps the default and a daemon that
+    /// predates the field stay distinguishable to the client deciding
+    /// whether the coming change applies to it (NET-076's notice).
+    #[test]
+    fn create_session_response_carries_the_deny_all_opt_out() {
+        let opted_out = CreateSessionResponse {
+            deny_all_opt_out: Some(true),
+            id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            daemon_version: Some("0.6.0".into()),
+            hostname_routing_unavailable: None,
+            hostname_proxy_port: None,
+            zone_answerer_port: None,
+            interim_loopback: false,
+        };
+        let json = serde_json_lenient::to_string(&opted_out).expect("serializes");
+        assert!(
+            json.contains(r#""deny_all_opt_out":true"#),
+            "an opted-out daemon must say so on the wire, got: {json}",
+        );
+        assert_eq!(
+            serde_json_lenient::from_str::<CreateSessionResponse>(&json)
+                .expect("decodes back")
+                .deny_all_opt_out,
+            Some(true),
+        );
+
+        let opted_in = CreateSessionResponse {
+            deny_all_opt_out: Some(false),
+            ..opted_out
+        };
+        assert_eq!(round_trip(&opted_in), opted_in);
     }
 
     /// A daemon that predates `hostname_routing_unavailable` must still decode,
     /// with the field absent. Absent has to mean "said nothing", not "reported
     /// a fault": an older daemon is not evidence that routing is down, and a
     /// client that read it that way would warn on every session it lists.
+    /// `deny_all_opt_out` rides the same reply and reads the same way — absent
+    /// from a daemon that predates it, which is a daemon that cannot have
+    /// opted out (NET-077), so the client prints the notice it always did.
     #[test]
     fn responses_predating_hostname_routing_field_decode_as_absent() {
         let list: ListSessionsResponse =
@@ -1456,6 +1687,12 @@ mod tests {
                 assert!(c.hostname_routing_unavailable.is_none());
                 assert!(c.hostname_proxy_port.is_none());
                 assert!(c.zone_answerer_port.is_none());
+                // The interim flag's legacy default is `false`, the read that
+                // changes nothing: an older daemon's reply is not evidence the
+                // reserved range is absent, and nothing downstream is gated
+                // on the flag.
+                assert!(!c.interim_loopback);
+                assert!(c.deny_all_opt_out.is_none());
             }
             Errorable::Err { error } => panic!("expected Ok, got {error}"),
         }

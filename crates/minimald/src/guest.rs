@@ -25,6 +25,30 @@ use tokio_vsock::{VMADDR_CID_HOST, VsockAddr, VsockStream};
 /// booted. The host listens here for the one-shot `READY` marker.
 const BOOT_MARKER_PORT: u32 = 7350;
 
+/// Whether this daemon is the microVM's init: pid 1, run as `init` — the
+/// kernel runs the initramfs `/init` (this binary) as pid-1, and nothing else
+/// satisfies both halves.
+///
+/// The lib side of the check `main` keeps for its own gating
+/// (`is_minimal_microvm` there, for `reboot(2)`): `argv[0]` is
+/// caller-controlled, so it cannot be trusted alone, and pid-1 alone is also
+/// no proof — a native daemon running as a container's init satisfies it. The
+/// classifier asks it one question only a guest answers "yes" to (design
+/// §7.1): a box this daemon cannot place is a box it refuses.
+pub fn is_microvm_daemon() -> bool {
+    is_microvm_init(std::process::id(), std::env::args_os().next().as_deref())
+}
+
+/// Pure form of [`is_microvm_daemon`], so the spoofing cases stay testable —
+/// neither a process's pid nor its `argv[0]` can be set from within a test.
+#[must_use]
+pub fn is_microvm_init(pid: u32, argv0: Option<&std::ffi::OsStr>) -> bool {
+    pid == 1
+        && argv0
+            .map(|a0| std::path::Path::new(a0).file_name() == Some(std::ffi::OsStr::new("init")))
+            .unwrap_or(false)
+}
+
 /// Writes the two-line beacon payload (`READY\n<openssh-pubkey>\n`) to the
 /// given async writer.
 ///
@@ -214,6 +238,77 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&ptmx);
         if let Err(e) = std::os::unix::fs::symlink("pts/ptmx", &ptmx) {
             tracing::warn!(error = %e, "linking /dev/ptmx -> pts/ptmx; interactive PTY sessions may fail");
+        }
+    }
+
+    // NET-079: cgroup2, mounted with `nsdelegate` so the cgroup namespace a
+    // box unshares onto its own leaf is a delegation boundary — the property
+    // that keeps a box from writing its way out of the leaf its verdict is
+    // decided on. The daemon builds the tree itself once this mount is up (it
+    // enters its leaf at start, which creates it — pid 1 needs no privileged
+    // step); the same path is what the installer provisions natively.
+    //
+    // Strict, not best-effort: a guest that cannot build this tree is a
+    // broken image, not a deployment state — there is no privileged step a
+    // person could run inside the VM to fix it, and a host-address box that
+    // ran unenforced here would speak with the VM's address and no verdict at
+    // all (design §7.1). Boot still continues — the daemon keeps serving the
+    // modes that need no classification — but the failure is logged at error
+    // level with the consequence named, and `session_host` refuses a
+    // host-address session on it.
+    let cgroup2 = format!("{NEWROOT}/sys/fs/cgroup");
+    if let Err(e) = std::fs::create_dir_all(&cgroup2) {
+        tracing::error!(
+            error = %e,
+            "creating the cgroup2 mountpoint: a broken guest image; \
+             host-address boxes will be refused"
+        );
+    }
+    let cgroup2_target = CString::new(cgroup2.as_str()).expect("no NUL in the cgroup2 mountpoint");
+    // SAFETY: mount(2) with valid C strings; `data` carries the `nsdelegate`
+    // option and is read for the duration of the call.
+    let mounted = unsafe {
+        libc::mount(
+            c"cgroup2".as_ptr(),
+            cgroup2_target.as_ptr(),
+            c"cgroup2".as_ptr(),
+            0,
+            c"nsdelegate".as_ptr().cast(),
+        )
+    };
+    // `EBUSY` (already mounted) is success for an idempotent mount — same
+    // tolerance as `raw_mount`, which cannot carry the `data` option. But an
+    // existing mount only counts if it carries `nsdelegate`: the delegation
+    // boundary is a property of the superblock, fixed at the first mount, so
+    // what this boot inherited is what the boxes would get.
+    let failure = if mounted == 0 {
+        None
+    } else {
+        let e = std::io::Error::last_os_error();
+        (e.raw_os_error() != Some(libc::EBUSY)).then_some(e)
+    };
+    // The initramfs itself has no /proc at this point; the one just mounted
+    // under the new root shows this very mount namespace, which is the table
+    // the question is about.
+    let mountinfo =
+        std::fs::read_to_string(format!("{NEWROOT}/proc/self/mountinfo")).unwrap_or_default();
+    let delegated = sandbox2::classifier::host_cgroup2_mounts(&mountinfo)
+        .into_iter()
+        .any(|(mountpoint, nsdelegate)| nsdelegate && mountpoint.ends_with("sys/fs/cgroup"));
+    match (failure, delegated) {
+        (None, true) => tracing::info!(
+            mountpoint = %cgroup2,
+            "mounted cgroup2 with nsdelegate for the per-box classifier tree"
+        ),
+        (failure, _) => {
+            let error = failure
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "the existing cgroup2 mount carries no nsdelegate".to_string());
+            tracing::error!(
+                error = %error,
+                "mounting cgroup2 with nsdelegate: a broken guest image; \
+                 host-address boxes will be refused"
+            );
         }
     }
 
@@ -524,10 +619,11 @@ pub fn mount_state_volume(device: &str, mountpoint: &str) -> std::io::Result<()>
 
 /// Quiesce the state volume before VMM teardown (spec R2.1): `syncfs(2)` the
 /// mount to flush all pending writes and the ext4 journal to the block device,
-/// then best-effort lazy-detach the mount so a clean stop leaves the journal
-/// closed. A syncfs error propagates; an unmount failure is logged and
-/// swallowed — the data is already synced, so the worst case is a journal
-/// replay on the next boot.
+/// then best-effort trim the freed extents back to the host, then best-effort
+/// lazy-detach the mount so a clean stop leaves the journal closed. A syncfs
+/// error propagates; a trim or unmount failure is logged and swallowed — the
+/// data is already synced, so the worst case is a journal replay on the next
+/// boot.
 pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -538,6 +634,19 @@ pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     drop(dir);
+
+    // Best-effort trim before teardown: a clean stop is the one moment the
+    // guest can return every freed extent to the host, and unlike the
+    // maintenance sweep it must not be skipped when nothing else ran. The
+    // error is logged and swallowed — the data is already synced, so a failed
+    // trim only strands extents for the next boot's sweep to reclaim.
+    if let Err(error) = trim_state_volume(mountpoint) {
+        tracing::warn!(
+            mountpoint,
+            %error,
+            "trimming state volume before teardown (best-effort; already synced)"
+        );
+    }
 
     let c_mountpoint = CString::new(mountpoint)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in mountpoint"))?;
@@ -1043,13 +1152,16 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
     }
 
     // Relay the tap to the host gvproxy over the vsock shuttle (CID 2). The
-    // daemon relay carries no gate, so it emits no deprecation notice; the
+    // daemon relay carries no gate, so it emits no deprecation notice; its
+    // lease is the daemon's own address (NET-084: a frame out of this tap
+    // whose source is anything else is rejected at the relay), and the
     // subnet passed is the one the guest is configured on above.
     let relay = switch::attach_to_switch_vsock(
         tap_fd,
         VSOCK_HOST_CID,
         VSOCK_GVPROXY_SHUTTLE_PORT,
         None,
+        ip,
         DEFAULT_SUBNET,
     )
     .await?;
@@ -1287,6 +1399,41 @@ fn mount_if_absent(target: &str, source: &str, fstype: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the microVM's init is the microVM daemon: both halves of
+    /// [`is_microvm_daemon`] are needed, because either one alone is spoofable
+    /// or satisfiable by something else. The classifier's guest refusal — a
+    /// host-address box a guest cannot place is refused, not run unenforced —
+    /// must fire for the guest alone.
+    #[test]
+    fn only_the_microvms_init_is_the_guest_daemon() {
+        use std::ffi::OsStr;
+
+        for (pid, argv0) in [
+            (1_u32, Some(OsStr::new("/init"))),
+            (1, Some(OsStr::new("init"))),
+            (1, Some(OsStr::new("/sbin/init"))),
+        ] {
+            assert!(
+                is_microvm_init(pid, argv0),
+                "pid 1 whose argv[0] basename is init is the microVM's init"
+            );
+        }
+        for (pid, argv0, why) in [
+            (
+                1_u32,
+                Some(OsStr::new("/sbin/minimald")),
+                "pid 1 run as itself",
+            ),
+            (1, None, "no argv[0] at all"),
+            (2, Some(OsStr::new("/init")), "the first fork, not pid 1"),
+        ] {
+            assert!(
+                !is_microvm_init(pid, argv0),
+                "{why} is not the microVM's init"
+            );
+        }
+    }
 
     /// The derivation in [`FITRIM`] must land on the number the kernel
     /// actually decodes. `0xc018_5879` is the value every asm-generic Linux

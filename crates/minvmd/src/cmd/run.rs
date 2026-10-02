@@ -41,17 +41,41 @@ pub fn run(detach: bool, timeout_secs: Option<u64>) -> Result<()> {
     }
     let timeout_secs = timeout_secs.unwrap_or(DEFAULT_DETACH_TIMEOUT_SECS);
 
-    // One line per VM start, naming the VM and its state directory
-    // (NET-052). Only the process that will actually supervise the VM logs
-    // it: a `--detach` caller re-execs `minvmd run` (without `--detach`) for
-    // the real start, so the line is written once, by the process that owns
-    // the boot.
+    // One line per VM start, naming the VM, its state directory (NET-052), and
+    // the boot images + switch it resolved (NET-049/NET-051). Only the process
+    // that will actually supervise the VM logs it: a `--detach` caller re-execs
+    // `minvmd run` (without `--detach`) for the real start, so the line is
+    // written once, by the process that owns the boot.
+    //
+    // When resolution fails the supervisor below fails on the same missing
+    // images, so no VM boots — do not emit the resolved-images line with empty
+    // paths (it would name nothing while claiming a start). The start record
+    // still exists, at WARN, carrying the reason instead.
     if !detach {
-        tracing::info!(
-            vm = %crate::state::vm_name(),
-            state_dir = %crate::state::provider_dir().display(),
-            "starting VM"
-        );
+        let switch = crate::image::resolve_gvproxy_path();
+        let switch_str = if switch.exists() {
+            switch.display().to_string()
+        } else {
+            "not found".to_string()
+        };
+        match crate::image::resolve_boot_images() {
+            Ok((kernel, rootfs, initramfs)) => tracing::info!(
+                vm = %crate::state::vm_name(),
+                state_dir = %crate::state::provider_dir().display(),
+                kernel = %kernel.display(),
+                rootfs = %rootfs.display(),
+                initramfs = %initramfs.display(),
+                switch = %switch_str,
+                "starting VM"
+            ),
+            Err(e) => tracing::warn!(
+                vm = %crate::state::vm_name(),
+                state_dir = %crate::state::provider_dir().display(),
+                switch = %switch_str,
+                error = %e,
+                "starting VM with unresolved boot images"
+            ),
+        }
     }
 
     #[cfg(minvmd_libkrun)]
@@ -76,9 +100,12 @@ fn run_supervisor(detach: bool, timeout_secs: u64) -> Result<()> {
     // caller so the user sees the error directly, even under --detach.
     crate::cmd::ensure_hypervisor_accessible()?;
     // Likewise the sun_path limit: libkrun aborts on an over-long UDS path
-    // deep in the VMM child; catch it here with a clear error instead.
+    // deep in the VMM child; catch it here with a clear error instead. The
+    // egress gate's socket (NET-081) is bridged by the same mechanism the
+    // switch socket is, so it carries the same limit.
     crate::sock::check_uds_path_len(&crate::sock::resolve_uds_path()?)?;
     crate::sock::check_uds_path_len(&crate::net::resolve_switch_sock()?)?;
+    crate::sock::check_uds_path_len(&crate::net::resolve_gate_sock()?)?;
 
     if detach {
         return run_detach(timeout_secs);
@@ -98,31 +125,86 @@ enum DetachPoll {
     Keep,
     /// The supervisor child exited with no daemon up: a real startup failure.
     Failed(std::process::ExitStatus),
+    /// The supervisor child exited but a leaked `__krun-vmm` still holds the
+    /// alive lock. The pid is the orphaned VMM process.
+    LeakedVmm(u32),
 }
 
 /// Classify one readiness poll. `ready` is the readiness predicate (UDS
 /// connectable, alive lock held, lifecycle `Running`); `child_status` is the
 /// supervisor child's exit status once it has exited; `daemon_alive` is whether
-/// some minvmd holds the alive lock.
+/// some minvmd holds the alive lock; `vmm_pid` is the VMM pid the supervisor
+/// recorded in state before it exited (if any); `vmm_owned_by_live_supervisor`
+/// is whether that VMM's parent is still a live supervisor (i.e. the VMM
+/// belongs to a competing supervisor, not to the exited child).
 ///
 /// A child that exits while a daemon still holds the alive lock lost the
 /// autospawn race: `try_acquire_alive_lock` handed the lock to a peer that is
 /// still coming up and will reach `Running` shortly. That is success in the
 /// making, not a startup failure — keep waiting to the deadline. Only a child
 /// exit with no live daemon is a genuine failure.
+///
+/// When the child exited and the lock is still held, the holder could also be
+/// an orphaned `__krun-vmm` that inherited the lock from a dead supervisor. If
+/// the recorded VMM pid is still alive and is *not* owned by a live supervisor,
+/// the VMM is leaked — fail fast rather than waiting for the full spawn
+/// timeout. A live VMM owned by a live supervisor is a competing supervisor's
+/// VMM, not a leak.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn classify_detach_poll(
     ready: bool,
     child_status: Option<std::process::ExitStatus>,
     daemon_alive: bool,
+    vmm_pid: Option<u32>,
+    vmm_owned_by_live_supervisor: bool,
 ) -> DetachPoll {
     if ready {
         return DetachPoll::Ready;
     }
     match child_status {
         Some(status) if !daemon_alive => DetachPoll::Failed(status),
+        Some(_status) if daemon_alive => {
+            // The supervisor exited but the alive lock is still held. If the
+            // supervisor recorded a VMM pid and that pid is still running, the
+            // VMM is orphaned — fail fast instead of waiting for the timeout.
+            // A VMM whose parent is still a live supervisor belongs to a
+            // competing supervisor that won the autospawn race, so it is not
+            // a leak.
+            if let Some(pid) = vmm_pid {
+                // SAFETY: kill(pid, 0) probes for process existence without
+                // delivering a signal.
+                if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
+                    && !vmm_owned_by_live_supervisor
+                {
+                    return DetachPoll::LeakedVmm(pid);
+                }
+            }
+            DetachPoll::Keep
+        }
         _ => DetachPoll::Keep,
     }
+}
+
+/// Whether `pid`'s parent is a live process other than init (pid 1).
+///
+/// A `__krun-vmm` child is reparented to init the moment its supervisor dies,
+/// so a live parent other than init means the VMM is still owned by a live
+/// supervisor — a competing supervisor's VMM, not a leak.
+#[cfg(minvmd_libkrun)]
+fn vmm_owned_by_live_supervisor(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // `comm` is the parenthesised process name and can itself contain spaces
+    // and ')' — split on the last ')' so the fields after it are stable. The
+    // first field after comm is `state`; the second is `ppid`.
+    let after_comm = stat.rsplit_once(')').map(|(_, rest)| rest).unwrap_or("");
+    let mut fields = after_comm.split_whitespace();
+    let _state = fields.next();
+    let Some(ppid) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
+        return false;
+    };
+    ppid != 1 && unsafe { libc::kill(ppid as libc::pid_t, 0) } == 0
 }
 
 /// Spawn `minvmd run` as a detached background supervisor, then poll until
@@ -184,16 +266,21 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
     loop {
         let child_status = child.try_wait().context("polling supervisor child")?;
         let daemon_alive = state_dir.daemon_alive().context("probing alive lock")?;
+        let state = state_dir.read_state().context("reading state")?;
         let ready = daemon_alive
             && std::os::unix::net::UnixStream::connect(&uds_path).is_ok()
-            && state_dir.read_state().context("reading state")?.lifecycle
-                == crate::lifecycle::Lifecycle::Running;
-        match classify_detach_poll(ready, child_status, daemon_alive) {
+            && state.lifecycle == crate::lifecycle::Lifecycle::Running;
+        let vmm_owned = state.vmm_pid.is_some_and(vmm_owned_by_live_supervisor);
+        match classify_detach_poll(ready, child_status, daemon_alive, state.vmm_pid, vmm_owned) {
             DetachPoll::Ready => return Ok(()),
             DetachPoll::Failed(status) => bail!(
                 "the detached supervisor exited during startup ({status}); \
                  see {} for its error output",
                 log_path.display()
+            ),
+            DetachPoll::LeakedVmm(pid) => bail!(
+                "the supervisor exited but a leaked __krun-vmm (pid {pid}) still holds the \
+                 alive lock; run `just reap` to kill stranded processes, then retry"
             ),
             DetachPoll::Keep => {}
         }
@@ -219,7 +306,7 @@ fn run_foreground() -> Result<()> {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::cmd::MARKER_SOCK_ENV;
-    use crate::image::{resolve_kernel_path, resolve_rootfs_path};
+    use crate::image::resolve_boot_images;
     use crate::lifecycle::{Action, Lifecycle, next_state};
     use crate::state::{StartingGuard, State, StateDir};
 
@@ -232,8 +319,8 @@ fn run_foreground() -> Result<()> {
 
     // Fail-fast: resolve paths before touching lifecycle state.
     // (UDS path lengths were already checked in `run_supervisor`.)
-    let _kernel = resolve_kernel_path().context("resolving kernel path")?;
-    let _rootfs = resolve_rootfs_path().context("resolving rootfs path")?;
+    let (_kernel, _rootfs, _initramfs) =
+        resolve_boot_images().context("resolving boot image paths")?;
 
     let state_dir = StateDir::new(StateDir::default_path()).context("opening state dir")?;
 
@@ -325,12 +412,75 @@ fn run_foreground() -> Result<()> {
         .set_nonblocking(false)
         .context("setting listener to blocking")?;
 
+    // The host-side table of published namespaces (NET-138): the rows the
+    // egress gate (NET-081) decides every frame leaving the VM by, filled in
+    // this process on the host — never from anything the guest says. Held for
+    // the supervisor's lifetime as the registration surface (the client-driven
+    // path is a later task); published here with the one row the host itself
+    // can name: the guest node's own namespace, the daemon's root-netns tap,
+    // whose reach is the allow-all interim until the node-plane baseline set is
+    // enumerated (NET-130). Its address is this host's derivation from the
+    // registry's subnet, and the switch is configured with that same subnet
+    // below — one value handed to both, so the row's lease and the switch's
+    // address plan cannot drift apart. The daemon therefore keeps the egress
+    // it had before the gate existed, its own package fetches above all.
+    //
+    // An own-address box's lease is not a row this process can name: the guest
+    // daemon's own allocator mints it inside the VM, so no host-side process
+    // knows it — not this supervisor, and not the CLI that asked for the box.
+    // Until the creator-side registration (T66, #1711) supplies those rows,
+    // such a source is what the gate's announced interim is for: an address
+    // inside the plan's lease block but held by no row is admitted — with a
+    // warn naming T66 on every admit — so an own-address box keeps the egress
+    // it had before the gate existed, while everything outside the block, and
+    // every row that *is* published, stays exactly as decided.
+    //
+    // What that admits, said plainly: under the interim the host-side gate
+    // cannot attribute a frame to the box it came from unless a row holds the
+    // address, so a box with restrictive rules can be escaped by sourcing
+    // frames from any unregistered in-block address — NET-081's host-side
+    // guarantee is deferred to T66 until its rows land and its flip of
+    // `UNREGISTERED_SOURCE_PHASE` (egress_gate) puts the per-box default in
+    // force. Every admit under the interim is rate-limited-warned, so a
+    // diagnostic bundle's daemon log tail shows a host running it.
+    // `UNREGISTERED_SOURCE_PHASE` (egress_gate) is the constant T66 flips.
+    let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+    boxes.register_node_namespace();
+
+    // The host-side door to the box table (T66): the control socket the
+    // activating client registers an own-address box on and reads its
+    // allocated switch and loopback addresses from — the addresses the
+    // create request then carries, so the in-VM daemon attaches with the
+    // handed one. Bound before the guest boots, so a session activated
+    // against this VM can only ever be handed an address this table holds.
+    // Best-effort at startup, like the switch above: a bind failure is
+    // warned and the VM still boots — a registration then degrades to the
+    // gate's announced interim, exactly as against a supervisor predating
+    // the socket — rather than failing a boot the client could still
+    // activate against.
+    let _control = crate::control::resolve_control_sock()
+        .and_then(|sock_path| crate::control::spawn(sock_path, boxes.clone()))
+        .inspect_err(|error| {
+            tracing::warn!(
+                %error,
+                "failed to bind the box-registration control socket; own-address \
+                 activations will not be handed addresses (the egress gate's \
+                 announced interim applies)"
+            );
+        })
+        .ok();
+
     // Spawn + supervise the host gvproxy switch before the VMM child boots, so
-    // its `-listen` switch socket exists when libkrun dials it for the guest
-    // shuttle. The guest's root netns (the daemon) attaches a primary tap for
-    // egress, and own-IP PTasks attach further taps; both
-    // are L2 clients on this one switch. The handle lives for the VM's lifetime
-    // and stops gvproxy on drop (after the VMM child exits below).
+    // its `-listen` switch socket exists when the gate relays into it for the
+    // guest shuttle. The switch runtime starts the gate on the socket beside
+    // the switch socket — the one libkrun bridges the shuttle's vsock port to
+    // — before reporting ready, so the guest that boots next can only reach
+    // the switch through it, decided per source address against `boxes`.
+    // The guest's root netns (the daemon) attaches a primary tap for egress,
+    // and own-IP PTasks attach further taps; both are L2 clients on this one
+    // switch, both through the gate. The handle lives for the VM's lifetime
+    // and stops gvproxy on drop (after the VMM child exits below), taking the
+    // gate with it.
     //
     // Best-effort: when the gvproxy binary is absent (e.g. the boot/session e2e
     // lanes that exercise only the vsock bridge) we warn and boot without
@@ -343,10 +493,18 @@ fn run_foreground() -> Result<()> {
             crate::sock::prepare_socket_dir(&switch_sock).context("preparing switch socket dir")?;
             crate::sock::remove_stale_socket(&switch_sock)
                 .context("removing stale switch socket")?;
+            // The gate binds the socket beside the switch socket, so a stale
+            // file from a prior run must go or the bind fails EEXIST — the
+            // same discipline the switch socket gets.
+            let gate_sock =
+                crate::net::resolve_gate_sock().context("resolving egress gate socket")?;
+            crate::sock::remove_stale_socket(&gate_sock)
+                .context("removing stale egress gate socket")?;
             match crate::net::HostGvproxy::spawn(
                 binary,
                 switch_sock,
                 crate::net::DEFAULT_DATAPATH_CHECK_INTERVAL,
+                &boxes,
             ) {
                 Ok(gvproxy) => {
                     tracing::info!(pid = gvproxy.pid(), "host gvproxy switch up");
@@ -605,7 +763,7 @@ mod tests {
         // The child exited, but the readiness predicate already holds: the VM
         // is serving, so this is success regardless of the exit.
         assert!(matches!(
-            super::classify_detach_poll(true, Some(exited(1)), true),
+            super::classify_detach_poll(true, Some(exited(1)), true, None, false),
             super::DetachPoll::Ready
         ));
     }
@@ -614,9 +772,11 @@ mod tests {
     fn detach_poll_lost_race_keeps_waiting() {
         // The supervisor exited because a peer already holds the alive lock —
         // the winner is still coming up. Keep waiting rather than reporting a
-        // startup failure that isn't one.
+        // startup failure that isn't one. The recorded VMM pid is not alive
+        // (None, or a pid that doesn't exist), so this is a genuine race, not
+        // a leak.
         assert!(matches!(
-            super::classify_detach_poll(false, Some(exited(1)), true),
+            super::classify_detach_poll(false, Some(exited(1)), true, None, false),
             super::DetachPoll::Keep
         ));
     }
@@ -626,8 +786,48 @@ mod tests {
         // Child exited and nothing holds the alive lock: a genuine startup
         // failure, still surfaced as an error.
         assert!(matches!(
-            super::classify_detach_poll(false, Some(exited(1)), false),
+            super::classify_detach_poll(false, Some(exited(1)), false, None, false),
             super::DetachPoll::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn detach_poll_leaked_vmm_detected() {
+        // The supervisor exited but the alive lock is still held AND the
+        // recorded VMM pid is still alive: the VMM is orphaned. Fail fast
+        // with the leaked pid.
+        let my_pid = std::process::id();
+        assert!(matches!(
+            super::classify_detach_poll(false, Some(exited(1)), true, Some(my_pid), false),
+            super::DetachPoll::LeakedVmm(pid) if pid == my_pid
+        ));
+    }
+
+    #[test]
+    fn detach_poll_competing_supervisor_vmm_is_not_a_leak() {
+        // The supervisor exited but the alive lock is still held AND the
+        // recorded VMM pid is still alive. However, that VMM's parent is a
+        // live supervisor (a competing supervisor that won the autospawn
+        // race), so this is not a leak — keep waiting for the winner to serve.
+        let my_pid = std::process::id();
+        assert!(matches!(
+            super::classify_detach_poll(false, Some(exited(1)), true, Some(my_pid), true),
+            super::DetachPoll::Keep
+        ));
+    }
+
+    #[test]
+    fn detach_poll_dead_vmm_pid_is_not_a_leak() {
+        // The supervisor exited, daemon is alive, but the recorded VMM pid
+        // is no longer running (e.g. a stale state file). This is not a
+        // leaked VMM — keep waiting (autospawn race).
+        // Use a pid that almost certainly doesn't exist. `u32::MAX` would
+        // wrap to -1 as `pid_t`, which `kill(-1, 0)` treats as "all
+        // processes" and would wrongly report alive; `i32::MAX` stays
+        // positive and is above any real `pid_max`.
+        assert!(matches!(
+            super::classify_detach_poll(false, Some(exited(1)), true, Some(i32::MAX as u32), false),
+            super::DetachPoll::Keep
         ));
     }
 }

@@ -274,6 +274,7 @@ pub async fn activate(
                 project_path: project_path.clone(),
                 network,
                 policy: SessionPolicy::default(),
+                box_addresses: None,
                 // Same default as an activate with no flags: the dashboard
                 // has no `--no-hooks` of its own, and a session created here
                 // is attachable later like any other.

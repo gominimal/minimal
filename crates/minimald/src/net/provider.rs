@@ -57,6 +57,19 @@ impl OwnAddressReporter {
             .expect("hostname registry lock poisoned");
         registry.report_own_address(self.session_id, session_name, lease, ports);
     }
+
+    /// The host loopback address this box's declaration publishes on (NET-010):
+    /// the address finalize leased for it out of the daemon's slice of the
+    /// reserved local range, or the node's shared address until one is leased.
+    /// The attach path reads it here — rather than re-deriving one — so the
+    /// forwards it binds and the name the registry answers stay at the one
+    /// address the box owns.
+    pub(crate) fn published_address(&self) -> Ipv4Addr {
+        self.registry
+            .read()
+            .expect("hostname registry lock poisoned")
+            .published_or_node(self.session_id)
+    }
 }
 
 /// The network provider for `mode`. `NoNet` is the sandbox layer's own; `HostNet`
@@ -65,14 +78,31 @@ impl OwnAddressReporter {
 /// lease, a tap and a switch attach. An unrecognised mode (`NetworkMode` is
 /// `#[non_exhaustive]`) gets the empty namespace, the safe direction.
 ///
+/// `policy` is the launch's whole session policy — the own-IP relay gate carries
+/// it in both directions (egress verdict per NET-062/063/064, inbound
+/// default-block per finding #2), while other modes have no relay to gate;
+/// `None` attaches ungated. The session launcher passes the box's *effective*
+/// policy (NET-074), and a task launch passes its session's effective egress
+/// alone when the rollout leaves one in force, `None` while the default is
+/// only announced or the daemon opted out — an ungated task keeps the open
+/// inbound it always had — because a task carries none of its session's
+/// ingress, the session's own PTask being attached at the same time.
 /// `own_address` carries the registry handle an own-address launch reports its
-/// lease through once the box attaches (NET-001); a task launch passes `None`.
+/// lease through once the box attaches (NET-001); a task launch passes `None`
+/// for that too. `box_addresses` carries the switch and loopback addresses
+/// the VM host daemon handed the box's registration (T66): its switch
+/// address is what this `OwnIp` PTask attaches with instead of drawing one,
+/// because the host-side table's row is keyed by it. A task launch passes
+/// `None` deliberately — the task's sandbox is not the box the registration
+/// named, and attaching it at the box's address would key its frames to the
+/// session's row.
 pub(crate) fn network_for(
     mode: NetworkMode,
     switch: &Arc<Mutex<SwitchClient>>,
     identity: &str,
-    ingress: Option<sessions::IngressPolicy>,
+    policy: Option<sessions::SessionPolicy>,
     own_address: Option<OwnAddressReporter>,
+    box_addresses: Option<sessions::BoxAddresses>,
 ) -> Arc<dyn Network> {
     match mode {
         NetworkMode::HostNet => Arc::new(HostIpAddressNetwork {
@@ -81,8 +111,9 @@ pub(crate) fn network_for(
         NetworkMode::OwnIp => Arc::new(OwnIpNetwork {
             switch: Arc::clone(switch),
             identity: identity.to_string(),
-            ingress,
+            policy,
             own_address,
+            box_addresses,
             reserved: std::sync::Mutex::new(None),
         }),
         _ => Arc::new(sandbox2::NoNet),
@@ -229,18 +260,28 @@ struct Reserved {
 }
 
 /// An own-IP network: leases an address from the per-host gvproxy switch before
-/// the sandbox starts, then relays the sandbox's own tap onto that switch and
-/// applies its static ingress forwards (R1.5/R2.3).
+/// the sandbox starts, then relays the sandbox's own tap onto that switch,
+/// gated by the session's policy — its declared egress enforced on the
+/// relay's outbound leg, its static ingress forwards applied and inbound
+/// ports gated on the other (R1.5/R2.3, NET-062).
 struct OwnIpNetwork {
     switch: Arc<Mutex<SwitchClient>>,
     /// Registered as the PTask's `*.min.internal` hostname on attach (R3.1).
     identity: String,
-    /// Static ingress port mappings to apply once attached.
-    ingress: Option<sessions::IngressPolicy>,
+    /// The launch's whole session policy, carried into the relay gate.
+    policy: Option<sessions::SessionPolicy>,
     /// The registry handle the lease is reported through on attach, so the
     /// box's proxy route exists exactly while the lease does (NET-001). `None`
     /// for a task launch, which owns no proxy route.
     own_address: Option<OwnAddressReporter>,
+    /// The addresses the VM host daemon handed this box's registration
+    /// (T66), when it was registered: the switch address this PTask attaches
+    /// with instead of drawing one — the host-side table's row is keyed by
+    /// it, so a self-allocated lease would never match — and the published
+    /// loopback address the host side names the box by. `None` for a launch
+    /// the activating client did not register, which draws as it always
+    /// has.
+    box_addresses: Option<sessions::BoxAddresses>,
     /// Taken by `plan`, taken back out by `attach` or `abandon`. A `std` mutex,
     /// never held across an await, so a cancelled launch cannot leak it.
     reserved: std::sync::Mutex<Option<Reserved>>,
@@ -250,7 +291,8 @@ impl std::fmt::Debug for OwnIpNetwork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OwnIpNetwork")
             .field("identity", &self.identity)
-            .field("has_ingress", &self.ingress.is_some())
+            .field("has_policy", &self.policy.is_some())
+            .field("handed_addresses", &self.box_addresses.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -259,12 +301,22 @@ impl Network for OwnIpNetwork {
     /// Lease an address and make sure the switch is up, then describe the tap
     /// the sandbox layer should build. Before the process starts, because the
     /// sandbox layer assigns the address as it creates the tap.
+    ///
+    /// The lease is the host's handed address when the box was registered
+    /// (T66) — the address the host-side table's row is keyed by — and a
+    /// self-allocated one otherwise, exactly as before this existed.
     fn plan(&self) -> PlanFuture<'_> {
         Box::pin(async move {
             let (lease, control, subnet) = {
                 let mut s = self.switch.lock().await;
                 let subnet = s.subnet();
-                let attach = s.attach().await.map_err(NetworkError::new)?;
+                let attach = match self.box_addresses.as_ref() {
+                    Some(handed) => s
+                        .attach_handed(handed.switch_address)
+                        .await
+                        .map_err(NetworkError::new)?,
+                    None => s.attach().await.map_err(NetworkError::new)?,
+                };
                 let control = match s.transport() {
                     crate::net::SwitchTransport::LocalSpawn => {
                         ControlChannel::Unix(s.control_socket())
@@ -328,8 +380,9 @@ impl Network for OwnIpNetwork {
                 reserved.control,
                 reserved.lease.ip,
                 &self.identity,
-                self.ingress.as_ref(),
+                self.policy.as_ref(),
                 self.own_address.as_ref(),
+                self.box_addresses.is_some(),
             )
             .await
             .map_err(NetworkError::new)?;
@@ -340,16 +393,23 @@ impl Network for OwnIpNetwork {
     }
 
     /// Give the lease back; the sandbox layer runs this on every path out of a
-    /// launch that does not reach `attach`.
+    /// launch that does not reach `attach`. The detach releases the lease
+    /// with the count (T66), so an abandoned launch leaves no lease in the
+    /// static-lease table for a tap nothing holds — the handed one included,
+    /// which is what lets the same box's re-attach re-hand its address.
     fn abandon(&self) -> AbandonFuture<'_> {
         Box::pin(async move {
-            let reserved = self.reserved.lock().unwrap().take();
-            if reserved.is_none() {
+            let Some(reserved) = self
+                .reserved
+                .lock()
+                .expect("reserved mutex poisoned")
+                .take()
+            else {
                 // The plan failed or an attach took it; detaching anyway would
                 // decrement the switch's count below the truth.
                 return;
-            }
-            if let Err(e) = self.switch.lock().await.detach().await {
+            };
+            if let Err(e) = self.switch.lock().await.detach(reserved.lease.ip).await {
                 tracing::warn!(error = %e, "detaching OwnIp PTask after an abandoned launch");
             }
         })
@@ -379,7 +439,7 @@ mod tests {
     async fn every_mode_gets_its_provider() {
         let switch = counting_switch();
 
-        let host = network_for(NetworkMode::HostNet, &switch, "s", None, None)
+        let host = network_for(NetworkMode::HostNet, &switch, "s", None, None, None)
             .plan()
             .await
             .unwrap();
@@ -393,14 +453,14 @@ mod tests {
             &Resolver::Nameservers(vec![crate::net::SwitchSubnet::default().dns_server()])
         );
 
-        let no_net = network_for(NetworkMode::NoNet, &switch, "s", None, None)
+        let no_net = network_for(NetworkMode::NoNet, &switch, "s", None, None, None)
             .plan()
             .await
             .unwrap();
         assert!(no_net.isolates_netns() && no_net.tap().is_none());
         assert_eq!(no_net.resolver(), &Resolver::None);
 
-        let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", None, None);
+        let own_ip = network_for(NetworkMode::OwnIp, &switch, "s", None, None, None);
         assert!(own_ip.plan().await.unwrap().isolates_netns());
         assert_eq!(switch.lock().await.attached(), 1, "own-IP takes a lease");
         own_ip.abandon().await;
@@ -471,7 +531,7 @@ mod tests {
         let switch = counting_switch();
         let before = switch.lock().await.attached();
 
-        let net = network_for(NetworkMode::OwnIp, &switch, "s", None, None);
+        let net = network_for(NetworkMode::OwnIp, &switch, "s", None, None, None);
         net.plan().await.expect("planning leases an address");
         assert_eq!(switch.lock().await.attached(), before + 1);
 
@@ -502,7 +562,16 @@ mod tests {
     async fn concurrent_own_ip_launches_do_not_serialize() {
         let switch = counting_switch();
         let launches: Vec<_> = (0..4)
-            .map(|i| network_for(NetworkMode::OwnIp, &switch, &format!("p{i}"), None, None))
+            .map(|i| {
+                network_for(
+                    NetworkMode::OwnIp,
+                    &switch,
+                    &format!("p{i}"),
+                    None,
+                    None,
+                    None,
+                )
+            })
             .collect();
         for net in &launches {
             net.plan().await.expect("planning leases an address");
@@ -526,7 +595,7 @@ mod tests {
     async fn host_ip_box_resolves_through_node_dns_layer() {
         let subnet = crate::net::SwitchSubnet::default();
         let switch = counting_switch();
-        let plan = network_for(NetworkMode::HostNet, &switch, "s", None, None)
+        let plan = network_for(NetworkMode::HostNet, &switch, "s", None, None, None)
             .plan()
             .await
             .expect("host-address plans do not fail");
@@ -565,7 +634,7 @@ mod tests {
             "/usr/bin/gvproxy",
             "/run/minimal/gvproxy",
         )));
-        let plan = network_for(NetworkMode::HostNet, &native, "s", None, None)
+        let plan = network_for(NetworkMode::HostNet, &native, "s", None, None, None)
             .plan()
             .await
             .unwrap();
@@ -581,7 +650,7 @@ mod tests {
 
         // VM-host host-address: the node's DNS layer answers the same name.
         let vm = counting_switch();
-        let plan = network_for(NetworkMode::HostNet, &vm, "s", None, None)
+        let plan = network_for(NetworkMode::HostNet, &vm, "s", None, None, None)
             .plan()
             .await
             .unwrap();

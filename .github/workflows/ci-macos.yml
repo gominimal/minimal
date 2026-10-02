@@ -10,9 +10,11 @@ name: CI (macOS)
 # "Expected" forever and wedges the PR; do NOT add trigger-level `paths:`.
 on:
     push:
-        branches: ["main"]
+        branches: ["main", "release/**"]
     pull_request:
-        branches: ["main"]
+        branches: ["main", "release/**"]
+    merge_group:
+        branches: ["main", "release/**"]
     workflow_dispatch:
     # Reusable so the nightly test tier can run the macOS/HVF e2e on a schedule
     # (nightly-tests.yml `macos-e2e`). On a scheduled call `github.event_name`
@@ -33,7 +35,7 @@ env:
 # Cancel a superseded run so the single runner isn't backed up by stale commits.
 concurrency:
     group: ci-macos-${{ github.ref }}
-    cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/heads/release/') }}
 
 # Least privilege: this workflow only checks out and builds.
 permissions:
@@ -150,7 +152,7 @@ jobs:
                   arch: aarch64
                   channel: unstable
             - name: Install cross
-              uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2
+              uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
               with:
                   tool: cross
             - name: Build guest initramfs (minimald as /init)
@@ -268,7 +270,7 @@ jobs:
                   name: mac-testbed
                   path: ${{ runner.temp }}/testbed
             - name: Install nextest
-              uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2
+              uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
               with:
                   tool: nextest
             - name: Unpack testbed + resolve paths
@@ -459,7 +461,7 @@ jobs:
                   toolchain: stable
                   components: clippy
             - name: Cache cargo registry and build artifacts
-              uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+              uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 # zizmor: ignore[cache-poisoning] test-only lane, nothing published; save-if keeps every non-main ref read-only
               with:
                   shared-key: mac-unit
                   # PR branches restore but never save, so PR churn cannot
@@ -469,7 +471,7 @@ jobs:
             - name: Provision libkrun (pinned own build)
               uses: ./.github/actions/setup-libkrun-macos
             - name: Install nextest
-              uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2
+              uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
               with:
                   tool: nextest
             - name: Clippy (minvmd)
