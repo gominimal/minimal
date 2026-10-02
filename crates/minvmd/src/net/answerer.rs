@@ -1066,3 +1066,530 @@ fn serve(socket: UdpSocket, answerer: HostAnswerer) {
         }
     }
 }
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use hickory_proto::op::Query;
+
+    use crate::box_registry::BoxRegistration;
+
+    use super::*;
+
+    /// The plan's default subnet: the one the daemon's own registry is
+    /// built with, so a test registry's rows sit at the addresses
+    /// production's do.
+    const SUBNET: switch::SwitchSubnet = switch::DEFAULT_SUBNET;
+
+    /// One query datagram, the wire form the answerer reads: `name` as an
+    /// FQDN (root dot included) at `rtype` — the same scaffolding the native
+    /// daemon's answerer tests drive, so the two prove the same wire.
+    fn encode_query(name: &str, rtype: RecordType) -> Vec<u8> {
+        let qname = Name::from_utf8(name).expect("query name parses");
+        let mut msg = Message::query();
+        msg.add_query(Query::query(qname, rtype));
+        msg.to_vec().expect("query encodes")
+    }
+
+    /// A registry holding one published box, `web`, at an address from the
+    /// reserved local range, beside the node's own namespace — the table the
+    /// daemon's start path fills. Returns the registry and the box's
+    /// published loopback address, the address its name must answer with.
+    fn web_registry() -> (BoxRegistry, Ipv4Addr) {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654, DEFAULT_ANSWERER_PORT);
+        let web = Ipv4Addr::new(127, 0, 64, 9);
+        registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            web,
+        ));
+        (registry, web)
+    }
+
+    /// The answerer over `own`, with its registered tables filled by
+    /// `install` — the rows a co-resident daemon would have filed over the
+    /// channel.
+    fn answerer_over(
+        own: BoxRegistry,
+        install: impl FnOnce(&RegisteredTables),
+    ) -> HostAnswerer {
+        let registered = Arc::new(RegisteredTables::new());
+        install(&registered);
+        HostAnswerer::new(own, registered)
+    }
+
+    /// The answerer over `own` alone — the lone-daemon shape, holding the
+    /// port and answering from its own table only.
+    fn answerer(own: BoxRegistry) -> HostAnswerer {
+        answerer_over(own, |_| {})
+    }
+
+    /// A source on this machine: a host resolver's datagram, from loopback.
+    fn on_host() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5353)
+    }
+
+    /// Sends `datagram` to `answerer` as if from `peer`, and decodes the
+    /// reply it produced, if any.
+    fn exchange(answerer: &HostAnswerer, peer: SocketAddr, datagram: &[u8]) -> Option<Message> {
+        let reply = answerer.respond(peer, datagram)?;
+        Some(Message::from_vec(&reply).expect("the answerer's reply decodes"))
+    }
+
+    /// One real query-exchange against the answerer listening on `port`:
+    /// a datagram from this machine's loopback, the reply decoded. `None`
+    /// when nothing answered inside the read window.
+    fn query(port: u16, name: &str, rtype: RecordType) -> Option<Message> {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the probe binds loopback");
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("the probe sets its read timeout");
+        socket
+            .send_to(&encode_query(name, rtype), (Ipv4Addr::LOCALHOST, port))
+            .expect("the probe sends on loopback");
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        match socket.recv_from(&mut buf) {
+            Ok((len, _)) => Some(Message::from_vec(&buf[..len]).expect("the reply decodes")),
+            Err(_) => None,
+        }
+    }
+
+    /// Waits until `probe` — one `query` attempt per try — returns `Some`,
+    /// failing the test on `what` when the deadline passes. The holder's
+    /// serve loop and a registrant's EOF are the two genuinely asynchronous
+    /// turns these tests wait on; everything else is already decided when
+    /// the call that made it so returns.
+    fn await_answer(
+        probe: impl Fn() -> Option<Message>,
+        what: &str,
+    ) -> Message {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(reply) = probe() {
+                return reply;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: nothing answered within 10 s"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The A record a reply answered with, when it answered with one.
+    fn a_answer(reply: &Message) -> Ipv4Addr {
+        let [record] = &reply.answers[..] else {
+            panic!("an A answer holds exactly one record");
+        };
+        assert_eq!(record.record_type(), RecordType::A, "the answer is an A record");
+        let RData::A(A(address)) = &record.data else {
+            panic!("the answer is an A record");
+        };
+        *address
+    }
+
+    /// The zone's SOA, which every negative reply carries in its authority
+    /// section (NET-124) — the record a host resolver needs to cache the
+    /// negative at all.
+    fn soa_of(reply: &Message) -> &Record {
+        let [record] = &reply.authorities[..] else {
+            panic!("a negative carries exactly the zone's SOA");
+        };
+        assert_eq!(record.record_type(), RecordType::SOA);
+        assert_eq!(
+            record.name,
+            Name::from_utf8(format!("{}.", zone_answer::ZONE_APEX)).expect("the apex parses"),
+            "the SOA is the zone's own"
+        );
+        record
+    }
+
+    /// The holder answers the zone from the host-authored table (NET-138):
+    /// a published box's name answers its published loopback address, and
+    /// the node's own namespace — a row like any other — answers the shared
+    /// loopback address. The same answer the native daemon's answerer gives
+    /// over the same shared decision, from a table this daemon authored on
+    /// the host.
+    #[test]
+    fn host_answerer_answers_zone_from_table() {
+        let (registry, web) = web_registry();
+        let answerer = answerer(registry);
+
+        let reply = exchange(
+            &answerer,
+            on_host(),
+            &encode_query("web.min.internal.", RecordType::A),
+        )
+        .expect("a held live name answers an A lookup");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert!(
+            reply.metadata.authoritative,
+            "the zone is authoritative for its own names"
+        );
+        assert_eq!(
+            a_answer(&reply),
+            web,
+            "the name answers the row's published loopback address"
+        );
+
+        let reply = exchange(
+            &answerer,
+            on_host(),
+            &encode_query("minimald.min.internal.", RecordType::A),
+        )
+        .expect("the node's own namespace is a held row");
+        assert_eq!(
+            a_answer(&reply),
+            Ipv4Addr::LOCALHOST,
+            "the node row answers the shared loopback address"
+        );
+    }
+
+    /// A record type other than A is NODATA on a held name (NET-124) — never
+    /// NXDOMAIN, which negative-caches the name away, and never an address
+    /// the type did not ask for — and the NODATA carries the zone's SOA so
+    /// the host resolver can cache it.
+    #[test]
+    fn host_answerer_non_a_is_nodata() {
+        let (registry, _) = web_registry();
+        let answerer = answerer(registry);
+
+        for rtype in [RecordType::AAAA, RecordType::HTTPS, RecordType::TXT] {
+            let reply = exchange(
+                &answerer,
+                on_host(),
+                &encode_query("web.min.internal.", rtype),
+            )
+            .expect("a held name answers every type");
+            assert_eq!(
+                reply.metadata.response_code,
+                ResponseCode::NoError,
+                "a {rtype:?} lookup on a held name is NODATA, never NXDOMAIN"
+            );
+            assert!(
+                reply.answers.is_empty(),
+                "NODATA carries no {rtype:?} record"
+            );
+            soa_of(&reply);
+        }
+    }
+
+    /// An in-zone name nothing holds is NXDOMAIN (NET-125), authoritative
+    /// and carrying the zone's SOA — a negative the host resolver can cache.
+    #[test]
+    fn host_answerer_unknown_name_is_nxdomain() {
+        let (registry, _) = web_registry();
+        let answerer = answerer(registry);
+
+        let reply = exchange(
+            &answerer,
+            on_host(),
+            &encode_query("gone.min.internal.", RecordType::A),
+        )
+        .expect("an in-zone lookup is answered");
+        assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain);
+        assert!(reply.answers.is_empty(), "NXDOMAIN carries no answer record");
+        assert!(
+            reply.metadata.authoritative,
+            "the zone's own negative is authoritative"
+        );
+        soa_of(&reply);
+
+        // A name outside the zone is none of this answerer's to answer:
+        // REFUSED, and no SOA of ours certifying someone else's namespace.
+        let reply = exchange(
+            &answerer,
+            on_host(),
+            &encode_query("example.com.", RecordType::A),
+        )
+        .expect("an out-of-zone lookup is answered");
+        assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
+        assert!(
+            reply.authorities.is_empty(),
+            "REFUSED cites no SOA over another namespace"
+        );
+    }
+
+    /// Every record the answerer emits holds a TTL of at most 15 s
+    /// (NET-126) — the A answers, and the SOA its negatives carry, minimum
+    /// included, which is the negative's own TTL — and a registered row is
+    /// re-gated on arrival: an address the host may not be told answers
+    /// NODATA (NET-127), not the address, while one it may answers.
+    #[test]
+    fn host_answerer_short_ttl_and_local_addresses_only() {
+        let (registry, _) = web_registry();
+        let answerer = answerer(registry.clone());
+
+        // The TTL ceiling, on every record of a positive answer...
+        let reply = exchange(
+            &answerer,
+            on_host(),
+            &encode_query("web.min.internal.", RecordType::A),
+        )
+        .expect("the held name answers");
+        for record in reply.answers.iter().chain(&reply.authorities) {
+            assert!(
+                record.ttl <= zone_answer::ANSWER_TTL_SECS,
+                "{} carries a {}s TTL, past the {}s ceiling",
+                record.name,
+                record.ttl,
+                zone_answer::ANSWER_TTL_SECS
+            );
+        }
+
+        // ...and on every record of a negative, whose SOA's `minimum` is the
+        // negative's own TTL (RFC 2308).
+        let reply = exchange(
+            &answerer,
+            on_host(),
+            &encode_query("gone.min.internal.", RecordType::A),
+        )
+        .expect("an unknown name is answered");
+        let soa = soa_of(&reply);
+        assert!(
+            soa.ttl <= zone_answer::ANSWER_TTL_SECS,
+            "the SOA carries a {}s TTL, past the ceiling",
+            soa.ttl
+        );
+        let RData::SOA(rdata) = &soa.data else {
+            panic!("the negative carries the zone's SOA");
+        };
+        assert!(
+            rdata.minimum <= zone_answer::ANSWER_TTL_SECS,
+            "the SOA's {}s minimum is the negative's TTL, past the ceiling",
+            rdata.minimum
+        );
+
+        // The registered rows, as a co-resident daemon would file them: one
+        // at an address the host may not be told — a box's switch lease,
+        // inside the guest's fabric — and one at an address it may.
+        let answerer = answerer_over(registry, |registered| {
+            registered.install(
+                0,
+                vec![
+                    RegisteredRow {
+                        name: "lease.min.internal".to_string(),
+                        address: Some(Ipv4Addr::new(100, 64, 0, 10)),
+                        live: true,
+                    },
+                    RegisteredRow {
+                        name: "peer.min.internal".to_string(),
+                        address: Some(Ipv4Addr::new(127, 0, 64, 10)),
+                        live: true,
+                    },
+                ],
+            );
+        });
+
+        let reply = exchange(
+            &answerer,
+            on_host(),
+            &encode_query("lease.min.internal.", RecordType::A),
+        )
+        .expect("a registered name is held");
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::NoError,
+            "a name held at an address the host may not be told answers NODATA (NET-127)"
+        );
+        assert!(
+            reply.answers.is_empty(),
+            "the registered switch lease never reaches the host's zone"
+        );
+        soa_of(&reply);
+
+        let reply = exchange(
+            &answerer,
+            on_host(),
+            &encode_query("peer.min.internal.", RecordType::A),
+        )
+        .expect("a registered name is held");
+        assert_eq!(
+            a_answer(&reply),
+            Ipv4Addr::new(127, 0, 64, 10),
+            "a registered row at a host-answerable address answers it"
+        );
+    }
+
+    /// A row withdrawn from the table takes its name with it: the name is
+    /// held by nothing and answers NXDOMAIN (NET-125) — never a name held
+    /// forever, and never an address nothing is answering on.
+    #[test]
+    fn host_answerer_withdrawn_row_is_nxdomain() {
+        let (registry, web) = web_registry();
+        let answerer = answerer(registry.clone());
+
+        let reply = exchange(
+            &answerer,
+            on_host(),
+            &encode_query("web.min.internal.", RecordType::A),
+        )
+        .expect("the published box's name is held");
+        assert_eq!(a_answer(&reply), web);
+
+        assert!(
+            registry.withdraw(Ipv4Addr::new(100, 64, 0, 9)).is_some(),
+            "the box was published at its lease"
+        );
+        let reply = exchange(
+            &answerer,
+            on_host(),
+            &encode_query("web.min.internal.", RecordType::A),
+        )
+        .expect("the withdrawn name is still an in-zone lookup");
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::NXDomain,
+            "a withdrawn namespace's name is held by nothing"
+        );
+        assert!(reply.answers.is_empty());
+        soa_of(&reply);
+    }
+
+    /// A name two sources both hold is the first writer's: this host's own
+    /// table is filed first, so a registered row for a name it already holds
+    /// is refused and never overwrites it — the answer stays the host's own
+    /// row, and the registrant's rows beside the refused one still answer.
+    #[test]
+    fn registered_row_does_not_take_a_held_name() {
+        let (registry, web) = web_registry();
+        let answerer = answerer_over(registry, |registered| {
+            registered.install(
+                0,
+                vec![
+                    RegisteredRow {
+                        name: "web.min.internal".to_string(),
+                        address: Some(Ipv4Addr::new(127, 0, 64, 99)),
+                        live: true,
+                    },
+                    RegisteredRow {
+                        name: "peer.min.internal".to_string(),
+                        address: Some(Ipv4Addr::new(127, 0, 64, 10)),
+                        live: true,
+                    },
+                ],
+            );
+        });
+
+        let reply = exchange(
+            &answerer,
+            on_host(),
+            &encode_query("web.min.internal.", RecordType::A),
+        )
+        .expect("the clashing name is answered by its keeper");
+        assert_eq!(
+            a_answer(&reply),
+            web,
+            "the first writer keeps the name; a registrant does not overwrite it"
+        );
+
+        let reply = exchange(
+            &answerer,
+            on_host(),
+            &encode_query("peer.min.internal.", RecordType::A),
+        )
+        .expect("the registration's other row is held");
+        assert_eq!(
+            a_answer(&reply),
+            Ipv4Addr::new(127, 0, 64, 10),
+            "the refusal is per name, not per registration"
+        );
+    }
+
+    /// Two VM host daemons on one machine: the one that holds the answerer
+    /// port answers for both, because the other registers its table's zone
+    /// rows with it over the channel — and the registration's lifetime is
+    /// its connection, so a daemon that exits never leaves names answering
+    /// behind it. Driven through a real UDP socket and a real channel
+    /// socket, the way the two daemons run: the holder through its own
+    /// acquisition loop, the registrant through the registration that loop
+    /// performs.
+    #[test]
+    fn second_vm_host_daemon_registers_names_with_holder() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        // A free loopback port: reserved only to learn a free number, then
+        // released for the holder to bind.
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the probe binds loopback");
+        let port = probe.local_addr().expect("the probe names its port").port();
+        drop(probe);
+
+        // The holder: its acquisition loop takes the port, holds the channel
+        // beside it, and serves the zone from its own table.
+        let (holder_registry, holder_web) = web_registry();
+        let holder_channel = channel.clone();
+        std::thread::Builder::new()
+            .name("test-zone-holder".to_string())
+            .spawn(move || acquire_loop_at(holder_registry, port, holder_channel))
+            .expect("the holder's thread spawns");
+
+        // The channel is bound before the serve loop starts, so the first
+        // answer implies the registration can land.
+        let reply = await_answer(
+            || query(port, "web.min.internal.", RecordType::A),
+            "the holder never answered its own table",
+        );
+        assert_eq!(
+            a_answer(&reply),
+            holder_web,
+            "the holder answers its own table's name"
+        );
+
+        // The second daemon's table, registered the way its own acquisition
+        // loop would: one connection, one registration line, one ack — and
+        // the rows are held before the ack is written, so they answer by the
+        // time this returns.
+        let second = BoxRegistry::new(SUBNET);
+        let second_web = Ipv4Addr::new(127, 0, 64, 11);
+        second.register(BoxRegistration::new(
+            "peer",
+            Ipv4Addr::new(100, 64, 0, 11),
+            second_web,
+        ));
+        let registration =
+            register_rows(&channel, zone_rows(&second)).expect("the holder accepts the table");
+
+        let reply =
+            query(port, "peer.min.internal.", RecordType::A).expect("the holder answers");
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::NoError,
+            "a registered row answers through the holder"
+        );
+        assert_eq!(
+            a_answer(&reply),
+            second_web,
+            "the second daemon's name answers at its own address, through the first's socket"
+        );
+
+        // The connection is the registration's lifetime: dropped, the
+        // holder retires its rows and the name it held answers NXDOMAIN.
+        drop(registration);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let answered = query(port, "peer.min.internal.", RecordType::A)
+                .expect("an in-zone lookup is still answered");
+            if answered.metadata.response_code == ResponseCode::NXDomain {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the retired registration's name still answers: {:?}",
+                answered.metadata.response_code
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // The holder's own table is untouched by the registrant's exit.
+        let reply = query(port, "web.min.internal.", RecordType::A).expect("the holder answers");
+        assert_eq!(
+            a_answer(&reply),
+            holder_web,
+            "the holder's own table still answers after a registrant exited"
+        );
+    }
+}
