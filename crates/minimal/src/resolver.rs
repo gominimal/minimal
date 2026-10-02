@@ -1090,24 +1090,47 @@ pub(crate) async fn live_name_surface_at(
 }
 
 /// [`live_name_surface_at`] with the detection this verb reads itself —
-/// `min ls`'s form: the list has no session-start advisory to share a
-/// read with, so the same bounded, read-only detection runs here — at
-/// [`ls_detection`]'s [`LIST_RESOLVECTL_BOUND`], the list's deadline, not
-/// the session start's, because the list is the most frequently-invoked
-/// verb and its read must stay a status read — and only when the daemon's
-/// answerer is bound (the cheap half the reply carries). The answerer is
-/// bound on every current daemon, so this read is not one only rare hosts
-/// pay: `cmd_ls` runs it in the modes that print the verdict alone, which
-/// is where the read belongs.
-pub(crate) async fn live_name_surface(
-    zone_answerer_port: Option<u16>,
-    answerer_bound: bool,
-) -> Option<LiveSurface> {
-    if zone_answerer_port.is_none() || !answerer_bound {
-        return None;
+/// `min ls`'s form, one verdict per VM the list spans: the list has no
+/// session-start advisory to share a read with, so the same bounded,
+/// read-only detection runs here — at [`ls_detection`]'s
+/// [`LIST_RESOLVECTL_BOUND`], the list's deadline, not the session
+/// start's, because the list is the most frequently-invoked verb and its
+/// read must stay a status read — and only when some VM's daemon reports
+/// its answerer bound (the cheap half each reply carries). The answerer
+/// is bound on every current daemon, so this read is not one only rare
+/// hosts pay: `cmd_ls` runs it in the modes that print the verdict alone,
+/// which is where the read belongs.
+///
+/// The list spans every VM on the host (NET-057), and the verdict is the
+/// VM's, not the host's alone: each VM's daemon publishes its answerer on
+/// a host port of its own (NET-059), so the host's resolver hook routes
+/// the zone to one VM's answerer and a sibling VM's names answer through
+/// its proxy. One detection read decides every VM's verdict — the pair of
+/// queries it runs is paid once for the whole list, never once per VM,
+/// and at most one VM's verdict reaches the bind probe behind the two
+/// cheap facts — so a wedged systemd-resolved costs the list the same one
+/// second however many VMs it lists. A VM whose daemon reports no bound
+/// answerer contributes `None`, the arm that cannot misreport (see the
+/// field's doc in `minimald-rpc`).
+pub(crate) async fn live_name_surfaces(
+    vms: impl Iterator<Item = (Option<u16>, bool)>,
+) -> Vec<Option<LiveSurface>> {
+    let vms: Vec<(Option<u16>, bool)> = vms.collect();
+    let any_bound = vms.iter().any(|(port, bound)| port.is_some() && *bound);
+    let detection = if any_bound {
+        Some(ls_detection().await)
+    } else {
+        None
+    };
+    let mut surfaces = Vec::with_capacity(vms.len());
+    for (port, bound) in vms {
+        let surface = match &detection {
+            Some(detection) => live_name_surface_at(detection, port, bound).await,
+            None => None,
+        };
+        surfaces.push(surface);
     }
-    let detection = ls_detection().await;
-    live_name_surface_at(&detection, zone_answerer_port, answerer_bound).await
+    surfaces
 }
 
 /// The host answerer's state as the two verbs consume it on a VM-backed
@@ -1303,7 +1326,7 @@ pub fn vm_host_answerer_line(status: ZoneAnswererStatus) -> Option<String> {
 /// the two reads could only misreport native. The two decided states read
 /// the list's own bounded detection and this CLI's liveness query at the
 /// port the status named — the same facts the session start reads, at the
-/// list's own deadline, as [`live_name_surface`] does for a native host.
+/// list's own deadline, as [`live_name_surfaces`] does for a native host.
 /// The pre-acquisition state claims nothing: no port named, no verdict to
 /// print, exactly as a native daemon's absent port is.
 pub(crate) async fn vm_host_name_surface(status: ZoneAnswererStatus) -> Option<LiveSurface> {
@@ -1358,7 +1381,7 @@ async fn range_present_on_host() -> bool {
 }
 
 /// NET-018's report: the line `min ls` and `min session activate` print,
-/// naming the surface [`live_name_surface`] decided is live. `proxy_port`
+/// naming the surface [`live_name_surfaces`] decided is live. `proxy_port`
 /// is the port the same reply carries, when the proxy came up: NET-019
 /// keeps it serving beside native DNS, and the line says so, because a
 /// client that captured `HTTP(S)_PROXY` at activation keeps routing
@@ -1763,7 +1786,10 @@ mod tests {
         // No port on the reply — the daemon still bringing its answerer up
         // — and no bound report are both the read that changes nothing:
         // nothing prints, and an old daemon's silence is never mistaken
-        // for an answerer that serves.
+        // for an answerer that serves. The list's form reads the host not
+        // at all until some VM's daemon reports a bound answerer, and a
+        // VM that reports none keeps the arm that cannot misreport even
+        // when a sibling VM's report paid for the read.
         let detection = (routing_hook(), None);
         assert!(live_name_surface_at(&detection, None, true).await.is_none());
         assert!(
@@ -1771,7 +1797,16 @@ mod tests {
                 .await
                 .is_none()
         );
-        assert!(live_name_surface(None, false).await.is_none());
+        // And the list's form: no VM reporting a bound answerer means no
+        // verdict for any of them — the read that changes nothing, however
+        // many VMs carry it.
+        let list = live_name_surfaces([(None, true), (Some(15353), false)].into_iter()).await;
+        assert_eq!(
+            list,
+            [None, None],
+            "no VM reporting a bound answerer leaves every verdict the read that \
+             changes nothing"
+        );
     }
 
     #[tokio::test]
@@ -2411,7 +2446,10 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let standin = install_query_standin("#!/bin/sh\nsleep 30\n");
         let started = std::time::Instant::now();
-        let surface = live_name_surface(Some(15353), true).await;
+        let [surface] = live_name_surfaces(std::iter::once((Some(15353), true)))
+            .await
+            .try_into()
+            .expect("one VM's facts in, one verdict out");
         assert_eq!(
             surface,
             Some(LiveSurface::Proxy),

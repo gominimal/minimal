@@ -423,6 +423,30 @@ test-cross: (_need "cross" "cargo install cross --locked")
     cross clippy --workspace --exclude minvmd --all-targets --target {{musl-target}} --locked -- -D warnings
     CROSS_CONTAINER_OPTS="--env HOME=/tmp" cross test --workspace --exclude minvmd --target {{musl-target}} --locked
 
+# commitlint is not replicated by `just ci`; `just hooks` installs its local
+# twin as the commit-msg hook (scripts/git-hooks/commit-msg) for this clone,
+# every worktree included, so an over-long line is refused before the commit
+# exists instead of after the push.
+#
+# Point this clone's git hooks at scripts/git-hooks (commit-msg = commitlint's local twin).
+hooks:
+    #!/usr/bin/env sh
+    set -eu
+    # Repointing core.hooksPath silently disables every hook in the old
+    # directory, so refuse while that directory holds live (non-.sample) hooks.
+    old=$(git config --get core.hooksPath || git rev-parse --git-path hooks)
+    if [ "$old" != scripts/git-hooks ] && [ -d "$old" ]; then
+        live=$(find "$old" -maxdepth 1 -type f ! -name '*.sample' | sort)
+        if [ -n "$live" ]; then
+            echo "hooks: $old holds hooks that core.hooksPath = scripts/git-hooks would stop running:" >&2
+            echo "$live" | sed 's/^/  /' >&2
+            echo "hooks: remove them, or chain scripts/git-hooks/commit-msg from $old/commit-msg instead" >&2
+            exit 1
+        fi
+    fi
+    git config core.hooksPath scripts/git-hooks
+    echo "hooks: core.hooksPath = scripts/git-hooks (commit-msg checks the message before each commit)"
+
 # Not replicated: commitlint, the dogfood jobs, the installer lane (`just test-installer`).
 #
 # The local PR gate set, cheapest first.
@@ -579,10 +603,10 @@ _kvm:
 
 # minvmd's VM harnesses (tests/*_integration.rs). CI: `test-kvm` / macOS `e2e`.
 [macos]
-test-vm: _nextest artifacts initramfs
+test-vm: _nextest artifacts initramfs gvproxy
     #!/usr/bin/env sh
     set -eu
-    export MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state"
+    export MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state" MINVMD_GVPROXY_BIN="{{gvproxy}}"
     # CI's archive pattern: build EVERYTHING, codesign minvmd LAST (a later
     # cargo call would relink it → entitlement lost), run from the archive.
     cargo nextest archive -p minvmd --locked --archive-file "{{scratch}}/nextest-archive.tar.zst"
@@ -605,9 +629,10 @@ test-vm: _nextest artifacts initramfs
 
 # minvmd's VM harnesses (tests/*_integration.rs). CI: ci-linux-kvm.yml `test-kvm`.
 [linux]
-test-vm: _nextest _kvm artifacts initramfs minvmd-build
+test-vm: _nextest _kvm artifacts initramfs minvmd-build gvproxy
     MINVMD_E2E=1 MINVMD_BIN="{{minvmd-bin}}" XDG_STATE_HOME="{{scratch}}/test-state" \
       MINVMD_REQUIRE_LIBKRUN=static LIBKRUN_PREFIX="{{krun-static}}" \
+      MINVMD_GVPROXY_BIN="{{gvproxy}}" \
       cargo nextest run -p minvmd --profile vm --target {{musl-target}} \
       --run-ignored all --no-tests=fail \
       -E 'binary(/_integration$/) and not binary(/_root_integration$/)'
