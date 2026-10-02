@@ -256,9 +256,13 @@ pub(crate) struct ResolvedBoxVm {
 /// original error (the selected VM's — usually the more useful of the two).
 /// An explicit `--vm` pins where to look, so it resolves nothing: the
 /// operator chose, and a resolution across the others would override that
-/// choice. A VM that is not running cannot own the name and is not asked; a
-/// VM whose daemon answers nothing is skipped with a warning — the name is
-/// resolved from the VMs that did answer.
+/// choice. A VM that is not running cannot own the name — an answer given
+/// without a word, since finding a stopped VM is the normal case on a host
+/// with several — and a VM whose daemon answers nothing is skipped with a
+/// warning, so the name is resolved from the VMs that did answer. Each look
+/// is leashed ([`crate::client::PROBE_TIMEOUT`]): the loop spans every VM on
+/// the host, and a wedged one must not hold an attach for the stacked
+/// connect, handshake and RPC deadlines (~72 s each).
 ///
 /// The daemon that owns the name is version-gated on the very reply that
 /// named it, so a skewed VM can never be reached *through* a resolution even
@@ -276,21 +280,31 @@ pub(crate) async fn resolve_box_vm(
         crate::client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
     let mut owners: Vec<ResolvedBoxVm> = Vec::new();
     for vm in vms {
-        // A VM that is not running cannot own the name; asking it would only
-        // pay the connect-retry delay for a daemon that is not there.
+        // A VM that is not running cannot own the name. The check is free, so
+        // it is made first; the probe classifies the cases it cannot see — a
+        // socket that vanished mid-walk reads the same as one never bound.
         if !vm.sock.exists() {
             continue;
         }
-        match box_record_on(&vm, name).await {
-            Ok(Some(record)) => owners.push(ResolvedBoxVm {
+        let look = tokio::time::timeout(crate::client::PROBE_TIMEOUT, box_record_on(&vm, name))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "the daemon did not answer within {:?}",
+                    crate::client::PROBE_TIMEOUT
+                )
+            });
+        match look {
+            Ok(Ok(Some(record))) => owners.push(ResolvedBoxVm {
                 vm: vm.vm,
                 sock: vm.sock,
                 record,
             }),
-            Ok(None) => {}
-            // Unreachable VMs are named, not silent: a resolution that
-            // quietly could not look would read as "no such box".
-            Err(e) => eprintln!(
+            Ok(Ok(None)) => {}
+            // VMs that could not be looked at are named, not silent: a
+            // resolution that quietly could not look would read as "no such
+            // box".
+            Ok(Err(e)) | Err(e) => eprintln!(
                 "warning: could not look for '{name}' in VM {}: {e:#}",
                 vm.vm
             ),
@@ -318,16 +332,31 @@ pub(crate) async fn resolve_box_vm(
 }
 
 /// Look `name` up on one VM's daemon: its record when that daemon owns the
-/// name, `None` when it does not. The owning daemon is gated on the very
-/// reply that named it; the probe that finds nothing stays ungated, exactly
-/// like the dashboard's listing of a skewed daemon.
+/// name, `None` when it does not — and `None` when the VM is not running,
+/// which is the same answer to the caller: a VM that is down cannot own the
+/// name, and finding a stopped VM is the normal case on a host with several.
+///
+/// This is a VM this process did not select — a resolution spans every VM it
+/// can see — so the connect is a probe: one attempt, no retry window. The
+/// window belongs to the VM the operator asked for; a stopped VM's stale
+/// `ssh.sock` must not collect it from every name resolution on the host.
+/// The owning daemon is gated on the very reply that named it; the probe
+/// that finds nothing stays ungated, exactly like the dashboard's listing of
+/// a skewed daemon.
 async fn box_record_on(
     vm: &crate::client::VmSocket,
     name: &str,
 ) -> Result<Option<sessions::Record>, anyhow::Error> {
-    let mut client = crate::client::Client::connect(&vm.sock)
-        .await
-        .with_context(|| format!("Failed to connect to the daemon at {}", vm.sock.display()))?;
+    let mut client = match crate::client::Client::probe(&vm.sock).await {
+        Ok(client) => client,
+        Err(crate::client::ProbeRefusal::NotRunning) => return Ok(None),
+        Err(crate::client::ProbeRefusal::Unreachable(e)) => {
+            return Err(e.context(format!(
+                "Failed to connect to the daemon at {}",
+                vm.sock.display()
+            )));
+        }
+    };
     let resp = crate::cmd::get_session_record(&mut client, name).await?;
     match resp.record {
         Some(record) => {

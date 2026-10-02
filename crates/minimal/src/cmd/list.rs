@@ -305,12 +305,13 @@ pub struct VmListing {
 /// [`minimal_client::enumerate_vm_sockets`] is the set: the default VM plus
 /// every named one. An explicit `--vm` narrows the listing to that VM alone —
 /// the operator named where to look. A VM that is not running hosts no boxes,
-/// so it contributes nothing; a VM whose daemon cannot be reached is skipped
-/// with a warning, unless it is the VM this process selected — that one was
-/// just ensured, so a failure there is the failure to report (and a skewed one
-/// is refused there, as `min ls` always has). Nothing enumerable — the native
-/// backend, which hosts no VMs — falls back to the selected provider's
-/// daemon, exactly the listing `min ls` has always printed.
+/// so it contributes nothing and no word is spent on it; a VM that answers
+/// badly is skipped with a warning, unless it is the VM this process selected
+/// — that one was just ensured, so a failure there is the failure to report
+/// (and a skewed one is refused there, as `min ls` always has). Nothing
+/// enumerable — the native backend, which hosts no VMs — falls back to the
+/// selected provider's daemon, exactly the listing `min ls` has always
+/// printed.
 pub(crate) async fn ls_listings(global: &GlobalArgs) -> Result<Vec<VmListing>, anyhow::Error> {
     let mut vms = client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
     if let Some(pinned) = global.vm.as_deref() {
@@ -319,22 +320,34 @@ pub(crate) async fn ls_listings(global: &GlobalArgs) -> Result<Vec<VmListing>, a
     let selected = client::vm_name();
     let mut listings = Vec::new();
     for vm in vms {
-        // A VM that is not running hosts no boxes. The selected VM is up —
-        // [`ensure_daemon`] saw to it before this ran — so this skip is only
-        // ever another VM's.
-        if !vm.sock.exists() {
-            continue;
-        }
         // The selected VM gets the gate `min ls` has always applied
         // (`connect_daemon`'s); the others are listable ungated, for the same
         // reason the dashboard lists them ungated — a listing is read-only,
         // and a skewed VM is precisely one whose boxes an operator still
         // needs to see.
         let gate = vm.vm == selected;
-        match list_vm(&vm.sock, gate).await {
-            Ok(resp) => listings.push(VmListing { vm: vm.vm, resp }),
-            Err(e) if gate => return Err(e),
-            Err(e) => eprintln!("warning: skipping VM {}: {e:#}", vm.vm),
+        // A VM that is not running hosts no boxes: an absent socket is "no
+        // boxes here", not a fault. The selected VM is exempt even so — it is
+        // up ([`ensure_daemon`] saw to it), but on the VM backend its bridge
+        // UDS can appear a beat after the `vm-up` line, which is exactly the
+        // race [`Client::connect`]'s retry window absorbs, so it is connected
+        // through rather than skipped. Skipping it would silently drop the
+        // operator's own boxes from the listing and print another VM's as the
+        // whole picture.
+        if !vm.sock.exists() && !gate {
+            continue;
+        }
+        if gate {
+            listings.push(VmListing {
+                vm: vm.vm,
+                resp: list_selected_vm(&vm.sock).await?,
+            });
+        } else {
+            match list_other_vm(&vm.sock).await {
+                Ok(Some(resp)) => listings.push(VmListing { vm: vm.vm, resp }),
+                Ok(None) => {}
+                Err(e) => eprintln!("warning: skipping VM {}: {e:#}", vm.vm),
+            }
         }
     }
     if listings.is_empty() {
@@ -342,33 +355,84 @@ pub(crate) async fn ls_listings(global: &GlobalArgs) -> Result<Vec<VmListing>, a
             .context("Failed to resolve daemon socket path")?;
         listings.push(VmListing {
             vm: selected.to_string(),
-            resp: list_vm(&sock, true).await?,
+            resp: list_selected_vm(&sock).await?,
         });
     }
     Ok(listings)
 }
 
-/// One daemon's `ListSessions` reply, from its socket. The daemon cannot
-/// probe git (on macOS it runs in the minvmd guest), so each session's git
-/// context is filled host-side before the reply is formatted. `gate` asserts
-/// the daemon's build first; see [`ls_listings`] for who gets it.
-async fn list_vm(
+/// The selected daemon's `ListSessions` reply, from its socket, gated as `min
+/// ls` has always been: connect with [`Client::connect`]'s retry window — the
+/// VM is this process's own, and that window is what absorbs its bridge UDS
+/// appearing late — then assert the daemon's build, then ask.
+async fn list_selected_vm(
     sock: &std::path::Path,
-    gate: bool,
 ) -> Result<minimald_rpc::ListSessionsResponse, anyhow::Error> {
     let mut client = client::Client::connect(sock)
         .await
         .with_context(|| format!("Failed to connect to the daemon at {}", sock.display()))?;
-    if gate {
-        client::ensure_version_match(&mut client).await?;
-    }
-    use minimald_rpc::ListSessions;
-    let mut resp = client
-        .oneshot_rpc::<ListSessions>(())
-        .await
-        .context("ListSessions RPC failed")?;
+    client::ensure_version_match(&mut client).await?;
+    let mut resp = list_sessions_from(&mut client).await?;
     minimal_client::fill_git_info(&mut resp.sessions).await;
     Ok(resp)
+}
+
+/// One unselected VM's `ListSessions` reply, or `None` when that VM is not
+/// running.
+///
+/// This VM is nobody's selection, so it gets no retry window and no full-dead
+/// line stack: a stopped VM leaves its `ssh.sock` on disk, and a listing
+/// spanning every VM on the host cannot spend [`Client::connect`]'s ~2 s
+/// retry plus the handshake and RPC deadlines on each one it passes. One
+/// probe attempt ([`Client::probe`]), and the RPC that follows it, both under
+/// the short [`client::PROBE_TIMEOUT`] leash — a wedged VM holds the listing
+/// for 4 s, not ~72 s. "Not running" — the stale socket of a VM that is down,
+/// or a path that vanished since the caller looked — is the answer, not a
+/// fault: `Ok(None)`, no warning. [`fill_git_info`] stays outside the leash:
+/// it walks git on the host, one repo probe per box, and a VM with many boxes
+/// has nothing to do with the daemon's reachability.
+async fn list_other_vm(
+    sock: &std::path::Path,
+) -> Result<Option<minimald_rpc::ListSessionsResponse>, anyhow::Error> {
+    let reply = tokio::time::timeout(client::PROBE_TIMEOUT, async {
+        let mut client = match client::Client::probe(sock).await {
+            Ok(client) => client,
+            Err(client::ProbeRefusal::NotRunning) => return Ok(None),
+            Err(client::ProbeRefusal::Unreachable(e)) => {
+                return Err(e.context(format!(
+                    "Failed to connect to the daemon at {}",
+                    sock.display()
+                )));
+            }
+        };
+        let resp = list_sessions_from(&mut client)
+            .await
+            .context("ListSessions RPC failed")?;
+        Ok(Some(resp))
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "daemon at {} did not answer within {:?}",
+            sock.display(),
+            client::PROBE_TIMEOUT
+        )
+    })??;
+    let Some(mut resp) = reply else {
+        return Ok(None);
+    };
+    minimal_client::fill_git_info(&mut resp.sessions).await;
+    Ok(Some(resp))
+}
+
+/// The `ListSessions` RPC itself, shared by the selected and the probed
+/// callers. The daemon cannot probe git (on macOS it runs in the minvmd
+/// guest), so the caller fills each session's git context host-side.
+async fn list_sessions_from(
+    client: &mut client::Client,
+) -> Result<minimald_rpc::ListSessionsResponse, anyhow::Error> {
+    use minimald_rpc::ListSessions;
+    client.oneshot_rpc::<ListSessions>(()).await
 }
 
 /// List sessions via the `ListSessions` RPC.
@@ -584,7 +648,7 @@ const VM_COLUMN_WIDTH: usize = 8;
 ///
 /// One VM listed is [`format_ls`] verbatim — the output every consumer of
 /// `min ls` has always read, `--json` included. More than one adds the VM per
-/// box: a VM column in the table, each VM's name inside its `--json` entry,
+/// box: a VM column in the table, the VM inside each `--json` session entry,
 /// and each VM's routing facts (NET-026's discovery lines) prefixed with the
 /// VM they belong to, because on a two-VM host each VM's proxy publishes on a
 /// host port of its own (NET-059).
@@ -614,24 +678,46 @@ pub fn format_ls_across_vms(
     }
 
     if args.json {
-        let wrapped = listings
-            .iter()
-            .map(|listing| {
-                let mut value = serde_json_lenient::to_value(&listing.resp)
-                    .context("Failed to serialize session list")?;
-                // Each reply with the VM it came from beside it: the
-                // attribution is the client's, so `--json` is the one surface
-                // that carries it per box for a pipeline to read.
-                if let serde_json_lenient::Value::Object(map) = &mut value {
-                    map.insert(
-                        "vm".to_string(),
-                        serde_json_lenient::Value::String(listing.vm.clone()),
-                    );
+        // One object, not one per VM: the top-level shape `min ls --json` has
+        // always printed, so a consumer parsing `.sessions` keeps working on a
+        // multi-VM host — it finds every VM's boxes in that one array, each
+        // entry carrying the VM it lives on (the attribution NET-057 adds to
+        // the table, on the surface a pipeline reads). The facts the
+        // single-VM object carries per daemon — resource pool, the routing
+        // ports, the build — cannot sit at the top level once there are
+        // several, so each VM keeps its own object under `vms`, named by
+        // `"vm"` the same way.
+        let mut sessions = Vec::new();
+        let mut vms = Vec::new();
+        for listing in listings {
+            let reply = serde_json_lenient::to_value(&listing.resp)
+                .context("Failed to serialize session list")?;
+            let mut object = match reply {
+                serde_json_lenient::Value::Object(map) => map,
+                other => anyhow::bail!("session list did not serialize to an object: {other}"),
+            };
+            let vm = serde_json_lenient::Value::String(listing.vm.clone());
+            // The sessions move into the one array with the VM inside each;
+            // the rest of the reply stays as that VM's own object.
+            let vm_sessions = object
+                .remove("sessions")
+                .unwrap_or(serde_json_lenient::Value::Array(Vec::new()));
+            if let serde_json_lenient::Value::Array(entries) = vm_sessions {
+                for mut entry in entries {
+                    if let serde_json_lenient::Value::Object(map) = &mut entry {
+                        map.insert("vm".to_string(), vm.clone());
+                    }
+                    sessions.push(entry);
                 }
-                Ok(value)
-            })
-            .collect::<Result<Vec<_>, anyhow::Error>>()?;
-        let json = serde_json_lenient::to_string_pretty(&wrapped)
+            }
+            object.insert("vm".to_string(), vm);
+            vms.push(serde_json_lenient::Value::Object(object));
+        }
+        let json = serde_json_lenient::json!({
+            "sessions": sessions,
+            "vms": vms,
+        });
+        let json = serde_json_lenient::to_string_pretty(&json)
             .context("Failed to serialize session list")?;
         writeln!(out, "{json}")?;
         return Ok(());

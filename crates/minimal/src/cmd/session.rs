@@ -1079,37 +1079,8 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
     // were already making, so the gate costs no round trip of its own.
     let (id, name, sock) = match args.session {
         Some(ref s) => {
-            let (record, sock) = match resolve_session_version_gated(&mut client, s).await {
-                Ok(record) => (record, sock),
-                // NET-058's cross-VM half: the selected VM's daemon has just
-                // said it does not know the name, so resolve the VM that owns
-                // it across every VM's socket. The resolution gates the
-                // owning daemon on the very reply that named the box, so a
-                // skewed VM cannot be reached through it.
-                Err(selected) => match attach::resolve_box_vm(global, s).await? {
-                    Some(resolved) => {
-                        // The operator never chose the VM the way they chose
-                        // the session, so tell them which one they're landing
-                        // in — the same announcement the unambiguous
-                        // auto-resolve below makes.
-                        if should_announce_session(global) {
-                            eprintln!(
-                                "Attaching to session {} on VM {}",
-                                session_announce_label(
-                                    &resolved.record.id,
-                                    resolved.record.name.as_deref()
-                                ),
-                                resolved.vm
-                            );
-                        }
-                        (resolved.record, resolved.sock)
-                    }
-                    // Nothing found anywhere: the selected VM's own error —
-                    // the "no session found" it computed, or its skew — is
-                    // the more useful of the two answers.
-                    None => return Err(selected),
-                },
-            };
+            let (record, sock) =
+                resolve_attach_target_version_gated(global, &mut client, sock, s).await?;
             (record.id, record.name, sock)
         }
         None => match resolve_smart_attach(
@@ -1131,6 +1102,49 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
     );
 
     session_via_ssh(&sock, id, None, global.config_dir.as_deref()).await
+}
+
+/// Resolve a named attach target to its record and the socket the hand-off
+/// runs over — the target `min session attach` lands in when the name alone
+/// decides where to look (NET-058).
+///
+/// The selected VM's daemon is asked first (`client`, reached over `sock`):
+/// the common case — a box on the VM the operator is already on — costs
+/// nothing beyond the one lookup the command always made, and its answer is
+/// gated on the reply that lookup was already making. When that daemon does
+/// not know the name, [`attach::resolve_box_vm`] resolves the VM that owns it
+/// across every VM's socket, so no global flag is needed to reach a box on
+/// another VM — the resolution gates the owning daemon on the very reply that
+/// named the box, so a skewed VM cannot be reached through it. Nothing found
+/// anywhere returns the selected VM's own error — the "no session found" it
+/// computed, or its skew — as the more useful of the two answers.
+pub(crate) async fn resolve_attach_target_version_gated(
+    global: &GlobalArgs,
+    client: &mut client::Client,
+    sock: std::path::PathBuf,
+    name: &str,
+) -> Result<(sessions::Record, std::path::PathBuf), anyhow::Error> {
+    match resolve_session_version_gated(client, name).await {
+        Ok(record) => Ok((record, sock)),
+        Err(selected) => match attach::resolve_box_vm(global, name).await? {
+            Some(resolved) => {
+                // The operator never chose the VM the way they chose the
+                // session, so tell them which one they're landing in.
+                if should_announce_session(global) {
+                    eprintln!(
+                        "Attaching to session {} on VM {}",
+                        session_announce_label(
+                            &resolved.record.id,
+                            resolved.record.name.as_deref()
+                        ),
+                        resolved.vm
+                    );
+                }
+                Ok((resolved.record, resolved.sock))
+            }
+            None => Err(selected),
+        },
+    }
 }
 
 /// Executes a command in an existing session.

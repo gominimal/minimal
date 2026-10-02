@@ -71,9 +71,14 @@ fn every_daemon_connection_is_classified() {
             "attach.rs::box_record_on = gated",
             "cmd/admin.rs::cmd_version = ungated",
             "cmd/list.rs::cmd_bare = gated",
-            // `min ls` reaches past the selected VM: the selected one keeps
-            // the gate, the others are listable ungated (see `ls_listings`).
-            "cmd/list.rs::list_vm = gated",
+            // `min ls` reaches past the selected VM, and the two halves carry
+            // the gate differently (see `ls_listings`): the selected VM is the
+            // one this process ensured and drives, so it keeps the gate; the
+            // others are probed ungated, for the same reason the dashboard
+            // lists a skewed VM ungated — its boxes are exactly what an
+            // operator still needs to see.
+            "cmd/list.rs::list_other_vm = ungated",
+            "cmd/list.rs::list_selected_vm = gated",
             "cmd/mod.rs::arm_activation_interrupt = ungated",
             "cmd/mod.rs::connect_daemon_unchecked = ungated",
             "cmd/net.rs::cmd_net_forward = gated",
@@ -83,6 +88,11 @@ fn every_daemon_connection_is_classified() {
             "cmd/session.rs::cmd_session_setup_zed = gated",
             "diag/net.rs::probe_socket = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
+            // Not a product path: the fall-through test's own connection to
+            // the selected daemon — but a connection all the same, and the
+            // paths it drives are the gated ones above, so the label records
+            // what the test asserts rather than a decision it makes.
+            "tests.rs::attach_fall_through_hands_off_the_owning_vm = gated",
         ]
     );
 }
@@ -200,12 +210,12 @@ fn crate_sources(manifest_dir: &str) -> (std::path::PathBuf, Vec<std::path::Path
     (src, files)
 }
 
-/// Attributes every line matching `needle` under `<crate>/src` to the
+/// Attributes every line matching one of `needles` under `<crate>/src` to the
 /// function containing it, labelling that function by whether its body
 /// carries one of `markers`.
 fn source_inventory(
     manifest_dir: &str,
-    needle: &str,
+    needles: &[&str],
     markers: &[&str],
     labels: (&str, &str),
 ) -> Vec<String> {
@@ -221,7 +231,7 @@ fn source_inventory(
             .to_string_lossy()
             .into_owned();
         for (i, line) in lines.iter().enumerate() {
-            if !line.contains(needle) {
+            if !needles.iter().any(|needle| line.contains(needle)) {
                 continue;
             }
             let (start, name) = decls
@@ -255,7 +265,7 @@ fn create_site_inventory(manifest_dir: &str) -> Vec<String> {
     const NEEDLE: &str = concat!("CreateSession", "Request {");
     source_inventory(
         manifest_dir,
-        NEEDLE,
+        &[NEEDLE],
         &[
             "must_match_version: version_assertion()",
             "must_match_version: minimal_client::version_assertion()",
@@ -275,12 +285,18 @@ fn create_site_inventory(manifest_dir: &str) -> Vec<String> {
 /// `*_version_gated` lookup helper), or the assertion it puts on its own
 /// `CreateSession`. What the inventory records is that the decision was
 /// made, not which mechanism made it.
+///
+/// A probe is a connection too — one attempt at a VM this process did not
+/// select — so both verbs the client opens are needles. That is what keeps
+/// a probe path from carrying a gate (or not) without this test noticing:
+/// the judgement is the same one, and the inventory is where it is recorded.
 fn connect_site_inventory(manifest_dir: &str) -> Vec<String> {
-    // Built by concatenation so this scanner does not match itself.
-    const NEEDLE: &str = concat!("Client", "::connect(");
+    // Both built by concatenation so this scanner does not match itself.
+    const CONNECT_NEEDLE: &str = concat!("Client", "::connect(");
+    const PROBE_NEEDLE: &str = concat!("Client", "::probe(");
     source_inventory(
         manifest_dir,
-        NEEDLE,
+        &[CONNECT_NEEDLE, PROBE_NEEDLE],
         &[
             "ensure_version_match",
             "ensure_version_reported",
@@ -1889,8 +1905,10 @@ async fn ls_shows_vm_per_box() {
         "one VM listed must render as the single-VM listing"
     );
 
-    // `--json` carries the same attribution per entry, where a pipeline can
-    // read it: the VM's name beside that VM's reply.
+    // `--json` stays one object on a multi-VM host — the shape every
+    // consumer of `min ls --json` parses — with the VM inside each entry of
+    // the one `sessions` array, where a pipeline reads it: `.sessions` keeps
+    // working across VMs instead of breaking on a per-VM array.
     let mut out = Vec::new();
     format_ls_across_vms(
         &mut out,
@@ -1901,15 +1919,169 @@ async fn ls_shows_vm_per_box() {
         &listings,
     )
     .expect("rendering the two-VM listing as JSON");
-    let entries: serde_json_lenient::Value =
+    let listing: serde_json_lenient::Value =
         serde_json_lenient::from_str(std::str::from_utf8(&out).expect("UTF-8"))
-            .expect("the multi-VM JSON listing is an array");
-    assert_eq!(entries[0]["vm"].as_str(), Some("default"), "got: {entries}");
-    assert_eq!(entries[1]["vm"].as_str(), Some("alpha"), "got: {entries}");
+            .expect("the multi-VM JSON listing is one object");
     assert!(
-        entries[0]["sessions"][0]["name"].as_str() == Some("api")
-            && entries[1]["sessions"][0]["name"].as_str() == Some("web"),
-        "each entry carries its own VM's boxes: {entries}"
+        !matches!(listing, serde_json_lenient::Value::Array(_)),
+        "the top level must stay an object, not one per VM: {listing}"
+    );
+    let sessions = listing["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("one sessions array spanning the VMs: {listing}"));
+    assert_eq!(
+        sessions.len(),
+        2,
+        "both VMs' boxes in the one array: {listing}"
+    );
+    let by_vm = |value: &serde_json_lenient::Value| -> (String, String) {
+        (
+            value["vm"]
+                .as_str()
+                .expect("each entry carries its VM")
+                .to_owned(),
+            value["name"]
+                .as_str()
+                .expect("each entry is a box")
+                .to_owned(),
+        )
+    };
+    assert_eq!(
+        by_vm(&sessions[0]),
+        ("default".to_owned(), "api".to_owned()),
+        "the first box carries its VM: {listing}"
+    );
+    assert_eq!(
+        by_vm(&sessions[1]),
+        ("alpha".to_owned(), "web".to_owned()),
+        "the second box carries its VM: {listing}"
+    );
+    // The facts the single-VM object carried per daemon cannot sit at the
+    // top level once there are several VMs, so each VM keeps its own object
+    // under `vms`, named the same way.
+    let vms = listing["vms"]
+        .as_array()
+        .unwrap_or_else(|| panic!("one vms array naming each VM's own facts: {listing}"));
+    assert_eq!(
+        (
+            vms[0]["vm"].as_str(),
+            vms[0]["resource_pool"].is_object(),
+            vms.len()
+        ),
+        (Some("default"), true, 2),
+        "each VM's facts stay reachable per VM: {listing}"
+    );
+    assert!(
+        vms.iter().all(|vm| vm.get("sessions").is_none()),
+        "the sessions live in the one array, not duplicated per VM: {listing}"
+    );
+}
+
+/// The selected VM's socket can appear a beat after the listing starts: on
+/// the VM backend the bridge UDS shows up slightly after the `vm-up` line —
+/// the race [`client::Client::connect`]'s retry window exists to absorb — so
+/// the not-running skip must exempt the selected VM. It is up
+/// ([`cmd::ensure_daemon`] saw to that before the listing ran); skipping it on
+/// a path that was merely late would drop the operator's own boxes and print
+/// another VM's as the whole picture.
+#[tokio::test]
+async fn ls_keeps_the_selected_vm_when_its_socket_appears_late() {
+    let state = tempfile::tempdir().expect("a temp minimal state dir for two VMs");
+    let provider = state.path().join("providers/local-minvmd0");
+    std::fs::create_dir_all(provider.join("alpha")).expect("the named VM's provider subdir");
+    let default_sock =
+        client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
+            .expect("the default VM's socket path");
+    // Both daemons are real. The selected VM's socket is not bound yet — its
+    // box is created over the harness's in-memory pair, the way a booting
+    // VM's daemon is up before its bridge socket exists.
+    let default_vm = minimald::test_harness::TestServer::new().await;
+    create_box_on(&default_vm, "api").await;
+    let alpha = minimald::test_harness::TestServer::new().await;
+    alpha.listen_on_uds(&provider.join("alpha/ssh.sock")).await;
+    create_box_on(&alpha, "web").await;
+
+    let global = vm_globals(state.path(), None);
+    let listing = tokio::spawn(async move { cmd::ls_listings(&global).await });
+    // The listing is now watching the selected VM's not-yet-bound path; the
+    // socket lands mid-retry — later than the listing started, earlier than
+    // the retry window closes. (The current-thread test runtime only polls
+    // the spawned listing where this sleep yields, so the socket is bound
+    // while the listing is provably inside that window.)
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    default_vm.listen_on_uds(&default_sock).await;
+
+    let listings = listing
+        .await
+        .expect("the listing task must not panic")
+        .expect("listing a two-VM host whose selected VM bound late succeeds");
+    assert_eq!(
+        listings.len(),
+        2,
+        "the selected VM must not be dropped for a socket that was late"
+    );
+    assert_eq!(listings[0].vm, "default", "the selected VM lists first");
+    assert_eq!(listed_names(&listings[0]), ["api"], "the selected VM's box");
+    assert_eq!(listings[1].vm, "alpha");
+    assert_eq!(listed_names(&listings[1]), ["web"]);
+}
+
+/// The VMs a listing reaches past must not be waited on: a stopped VM's
+/// stale `ssh.sock` — the path a dead listener left behind — is "not
+/// running", one probe attempt with no retry and no warning, and a wedged
+/// one — the socket accepts, the daemon never speaks SSH — is bounded by the
+/// probe's short leash rather than the stacked connect, handshake and RPC
+/// deadlines that held a listing for ~72 s per wedged VM before the probe
+/// existed.
+#[tokio::test]
+async fn ls_leashes_the_vms_it_did_not_select() {
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    let provider = state.path().join("providers/local-minvmd0");
+    std::fs::create_dir_all(provider.join("alpha")).expect("the wedged VM's dir");
+    std::fs::create_dir_all(provider.join("beta")).expect("the stopped VM's dir");
+
+    // The selected VM, running, with its box.
+    let default_sock =
+        client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
+            .expect("the default VM's socket path");
+    let default_vm = minimald::test_harness::TestServer::new().await;
+    default_vm.listen_on_uds(&default_sock).await;
+    create_box_on(&default_vm, "api").await;
+
+    // A wedged VM: the socket accepts and never speaks SSH — the shape a
+    // suspended microVM presents behind an always-accepting bridge.
+    let wedged = tokio::net::UnixListener::bind(provider.join("alpha/ssh.sock"))
+        .expect("the wedged VM's socket binds");
+    tokio::spawn(async move {
+        // Accepted connections are held, never read, never closed: the
+        // handshake on the other end must be the one that gives up.
+        let mut held = Vec::new();
+        while let Ok((conn, _)) = wedged.accept().await {
+            held.push(conn);
+        }
+    });
+
+    // A stopped VM: the listener died and left its socket path behind.
+    let stale = std::os::unix::net::UnixListener::bind(provider.join("beta/ssh.sock"))
+        .expect("the stopped VM's socket path binds");
+    drop(stale);
+
+    let started = std::time::Instant::now();
+    let listings = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        cmd::ls_listings(&vm_globals(state.path(), None)),
+    )
+    .await
+    .expect("a listing that reaches past other VMs must not be held by any of them")
+    .expect("listing past a wedged and a stopped VM succeeds");
+    assert_eq!(listings.len(), 1, "only the running VM lists");
+    assert_eq!(listings[0].vm, "default");
+    assert_eq!(listed_names(&listings[0]), ["api"]);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(8),
+        "a wedged VM may hold the listing only for the probe's leash, \
+         not the handshake's own deadline ({elapsed:?})"
     );
 }
 
@@ -1984,5 +2156,99 @@ async fn box_name_resolves_vm_without_flag() {
     assert!(
         err.contains("--vm"),
         "the refusal must point at the disambiguator: {err}"
+    );
+}
+
+/// NET-058's attach half: `min session attach <box>` asks the selected VM's
+/// daemon first and, when that daemon does not know the name, falls through
+/// to the VM that owns it — the record *and* the socket the SSH hand-off runs
+/// over are the owning VM's, not the selected one's. The helper is driven
+/// directly, without the live session shell behind the hand-off: what the
+/// hand-off consumes is exactly what it returns.
+#[tokio::test]
+async fn attach_fall_through_hands_off_the_owning_vm() {
+    let (state, default_vm, alpha) = two_vms().await;
+    let api = create_box_on(&default_vm, "api").await;
+    let web = create_box_on(&alpha, "web").await;
+    let global = vm_globals(state.path(), None);
+    let selected =
+        client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
+            .expect("the selected VM's socket path");
+    let mut client = client::Client::connect(&selected)
+        .await
+        .expect("connect to the selected VM's daemon");
+
+    // A name only alpha knows: the selected VM's daemon has just said so, so
+    // the target is alpha's record over alpha's socket.
+    let (record, handed_off) =
+        cmd::resolve_attach_target_version_gated(&global, &mut client, selected.clone(), "web")
+            .await
+            .expect("a name alpha owns resolves through the selected VM's miss");
+    assert_eq!(
+        record.id, web,
+        "the owning VM's record, not the selected one's"
+    );
+    assert_eq!(record.name.as_deref(), Some("web"));
+    assert_eq!(
+        handed_off,
+        state.path().join("providers/local-minvmd0/alpha/ssh.sock"),
+        "the hand-off runs over the owning VM's socket"
+    );
+
+    // A name the selected VM itself knows never leaves it.
+    let (on_selected, its_sock) =
+        cmd::resolve_attach_target_version_gated(&global, &mut client, selected.clone(), "api")
+            .await
+            .expect("a name the selected VM owns resolves on the selected VM");
+    assert_eq!(on_selected.id, api);
+    assert_eq!(its_sock, selected, "the selected VM's own socket");
+
+    // A name nothing owns reports the selected VM's own miss: it is the
+    // more useful of the two answers.
+    let err =
+        cmd::resolve_attach_target_version_gated(&global, &mut client, selected, "no-such-box")
+            .await
+            .expect_err("an unowned name is the selected VM's error");
+    assert!(
+        err.to_string().contains("no-such-box"),
+        "the miss names what was asked for: {err}"
+    );
+}
+
+/// The resolution path gets the same treatment as the listing: a stopped
+/// VM's stale `ssh.sock` is probed once — "not running", not a fault to retry
+/// for — so a name resolution across every VM costs the VMs that are up, not
+/// the stopped ones' retry windows.
+#[tokio::test]
+async fn a_stopped_vm_does_not_hold_a_box_name_resolution() {
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    let provider = state.path().join("providers/local-minvmd0");
+    std::fs::create_dir_all(provider.join("beta")).expect("the stopped VM's dir");
+
+    let default_sock =
+        client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
+            .expect("the default VM's socket path");
+    let default_vm = minimald::test_harness::TestServer::new().await;
+    default_vm.listen_on_uds(&default_sock).await;
+    create_box_on(&default_vm, "api").await;
+
+    // The stopped VM: a dead listener's socket path, still enumerable.
+    let stale = std::os::unix::net::UnixListener::bind(provider.join("beta/ssh.sock"))
+        .expect("the stopped VM's socket path binds");
+    drop(stale);
+
+    let global = vm_globals(state.path(), None);
+    let started = std::time::Instant::now();
+    let resolved = attach::resolve_box_vm(&global, "api")
+        .await
+        .expect("resolving past a stopped VM succeeds")
+        .expect("'api' lives on the running VM");
+    let elapsed = started.elapsed();
+    assert_eq!(resolved.vm, "default", "the VM that owns the name");
+    assert_eq!(resolved.record.name.as_deref(), Some("api"));
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "a stopped VM's stale socket must not charge the resolution its \
+         connect-retry window ({elapsed:?})"
     );
 }
