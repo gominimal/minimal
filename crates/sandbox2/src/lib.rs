@@ -488,7 +488,16 @@ impl Container {
 ///   boxes/                every box leaf lives under here, and the daemon
 ///                         never places itself under it (NET-078's two
 ///                         identities)
-///     <box-id>/           one leaf per box, named by its session id, created
+///     deny/               the subtree a box whose declaration admits no
+///                         destination lives in: the packet-filter rule that
+///                         refuses a deny-all box's connections matches this
+///                         subtree by cgroup path, so no leaf may sit
+///                         directly under `boxes/` — one there would be
+///                         decided by no rule at all (NET-079)
+///     allow/              every other box, whatever it declared: the shipped
+///                         allow-all included, and its traffic is one of the
+///                         cohort's (NET-078)
+///       <box-id>/         one leaf per box, named by its session id, created
 ///                         before the spawn and removed after the box is
 ///                         reaped; an empty one a daemon death left behind is
 ///                         swept at the next daemon start
@@ -541,6 +550,7 @@ impl Container {
 /// asserts: the host-side `cgroup.procs` holds the box's pid while the box
 /// reads `0::/`.
 pub mod classifier {
+    use crate::config;
     use std::path::{Path, PathBuf};
 
     /// The daemon's tree root: where the host's cgroup2 mount carries the
@@ -557,6 +567,20 @@ pub mod classifier {
     /// The host-address cohort: every box leaf lives under here, and the
     /// daemon never places itself under it (NET-078's two identities).
     pub const BOXES_DIR: &str = "boxes";
+
+    /// The presence marker of the packet-filter table the privileged step
+    /// installs (NET-079): a cgroup directory under the tree root — on real
+    /// cgroupfs a plain file cannot exist, so the marker is a cgroup that
+    /// holds no process, and on the stand-in trees a test rehearses against
+    /// it is a directory. The step writes it *after* the one `nft -f`
+    /// transaction that loads the table succeeds, so it records "the table
+    /// that decides a deny-all box's connections is loaded" — and the daemon
+    /// probes it read-only, because listing a table needs the very
+    /// capability the step runs with (`nft list table` is CAP_NET_ADMIN).
+    /// Nothing else creates it: the guest builds its own tree but no table,
+    /// so a guest's marker is honestly absent and its recorded state says
+    /// the table is not there.
+    pub const TABLE_MARKER: &str = "classifier-table";
 
     /// The conventional cgroup2 mountpoint: where the box's classifier tree
     /// is bound for the join, and where the cover — the design's read-only
@@ -612,11 +636,20 @@ pub mod classifier {
         }
     }
 
-    /// The leaf for `box_id` under `root` — a directory in the daemon's own
-    /// namespaces, resolved before any of the box's namespaces exist.
+    /// The leaf for `box_id` under `root`, in the cohort subtree `verdict`
+    /// picks — `<root>/boxes/<deny|allow>/<box-id>`, never
+    /// `<root>/boxes/<box-id>`: both subtrees share one depth, so the
+    /// cohort's source-identity match (NET-078) covers a leaf in either
+    /// subtree at the same level, and the deny-all refusal (NET-079) matches
+    /// the `deny` subtree alone — a leaf directly under the cohort would be
+    /// decided by no rule at all, which is why none may sit there. A
+    /// directory in the daemon's own namespaces, resolved before any of the
+    /// box's namespaces exist.
     #[must_use]
-    pub fn box_leaf(root: &Path, box_id: &str) -> PathBuf {
-        root.join(BOXES_DIR).join(sanitize_box_id(box_id))
+    pub fn box_leaf(root: &Path, box_id: &str, verdict: config::Verdict) -> PathBuf {
+        root.join(BOXES_DIR)
+            .join(verdict.dir_name())
+            .join(sanitize_box_id(box_id))
     }
 
     /// The name of the report file the box's pre-exec closure writes into
@@ -633,19 +666,24 @@ pub mod classifier {
         format!("minimal-closure-{box_id}")
     }
 
-    /// Creates the box's leaf under `root`, before the box's first process
-    /// exists. Requires the tree the privileged step installs (or the guest
-    /// daemon builds): `<root>/boxes` must already exist and be delegated to
-    /// the daemon's account, and its absence is the `NotFound` that tells the
-    /// daemon this host has no per-box classifier at all — the box then runs
+    /// Creates the box's leaf under `root`, in the subtree `verdict` picks,
+    /// before the box's first process exists. Requires the tree the
+    /// privileged step installs (or the guest daemon builds): the cohort's
+    /// two subtrees must already exist and be delegated to the daemon's
+    /// account, and their absence is the `NotFound` that tells the daemon
+    /// this host has no per-box classifier at all — the box then runs
     /// unenforced, never refused (NET-079's exception).
     ///
     /// A leaf that already exists is surfaced, not reused: the leaf is named
     /// by its session's id, so on a fresh launch an existing one is a
     /// collision — another session holds it — and [`sweep_box_leaves`] has
     /// already taken the empty directories a daemon death leaves behind.
-    pub fn create_box_leaf(root: &Path, box_id: &str) -> std::io::Result<PathBuf> {
-        let leaf = box_leaf(root, box_id);
+    pub fn create_box_leaf(
+        root: &Path,
+        box_id: &str,
+        verdict: config::Verdict,
+    ) -> std::io::Result<PathBuf> {
+        let leaf = box_leaf(root, box_id, verdict);
         std::fs::create_dir(&leaf).map(|()| leaf)
     }
 
@@ -691,29 +729,40 @@ pub mod classifier {
     /// a cgroup holds a process is the sweep's own test of emptiness: a leaf
     /// that goes was nobody's, and a leaf that stays belongs to a session the
     /// daemon no longer knows — which is the collision its next launch
-    /// reports rather than a directory it reuses. A missing `boxes/` is not
-    /// an error; it is the host with no tree at all.
+    /// reports rather than a directory it reuses. A missing cohort is not an
+    /// error; it is the host with no tree at all.
+    ///
+    /// Sweeps *both* subtrees and nothing else: a box's leaf is always under
+    /// one of them (NET-079), so the cohort's own direct children — the two
+    /// subtrees the step installs — are not the sweep's to test. A leaf left
+    /// directly under the cohort by a daemon predating the subtrees is not
+    /// swept either: `rmdir` on a direct child would remove the subtrees
+    /// themselves the moment both were empty, so the sweep keeps to the
+    /// leaves it could own.
     ///
     /// Returns the leaves it removed, so the caller can say what it swept.
     pub fn sweep_box_leaves(root: &Path) -> std::io::Result<Vec<PathBuf>> {
         let mut swept = Vec::new();
-        let entries = match std::fs::read_dir(root.join(BOXES_DIR)) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(swept),
-            Err(e) => return Err(e),
-        };
-        for entry in entries {
-            let Ok(entry) = entry else { continue };
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            // `rmdir` refuses — `EBUSY` over a real tree, `ENOTEMPTY` over a
-            // stand-in holding a `cgroup.procs` — whatever still has a
-            // session in it, and that refusal is kept, not an error: the
-            // sweep owes a leaf its removal only when the leaf is empty.
-            if std::fs::remove_dir(&path).is_ok() {
-                swept.push(path);
+        for subtree in [config::DENY_DIR, config::ALLOW_DIR] {
+            let entries = match std::fs::read_dir(root.join(BOXES_DIR).join(subtree)) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            for entry in entries {
+                let Ok(entry) = entry else { continue };
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                // `rmdir` refuses — `EBUSY` over a real tree, `ENOTEMPTY`
+                // over a stand-in holding a `cgroup.procs` — whatever still
+                // has a session in it, and that refusal is kept, not an
+                // error: the sweep owes a leaf its removal only when the
+                // leaf is empty.
+                if std::fs::remove_dir(&path).is_ok() {
+                    swept.push(path);
+                }
             }
         }
         Ok(swept)
@@ -723,7 +772,10 @@ pub mod classifier {
     /// the daemon-side half of the placement, proved by doing it: a
     /// throwaway child of this process migrates into a throwaway leaf and
     /// back out, and the probe succeeding is the only evidence that the join
-    /// the box's own pre-exec closure makes can succeed.
+    /// the box's own pre-exec closure makes can succeed. The leaf is made in
+    /// the subtree `verdict` picks, the same one the launch's own leaf will
+    /// live in: the subtrees share one delegation, but the probe answers for
+    /// the cgroup the box is actually about to be placed in.
     ///
     /// The kernel gates that migration on write permission to the
     /// `cgroup.procs` of the *common ancestor* of source and destination, so
@@ -738,11 +790,16 @@ pub mod classifier {
     /// own pid-1 hand in the guest — needs no help, and every launch pays
     /// one throwaway migration for the proof.
     #[cfg(target_os = "linux")]
-    pub fn probe_child_placement(root: &Path) -> std::io::Result<()> {
-        // A throwaway leaf under the cohort, named by this daemon's pid so
-        // two daemons probing one tree never share one, and removed first so
-        // a probe that died before its own cleanup cannot wedge the next.
-        let leaf = box_leaf(root, &format!("placement-probe-{}", std::process::id()));
+    pub fn probe_child_placement(root: &Path, verdict: config::Verdict) -> std::io::Result<()> {
+        // A throwaway leaf under the cohort, in the verdict's subtree, named
+        // by this daemon's pid so two daemons probing one tree never share
+        // one, and removed first so a probe that died before its own cleanup
+        // cannot wedge the next.
+        let leaf = box_leaf(
+            root,
+            &format!("placement-probe-{}", std::process::id()),
+            verdict,
+        );
         let _ = std::fs::remove_dir(&leaf);
         std::fs::create_dir(&leaf)?;
         let placed = place_child_in(&leaf.join("cgroup.procs"));
@@ -894,6 +951,21 @@ pub mod classifier {
         }
     }
 
+    /// The command a person runs on this host to move *this daemon* into the
+    /// tree its boxes are placed in: the installer's `--pid` step is the one
+    /// migration the delegated account cannot make itself, so the hint names
+    /// this daemon's pid — the one fact the person cannot guess and the
+    /// advisory that carries the hint would otherwise have to name a
+    /// placeholder for.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn place_hint() -> String {
+        format!(
+            "sudo scripts/install-host-classifier.sh --pid {}",
+            std::process::id()
+        )
+    }
+
     /// Moves this process into `root`'s [`DAEMON_LEAF`], as the daemon does at
     /// startup: its own traffic then leaves from a leaf of its own (NET-080),
     /// never classed with a box's, and the daemon sits in a *sibling* of every
@@ -911,14 +983,30 @@ pub mod classifier {
     /// it can place a box in from one it cannot, and nothing boxes into a
     /// leaf before that.
     ///
-    /// Also asks the kernel for the `memory` controller on the cohort —
-    /// best-effort, and safe: `boxes/` holds no process, so enabling a
-    /// controller on it breaks no internal-process rule. A leaf without it
-    /// carries no `memory.max` at all, so no reader — a diagnostics bundle
-    /// on the host side, or the box itself under the design's own cover —
-    /// can name the limit a box's verdict is decided on.
+    /// Also asks the kernel for the `memory` controller on the cohort and on
+    /// both of its subtrees — best-effort, and safe: none of them holds a
+    /// process, so enabling a controller on any of them breaks no
+    /// internal-process rule. A leaf without it carries no `memory.max` at
+    /// all, so no reader — a diagnostics bundle on the host side, or the box
+    /// itself under the design's own cover — can name the limit a box's
+    /// verdict is decided on.
     pub fn enter_daemon_leaf(root: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(root.join(BOXES_DIR))?;
+        // The cohort and both of its subtrees: a box leaf is now a grandchild
+        // of the cohort, so the subtree its verdict picks must exist before
+        // the launch that places it. Already-there is the common case (the
+        // installer made them, or a previous daemon did).
+        let mut tree = vec![root.join(BOXES_DIR)];
+        for subtree in [config::DENY_DIR, config::ALLOW_DIR] {
+            let dir = root.join(BOXES_DIR).join(subtree);
+            std::fs::create_dir(&dir).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })?;
+            tree.push(dir);
+        }
         let daemon = daemon_leaf(root);
         std::fs::create_dir(&daemon).or_else(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -930,18 +1018,22 @@ pub mod classifier {
         // Over a stand-in tree (a test's) this writes a plain file; over a
         // real tree the kernel takes `+memory` as a subtree_control command
         // and may refuse it — a host without the memory controller, or one
-        // that has it threaded off, still gets its boxes placed.
-        if let Err(e) = std::fs::write(
-            root.join(BOXES_DIR).join("cgroup.subtree_control"),
-            "+memory\n",
-        ) && e.kind() != std::io::ErrorKind::NotFound
-            && e.kind() != std::io::ErrorKind::PermissionDenied
-        {
-            tracing::warn!(
-                error = %e,
-                "enabling the memory controller on the box cohort; a box leaf \
-                 may carry no memory.max for a reader to name its limit from"
-            );
+        // that has it threaded off, still gets its boxes placed. The cohort
+        // comes first and the subtrees after it: over a real tree a
+        // controller reaches a cgroup only once the cgroup above it has
+        // enabled it, so the cascade order is the only one that works.
+        for dir in &tree {
+            if let Err(e) = std::fs::write(dir.join("cgroup.subtree_control"), "+memory\n")
+                && e.kind() != std::io::ErrorKind::NotFound
+                && e.kind() != std::io::ErrorKind::PermissionDenied
+            {
+                tracing::warn!(
+                    error = %e,
+                    "enabling the memory controller on {} ; a box leaf \
+                     may carry no memory.max for a reader to name its limit from",
+                    dir.display()
+                );
+            }
         }
         place_pid(&daemon.join("cgroup.procs"), std::process::id())
     }
@@ -4534,7 +4626,17 @@ int main(int argc, char **argv) {
         std::fs::create_dir_all(tree.path().join(classifier::BOXES_DIR))
             .expect("creating the cohort directory");
 
-        let missing = classifier::probe_child_placement(tree.path())
+        // The probe asks its question in the subtree the box it is about is
+        // declared into: a deny-all box is probed in `deny`, so that is the
+        // cohort the stand-in tree needs and the one the throwaway leaf
+        // lands in.
+        let deny = tree
+            .path()
+            .join(classifier::BOXES_DIR)
+            .join(config::DENY_DIR);
+        std::fs::create_dir(&deny).expect("creating the deny subtree");
+
+        let missing = classifier::probe_child_placement(tree.path(), config::Verdict::Deny)
             .expect_err("over a stand-in tree nothing made the probe leaf's cgroup.procs");
         assert_eq!(
             missing.kind(),
@@ -4548,7 +4650,8 @@ int main(int argc, char **argv) {
         assert!(
             !classifier::box_leaf(
                 tree.path(),
-                &format!("placement-probe-{}", std::process::id())
+                &format!("placement-probe-{}", std::process::id()),
+                config::Verdict::Deny,
             )
             .exists(),
             "the throwaway leaf the probe made is gone, failure or not"
@@ -4556,8 +4659,11 @@ int main(int argc, char **argv) {
 
         // A host with no cohort directory at all says the same thing one step
         // earlier: the probe never made its leaf.
-        let bare = classifier::probe_child_placement(tree.path().join("no-such-tree").as_path())
-            .expect_err("the probe cannot make a leaf under a tree that is absent");
+        let bare = classifier::probe_child_placement(
+            tree.path().join("no-such-tree").as_path(),
+            config::Verdict::Deny,
+        )
+        .expect_err("the probe cannot make a leaf under a tree that is absent");
         assert_eq!(
             bare.kind(),
             std::io::ErrorKind::NotFound,
@@ -4618,14 +4724,21 @@ int main(int argc, char **argv) {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
         let boxes = tree.path().join(classifier::BOXES_DIR);
         std::fs::create_dir_all(&boxes).expect("creating the cohort directory");
+        for subtree in [config::DENY_DIR, config::ALLOW_DIR] {
+            std::fs::create_dir(boxes.join(subtree)).expect("creating the cohort's two subtrees");
+        }
 
         // The box-id is derived from the session's name, which is user input.
+        // A deny-all session names a leaf in the deny subtree — the one
+        // subtree a session's declaration can land it in.
         let hostile = "box ../../cannot --see=or join";
-        let leaf = classifier::create_box_leaf(tree.path(), hostile)
+        let leaf = classifier::create_box_leaf(tree.path(), hostile, config::Verdict::Deny)
             .expect("creating the box's leaf before its first process exists");
         assert_eq!(
             leaf,
-            boxes.join("box....cannot--seeorjoin"),
+            boxes
+                .join(config::DENY_DIR)
+                .join("box....cannot--seeorjoin"),
             "a session name is user input, so the leaf it names must be a \
              single sanitized component: its separators are dropped, so a \
              traversal (`../..`) cannot leave the cohort, and it never starts \
@@ -4675,11 +4788,21 @@ int main(int argc, char **argv) {
         // A leaf that already exists is a collision, not a reuse: the leaf is
         // named by the session that holds it, so a fresh launch finding one
         // is told — and the sweep below has already taken what a daemon
-        // death left behind.
-        classifier::create_box_leaf(tree.path(), "held by another session")
-            .expect("creating the leaf a second session will collide with");
-        let collision = classifier::create_box_leaf(tree.path(), "held by another session")
-            .expect_err("a leaf another session holds is not taken over");
+        // death left behind. The colliding session here is declared into
+        // the allow subtree, so the collision is pinned in the other half of
+        // the cohort too.
+        classifier::create_box_leaf(
+            tree.path(),
+            "held by another session",
+            config::Verdict::Allow,
+        )
+        .expect("creating the leaf a second session will collide with");
+        let collision = classifier::create_box_leaf(
+            tree.path(),
+            "held by another session",
+            config::Verdict::Allow,
+        )
+        .expect_err("a leaf another session holds is not taken over");
         assert_eq!(
             collision.kind(),
             std::io::ErrorKind::AlreadyExists,
@@ -4689,6 +4812,7 @@ int main(int argc, char **argv) {
         classifier::remove_box_leaf(&classifier::box_leaf(
             tree.path(),
             "held by another session",
+            config::Verdict::Allow,
         ))
         .expect("dropping the collision leaf now that it has done its work");
 
@@ -4696,12 +4820,17 @@ int main(int argc, char **argv) {
         // leaves behind — and only those: a leaf that still holds a session
         // is refused by its `rmdir`, over a real tree because the kernel
         // will not remove a cgroup holding a process, and over this stand-in
-        // because the modelled procs file stands in for them.
-        let held = classifier::create_box_leaf(tree.path(), "a live session")
-            .expect("creating the leaf a live session holds");
+        // because the modelled procs file stands in for them. The held leaf
+        // and the abandoned one are deliberately in different subtrees, so
+        // the sweep is proved to walk both and to refuse the occupied one
+        // wherever it sits.
+        let held =
+            classifier::create_box_leaf(tree.path(), "a live session", config::Verdict::Deny)
+                .expect("creating the leaf a live session holds");
         model_cgroup_files(&held);
-        let empty = classifier::create_box_leaf(tree.path(), "an abandoned launch")
-            .expect("creating the leaf a daemon death left behind");
+        let empty =
+            classifier::create_box_leaf(tree.path(), "an abandoned launch", config::Verdict::Allow)
+                .expect("creating the leaf a daemon death left behind");
         assert_eq!(
             classifier::sweep_box_leaves(tree.path()).expect("sweeping the cohort at daemon start"),
             vec![empty.clone()],
@@ -4725,8 +4854,12 @@ int main(int argc, char **argv) {
         // daemon reads this as "no per-box classifier on this host" and runs
         // the box unenforced (NET-079's exception) — or, in the guest, refuses
         // a host-address box rather than run it unenforced (design §7.1).
-        let missing = classifier::create_box_leaf(tree.path().join("no-such-tree").as_path(), "b")
-            .expect_err("a tree that was never installed refuses the leaf");
+        let missing = classifier::create_box_leaf(
+            tree.path().join("no-such-tree").as_path(),
+            "b",
+            config::Verdict::Deny,
+        )
+        .expect_err("a tree that was never installed refuses the leaf");
         assert_eq!(
             missing.kind(),
             std::io::ErrorKind::NotFound,
@@ -4743,26 +4876,42 @@ int main(int argc, char **argv) {
         let box_tree = tempfile::tempdir().expect("a temp dir standing in for the box's tree");
         std::fs::create_dir_all(box_tree.path().join(classifier::BOXES_DIR))
             .expect("creating the cohort directory");
+        for subtree in [config::DENY_DIR, config::ALLOW_DIR] {
+            std::fs::create_dir(box_tree.path().join(classifier::BOXES_DIR).join(subtree))
+                .expect("creating the cohort's two subtrees");
+        }
+        // The box is declared deny-all, so its leaf is in the deny subtree;
+        // the sibling it must not reach sits in the allow subtree, the
+        // farthest leaf from it the cohort offers.
         let leaf = config::ClassifierLeaf::new(
-            classifier::create_box_leaf(box_tree.path(), "cg-probe")
+            classifier::create_box_leaf(box_tree.path(), "cg-probe", config::Verdict::Deny)
                 .expect("creating the box's leaf before its first process exists"),
         );
-        let _sibling = classifier::create_box_leaf(box_tree.path(), "the-other-box")
-            .expect("creating the sibling's leaf, for the box to fail to reach");
+        let _sibling =
+            classifier::create_box_leaf(box_tree.path(), "the-other-box", config::Verdict::Allow)
+                .expect("creating the sibling's leaf, for the box to fail to reach");
         // The kernel made both leaves' files when it made the leaves; over a
         // stand-in tree nothing did, and the box's own join — the write its
         // pre-exec closure makes through the tree the sandbox bound — is
         // into the modelled procs file.
         model_cgroup_files(leaf.dir());
-        model_cgroup_files(&classifier::box_leaf(box_tree.path(), "the-other-box"));
+        model_cgroup_files(&classifier::box_leaf(
+            box_tree.path(),
+            "the-other-box",
+            config::Verdict::Allow,
+        ));
 
         let mountpoint = classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT.to_string();
         let controllers = format!("{mountpoint}/cgroup.controllers");
         let root_procs = format!("{mountpoint}/cgroup.procs");
-        let sibling_procs = classifier::box_leaf(Path::new(&mountpoint), "the-other-box")
-            .join("cgroup.procs")
-            .to_string_lossy()
-            .into_owned();
+        let sibling_procs = classifier::box_leaf(
+            Path::new(&mountpoint),
+            "the-other-box",
+            config::Verdict::Allow,
+        )
+        .join("cgroup.procs")
+        .to_string_lossy()
+        .into_owned();
         let probe_args = vec![
             format!("STATFS:{mountpoint}"),
             format!("READ:{controllers}"),
@@ -5031,23 +5180,27 @@ int main(int argc, char **argv) {
         }
         let root = Path::new(classifier::TREE_ROOT);
         let boxes = root.join(classifier::BOXES_DIR);
-        if !boxes.is_dir() {
-            eprintln!(
-                "{SKIP}: {} is absent — this host has no classifier tree to \
-                 place a box in (scripts/install-host-classifier.sh installs one)",
-                boxes.display()
-            );
-            return;
+        let deny = boxes.join(config::DENY_DIR);
+        let allow = boxes.join(config::ALLOW_DIR);
+        for subtree in [&deny, &allow] {
+            if !subtree.is_dir() {
+                eprintln!(
+                    "{SKIP}: {} is absent — this host has no classifier tree to \
+                     place a box in (scripts/install-host-classifier.sh installs one)",
+                    subtree.display()
+                );
+                return;
+            }
         }
-        if nix::unistd::access(&boxes, nix::unistd::AccessFlags::W_OK).is_err() {
+        if nix::unistd::access(&deny, nix::unistd::AccessFlags::W_OK).is_err() {
             eprintln!(
                 "{SKIP}: {} is not writable by this account — the tree is \
                  installed but not delegated to the account this process runs as",
-                boxes.display()
+                deny.display()
             );
             return;
         }
-        if let Err(e) = classifier::probe_child_placement(root) {
+        if let Err(e) = classifier::probe_child_placement(root, config::Verdict::Deny) {
             eprintln!(
                 "{SKIP}: this process cannot place a child in the tree ({e}; it \
                  runs in {}) — the installer's --pid step or a Delegate=yes unit \
@@ -5060,34 +5213,39 @@ int main(int argc, char **argv) {
         }
 
         // Two leaves of the real cohort, this test's own: the box's, and a
-        // sibling's the box must not reach.
+        // sibling's the box must not reach. The box is declared deny-all, so
+        // its leaf is in the deny subtree; the sibling sits in the allow
+        // subtree, the farthest leaf from it the cohort offers.
         let box_id = format!("host-address-{}", std::process::id());
         let sibling_id = format!("sibling-of-{box_id}");
-        let leaf = classifier::create_box_leaf(root, &box_id)
+        let leaf = classifier::create_box_leaf(root, &box_id, config::Verdict::Deny)
             .expect("creating the box's leaf in the real tree");
-        let sibling = classifier::create_box_leaf(root, &sibling_id)
+        let sibling = classifier::create_box_leaf(root, &sibling_id, config::Verdict::Allow)
             .expect("creating the sibling's leaf in the real tree");
         let mountpoint = classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT.to_string();
         let controllers = format!("{mountpoint}/cgroup.controllers");
         let memory_max = format!("{mountpoint}/memory.max");
         let root_procs = format!("{mountpoint}/cgroup.procs");
-        let sibling_procs = classifier::box_leaf(Path::new(&mountpoint), &sibling_id)
-            .join("cgroup.procs")
-            .to_string_lossy()
-            .into_owned();
+        let sibling_procs =
+            classifier::box_leaf(Path::new(&mountpoint), &sibling_id, config::Verdict::Allow)
+                .join("cgroup.procs")
+                .to_string_lossy()
+                .into_owned();
 
-        // The memory controller on the cohort, the same enabling a running
-        // daemon performs at its start (`enter_daemon_leaf`): without it a
-        // leaf carries no `memory.max` at all, and this proof reads the box's
-        // own limit under the design's cover — the assertion that the box's
-        // verdict is where a runtime looks. Best-effort and warned, as in
-        // the daemon; a host without the controller is one the design's own
-        // diagnostics already tell.
-        if let Err(e) = std::fs::write(boxes.join("cgroup.subtree_control"), "+memory\n")
-            && e.kind() != std::io::ErrorKind::NotFound
-            && e.kind() != std::io::ErrorKind::PermissionDenied
-        {
-            panic!("enabling the memory controller on the real cohort: {e}");
+        // The memory controller on the cohort and on both of its subtrees,
+        // the same enabling a running daemon performs at its start
+        // (`enter_daemon_leaf`): without it a leaf carries no `memory.max` at
+        // all, and this proof reads the box's own limit under the design's
+        // cover — the assertion that the box's verdict is where a runtime
+        // looks. Best-effort and warned, as in the daemon; a host without the
+        // controller is one the design's own diagnostics already tell.
+        for dir in [&boxes, &deny, &allow] {
+            if let Err(e) = std::fs::write(dir.join("cgroup.subtree_control"), "+memory\n")
+                && e.kind() != std::io::ErrorKind::NotFound
+                && e.kind() != std::io::ErrorKind::PermissionDenied
+            {
+                panic!("enabling the memory controller on the real cohort: {e}");
+            }
         }
 
         // The probe holds the box in its leaf for a while — the kernel drops

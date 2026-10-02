@@ -187,6 +187,52 @@ impl WdSetup {
     }
 }
 
+/// The cohort subtree a box whose declaration admits no destination lives
+/// in (NET-079): the packet-filter rule that refuses a deny-all box's
+/// connections matches this subtree, so a leaf anywhere else — directly
+/// under the cohort, or under [`ALLOW_DIR`] — is decided by a rule that does
+/// not name it.
+pub const DENY_DIR: &str = "deny";
+
+/// The cohort subtree every other box lives in (NET-079): a box that
+/// declared nothing, or declared a list, keeps the shipped allow-all — the
+/// verdict its leaf is decided on is `allow`, and its traffic is one of the
+/// cohort's (NET-078), never the node plane's.
+pub const ALLOW_DIR: &str = "allow";
+
+/// Which cohort subtree a box's leaf lives in (NET-079): the classifier's
+/// answer to "what does this box's declaration admit?", spelled as the one
+/// path component that picks the subtree — `deny` for a declaration that
+/// admits no destination, `allow` for every other box, whatever it declared.
+///
+/// Decided once, from the declaration, at the box's launch: a declaration is
+/// fixed at create (tightening is recreate), so the verdict is a property of
+/// the leaf the box is placed in rather than something a launch or a stop
+/// edits. `sandbox2` knows the *name* of the verdict and nothing about the
+/// declarations that map onto it — the mapping lives where the declaration
+/// does, in the daemon, so this crate never learns what an egress section is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// The box's declaration admits no destination; its leaf is under
+    /// [`DENY_DIR`], and the rule that refuses its connections matches.
+    Deny,
+    /// Every other box; its leaf is under [`ALLOW_DIR`], and only the
+    /// cohort's identity (NET-078) is carried on its traffic.
+    Allow,
+}
+
+impl Verdict {
+    /// The cohort subtree this verdict's leaves live in — the one path
+    /// component that places a leaf: `<tree>/boxes/<dir_name>/<box-id>`.
+    #[must_use]
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            Self::Deny => DENY_DIR,
+            Self::Allow => ALLOW_DIR,
+        }
+    }
+}
+
 /// The classifier leaf a box is placed in: the cgroup its egress verdict is
 /// decided on (NET-079, design §4.1), and the one no process of the box may
 /// leave or let another box join.
@@ -206,15 +252,27 @@ impl WdSetup {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassifierLeaf {
     /// The leaf's directory in the daemon's classifier tree, e.g.
-    /// `<tree>/boxes/<box-id>`.
+    /// `<tree>/boxes/<deny|allow>/<box-id>` — never `<tree>/boxes/<box-id>`:
+    /// a leaf directly under the cohort sits outside both subtrees, so the
+    /// deny rule's match on [`DENY_DIR`] would silently miss it (NET-079).
     dir: PathBuf,
 }
 
 impl ClassifierLeaf {
-    /// A leaf at `dir`, e.g. `<tree>/boxes/<box-id>`.
+    /// A leaf at `dir`, e.g. `<tree>/boxes/<deny|allow>/<box-id>`.
     #[must_use]
     pub fn new<P: Into<PathBuf>>(dir: P) -> Self {
         Self { dir: dir.into() }
+    }
+
+    /// The leaf for `box_id` under `root`'s cohort, in the subtree `verdict`
+    /// picks — the spelling the daemon's own placement creates, so a caller
+    /// that knows the verdict can name the leaf without duplicating the
+    /// layout: `<root>/boxes/<deny|allow>/<sanitized box-id>`, one level
+    /// below the cohort in either subtree, never the cohort itself.
+    #[must_use]
+    pub fn under(root: &Path, box_id: &str, verdict: Verdict) -> Self {
+        Self::new(crate::classifier::box_leaf(root, box_id, verdict))
     }
 
     /// The leaf's directory in the daemon's classifier tree.
@@ -233,25 +291,26 @@ impl ClassifierLeaf {
         self.dir.join("cgroup.procs")
     }
 
-    /// The tree this leaf belongs to — `dir`'s parent's parent, since every
-    /// leaf is `<tree>/<BOXES_DIR>/<box-id>`. The daemon resolves the leaf
-    /// through it, and the sandbox binds *it* into the box at the
-    /// conventional cgroup mountpoint, so the box's own join goes through the
-    /// tree it is a leaf of — which the box then covers, so no process it
-    /// runs is left a cgroup path at all.
+    /// The tree this leaf belongs to — `dir`'s parent's parent's parent, since
+    /// every leaf is `<tree>/<BOXES_DIR>/<deny|allow>/<box-id>`. The daemon
+    /// resolves the leaf through it, and the sandbox binds *it* into the box
+    /// at the conventional cgroup mountpoint, so the box's own join goes
+    /// through the tree it is a leaf of — which the box then covers, so no
+    /// process it runs is left a cgroup path at all.
     #[must_use]
     pub fn tree_root(&self) -> PathBuf {
         self.dir
             .parent()
             .and_then(Path::parent)
+            .and_then(Path::parent)
             .map_or_else(|| self.dir.clone(), Path::to_path_buf)
     }
 
     /// The leaf's path under its [`tree_root`](Self::tree_root) —
-    /// `<BOXES_DIR>/<box-id>`. The box joins its leaf through the tree bound
-    /// at the conventional mountpoint, so this is the one spelling of the
-    /// leaf that resolves *inside* the box, before its cgroup namespace is
-    /// unshared onto the leaf.
+    /// `<BOXES_DIR>/<deny|allow>/<box-id>`. The box joins its leaf through
+    /// the tree bound at the conventional mountpoint, so this is the one
+    /// spelling of the leaf that resolves *inside* the box, before its cgroup
+    /// namespace is unshared onto the leaf.
     #[must_use]
     pub fn relative_dir(&self) -> PathBuf {
         self.dir
@@ -988,8 +1047,10 @@ mod tests {
              classifier existed"
         );
 
+        // The depth the verdict's subtrees add (NET-079): a leaf is
+        // `<tree>/boxes/<deny|allow>/<box-id>`, never `<tree>/boxes/<box-id>`.
         let config = session_config().with_classifier_leaf(ClassifierLeaf::new(
-            "/sys/fs/cgroup/minimald.slice/boxes/b1",
+            "/sys/fs/cgroup/minimald.slice/boxes/deny/b1",
         ));
         let leaf = config
             .classifier_leaf
@@ -998,14 +1059,48 @@ mod tests {
 
         assert_eq!(
             leaf.dir(),
-            Path::new("/sys/fs/cgroup/minimald.slice/boxes/b1"),
+            Path::new("/sys/fs/cgroup/minimald.slice/boxes/deny/b1"),
             "the leaf's directory is the placement the daemon created"
         );
         assert_eq!(
             leaf.procs(),
-            Path::new("/sys/fs/cgroup/minimald.slice/boxes/b1/cgroup.procs"),
+            Path::new("/sys/fs/cgroup/minimald.slice/boxes/deny/b1/cgroup.procs"),
             "the leaf's migration target is its own cgroup.procs, so the \
              daemon and an injected process write the same file"
         );
+        assert_eq!(
+            leaf.tree_root(),
+            Path::new("/sys/fs/cgroup/minimald.slice"),
+            "the tree is three levels up from the leaf: cohort, then the \
+             verdict's subtree, then the leaf"
+        );
+        assert_eq!(
+            leaf.relative_dir(),
+            Path::new("boxes/deny/b1"),
+            "the leaf's spelling inside the box names the subtree its verdict \
+             picked, so the join the box's own closure makes goes through the \
+             one cgroup its verdict is decided on"
+        );
+
+        // The per-verdict constructor spells the same leaf from the tree and
+        // the session's name, in either subtree — the layout lives in one
+        // place, not in every caller that names a leaf. The name goes through
+        // the same sanitize as the placement, so its separators are dropped.
+        let root = Path::new("/sys/fs/cgroup/minimald.slice");
+        for (verdict, dir) in [
+            (super::Verdict::Deny, "deny"),
+            (super::Verdict::Allow, "allow"),
+        ] {
+            assert_eq!(
+                ClassifierLeaf::under(root, "a session", verdict).dir(),
+                &Path::new("/sys/fs/cgroup/minimald.slice")
+                    .join("boxes")
+                    .join(dir)
+                    .join("asession"),
+                "a {dir} leaf is one level below the cohort, in its verdict's \
+                 subtree: the sanitize the placement performs is the \
+                 constructor's, so no caller can spell a leaf the cohort owns"
+            );
+        }
     }
 }
