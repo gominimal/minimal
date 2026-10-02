@@ -10,3 +10,4 @@ pub mod loopback;
 pub mod policy;
 pub mod primitives;
 pub mod source;
+pub mod switch_request;

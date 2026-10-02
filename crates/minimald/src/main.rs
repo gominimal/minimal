@@ -480,13 +480,17 @@ async fn async_main() -> Result<(), MainError> {
                 // In-VM (DM1/3/4) the PTask attaches to the host gvproxy over the
                 // vsock shuttle, so no in-guest gvproxy binary path is needed.
                 gvproxy_bin: None,
-                // Auto-select the hostname proxy's port: a VM daemon shares its
-                // host with whatever native daemon runs there, and the host
-                // gvproxy publishes whichever port this guest ends up on, so
-                // the two route both sets of names at the same time (NET-027)
-                // rather than fighting over one pinned port. `None` still
-                // tries the documented default first — it only relocates when
-                // something else on the machine holds it.
+                // The node ports are the host's, not the daemon's: minvmd
+                // assigns them before the VM boots (NET-025) and hands them
+                // on the kernel command line, so the guest binds exactly
+                // what the host's box table already admits (NET-138) and the
+                // host gvproxy publishes it at the same number. Binds as
+                // handed and selects none; a boot that carries no tokens — an
+                // older minvmd, a native run — falls back to default-then-
+                // select, the pre-handoff behaviour. The tokens are read
+                // once the log sink is live, below, because a token present
+                // but unusable is a surfaced boot error, which `Cli`
+                // construction has nowhere to raise.
                 hostname_proxy_port: None,
                 zone_answerer_port: None,
                 // The microVM's pid-1 has no flags to read: the guest runs
@@ -534,6 +538,30 @@ async fn async_main() -> Result<(), MainError> {
     let logger = DaemonLogger::install(log_mode)?;
 
     let listen_args = cli.listen_args().unwrap();
+
+    // The node ports this daemon listens on, resolved once: the tokens the
+    // VM host handed on the boot line in a microVM, the CLI's otherwise.
+    // The read lives here, once the log sink is live, because a token
+    // present but unusable is a surfaced boot failure, not a fallback: the
+    // daemon would otherwise publish a listener the host's box table does
+    // not name (NET-025, NET-138) and strand every client pointed at the
+    // handed one. A handed pair that cannot bind — something in the guest
+    // already holds a port — fails the boot here too, probed in the bind
+    // base the daemon's own listeners use, rather than surfacing after
+    // READY, when the host already believes the VM healthy.
+    let (hostname_proxy_port, zone_answerer_port) = if is_minimal_microvm() {
+        let proxy = guest::handed_proxy_port().map_err(|e| MainError::Other(e.to_string()))?;
+        let answerer =
+            guest::handed_answerer_port().map_err(|e| MainError::Other(e.to_string()))?;
+        guest::probe_handed_node_ports(proxy, answerer)
+            .map_err(|e| MainError::IO(e, "binding the handed node ports"))?;
+        (proxy, answerer)
+    } else {
+        (
+            listen_args.hostname_proxy_port,
+            listen_args.zone_answerer_port,
+        )
+    };
 
     // Daemonize before doing any work: re-exec ourselves in a new session and
     // wait until the SSH socket is accepting connections, then return so the
@@ -857,12 +885,12 @@ async fn async_main() -> Result<(), MainError> {
         // not spawn gvproxy in-guest. The UDS path is DM2.
         in_microvm: cli.listen_args().unwrap().vsock,
         state_volume_mounted,
-        // The port the hostname proxy listens on when the deployment pins
-        // one; `None` tries the documented default and only when it is busy
-        // asks the OS for a free port (NET-024/NET-025).
-        hostname_proxy_port: cli.listen_args().unwrap().hostname_proxy_port,
-        // The answerer's port, given the same treatment.
-        zone_answerer_port: cli.listen_args().unwrap().zone_answerer_port,
+        // The node ports, resolved once above: the ones the VM host handed
+        // in a microVM, the CLI's otherwise; `None` tries the documented
+        // default and only when it is busy asks the OS for a free port
+        // (NET-024/NET-025).
+        hostname_proxy_port,
+        zone_answerer_port,
         // The daemon derives its switch /24 from its instance id (NET-027);
         // no CLI flag pins one yet.
         switch_subnet_octet: None,

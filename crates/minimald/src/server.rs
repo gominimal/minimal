@@ -2530,6 +2530,228 @@ mod tests {
         .expect("the hostname proxy must bind and report its port")
     }
 
+    /// T63 (NET-025, NET-138): a VM-hosted daemon binds the ports its host
+    /// handed it on the boot line, and selects none of its own. The handed
+    /// ports are read exactly the way pid-1 reads them — off the environment
+    /// the kernel passes through — and the startup is driven the way a VM
+    /// daemon's is: bind 0.0.0.0, publish behind the host-loopback gate, then
+    /// record the bound port for the discovery reply to carry. With a handed
+    /// port held busy, the startup keeps retrying that port and never
+    /// re-picks: the host's box table names it, so a silent move would strand
+    /// every client pointed at it.
+    ///
+    /// The host-loopback publish is the `Fixed(None)` stand-in — the real
+    /// gate's decisions are proven from the gate side (`minvmd`'s
+    /// `switch_request_refused_and_logged`); what is under test here is the
+    /// port policy the handed values feed.
+    // Env is process state: nextest runs every test in its own process.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn vm_hosted_daemon_binds_handed_port() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        use crate::guest;
+
+        // Reserve free ports, then write them onto the boot line the way
+        // minvmd does: as tokens the kernel hands pid-1 as environment
+        // variables.
+        let probe = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let proxy_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let answerer_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        unsafe {
+            std::env::set_var(guest::HANDED_PROXY_PORT_TOKEN, proxy_port.to_string());
+            std::env::set_var(guest::HANDED_ANSWERER_PORT_TOKEN, answerer_port.to_string());
+        }
+        // What pid-1's CLI is built with: the handed ports.
+        assert_eq!(guest::handed_proxy_port().unwrap(), Some(proxy_port));
+        assert_eq!(guest::handed_answerer_port().unwrap(), Some(answerer_port));
+
+        let dir = TempDir::new().unwrap();
+        let state = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
+
+        // The VM startup shape: bind UNSPECIFIED, publish behind the
+        // host-loopback gate, record the bound port. The compressed backoff
+        // keeps a failed attempt cheap should the box be noisy.
+        let retry = RetryBackoff::new(Duration::from_millis(10), Duration::from_millis(100));
+        tokio::spawn(drive_proxy_until_serving(
+            state.clone(),
+            HostProxyStartup::Egress {
+                bind_base: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                port: ProxyPort::from_config(
+                    guest::handed_proxy_port().unwrap(),
+                    crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
+                ),
+            },
+            true,
+            HostExpose::Fixed(None),
+            retry,
+        ));
+        let answerer = crate::net::answerer::ZoneAnswerer::new(
+            state.sessions_manager().await.hostnames(),
+            crate::net::answerer::AnswerScope::Microvm {
+                subnet: crate::net::DEFAULT_SUBNET,
+            },
+        );
+        tokio::spawn(drive_answerer_until_serving(
+            state.clone(),
+            answerer,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            ProxyPort::from_config(
+                guest::handed_answerer_port().unwrap(),
+                crate::net::answerer::ANSWERER_PORT,
+            ),
+            true,
+            HostExpose::Fixed(None),
+            retry,
+        ));
+
+        // Bound as handed, both of them, and reported on the discovery path
+        // the RPC replies carry.
+        assert_eq!(
+            wait_for_proxy_port(&state).await,
+            proxy_port,
+            "the handed proxy port is bound, not re-picked"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state.zone_answerer_port().await == Some(answerer_port) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the handed answerer port is bound, not re-picked");
+
+        // And it really is a listener on the handed port: the proxy answers
+        // (a name no live box owns gets its refusal).
+        let routed = proxy_get(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), proxy_port),
+            "ghost.min.internal",
+        )
+        .await;
+        assert!(routed.contains("502"), "the handed port answers: {routed}");
+
+        // Selects none: with a handed port held, the startup keeps retrying
+        // that port and never re-picks — the state stays portless while the
+        // loop is alive. A fresh state, so the first phase's recorded port
+        // cannot stand in for this one's.
+        let probe = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let held = probe.local_addr().unwrap().port();
+        unsafe { std::env::set_var(guest::HANDED_PROXY_PORT_TOKEN, held.to_string()) };
+        let dir = TempDir::new().unwrap();
+        let state = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
+        let drive = tokio::spawn(drive_proxy_until_serving(
+            state.clone(),
+            HostProxyStartup::Egress {
+                bind_base: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                port: ProxyPort::from_config(
+                    guest::handed_proxy_port().unwrap(),
+                    crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
+                ),
+            },
+            true,
+            HostExpose::Fixed(None),
+            RetryBackoff::new(Duration::from_millis(10), Duration::from_millis(50)),
+        ));
+        // Several retries on the compressed backoff, then prove it stayed put.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !drive.is_finished(),
+            "a busy handed port is retried, not abandoned"
+        );
+        assert_eq!(
+            state.hostname_proxy_port().await,
+            None,
+            "a busy handed port is never re-picked"
+        );
+        drive.abort();
+        drop(probe);
+    }
+
+    /// T63 (NET-025): the pid-1 boot reads its handed ports fail-closed and
+    /// binds them before anything else answers. A token present but unusable
+    /// is a surfaced boot error — the read is an `Err` naming the token and
+    /// the value it carried, not a `None` the daemon would fall back from —
+    /// and a handed port something already holds fails the probe bind, which
+    /// is boot-fatal: the startup pid-1 would drive next is driven here and
+    /// stays portless, the boot was over before it, never rescued by a
+    /// re-pick.
+    // Env is process state: nextest runs every test in its own process.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_broken_handoff_fails_the_boot_before_any_listener_comes_up() {
+        use std::net::Ipv4Addr;
+
+        use crate::guest;
+
+        // A present token that carries no port: the surfaced error, not a
+        // quiet absence.
+        unsafe { std::env::set_var(guest::HANDED_PROXY_PORT_TOKEN, "no-port-here") };
+        let error = guest::handed_proxy_port()
+            .expect_err("an unusable token is a surfaced boot error, not an absence");
+        assert_eq!(error.token, guest::HANDED_PROXY_PORT_TOKEN);
+        assert_eq!(error.value, "no-port-here");
+
+        // A handed port something already holds — the way a stale daemon or
+        // an unrelated process in the guest holds one: the probe bind fails
+        // it, with the port named, and that is the boot's end.
+        let held_listener = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let held = held_listener.local_addr().unwrap().port();
+        unsafe { std::env::set_var(guest::HANDED_PROXY_PORT_TOKEN, held.to_string()) };
+        unsafe { std::env::remove_var(guest::HANDED_ANSWERER_PORT_TOKEN) };
+        let proxy = guest::handed_proxy_port().unwrap();
+        let answerer = guest::handed_answerer_port().unwrap();
+        assert_eq!(proxy, Some(held));
+        assert_eq!(answerer, None);
+        let error = guest::probe_handed_node_ports(proxy, answerer)
+            .expect_err("a held handed port cannot bind for the probe");
+        assert!(
+            error.to_string().contains(&held.to_string()),
+            "the boot-fatal bind names the port it failed on, got: {error}"
+        );
+
+        // And no listener ever comes up from it: the startup pid-1 would
+        // drive next, driven here, keeps retrying the held handed port and
+        // never re-picks — the boot was over before it.
+        let dir = TempDir::new().unwrap();
+        let state = ServerStateHandle::new(test_config(&dir), None)
+            .await
+            .unwrap();
+        let drive = tokio::spawn(drive_proxy_until_serving(
+            state.clone(),
+            HostProxyStartup::Egress {
+                bind_base: std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                port: ProxyPort::from_config(
+                    guest::handed_proxy_port().unwrap(),
+                    crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
+                ),
+            },
+            true,
+            HostExpose::Fixed(None),
+            RetryBackoff::new(Duration::from_millis(10), Duration::from_millis(50)),
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !drive.is_finished(),
+            "the held handed port is retried, not abandoned"
+        );
+        assert_eq!(
+            state.hostname_proxy_port().await,
+            None,
+            "a boot that failed its probe bind never publishes a listener"
+        );
+        drive.abort();
+        drop(held_listener);
+    }
+
     /// NET-024: a daemon configured with a hostname-proxy port listens on
     /// exactly that one — driven through the start path [`Server::run`] takes,
     /// so the flags a deployment passes are the ones proven. The startup
