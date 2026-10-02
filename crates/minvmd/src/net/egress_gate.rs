@@ -119,7 +119,7 @@ use sessions::core::switch_request::{
     self, Applied, MAX_REQUEST_RECORDS, Record, Refusal, SwitchRequest, SwitchRow, SwitchTable,
     SwitchVerb,
 };
-use switch::DEFAULT_MTU;
+use switch::{DEFAULT_MTU, RESERVED_LOCAL_RANGE};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
@@ -1995,13 +1995,45 @@ fn summarize_dns_add(
 }
 
 /// The loopback listener a control body's `local` field carries, as the
-/// daemon's own client builds it: `127.0.0.1:<port>`. Anything else —
-/// another loopback spelling, a non-loopback host, no port — is not a body
-/// the gate summarizes: the host binds forwarders on the loopback the
-/// daemon names, and only the daemon's own client names this one.
+/// daemon's own client builds it — in either of its two spellings.
+/// `127.0.0.1:<port>`: the daemon's own proxy and answerer listeners
+/// (`publish_listener_on_control`), and a box publishing on the
+/// shared-address interim (NET-123). `<lease>:<port>` on an address of the
+/// reserved local range: the box's own granted publish address (NET-010) —
+/// the spelling every own-address box's ingress exposes and teardowns
+/// carry — the address a VM node's shared one is granted from (NET-129),
+/// and the address each round of the forwarder range probe walks
+/// (NET-123). The `local` is shape, never decision: the request it
+/// summarizes is keyed at the *remote* switch address and decided by the
+/// port record, and the local only names where the host-side forwarder
+/// binds — loopback, both spellings, never the LAN. Anything else — a
+/// loopback spelling outside both, a non-loopback host, no port — is not a
+/// body the gate summarizes: the host binds forwarders on the loopback the
+/// daemon names, and only the daemon's own client names these two.
 fn loopback_port(local: &str) -> Result<u16, ()> {
-    let port = local.strip_prefix("127.0.0.1:").ok_or(())?;
+    let (host, port) = local.rsplit_once(':').ok_or(())?;
+    let addr = Ipv4Addr::from_str(host).map_err(|_| ())?;
+    if addr != Ipv4Addr::LOCALHOST && !in_reserved_local_range(addr) {
+        return Err(());
+    }
     port.parse::<u16>().map_err(|_| ())
+}
+
+/// Whether `addr` falls in [`RESERVED_LOCAL_RANGE`] — the block published
+/// addresses are granted from, read from the switch crate so the number
+/// every component shares stays the one number. The same membership rule
+/// the daemon's own answerer applies to a zone record
+/// (`minimald::net::dns::in_reserved_local_range`).
+fn in_reserved_local_range(addr: Ipv4Addr) -> bool {
+    let (network, prefix) = RESERVED_LOCAL_RANGE;
+    let host_bits = 32 - u32::from(prefix);
+    // A /0 range would mean "every address"; the shift below needs a network
+    // part to keep.
+    if host_bits >= 32 {
+        return true;
+    }
+    let mask = u32::MAX << host_bits;
+    u32::from(network) & mask == u32::from(addr) & mask
 }
 
 /// A `<host>:<port>` pair with a dotted-quad host, as a forwarder's remote
@@ -3269,11 +3301,11 @@ mod tests {
     use super::{
         AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb, DROP_WARN_MAX_TRACKED_PAIRS,
         DROP_WARN_MIN_INTERVAL, DropLimiter, EgressGate, GateAdmit, GateDrop, GuestSource,
-        GuestSpeak, HANDSHAKE_TIMEOUT, MAX_HEAD, MAX_LIVE_RELAYS, MAX_NAMED_TARGET,
-        PublishedForwards, Record, UNDECLARED_PUBLISH_RECORD_RULE, UNDECLARED_RETRACT_RULE,
-        UNREGISTERED_PUBLISH_RULE, UNREGISTERED_SOURCE_PHASE, UNREGISTERED_SOURCE_RULE,
-        UnregisteredSourcePhase, WarnDecision, accept_loop, gate_verdict, max_frame, render_record,
-        serve_connection,
+        GuestSpeak, HANDSHAKE_TIMEOUT, MALFORMED_PUBLISH_RULE, MAX_HEAD, MAX_LIVE_RELAYS,
+        MAX_NAMED_TARGET, PublishedForwards, Record, UNDECLARED_PUBLISH_RECORD_RULE,
+        UNDECLARED_RETRACT_RULE, UNREGISTERED_PUBLISH_RULE, UNREGISTERED_SOURCE_PHASE,
+        UNREGISTERED_SOURCE_RULE, UnregisteredSourcePhase, WarnDecision, accept_loop, gate_verdict,
+        max_frame, render_record, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
     use crate::net::baseline::{BaselineCategory, NodeBaselinePhase, NodePlaneBaseline};
@@ -6509,6 +6541,145 @@ mod tests {
             spoken, request,
             "the declared listener's publish reached the switch whole"
         );
+    }
+
+    /// An own-address box's ingress exposes are named at the box's **own**
+    /// leased loopback address (NET-010), not `127.0.0.1`: the daemon's
+    /// client builds `local` from the grant the answerer's record holds for
+    /// it, the address the box's name answers at (NET-011), and the host
+    /// binds the forwarder there. The gate summarizes that spelling like
+    /// the interim's own — the publish decided by its switch address and
+    /// its port record — so the box's declared mapping publishes, and its
+    /// teardown, which carries the same `local`, is *decided*: keyed at
+    /// the address its publication was applied at and refused as the
+    /// retraction it is, never refused as a body the gate cannot parse.
+    #[tokio::test]
+    async fn an_expose_on_the_boxs_leased_loopback_publishes_when_the_listener_is_declared() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        // The box's own granted address out of the reserved local range, at
+        // a port the row declares, with the inside end different as a
+        // mapping's is: the exact shape `expose_request` builds for an
+        // own-address box's declaration
+        // (`crates/minimald/src/net/policy.rs`).
+        let body = br#"{"local":"127.0.64.9:8080","remote":"100.64.0.9:18080","protocol":"tcp"}"#;
+        let mut expose =
+            b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+        expose.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        expose.extend_from_slice(body);
+        let mut h = gate_connected(registry).await;
+        h.guest
+            .write_all(&expose)
+            .await
+            .expect("writing the expose");
+        let mut spoken = vec![0u8; expose.len()];
+        read_within(&mut h.switch, &mut spoken).await;
+        assert_eq!(
+            spoken, expose,
+            "the publish on the box's leased loopback reached the switch whole"
+        );
+
+        // Answered, as the daemon's client reads its publishes back, so the
+        // gate's attribution is in place before the teardown is spoken.
+        let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        h.switch
+            .write_all(answer)
+            .await
+            .expect("writing gvproxy's answer");
+        let mut seen = vec![0u8; answer.len()];
+        read_within(&mut h.guest, &mut seen).await;
+        assert_eq!(
+            seen, answer,
+            "the publish's answer reaches the guest verbatim"
+        );
+
+        // The teardown carries the same `local` and is decided, not
+        // discarded: the refusal names the row's own address — the one the
+        // publish was applied at — and the listener, and its own class, the
+        // retraction's, not the malformed body's.
+        let body = br#"{"local":"127.0.64.9:8080","protocol":"tcp"}"#;
+        let mut unexpose =
+            b"POST /services/forwarder/unexpose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+        unexpose.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        unexpose.extend_from_slice(body);
+        let (mut guest, mut switch) = connect_control(&h).await;
+        guest
+            .write_all(&unexpose)
+            .await
+            .expect("writing the retraction");
+        wait_for_log(&h.log, UNDECLARED_RETRACT_RULE).await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains("rule_matched=\"egress-undeclared-retract\"")
+                && logged.contains("source=100.64.0.9")
+                && logged.contains("port_or_name=port 8080"),
+            "the teardown on the leased loopback is decided at its address, got: {logged}"
+        );
+        assert!(
+            !logged.contains(MALFORMED_PUBLISH_RULE),
+            "neither the publish nor its teardown was refused as malformed, got: {logged}"
+        );
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("{n} byte(s) of a refused retraction reached the switch"),
+            Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+            Err(_) => panic!("the gate left the switch side hanging"),
+        }
+        expect_teardown(&mut guest).await;
+    }
+
+    /// The two accepted spellings are the daemon's own, and a `local`
+    /// outside both is refused as a body the gate does not summarize —
+    /// before any decision the row could have made about its port, which is
+    /// why the refusal comes for a port the row *does* declare: the
+    /// host-side forwarder binds where the daemon's client says, and only
+    /// its two spellings say anywhere.
+    #[tokio::test]
+    async fn a_local_outside_the_daemons_two_loopback_spellings_is_refused_as_malformed() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        // `127.0.0.2`: loopback, but neither the interim's `127.0.0.1` nor
+        // an address of the reserved local range — a spelling no client of
+        // the daemon builds, carrying a declared port at the row's own
+        // address, so the refusal that comes is the parser's alone.
+        let body = br#"{"local":"127.0.0.2:8080","remote":"100.64.0.9:8080","protocol":"tcp"}"#;
+        let mut request =
+            b"POST /services/forwarder/expose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        request.extend_from_slice(body);
+        let mut h = gate_connected(registry).await;
+        h.guest
+            .write_all(&request)
+            .await
+            .expect("writing the expose");
+
+        // Refused as malformed, and named: the rule is the malformed
+        // publish's own class, and the listener is the spelling it refused.
+        wait_for_log(&h.log, MALFORMED_PUBLISH_RULE).await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains("rule_matched=\"egress-malformed-publish\""),
+            "the refusal names its own class, got: {logged}"
+        );
+        assert!(
+            logged.contains("port_or_name=127.0.0.2:8080"),
+            "the refusal names the local it refused, got: {logged}"
+        );
+        assert!(
+            !logged.contains(UNDECLARED_PUBLISH_RECORD_RULE),
+            "a malformed body never reaches the decision, got: {logged}"
+        );
+
+        // Nothing of it reached the switch, and the caller's end comes down.
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, h.switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("{n} byte(s) of a malformed publish reached the switch"),
+            Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+            Err(_) => panic!("the gate left the switch side hanging"),
+        }
+        expect_teardown(&mut h.guest).await;
     }
 
     /// A retraction is decided by the row at the address the gate attributes
