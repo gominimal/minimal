@@ -2148,15 +2148,21 @@ mod tests {
         }
     }
 
-    /// NET-059: two VMs on one host — shaped the way two really are, each
-    /// daemon binding its own loopback at the same documented port, as two
-    /// guests each hold their own netns — publish their hostname proxies on
-    /// host ports of their own, and both VMs' box names route through the
-    /// host at the same time. The first VM's publication holds the default;
-    /// the second's is refused there and takes the next rung, and its
-    /// *listener* keeps the documented port its boxes share its loopback
-    /// with. A host client dialing each VM's published port reaches that
-    /// VM's boxes — and no other VM's — concurrently.
+    /// NET-059: two VMs on one host both route their box names through the
+    /// host at the same time. On a VM boot, each VM's host ports come from
+    /// minvmd's handed assignment — the boot-line tokens the guest daemon
+    /// binds as pinned, one pair of its own per VM — so each publishes at
+    /// exactly the numbers it was handed and the walk never runs
+    /// (`two_vms_pinned_ports_route_concurrently` drives that shape). This
+    /// test drives the boots the walk *does* cover: no handed port — an
+    /// older minvmd, a native run, a host that handed `0` — where each
+    /// daemon binds its own loopback at the same documented port, as two
+    /// guests each hold their own netns, and the *publications* contend.
+    /// The first VM's publication holds the default; the second's is
+    /// refused there and takes the next rung, and its *listener* keeps the
+    /// documented port its boxes share its loopback with. A host client
+    /// dialing each VM's published port reaches that VM's boxes — and no
+    /// other VM's — concurrently.
     ///
     /// Both halves of the host's hostname surface are driven: the routing
     /// proxies (`Host:`-dialled TCP) and the box-zone answerers (A queries),
@@ -2465,6 +2471,281 @@ mod tests {
             b_zone_direct.metadata.response_code,
             ResponseCode::NoError,
             "VM B's answerer must keep the documented default"
+        );
+    }
+
+    /// NET-059 as a VM boot really runs it since T63: minvmd assigns each
+    /// VM its own distinct node ports on the host and hands them on the
+    /// boot line, and each guest daemon binds them as [`ProxyPort::Pinned`]
+    /// — so two VMs on one host publish their hostname proxies and zone
+    /// answerers at exactly the numbers they were handed, and the
+    /// publication walk never runs on this path
+    /// (`two_vms_hostnames_route_concurrently` drives the boots with no
+    /// handed port — an older minvmd, a native run, a host that handed `0`
+    /// — that the walk covers). Both publish at their pinned numbers, no
+    /// `relocated` line appears in either daemon's startup, and both VMs'
+    /// box names route through the host at the same time: each through the
+    /// port its VM was handed, reaching its own VM's box and refusing the
+    /// other VM's, concurrently, on both halves of the host's hostname
+    /// surface — the routing proxies (`Host:`-dialled TCP) and the
+    /// box-zone answerers (A queries).
+    ///
+    /// The gvproxy forwarder each publication goes through is played two
+    /// ways, as in the walking test: the *port* is arbitrated by
+    /// [`crate::server::HostExpose::HeldPorts`] — the stand-in that holds
+    /// every host port it accepts, the ledger minvmd's own assignment
+    /// guarantees is never contended — and the *forward* itself is wired by
+    /// hand (`spawn_forward` for TCP, `spawn_udp_forward` for the answerer's
+    /// datagrams), binding the handed host port and relaying to the guest
+    /// listener.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn two_vms_pinned_ports_route_concurrently() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use hickory_proto::op::ResponseCode;
+        use tempfile::TempDir;
+
+        use crate::server::{
+            Config, HostExpose, HostProxyStartup, ProxyPort, RetryBackoff, ServerStateHandle,
+        };
+
+        // The handed pairs, the way minvmd's assignment makes them: one
+        // proxy port and one answerer port per VM, all four distinct on the
+        // host — the property two pinned publications rely on. Probed free
+        // on the loopback, TCP for the proxies and UDP for the answerers,
+        // the way every other borrowed port in this suite is.
+        let free_tcp = |taken: &mut HashSet<u16>| -> u16 {
+            loop {
+                let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                let port = probe.local_addr().unwrap().port();
+                drop(probe);
+                if taken.insert(port) {
+                    break port;
+                }
+            }
+        };
+        let free_udp = |taken: &mut HashSet<u16>| -> u16 {
+            loop {
+                let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+                let port = probe.local_addr().unwrap().port();
+                drop(probe);
+                if taken.insert(port) {
+                    break port;
+                }
+            }
+        };
+        let mut handed = HashSet::new();
+        let proxy_a_port = free_tcp(&mut handed);
+        let answerer_a_port = free_udp(&mut handed);
+        let proxy_b_port = free_tcp(&mut handed);
+        let answerer_b_port = free_udp(&mut handed);
+
+        // Two VM-shaped daemons: `in_microvm` is what routes an own-address
+        // box to its lease, and each binds the pair its VM was handed on its
+        // own loopback — two guests, two netns, two numbers.
+        let vm_host = |dir: &TempDir| Config {
+            in_microvm: true,
+            ..crate::server::test_config(dir.path())
+        };
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let a = ServerStateHandle::new(vm_host(&dir_a), None).await.unwrap();
+        let b = ServerStateHandle::new(vm_host(&dir_b), None).await.unwrap();
+
+        // The host port ledger both publications go through: the stand-in
+        // forwarder that holds every port it accepts, standing in for the
+        // host gvproxy that holds the handed numbers.
+        let held = Arc::new(Mutex::new(HashSet::new()));
+
+        // The log the daemons' startup lines land in: the walk's own line
+        // is what must never appear on this path.
+        let (buf, guard) = capture_logs();
+
+        // Each VM's proxy, pinned to the port its VM was handed: the
+        // publication lands on the host at exactly that number, on the
+        // first proposal — no rung, no refusal.
+        let guest_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), proxy_a_port);
+        let guest_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)), proxy_b_port);
+        crate::server::drive_proxy_until_serving(
+            a.clone(),
+            HostProxyStartup::Egress {
+                bind_base: guest_a.ip(),
+                port: ProxyPort::Pinned(proxy_a_port),
+            },
+            true,
+            HostExpose::HeldPorts(Arc::clone(&held)),
+            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
+        )
+        .await;
+        let port_a = wait_for_proxy_port(&a).await;
+        assert_eq!(
+            port_a, proxy_a_port,
+            "VM A's proxy must publish at exactly the number it was handed"
+        );
+        crate::server::drive_proxy_until_serving(
+            b.clone(),
+            HostProxyStartup::Egress {
+                bind_base: guest_b.ip(),
+                port: ProxyPort::Pinned(proxy_b_port),
+            },
+            true,
+            HostExpose::HeldPorts(Arc::clone(&held)),
+            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
+        )
+        .await;
+        let port_b = wait_for_proxy_port(&b).await;
+        assert_eq!(
+            port_b, proxy_b_port,
+            "VM B's proxy must publish at exactly the number it was handed"
+        );
+
+        // Each VM's own box, on its own lease, at the one external port both
+        // registries publish — the two leases the attach path would report.
+        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let box_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let lease_a = Ipv4Addr::new(127, 0, 0, 4);
+        let lease_b = Ipv4Addr::new(127, 0, 0, 5);
+        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_a), box_port), "vm-a-web").await;
+        spawn_backend_on(SocketAddr::new(IpAddr::V4(lease_b), box_port), "vm-b-api").await;
+        a.sessions_manager()
+            .await
+            .hostnames()
+            .write()
+            .unwrap()
+            .report_own_address(SessionId::nil(), "web", lease_a, BTreeMap::from([(80, box_port)]));
+        b.sessions_manager()
+            .await
+            .hostnames()
+            .write()
+            .unwrap()
+            .report_own_address(SessionId::nil(), "api", lease_b, BTreeMap::from([(80, box_port)]));
+
+        // The forwards those publications describe, played by hand: each
+        // VM's handed host port relays to that VM's proxy — the half of the
+        // publication that lives on the host.
+        let host_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
+        let host_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
+        spawn_forward(host_a, guest_a).await;
+        spawn_forward(host_b, guest_b).await;
+
+        // Both VMs' box names route through the host at the same time: each
+        // handed port reaches its own VM's box and refuses the other VM's
+        // names, concurrently.
+        let (a_web, a_api, b_api, b_web) = tokio::join!(
+            proxy_get(host_a, "web.min.internal"),
+            proxy_get(host_a, "api.min.internal"),
+            proxy_get(host_b, "api.min.internal"),
+            proxy_get(host_b, "web.min.internal"),
+        );
+        assert!(a_web.contains("vm-a-web"), "got: {a_web}");
+        assert!(
+            a_api.contains("502"),
+            "VM A's proxy must refuse VM B's box, got: {a_api}"
+        );
+        assert!(b_api.contains("vm-b-api"), "got: {b_api}");
+        assert!(
+            b_web.contains("502"),
+            "VM B's proxy must refuse VM A's box, got: {b_web}"
+        );
+
+        // The other half of the hostname surface, handed the same way: each
+        // VM's box-zone answerer pinned to the port its VM was handed, the
+        // same two-gated startup its proxy takes.
+        let zone_scope = crate::net::answerer::AnswerScope::Microvm {
+            subnet: crate::net::DEFAULT_SUBNET,
+        };
+        crate::server::drive_answerer_until_serving(
+            a.clone(),
+            crate::net::answerer::ZoneAnswerer::new(
+                a.sessions_manager().await.hostnames(),
+                zone_scope.clone(),
+            ),
+            guest_a.ip(),
+            ProxyPort::Pinned(answerer_a_port),
+            true,
+            HostExpose::HeldPorts(Arc::clone(&held)),
+            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
+        )
+        .await;
+        let zone_port_a = wait_for_zone_port(&a).await;
+        assert_eq!(
+            zone_port_a, answerer_a_port,
+            "VM A's answerer must publish at exactly the number it was handed"
+        );
+        crate::server::drive_answerer_until_serving(
+            b.clone(),
+            crate::net::answerer::ZoneAnswerer::new(
+                b.sessions_manager().await.hostnames(),
+                zone_scope,
+            ),
+            guest_b.ip(),
+            ProxyPort::Pinned(answerer_b_port),
+            true,
+            HostExpose::HeldPorts(Arc::clone(&held)),
+            RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20)),
+        )
+        .await;
+        let zone_port_b = wait_for_zone_port(&b).await;
+        assert_eq!(
+            zone_port_b, answerer_b_port,
+            "VM B's answerer must publish at exactly the number it was handed"
+        );
+
+        // The UDP forwards those publications describe, played by hand: each
+        // VM's handed host port relays datagrams to that VM's answerer —
+        // the half a host resolver's packets ride.
+        let zone_host_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), zone_port_a);
+        let zone_host_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), zone_port_b);
+        let zone_guest_a = SocketAddr::new(guest_a.ip(), answerer_a_port);
+        let zone_guest_b = SocketAddr::new(guest_b.ip(), answerer_b_port);
+        spawn_udp_forward(zone_host_a, zone_guest_a).await;
+        spawn_udp_forward(zone_host_b, zone_guest_b).await;
+
+        // Both VMs' box names answer through the host at the same time, each
+        // through the port its VM was handed: its own box is held in its
+        // zone (NODATA at a lease the host may not be told — NET-127 — but
+        // held, never a leak), and the other VM's box is nobody's here.
+        let (a_web, a_api, b_api, b_web) = tokio::join!(
+            zone_lookup(zone_host_a, "web.min.internal"),
+            zone_lookup(zone_host_a, "api.min.internal"),
+            zone_lookup(zone_host_b, "api.min.internal"),
+            zone_lookup(zone_host_b, "web.min.internal"),
+        );
+        assert_eq!(
+            a_web.metadata.response_code,
+            ResponseCode::NoError,
+            "VM A's zone must hold its own box"
+        );
+        assert_eq!(
+            a_api.metadata.response_code,
+            ResponseCode::NXDomain,
+            "VM A's zone must not hold VM B's box"
+        );
+        assert_eq!(
+            b_api.metadata.response_code,
+            ResponseCode::NoError,
+            "VM B's zone must hold its own box"
+        );
+        assert_eq!(
+            b_web.metadata.response_code,
+            ResponseCode::NXDomain,
+            "VM B's zone must not hold VM A's box"
+        );
+
+        // And neither daemon's startup ever walked: no `relocated` line may
+        // appear, because a handed publication that is refused keeps
+        // proposing its port (the retry is the remedy) and these two never
+        // refused each other anything.
+        drop(guard);
+        let logged = buf.contents();
+        assert!(
+            !logged.contains("relocated"),
+            "a handed, pinned publication never walks to a rung, so the \
+             walk's line must not appear in either VM's startup: {logged}"
         );
     }
 

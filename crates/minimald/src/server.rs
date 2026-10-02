@@ -1166,13 +1166,21 @@ impl ProxyPort {
     /// chose — the OS-selected one, or the documented default nobody
     /// pinned — is the daemon's to relocate on the host side; a port the
     /// operator pinned keeps proposing it (the publish retry is the
-    /// remedy, and the report says so). Taking a host port of its own is
-    /// what lets two VMs on one host both publish (NET-059): the first
-    /// holds the default on the host loopback, and the second's
-    /// publication lands on the next rung beside it — while each VM's
-    /// *listener* keeps the documented port its own boxes share its
-    /// loopback on, because the walk moves the publication, never the
-    /// bind.
+    /// remedy, and the report says so). Either way the walk moves the
+    /// publication, never the bind: the listener keeps the port its own
+    /// boxes reach it on.
+    ///
+    /// On a VM boot this is false by construction: minvmd hands each VM
+    /// its own distinct node ports on the boot line
+    /// ([`crate::guest::handed_proxy_port`], and the answerer's beside it),
+    /// the daemon binds them as [`ProxyPort::Pinned`], and each VM's
+    /// publication lands on the host at exactly the number it was handed —
+    /// no two VMs contend for one host port, so the walk never runs on the
+    /// VM path. What the walk covers is boots with no handed port — an
+    /// older minvmd, a native run, a host that handed `0` — where two
+    /// daemons can meet on the one documented default: the first holds it
+    /// on the host loopback and the second's publication lands on the next
+    /// rung beside it, so both VMs on one host publish (NET-059).
     ///
     /// "Refused" means the host port was actually taken
     /// ([`HostPublishFailure::port_taken`]) — a transient failure keeps the
@@ -1655,12 +1663,16 @@ pub(crate) async fn drive_proxy_until_serving(
 ///
 /// The serve loop starts as soon as the socket binds and stays up while the
 /// publish retries; the bind gate never runs again once it has passed, so a
-/// bound-and-served answerer is never dropped and rebound. A host port the
-/// host refuses is left for the next proposal, one rung further up
-/// ([`next_host_publish_port`]), while the socket keeps the documented port
-/// this VM's own boxes query its loopback on — the same "publication walks,
-/// bind stays" rule the proxies follow, so on a two-VM host each VM's
-/// answerer serves its zone on a host port of its own (NET-059).
+/// bound-and-served answerer is never dropped and rebound. On a VM boot the
+/// host port never moves at all: minvmd hands each VM its own distinct node
+/// ports on the boot line ([`crate::guest::handed_answerer_port`]) and the
+/// daemon binds them pinned, so each VM's answerer publishes at exactly the
+/// number it was handed and the walk below never runs (NET-059). The walk
+/// covers boots with no handed port — an older minvmd, a native run, a host
+/// that handed `0` — where a host port the host refuses is left for the
+/// next proposal, one rung further up ([`next_host_publish_port`]), while
+/// the socket keeps the port it bound: the same "publication walks, bind
+/// stays" rule the proxies follow.
 #[cfg(target_os = "linux")]
 pub(crate) async fn drive_answerer_until_serving<T: crate::net::answerer::Zone>(
     state: ServerStateHandle,
