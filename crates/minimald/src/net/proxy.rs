@@ -2616,13 +2616,23 @@ mod tests {
             .hostnames()
             .write()
             .unwrap()
-            .report_own_address(SessionId::nil(), "web", lease_a, BTreeMap::from([(80, box_port)]));
+            .report_own_address(
+                SessionId::nil(),
+                "web",
+                lease_a,
+                BTreeMap::from([(80, box_port)]),
+            );
         b.sessions_manager()
             .await
             .hostnames()
             .write()
             .unwrap()
-            .report_own_address(SessionId::nil(), "api", lease_b, BTreeMap::from([(80, box_port)]));
+            .report_own_address(
+                SessionId::nil(),
+                "api",
+                lease_b,
+                BTreeMap::from([(80, box_port)]),
+            );
 
         // The forwards those publications describe, played by hand: each
         // VM's handed host port relays to that VM's proxy — the half of the
