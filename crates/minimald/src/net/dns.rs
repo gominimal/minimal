@@ -1648,7 +1648,7 @@ impl LoopbackLeaseBook {
             verdict_landing,
             verdict_witness,
             hand_verdict_wait: std::sync::atomic::AtomicU64::new(
-                HAND_VERDICT_WAIT.as_millis() as u64,
+                HAND_VERDICT_WAIT.as_millis() as u64
             ),
         })
     }

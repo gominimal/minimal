@@ -3477,9 +3477,7 @@ async fn a_handed_box_pending_at_finalize_publishes_the_interim_when_the_verdict
     let mut finalize_client = server.connect().await;
     let finalize = tokio::spawn(async move { finalize_session(&mut finalize_client, web).await });
     manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
-    finalize
-        .await
-        .expect("the finalize's task runs to its end");
+    finalize.await.expect("the finalize's task runs to its end");
 
     // The verdict landed absent inside the wait: the hand is unvouched, so
     // the box publishes on the interim — never at the hand, which the
@@ -3511,8 +3509,7 @@ async fn a_handed_box_pending_at_finalize_publishes_the_interim_when_the_verdict
         })
         .unwrap_or_else(|| panic!("the hand→interim move must be logged, got: {logged}"));
     assert!(
-        moved.contains(&format!("from={handed}"))
-            && moved.contains("to=127.0.0.1"),
+        moved.contains(&format!("from={handed}")) && moved.contains("to=127.0.0.1"),
         "the move names both addresses, got: {moved}"
     );
     // And the name was published once: no registration ever named the hand.
@@ -3722,9 +3719,7 @@ async fn a_box_destroyed_inside_the_landing_window_is_not_resurrected() {
         "a box destroyed inside the landing's window is not resurrected"
     );
     assert!(
-        zone_answer_for(&server, "web.min.internal")
-            .await
-            .is_none(),
+        zone_answer_for(&server, "web.min.internal").await.is_none(),
         "no name is registered for the destroyed box"
     );
     assert_eq!(
@@ -3900,9 +3895,7 @@ async fn a_handed_reserved_address_waits_for_the_verdict_before_it_publishes() {
         let finalize =
             tokio::spawn(async move { finalize_session(&mut finalize_client, web).await });
         manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
-        finalize
-            .await
-            .expect("the finalize's task runs to its end");
+        finalize.await.expect("the finalize's task runs to its end");
         assert_eq!(
             manager
                 .hostnames()

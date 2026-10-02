@@ -734,9 +734,8 @@ pub(crate) fn apply_interim_upgrade(
     // check and the publish.
     let applied = {
         let mut reg = registry.write().expect("hostname registry lock poisoned");
-        let box_still_exists =
-            reg.name_held_by(upgrade.session, &upgrade.name)
-                && reg.published_own_address(upgrade.session) == Some(Ipv4Addr::LOCALHOST);
+        let box_still_exists = reg.name_held_by(upgrade.session, &upgrade.name)
+            && reg.published_own_address(upgrade.session) == Some(Ipv4Addr::LOCALHOST);
         if !box_still_exists {
             false
         } else {
