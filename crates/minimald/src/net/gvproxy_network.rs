@@ -370,6 +370,7 @@ mod tests {
     use std::sync::Arc;
 
     use switch::MacAddr;
+    use sandbox2::NetGuard as _;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::{Mutex, mpsc};
@@ -566,15 +567,20 @@ mod tests {
 
     /// A switch whose attach/detach are pure bookkeeping: `HostShuttle`
     /// leaves the gvproxy process to `minvmd`, so only the count moves —
-    /// the shape a VM-backed host's daemon carries.
+    /// the shape a VM-backed host's daemon carries. Carries the same
+    /// instance host id the NET-121 proofs build their registry with
+    /// (`aaaa1`), the pairing the daemon itself makes
+    /// (`sessions.rs` builds its registry from this switch's `host_id`),
+    /// so the attach's per-id `/services/dns/add` publishes — its own id
+    /// beside the deprecated `local` one — are the two the proofs count.
     fn vm_host_switch() -> Arc<Mutex<SwitchClient>> {
         Arc::new(Mutex::new(
-            SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy").with_transport(
-                SwitchTransport::HostShuttle {
+            SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_host_id("aaaa1")
+                .with_transport(SwitchTransport::HostShuttle {
                     cid: crate::net::VSOCK_HOST_CID,
                     port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
-                },
-            ),
+                }),
         ))
     }
 
@@ -1177,19 +1183,23 @@ mod tests {
         );
 
         // The registry's route exists now, after the binds — the report is
-        // the last of the three steps the attach takes.
+        // the last of the three steps the attach takes. The route is the
+        // full zone name the registry answers (`<name>.min.internal`).
         let held = registry
             .read()
             .expect("registry lock")
-            .zone_entry("web", &[]);
+            .zone_entry("web.min.internal", &[]);
         assert!(
             matches!(held, crate::net::dns::ZoneEntry::Held { .. }),
             "the name routes only after the binds: {held:?}"
         );
 
         // The forwarders are held until stop: the guard's teardown unbinds
-        // them, one unexpose per bound port.
-        drop(guard);
+        // them, one unexpose per bound port. Teardown is explicit — the
+        // sandbox layer drives it at the box's end — so the proof drives it
+        // too: a bare drop would only abort the frame relay and leave the
+        // forwards standing.
+        Box::new(guard).teardown().await;
         let unbound = collect_until(&mut events_rx, "/services/forwarder/unexpose", 2).await;
         assert_eq!(
             locals_of(&unbound, "/services/forwarder/unexpose"),
@@ -1290,11 +1300,13 @@ mod tests {
         );
 
         // And no route in the registry: the name the box's declaration
-        // wanted is held by nothing.
+        // wanted is held by nothing — looked up as the full zone name the
+        // registry answers, so the assertion is about the route the attach
+        // never reported, not a name nothing ever held.
         let held = registry
             .read()
             .expect("registry lock")
-            .zone_entry("web", &[]);
+            .zone_entry("web.min.internal", &[]);
         assert_eq!(
             held,
             crate::net::dns::ZoneEntry::Absent,
