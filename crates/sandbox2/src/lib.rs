@@ -991,11 +991,24 @@ pub mod classifier {
     /// itself under the design's own cover — can name the limit a box's
     /// verdict is decided on.
     pub fn enter_daemon_leaf(root: &Path) -> std::io::Result<()> {
-        // The cohort and both of its subtrees: a box leaf is now a grandchild
-        // of the cohort, so the subtree its verdict picks must exist before
-        // the launch that places it. Already-there is the common case (the
-        // installer made them, or a previous daemon did).
+        // The cohort first, then both of its subtrees: a box leaf is now a
+        // grandchild of the cohort, so the subtree its verdict picks must
+        // exist before the launch that places it — and `create_dir` makes
+        // no parent, so the cohort the subtrees live in is this entry's to
+        // build too. The guest's pid 1 boots into a tree with nothing in
+        // it, and it is the one entry that has the privilege to make the
+        // whole layout. Already-there is the common case (the installer
+        // made them, or a previous daemon did).
         let mut tree = vec![root.join(BOXES_DIR)];
+        for dir in &tree {
+            std::fs::create_dir(dir).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })?;
+        }
         for subtree in [config::DENY_DIR, config::ALLOW_DIR] {
             let dir = root.join(BOXES_DIR).join(subtree);
             std::fs::create_dir(&dir).or_else(|e| {
