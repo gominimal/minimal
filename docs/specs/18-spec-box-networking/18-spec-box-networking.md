@@ -460,10 +460,10 @@ included, with every refusal logged (NET-001 to NET-004).
   verify:   cargo nextest run -p minimald aaaa_https_and_svcb_queries_are_nodata
   <!-- design §5.3 (v0.9); event-driven; the gateway resolver's rule for every name in v1: AAAA because no IPv6 admission path exists yet, so happy-eyeballs degrades cleanly to IPv4 instead of timing out (an interim the IPv6 dual-stack epoch replaces, design §12 item 5); HTTPS and SVCB because an address hint would be either unadmitted, a silent stall for a client racing it, or a new admission path outside NET-067's intersection; `alpn="h3"` would invite the QUIC probes design §5.7 suppresses; and an ECH configuration would hide the SNI the gateway's monitoring reads -->
 
-- **NET-068** WHILE a box's egress is a hostname-only allowlist naming every host that `apt`, `git clone`, `npm install`, `pip`, and a container pull contact THE SYSTEM SHALL complete those operations.
+- **NET-068** WHILE a box's egress is a hostname-only allowlist naming every host that `git clone`, `npm install`, `pip install`, and a container pull contact THE SYSTEM SHALL complete those operations.
   tier:     T0
   verify:   cargo nextest run -p minvmd hostname_allowlist_toolchain_completes
-  <!-- S8b/AC3; prose 44; state-driven -->
+  <!-- S8b/AC3; prose 44; state-driven; the story's list also names apt, which the composed base (the gominimal/pkgs base, no Debian userland) does not ship, so no box can run it; the container pull keeps the rotating-CDN shape apt stood for, and git, npm and pip cover the pinned-name shape; the five-tool list came from the egress-gateway spike as an illustration, not as a requirement in itself -->
 
 - **NET-069** IF a request through the hostname proxy targets a port the target box did not declare THEN THE SYSTEM SHALL refuse it with the same refusal as a direct connection.
   tier:     T2
