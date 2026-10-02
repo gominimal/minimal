@@ -478,7 +478,18 @@ async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
     let provider = state.path().join("providers/local-minvmd0");
     std::fs::create_dir_all(&provider).unwrap();
     std::fs::write(provider.join("run.log"), "supervisor stderr\n").unwrap();
+    // The zone-table dump (NET-138): the table the VM host daemon's
+    // answerer answered from, under the name the daemon writes — the
+    // bundle carries the table itself, not just its name in the dir
+    // listing.
+    let zone_table =
+        "[\n  {\n    \"name\": \"web.min.internal\",\n    \"address\": \"127.0.64.9\",\n    \"live\": true\n  }\n]";
+    std::fs::write(provider.join(minvmd::diag::ZONE_TABLE_FILE), zone_table).unwrap();
     // boot.log deliberately absent — recorded as a skip, not an error.
+    // A native provider instance carries no zone dump either: same skip.
+    let native = state.path().join("providers/local-minimald0");
+    std::fs::create_dir_all(&native).unwrap();
+    std::fs::write(native.join("run.log"), "native daemon stderr\n").unwrap();
     // Non-`local-` entries are not provider instances and must be ignored.
     let stray = state.path().join("providers/remote-x");
     std::fs::create_dir_all(&stray).unwrap();
@@ -507,6 +518,18 @@ async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
 
     assert!(find(&files, "providers/local-minvmd0/run.log").is_some());
     assert!(find(&files, "providers/remote-x/run.log").is_none());
+    // The zone table rides the bundle beside the logs, whole — a table
+    // this small is never tail-capped — and by its daemon-given name.
+    let zone = find(
+        &files,
+        &format!("providers/local-minvmd0/{}", minvmd::diag::ZONE_TABLE_FILE),
+    )
+    .expect("the zone-table dump is bundled");
+    assert_eq!(
+        String::from_utf8_lossy(zone),
+        zone_table,
+        "the dump is copied, not summarized"
+    );
     let manifest: serde_json_lenient::Value =
         serde_json_lenient::from_slice(find(&files, "manifest.json").expect("manifest")).unwrap();
     let skipped = manifest["skipped"].as_array().unwrap();
@@ -515,6 +538,15 @@ async fn logs_collects_newest_five_per_prefix_and_provider_logs() {
             .iter()
             .any(|s| s["what"] == "providers/local-minvmd0/boot.log" && s["reason"] == "absent"),
         "absent boot.log is a skip: {skipped:?}"
+    );
+    assert!(
+        skipped.iter().any(|s| {
+            s["what"]
+                == format!("providers/local-minimald0/{}", minvmd::diag::ZONE_TABLE_FILE)
+                    && s["reason"] == "absent"
+        }),
+        "a provider instance with no zone dump records its absence the \
+         same way a missing log does: {skipped:?}"
     );
     assert_eq!(manifest["errors"].as_array().unwrap().len(), 0, "no errors");
 }
