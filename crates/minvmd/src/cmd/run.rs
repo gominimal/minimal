@@ -596,8 +596,18 @@ fn run_foreground() -> Result<()> {
                     Some(gvproxy)
                 }
                 // An own-IP VM cannot work without the switch: fail loudly. A
-                // non-own-IP boot tolerates it (same as a missing binary below).
-                Err(error) if crate::cmd::own_ip_requested() => {
+                // non-own-IP production boot tolerates a switch that will not
+                // come up (same as a missing binary below) — sessions still
+                // run, without guest egress. The stand-in's flag carries the
+                // same argument as own-IP: it is the e2e lane's and nothing
+                // else's, and a boot under it exists to be probed through
+                // this switch. Worse, the stand-in is bound before the switch
+                // is spawned, so a degraded boot looks healthy to a lane that
+                // waits on the stand-in's socket — every probe below it then
+                // fails in terms of a peer that was never there. Fail here,
+                // where the cause is and the error names it, not three steps
+                // later in a box's blank answer.
+                Err(error) if crate::cmd::own_ip_requested() || stub_enabled => {
                     return Err(error).context("spawning host gvproxy switch");
                 }
                 Err(error) => {
