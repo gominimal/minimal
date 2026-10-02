@@ -1694,3 +1694,251 @@ fn cli_reference_documents_network_flags() {
         );
     }
 }
+
+/// Stand up the two-VM shape the named-VM tests below need (NET-057/NET-058):
+/// a minimal state dir laid out as the minvmd provider nests a named VM
+/// (NET-052) — the default VM serving `providers/local-minvmd0/ssh.sock`,
+/// `alpha` serving `providers/local-minvmd0/alpha/ssh.sock` — with a real
+/// daemon behind each socket. Real daemons, not stub sockets, because both
+/// tests drive the real client transport: the listing connects to each VM to
+/// take its `ListSessions`, and the box-name resolution looks the name up on
+/// each VM's daemon.
+async fn two_vms() -> (
+    tempfile::TempDir,
+    minimald::test_harness::TestServer,
+    minimald::test_harness::TestServer,
+) {
+    let state = tempfile::tempdir().expect("a temp minimal state dir for two VMs");
+    let alpha_dir = state.path().join("providers/local-minvmd0/alpha");
+    std::fs::create_dir_all(&alpha_dir).expect("the named VM's provider subdir");
+    let default_sock = client::resolve_socket_path_named(
+        Some(state.path()),
+        true,
+        paths::DEFAULT_VM_NAME,
+    )
+    .expect("the default VM's socket path");
+    let default_vm = minimald::test_harness::TestServer::new().await;
+    default_vm.listen_on_uds(&default_sock).await;
+    let alpha = minimald::test_harness::TestServer::new().await;
+    alpha.listen_on_uds(&alpha_dir.join("ssh.sock")).await;
+    (state, default_vm, alpha)
+}
+
+/// Create a named box on one VM's daemon — the CLI's own
+/// create/configure/finalize sequence, so the record is durable (an
+/// unfinalized one is reaped when the connection that created it drops) and
+/// therefore listed under the name given.
+async fn create_box_on(
+    server: &minimald::test_harness::TestServer,
+    name: &str,
+) -> sessions::SessionId {
+    use minimald_rpc::{
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
+        Errorable, FinalizeSession, FinalizeSessionRequest, SessionConfig,
+    };
+
+    let mut client = server.connect().await;
+    let project_path =
+        camino::Utf8PathBuf::from_path_buf(std::env::current_dir().expect("the test cwd"))
+            .expect("UTF-8");
+    let id = match client
+        .call::<CreateSession>(&CreateSessionRequest {
+            config: SessionConfig {
+                name: Some(name.to_string()),
+                project_path: paths::HostAbsPath::try_new(project_path)
+                    .expect("the test cwd as a host path"),
+                network: sessions::NetworkMode::NoNet,
+                policy: sessions::SessionPolicy::default(),
+                box_addresses: None,
+                hooks_enabled: true,
+                attrs: Default::default(),
+            },
+            must_match_version: None,
+        })
+        .await
+    {
+        Errorable::Ok(created) => created.id,
+        Errorable::Err { error } => panic!("CreateSession failed: {error}"),
+    };
+    // The empty composition needs no workspace and no gating, so both steps
+    // take their happy paths and leave an `Active`, durable record.
+    match client
+        .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+            session_id: id,
+            contribution: Default::default(),
+        })
+        .await
+    {
+        Errorable::Ok(_) => {}
+        Errorable::Err { error } => panic!("ConfigureLoadout failed: {error}"),
+    }
+    match client
+        .call::<FinalizeSession>(&FinalizeSessionRequest { session_id: id })
+        .await
+    {
+        Errorable::Ok(_) => id,
+        Errorable::Err { error } => panic!("FinalizeSession failed: {error}"),
+    }
+}
+
+/// The `GlobalArgs` that select the minvmd backend for `state`, pinning `vm`
+/// when given: what a `min --provider local-minvmd [--vm NAME] …` invocation
+/// resolves to. (Published `--vm` names are not set here: the process-global
+/// is first-call-wins, and these tests must not perturb it for others.)
+fn vm_globals(state: &std::path::Path, vm: Option<String>) -> GlobalArgs {
+    GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(state.to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinvmd),
+        no_input: true,
+        vm,
+    }
+}
+
+/// The box names a listing's VM carries, `-`-free and in order.
+fn listed_names(listing: &VmListing) -> Vec<&str> {
+    listing
+        .resp
+        .sessions
+        .iter()
+        .map(|entry| entry.name.as_deref().expect("the test boxes are named"))
+        .collect()
+}
+
+/// NET-057: with two VMs running, `min ls` lists every VM's boxes and shows
+/// the VM each box lives on — one listing spanning both daemons, the VM per
+/// box filled in client-side (each daemon knows only its own).
+#[tokio::test]
+async fn ls_shows_vm_per_box() {
+    let (state, default_vm, alpha) = two_vms().await;
+    let api = create_box_on(&default_vm, "api").await;
+    let web = create_box_on(&alpha, "web").await;
+
+    let listings = cmd::ls_listings(&vm_globals(state.path(), None))
+        .await
+        .expect("listing a two-VM host succeeds");
+    assert_eq!(listings.len(), 2, "a two-VM host lists both VMs");
+    assert_eq!(listings[0].vm, "default", "the default VM lists first");
+    assert_eq!(listings[1].vm, "alpha");
+    assert_eq!(listed_names(&listings[0]), ["api"], "the default VM's box");
+    assert_eq!(listed_names(&listings[1]), ["web"], "the named VM's box");
+
+    // The VM is a column, and each box's row carries its own.
+    let mut out = Vec::new();
+    format_ls_across_vms(&mut out, &LsArgs { raw: false, json: false }, &listings)
+        .expect("rendering the two-VM listing");
+    let table = String::from_utf8(out).expect("the listing is UTF-8");
+    let row_of = |id: &sessions::SessionId| {
+        table
+            .lines()
+            .find(|l| l.contains(&id.to_string()))
+            .unwrap_or_else(|| panic!("a row for {id} in:\n{table}"))
+            .to_string()
+    };
+    assert!(table.contains("VM  "), "the table must carry a VM column:\n{table}");
+    assert!(row_of(&api).starts_with("default "), "got:\n{table}");
+    assert!(row_of(&web).starts_with("alpha "), "got:\n{table}");
+
+    // One VM listed renders exactly the single-VM listing `min ls` has always
+    // printed: the column is a fact about a multi-VM host, not a new format.
+    let single = &listings[1..];
+    let mut delegated = Vec::new();
+    format_ls_across_vms(&mut delegated, &LsArgs { raw: false, json: false }, single)
+        .expect("rendering the single-VM listing");
+    let mut direct = Vec::new();
+    format_ls(&mut direct, &LsArgs { raw: false, json: false }, &single[0].resp)
+        .expect("format_ls on the same listing");
+    assert_eq!(
+        String::from_utf8_lossy(&delegated),
+        String::from_utf8_lossy(&direct),
+        "one VM listed must render as the single-VM listing"
+    );
+
+    // `--json` carries the same attribution per entry, where a pipeline can
+    // read it: the VM's name beside that VM's reply.
+    let mut out = Vec::new();
+    format_ls_across_vms(&mut out, &LsArgs { raw: false, json: true }, &listings)
+        .expect("rendering the two-VM listing as JSON");
+    let entries: serde_json_lenient::Value =
+        serde_json_lenient::from_str(std::str::from_utf8(&out).expect("UTF-8"))
+            .expect("the multi-VM JSON listing is an array");
+    assert_eq!(entries[0]["vm"].as_str(), Some("default"), "got: {entries}");
+    assert_eq!(entries[1]["vm"].as_str(), Some("alpha"), "got: {entries}");
+    assert!(
+        entries[0]["sessions"][0]["name"].as_str() == Some("api")
+            && entries[1]["sessions"][0]["name"].as_str() == Some("web"),
+        "each entry carries its own VM's boxes: {entries}"
+    );
+}
+
+/// NET-058: a box name resolves to the VM that owns it with no global flag —
+/// across every VM's socket, since the selected VM's daemon has just said it
+/// does not know the name. The resolution covers the selected VM too (a
+/// caller that asks once gets one answer), refuses nothing but an ambiguous
+/// name, and stays out of the way of an explicit `--vm`.
+#[tokio::test]
+async fn box_name_resolves_vm_without_flag() {
+    let (state, default_vm, alpha) = two_vms().await;
+    create_box_on(&default_vm, "api").await;
+    let web = create_box_on(&alpha, "web").await;
+    let global = vm_globals(state.path(), None);
+
+    let resolved = attach::resolve_box_vm(&global, "web")
+        .await
+        .expect("resolving across a two-VM host succeeds")
+        .expect("'web' lives on alpha, so the name must resolve");
+    assert_eq!(resolved.vm, "alpha", "the VM that owns the name");
+    assert_eq!(resolved.record.id, web, "the record that VM's daemon resolved the name to");
+    assert_eq!(resolved.record.name.as_deref(), Some("web"));
+    assert_eq!(
+        resolved.sock,
+        state.path().join("providers/local-minvmd0/alpha/ssh.sock"),
+        "the owning VM's socket, ready for the hand-off"
+    );
+
+    // A box on the selected VM resolves to it: the resolution spans every
+    // VM's socket, so one ask has one answer wherever the box lives.
+    let on_selected = attach::resolve_box_vm(&global, "api")
+        .await
+        .expect("resolving a name the default VM owns succeeds")
+        .expect("'api' lives on the default VM");
+    assert_eq!(on_selected.vm, "default");
+
+    // A name no VM owns resolves to nothing — the caller reports its own
+    // original error.
+    assert!(
+        attach::resolve_box_vm(&global, "no-such-box")
+            .await
+            .expect("an unowned name is not an error")
+            .is_none()
+    );
+
+    // An explicit `--vm` pins where to look; the resolution must not override
+    // the operator's choice by looking elsewhere.
+    let pinned = vm_globals(state.path(), Some("alpha".to_string()));
+    assert!(
+        attach::resolve_box_vm(&pinned, "web")
+            .await
+            .expect("a pinned run is not an error")
+            .is_none(),
+        "a pinned run resolves nothing on its own"
+    );
+
+    // Two VMs owning the same name is a tie the name cannot settle: refuse
+    // it, name both, and point at the flag that disambiguates.
+    create_box_on(&alpha, "shared").await;
+    create_box_on(&default_vm, "shared").await;
+    let err = attach::resolve_box_vm(&global, "shared")
+        .await
+        .expect_err("an ambiguous name must be refused, not guessed")
+        .to_string();
+    assert!(
+        err.contains("default") && err.contains("alpha"),
+        "the refusal must name every VM that owns it: {err}"
+    );
+    assert!(
+        err.contains("--vm"),
+        "the refusal must point at the disambiguator: {err}"
+    );
+}

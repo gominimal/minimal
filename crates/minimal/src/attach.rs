@@ -233,6 +233,108 @@ pub(crate) fn can_pick_interactively() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
+/// A box name resolved to the VM that owns it (NET-058): everything a caller
+/// needs to act on a box from its name alone — the VM's name, the socket its
+/// daemon serves, and the record the name resolved to there.
+#[derive(Debug)]
+pub(crate) struct ResolvedBoxVm {
+    /// The VM that owns the name, as `min ls` shows it.
+    pub vm: String,
+    /// That VM's daemon socket.
+    pub sock: std::path::PathBuf,
+    /// The record the name resolved to on that VM.
+    pub record: sessions::Record,
+}
+
+/// Resolve the VM that owns a box name from the name alone (NET-058), across
+/// every VM's socket: the shared resolution `min session attach` reaches for
+/// when the selected VM's daemon does not know the name, and the one a
+/// box-naming verb reaches for when it must not ask for a global flag — `min
+/// net expose` reuses this once it lands.
+///
+/// `Ok(None)` when no VM owns the name, so the caller reports its own
+/// original error (the selected VM's — usually the more useful of the two).
+/// An explicit `--vm` pins where to look, so it resolves nothing: the
+/// operator chose, and a resolution across the others would override that
+/// choice. A VM that is not running cannot own the name and is not asked; a
+/// VM whose daemon answers nothing is skipped with a warning — the name is
+/// resolved from the VMs that did answer.
+///
+/// The daemon that owns the name is version-gated on the very reply that
+/// named it, so a skewed VM can never be reached *through* a resolution even
+/// though the probes that do not find the name pass it ungated (the same
+/// ride-along shape [`crate::cmd::resolve_session_version_gated`]'s callers
+/// use).
+pub(crate) async fn resolve_box_vm(
+    global: &crate::GlobalArgs,
+    name: &str,
+) -> Result<Option<ResolvedBoxVm>, anyhow::Error> {
+    if global.vm.is_some() {
+        return Ok(None);
+    }
+    let vms =
+        crate::client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
+    let mut owners: Vec<ResolvedBoxVm> = Vec::new();
+    for vm in vms {
+        // A VM that is not running cannot own the name; asking it would only
+        // pay the connect-retry delay for a daemon that is not there.
+        if !vm.sock.exists() {
+            continue;
+        }
+        match box_record_on(&vm, name).await {
+            Ok(Some(record)) => owners.push(ResolvedBoxVm {
+                vm: vm.vm,
+                sock: vm.sock,
+                record,
+            }),
+            Ok(None) => {}
+            // Unreachable VMs are named, not silent: a resolution that
+            // quietly could not look would read as "no such box".
+            Err(e) => eprintln!("warning: could not look for '{name}' in VM {}: {e:#}", vm.vm),
+        }
+    }
+    match owners.len() {
+        0 => Ok(None),
+        1 => {
+            let resolved = owners.pop().expect("the one owner");
+            tracing::debug!(box = name, vm = %resolved.vm, "box name resolved to a VM");
+            Ok(Some(resolved))
+        }
+        // Two VMs can both own the name, and picking one silently would send
+        // an attach into a project the operator may not have meant. The flag
+        // is the disambiguator, so the error names both and points at it.
+        _ => Err(anyhow::anyhow!(
+            "box name '{name}' exists on more than one VM ({}); name the one you mean with --vm",
+            owners
+                .iter()
+                .map(|owner| owner.vm.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Look `name` up on one VM's daemon: its record when that daemon owns the
+/// name, `None` when it does not. The owning daemon is gated on the very
+/// reply that named it; the probe that finds nothing stays ungated, exactly
+/// like the dashboard's listing of a skewed daemon.
+async fn box_record_on(
+    vm: &crate::client::VmSocket,
+    name: &str,
+) -> Result<Option<sessions::Record>, anyhow::Error> {
+    let mut client = crate::client::Client::connect(&vm.sock)
+        .await
+        .with_context(|| format!("Failed to connect to the daemon at {}", vm.sock.display()))?;
+    let resp = crate::cmd::get_session_record(&mut client, name).await?;
+    match resp.record {
+        Some(record) => {
+            crate::client::ensure_version_reported(resp.daemon_version.as_deref())?;
+            Ok(Some(record))
+        }
+        None => Ok(None),
+    }
+}
+
 /// A pickable session. `Display` renders the row the user sees and fuzzy-
 /// searches against; the carried entry preserves the id/name so the chosen
 /// one can be attached without a follow-up round-trip.

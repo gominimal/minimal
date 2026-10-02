@@ -1056,6 +1056,13 @@ pub(crate) async fn activate_session(
 /// working directory (or the only existing session), opening an interactive
 /// picker when the choice is ambiguous; see [`attach::resolve_for_attach`]
 /// and [`resolve_smart_attach`].
+///
+/// When `args.session` names a box, the name alone decides where to look
+/// (NET-058): the selected VM's daemon first — the common case costs nothing
+/// beyond the one lookup it always made — and, when that daemon does not know
+/// the name, [`attach::resolve_box_vm`] resolves the VM that owns it across
+/// every VM's socket, so no global flag is needed to reach a box on another
+/// VM.
 pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
 
@@ -1070,16 +1077,46 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
     // named, this path creates one, and a skewed activation is #1251 exactly.
     // Both arms below gate on the build the daemon reports on the lookup they
     // were already making, so the gate costs no round trip of its own.
-    let (id, name) = match args.session {
+    let (id, name, sock) = match args.session {
         Some(ref s) => {
-            let r = resolve_session_version_gated(&mut client, s).await?;
-            (r.id, r.name)
+            let (record, sock) = match resolve_session_version_gated(&mut client, s).await {
+                Ok(record) => (record, sock),
+                // NET-058's cross-VM half: the selected VM's daemon has just
+                // said it does not know the name, so resolve the VM that owns
+                // it across every VM's socket. The resolution gates the
+                // owning daemon on the very reply that named the box, so a
+                // skewed VM cannot be reached through it.
+                Err(selected) => match attach::resolve_box_vm(global, s).await? {
+                    Some(resolved) => {
+                        // The operator never chose the VM the way they chose
+                        // the session, so tell them which one they're landing
+                        // in — the same announcement the unambiguous
+                        // auto-resolve below makes.
+                        if should_announce_session(global) {
+                            eprintln!(
+                                "Attaching to session {} on VM {}",
+                                session_announce_label(
+                                    &resolved.record.id,
+                                    resolved.record.name.as_deref()
+                                ),
+                                resolved.vm
+                            );
+                        }
+                        (resolved.record, resolved.sock)
+                    }
+                    // Nothing found anywhere: the selected VM's own error —
+                    // the "no session found" it computed, or its skew — is
+                    // the more useful of the two answers.
+                    None => return Err(selected),
+                },
+            };
+            (record.id, record.name, sock)
         }
         None => match resolve_smart_attach(
             &list_sessions_version_gated(&mut client).await?.sessions,
             global,
         )? {
-            SmartAttach::Attach(entry) => (entry.id, entry.name),
+            SmartAttach::Attach(entry) => (entry.id, entry.name, sock),
             SmartAttach::CreateForCwd => return activate_new_for_attach(global).await,
             SmartAttach::NoSessions => {
                 bail!("no sessions exist; use 'min session activate' to create one")

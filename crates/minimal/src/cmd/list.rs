@@ -288,28 +288,117 @@ pub async fn cmd_dash(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     .await
 }
 
-/// List sessions via the `ListSessions` RPC.
-pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Error> {
-    ensure_daemon(global)?;
+/// One VM's `ListSessions` reply with the VM it came from: the pairing
+/// [`ls_listings`] produces and [`format_ls_across_vms`] renders. The
+/// attribution is the client's — a daemon knows only its own boxes, so the
+/// wire reply carries no VM of its own.
+pub struct VmListing {
+    /// The VM the reply came from, as `--vm` accepts it.
+    pub vm: String,
+    /// That VM's daemon reply.
+    pub resp: minimald_rpc::ListSessionsResponse,
+}
 
-    let mut client = connect_daemon(global).await?;
+/// List sessions across every VM the CLI can see (NET-057): each running VM
+/// contributes its own boxes, and the listing carries the VM per box.
+///
+/// [`minimal_client::enumerate_vm_sockets`] is the set: the default VM plus
+/// every named one. An explicit `--vm` narrows the listing to that VM alone —
+/// the operator named where to look. A VM that is not running hosts no boxes,
+/// so it contributes nothing; a VM whose daemon cannot be reached is skipped
+/// with a warning, unless it is the VM this process selected — that one was
+/// just ensured, so a failure there is the failure to report (and a skewed one
+/// is refused there, as `min ls` always has). Nothing enumerable — the native
+/// backend, which hosts no VMs — falls back to the selected provider's
+/// daemon, exactly the listing `min ls` has always printed.
+pub(crate) async fn ls_listings(global: &GlobalArgs) -> Result<Vec<VmListing>, anyhow::Error> {
+    let mut vms =
+        client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
+    if let Some(pinned) = global.vm.as_deref() {
+        vms.retain(|vm| vm.vm == pinned);
+    }
+    let selected = client::vm_name();
+    let mut listings = Vec::new();
+    for vm in vms {
+        // A VM that is not running hosts no boxes. The selected VM is up —
+        // [`ensure_daemon`] saw to it before this ran — so this skip is only
+        // ever another VM's.
+        if !vm.sock.exists() {
+            continue;
+        }
+        // The selected VM gets the gate `min ls` has always applied
+        // (`connect_daemon`'s); the others are listable ungated, for the same
+        // reason the dashboard lists them ungated — a listing is read-only,
+        // and a skewed VM is precisely one whose boxes an operator still
+        // needs to see.
+        let gate = vm.vm == selected;
+        match list_vm(&vm.sock, gate).await {
+            Ok(resp) => listings.push(VmListing {
+                vm: vm.vm,
+                resp,
+            }),
+            Err(e) if gate => return Err(e),
+            Err(e) => eprintln!("warning: skipping VM {}: {e:#}", vm.vm),
+        }
+    }
+    if listings.is_empty() {
+        let sock =
+            client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+                .context("Failed to resolve daemon socket path")?;
+        listings.push(VmListing {
+            vm: selected.to_string(),
+            resp: list_vm(&sock, true).await?,
+        });
+    }
+    Ok(listings)
+}
 
+/// One daemon's `ListSessions` reply, from its socket. The daemon cannot
+/// probe git (on macOS it runs in the minvmd guest), so each session's git
+/// context is filled host-side before the reply is formatted. `gate` asserts
+/// the daemon's build first; see [`ls_listings`] for who gets it.
+async fn list_vm(
+    sock: &std::path::Path,
+    gate: bool,
+) -> Result<minimald_rpc::ListSessionsResponse, anyhow::Error> {
+    let mut client = client::Client::connect(sock)
+        .await
+        .with_context(|| format!("Failed to connect to the daemon at {}", sock.display()))?;
+    if gate {
+        client::ensure_version_match(&mut client).await?;
+    }
     use minimald_rpc::ListSessions;
     let mut resp = client
         .oneshot_rpc::<ListSessions>(())
         .await
         .context("ListSessions RPC failed")?;
-
-    // The daemon cannot probe git (on macOS it runs in the minvmd guest),
-    // so fill each session's git context host-side before formatting.
     minimal_client::fill_git_info(&mut resp.sessions).await;
+    Ok(resp)
+}
 
-    // On stderr, and outside `format_ls`: every output mode should carry a
+/// List sessions via the `ListSessions` RPC.
+pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Error> {
+    ensure_daemon(global)?;
+
+    let listings = ls_listings(global).await?;
+
+    // On stderr, and outside the formatters: every output mode should carry a
     // fault this severe — `--raw` most of all, since a script parsing bare ids
     // is exactly what will go on using hostnames that no longer resolve — and
-    // stdout stays clean for the parser either way.
-    warn_if_hostname_routing_down(resp.hostname_routing_unavailable.as_deref(), "min ls");
-    format_ls(&mut std::io::stdout(), &args, &resp)?;
+    // stdout stays clean for the parser either way. With more than one VM
+    // listed the fault is per daemon, so each warning names the VM it is on;
+    // one listing keeps the single-VM wording every consumer of `min ls` has
+    // always read.
+    for listing in &listings {
+        if let Some(reason) = listing.resp.hostname_routing_unavailable.as_deref() {
+            if listings.len() == 1 {
+                warn_if_hostname_routing_down(Some(reason), "min ls");
+            } else {
+                eprintln!("VM {}: {}", listing.vm, hostname_routing_warning(reason, "min ls"));
+            }
+        }
+    }
+    format_ls_across_vms(&mut std::io::stdout(), &args, &listings)?;
     Ok(())
 }
 
@@ -442,37 +531,213 @@ pub fn format_ls(
     )?;
 
     for entry in &resp.sessions {
-        let id = entry.id.to_string();
-        let name = entry.name.as_deref().unwrap_or("-");
-        let status = status_label(entry.status);
-        let project_path = entry
-            .project_path
-            .as_ref()
-            .map(paths::HostAbsPath::to_string)
-            .unwrap_or_else(|| "-".to_string());
-        let (title, last_activity) = match &entry.attrs {
-            Some(attrs) => {
-                let title = attrs
-                    .title
-                    .as_ref()
-                    .map(|t| t.value.as_str())
-                    .unwrap_or("-");
-                let last = attrs
-                    .last_stdout
-                    .or(attrs.last_stdin)
-                    .map(|dt| {
-                        let local = dt.with_timezone(&chrono::Local);
-                        local.format("%Y-%m-%d %H:%M:%S").to_string()
-                    })
-                    .unwrap_or_else(|| "-".to_string());
-                (title, last)
-            }
-            None => ("-", "-".to_string()),
-        };
+        let [id, name, status, title, last_activity, project_path] = session_cells(entry);
         writeln!(
             out,
             "{id:<36}  {name:<20}  {status:<13}  {title:<20}  {last_activity:<19}  {project_path}"
         )?;
+    }
+
+    Ok(())
+}
+
+/// The cells of one session row — id, name, status, title, last activity,
+/// project path — shared by the single-VM table ([`format_ls`]) and the
+/// multi-VM one ([`format_ls_across_vms`]), so the two surfaces present the
+/// same session attributes.
+fn session_cells(entry: &minimald_rpc::ListSessionsEntry) -> [String; 6] {
+    let id = entry.id.to_string();
+    let name = entry.name.as_deref().unwrap_or("-").to_string();
+    let status = status_label(entry.status).to_string();
+    let project_path = entry
+        .project_path
+        .as_ref()
+        .map(paths::HostAbsPath::to_string)
+        .unwrap_or_else(|| "-".to_string());
+    let (title, last_activity) = match &entry.attrs {
+        Some(attrs) => {
+            let title = attrs
+                .title
+                .as_ref()
+                .map(|t| t.value.as_str())
+                .unwrap_or("-")
+                .to_string();
+            let last = attrs
+                .last_stdout
+                .or(attrs.last_stdin)
+                .map(|dt| {
+                    let local = dt.with_timezone(&chrono::Local);
+                    local.format("%Y-%m-%d %H:%M:%S").to_string()
+                })
+                .unwrap_or_else(|| "-".to_string());
+            (title, last)
+        }
+        None => ("-".to_string(), "-".to_string()),
+    };
+    [id, name, status, title, last_activity, project_path]
+}
+
+/// The width of the VM column in the multi-VM table: enough for the default
+/// VM's name plus a space, so the common host reads evenly.
+const VM_COLUMN_WIDTH: usize = 8;
+
+/// Format the listing across every VM [`ls_listings`] gathered (NET-057).
+///
+/// One VM listed is [`format_ls`] verbatim — the output every consumer of
+/// `min ls` has always read, `--json` included. More than one adds the VM per
+/// box: a VM column in the table, each VM's name inside its `--json` entry,
+/// and each VM's routing facts (NET-026's discovery lines) prefixed with the
+/// VM they belong to, because on a two-VM host each VM's proxy publishes on a
+/// host port of its own (NET-059).
+pub fn format_ls_across_vms(
+    out: &mut impl std::io::Write,
+    args: &LsArgs,
+    listings: &[VmListing],
+) -> Result<(), anyhow::Error> {
+    if let [only] = listings {
+        return format_ls(out, args, &only.resp);
+    }
+    if listings.is_empty() {
+        // `cmd_ls` always lists the selected VM, so this is only reachable
+        // from a direct caller; render it as the empty listing it is.
+        return format_ls(
+            out,
+            args,
+            &minimald_rpc::ListSessionsResponse {
+                resource_pool: None,
+                sessions: Vec::new(),
+                daemon_version: None,
+                hostname_routing_unavailable: None,
+                hostname_proxy_port: None,
+                zone_answerer_port: None,
+            },
+        );
+    }
+
+    if args.json {
+        let wrapped = listings
+            .iter()
+            .map(|listing| {
+                let mut value = serde_json_lenient::to_value(&listing.resp)
+                    .context("Failed to serialize session list")?;
+                // Each reply with the VM it came from beside it: the
+                // attribution is the client's, so `--json` is the one surface
+                // that carries it per box for a pipeline to read.
+                if let serde_json_lenient::Value::Object(map) = &mut value {
+                    map.insert("vm".to_string(), serde_json_lenient::Value::String(listing.vm.clone()));
+                }
+                Ok(value)
+            })
+            .collect::<Result<Vec<_>, anyhow::Error>>()?;
+        let json = serde_json_lenient::to_string_pretty(&wrapped)
+            .context("Failed to serialize session list")?;
+        writeln!(out, "{json}")?;
+        return Ok(());
+    }
+
+    if !args.raw {
+        // Each VM's own facts, one line each, named by the VM they belong
+        // to — the same words the single-VM listing prints for them.
+        let mut facts = 0;
+        for listing in listings {
+            if let Some(pool) = &listing.resp.resource_pool {
+                let session_count = listing.resp.sessions.len();
+                let core_label = if pool.cpu_cores == 1 { "core" } else { "cores" };
+                let session_label = if session_count == 1 {
+                    "session"
+                } else {
+                    "sessions"
+                };
+                writeln!(
+                    out,
+                    "RESOURCE POOL:  {vm:<width$} {cores} CPU {core_label} · {memory} · shared by {count} {session_label}",
+                    vm = listing.vm,
+                    width = VM_COLUMN_WIDTH,
+                    cores = pool.cpu_cores,
+                    memory = format_memory(pool.memory_bytes),
+                    count = session_count,
+                )?;
+                facts += 1;
+            }
+            if let Some(port) = listing.resp.hostname_proxy_port {
+                writeln!(
+                    out,
+                    "HOSTNAME PROXY:  {vm:<width$} listening on 127.0.0.1:{port} · <name>.min.internal routes through it",
+                    vm = listing.vm,
+                    width = VM_COLUMN_WIDTH,
+                )?;
+                facts += 1;
+            }
+            if let Some(answerer) = listing.resp.zone_answerer_port {
+                writeln!(
+                    out,
+                    "ZONE ANSWERER:   {vm:<width$} listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal",
+                    vm = listing.vm,
+                    width = VM_COLUMN_WIDTH,
+                )?;
+                facts += 1;
+            }
+        }
+        if facts > 0 {
+            writeln!(out)?;
+        }
+    }
+
+    let any_sessions = listings
+        .iter()
+        .any(|listing| !listing.resp.sessions.is_empty());
+    if !any_sessions {
+        if !args.raw {
+            writeln!(out, "No active sessions.")?;
+        }
+        return Ok(());
+    }
+
+    if args.raw {
+        // Bare ids only — one per box, across every VM.
+        for listing in listings {
+            for entry in &listing.resp.sessions {
+                writeln!(out, "{}", entry.id)?;
+            }
+        }
+        return Ok(());
+    }
+
+    // Format as a table, the single-VM columns with the VM each box lives on
+    // leading them (NET-057: the listing shows the VM per box).
+    writeln!(
+        out,
+        "{:<vm_width$}  {:<36}  {:<20}  {:<13}  {:<20}  {:<19}  PROJECT PATH",
+        "VM",
+        "SESSION ID",
+        "NAME",
+        "STATUS",
+        "TITLE",
+        "LAST ACTIVITY",
+        vm_width = VM_COLUMN_WIDTH,
+    )?;
+    writeln!(
+        out,
+        "{:<vm_width$}  {:-<36}  {:-<20}  {:-<13}  {:-<20}  {:-<19}  {:-<24}",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        vm_width = VM_COLUMN_WIDTH,
+    )?;
+    for listing in listings {
+        for entry in &listing.resp.sessions {
+            let [id, name, status, title, last_activity, project_path] = session_cells(entry);
+            writeln!(
+                out,
+                "{:<vm_width$}  {id:<36}  {name:<20}  {status:<13}  {title:<20}  {last_activity:<19}  {project_path}",
+                listing.vm,
+                vm_width = VM_COLUMN_WIDTH,
+            )?;
+        }
     }
 
     Ok(())
