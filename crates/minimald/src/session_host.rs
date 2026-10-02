@@ -2867,11 +2867,13 @@ fn say_closure_line(line: &str, session: &str) -> bool {
 /// a person could run to fix either half: a box that cannot be placed in a
 /// leaf has no leaf to decide on at all, and a deny-all box whose table is
 /// not loaded would run placed while nothing refuses its connections — a
-/// verdict that looks decided and is not. Both are a broken guest image,
-/// and both are refused with the error that says so (design §7.1). An
-/// allow box needs no verdict enforced, so a guest that places it runs it.
-/// Natively the same states are the deployment exception instead —
-/// NET-079's advisory posture, never a refusal.
+/// verdict that looks decided and is not. The first is a broken guest
+/// image; the second is the interim, guest-side classifier enforcement not
+/// being available yet. Both are refused, each with the error that says
+/// which it is (design §7.1). An allow box needs no verdict enforced, so a
+/// guest that places it runs it. Natively the same states are the
+/// deployment exception instead — NET-079's advisory posture, never a
+/// refusal.
 ///
 /// Pure over its inputs, so the gate is pinned where it is written.
 fn refuses_unenforced_host_address_box(
@@ -2895,7 +2897,8 @@ fn refuses_unenforced_host_address_box(
 /// refusal (design §7.4), so every *session* launch the record says `none`
 /// for says so — once per launch, like the resolver advisory it is modelled
 /// on (design §7.1), never once per daemon. A guest never advises: its
-/// unplaceable box is refused, and its unenforced box is a broken image
+/// unplaceable box is refused, and its unenforced deny-all box is the
+/// interim — guest-side classifier enforcement not being available yet —
 /// said so by the refusal. What this predicate does not carry is the
 /// launch's audience — a launch minted for lifecycle hooks advises nobody
 /// (a hook run is not a session start), which the launch itself folds in
@@ -3048,9 +3051,12 @@ impl SessionLauncher for SandboxLauncher {
         // there is no installer to run (design §7.1): a box that cannot be
         // placed has no leaf to decide on at all, and a deny-all box whose
         // table is not loaded would run placed while nothing refuses its
-        // connections — a verdict that looks decided and is not. Natively
-        // the same states run the box unenforced and say so in the log
-        // instead (NET-079's exception).
+        // connections — a verdict that looks decided and is not. That
+        // second ground is the interim, not an image fault — guest-side
+        // classifier enforcement is not available yet — so its refusal
+        // names the interim, while the unplaceable tree names the broken
+        // image it is. Natively the same states run the box unenforced
+        // and say so in the log instead (NET-079's exception).
         if refuses_unenforced_host_address_box(
             guest,
             network_mode,
@@ -3058,6 +3064,24 @@ impl SessionLauncher for SandboxLauncher {
             leaf.is_some(),
             can_decide_per_box,
         ) {
+            let (ground, refusal) = if leaf.is_none() {
+                (
+                    "a broken guest image",
+                    "this guest has no classifier tree to place a host-address \
+                     box in: its cgroup2 is not mounted with nsdelegate, so the \
+                     box's verdict could not be decided and the box was refused \
+                     rather than run unenforced (broken guest image)",
+                )
+            } else {
+                (
+                    "guest-side classifier enforcement is not available yet",
+                    "this guest has not loaded the classifier table, so a \
+                     deny-all box's connections would not be refused: the box's \
+                     declaration promises a verdict nothing here refuses yet, \
+                     and the box was refused rather than run unenforced \
+                     (guest-side classifier enforcement is not available yet)",
+                )
+            };
             tracing::error!(
                 session = %session_name,
                 network_mode = ?network_mode,
@@ -3067,20 +3091,9 @@ impl SessionLauncher for SandboxLauncher {
                  egress verdict for: its cgroup2 tree is missing or mounted \
                  without namespace delegation, or the daemon cannot place a \
                  process in it, or the image never loaded the table that \
-                 refuses a deny-all box's connections — a broken guest image"
+                 refuses a deny-all box's connections — {ground}"
             );
-            return Err(io::Error::other(if leaf.is_none() {
-                "this guest has no classifier tree to place a host-address \
-                 box in: its cgroup2 is not mounted with nsdelegate, so the \
-                 box's verdict could not be decided and the box was refused \
-                 rather than run unenforced (broken guest image)"
-            } else {
-                "this guest has not loaded the classifier table, so a \
-                 deny-all box's connections would not be refused: the box's \
-                 declaration promises a verdict this image does not enforce, \
-                 and the box was refused rather than run unenforced (broken \
-                 guest image)"
-            }));
+            return Err(io::Error::other(refusal));
         }
 
         // The advisory for that same state, natively, as a diagnostic record

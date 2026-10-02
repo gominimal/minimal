@@ -715,7 +715,11 @@ async fn async_main() -> Result<(), MainError> {
     // names the cause, and the exact command that ends it when one can —
     // the step's install for a host without the step, nothing for a host
     // that cannot confine a box or a guest whose image never loaded the
-    // table — so the daemon's log carries what a session's start is about
+    // table — and says what this host does with the boxes, because the two
+    // hosts answer it differently: natively the exception runs them
+    // unenforced, never refused, while the guest refuses — the deny-all
+    // box on a table that is not loaded, every box on a tree that cannot
+    // confine — so the daemon's log carries what a session's start is about
     // to tell the person in the terminal, and stays quiet on a host that
     // decides, which is not a state to report.
     let classifier_decision = minimald::net::classifier::decide(
@@ -730,7 +734,8 @@ async fn async_main() -> Result<(), MainError> {
             install = ?cause.install_command(),
             host_ip_enforcement = "none",
             "this host cannot decide a host-address box's egress verdict \
-             per box, so its host-address boxes run unenforced"
+             per box, so {}",
+            cause.host_ip_box_outcome(guest::is_microvm_daemon())
         );
     }
     minimald::net::classifier::record(classifier_decision);

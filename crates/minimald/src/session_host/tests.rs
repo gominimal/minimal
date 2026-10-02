@@ -1824,11 +1824,12 @@ fn daemon_enters_its_own_leaf() {
 /// undelegated cgroup2 tree is a broken image — the daemon's own boot path
 /// is the only thing that could have built it — so a box that would speak
 /// with the VM's address and no verdict of its own is refused rather than
-/// run unenforced. So is a deny-all box whose table never loaded: placed in
-/// a leaf that decides nothing, it would run looking refused while nothing
-/// refuses its connections. Natively the same states are NET-079's
-/// exception: advisory, never a refusal; and a box that isolates its own
-/// network is never the box the refusal is for.
+/// run unenforced. So is a deny-all box whose table is not loaded — the
+/// interim, guest-side classifier enforcement not being available yet:
+/// placed in a leaf that decides nothing, it would run looking refused
+/// while nothing refuses its connections. Natively the same states are
+/// NET-079's exception: advisory, never a refusal; and a box that isolates
+/// its own network is never the box the refusal is for.
 #[test]
 fn only_the_guest_refuses_a_host_address_box_it_cannot_decide() {
     use sandbox2::config::Verdict;
@@ -1863,13 +1864,13 @@ fn only_the_guest_refuses_a_host_address_box_it_cannot_decide() {
         "a guest that never loaded the table still runs an allow box: only a \
          deny-all declaration promises a verdict the table refuses"
     );
-    // The state a broken image is refused for: a deny-all box placed on a
-    // host whose table is not loaded.
+    // The state the interim is refused for: a deny-all box placed on a
+    // guest whose table is not loaded.
     assert!(
         refuses_unenforced_host_address_box(true, NetworkMode::HostNet, Verdict::Deny, true, false),
         "a guest that places a deny-all box but never loaded the table \
-         refuses it: its declaration promises a verdict this image does not \
-         enforce"
+         refuses it: its declaration promises a verdict nothing here refuses \
+         yet, and guest-side classifier enforcement is not available yet"
     );
     for (guest, mode, why) in [
         (

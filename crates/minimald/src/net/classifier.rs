@@ -96,12 +96,13 @@ pub enum Cause {
     /// refuses to install over a tree no cgroup2 covers — so none is
     /// named.
     CannotConfine,
-    /// The guest's boot has not loaded the deny table: the tree and the
-    /// table were this guest image's own to build — there is no privileged
-    /// step a person can run inside a microVM, and the person to tell is
-    /// the image's builder, not whoever is holding the session. A deny-all
-    /// host-address box is refused on this ground rather than placed in a
-    /// leaf that decides nothing, so no command is named.
+    /// The guest's boot has not loaded the deny table: guest-side classifier
+    /// enforcement is not available yet — no guest image loads the table
+    /// today — and there is no privileged step a person can run inside a
+    /// microVM to load one, so the person to tell is the image's builder,
+    /// not whoever is holding the session. A deny-all host-address box is
+    /// refused on this ground rather than placed in a leaf that decides
+    /// nothing, so no command is named.
     GuestTableNotLoaded,
 }
 
@@ -118,8 +119,43 @@ impl Cause {
                  box could migrate out of its leaf"
             }
             Self::GuestTableNotLoaded => {
-                "this guest image has not loaded the classifier's packet-filter \
+                "guest-side classifier enforcement is not available yet: this \
+                 guest image has not loaded the classifier's packet-filter \
                  table, so no per-box verdict is decided in it"
+            }
+        }
+    }
+
+    /// What this daemon does with a host-address box on this cause, spelled
+    /// for the cause's own host: the half of the start-up line that must say
+    /// what the next launch will actually do, because the two hosts answer
+    /// a host that cannot decide per box differently. Natively every cause
+    /// is the requirement's own exception (NET-079) — the box runs
+    /// unenforced, never refused on this ground. In the guest the tree and
+    /// the table were the image's own to build: a tree that cannot confine
+    /// a box leaves nothing to place one in, so every host-address box is
+    /// refused, and on a table that is not loaded — guest-side enforcement
+    /// not being available yet — a deny-all box is refused rather than run
+    /// on a refusal that is not there, while every other box needs no
+    /// verdict enforced and runs.
+    ///
+    /// [`Cause::StepNotInstalled`] is the one cause this cannot arise as in
+    /// a guest ([`decide`] maps the missing step to the guest's own
+    /// cause), so it takes the deny-all spelling with
+    /// [`Cause::GuestTableNotLoaded`]: the match stays exhaustive over
+    /// causes, never claiming a host kind that cannot produce it.
+    pub fn host_ip_box_outcome(self, guest: bool) -> &'static str {
+        if !guest {
+            return "its host-address boxes run unenforced";
+        }
+        match self {
+            Self::CannotConfine => {
+                "its host-address boxes are refused: it cannot place one in a \
+                 leaf that confines"
+            }
+            Self::StepNotInstalled | Self::GuestTableNotLoaded => {
+                "its deny-all host-address boxes are refused and its other \
+                 host-address boxes run unenforced"
             }
         }
     }
@@ -759,15 +795,25 @@ mod tests {
         );
 
         // The same shape in a guest names its own image's half instead:
-        // the tree and the table were its boot's work, so a missing table
-        // is a broken image rather than a deployment state, and no
-        // installer exists inside a microVM — no command is named for a
-        // person who cannot run one.
+        // the tree and the table were its boot's work, and guest-side
+        // classifier enforcement is not available yet, so a missing table
+        // is the interim rather than a broken image — and no installer
+        // exists inside a microVM, so no command is named for a person who
+        // cannot run one.
         let guest_unloaded = decide(root, Some(&mountinfo(root, true)), true);
         assert_eq!(
             guest_unloaded.cause(),
             Some(Cause::GuestTableNotLoaded),
             "the guest's missing table is its image's own half"
+        );
+        let detail = guest_unloaded.cause().expect("the cause is named").detail();
+        assert!(
+            detail.contains("not available yet"),
+            "the guest's cause names the interim: {detail}"
+        );
+        assert!(
+            !detail.contains("broken"),
+            "the interim is not a broken image: {detail}"
         );
         assert!(
             !guest_unloaded.can_decide_per_box(),
@@ -820,6 +866,44 @@ mod tests {
                 "a decided {kind} host names no cause"
             );
         }
+    }
+
+    /// The cause names what happens to a host-address box on the host it was
+    /// decided on — the half of the start-up line that must match what the
+    /// next launch actually does, because the two hosts answer a host that
+    /// cannot decide per box differently. Natively every cause is NET-079's
+    /// own exception: the box runs unenforced, never refused on this ground.
+    /// The guest refuses instead, and its two grounds say so differently:
+    /// a tree that cannot confine a box leaves nothing to place one in, so
+    /// every host-address box is refused, while a table that is not loaded —
+    /// guest-side enforcement not being available yet — refuses the deny-all
+    /// box, whose declaration promises a verdict nothing would enforce, and
+    /// runs every other, which needs no verdict enforced. Pinned as data,
+    /// the same spelling the start-up line renders.
+    #[test]
+    fn the_cause_names_what_happens_to_the_box_on_each_host() {
+        for (cause, why) in [
+            (Cause::StepNotInstalled, "a host without the step"),
+            (Cause::CannotConfine, "a host that cannot confine a box"),
+        ] {
+            assert_eq!(
+                cause.host_ip_box_outcome(false),
+                "its host-address boxes run unenforced",
+                "natively, {why} is the exception, never a refusal"
+            );
+        }
+        assert_eq!(
+            Cause::CannotConfine.host_ip_box_outcome(true),
+            "its host-address boxes are refused: it cannot place one in a \
+             leaf that confines",
+            "a guest that cannot confine a box has no leaf to decide anything in"
+        );
+        assert_eq!(
+            Cause::GuestTableNotLoaded.host_ip_box_outcome(true),
+            "its deny-all host-address boxes are refused and its other \
+             host-address boxes run unenforced",
+            "the interim refuses the deny-all box and runs the rest"
+        );
     }
 
     /// The recorded decision answers a create from the fact the start block
