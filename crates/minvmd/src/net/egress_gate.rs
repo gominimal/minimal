@@ -6553,4 +6553,79 @@ mod tests {
             "the node's frames still pass after the earlier relay's end"
         );
     }
+
+    /// The withdrawal report itself, watched: one relay carries a
+    /// node-sourced frame and a lease-run frame, ends, and the report it
+    /// files names the lease-run address only — the node's address is not in
+    /// it, because the node's row is the host's own registration, filed once
+    /// at boot and never by a connection ([`BoxRegistry::register_node_namespace`]),
+    /// and a report that named it would retire the row that decides the
+    /// in-VM daemon's frames and publishes for it for the rest of the VM's
+    /// life. The report is read off the channel the drainer would consume,
+    /// so the assertion is the host's own words about what ended, not just
+    /// the rows left standing after it.
+    #[tokio::test]
+    async fn node_row_survives_relay_end() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let node = registry.register_node_namespace(7654, 7656);
+        // The reports, read directly: the drainer is not started, so the
+        // report's content is the test's to assert on.
+        let reports = registry
+            .take_withdrawal_reports()
+            .expect("the withdrawal reports' receiver is taken once");
+
+        let mut h = gate_over(registry).await;
+
+        // One node-sourced frame, one lease-run frame, both admitted — the
+        // traffic the relay attributes to the connection that carried it.
+        let node_frame = ipv4_frame(SUBNET.daemon_ip().octets(), 6, [10, 1, 2, 3], 80);
+        send_frame(&mut h.guest, &node_frame).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            node_frame,
+            "the node's frame reaches the switch by its row"
+        );
+        let box_frame = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
+        send_frame(&mut h.guest, &box_frame).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            box_frame,
+            "the box's frame reaches the switch by its row"
+        );
+
+        // The connection ends.
+        h.guest.shutdown().await.expect("closing the guest's side");
+
+        // The report names the lease-run address only, and the node's row
+        // stands: the exclusion is the fix the round-6 review asked for,
+        // pinned here at the report the drainer acts on. The report is filed
+        // by the gate's task on this runtime, so the read polls around
+        // yields instead of blocking the thread the filing runs on.
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        let report = loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the withdrawal report is not filed within {DEADLINE:?}"
+            );
+            match reports.try_recv() {
+                Ok(report) => break report,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("the withdrawal channel is down; nothing will file a report")
+                }
+            }
+        };
+        assert_eq!(
+            report,
+            vec![LEASE],
+            "the withdrawal report names only the lease-run address"
+        );
+        assert!(
+            h.table.by_source(node.switch_addr().octets()).is_some(),
+            "the node's row survives the relay's end"
+        );
+    }
 }
