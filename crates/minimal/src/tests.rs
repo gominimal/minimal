@@ -2295,3 +2295,218 @@ async fn a_stopped_vm_does_not_hold_a_box_name_resolution() {
          connect-retry window ({elapsed:?})"
     );
 }
+
+/// NET-058's ambiguous half, on the path attach itself runs: when the
+/// selected VM does not know the name and the fall-through finds it on two
+/// VMs, the attach must refuse rather than take the first VM that answers —
+/// an attach that lands in a project the operator did not choose is worse
+/// than one that asks. The refusal names every VM that knows the name and
+/// points at the flag that disambiguates, and it stops the hand-off: the
+/// resolution itself fails, so no record and no socket come back for ssh to
+/// run over.
+///
+/// The selected VM has to be a third VM that does *not* know the name — that
+/// is what sends attach through the fall-through. A name the selected VM
+/// knows is its fast path, never ambiguous, and an explicit `--vm` is the
+/// operator's own answer. The share this pins is the exposed verb's too: the
+/// resolution the two verbs share carries the refusal for both.
+#[tokio::test]
+async fn attach_refuses_a_box_name_two_vms_know() {
+    // Three VMs: the selected one, plus alpha and beta, which both own the
+    // ambiguous name.
+    let state = tempfile::tempdir().expect("a temp minimal state dir for three VMs");
+    let provider = state.path().join("providers/local-minvmd0");
+    for vm in ["alpha", "beta"] {
+        std::fs::create_dir_all(provider.join(vm)).expect("the named VM's provider subdir");
+    }
+    let selected_sock =
+        client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
+            .expect("the selected VM's socket path");
+    let selected_vm = minimald::test_harness::TestServer::new().await;
+    selected_vm.listen_on_uds(&selected_sock).await;
+    let alpha = minimald::test_harness::TestServer::new().await;
+    alpha.listen_on_uds(&provider.join("alpha/ssh.sock")).await;
+    let beta = minimald::test_harness::TestServer::new().await;
+    beta.listen_on_uds(&provider.join("beta/ssh.sock")).await;
+
+    // The selected VM knows a box of its own — so the connection, and the
+    // version gate the lookup carries, are real — but not this name.
+    create_box_on(&selected_vm, "api").await;
+    create_box_on(&alpha, "shared").await;
+    create_box_on(&beta, "shared").await;
+
+    let global = vm_globals(state.path(), None);
+    let mut client = client::Client::connect(&selected_sock)
+        .await
+        .expect("connect to the selected VM's daemon");
+    let err =
+        cmd::resolve_attach_target_version_gated(&global, &mut client, selected_sock, "shared")
+            .await
+            .expect_err("a name two VMs own must be refused, not guessed")
+            .to_string();
+    assert!(
+        err.contains("alpha") && err.contains("beta"),
+        "the refusal must name every VM that knows the name: {err}"
+    );
+    assert!(
+        err.contains("shared"),
+        "the refusal must name the box it refused: {err}"
+    );
+    assert!(
+        err.contains("--vm"),
+        "the refusal must point at the flag that disambiguates: {err}"
+    );
+    assert!(
+        !err.contains(paths::DEFAULT_VM_NAME),
+        "a VM that does not know the name is not an owner to choose \
+         between: {err}"
+    );
+}
+
+/// NET-059's report, and NET-025's: a proxy that is *not* where the recipes
+/// assume — a VM whose proposed host port the host already held, publishing on
+/// a host port of its own; a native daemon whose default was busy, asking the
+/// OS for a free one — must tell the operator the port it is reachable on, on
+/// the two surfaces the operator points a PAC file or an `HTTP(S)_PROXY`
+/// export at. A log line alone is not the report.
+///
+/// Both surfaces render the daemon's *reported* port, the one its
+/// `ListSessions`/`CreateSession` replies carry — which is what makes the walk
+/// visible client-side at all. The daemon-side half — a publication refused on
+/// the proposed port walking to the next rung, and that rung landing in the
+/// reported field the replies read — is pinned by
+/// `two_vms_hostnames_route_concurrently` in minimald, whose second VM's rung
+/// is the port this test puts in alpha's reply. Here the fact under test is the
+/// rendering: each VM's routing line names the VM and the real port, the two
+/// surfaces agree on the address, and the port the recipes assume appears
+/// nowhere on the walked VM.
+#[tokio::test]
+async fn walked_proxy_port_reported_at_start_and_in_ls() {
+    use minimald_rpc::ListSessions;
+
+    // A real listing reply for the shape, so the lines render beside the facts
+    // they render beside in production; the proxy port is the only thing that
+    // differs per VM here.
+    let server = minimald::test_harness::TestServer::new().await;
+    let mut reply_client = server.connect().await;
+    let reply = reply_client.call::<ListSessions>(&()).await;
+    let listing_for = |vm: &str, port: u16| {
+        let mut resp = reply.clone();
+        resp.hostname_proxy_port = Some(port);
+        VmListing {
+            vm: vm.to_owned(),
+            resp,
+        }
+    };
+
+    // The walked shape: the first VM holds the port the recipes name; the
+    // second's publication took the next rung — one stride up, the daemon's
+    // own walk when a host port is refused.
+    const RECIPES_PORT: u16 = 7654;
+    const NEXT_RUNG: u16 = RECIPES_PORT + 1_000;
+    let listings = vec![
+        listing_for("default", RECIPES_PORT),
+        listing_for("alpha", NEXT_RUNG),
+    ];
+
+    // `min ls`: alpha's routing line names alpha and the port the host
+    // reaches it on — the real port, not the one the recipes assume.
+    let mut out = Vec::new();
+    format_ls_across_vms(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &listings,
+    )
+    .expect("rendering the two-VM listing");
+    let ls = String::from_utf8(out).expect("the listing is UTF-8");
+    let routing = |vm: &str| {
+        ls.lines()
+            .find(|l| l.starts_with("HOSTNAME PROXY:") && l.contains(vm))
+            .unwrap_or_else(|| panic!("a HOSTNAME PROXY line for {vm} in:\n{ls}"))
+            .to_string()
+    };
+    assert!(
+        routing("alpha").contains(&format!("127.0.0.1:{NEXT_RUNG}")),
+        "a walked port must be the port on the routing line, not a log \
+         line: {}",
+        routing("alpha")
+    );
+    assert!(
+        !routing("alpha").contains(&RECIPES_PORT.to_string()),
+        "the walked VM's line must not name the port the recipes assume: {}",
+        routing("alpha")
+    );
+    assert!(
+        routing("default").contains(&format!("127.0.0.1:{RECIPES_PORT}")),
+        "the VM that kept the port the recipes name still prints it: {}",
+        routing("default")
+    );
+
+    // Session start: one line naming the VM the session landed on and the
+    // same port, so the two surfaces agree on the address to point at.
+    let start = hostname_proxy_start_line(Some("alpha"), NEXT_RUNG);
+    let address = format!("127.0.0.1:{NEXT_RUNG}");
+    assert!(
+        routing("alpha").contains(&address) && start.contains(&address),
+        "the routing line and the session-start line must agree on the \
+         address: ls={} start={start}",
+        routing("alpha")
+    );
+    assert!(
+        start.contains("VM alpha"),
+        "on a two-VM host the start line must say whose port it is: {start}"
+    );
+
+    // And the wiring: the start line names a VM exactly when the backend hosts
+    // them — the selected VM on the VM backend, nothing on the native one,
+    // whose single daemon has no VM to name. This test process never publishes
+    // a `--vm` name, so the selected VM is the default one.
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    assert_eq!(
+        hostname_proxy_start_vm(&vm_globals(state.path(), None)),
+        Some(paths::DEFAULT_VM_NAME),
+        "the VM backend names the selected VM"
+    );
+    let native = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(state.path().to_path_buf()),
+        config_dir: None,
+        provider: Some(Provider::LocalMinimald),
+        no_input: true,
+        vm: None,
+    };
+    assert_eq!(
+        hostname_proxy_start_vm(&native),
+        None,
+        "the native backend hosts no VM to name"
+    );
+
+    // The native line is the single-VM routing line word for word — the same
+    // address in the same words, so the two surfaces read as one.
+    let native_start = hostname_proxy_start_line(hostname_proxy_start_vm(&native), NEXT_RUNG);
+    let mut single = Vec::new();
+    let mut native_resp = reply.clone();
+    native_resp.hostname_proxy_port = Some(NEXT_RUNG);
+    format_ls(
+        &mut single,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &native_resp,
+    )
+    .expect("rendering the single-VM listing");
+    let single = String::from_utf8(single).expect("the listing is UTF-8");
+    assert_eq!(
+        single
+            .lines()
+            .find(|l| l.starts_with("HOSTNAME PROXY:"))
+            .expect("the single-VM listing prints a routing line"),
+        native_start.as_str(),
+        "the native start line and `min ls`'s routing line must be the same \
+         line"
+    );
+}
