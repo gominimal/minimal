@@ -873,10 +873,28 @@ pub(crate) fn native_surface_at(
     answerer_bound && hook.routes(answerer_port) && range_present && blocker.is_none()
 }
 
+/// The verdict [`live_name_surface_at`] decides, with the range fact of the
+/// host's own read carried back beside it — the form `min session activate`
+/// logs at session start (NET-018's host-side record): the daemon's line can
+/// name only the answerer *it* binds, so the surface a host's names actually
+/// resolve through is the host's to record, logged where the host read it.
+/// [`Self::range_present`] is `None` when the two cheap facts settled the
+/// proxy without a probe — the honest record: a range never read is not a
+/// range reported present or absent.
+pub(crate) struct LiveSurfaceVerdict {
+    /// Which surface the three facts decided is live.
+    pub surface: LiveSurface,
+    /// Whether the reserved range read present on this host's loopback,
+    /// when the verdict read it.
+    pub range_present: Option<bool>,
+}
+
 /// The live surface for the facts one reply carries, from a detection the
-/// caller already read — `min session activate`'s form: the session start
-/// reads this host's resolver state once (see [`session_advisory_at`]) and
-/// decides both the advisory and this verdict from that one read.
+/// caller already read, with the range fact of the host's own read beside
+/// the verdict — `min session activate`'s form: the session start reads
+/// this host's resolver state once (see [`session_advisory_at`]) and
+/// decides the advisory, this verdict, and the log that records it from
+/// that one read.
 ///
 /// `None` — nothing to print — when the daemon's answerer is not bound in
 /// its own namespace (`answerer_bound` false, or the reply carrying no
@@ -892,11 +910,11 @@ pub(crate) fn native_surface_at(
 /// ones: a host whose resolver does not route the zone to the answerer —
 /// or one whose lookups bypass the resolver a hook would configure —
 /// cannot read native whatever the range says, so it pays no bind probe.
-pub(crate) async fn live_name_surface_at(
+pub(crate) async fn live_name_surface_with_range_at(
     detection: &(Hook, Option<String>),
     zone_answerer_port: Option<u16>,
     answerer_bound: bool,
-) -> Option<LiveSurface> {
+) -> Option<LiveSurfaceVerdict> {
     let port = zone_answerer_port?;
     if !answerer_bound {
         return None;
@@ -907,23 +925,43 @@ pub(crate) async fn live_name_surface_at(
     // hook would configure — cannot read native whatever the range says,
     // so it settles on the proxy without paying the bind probe below.
     if !hook.routes(port) || blocker.is_some() {
-        return Some(LiveSurface::Proxy);
+        return Some(LiveSurfaceVerdict {
+            surface: LiveSurface::Proxy,
+            range_present: None,
+        });
     }
     let range_present = range_present_on_host().await;
-    Some(
-        if native_surface_at(hook, port, true, range_present, blocker.as_deref()) {
+    Some(LiveSurfaceVerdict {
+        surface: if native_surface_at(hook, port, true, range_present, blocker.as_deref()) {
             LiveSurface::Native
         } else {
             LiveSurface::Proxy
         },
-    )
+        range_present: Some(range_present),
+    })
+}
+
+/// [`live_name_surface_with_range_at`] as the printed verdict alone — the
+/// form `min ls` reads and the table tests assert: just the surface, the
+/// facts it was decided from staying where the caller that holds them (the
+/// detection, the reply) can log them.
+pub(crate) async fn live_name_surface_at(
+    detection: &(Hook, Option<String>),
+    zone_answerer_port: Option<u16>,
+    answerer_bound: bool,
+) -> Option<LiveSurface> {
+    live_name_surface_with_range_at(detection, zone_answerer_port, answerer_bound)
+        .await
+        .map(|verdict| verdict.surface)
 }
 
 /// [`live_name_surface_at`] with the detection this verb reads itself —
 /// `min ls`'s form: the list has no session-start advisory to share a
 /// read with, so the same bounded, read-only detection runs here, and
 /// only when the daemon's answerer is bound (the cheap half the reply
-/// carries), so a proxy-only host pays nothing per list.
+/// carries). The answerer is bound on every current daemon, so this read
+/// is not one only rare hosts pay: `cmd_ls` runs it in the modes that
+/// print the verdict alone, which is where the read belongs.
 pub(crate) async fn live_name_surface(
     zone_answerer_port: Option<u16>,
     answerer_bound: bool,
@@ -1280,6 +1318,27 @@ mod tests {
             live_name_surface_at(&blocked, Some(port), true).await,
             Some(LiveSurface::Proxy),
             "a hook no host process consults is the proxy's story, on both verbs"
+        );
+    }
+
+    /// NET-018's positive arm on the real host, on NET-018's verify line:
+    /// the routing hook and the bound answerer are the two facts a table
+    /// can spell, but the third — the reserved range on this host's own
+    /// loopback — is a fact about a real loopback, so this arm runs the
+    /// verdict's own bind probe against the host the suite runs on. Linux
+    /// only: the whole `127/8` is local to `lo` there, so the probe always
+    /// reads the range present and the arm takes the real path both verbs
+    /// take to a native verdict — the same probe the daemon's
+    /// session-start one mirrors (NET-123).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_surface_is_native_where_all_three_facts_hold() {
+        let port = 15353;
+        assert_eq!(
+            live_name_surface_at(&(routing_hook(), None), Some(port), true).await,
+            Some(LiveSurface::Native),
+            "a routing hook on a bound answerer over this host's present range is \
+             native DNS, and both verbs print it"
         );
     }
 

@@ -686,16 +686,35 @@ pub(crate) async fn activate_session(
     // The proxy's half is said with the native arm either way (NET-019):
     // the `HTTP(S)_PROXY` recipes this activation prints keep working
     // beside native DNS, so nothing already captured goes stale.
-    if let Some(surface) = crate::resolver::live_name_surface_at(
-        &detection,
-        created.zone_answerer_port,
-        created.answerer_bound,
-    )
-    .await
+    if let Some(answerer_port) = created.zone_answerer_port
+        && let Some(verdict) = crate::resolver::live_name_surface_with_range_at(
+            &detection,
+            Some(answerer_port),
+            created.answerer_bound,
+        )
+        .await
     {
+        // The host-side record of that verdict, the half the daemon's own
+        // log cannot make: a daemon can name only the answerer *it* binds
+        // (see the daemon's `log_live_name_surface`), so the surface this
+        // host's own reads decided — and the three facts behind it, with
+        // the range as the one fact only this read holds — is logged here,
+        // at the start that printed it, for the bundle a support engineer
+        // tails beside the daemon's line. Logged, never printed: the line
+        // below is the user's. `min ls` does not log its verdict — a list
+        // re-reads the host every run, and the record that matters is the
+        // one at the starts that rely on the names.
+        tracing::info!(
+            surface = ?verdict.surface,
+            hook_routes = detection.0.routes(answerer_port),
+            blocker = ?detection.1,
+            answerer_bound = created.answerer_bound,
+            range_present = ?verdict.range_present,
+            "session start decided the live name surface for this host"
+        );
         eprintln!(
             "{}",
-            crate::resolver::name_surface_line(surface, created.hostname_proxy_port)
+            crate::resolver::name_surface_line(verdict.surface, created.hostname_proxy_port)
         );
     }
     let id = created.id;

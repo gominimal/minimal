@@ -1349,13 +1349,13 @@ async fn setup_opted_out() -> (
 // runs the real retry loop against it, and reads what `min ls` and
 // `min session activate` print while the proxy is down and after it recovers.
 
-/// Builds the compiled `min` the way [`run_min`] runs it: the harness
-/// daemon's `--minimal-dir`, an empty `--config-dir` (the developer's own
-/// loadouts and policy stay out of the run), `--no-input`, plus `extra` as
-/// the command. The tempdir holds that `--config-dir` — it must outlive the
-/// child it is spelled into, so the caller keeps the pair.
+/// Runs the compiled `min` with the harness daemon's `--minimal-dir`, an empty
+/// `--config-dir` (the developer's own loadouts and policy stay out of the
+/// run), and `--no-input`, plus `extra` as the command, and returns its
+/// captured output. The tempdir holding that `--config-dir` lives until the
+/// function returns, so the child it is spelled into outlives it.
 #[cfg(target_os = "linux")]
-fn min_command(args: &GlobalArgs, extra: &[&str]) -> (tokio::process::Command, tempfile::TempDir) {
+async fn run_min(args: &GlobalArgs, extra: &[&str]) -> std::process::Output {
     let minimal_dir = args
         .minimal_dir
         .as_ref()
@@ -1367,16 +1367,6 @@ fn min_command(args: &GlobalArgs, extra: &[&str]) -> (tokio::process::Command, t
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
         .args(extra);
-    (command, config_dir)
-}
-
-/// Runs the compiled `min` with the harness daemon's `--minimal-dir`, an empty
-/// `--config-dir` (the developer's own loadouts and policy stay out of the
-/// run), and `--no-input`, plus `extra` as the command, and returns its
-/// captured output.
-#[cfg(target_os = "linux")]
-async fn run_min(args: &GlobalArgs, extra: &[&str]) -> std::process::Output {
-    let (mut command, _config_dir) = min_command(args, extra);
     command
         .output()
         .await
@@ -1644,7 +1634,16 @@ async fn min_prints_discovered_proxy_port() {
 /// depends on the host it runs on. The decision is pure, so its table —
 /// the native arm, and the reviewer's case that must not print native on a
 /// hook no host process consults — lives beside the function in
-/// `resolver`'s tests, where every arm runs on every host.
+/// `resolver`'s tests, where every arm runs on every host (`resolver`'s
+/// own Linux test additionally runs the positive arm against a real host
+/// loopback, where the range always reads present).
+///
+/// The positive arm's *words* run here as the in-process arm: the binary
+/// cannot reach them on this host, because the verdict reads the host's own
+/// resolver files, which no test may rewrite — so the native verdict is fed
+/// straight to the formatter `cmd_ls` prints from, over this daemon's live
+/// reply, and what a host whose three facts all hold is told is asserted
+/// all the same.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn activate_and_ls_report_native_surface() {
@@ -1758,6 +1757,49 @@ async fn activate_and_ls_report_native_surface() {
             || activate_stderr.contains("bypass systemd-resolved"),
         "the advisory names what is missing — the command to run, or the host fact that \
          makes one dead: {activate_stderr}"
+    );
+
+    // The positive arm, in process (see the test's doc): the native verdict
+    // fed to the formatter `cmd_ls` prints through, over this daemon's live
+    // reply — which carries the real proxy port the line's second half
+    // names. A host whose three facts all hold is told native DNS is the
+    // live surface, the proxy's half stays beside it (NET-019), and the
+    // NET-122 advisory a native host no longer needs does not ride it.
+    let mut native_out = Vec::new();
+    format_ls(
+        &mut native_out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+        Some(resolver::LiveSurface::Native),
+    )
+    .unwrap();
+    let native_ls = String::from_utf8(native_out).unwrap();
+    assert!(
+        native_ls.contains("NAME SURFACE:    native DNS is the live name surface"),
+        "`min ls` must say native DNS is the live surface when the three facts hold, got: \
+         {native_ls}"
+    );
+    assert!(
+        native_ls.contains(&format!(
+            "the hostname proxy still serves on 127.0.0.1:{port}"
+        )),
+        "the native arm keeps the proxy's half beside it (NET-019): {native_ls}"
+    );
+    assert!(
+        !native_ls.contains("note:") && !native_ls.contains("Configure the host's resolver"),
+        "a host the verdict calls native is a configured one: no advisory rides its list, \
+         got: {native_ls}"
+    );
+    // And the words are activate's: one function renders the line for both
+    // verbs, so the native words `min ls` printed are the words the session
+    // start prints at the moment the user relies on the names.
+    let activate_words = resolver::name_surface_line(resolver::LiveSurface::Native, Some(port));
+    assert!(
+        native_ls.contains(&activate_words),
+        "`min ls` and activate print the same native words: {native_ls} vs {activate_words}"
     );
 }
 

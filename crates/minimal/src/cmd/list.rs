@@ -317,12 +317,19 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // hook configures), the daemon's answerer-bound report, and the
     // reserved range on this host's own loopback; native DNS is live only
     // when all three hold. Nothing prints when the daemon's answerer is
-    // not bound — the port lines below already tell that story — and the
-    // detection is read only then, so a proxy-only host pays nothing per
-    // list. The daemon's own view of this host's resolver is not a thing
-    // that exists, so the host's half is the host's to read.
-    let surface =
-        crate::resolver::live_name_surface(resp.zone_answerer_port, resp.answerer_bound).await;
+    // not bound — the port lines below already tell that story. The
+    // detection runs only in the modes that can print the verdict:
+    // `--json` and `--raw` are machine-readable-only and never carry the
+    // line, so they pay no resolver read — and the answerer is bound on
+    // every current daemon, so every human-mode list does read the host,
+    // which is the read the line is for. The daemon's own view of this
+    // host's resolver is not a thing that exists, so the host's half is
+    // the host's to read.
+    let surface = if args.json || args.raw {
+        None
+    } else {
+        crate::resolver::live_name_surface(resp.zone_answerer_port, resp.answerer_bound).await
+    };
     format_ls(&mut std::io::stdout(), &args, &resp, surface)?;
     Ok(())
 }
