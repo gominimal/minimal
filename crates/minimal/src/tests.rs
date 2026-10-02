@@ -88,11 +88,12 @@ fn every_daemon_connection_is_classified() {
             "cmd/session.rs::cmd_session_setup_zed = gated",
             "diag/net.rs::probe_socket = ungated",
             "task.rs::arm_task_run_interrupt = ungated",
-            // Not a product path: the fall-through test's own connection to
-            // the selected daemon — but a connection all the same, and the
-            // paths it drives are the gated ones above, so the label records
-            // what the test asserts rather than a decision it makes.
+            // Not a product path: the fall-through tests' own connections to
+            // the selected daemon — but connections all the same, and the
+            // paths they drive are the gated ones above, so the label records
+            // what the tests assert rather than a decision they make.
             "tests.rs::attach_fall_through_hands_off_the_owning_vm = gated",
+            "tests.rs::attach_refuses_a_box_name_two_vms_know = gated",
         ]
     );
 }
