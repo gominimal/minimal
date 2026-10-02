@@ -1711,12 +1711,9 @@ async fn two_vms() -> (
     let state = tempfile::tempdir().expect("a temp minimal state dir for two VMs");
     let alpha_dir = state.path().join("providers/local-minvmd0/alpha");
     std::fs::create_dir_all(&alpha_dir).expect("the named VM's provider subdir");
-    let default_sock = client::resolve_socket_path_named(
-        Some(state.path()),
-        true,
-        paths::DEFAULT_VM_NAME,
-    )
-    .expect("the default VM's socket path");
+    let default_sock =
+        client::resolve_socket_path_named(Some(state.path()), true, paths::DEFAULT_VM_NAME)
+            .expect("the default VM's socket path");
     let default_vm = minimald::test_harness::TestServer::new().await;
     default_vm.listen_on_uds(&default_sock).await;
     let alpha = minimald::test_harness::TestServer::new().await;
@@ -1733,8 +1730,8 @@ async fn create_box_on(
     name: &str,
 ) -> sessions::SessionId {
     use minimald_rpc::{
-        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
-        Errorable, FinalizeSession, FinalizeSessionRequest, SessionConfig,
+        ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest, Errorable,
+        FinalizeSession, FinalizeSessionRequest, SessionConfig,
     };
 
     let mut client = server.connect().await;
@@ -1826,8 +1823,15 @@ async fn ls_shows_vm_per_box() {
 
     // The VM is a column, and each box's row carries its own.
     let mut out = Vec::new();
-    format_ls_across_vms(&mut out, &LsArgs { raw: false, json: false }, &listings)
-        .expect("rendering the two-VM listing");
+    format_ls_across_vms(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &listings,
+    )
+    .expect("rendering the two-VM listing");
     let table = String::from_utf8(out).expect("the listing is UTF-8");
     let row_of = |id: &sessions::SessionId| {
         table
@@ -1836,7 +1840,10 @@ async fn ls_shows_vm_per_box() {
             .unwrap_or_else(|| panic!("a row for {id} in:\n{table}"))
             .to_string()
     };
-    assert!(table.contains("VM  "), "the table must carry a VM column:\n{table}");
+    assert!(
+        table.contains("VM  "),
+        "the table must carry a VM column:\n{table}"
+    );
     assert!(row_of(&api).starts_with("default "), "got:\n{table}");
     assert!(row_of(&web).starts_with("alpha "), "got:\n{table}");
 
@@ -1844,11 +1851,25 @@ async fn ls_shows_vm_per_box() {
     // printed: the column is a fact about a multi-VM host, not a new format.
     let single = &listings[1..];
     let mut delegated = Vec::new();
-    format_ls_across_vms(&mut delegated, &LsArgs { raw: false, json: false }, single)
-        .expect("rendering the single-VM listing");
+    format_ls_across_vms(
+        &mut delegated,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        single,
+    )
+    .expect("rendering the single-VM listing");
     let mut direct = Vec::new();
-    format_ls(&mut direct, &LsArgs { raw: false, json: false }, &single[0].resp)
-        .expect("format_ls on the same listing");
+    format_ls(
+        &mut direct,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &single[0].resp,
+    )
+    .expect("format_ls on the same listing");
     assert_eq!(
         String::from_utf8_lossy(&delegated),
         String::from_utf8_lossy(&direct),
@@ -1858,8 +1879,15 @@ async fn ls_shows_vm_per_box() {
     // `--json` carries the same attribution per entry, where a pipeline can
     // read it: the VM's name beside that VM's reply.
     let mut out = Vec::new();
-    format_ls_across_vms(&mut out, &LsArgs { raw: false, json: true }, &listings)
-        .expect("rendering the two-VM listing as JSON");
+    format_ls_across_vms(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: true,
+        },
+        &listings,
+    )
+    .expect("rendering the two-VM listing as JSON");
     let entries: serde_json_lenient::Value =
         serde_json_lenient::from_str(std::str::from_utf8(&out).expect("UTF-8"))
             .expect("the multi-VM JSON listing is an array");
@@ -1889,7 +1917,10 @@ async fn box_name_resolves_vm_without_flag() {
         .expect("resolving across a two-VM host succeeds")
         .expect("'web' lives on alpha, so the name must resolve");
     assert_eq!(resolved.vm, "alpha", "the VM that owns the name");
-    assert_eq!(resolved.record.id, web, "the record that VM's daemon resolved the name to");
+    assert_eq!(
+        resolved.record.id, web,
+        "the record that VM's daemon resolved the name to"
+    );
     assert_eq!(resolved.record.name.as_deref(), Some("web"));
     assert_eq!(
         resolved.sock,

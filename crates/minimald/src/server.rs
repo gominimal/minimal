@@ -3013,9 +3013,9 @@ mod tests {
 
         // The forwarder's ledger with the default already held — the host
         // loopback as a second VM's daemon finds it.
-        let held = std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::HashSet::from([default_port]),
-        ));
+        let held = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::from([
+            default_port,
+        ])));
 
         drive_proxy_until_serving(
             state.clone(),
@@ -3322,9 +3322,10 @@ mod tests {
             failure.report
         );
         assert!(
-            failure
-                .report
-                .contains(&format!("could not publish port {}", 7654 + HOST_PUBLISH_PORT_STRIDE)),
+            failure.report.contains(&format!(
+                "could not publish port {}",
+                7654 + HOST_PUBLISH_PORT_STRIDE
+            )),
             "the taken arm's report must name the host port the publication proposed, got: {}",
             failure.report
         );

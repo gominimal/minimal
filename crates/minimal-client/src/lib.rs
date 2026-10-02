@@ -1848,9 +1848,11 @@ mod tests {
     #[test]
     fn the_native_backend_enumerates_no_vms() {
         let base = tempfile::tempdir().unwrap();
-        assert!(super::enumerate_vm_sockets(Some(base.path()), false)
-            .unwrap()
-            .is_empty());
+        assert!(
+            super::enumerate_vm_sockets(Some(base.path()), false)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// An initialized repository with an unborn `HEAD` (no commits yet) still

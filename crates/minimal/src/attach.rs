@@ -290,7 +290,10 @@ pub(crate) async fn resolve_box_vm(
             Ok(None) => {}
             // Unreachable VMs are named, not silent: a resolution that
             // quietly could not look would read as "no such box".
-            Err(e) => eprintln!("warning: could not look for '{name}' in VM {}: {e:#}", vm.vm),
+            Err(e) => eprintln!(
+                "warning: could not look for '{name}' in VM {}: {e:#}",
+                vm.vm
+            ),
         }
     }
     match owners.len() {

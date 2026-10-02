@@ -312,8 +312,7 @@ pub struct VmListing {
 /// backend, which hosts no VMs — falls back to the selected provider's
 /// daemon, exactly the listing `min ls` has always printed.
 pub(crate) async fn ls_listings(global: &GlobalArgs) -> Result<Vec<VmListing>, anyhow::Error> {
-    let mut vms =
-        client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
+    let mut vms = client::enumerate_vm_sockets(global.minimal_dir.as_deref(), global.use_minvmd())?;
     if let Some(pinned) = global.vm.as_deref() {
         vms.retain(|vm| vm.vm == pinned);
     }
@@ -333,18 +332,14 @@ pub(crate) async fn ls_listings(global: &GlobalArgs) -> Result<Vec<VmListing>, a
         // needs to see.
         let gate = vm.vm == selected;
         match list_vm(&vm.sock, gate).await {
-            Ok(resp) => listings.push(VmListing {
-                vm: vm.vm,
-                resp,
-            }),
+            Ok(resp) => listings.push(VmListing { vm: vm.vm, resp }),
             Err(e) if gate => return Err(e),
             Err(e) => eprintln!("warning: skipping VM {}: {e:#}", vm.vm),
         }
     }
     if listings.is_empty() {
-        let sock =
-            client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
-                .context("Failed to resolve daemon socket path")?;
+        let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
+            .context("Failed to resolve daemon socket path")?;
         listings.push(VmListing {
             vm: selected.to_string(),
             resp: list_vm(&sock, true).await?,
@@ -394,7 +389,11 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
             if listings.len() == 1 {
                 warn_if_hostname_routing_down(Some(reason), "min ls");
             } else {
-                eprintln!("VM {}: {}", listing.vm, hostname_routing_warning(reason, "min ls"));
+                eprintln!(
+                    "VM {}: {}",
+                    listing.vm,
+                    hostname_routing_warning(reason, "min ls")
+                );
             }
         }
     }
@@ -624,7 +623,10 @@ pub fn format_ls_across_vms(
                 // attribution is the client's, so `--json` is the one surface
                 // that carries it per box for a pipeline to read.
                 if let serde_json_lenient::Value::Object(map) = &mut value {
-                    map.insert("vm".to_string(), serde_json_lenient::Value::String(listing.vm.clone()));
+                    map.insert(
+                        "vm".to_string(),
+                        serde_json_lenient::Value::String(listing.vm.clone()),
+                    );
                 }
                 Ok(value)
             })

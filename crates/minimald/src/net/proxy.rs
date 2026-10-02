@@ -2176,8 +2176,8 @@ mod tests {
         use tempfile::TempDir;
 
         use crate::server::{
-            Config, HostExpose, HostProxyStartup, ProxyPort, RetryBackoff, ServerStateHandle,
-            HOST_PUBLISH_PORT_STRIDE,
+            Config, HOST_PUBLISH_PORT_STRIDE, HostExpose, HostProxyStartup, ProxyPort,
+            RetryBackoff, ServerStateHandle,
         };
 
         // The documented default each VM binds in its own guest: a free
@@ -2271,13 +2271,23 @@ mod tests {
             .hostnames()
             .write()
             .unwrap()
-            .report_own_address(SessionId::nil(), "web", lease_a, BTreeMap::from([(80, box_port)]));
+            .report_own_address(
+                SessionId::nil(),
+                "web",
+                lease_a,
+                BTreeMap::from([(80, box_port)]),
+            );
         b.sessions_manager()
             .await
             .hostnames()
             .write()
             .unwrap()
-            .report_own_address(SessionId::nil(), "api", lease_b, BTreeMap::from([(80, box_port)]));
+            .report_own_address(
+                SessionId::nil(),
+                "api",
+                lease_b,
+                BTreeMap::from([(80, box_port)]),
+            );
 
         // The forwards the publications describe, played by hand: each VM's
         // published host port relays to that VM's proxy — the half of the
@@ -2396,11 +2406,24 @@ mod tests {
             while let Ok((mut sock, _)) = backend.accept().await {
                 tokio::spawn(async move {
                     let mut scratch = [0u8; 1024];
+                    // Neither the read's count nor the answer's fate is what
+                    // this backend exists for; the drop that follows closes
+                    // the connection the test then reads to its end, which is
+                    // its success path.
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "the request is only read to be drained"
+                    )]
                     let _ = sock.read(&mut scratch).await;
-                    let response =
-                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "the answer's fate is not what this backend records"
+                    )]
                     let _ = sock.write_all(response.as_bytes()).await;
-                    // `sock` drops here, closing the upstream side.
                 });
             }
         });
@@ -2421,6 +2444,12 @@ mod tests {
                     let Ok(mut upstream) = TcpStream::connect(remote).await else {
                         return;
                     };
+                    // The relay ends when either side closes; how it ended is
+                    // the test's business, read from the response it got.
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "a closed relay is its outcome, not its failure"
+                    )]
                     let _ = tokio::io::copy_bidirectional(&mut inbound, &mut upstream).await;
                 });
             }
