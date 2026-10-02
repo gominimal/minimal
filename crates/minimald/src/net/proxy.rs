@@ -867,42 +867,66 @@ mod tests {
     }
 
     /// NET-019: supersession is a verdict about what a client *reports*, not
-    /// about what the proxy does. Once both halves of NET-018's condition are
-    /// deployed — the box-zone answerer serving, the reserved local range
-    /// present — and the daemon therefore reports native DNS as the live
-    /// surface, a request through the proxy still routes: a client that
-    /// captured `HTTP(S)_PROXY` at activation keeps working, which is why the
+    /// about what the proxy does. Once the native condition holds — the
+    /// answerer bound (the daemon's half, the one fact its replies carry)
+    /// and the reserved local range present on this host — a request
+    /// through the proxy still routes: a client that captured
+    /// `HTTP(S)_PROXY` at activation keeps working, which is why the
     /// verdict never stops the proxy.
     ///
-    /// The answerer half is stood in for by a bound UDP socket on a free
-    /// loopback port — the verdict reads the port's presence, not the socket
-    /// behind it — and the range half is this host's real probe, which on
-    /// Linux reads present. The daemon-side test
+    /// The answerer half is the daemon's own driver, driven to serving the
+    /// way startup drives it; the port it records on the state is the
+    /// record the replies' `answerer_bound` projects. The range half is
+    /// this host's real probe. The daemon-side test
     /// (`name_surface_reported_when_both_deployed` in `rpc`) drives both
-    /// listeners and routes through the daemon's own proxy beside its
-    /// verdict; this one isolates the other half: the verdict's pure
-    /// function, the real `serve` loop and a real route, after it has
-    /// already said native.
+    /// listeners through the daemon's RPC replies beside its own log line;
+    /// this one isolates the other half: the proxy's real `serve` loop and
+    /// a real route, after the condition has already come to hold.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn proxy_keeps_serving_after_supersession() {
-        use tokio::net::UdpSocket;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::time::Duration;
 
-        // The answerer half: serving on a free loopback port.
-        let answerer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let answerer_port = answerer.local_addr().unwrap().port();
+        use tempfile::TempDir;
+
+        // A state the answerer's driver records its bind on, the way the
+        // daemon's start path does.
+        let dir = TempDir::new().unwrap();
+        let state =
+            crate::server::ServerStateHandle::new(crate::server::test_config(dir.path()), None)
+                .await
+                .unwrap();
+
+        // The answerer's half: the daemon's own driver, serving the zone on
+        // a free loopback port, its port recorded — the record the replies'
+        // `answerer_bound` carries.
+        let compressed = crate::server::RetryBackoff::new(
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+        );
+        crate::server::retry_zone_answerer_until_serving(
+            state.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            compressed,
+        )
+        .await;
+        let answerer_port = state
+            .zone_answerer_port()
+            .await
+            .expect("the answerer's driver records the port it bound");
+        assert_ne!(
+            answerer_port, 0,
+            "the recorded answerer port is the bind the replies report as bound"
+        );
 
         // The published-address half: the real probe over the reserved
         // range, whose presence is what a native host's loopback carries.
-        let probe = crate::net::loopback::probe();
-
-        // Both halves deployed: the daemon reports native DNS as the live
-        // name surface (NET-018) — the very verdict that would matter if it
-        // were the proxy's cue to stop.
-        assert_eq!(
-            crate::rpc::live_name_surface(Some(answerer_port), &probe),
-            minimald_rpc::NameSurface::Native,
-            "an answerer serving on a range-present host makes native DNS the live surface"
+        let range_present = crate::net::loopback::probe().present();
+        assert!(
+            range_present,
+            "the reserved local range must be present on this host for the native condition \
+             to hold here"
         );
 
         // And the proxy still serves beside it: the same route answers a
@@ -921,7 +945,8 @@ mod tests {
         let routed = proxy_get(proxy_addr, &format!("web.min.internal:{backend_port}")).await;
         assert!(
             routed.contains("200 OK"),
-            "native DNS is the reported surface, and the proxy still routes: {routed}"
+            "the native condition holds — answerer bound on {answerer_port}, range present — \
+             and the proxy still routes: {routed}"
         );
     }
 
