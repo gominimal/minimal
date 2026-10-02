@@ -19,7 +19,6 @@
 use serde::Serialize;
 #[cfg(any(test, not(target_os = "macos")))]
 use std::net::Ipv4Addr;
-#[cfg(any(test, not(target_os = "macos")))]
 use std::time::Duration;
 use switch::loopback::RangeProbe;
 
@@ -580,70 +579,145 @@ pub(crate) fn stub_bypass_blocker(
     ))
 }
 
-/// How long one `resolvectl` query may run before detection gives up on
-/// it. A healthy systemd-resolved answers in milliseconds, but a wedged
-/// one — or its D-Bus bus — blocks the call indefinitely, and the session
-/// start this detection runs inside must neither prompt nor hang
-/// (NET-123); a query that outlives the bound reads as absent, the arm
-/// the advisory is safe under, instead of wedging the activate. Generous
-/// on purpose: a loaded host's slow-but-healthy query must not misread.
-#[cfg(not(target_os = "macos"))]
+/// How long the detection's two `resolvectl` queries may take between
+/// them before detection gives up on both: the deadline is the *pair's*,
+/// paid once — the queries run together ([`host_detection`]), so a wedged
+/// systemd-resolved costs the verb that reads this one wait, not one wait
+/// per query. A healthy systemd-resolved answers in milliseconds, but a
+/// wedged one — or its D-Bus bus — blocks each call indefinitely, and the
+/// session start this deadline was sized for must neither prompt nor hang
+/// (NET-123); a query the deadline outlives reads as absent, the arm the
+/// advisory is safe under, instead of wedging the activate. Generous on
+/// purpose: a loaded host's slow-but-healthy query must not misread. The
+/// queries this bounds run on Linux; macOS's detection is one file read
+/// that carries no deadline.
 const RESOLVECTL_BOUND: Duration = Duration::from_secs(5);
 
+/// The same deadline sized for the verb that must not wait:
+/// [`ls_detection`] — `min ls`'s form of the same detection — reads under
+/// this one. The list is the most frequently-invoked verb, run in loops
+/// and from shell prompts, and its read of the host's resolver must stay
+/// a status read, not a wait, so this is the deadline the list's own
+/// host-side subprocess probes already carry (`minimal-client`'s
+/// `GIT_PROBE_TIMEOUT`: "a list response must stay fast even when a
+/// session's project sits on a wedged filesystem"). A wedged
+/// systemd-resolved costs a `min ls` this one second — not the session
+/// start's five, and not ten when its two queries each pay that five —
+/// and a read the deadline outlives reads as absent, which is the
+/// proxy's arm: the verdict that cannot strand the user (NET-019 keeps
+/// the proxy serving), and the verdict a wedged resolver genuinely
+/// leaves. The queries this bounds run on Linux; macOS's detection is one
+/// file read that carries no deadline.
+const LIST_RESOLVECTL_BOUND: Duration = Duration::from_secs(1);
+
 /// One read-only query of `program`, or `None` when the binary is missing,
-/// the call failed, it outlived `bound`, or its output is not UTF-8.
-/// Reading through systemd-resolved's read API writes nothing, so it
-/// cannot prompt. `kill_on_drop` reaps the query the bound abandons, so a
-/// wedged call leaves no process behind on the host it hung.
+/// the call failed, or its output is not UTF-8. Reading through
+/// systemd-resolved's read API writes nothing, so it cannot prompt.
+/// `kill_on_drop` reaps a query the caller's deadline abandons — the
+/// deadline itself is the caller's, over the pair of queries
+/// [`host_detection`] makes — so a wedged call leaves no process behind
+/// on the host it hung.
 #[cfg(any(test, not(target_os = "macos")))]
-async fn bounded_query(program: &str, args: &[&str], bound: Duration) -> Option<String> {
-    let query = tokio::process::Command::new(program)
+async fn query(program: &str, args: &[&str]) -> Option<String> {
+    let output = tokio::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
-        .output();
-    let output = match tokio::time::timeout(bound, query).await {
-        Ok(output) => output.ok()?,
-        Err(_outlived_the_bound) => return None,
-    };
+        .output()
+        .await;
+    let output = output.ok()?;
     if !output.status.success() {
         return None;
     }
     String::from_utf8(output.stdout).ok()
 }
 
-/// One read-only `resolvectl` query, or `None` when the binary is missing,
-/// the call failed, it outlived [`RESOLVECTL_BOUND`], or its output is not
-/// UTF-8. Reading through systemd-resolved's read API writes nothing, so
-/// it cannot prompt.
-#[cfg(not(target_os = "macos"))]
-async fn resolvectl(args: &[&str]) -> Option<String> {
-    bounded_query("resolvectl", args, RESOLVECTL_BOUND).await
+/// [`query`] under `bound`: the form the deadline's mechanism is tested
+/// in. The production reads run the pair under one deadline instead
+/// ([`host_detection`]); this stays the seam that proves the mechanism —
+/// a call that outlives its bound reads as absent and leaves nothing
+/// behind on the host it hung.
+#[cfg(all(test, not(target_os = "macos")))]
+async fn bounded_query(program: &str, args: &[&str], bound: Duration) -> Option<String> {
+    // A query that outlived its bound reads as absent.
+    tokio::time::timeout(bound, query(program, args))
+        .await
+        .unwrap_or_default()
+}
+
+/// The query program a test installed in place of `resolvectl`, when one is
+/// installed. A wedged `resolvectl`, or a slow-but-healthy one, is not a
+/// state this host can be put in, so the tests that need one write a
+/// stand-in script and install its path here — the same stand-in discipline
+/// the daemon's tests use for their loopback probe. Process-global: under
+/// libtest the tests of one binary share a process, so the tests that use
+/// it hold the stand-in mutex in the tests module below for the whole
+/// install→assert→clear window; the other detection readers assert on no
+/// particular arm, so a stand-in they read by accident is a slower pass,
+/// not a wrong one.
+#[cfg(all(test, not(target_os = "macos")))]
+static QUERY_STANDIN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The program the detection's queries run: `resolvectl`, or the stand-in
+/// a test installed.
+#[cfg(all(test, not(target_os = "macos")))]
+fn query_program() -> String {
+    QUERY_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .unwrap_or_else(|| "resolvectl".to_string())
 }
 
 /// Reads the host's current hook state (NET-122's detection proper) and the
 /// reason no zone command would reach this host's lookups, when there is one.
-/// Detection is read-only and never prompts: two `resolvectl` queries —
-/// each bounded by [`RESOLVECTL_BOUND`], so a wedged systemd-resolved
-/// reads as absent rather than hanging the activate — and three file reads
-/// on Linux, one file read on macOS.
+/// Detection is read-only and never prompts: on Linux, two `resolvectl`
+/// queries under one [`RESOLVECTL_BOUND`] deadline — run together, so the
+/// deadline is paid once, and a wedged systemd-resolved reads as absent
+/// rather than hanging the activate — and three file reads; on macOS, one
+/// file read.
 pub(crate) async fn session_detection() -> (Hook, Option<String>) {
-    host_detection().await
+    host_detection(RESOLVECTL_BOUND).await
+}
+
+/// [`session_detection`] at [`LIST_RESOLVECTL_BOUND`], the deadline the
+/// list's read carries: `min ls` is the most frequently-invoked verb, so
+/// the same host state it reads must not make it a wait — the verdict a
+/// wedged systemd-resolved leaves is decided inside this one second, and
+/// it is the proxy's arm, the one that cannot strand the user, so the
+/// worst a wedged resolver costs a list is a second, never the session
+/// start's five.
+async fn ls_detection() -> (Hook, Option<String>) {
+    host_detection(LIST_RESOLVECTL_BOUND).await
 }
 
 #[cfg(target_os = "macos")]
-async fn host_detection() -> (Hook, Option<String>) {
+async fn host_detection(_bound: Duration) -> (Hook, Option<String>) {
     // macOS's resolver consults the resolver file directly — there is no
-    // stub for host lookups to bypass, so nothing can block the command.
+    // stub for host lookups to bypass, so nothing can block the command,
+    // and the one read this makes carries no deadline to bound.
     (host_hook().await, None)
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn host_detection() -> (Hook, Option<String>) {
-    let domain = resolvectl(&["domain"]).await;
-    let dns = resolvectl(&["dns"]).await;
+async fn host_detection(bound: Duration) -> (Hook, Option<String>) {
+    // The queries' program: the stand-in a test installed, else
+    // `resolvectl` itself.
+    #[cfg(test)]
+    let program = query_program();
+    #[cfg(not(test))]
+    let program = "resolvectl".to_string();
+    // Both queries under the one deadline, run together: the deadline is
+    // the pair's, paid once, so a wedged systemd-resolved costs the verb
+    // that reads this one wait — not one per query — and a pair that
+    // outlives it reads as absent, both queries reaped where they hang.
+    let (domain, dns) = tokio::time::timeout(bound, async {
+        tokio::join!(query(&program, &["domain"]), query(&program, &["dns"]))
+    })
+    .await
+    .unwrap_or((None, None));
     let resolv_conf = tokio::fs::read_to_string(RESOLV_CONF).await.ok();
     let nsswitch = tokio::fs::read_to_string(NSSWITCH_CONF).await.ok();
     let resolve_module = resolve_module_installed().await;
@@ -724,22 +798,38 @@ pub(crate) fn command(port: u16) -> String {
 }
 
 /// The advisory for one session start, as a function of the hook state, the
-/// daemon's interim verdict, and whether anything blocks the command
+/// daemon's interim verdict, whether the reserved local range read present
+/// on this host's own loopback, and whether anything blocks the command
 /// (NET-122, NET-123's interim arm). Pure.
 ///
 /// `None` — nothing to say — when the hook already routes the zone to this
-/// answerer, the daemon did not publish at the interim, *and* nothing
-/// blocks the command. Otherwise the advisory says what is missing and
-/// names the exact command. The interim re-surfaces the advisory even when
-/// the hook routes (NET-123: "re-surface
+/// answerer, the daemon did not publish at the interim, the range read
+/// present on this host's own loopback, *and* nothing blocks the command.
+/// Otherwise the advisory says what is missing and names the exact command.
+/// The interim re-surfaces the advisory even when the hook routes (NET-123:
+/// "re-surface
 /// the advisory of NET-122"): a session on the interim is a fact the user
 /// has no other way to see. The interim fact names the step that ends it:
 /// installing the range on the host — by design §7.1 the job of the same
 /// advisory command on macOS, once that command reserves the range (a
-/// root-held boot step, not yet part of the command it renders here). The
+/// root-held boot step that T76
+/// (<https://github.com/gominimal/minimal/issues/1817>) adds to the command
+/// rendered here). The
 /// command the advisory names is therefore said to configure the resolver,
 /// and the range fact stands beside it rather than under it, so a user who
 /// ran the command is not told it ended the interim. String assembly only.
+///
+/// `range_present` is this host's own read of the range — the one read the
+/// live-surface verdict shares with this advisory (see
+/// [`session_advisory_at`]) — and not the daemon's interim flag, which on a
+/// VM-backed host reads the guest's loopback and always says present, so a
+/// daemon's `false` cannot vouch for the host whose names the verdict
+/// decides. A read that says absent keeps the advisory from falling quiet
+/// on a hook that routes — the very state whose verdict names the proxy for
+/// exactly that missing range — and adds the fact saying so. `None`, no
+/// read made, claims nothing: the advisory stays quiet where it did, the
+/// one start that reaches its quiet arm without a read being a reply whose
+/// answerer is not bound, where no verdict prints beside it to disagree.
 ///
 /// `blocker` names why the command would do nothing on this host — a host
 /// whose lookups never reach the resolver the command configures — in which
@@ -754,6 +844,7 @@ pub(crate) fn advisory_at(
     hook: &Hook,
     port: u16,
     interim: bool,
+    range_present: Option<bool>,
     blocker: Option<&str>,
 ) -> Option<String> {
     // A hook routing this answerer's port is configured, but only on a
@@ -762,21 +853,41 @@ pub(crate) fn advisory_at(
     // would tell the user their resolver is set up while no host process's
     // lookup consults it, and `*.{ZONE}` would not resolve — NET-122's
     // WHILE clause is about the resolver that works, not the one whose
-    // configuration is on paper.
-    if hook.routes(port) && !interim && blocker.is_none() {
+    // configuration is on paper. The range beside them is the host's own
+    // read, the verdict's read: a hook that routes over a loopback that
+    // lacks the range is a host the verdict calls the proxy, and the
+    // advisory says the range is what is missing there rather than
+    // staying quiet on the daemon's interim flag, which on a VM-backed
+    // host reads the guest's loopback — always present — and not the host
+    // the names resolve on.
+    if hook.routes(port) && !interim && !matches!(range_present, Some(false)) && blocker.is_none() {
         return None;
     }
     let mut facts = Vec::new();
     if interim {
         // The interim ends when the range is installed on the host — the
         // root-held boot step design §7.1 folds into the macOS advisory
-        // command. The command rendered here does not carry that step yet,
-        // so the fact names the range as what is missing and stops there:
+        // command. That step is T76's to add to the command rendered here
+        // (https://github.com/gominimal/minimal/issues/1817); until it does,
+        // the fact names the range as what is missing and stops there:
         // it neither claims the command below ends the interim nor claims
         // nothing ever will.
         facts.push(format!(
             "this session publishes at the shared 127.0.0.1 interim: the \
              reserved local range {} is not installed on this host's loopback",
+            range_text()
+        ));
+    } else if matches!(range_present, Some(false)) {
+        // The same missing range without the interim behind it: the daemon
+        // published this session from the range — its flag says no interim —
+        // so the names that resolve answer with addresses from a range this
+        // host's loopback does not carry, and the host cannot reach them.
+        // The verdict says the proxy for exactly this fact (NET-018); the
+        // advisory says the fact.
+        facts.push(format!(
+            "the reserved local range {} is not installed on this host's \
+             loopback, so this session's box names resolve to addresses this \
+             host cannot reach",
             range_text()
         ));
     }
@@ -804,7 +915,10 @@ pub(crate) fn advisory_at(
 }
 
 /// The advisory to print at this session's start, given what the daemon
-/// reported on its create response.
+/// reported on its create response and a detection the caller already read
+/// — the session-start path's form, so the advisory and the live-surface
+/// verdict printed below it share one read of this host's resolver state
+/// and cannot disagree about it.
 ///
 /// `zone_answerer_port` is `None` while the daemon is still bringing its
 /// answerer up (or from a daemon predating the field, which the create's
@@ -812,20 +926,232 @@ pub(crate) fn advisory_at(
 /// at, so the advisory stays quiet rather than naming a command that
 /// cannot work. `interim_loopback` is the daemon's NET-123 verdict: its
 /// session-start bind probe found the reserved range absent and it
-/// published this session at the 127.0.0.1 interim. On a host whose
-/// `/etc/resolv.conf` bypasses systemd-resolved's stub *and* whose
-/// `hosts:` lookups do not consult `nss-resolve`, the advisory says so and
-/// names no command (see [`session_detection`]): none would reach host
-/// lookups there.
+/// published this session at the 127.0.0.1 interim. `range_present` is
+/// *this* host's own read of the same range — the read the surface verdict
+/// the same start decides, passed back here so both lines draw the one
+/// fact from the one probe: the daemon's interim flag is not that fact on
+/// a VM-backed host, where it reads the guest's loopback and always says
+/// present, and a host whose own loopback lacks the range is one the
+/// verdict calls the proxy, so the advisory must say the range is what is
+/// missing there instead of going quiet. `None`, no read made, claims
+/// nothing (see [`advisory_at`]). On a host whose `/etc/resolv.conf`
+/// bypasses systemd-resolved's stub *and* whose `hosts:` lookups do not
+/// consult `nss-resolve`, the advisory says so and names no command (see
+/// [`session_detection`]): none would reach host lookups there.
 ///
 /// Printed once per session start, to stderr; never prompts.
-pub(crate) async fn session_advisory(
+pub(crate) fn session_advisory_at(
+    detection: &(Hook, Option<String>),
     zone_answerer_port: Option<u16>,
     interim_loopback: bool,
+    range_present: Option<bool>,
 ) -> Option<String> {
     let port = zone_answerer_port?;
-    let (hook, blocker) = session_detection().await;
-    advisory_at(&hook, port, interim_loopback, blocker.as_deref())
+    let (hook, blocker) = detection;
+    advisory_at(
+        hook,
+        port,
+        interim_loopback,
+        range_present,
+        blocker.as_deref(),
+    )
+}
+
+/// The surface a `*.{ZONE}` name resolves through on this host, as the two
+/// verbs that can print it report it (NET-018). [`LiveSurface::Native`] is
+/// native DNS: the host's own resolver answers the zone from the daemon's
+/// answerer, no proxy settings involved. [`LiveSurface::Proxy`] is the
+/// hostname proxy: names resolve only through the listener an
+/// `HTTP(S)_PROXY` export points at.
+///
+/// It lives here, beside the detection and the advisory, because the
+/// verdict is the *host's* — the one place it can be computed is the host
+/// the names resolve on — so `min session activate` and `min ls` both
+/// print from the one function that reads it and cannot disagree about
+/// one host. T65's verbs inherit it unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveSurface {
+    /// Native DNS: the host resolver answers `*.{ZONE}` from the answerer.
+    Native,
+    /// The hostname proxy: names resolve only through it.
+    Proxy,
+}
+
+/// Design §7.1's supersession condition, as the three facts it is: this
+/// host's resolver hook routes [`ZONE`] to the answerer on `answerer_port`
+/// — with no [`stub_bypass_blocker`], because on a host whose lookups
+/// bypass the resolver a routing-domain hook configures, the hook is
+/// configuration no host process consults — the daemon's box-zone answerer
+/// is bound in its own namespace, and the reserved local range whose
+/// addresses the boxes publish from is present on this host's loopback.
+/// Native DNS is live only when all three hold; any one of them missing
+/// and the hostname proxy is the only surface that answers a box name.
+/// Pure, so the table is unit-testable on every platform the suite runs
+/// on, whatever that host's own files say.
+pub(crate) fn native_surface_at(
+    hook: &Hook,
+    answerer_port: u16,
+    answerer_bound: bool,
+    range_present: bool,
+    blocker: Option<&str>,
+) -> bool {
+    answerer_bound && hook.routes(answerer_port) && range_present && blocker.is_none()
+}
+
+/// The verdict [`live_name_surface_at`] decides, with the range fact of the
+/// host's own read carried back beside it — the form `min session activate`
+/// logs at session start (NET-018's host-side record): the daemon's line can
+/// name only the answerer *it* binds, so the surface a host's names actually
+/// resolve through is the host's to record, logged where the host read it.
+/// [`Self::range_present`] is `None` when the two cheap facts settled the
+/// proxy without a probe — the honest record: a range never read is not a
+/// range reported present or absent.
+pub(crate) struct LiveSurfaceVerdict {
+    /// Which surface the three facts decided is live.
+    pub surface: LiveSurface,
+    /// Whether the reserved range read present on this host's loopback,
+    /// when the verdict read it.
+    pub range_present: Option<bool>,
+}
+
+/// The live surface for the facts one reply carries, from a detection the
+/// caller already read, with the range fact of the host's own read beside
+/// the verdict — `min session activate`'s form: the session start reads
+/// this host's resolver state once (see [`session_advisory_at`]) and
+/// decides the advisory, this verdict, and the log that records it from
+/// that one read, carrying [`LiveSurfaceVerdict::range_present`] back to
+/// the advisory so the two lines draw the range from the one probe and
+/// cannot disagree about the host whose loopback it read.
+///
+/// `None` — nothing to print — when the daemon's answerer is not bound in
+/// its own namespace (`answerer_bound` false, or the reply carrying no
+/// port): there is then no native surface to name, the proxy is the only
+/// surface and the port lines and the advisory already tell its story, and
+/// — the same read — a daemon old enough to predate the field is not
+/// evidence its answerer serves, so silence is the arm that cannot
+/// misreport (see the field's doc in `minimald-rpc`). Otherwise the
+/// verdict is the three facts': native when they all hold, the proxy when
+/// any one of them does not.
+///
+/// The published-range fact is read last, and only behind the two cheap
+/// ones: a host whose resolver does not route the zone to the answerer —
+/// or one whose lookups bypass the resolver a hook would configure —
+/// cannot read native whatever the range says, so it pays no bind probe.
+pub(crate) async fn live_name_surface_with_range_at(
+    detection: &(Hook, Option<String>),
+    zone_answerer_port: Option<u16>,
+    answerer_bound: bool,
+) -> Option<LiveSurfaceVerdict> {
+    let port = zone_answerer_port?;
+    if !answerer_bound {
+        return None;
+    }
+    let (hook, blocker) = detection;
+    // The two cheap facts first: a host whose resolver does not route the
+    // zone to the answerer — or one whose lookups bypass the resolver a
+    // hook would configure — cannot read native whatever the range says,
+    // so it settles on the proxy without paying the bind probe below.
+    if !hook.routes(port) || blocker.is_some() {
+        return Some(LiveSurfaceVerdict {
+            surface: LiveSurface::Proxy,
+            range_present: None,
+        });
+    }
+    let range_present = range_present_on_host().await;
+    Some(LiveSurfaceVerdict {
+        surface: if native_surface_at(hook, port, true, range_present, blocker.as_deref()) {
+            LiveSurface::Native
+        } else {
+            LiveSurface::Proxy
+        },
+        range_present: Some(range_present),
+    })
+}
+
+/// [`live_name_surface_with_range_at`] as the printed verdict alone — the
+/// form `min ls` reads and the table tests assert: just the surface, the
+/// facts it was decided from staying where the caller that holds them (the
+/// detection, the reply) can log them.
+pub(crate) async fn live_name_surface_at(
+    detection: &(Hook, Option<String>),
+    zone_answerer_port: Option<u16>,
+    answerer_bound: bool,
+) -> Option<LiveSurface> {
+    live_name_surface_with_range_at(detection, zone_answerer_port, answerer_bound)
+        .await
+        .map(|verdict| verdict.surface)
+}
+
+/// [`live_name_surface_at`] with the detection this verb reads itself —
+/// `min ls`'s form: the list has no session-start advisory to share a
+/// read with, so the same bounded, read-only detection runs here — at
+/// [`ls_detection`]'s [`LIST_RESOLVECTL_BOUND`], the list's deadline, not
+/// the session start's, because the list is the most frequently-invoked
+/// verb and its read must stay a status read — and only when the daemon's
+/// answerer is bound (the cheap half the reply carries). The answerer is
+/// bound on every current daemon, so this read is not one only rare hosts
+/// pay: `cmd_ls` runs it in the modes that print the verdict alone, which
+/// is where the read belongs.
+pub(crate) async fn live_name_surface(
+    zone_answerer_port: Option<u16>,
+    answerer_bound: bool,
+) -> Option<LiveSurface> {
+    if zone_answerer_port.is_none() || !answerer_bound {
+        return None;
+    }
+    let detection = ls_detection().await;
+    live_name_surface_at(&detection, zone_answerer_port, answerer_bound).await
+}
+
+/// Whether the reserved local range is present on *this* host's loopback:
+/// the same bind probe the daemon runs at session start (`switch::loopback`,
+/// one definition next to the range it probes), run where the verdict is
+/// decided — the CLI's own host, which is the host whose processes resolve
+/// the names, on a VM-backed one and a native one alike. Blocking, so on a
+/// blocking thread; a probe task that panics or is lost reads as absent,
+/// because without a verdict the verbs may not say native.
+async fn range_present_on_host() -> bool {
+    tokio::task::spawn_blocking(switch::loopback::probe)
+        .await
+        .map(|probe| probe.present())
+        .unwrap_or_else(|join| {
+            tracing::warn!(
+                error = %join,
+                "the live-surface bind probe did not run; treating the \
+                 reserved local range as absent"
+            );
+            false
+        })
+}
+
+/// NET-018's report: the line `min ls` and `min session activate` print,
+/// naming the surface [`live_name_surface`] decided is live. `proxy_port`
+/// is the port the same reply carries, when the proxy came up: NET-019
+/// keeps it serving beside native DNS, and the line says so, because a
+/// client that captured `HTTP(S)_PROXY` at activation keeps routing
+/// through it — the export does not go stale when the surface changes.
+/// With no port the proxy is down, and the line says that in the daemon's
+/// own words rather than claiming it still serves. Pure, so both verbs
+/// print the same words and tests assert them without capturing output.
+#[must_use]
+pub fn name_surface_line(surface: LiveSurface, proxy_port: Option<u16>) -> String {
+    let proxy_half = match proxy_port {
+        Some(port) => format!("; the hostname proxy still serves on 127.0.0.1:{port}"),
+        None => "; the hostname proxy is not serving".to_string(),
+    };
+    match surface {
+        LiveSurface::Native => format!(
+            "native DNS is the live name surface · <name>.min.internal answers from \
+             the zone answerer and each box's own reserved-range address{proxy_half}"
+        ),
+        LiveSurface::Proxy => match proxy_port {
+            Some(port) => format!(
+                "the hostname proxy is the live name surface · <name>.min.internal \
+                 routes through it on 127.0.0.1:{port}"
+            ),
+            None => "the hostname proxy is the live name surface; it is not serving".to_string(),
+        },
+    }
 }
 
 /// The reserved range as `network/prefix`, the form the advisory and the
@@ -943,7 +1269,7 @@ mod tests {
         let port = 15353;
         // An unconfigured host is advised, with the exact command to run.
         let unconfigured = Hook::absent("test", "no hook for the zone");
-        let advisory = advisory_at(&unconfigured, port, false, None)
+        let advisory = advisory_at(&unconfigured, port, false, None, None)
             .expect("an unconfigured host must be advised");
         for marker in command_markers(port) {
             assert!(
@@ -956,17 +1282,19 @@ mod tests {
             "an advisory never asks a question — it names a command: {advisory}"
         );
 
-        // A hook already routing this answerer is not advised again.
+        // A hook already routing this answerer is not advised again — on a
+        // host whose own loopback carries the range, the quiet arm's every
+        // fact holds.
         let configured = Hook::configured("test", Some(port), "routes the zone");
         assert!(
-            advisory_at(&configured, port, false, None).is_none(),
+            advisory_at(&configured, port, false, Some(true), None).is_none(),
             "a configured host must not be re-advised"
         );
 
         // A hook routing a *stale* port is advised: the command points the
         // resolver at this daemon's answerer, not the old one's.
         let stale = Hook::configured("test", Some(port - 1), "routes the zone elsewhere");
-        let advisory = advisory_at(&stale, port, false, None)
+        let advisory = advisory_at(&stale, port, false, None, None)
             .expect("a stale hook must be re-advised for this answerer's port");
         for marker in command_markers(port) {
             assert!(
@@ -977,7 +1305,7 @@ mod tests {
 
         // NET-123's interim arm: a session published at the 127.0.0.1
         // interim re-surfaces the advisory even when the hook routes.
-        let interim = advisory_at(&configured, port, true, None)
+        let interim = advisory_at(&configured, port, true, None, None)
             .expect("the interim must re-surface the advisory");
         assert!(
             interim.contains("127.0.0.1 interim"),
@@ -1013,14 +1341,15 @@ mod tests {
     #[tokio::test]
     async fn session_advisory_agrees_with_the_hook_it_detected() {
         let port = 15353;
-        let (hook, blocker) = session_detection().await;
-        let advisory = session_advisory(Some(port), false).await;
+        let detection = session_detection().await;
+        let advisory = session_advisory_at(&detection, Some(port), false, None);
+        let (hook, blocker) = &detection;
         if hook.routes(port) && blocker.is_none() {
             assert!(advisory.is_none(), "configured host must not be advised");
         } else if let Some(blocker) = blocker {
             let advisory = advisory.expect("a host the command cannot reach must be told why");
             assert!(
-                advisory.contains(&blocker),
+                advisory.contains(blocker),
                 "the advisory says why no command is named: {advisory}"
             );
             assert!(
@@ -1043,7 +1372,182 @@ mod tests {
         // `None` is the daemon still bringing its answerer up — there is no
         // port to point a command at, so nothing is printed rather than a
         // command that cannot work.
-        assert!(session_advisory(None, false).await.is_none());
+        let detection = session_detection().await;
+        assert!(session_advisory_at(&detection, None, false, None).is_none());
+    }
+
+    /// A routing hook for the answerer's port, the state a host is in once
+    /// the advisory's command has run.
+    fn routing_hook() -> Hook {
+        Hook::configured("test", Some(15353), "test hook routes the zone")
+    }
+
+    #[test]
+    fn native_surface_needs_all_three_facts() {
+        let port = 15353;
+        let routes = routing_hook();
+        let blocker: Option<&str> = None;
+        // All three facts: native DNS is live.
+        assert!(
+            native_surface_at(&routes, port, true, true, blocker),
+            "a routing hook on a bound answerer over a present range is native DNS"
+        );
+        // Each fact on its own is the difference between native and the
+        // proxy, so each missing one must drop the verdict.
+        assert!(
+            !native_surface_at(&routes, port, false, true, blocker),
+            "an unbound answerer cannot answer the zone natively"
+        );
+        assert!(
+            !native_surface_at(&Hook::absent("test", "no hook"), port, true, true, blocker),
+            "a host whose resolver does not route the zone reads the proxy"
+        );
+        assert!(
+            !native_surface_at(&routes, port, true, false, blocker),
+            "a host without the reserved range has no published addresses to resolve"
+        );
+        // A dead hook: the routing-domain hook is
+        // configured — it routes — but the stub-bypass blocker says no host
+        // process's lookups consult what it configures, so it is dead
+        // configuration and the verdict must not be native on its word.
+        assert!(
+            !native_surface_at(&routes, port, true, true, Some("lookups bypass resolved")),
+            "a hook no host process consults does not make native DNS live"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_surface_prints_nothing_until_the_answerer_binds() {
+        // No port on the reply — the daemon still bringing its answerer up
+        // — and no bound report are both the read that changes nothing:
+        // nothing prints, and an old daemon's silence is never mistaken
+        // for an answerer that serves.
+        let detection = (routing_hook(), None);
+        assert!(live_name_surface_at(&detection, None, true).await.is_none());
+        assert!(
+            live_name_surface_at(&detection, Some(15353), false)
+                .await
+                .is_none()
+        );
+        assert!(live_name_surface(None, false).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn live_surface_is_the_proxy_when_either_cheap_fact_is_missing() {
+        let port = 15353;
+        // A hook that does not route: proxy, settled without a probe.
+        let absent = (Hook::absent("test", "no hook"), None);
+        assert_eq!(
+            live_name_surface_at(&absent, Some(port), true).await,
+            Some(LiveSurface::Proxy),
+            "a host whose resolver does not route the zone prints the proxy as live"
+        );
+        // A dead hook: a routing hook whose stub-bypass blocker
+        // makes it configuration no host process consults — the proxy, and
+        // both verbs must read it, never native on the hook's word alone.
+        let blocked = (routing_hook(), Some("lookups bypass resolved".to_string()));
+        assert_eq!(
+            live_name_surface_at(&blocked, Some(port), true).await,
+            Some(LiveSurface::Proxy),
+            "a hook no host process consults is the proxy's story, on both verbs"
+        );
+    }
+
+    /// NET-018's positive arm on the real host, on NET-018's verify line:
+    /// the routing hook and the bound answerer are the two facts a table
+    /// can spell, but the third — the reserved range on this host's own
+    /// loopback — is a fact about a real loopback, so this arm runs the
+    /// verdict's own bind probe against the host the suite runs on. Linux
+    /// only: the whole `127/8` is local to `lo` there, so the probe always
+    /// reads the range present and the arm takes the real path both verbs
+    /// take to a native verdict — the same probe the daemon's
+    /// session-start one mirrors (NET-123).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn activate_and_ls_report_native_surface_verdict_on_host() {
+        let port = 15353;
+        assert_eq!(
+            live_name_surface_at(&(routing_hook(), None), Some(port), true).await,
+            Some(LiveSurface::Native),
+            "a routing hook on a bound answerer over this host's present range is \
+             native DNS, and both verbs print it"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_verdict_and_advisory_cannot_disagree() {
+        let port = 15353;
+        // The two lines share one read, so the states they print from are
+        // the same: a host the verdict calls native is a host the advisory
+        // has nothing to say about, and a host the advisory must warn is
+        // one the verdict calls the proxy.
+        let detection = (routing_hook(), None);
+        let advisory = session_advisory_at(&detection, Some(port), false, Some(true));
+        assert!(
+            advisory.is_none(),
+            "a native verdict has no advisory: {advisory:?}"
+        );
+        let blocked = (routing_hook(), Some("lookups bypass resolved".to_string()));
+        assert!(
+            session_advisory_at(&blocked, Some(port), false, Some(true)).is_some(),
+            "the blocked hook is still the advisory's to say"
+        );
+        assert!(
+            !native_surface_at(&blocked.0, port, true, true, blocked.1.as_deref()),
+            "and it is the proxy the verdict names for the same read"
+        );
+        // The range-absent arm, the one state the daemon's interim flag
+        // cannot vouch for: on a VM-backed host that flag reads the guest's
+        // loopback, which always carries the range, so a host whose own
+        // loopback lacks it is one only this host's read can name — and the
+        // two lines must read it the one way. The verdict calls the proxy
+        // for exactly this fact, so the advisory says the range is what is
+        // missing rather than staying quiet on the daemon's `false`.
+        let absent = session_advisory_at(&detection, Some(port), false, Some(false))
+            .expect("a host whose own loopback lacks the range is the advisory's to say");
+        assert!(
+            absent.contains("is not installed on this host's loopback"),
+            "the advisory names the missing range: {absent}"
+        );
+        assert!(
+            !native_surface_at(&detection.0, port, true, false, None),
+            "and the verdict for the same read is the proxy's, not native"
+        );
+    }
+
+    #[test]
+    fn name_surface_line_says_which_surface_and_where_the_proxy_serves() {
+        let native = name_surface_line(LiveSurface::Native, Some(15390));
+        assert!(
+            native.contains("native DNS is the live name surface"),
+            "the native arm names the surface: {native}"
+        );
+        assert!(
+            native.contains("the hostname proxy still serves on 127.0.0.1:15390"),
+            "the native arm says the proxy keeps serving beside it (NET-019): {native}"
+        );
+        let not_serving = name_surface_line(LiveSurface::Native, None);
+        assert!(
+            not_serving.contains("the hostname proxy is not serving"),
+            "a daemon with no proxy port is one whose proxy is not serving: {not_serving}"
+        );
+        assert!(
+            !not_serving.contains("still serves"),
+            "with no port to name, the line must not claim the proxy serves: {not_serving}"
+        );
+        let proxy = name_surface_line(LiveSurface::Proxy, Some(15390));
+        assert!(
+            proxy.contains("the hostname proxy is the live name surface"),
+            "the proxy arm names the surface: {proxy}"
+        );
+        assert!(
+            proxy.contains("routes through it on 127.0.0.1:15390"),
+            "the proxy arm names where it serves: {proxy}"
+        );
+        assert!(
+            !proxy.contains("native DNS is the live name surface"),
+            "the proxy arm must not say the native words: {proxy}"
+        );
     }
 
     #[cfg(any(test, target_os = "macos"))]
@@ -1224,7 +1728,7 @@ mod tests {
         assert!(blocker.contains(RESOLVED_STUB), "{blocker}");
 
         let hook = Hook::absent("test", "no link carries a routing domain for the zone");
-        let advisory = advisory_at(&hook, 15353, false, Some(&blocker))
+        let advisory = advisory_at(&hook, 15353, false, None, Some(&blocker))
             .expect("a stub-bypassing host is still advised");
         assert!(
             advisory.contains(&blocker),
@@ -1246,7 +1750,7 @@ mod tests {
         // nothing is missing there, so the note carries no dangling `; `
         // where a fact would sit and no dead command either.
         let routed = Hook::configured("test", Some(15353), "the routing domain routes the zone");
-        let advisory = advisory_at(&routed, 15353, false, Some(&blocker))
+        let advisory = advisory_at(&routed, 15353, false, None, Some(&blocker))
             .expect("a bypassing host is advised even when its hook routes");
         assert_eq!(
             advisory,
@@ -1321,7 +1825,7 @@ mod tests {
 
         // Which is the whole point: that host's advisory names the command.
         let hook = Hook::absent("test", "no link carries a routing domain for the zone");
-        let advisory = advisory_at(&hook, 15353, false, None)
+        let advisory = advisory_at(&hook, 15353, false, None, None)
             .expect("an nss-resolve host is advised the command");
         assert!(
             advisory.contains("sudo"),
@@ -1463,10 +1967,10 @@ mod tests {
         assert!(json.contains("\"port\": 15353"), "{json}");
     }
 
-    // The bound on every `resolvectl` read: a wedged systemd-resolved — or
-    // its D-Bus bus — blocks the call indefinitely, and the activate that
-    // awaits it must neither prompt nor hang (NET-123). A call past its
-    // bound reads as absent, the arm the advisory is safe under.
+    // The mechanism under the detection's deadlines: a wedged
+    // systemd-resolved — or its D-Bus bus — blocks the call indefinitely,
+    // and no verb that reads it may hang (NET-123). A call past its bound
+    // reads as absent, the arm the advisory is safe under.
     #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn a_query_outliving_its_bound_reads_absent_instead_of_hanging() {
@@ -1496,5 +2000,124 @@ mod tests {
                 .is_none(),
             "a missing binary must read as absent"
         );
+    }
+
+    // NET-018's list read, and the deadline it carries, sized for the
+    // list's frequency: `min ls`
+    // is the most frequently-invoked verb, run in loops and from shell
+    // prompts, and the session start's generous deadline was never a choice
+    // a list made. The two halves of the answer, each made testable by the
+    // query stand-in: a wedged resolver costs the list one deadline, not a
+    // hang, and the deadline is the pair's — paid once by the two queries
+    // that run under it together, not once per query.
+    //
+    /// Serializes the window in which a query stand-in is installed: the
+    /// stand-in is process-global (`query_program`), so under libtest —
+    /// where every test in this binary shares one process — a detection
+    /// driven by another test would read it too. Nextest runs each test
+    /// in its own process; the mutex keeps the in-process runner as safe.
+    #[cfg(not(target_os = "macos"))]
+    static QUERY_STANDIN_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// One stand-in `resolvectl`: `script` written executable into a fresh
+    /// tempdir and installed as the detection's query program. Dropping the
+    /// guard clears the install and the script together; hold the stand-in
+    /// mutex for the whole install→assert window, because the slot is
+    /// process-global.
+    #[cfg(not(target_os = "macos"))]
+    struct QueryStandin {
+        _script: tempfile::TempDir,
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    impl Drop for QueryStandin {
+        fn drop(&mut self) {
+            *QUERY_STANDIN.lock().unwrap() = None;
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn install_query_standin(script: &str) -> QueryStandin {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("a dir for the stand-in script");
+        let path = dir.path().join("resolvectl");
+        std::fs::write(&path, script).expect("the stand-in script to write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("the stand-in script to be made executable");
+        *QUERY_STANDIN.lock().unwrap() = Some(path.to_string_lossy().into_owned());
+        QueryStandin { _script: dir }
+    }
+
+    /// A wedged resolver: a systemd-resolved wedged hard
+    /// enough that both queries hang — the exact case the deadline exists
+    /// for. The list still answers, inside its own one-second deadline and
+    /// not the session start's five, and the verdict it prints is the
+    /// proxy's — the arm a wedged resolver genuinely leaves, and the one
+    /// that cannot strand the user, because the proxy keeps serving
+    /// (NET-019).
+    // The window is held across the awaited read on purpose: the stand-in
+    // it installs is the point of the test.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the stand-in window must span the awaited read it stands in for"
+    )]
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn a_wedged_resolver_costs_the_list_one_deadline_not_a_hang() {
+        let _standin_window = QUERY_STANDIN_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let standin = install_query_standin("#!/bin/sh\nsleep 30\n");
+        let started = std::time::Instant::now();
+        let surface = live_name_surface(Some(15353), true).await;
+        assert_eq!(
+            surface,
+            Some(LiveSurface::Proxy),
+            "a wedged resolver leaves the proxy's arm — after {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < LIST_RESOLVECTL_BOUND * 3,
+            "the list's read must give up at its own deadline, not the session \
+             start's: {:?} against the deadline {:?}",
+            started.elapsed(),
+            LIST_RESOLVECTL_BOUND
+        );
+        drop(standin);
+    }
+
+    /// The deadline is the pair's, paid once: two queries that each answer
+    /// in 600 ms — slow but healthy, faster than the deadline — read whole
+    /// under the one second the list allows, because they run together. A
+    /// pair run one after the other instead would lose the second query to
+    /// the same deadline (it starts at 600 ms and the deadline fires at
+    /// 1 s), and a hook that reads takes both queries' facts together —
+    /// the routing domain from `domain`, the 127.0.0.1:<port> server from
+    /// `dns` — so the hook that routes is the proof both landed.
+    // The window is held across the awaited read on purpose: the stand-in
+    // it installs is the point of the test.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the stand-in window must span the awaited read it stands in for"
+    )]
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn the_lists_two_queries_run_under_one_deadline() {
+        let _standin_window = QUERY_STANDIN_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let standin = install_query_standin(
+            "#!/bin/sh\nsleep 0.6\n\
+             if [ \"$1\" = domain ]; then \
+             printf 'Global Domains: ~.\\nLink 2 (enp3s0): ~min.internal\\n'\nelse \
+             printf 'Global: 10.0.0.1\\nLink 2 (enp3s0): 127.0.0.1:15353\\n'\nfi\n",
+        );
+        let (hook, _) = ls_detection().await;
+        assert!(
+            hook.routes(15353),
+            "both queries must read within the one deadline — run together, not \
+             one after the other: {hook:?}"
+        );
+        drop(standin);
     }
 }
