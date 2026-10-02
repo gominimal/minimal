@@ -4,7 +4,7 @@ title: Box resources — a host-sized guest, one enforced memory limit per box, 
 owner: mitodrummer
 epic: gominimal/inbox#698
 arch: https://github.com/gominimal/arch/blob/main/architecture.md#box-resources
-updated: 2026-09-30
+updated: 2026-10-02
 ---
 
 # BRES — Box resources — a host-sized guest, one enforced memory limit per box, admission that says why, and a signal when the kernel kills
@@ -193,7 +193,7 @@ memory than the host has is refused end to end, with the numbers, before any lim
   verify:   cargo nextest run -p minvmd prop_small_host_keeps_arch_constant_with_default_source
   property: For every host memory size and architecture, the default resolves to that architecture's constant with source `default` exactly when host memory is at or below twice the constant, and with source `derived` otherwise.
 
-- **BRES-007** WHEN `minimald` enters the root filesystem at guest boot THE SYSTEM SHALL create a zram device sized at one half of guest RAM capped at 8 GiB, format it as swap and enable it, enforced by `minimald` at guest boot and the guest kernel, on the guest side of TB3.
+- **BRES-007** WHEN `minimald` enters the root filesystem at guest boot THE SYSTEM SHALL create a zram device sized at one half of guest RAM capped at 8 GiB, with its `mem_limit` set to one half of that size (the 2:1 compression this spec assumes, held as a bound even for incompressible pages), format it as swap and enable it, enforced by `minimald` at guest boot and the guest kernel, on the guest side of TB3.
   tier:     T0
   verify:   cargo nextest run -p minvmd guest_zram_swap_sized_half_ram_capped_8gib_integration
 
@@ -213,7 +213,7 @@ memory than the host has is refused end to end, with the numbers, before any lim
   tier:     T0
   verify:   cargo nextest run -p minvmd guest_mounts_cgroup2_at_boot_integration
 
-- **BRES-012** THE SYSTEM SHALL cap the guest's boxes subtree, the one subtree the egress classifier matches, at `memory.max` equal to the host's allocatable (guest RAM minus the daemon's 512 MiB reserve), enforced by `minimald` and the kernel outside the box, on the host side of TB2 inside the guest (the guest side of TB3), against every process in the box including root inside it.
+- **BRES-012** THE SYSTEM SHALL cap the guest's boxes subtree, the one subtree the egress classifier matches, at `memory.max` equal to the host's allocatable (guest RAM minus the daemon's 512 MiB reserve and minus the zram device's worst-case footprint, its `mem_limit` of BRES-007), enforced by `minimald` and the kernel outside the box, on the host side of TB2 inside the guest (the guest side of TB3), against every process in the box including root inside it.
   tier:     T0
   verify:   cargo nextest run -p minvmd guest_boxes_subtree_capped_at_allocatable_integration
 
@@ -221,7 +221,7 @@ memory than the host has is refused end to end, with the numbers, before any lim
   tier:     T0
   verify:   cargo nextest run -p minvmd guest_daemon_and_pumps_outside_boxes_subtree_integration
 
-- **BRES-014** WHEN `minimald` starts a box on either local host (`local0` with a delegated subtree, `local-minvmd0`) THE SYSTEM SHALL create a leaf for it in the boxes subtree with `memory.max` equal to the box's resolved `ram`, `memory.swap.max` equal to the same value, and `memory.min` equal to the box's reservation, enforced by `minimald` and the kernel outside the box, on the host side of TB2 (inside the guest on `local-minvmd0`; on the developer's machine on `local0`, inside a subtree the host's cgroup manager delegates), against every process in the box including root inside it.
+- **BRES-014** WHEN `minimald` starts a box on either local host (`local0` with a delegated subtree, `local-minvmd0`) THE SYSTEM SHALL create a leaf for it in the boxes subtree with `memory.max` equal to the box's resolved `ram`, `memory.swap.max` equal to the same value on `local-minvmd0` and on `local0` where BRES-075 allows swap (0 otherwise), and `memory.min` equal to the box's reservation, enforced by `minimald` and the kernel outside the box, on the host side of TB2 (inside the guest on `local-minvmd0`; on the developer's machine on `local0`, inside a subtree the host's cgroup manager delegates), against every process in the box including root inside it.
   tier:     T0
   verify:   cargo nextest run -p minvmd guest_box_leaf_limits_integration && cargo nextest run -p minimald local0_box_leaf_limits_root_integration
 
@@ -229,9 +229,9 @@ memory than the host has is refused end to end, with the numbers, before any lim
   tier:     T0
   verify:   cargo nextest run -p minvmd attach_shell_joins_leaf_before_namespaces_integration && cargo nextest run -p minimald local0_join_leaf_before_namespaces_root_integration
 
-- **BRES-016** THE SYSTEM SHALL make each box's leaf the root of the box's cgroup namespace, so that `/sys/fs/cgroup/memory.max` read inside the box returns the box's limit, enforced by `minimald` and the kernel outside the box, on the host side of TB2 inside the guest (the guest side of TB3), against every process in the box including root inside it.
+- **BRES-016** WHEN `minimald` starts a box on either local host (`local0` with a delegated subtree, `local-minvmd0`) THE SYSTEM SHALL make the box's leaf the root of the box's cgroup namespace, on a cgroup2 mount with `nsdelegate` (mounted so by `minimald` in the guest, by the host's cgroup manager on `local0`), so that `/sys/fs/cgroup/memory.max` read inside the box returns the box's limit and the kernel refuses writes from inside to the leaf's own limit files, enforced by `minimald` and the kernel outside the box, on the host side of TB2 (inside the guest on `local-minvmd0`; on the developer's machine on `local0`, inside a subtree the host's cgroup manager delegates), against every process in the box including root inside it.
   tier:     T0
-  verify:   cargo nextest run -p sandbox2 box_cgroup_namespace_root_is_leaf
+  verify:   cargo nextest run -p sandbox2 box_cgroup_namespace_root_is_leaf && cargo nextest run -p minimald local0_box_cgroup_namespace_root_is_leaf_root_integration
 
 - **BRES-017** IF root inside a box on either local host (`local0` with a delegated subtree, `local-minvmd0`) writes to the box's `/sys/fs/cgroup/memory.max` THEN THE SYSTEM SHALL fail the write, enforced by `minimald` and the kernel outside the box, on the host side of TB2 (inside the guest on `local-minvmd0`; on the developer's machine on `local0`, inside a subtree the host's cgroup manager delegates), against every process in the box including root inside it.
   tier:     T0
@@ -294,7 +294,7 @@ memory than the host has is refused end to end, with the numbers, before any lim
 - **BRES-031** WHEN admission resolves a box whose `ram` is omitted or `"auto"` THE SYSTEM SHALL resolve it to the host's default box size, one half of allocatable on `local0` and `local-minvmd0`, and record its source as `default`.
   tier:     T2
   verify:   cargo nextest run -p minimald auto_ram_resolves_to_half_allocatable
-  property: For every allocatable, the default box size equals one half of it rounded down, so above zero it is less than all of it; at an allocatable of zero no box is admitted.
+  property: For every allocatable, the default box size equals one half of it rounded down, so above zero it is less than all of it; no box whose `ram` is omitted or `"auto"` is admitted at a default box size below 256 MiB (BRES-078).
   harness:  `crates/sessions/src/core/admission.rs` `kani_default_box_size_below_allocatable`, 8 boxes in all (7 counted plus the new one), symbolic `u64` byte sizes, `#[kani::unwind(9)]`
 
 - **BRES-032** WHEN a box's `ram` is written THE SYSTEM SHALL write exactly that value to the leaf's `memory.max`, without clamping or shrinking it, so that the leaf's `memory.max` reads back equal to the written `ram` rounded down to the host page size, and record its source as `entry`, enforced by `minimald` and the kernel outside the box, on the host side of TB2 (inside the guest on `local-minvmd0`, on the developer's machine on `local0`), against every process in the box including root inside it.
@@ -314,7 +314,7 @@ memory than the host has is refused end to end, with the numbers, before any lim
     tier:   T0
     verify: cargo nextest run -p minimald local0_capacity_at_or_below_reserve_refuses_every_box
 
-- **BRES-035** WHEN admission refuses a box with exit 8 because it does not fit (BRES-034) or its reservation cannot be met (BRES-038, BRES-039) THE SYSTEM SHALL carry the machine form `{"schema":"min/v1/error","code":"insufficient_resources",…}` with the dimension, the requested size and the layer it came from, the host's allocatable and allocated, and the remedy for the refused dimension (for `ram`: omit `ram`, or give the host more memory; for `cpus` or `disk`: write a smaller value, or give the host more of it), enforced by the Box Host daemon at admission, on the host side of TB2.
+- **BRES-035** WHEN admission refuses a box with exit 8 because it does not fit (BRES-034) or its reservation cannot be met (BRES-038, BRES-039) THE SYSTEM SHALL carry the machine form `{"schema":"min/v1/error","code":"insufficient_resources",…}` with the dimension, the requested size and the layer it came from, the host's allocatable and allocated, and the remedy for the refusal (for a `ram` fit refusal: omit `ram`, or give the host more memory; for `cpus` or `disk`: write a smaller value, or give the host more of it; for a reservation refusal, the remedy BRES-038 or BRES-039 states), enforced by the Box Host daemon at admission, on the host side of TB2.
   tier:     T2
   verify:   cargo nextest run -p minimald exit_8_refusal_carries_insufficient_resources_figures
   property: Every fit or reservation refusal carries the `min/v1/error` machine form with the requested size, its layer, and the host's allocatable and allocated as admission computed them.
@@ -337,16 +337,16 @@ memory than the host has is refused end to end, with the numbers, before any lim
   property: For every resolved `ram`, an omitted `ram_reserved` resolves to the smaller of 256 MiB and that `ram`, so no reservation exceeds its box's resolved `ram`.
   harness:  `crates/sessions/src/core/admission.rs` `kani_omitted_reservation_is_capped_floor`, 8 boxes in all (7 counted plus the new one), symbolic `u64` byte sizes, `#[kani::unwind(9)]`
 
-- **BRES-038** IF a written `ram_reserved` is above what the box's omitted or `"auto"` `ram` resolves to THEN THE SYSTEM SHALL refuse the box at admission with exit 8 and `code = "insufficient_resources"`, naming `ram` as the remedy, enforced by the Box Host daemon at admission, on the host side of TB2.
+- **BRES-038** IF a written `ram_reserved` is above the box's resolved `ram`, whether that `ram` is written, omitted or `"auto"`, THEN THE SYSTEM SHALL refuse the box at admission with exit 8 and `code = "insufficient_resources"`, with the remedy naming `ram` (write a `ram` at least `ram_reserved`, or lower `ram_reserved`), whatever client sent the request and whether or not `min`'s expansion check (BRES-030) ran, enforced by the Box Host daemon at admission, on the host side of TB2.
   tier:     T2
   verify:   cargo nextest run -p minimald ram_reserved_above_auto_ram_refused_exit_8
-  property: For every admitted box, its reservation is at most its resolved `ram`; a written `ram_reserved` above an omitted or `"auto"` `ram`'s resolution is refused with exit 8 naming `ram`.
+  property: For every admitted box, its reservation is at most its resolved `ram`; every request whose written `ram_reserved` is above its resolved `ram`, written, omitted or `"auto"`, is refused with exit 8 naming `ram`.
   harness:  `crates/sessions/src/core/admission.rs` `kani_reservation_never_exceeds_resolved_ram`, 8 boxes in all (7 counted plus the new one), symbolic `u64` byte sizes, `#[kani::unwind(9)]`
 
-- **BRES-039** IF the sum of the reservations of the host's running boxes, the new box's included, exceeds the host's allocatable THEN THE SYSTEM SHALL refuse the new box at admission with exit 8 and the figures of BRES-035, taking that sum as the host's allocated, enforced by the Box Host daemon at admission, on the host side of TB2.
+- **BRES-039** IF the sum of the reservations of the host's running boxes, the new box's included, exceeds the host's allocatable THEN THE SYSTEM SHALL refuse the new box at admission with exit 8, the figures of BRES-035 and the remedy: lower or omit `ram_reserved`, or stop other boxes, taking that sum as the host's allocated, enforced by the Box Host daemon at admission, on the host side of TB2.
   tier:     T2
   verify:   cargo nextest run -p minimald admission_refuses_when_reservations_exceed_allocatable
-  property: For every set of at most 8 boxes, admission admits the new box only when the sum of the counted boxes' reservations, the new one's included, is at most the host's allocatable, computes that sum without overflow, and reports it as allocated in any refusal.
+  property: For every set of at most 8 boxes, admission admits the new box only when the sum of the counted boxes' reservations, the new one's included, is at most the host's allocatable, computes that sum without overflow, and reports it as allocated, with the reservation remedy, in any refusal.
   harness:  `crates/sessions/src/core/admission.rs` `kani_reservations_sum_within_allocatable`, 8 boxes in all (7 counted plus the new one), symbolic `u64` byte sizes, `#[kani::unwind(9)]`
 
 - **BRES-040** WHILE a host reports `enforced` THE SYSTEM SHALL set each box leaf's `memory.min` to the box's reservation, enforced by `minimald` and the kernel outside the box, on the host side of TB2 (inside the guest on `local-minvmd0`, on the developer's machine on `local0`), against every process in the box including root inside it.
@@ -418,11 +418,11 @@ memory than the host has is refused end to end, with the numbers, before any lim
   verify:   cargo nextest run -p minimald prop_pressure_clear_logs_one_info
   property: For every sequence of timestamped samples, exactly one `INFO` follows each episode that raised a `WARN`, at the first sample below 25%, and none follows an episode that raised none.
 
-- **BRES-054** IF an OOM kill happened while `minimald` was not sampling, or has scrolled out of `kmsg`, THEN THE SYSTEM SHALL count it from the cumulative `memory.events` counters and emit its `WARN` at the next tick, treating a counter lower than the previous sample (a leaf created again on resume) as a reset counted from zero.
+- **BRES-054** IF an OOM kill happened while `minimald` was not sampling, or has scrolled out of `kmsg`, THEN THE SYSTEM SHALL count it from the cumulative `memory.events` counters and emit its `WARN` at the next tick, keying each leaf's previous snapshot on the leaf's identity, a generation `minimald` assigns each time it creates the leaf, so that a leaf created again (on resume) is counted from zero whatever its counter reads.
   tier:     T1
   verify:   cargo nextest run -p minimald prop_missed_oom_kills_counted_at_next_tick
-  property: For every pair of successive cumulative `oom_kill` snapshots, however many ticks lie between them, the next tick reports exactly the difference for each leaf, or the new value where the counter went down, so no kill is lost or counted twice.
-  - WHEN `minimald` removes a box's leaf THE SYSTEM SHALL read the leaf's `memory.events` once more first and account any `oom_kill` increase since the last sample, so a kill between the last tick and the box's end is not lost.
+  property: For every sequence of cumulative `oom_kill` snapshots keyed by leaf generation, however many ticks lie between them, and including a box's leaf removed and created again under a new generation with a counter below, equal to or above the old one, the next tick reports for each generation exactly its count minus that generation's previous snapshot, or its whole count for a generation with no previous snapshot, so no kill is lost or counted twice.
+  - WHEN `minimald` removes a box's leaf THE SYSTEM SHALL read the leaf's `memory.events` once more first, account any `oom_kill` increase since the last sample, and then drop that generation's snapshot, so a kill between the last tick and the box's end is not lost and no later leaf is compared against it.
     tier:   T0
     verify: cargo nextest run -p minimald leaf_removal_accounts_final_oom_kills
 
@@ -499,7 +499,7 @@ memory than the host has is refused end to end, with the numbers, before any lim
 - **BRES-068** WHEN `min box show <box>` runs THE SYSTEM SHALL carry the box's memory limit and its source (`entry` or `default`), its reservation, its current use (`memory.current`) and its OOM kill count.
   tier:     T0
   verify:   cargo nextest run -p minimal box_show_carries_memory_fields
-  - WHILE a box's host reports `advisory` THE SYSTEM SHALL mark the box's limit and reservation advisory in `min box show`, including under `-o json`.
+  - WHILE a box's host reports `advisory` THE SYSTEM SHALL mark the box's limit and reservation advisory in `min box show`, including under `-o json`, or only its reservation where BRES-077 applies.
     tier:   T0
     verify: cargo nextest run -p minimal box_show_marks_advisory_limit_and_reservation
 
@@ -507,7 +507,7 @@ memory than the host has is refused end to end, with the numbers, before any lim
   tier:     T0
   verify:   ./scripts/session-e2e.sh box_show_self_carries_memory_fields
 
-- **BRES-070** THE SYSTEM SHALL report a host's memory enforcement as `enforced` when the host holds a delegated memory controller delivering each box's limit, hard reservations and the cap on the boxes subtree, and as `advisory` otherwise, so that `local0` reports `enforced` with a delegated subtree and `advisory` without, decided by the Box Host daemon from what it detects, on the host side of TB2.
+- **BRES-070** THE SYSTEM SHALL report a host's memory enforcement as `enforced` only when the host holds a delegated memory controller delivering each box's limit and the cap on the boxes subtree and the effective protection along the boxes subtree's ancestor chain can deliver its reservations (BRES-076), and as `advisory` otherwise, so that `local0` reports `enforced` with a delegated subtree whose ancestors protect its allocatable, and `advisory` without a delegated subtree or without that protection, decided by the Box Host daemon from what it detects, on the host side of TB2.
   tier:     T0
   verify:   cargo nextest run -p minimald local0_memory_enforcement_follows_delegation_root_integration
 
@@ -519,13 +519,31 @@ memory than the host has is refused end to end, with the numbers, before any lim
   tier:     T0
   verify:   cargo nextest run -p minvmd local_minvmd0_reports_enforced_integration
 
-- **BRES-073** WHILE a host reports `advisory` THE SYSTEM SHALL admit a box by the same fit and reservation accounting as an enforced host, whether or not its `ram` is written, and apply no memory limit to it.
+- **BRES-073** WHILE a host reports `advisory` THE SYSTEM SHALL admit a box by the same fit and reservation accounting as an enforced host, whether or not its `ram` is written, and apply no memory limit to it, except on `local0` as BRES-077 states.
   tier:     T0
   verify:   cargo nextest run -p minimald advisory_host_admits_by_accounting_without_limit
 
-- **BRES-074** WHILE a host reports `advisory`, WHEN a box is created on it THE SYSTEM SHALL print a warning on stderr that the box's memory is not protected.
+- **BRES-074** WHILE a host reports `advisory`, WHEN a box is created on it THE SYSTEM SHALL print a warning on stderr that the box's memory is not protected, or, where BRES-077 applies, that its reservation is not protected.
   tier:     T0
   verify:   cargo nextest run -p minimal advisory_host_create_warns_on_stderr
+
+- **BRES-075** WHERE the host delegates a cgroup2 subtree with the memory controller enabled to the native `minimald`, WHEN `minimald` creates a box's leaf on `local0` THE SYSTEM SHALL set the leaf's `memory.swap.max` to 0 unless every swap device enabled on the host is a zram device or an encrypted (dm-crypt) device, so that box memory never reaches a plaintext swap partition or swap file on the developer's disk, enforced by the native `minimald` and the kernel outside the box, on the host side of TB2 on the developer's machine (no TB3), inside a subtree the host's cgroup manager delegates, against every process in the box including root inside it.
+  tier:     T0
+  verify:   cargo nextest run -p minimald local0_leaf_swap_max_zero_unless_host_swap_zram_or_encrypted_root_integration
+
+- **BRES-076** WHERE the host delegates a cgroup2 subtree with the memory controller enabled to the native `minimald` THE SYSTEM SHALL count `local0`'s reservations as deliverable only when the kernel's effective protection for the boxes subtree can reach `local0`'s allocatable: every ancestor above the delegated subtree, up to but not including the cgroup root, carries a `memory.min` of at least that allocatable (a `MemoryMin=` on the delegating unit and on each slice above it), and every cgroup between the delegated subtree's root and the boxes subtree carries one too or cgroup2 is mounted with `memory_recursiveprot`, decided by the Box Host daemon from what it reads, on the host side of TB2.
+  tier:     T0
+  verify:   cargo nextest run -p minimald local0_reservations_advisory_without_ancestor_protection_root_integration
+
+- **BRES-077** WHILE `local0` holds a delegated memory controller but reports `advisory` because its reservations cannot be delivered (BRES-076) THE SYSTEM SHALL still write each box's leaf `memory.max` and the boxes subtree's `memory.max`, and mark only the box's reservation advisory, enforced by the native `minimald` and the kernel outside the box, on the host side of TB2 on the developer's machine (no TB3), against every process in the box including root inside it.
+  tier:     T0
+  verify:   cargo nextest run -p minimald local0_reservation_advisory_keeps_limits_root_integration
+
+- **BRES-078** IF the host's default box size, one half of its allocatable, is below 256 MiB THEN THE SYSTEM SHALL refuse a box whose `ram` is omitted or `"auto"` at admission with exit 8 and the figures of BRES-035, with the remedy: write a `ram` that fits, or give the host more memory, enforced by the Box Host daemon at admission, on the host side of TB2.
+  tier:     T2
+  verify:   cargo nextest run -p minimald default_box_size_below_256mib_refused_exit_8
+  property: For every allocatable, a box whose `ram` is omitted or `"auto"` is admitted only when one half of that allocatable, rounded down, is at least 256 MiB, so no box is admitted at a default size below 256 MiB.
+  harness:  `crates/sessions/src/core/admission.rs` `kani_default_box_size_floor_refuses_below_256mib`, 8 boxes in all (7 counted plus the new one), symbolic `u64` byte sizes, `#[kani::unwind(9)]`
 
 ## Non-goals
 
@@ -533,7 +551,7 @@ memory than the host has is refused end to end, with the numbers, before any lim
   spec 09 non-goals, reaffirmed by the architecture's Box Resources › Guest memory).
 - **A large guest returning memory it no longer uses:** a SHOULD in the architecture's Box
   Resources › Guest memory; S1 is complete without it and it lives there until a spec takes it.
-- **Workstation paging of the VM's memory:** the swap requirements are guest-only; whether the
+- **Workstation paging of the VM's memory:** the guest's swap requirements cover the guest; whether the
   physical host pages guest memory, zram pages included, is an architecture gap (Open
   questions).
 - **Remote hosts:** the architecture expects them to inherit these rules and report the same
@@ -615,7 +633,7 @@ owns. An event on the box's stream was rejected because it is not in BOX-040's e
 surface of a two-surface behaviour are sub-bullets under their parent, as in the BOX spec. One id
 per half was rejected: a failing test already names the half, and the split cost ten more ids.
 The per-box leaf rules are written once, "on either local host", with a test on each lane
-(BRES-014, BRES-015, BRES-017), and `local0` keeps only its own subtree cap (BRES-026). A second
+(BRES-014, BRES-015, BRES-016, BRES-017), and `local0` keeps only its own subtree cap (BRES-026). A second
 set of the same rules for the native lane was rejected because one host's proof would then stand
 alone.
 
@@ -649,9 +667,9 @@ throughout: there is no Lean project, and most of these requirements reach the k
 - The expansion checks (BRES-029, BRES-030) are T1, as decided for the BOX spec: the size parser
   must be a pure function whose error carries the hint and whose multiplication is checked, with
   the exit-code mapping outside it.
-- The admission core (BRES-031, BRES-034, BRES-035, BRES-037, BRES-038, BRES-039) is T2, Kani
-  harnesses beside the existing session-core proofs, which takes that lane's expected harness
-  count from 8 to 15: admission must be a pure decision over owned values with no enforcement
+- The admission core (BRES-031, BRES-034, BRES-035, BRES-037, BRES-038, BRES-039, BRES-078) is
+  T2, Kani harnesses beside the existing session-core proofs, which takes that lane's expected
+  harness count from 8 to 16: admission must be a pure decision over owned values with no enforcement
   input, summing with checked addition so an overflow refuses, while its caller chooses which
   boxes count. The same shape makes BRES-073's "same accounting on an `advisory` host" and
   BRES-035's "never names another box" hold by construction. BRES-033 stays T0, one equality.
@@ -662,7 +680,8 @@ throughout: there is no Lean project, and most of these requirements reach the k
   a failed start's rollback included, must call the core's release. T0 was rejected because a
   forgotten release path would be caught only by an integration run.
 - OOM-kill accounting (BRES-050, BRES-054, BRES-056) is T1: it must be a pure function from the
-  previous and current counter snapshots to bursts, and a burst has no command-line field. Scripted
+  previous and current counter snapshots, keyed by leaf generation, to bursts, and a burst has no
+  command-line field. Scripted
   T0 sequences were rejected.
 - The pressure tracker (BRES-051, BRES-052, BRES-053) is T1: it must be a pure state machine fed
   timestamped samples of `some avg10` and the top leaf, with no clock inside it. Scripted T0
@@ -699,8 +718,8 @@ Six findings from the tier pass were settled as assumptions. BRES-032 is worded 
 granularity, because the kernel keeps `memory.max` in pages. A `local0` whose capacity is at or
 below its reserve has allocatable 0 and refuses every box with exit 8, reported by `min host show`
 (BRES-034's sub-bullet); reporting it `advisory` instead is an Open question. The unit hint names
-the same number with the IEC unit and says `8GB` is not `8GiB` (BRES-029). A counter lower than
-the previous sample, from a leaf created again on resume, is a reset counted from zero (BRES-054).
+the same number with the IEC unit and says `8GB` is not `8GiB` (BRES-029). A leaf created again
+on resume carries a new generation and is counted from zero (BRES-054).
 "30 seconds" means samples whose timestamps span at least 30 seconds (BRES-051). The single-scenario
 requirements stay T0.
 
@@ -746,15 +765,19 @@ The epic's hard constraint follows from those four:
   boxes subtree reaching allocatable to the boxes subtree, never the daemon.
   enforced by: the kernel's OOM killer, which acts within the cgroup whose limit was reached;
   Minimal itself never kills for memory, clamps or shrinks a size
-  covered by: BRES-020, BRES-024, BRES-025, BRES-028, BRES-032, BRES-044, BRES-045, BRES-046
+  covered by: BRES-012, BRES-020, BRES-024, BRES-025, BRES-028, BRES-032, BRES-044, BRES-045,
+  BRES-046
 
 The other invariants:
 
-- **Invariant:** THE SYSTEM SHALL keep swap unreadable once the guest's boot ends. This is a
-  guest-only claim: whether the physical host pages the VM's memory is an Open question.
+- **Invariant:** THE SYSTEM SHALL keep a box's swapped memory unreadable once the boot that
+  wrote it ends. In the guest that is zram; on `local0` a box's leaf may swap only where every
+  host swap device is zram or encrypted. Whether the physical host pages the VM's memory is an
+  Open question.
   enforced by: zram created by the Box Host daemon at guest boot; no swap on any volume that
-  persists or is snapshotted; the daemon's own cgroup never swaps
-  covered by: BRES-007, BRES-008, BRES-010
+  persists or is snapshotted; the daemon's own cgroup never swaps; on `local0`, a leaf
+  `memory.swap.max` of 0 over any other host swap
+  covered by: BRES-007, BRES-008, BRES-010, BRES-075
 - **Invariant:** THE SYSTEM SHALL never reveal another box's name or owner in a refusal, nor a
   killed process's command line in a log line or event.
   enforced by: the admission core takes other boxes' reservations as bare numbers, and an OOM
@@ -762,8 +785,9 @@ The other invariants:
   covered by: BRES-035, BRES-050, BRES-056 (their sub-bullets)
 - **Invariant:** THE SYSTEM SHALL report a host `enforced` only when it can deliver the per-box
   limit, hard reservations and the subtree cap.
-  enforced by: detection in the Box Host daemon, with no configuration key that sets it
-  covered by: BRES-070, BRES-071, BRES-072
+  enforced by: detection in the Box Host daemon, including the effective protection along the
+  boxes subtree's ancestor chain on `local0`, with no configuration key that sets it
+  covered by: BRES-070, BRES-071, BRES-072, BRES-076
 
 **Residual, beside AT26.** The architecture presumes a box can escape into its Box Host (Box
 Isolation Model). All four controls sit on the host side of TB2, so a box that crosses TB2 is
@@ -802,6 +826,20 @@ limit on the rest of the desktop.
   open.]
 - [NEEDS CLARIFICATION (LOW): A `local0` whose capacity is at or below its reserve takes
   allocatable 0 and refuses every box (BRES-034). The alternative is to report it `advisory`.]
-- [NEEDS CLARIFICATION (LOW): BRES-016 (the leaf is the root of the box's cgroup namespace) is
-  stated and tested for the guest only; the epic names only the not-writable rule for `local0`.
-  Whether `local0` must also show the limit inside the box is unasked.]
+- [NEEDS CLARIFICATION (MEDIUM): Architecture gap — the Swap rule is written for the guest. It
+  says swap is unreadable once the boot ends and the host's own processes never swap, but not
+  what a box on `local0` may swap to when the desktop's swap is a plaintext partition or file.
+  Proposed for the architecture: on `local0` a box swaps only where the host's swap is zram or
+  encrypted, and otherwise its swap allowance is 0 (BRES-075). The rule's "a key that exists only
+  for that boot" is stricter than what BRES-075 detects, which is any dm-crypt device.]
+- [NEEDS CLARIFICATION (MEDIUM): Architecture gap — allocatable is capacity minus the Box Host's
+  reserve, and swap held in memory is not counted. zram's compressed pages are charged to no
+  memory cgroup, so boxes that swap can push the guest past its reserve into a global OOM.
+  Proposed for the architecture: a host whose swap lives in memory subtracts its worst-case
+  footprint from allocatable as well, as BRES-012 does with the zram `mem_limit` of BRES-007.]
+- [NEEDS CLARIFICATION (MEDIUM): Architecture gap — memory enforcement is one value covering all
+  three guarantees. A `local0` that delivers each box's limit and the subtree cap but not its
+  reservations reports `advisory` and still applies the limits (BRES-077), which BRES-073 and the
+  architecture's "an `advisory` host enforces none of the three" do not otherwise allow. Proposed
+  for the architecture: let an `advisory` host apply the guarantees it can deliver and mark the
+  rest, or report enforcement per guarantee.]
