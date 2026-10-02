@@ -3606,6 +3606,107 @@ mod tests {
         expect_silence(&mut h.switch).await;
     }
 
+    /// The deferral's edge, from the other side: a name-declaring row defers
+    /// the undeclared-destination drop and nothing else. For the same row
+    /// shape — names declared beside a narrow allowed subnet — every other
+    /// drop the host-side gate decides is still made here, before the
+    /// switch: a destination inside its own `deny_subnets`, the switch's own
+    /// address (the one piece of the plan's infrastructure the gate refuses
+    /// as a frame rule, before any row is consulted), a protocol its rules
+    /// do not allow — aimed at the very destination the deferral lifts over
+    /// TCP — and a source no row holds. The DNS rebinding intersection's
+    /// wider infrastructure deny set (NET-067) is not a frame rule the host
+    /// gate reads: it is decided at answer time, in the guest, so no frame
+    /// class of the host's carries it and this test claims nothing about it.
+    ///
+    /// The registration itself says what is deferred, once, where the row
+    /// enters the table (#1808 is the task that moves the decision
+    /// host-side): the line names the box's switch address and is written
+    /// at registration — before the gate is up — so a capture installed
+    /// ahead of the registry catches it, and a no-names row adds none.
+    #[tokio::test]
+    async fn a_row_that_resolves_names_still_takes_every_other_drop_on_the_host() {
+        let (registration_log, registration_guard) = capture_log();
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    allow_subnets: Some(vec!["203.0.113.0/24".to_string()]),
+                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                    deny_subnets: Some(vec!["198.51.100.0/24".to_string()]),
+                }),
+        );
+        tcp_lan_box(&registry, [100, 64, 0, 10]);
+        drop(registration_guard);
+        let logged = registration_log.contents();
+        assert!(
+            logged.contains("deferred to the guest's gate") && logged.contains("INFO"),
+            "the registration says the destination rule is deferred, got: {logged}"
+        );
+        assert!(
+            logged.contains("switch_addr=100.64.0.9"),
+            "the registration line names the box's switch address, got: {logged}"
+        );
+        assert_eq!(
+            logged.matches("deferred to the guest's gate").count(),
+            1,
+            "one line per name-declaring row; the no-names row adds none, got: {logged}"
+        );
+        let mut h = gate_over(registry).await;
+
+        // The deferred class, as the baseline: the undeclared destination
+        // reaches the switch over the allowed protocol.
+        let pinned = ipv4_frame(LEASE, 6, [93, 184, 216, 34], 443);
+        send_frame(&mut h.guest, &pinned).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            pinned,
+            "the undeclared destination still defers to the guest's gate"
+        );
+
+        // Four drops the deferral does not lift, then the marker that proves
+        // all four were decided before it and none passed.
+        let denied = ipv4_frame(LEASE, 6, [198, 51, 100, 9], 443);
+        let gateway = SUBNET.dns_server().octets();
+        let switch_api = ipv4_frame(LEASE, 6, gateway, 443);
+        let udp_to_pinned = ipv4_frame(LEASE, 17, [93, 184, 216, 34], 443);
+        let stranger = [203, 0, 113, 7];
+        let from_stranger = ipv4_frame(stranger, 6, [93, 184, 216, 34], 443);
+        let marker = ipv4_frame(LEASE, 6, [203, 0, 113, 7], 443);
+        for frame in [&denied, &switch_api, &udp_to_pinned, &from_stranger] {
+            send_frame(&mut h.guest, frame).await;
+        }
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the four frames never reached the switch; the marker did"
+        );
+        expect_silence(&mut h.switch).await;
+
+        // Each drop is the host's own, named under its rule; no
+        // undeclared-destination line, because that class was deferred.
+        for rule in [
+            "egress-denied-subnet",
+            "egress-switch-control-surface",
+            "egress-undeclared-protocol",
+            "egress-unknown-source",
+        ] {
+            wait_for_log(&h.log, rule).await;
+        }
+        let logged = h.log.contents();
+        assert!(
+            logged.contains("source=100.64.0.9") && logged.contains("source=203.0.113.7"),
+            "the drop lines name the row's address and the stranger's, got: {logged}"
+        );
+        assert!(
+            !logged.contains("egress-undeclared-subnet"),
+            "a deferred drop is not a host-side drop: no undeclared line, got: {logged}"
+        );
+    }
+
     /// NET-081's failure case, as the phase this build ships holds it: a frame
     /// whose source address the plan could never hand to a box never leaves
     /// the VM, and a frame whose source the plan *could* hand out but no

@@ -424,11 +424,36 @@ impl BoxRegistry {
     /// boundary — only the host process holding this registry can publish at
     /// all, so nothing inside the VM can change a row behind the gate's back.
     ///
+    /// A row that declared DNS hosts is announced once, here, at `info`: its
+    /// undeclared-destination drop is the one class the host-side gate
+    /// defers to the guest's ([`BoxRecord::resolves_names`]), and the host's
+    /// log says so where the row enters the table rather than leaving it to
+    /// be inferred from a frame that reached the switch. The line goes away
+    /// with the deferral: moving that decision host-side is #1808's task.
+    ///
     /// # Panics
     ///
     /// Never: the row lock is only ever held across this map update, never
     /// across a panic.
     pub fn register(&self, registration: BoxRegistration) -> Arc<BoxRecord> {
+        // The name-based admission lives in the guest's gate, not in the
+        // frame rules: whether this row's host-side verdict may defer the
+        // undeclared-destination drop to the in-guest one is the
+        // declaration's own fact, read off the policy here and carried
+        // beside the rules for the verdict to consult.
+        let resolves_names = registration
+            .egress
+            .as_ref()
+            .and_then(|policy| policy.allow_dns_hosts.as_ref())
+            .is_some_and(|hosts| !hosts.is_empty());
+        if resolves_names {
+            tracing::info!(
+                switch_addr = %registration.switch_addr,
+                name = %registration.name,
+                "the row declared DNS hosts: its undeclared-destination rule is deferred to \
+                 the guest's gate, because names resolve in-VM (#1808 moves it host-side)"
+            );
+        }
         let record = Arc::new(BoxRecord {
             name: registration.name,
             // The lease the compiled rules check is the row's own switch
@@ -440,16 +465,7 @@ impl BoxRegistry {
                 self.subnet.dns_server().octets(),
                 registration.switch_addr.octets(),
             ),
-            // The name-based admission lives in the guest's gate, not in the
-            // frame rules: whether this row's host-side verdict may defer the
-            // undeclared-destination drop to the in-guest one is the
-            // declaration's own fact, read off the policy here and carried
-            // beside the rules for the verdict to consult.
-            resolves_names: registration
-                .egress
-                .as_ref()
-                .and_then(|policy| policy.allow_dns_hosts.as_ref())
-                .is_some_and(|hosts| !hosts.is_empty()),
+            resolves_names,
             switch_addr: registration.switch_addr,
             loopback_addr: registration.loopback_addr,
             admitted_ports: registration.admitted_ports,
