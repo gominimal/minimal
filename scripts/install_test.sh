@@ -1726,14 +1726,18 @@ STUB
              END {exit !(d && t && d < t)}' "$nft_input"
     want_ok "the transaction keys its deny rule on the deny subtree" \
         grep -q 'cgroupv2 level 3 "minimald.slice/boxes/deny" jump deny_out' "$nft_input"
-    # deny_out's first rule is pinned as the exact line it must be: a flow
-    # already admitted stays admitted, and the refusal falls on new
-    # connections only.
+    # deny_out's first rule is pinned as the exact line it must be: the
+    # reply leg of a connection someone else opened to the box — the
+    # hostname proxy's to its loopback listener — is admitted, and nothing
+    # the box itself originates is, so the refusal falls on it.
     check "$(awk '/chain deny_out \{/ {ch = 1; next}
                   ch && /^\}/ {exit}
                   ch && NF {sub(/^[ \t]+/, ""); print; exit}' "$nft_input")" \
-          "ct state established,related accept" \
-          "deny_out admits established and related flows as its first rule"
+          "ct state established,related ct direction reply accept" \
+          "deny_out admits the reply direction only as its first rule"
+    want_err "the deny chain admits no direction-less flow: what the box \
+originates is refused" \
+        grep -q 'ct state established,related accept' "$nft_input"
     want_ok "the deny rule admits the answerer by address and port only" \
         grep -q 'ip daddr 127.0.0.1 udp dport 7656 accept' "$nft_input"
     want_ok "the deny subtree's DNS-port lookups are retargeted onto the answerer" \

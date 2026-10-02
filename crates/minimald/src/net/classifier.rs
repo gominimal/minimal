@@ -1039,26 +1039,34 @@ pub(crate) const TEST_COHORT_ADDRESS: &str = "100.72.0.9";
 #[cfg(test)]
 pub(crate) const TEST_NODE_PLANE_ADDRESS: &str = "100.72.0.1";
 
-/// The installer's rendered table, exactly as a host loads it, over a
-/// stand-in tree the caller never sees: the privileged step's
-/// `--print-ruleset` mode prints the transaction its install would hand
-/// `nft -f`, with the cgroup paths and match levels derived from the same
-/// mount facts an install reads. Reading the step's own output — rather
-/// than restating its rules here — is what makes the tests below pin what
-/// a host actually loads.
+/// The stand-in mount the step's own tests render and load over, the one
+/// [`rendered_ruleset`] and the install-lane test below share: a plain
+/// directory standing in for the cgroup2 mount, the slice below it named as
+/// the production one is, and a mount table spelling the two facts
+/// `verify_mount` demands — the hierarchy itself, mounted `nsdelegate`, this
+/// namespace's view of it — so the cgroup paths both lanes render are the
+/// ones they name on a real host.
 #[cfg(test)]
-pub(crate) fn rendered_ruleset() -> String {
+struct StandinMount {
+    /// Held, so the directories it names outlive the step's run.
+    _scratch: tempfile::TempDir,
+    root: PathBuf,
+    mountinfo: PathBuf,
+}
+
+#[cfg(test)]
+fn standin_mount() -> StandinMount {
     let scratch = tempfile::tempdir().expect("a temp dir standing in for the cgroup2 mount");
-    // The tree root named as the production one is: the slice under its
-    // own mount, so the cgroup paths the rendered rules name are the ones
-    // they name on a real host.
+    // The tree root named as the production one is: the slice under its own
+    // mount, so the cgroup paths the rendered rules name are the ones they
+    // name on a real host.
     let mountpoint = scratch.path().join("cgroup");
     let root = mountpoint.join(
         std::path::Path::new(sandbox2::classifier::TREE_ROOT)
             .file_name()
             .expect("the tree root is a slice below the cgroup2 mount root"),
     );
-    std::fs::create_dir_all(&root).expect("the print mode's mount covers the tree root");
+    std::fs::create_dir_all(&root).expect("the mount covers the tree root");
     let mountinfo = scratch.path().join("mountinfo");
     std::fs::write(
         &mountinfo,
@@ -1068,20 +1076,94 @@ pub(crate) fn rendered_ruleset() -> String {
         ),
     )
     .expect("writing the stand-in mount table");
+    StandinMount {
+        _scratch: scratch,
+        root,
+        mountinfo,
+    }
+}
+
+/// Builds the privileged step's command over a stand-in mount: `mode`
+/// names the flags after `--root` (`--print-ruleset`, or nothing for the
+/// install itself), plus the two source identities the step refuses to
+/// render half of. `nft` is looked up on a PATH with `nft_dir` prepended,
+/// so the install lane can hand its transaction to a recording stub rather
+/// than a real `nft` — the one difference between the two lanes, and the
+/// reason both read the same mount facts.
+#[cfg(test)]
+fn step_command(
+    mount: &StandinMount,
+    mode: &[&str],
+    nft_dir: Option<&Path>,
+) -> std::process::Command {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../scripts/install-host-classifier.sh");
-    let printed = std::process::Command::new("bash")
-        .env("MINIMAL_OVERRIDE_CGROUP_MOUNTINFO", &mountinfo)
-        .arg(script)
-        .arg("--print-ruleset")
+    let mut step = std::process::Command::new("bash");
+    step.env("MINIMAL_OVERRIDE_CGROUP_MOUNTINFO", &mount.mountinfo);
+    if let Some(dir) = nft_dir {
+        let mut path = vec![dir.to_path_buf()];
+        if let Some(existing) = std::env::var_os("PATH") {
+            path.extend(std::env::split_paths(&existing));
+        }
+        step.env(
+            "PATH",
+            std::env::join_paths(path).expect("the stub's directory joins the PATH"),
+        );
+    }
+    step.arg(script)
         .arg("--root")
-        .arg(&root)
+        .arg(&mount.root)
+        .args(mode)
         .arg("--cohort-address")
         .arg(TEST_COHORT_ADDRESS)
         .arg("--node-plane-address")
-        .arg(TEST_NODE_PLANE_ADDRESS)
+        .arg(TEST_NODE_PLANE_ADDRESS);
+    step
+}
+
+/// Runs the privileged step over a stand-in mount, in the mode the test is
+/// driving.
+#[cfg(test)]
+fn run_step(mount: &StandinMount, mode: &[&str], nft_dir: Option<&Path>) -> std::process::Output {
+    step_command(mount, mode, nft_dir)
         .output()
-        .expect("running the privileged step's print mode");
+        .expect("running the privileged step over the stand-in mount")
+}
+
+/// The install lane over a stand-in mount: the step lays out its tree,
+/// delegates it, and hands its one transaction to whatever `nft` a PATH
+/// with `nft_dir` prepended resolves to — a recording stub, so the bytes
+/// it pipes to the packet filter are captured whole. The account the tree
+/// is delegated to is this process's own, named through the step's sudo
+/// seam, because an install a person runs names the account that ran
+/// sudo. `None` when this process is root: the step refuses to delegate
+/// its tree to root, so there is no install to rehearse.
+#[cfg(test)]
+fn run_install(mount: &StandinMount, nft_dir: &Path) -> Option<std::process::Output> {
+    let uid = unsafe { libc::geteuid() };
+    if uid == 0 {
+        return None;
+    }
+    let mut step = step_command(mount, &[], Some(nft_dir));
+    step.env("SUDO_UID", uid.to_string())
+        .env("SUDO_GID", unsafe { libc::getegid() }.to_string());
+    Some(
+        step.output()
+            .expect("running the privileged step's install over the stand-in mount"),
+    )
+}
+
+/// The installer's rendered table, exactly as a host loads it, over a
+/// stand-in tree the caller never sees: the privileged step's
+/// `--print-ruleset` mode prints the transaction its install would hand
+/// `nft -f`, with the cgroup paths and match levels derived from the same
+/// mount facts an install reads. Reading the step's own output — rather
+/// than restating its rules here — is what makes the tests below pin what
+/// a host actually loads.
+#[cfg(test)]
+pub(crate) fn rendered_ruleset() -> String {
+    let mount = standin_mount();
+    let printed = run_step(&mount, &["--print-ruleset"], None);
     assert!(
         printed.status.success(),
         "the step's print mode renders its ruleset: {}",
@@ -1426,11 +1508,12 @@ mod tests {
         );
 
         // And nothing else is: the chain's accepts are the conntrack one —
-        // a flow already admitted stays in on its own conntrack state —
-        // and the answerer's. Every other destination a deny-all box's
-        // connections can name meets the rejection at the chain's end,
-        // which is what makes the carve-out the *only* thing the box
-        // reaches.
+        // the reply direction only, the one admission a box's answer to a
+        // connection someone else opened needs, never a direction the box
+        // originates — and the answerer's. Every other destination a
+        // deny-all box's connections can name meets the rejection at the
+        // chain's end, which is what makes the carve-out the *only* thing
+        // the box reaches.
         let accepts: Vec<&str> = deny_out
             .iter()
             .filter(|rule| rule.ends_with("accept"))
@@ -1438,14 +1521,255 @@ mod tests {
             .collect();
         assert_eq!(
             accepts,
-            ["ct state established,related accept", answerer.as_str()],
-            "the deny chain's only non-established accept is the answerer: {deny_out:?}"
+            [
+                "ct state established,related ct direction reply accept",
+                answerer.as_str()
+            ],
+            "the deny chain's accepts are the reply direction and the answerer's, \
+             nothing else: {deny_out:?}"
         );
         assert!(
             !deny_out
                 .iter()
                 .any(|rule| rule.contains("127.0.0.1") && !rule.contains(&answerer)),
             "no rule admits the loopback wide: {deny_out:?}"
+        );
+    }
+
+    /// The reply admission (NET-079, as the architecture review ruled it):
+    /// a box's answer to a connection someone else opened is not egress the
+    /// box originates, so the deny subtree's chain admits that one
+    /// direction — and *only* it, before the deny verdict, in the deny
+    /// subtree alone. A direction-less `ct state established` accept would
+    /// admit a flow the box itself originated the moment conntrack holds it
+    /// (loose tracking is the host's, never this table's to tighten), and
+    /// the same admission in any other chain would admit replies a subtree
+    /// never asked for.
+    #[test]
+    fn rendered_ruleset_admits_only_reply_direction_in_deny_subtree() {
+        let ruleset = rendered_ruleset();
+        let reply = "ct state established,related ct direction reply accept";
+        let deny_out = chain_rules(&ruleset, "deny_out");
+        let admitted = deny_out
+            .iter()
+            .position(|rule| *rule == reply)
+            .unwrap_or_else(|| panic!("the deny chain admits the reply direction: {deny_out:?}"));
+        let refused = deny_out
+            .iter()
+            .position(|rule| rule.starts_with("reject"))
+            .unwrap_or_else(|| panic!("the deny chain carries its verdict: {deny_out:?}"));
+        assert!(
+            admitted < refused,
+            "the reply is admitted before the deny verdict: {deny_out:?}"
+        );
+
+        // Only the reply direction: the chain's one conntrack admission
+        // names the direction it admits, so no direction-less accept — and
+        // no explicit original one — can be built from the text a host
+        // loads. What the box itself originates still meets the verdict.
+        for rule in &deny_out {
+            if rule.contains("ct state") {
+                assert_eq!(
+                    *rule, reply,
+                    "the chain's one conntrack admission is the reply direction: {deny_out:?}"
+                );
+            }
+            assert!(
+                !rule.contains("ct direction original"),
+                "the original direction is never admitted, so a flow the box \
+                 itself originates is refused: {deny_out:?}"
+            );
+        }
+
+        // And in the deny subtree only: no other chain carries a
+        // conntrack-direction admission, and the one route into the deny
+        // chain is the jump the deny subtree's own match makes — an allow
+        // box's replies never pass through a chain that could refuse them.
+        for chain in ["output", "dstnat", "postrouting"] {
+            let rules = chain_rules(&ruleset, chain);
+            assert!(
+                rules.iter().all(|rule| !rule.contains("ct direction")),
+                "the reply admission lives in the deny chain alone, not {chain}: {rules:?}"
+            );
+        }
+        let output = chain_rules(&ruleset, "output");
+        assert_eq!(
+            output.len(),
+            1,
+            "the output chain does one thing, route a cgroup to its chain: {output:?}"
+        );
+        assert!(
+            output[0].contains(sandbox2::config::DENY_DIR) && output[0].ends_with("jump deny_out"),
+            "the one jump is the deny subtree's, so nothing else is decided \
+             against a deny-all box: {output:?}"
+        );
+    }
+
+    /// NET-079, as the architecture review ruled it: a deny-all
+    /// host-address box with a listener answers a request through the
+    /// hostname proxy, while its own outbound connect is still refused. The
+    /// request's leg is driven live, end to end, through the proxy the
+    /// daemon serves — a host-address box serves on the host's loopback, the
+    /// name routes there, and the proxy's dial is the daemon's own, outside
+    /// the cohort — and the box's half of that connection, its answer leg,
+    /// is the reply direction the table has to admit for the request to
+    /// ever be answered: without that admission the client hangs on a box
+    /// whose SYN-ACK never left it, and with an admission any wider the box
+    /// originates flows the deny was written to refuse.
+    #[tokio::test]
+    async fn deny_all_host_ip_box_answers_the_proxy() {
+        // The box's declaration is the deny-all one, so its leaf is in the
+        // subtree whose chain every rule below is read from — the verdict
+        // the launch's own placement would pick for this box.
+        let deny_all = sessions::EgressPolicy::deny_all();
+        assert_eq!(verdict_of(Some(&deny_all)), Verdict::Deny);
+
+        // The box's listener, on the loopback a host-address box shares with
+        // its host, and the daemon's proxy serving the zone the box's name
+        // lives in — the pieces the request runs over, as they run in the
+        // daemon.
+        let backend_port = crate::net::proxy::spawn_backend().await;
+        let registry = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::net::dns::HostnameRegistry::new("dev", false),
+        ));
+        registry
+            .write()
+            .unwrap()
+            .register_host_net(sessions::SessionId::nil(), "denybox");
+        let router = crate::net::proxy::Router::new(
+            std::sync::Arc::clone(&registry),
+            crate::net::switch::proxied_request_verdict,
+        );
+        let proxy = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("the proxy binds a loopback port");
+        let proxy_addr = proxy.local_addr().expect("the proxy's address");
+        tokio::spawn(crate::net::proxy::serve(proxy, router));
+        let answered = crate::net::proxy::proxy_get(
+            proxy_addr,
+            &format!("denybox.min.internal:{backend_port}"),
+        )
+        .await;
+        assert!(
+            answered.contains("200 OK"),
+            "a request through the hostname proxy reaches the deny-all box's \
+             listener and is answered, got: {answered}"
+        );
+
+        // The table's half of the same connection: the proxy opened it, so
+        // the box's answer leg is the reply direction, and the chain admits
+        // exactly that — before its verdict, so the answer leaves the box
+        // — while nothing the box itself originates is admitted, so the
+        // connect it opens meets the refusal the declaration asked for.
+        let ruleset = rendered_ruleset();
+        let deny_out = chain_rules(&ruleset, "deny_out");
+        let reply = "ct state established,related ct direction reply accept";
+        let admitted = deny_out
+            .iter()
+            .position(|rule| *rule == reply)
+            .unwrap_or_else(|| panic!("the box's answer leg is admitted: {deny_out:?}"));
+        let refused = deny_out
+            .iter()
+            .position(|rule| rule.starts_with("reject"))
+            .unwrap_or_else(|| panic!("the deny chain carries its verdict: {deny_out:?}"));
+        assert!(
+            admitted < refused,
+            "the reply is admitted before the deny verdict, so the box's \
+             answer to the proxy's connection leaves it: {deny_out:?}"
+        );
+        assert_eq!(
+            deny_out
+                .iter()
+                .filter(|rule| rule.contains("ct state"))
+                .count(),
+            1,
+            "one conntrack admission, the reply direction, and nothing the box \
+             originates: {deny_out:?}"
+        );
+        assert_eq!(
+            deny_out.last(),
+            Some(&"reject with icmpx admin-prohibited"),
+            "a connect the box itself opens is refused, actively: {deny_out:?}"
+        );
+    }
+
+    /// The one rendered text, in both lanes that load it: the install's own
+    /// `nft -f` transaction — the bytes a native host's privileged step
+    /// pipes to the packet filter — and the print mode's output, the text a
+    /// guest load renders from and the daemon's own tests read. Both come
+    /// from `render_ruleset` and neither spells a rule the other does not,
+    /// so a digest over each must be the same digest: a rule added to one
+    /// lane and not the other is a host whose two spellings of the same
+    /// table disagree. Read by driving the install itself, over a
+    /// recording stand-in for `nft`, so what is compared is what the step
+    /// really hands the packet filter — and the reply admission this round
+    /// added is part of that one text.
+    #[test]
+    fn ruleset_digest_covers_bytes_piped_to_nft_in_both_lanes() {
+        // A recording stand-in for `nft`: the packet filter is the step's
+        // own dependency, and what a test can pin of it without the
+        // capability to load one is the bytes it was handed, captured whole
+        // — the same capture the step's own installer case reads.
+        let stub = tempfile::tempdir().expect("a temp dir holding the recording nft");
+        std::fs::write(
+            stub.path().join("nft"),
+            "#!/bin/sh\n\
+             [ \"$1\" = \"-f\" ] && [ -n \"${2:-}\" ] && cat \"$2\" >\"${0%/*}/nft.input\"\n\
+             exit 0\n",
+        )
+        .expect("writing the recording stub");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                stub.path().join("nft"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("the recording stub is executable");
+        }
+        let mount = standin_mount();
+        // The install lane: the step lays out its stand-in tree, renders its
+        // one transaction, and hands it to `nft` — the recording one, so
+        // the bytes it was handed are this proof's own artifact. The step
+        // refuses to delegate its tree to root, so a test running as root
+        // cannot rehearse an install at all — the root check the rehearsal
+        // posture lifts is the only privilege it does. Say so and pin the
+        // print lane alone, which needs none of this.
+        let installed = match run_install(&mount, stub.path()) {
+            Some(installed) => installed,
+            None => {
+                eprintln!(
+                    "skipping ruleset_digest_covers_bytes_piped_to_nft_in_both_lanes: \
+                     the install this lane rehearses refuses to delegate its tree \
+                     to root, and this test runs as root"
+                );
+                let printed = rendered_ruleset();
+                assert!(
+                    printed.contains("ct state established,related ct direction reply accept"),
+                    "the reply admission is part of the one rendered text: {printed}"
+                );
+                return;
+            }
+        };
+        assert!(
+            installed.status.success(),
+            "the install lays out its tree and hands its one transaction to nft: {}{}",
+            String::from_utf8_lossy(&installed.stdout),
+            String::from_utf8_lossy(&installed.stderr),
+        );
+        let piped = std::fs::read_to_string(stub.path().join("nft.input"))
+            .expect("the recording stub captured the bytes nft was handed");
+
+        // The print lane: the same transaction as text.
+        let printed = rendered_ruleset();
+        assert_eq!(
+            blake3::hash(piped.as_bytes()),
+            blake3::hash(printed.as_bytes()),
+            "the bytes piped to nft are the one rendered text in both lanes:\n\
+             -- piped --\n{piped}-- printed --\n{printed}"
+        );
+        assert!(
+            piped.contains("ct state established,related ct direction reply accept"),
+            "the reply admission is part of the one rendered text: {piped}"
         );
     }
 

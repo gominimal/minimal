@@ -40,7 +40,10 @@
 # chain matches a box's own cgroup before any source translation and
 # refuses every connection a box in boxes/deny opens except the one to the
 # zone answerer (--answerer-address, --answerer-port; the box's resolver,
-# refused actively and never silently dropped). Its dstnat chain retargets
+# refused actively and never silently dropped), while the reply leg of a
+# connection someone else opened to the box — the hostname proxy's to its
+# loopback listener — is admitted: a box answering a connection it did not
+# open is not egress the box originates. Its dstnat chain retargets
 # the deny subtree's DNS-port lookups on the answerer's address onto the
 # answerer's own port, so the one destination the deny rule admits is also
 # the one a deny-all box's lookups reach. Its postrouting chain gives the
@@ -150,7 +153,7 @@ while [ $# -gt 0 ]; do
         # The header above this line is the usage. Two explicit strips, not
         # 's/^# \?//': \? is a GNU sed extension BSD sed does not know, and this
         # script's own tests run on macOS's /bin/sh too.
-        -h|--help)   sed -n '2,57p' "$0" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
+        -h|--help)   sed -n '2,60p' "$0" | sed -e 's/^# //' -e 's/^#//'; exit 0 ;;
         *)           die "unknown argument: $1 (see --help)" ;;
     esac
 done
@@ -394,12 +397,16 @@ cgroup_level() {
 # srcnat), so a connection refused on the box's own cgroup is refused
 # before any source translation: the deny is decided inside the box host,
 # on the declaration, not on the identity the packet would leave with. In
-# deny_out, established and related flows are admitted first — a
-# connection the answerer rule let in stays in on its own conntrack
-# state, and the refusal falls on new connections only. The refusal is
-# active — reject, never a silent drop — and each one logs, rate-limited,
-# so a diagnostics bundle's daemon log tail carries the refused
-# connections themselves.
+# deny_out, replies are admitted first — and only replies: a connection
+# someone else opened to the box, the hostname proxy's to its loopback
+# listener among them, has its answer leg in the reply direction, so
+# admitting that one direction is what lets a deny-all box serve what
+# reaches it, while a flow the box itself originates is original-direction
+# and still meets the refusal — egress the box originates is what the deny
+# denies, not the box answering a connection it did not open. The refusal
+# is active — reject, never a silent drop — and each one logs,
+# rate-limited, so a diagnostics bundle's daemon log tail carries the
+# refused connections themselves.
 #
 # The postrouting SNAT rules carry a `lo` guard: a packet to the answerer
 # never leaves the host, so translating its source would rewrite the reply
@@ -416,7 +423,7 @@ table inet $TABLE_NAME {
         socket cgroupv2 level $(cgroup_level "$deny_path") "$deny_path" jump deny_out
     }
     chain deny_out {
-        ct state established,related accept
+        ct state established,related ct direction reply accept
         ip daddr $answerer_address udp dport $answerer_port accept
         limit rate 1/second burst 4 packets log prefix "minimal-classifier: refused " level warn
         reject with icmpx admin-prohibited
