@@ -3441,9 +3441,8 @@ mod tests {
         log.lines()
             .filter(|line| line.contains("publishing on a port of its own"))
             .filter_map(|line| {
-                let idx = line.find("host_port=")?;
-                line[idx + "host_port=".len()..]
-                    .split(|c: char| !c.is_ascii_digit())
+                let rest = line.split_once("host_port=")?.1;
+                rest.split(|c: char| !c.is_ascii_digit())
                     .next()
                     .and_then(|digits| digits.parse().ok())
             })

@@ -394,6 +394,10 @@ async fn list_selected_vm(
 async fn list_other_vm(
     sock: &std::path::Path,
 ) -> Result<Option<minimald_rpc::ListSessionsResponse>, anyhow::Error> {
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "the elapsed marker carries nothing the message lacks"
+    )]
     let reply = tokio::time::timeout(client::PROBE_TIMEOUT, async {
         let mut client = match client::Client::probe(sock).await {
             Ok(client) => client,

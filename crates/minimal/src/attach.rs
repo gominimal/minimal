@@ -286,6 +286,10 @@ pub(crate) async fn resolve_box_vm(
         if !vm.sock.exists() {
             continue;
         }
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "the elapsed marker carries nothing the message lacks"
+        )]
         let look = tokio::time::timeout(crate::client::PROBE_TIMEOUT, box_record_on(&vm, name))
             .await
             .map_err(|_| {
