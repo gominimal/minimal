@@ -1582,7 +1582,9 @@ fn switch_rows_of(rows: &[Arc<BoxRecord>], dictionary: &mut Vec<String>) -> Opti
     for record in rows {
         let own = record.name().to_ascii_lowercase();
         let mut names = Vec::with_capacity(record.declared_names().len() + 1);
-        for name in std::iter::once(own.as_str()).chain(record.declared_names().iter().map(String::as_str)) {
+        for name in
+            std::iter::once(own.as_str()).chain(record.declared_names().iter().map(String::as_str))
+        {
             let index = match seen.get(name) {
                 Some(&index) => index,
                 None => {
@@ -1785,8 +1787,12 @@ fn summarize_expose(body: &[u8]) -> Result<SwitchRequest, RefusedRequest> {
     if !is_client_protocol(&parsed.protocol) {
         return Err(malformed(Some(parsed.protocol)));
     }
-    SwitchRequest::of(SwitchVerb::Publish, remote_addr, &[Record::Port(local_port)])
-        .ok_or_else(|| malformed(None))
+    SwitchRequest::of(
+        SwitchVerb::Publish,
+        remote_addr,
+        &[Record::Port(local_port)],
+    )
+    .ok_or_else(|| malformed(None))
 }
 
 /// Summarizes a retraction: the listener it names, keyed at the address the
@@ -2264,7 +2270,8 @@ fn gate_verdict(
         return match egress::verdict(summary, record.egress()) {
             FrameVerdict::Admit => Ok(GateAdmit::Row),
             FrameVerdict::Drop(reason)
-                if matches!(reason, DropReason::UndeclaredSubnet { .. }) && record.resolves_names() =>
+                if matches!(reason, DropReason::UndeclaredSubnet { .. })
+                    && record.resolves_names() =>
             {
                 Ok(GateAdmit::Row)
             }
