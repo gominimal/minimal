@@ -291,7 +291,10 @@ impl ServerState {
         let net_switch = Arc::new(Mutex::new(
             crate::net::SwitchClient::with_subnet(
                 config.gvproxy_bin_path(),
-                minimal_state_dir.as_utf8_path().join("gvproxy"),
+                minimal_state_dir
+                    .as_utf8_path()
+                    .join("gvproxy")
+                    .join(&daemon_id),
                 switch_subnet,
             )
             .with_transport(transport)
