@@ -1378,11 +1378,11 @@ pub enum LoopbackGrant {
     /// probe that produces it — on a microVM daemon, the forwarder-conducted
     /// walk [`crate::sessions::Manager::init`] defers so the accept loop is
     /// never held for it — is still running, so nothing has yet vouched for
-    /// an address of the range. Only an ask for a namespace the record does
-    /// not name is answered this way: one it already names is answered with
-    /// the address it holds ([`LoopbackGrant::Granted`]), so a box resumed
-    /// inside the window finds its address waiting (NET-013) instead of
-    /// being asked for again.
+    /// an address of the range. Every ask is answered this way, one for a
+    /// namespace the record already names too: the box publishes on the
+    /// interim, its recorded line is kept, and the present landing's re-ask
+    /// answers with that line, so a box resumed inside the window gets its
+    /// address back (NET-013) without ever standing at it unvouched.
     RangePending,
     /// The reserved local range is not bindable on this host (NET-123's
     /// absent verdict): no address from it can be published, so none is
@@ -1546,11 +1546,11 @@ pub struct LoopbackLeaseBook {
     /// through the forwarder, once that walk lands, by
     /// [`LoopbackLeaseBook::set_range_verdict`]. A landed absent verdict gates
     /// every ask ([`LoopbackGrant::RangeAbsent`]: the addresses this book
-    /// would grant are not publishable, so none is spent); a pending one gates
-    /// only the asks for namespaces the record does not name, so a box that
-    /// asks for a fresh grant inside the walk's window is published on the
-    /// interim and never handed an address nothing has vouched for, while a
-    /// box the record already names keeps its address (NET-013).
+    /// would grant are not publishable, so none is spent); a pending one
+    /// answers every ask with the interim ([`LoopbackGrant::RangePending`]),
+    /// so no box is published at an address nothing has vouched for — a box
+    /// the record already names keeps its line, and the present landing
+    /// restores it to that address (NET-013).
     verdict: std::sync::atomic::AtomicU8,
     /// The verdict's landing, broadcast to the registrations waiting on it
     /// ([`LoopbackLeaseBook::await_vouch_for`]): the atomic above is the
@@ -1561,29 +1561,32 @@ pub struct LoopbackLeaseBook {
     /// the atomic by [`LoopbackLeaseBook::set_range_verdict`], so the two
     /// never disagree.
     verdict_landing: tokio::sync::watch::Sender<RangeVerdict>,
-    /// How long [`LoopbackLeaseBook::await_vouch_for`] waits before it
-    /// answers a still-pending verdict with "not vouched", in milliseconds
-    /// (an atomic because the wait is async and the setter is test-only):
-    /// the session-start deadline the client already bounds its
-    /// box-control requests at — [`HAND_VERDICT_WAIT`] — so a finalize that
-    /// waits for the deferred walk stays inside the caller it answers. The
-    /// bound is spent only by a verdict that never lands; a landing wakes
-    /// the waiter at once.
-    hand_verdict_wait: std::sync::atomic::AtomicU64,
+    /// The moment this book opened — the daemon's start, for the one book a
+    /// daemon opens — which [`Self::hand_verdict_deadline`] is counted from.
+    opened_at: std::time::Instant,
+    /// The daemon's one verdict deadline, in milliseconds after
+    /// `opened_at`: [`HAND_VERDICT_WAIT`] at open. Every registration that
+    /// waits in [`LoopbackLeaseBook::await_vouch_for`] races this same
+    /// instant, so waiters started at different moments all return together
+    /// when the verdict lands or the deadline passes, and the waits never
+    /// add up. An atomic because the wait is async and the setter is
+    /// test-only.
+    hand_verdict_deadline: std::sync::atomic::AtomicU64,
 }
 
-/// How long a registration holding an unvouched hand waits for the range
-/// verdict to land (NET-123 §7.1): the session-start deadline the client's
-/// box-control requests are already bounded at — 5 s — the one bound a
-/// session's start is held to, so a finalize that waits for the deferred
-/// walk never out-waits the client it answers. A verdict that lands inside
-/// it publishes the hand; one that does not publishes the `127.0.0.1`
-/// interim, which the present landing's sweep upgrades to the hand it now
-/// vouches for. Test-only code shrinks the wait
-/// ([`LoopbackLeaseBook::shrink_hand_verdict_wait`]) so the expiry shape is
-/// proven without paying the bound.
+/// How long after the daemon starts — after its lease book opens — a box's
+/// first finalize holding an unvouched hand may wait for the range verdict
+/// to land (NET-123 §7.1). It is one deadline for the whole daemon, not a
+/// per-call wait: the deferred walk starts with the daemon, so a verdict
+/// that has not landed this long after the start is not one a session's
+/// start should be held for, and every waiter is answered by the same
+/// instant. A verdict that lands inside it publishes the hand; one that
+/// does not publishes the `127.0.0.1` interim, which the present landing's
+/// sweep upgrades to the hand it then vouches for. Test-only code moves
+/// the deadline ([`LoopbackLeaseBook::reset_hand_verdict_deadline`]) so the
+/// expiry shape is proven without paying it.
 #[cfg(target_os = "linux")]
-const HAND_VERDICT_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const HAND_VERDICT_WAIT: Duration = Duration::from_secs(5);
 
 #[cfg(target_os = "linux")]
 impl LoopbackLeaseBook {
@@ -1595,8 +1598,9 @@ impl LoopbackLeaseBook {
     /// publish surface, so it reads the answer before it gets here — and
     /// [`RangeVerdict::Pending`] where it has not, the microVM daemon's
     /// shape, whose walk is deferred so its accept loop is never held for it.
-    /// See [`LoopbackGrant::RangePending`] for which asks the pending state
-    /// gates.
+    /// See [`LoopbackGrant::RangePending`] for how the pending state answers
+    /// an ask. The book's opening also starts the daemon's one verdict
+    /// deadline ([`HAND_VERDICT_WAIT`]).
     ///
     /// # Errors
     ///
@@ -1635,7 +1639,8 @@ impl LoopbackLeaseBook {
             lock: std::sync::Mutex::new(Some(lock)),
             verdict: std::sync::atomic::AtomicU8::new(verdict.key()),
             verdict_landing,
-            hand_verdict_wait: std::sync::atomic::AtomicU64::new(
+            opened_at: std::time::Instant::now(),
+            hand_verdict_deadline: std::sync::atomic::AtomicU64::new(
                 HAND_VERDICT_WAIT.as_millis() as u64
             ),
         })
@@ -1692,15 +1697,28 @@ impl LoopbackLeaseBook {
         self.verdict_landing.send_replace(verdict);
     }
 
-    /// Waits for the verdict to vouch for `address`, bounded by the
-    /// session-start deadline (NET-123 §7.1) — the registration path a handed
-    /// box takes when the verdict it must be vouched by has not landed yet.
+    /// The daemon's one verdict deadline, as an instant: the moment the book
+    /// opened plus [`HAND_VERDICT_WAIT`] (or the instant a test moved it to).
+    fn hand_verdict_deadline(&self) -> std::time::Instant {
+        self.opened_at
+            + std::time::Duration::from_millis(
+                self.hand_verdict_deadline
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+    }
+
+    /// Waits for the verdict to vouch for `address`, bounded by the daemon's
+    /// one verdict deadline (NET-123 §7.1) — the path a handed box's first
+    /// finalize takes when the verdict it must be vouched by has not landed
+    /// yet.
     ///
     /// A verdict already landed answers at once: **present** vouches for an
     /// address of the range, **absent** does not, and an address outside the
     /// range needs no verdict either way. Only a **pending** verdict waits,
-    /// and it waits only until the deadline — a walk that has not answered
-    /// by then is answered as "not vouched", so the caller publishes the
+    /// and only until the deadline — the same instant for every waiter,
+    /// counted from the daemon's start ([`HAND_VERDICT_WAIT`]), so waiters
+    /// never add up and all return together. A walk that has not answered by
+    /// then is answered as "not vouched", so the caller publishes the
     /// `127.0.0.1` interim rather than holding the session's start for a
     /// probe the landing sweep will settle the moment it lands. A waiter
     /// woken late re-reads the verdict before the deadline decides, so a
@@ -1710,11 +1728,7 @@ impl LoopbackLeaseBook {
         if !in_reserved_local_range(address) {
             return true;
         }
-        let wait = std::time::Duration::from_millis(
-            self.hand_verdict_wait
-                .load(std::sync::atomic::Ordering::Acquire),
-        );
-        let deadline = tokio::time::Instant::now() + wait;
+        let deadline = tokio::time::Instant::from_std(self.hand_verdict_deadline());
         let mut landing = self.verdict_landing.subscribe();
         loop {
             match *landing.borrow_and_update() {
@@ -1729,7 +1743,7 @@ impl LoopbackLeaseBook {
                 // landing's sweep upgrades it when the walk finally lands.
                 return false;
             }
-            if tokio::time::timeout(remaining, landing.changed())
+            if tokio::time::timeout_at(deadline, landing.changed())
                 .await
                 .is_err()
             {
@@ -1738,16 +1752,30 @@ impl LoopbackLeaseBook {
         }
     }
 
-    /// Shrinks the bound [`Self::await_vouch_for`] waits to, in
-    /// milliseconds, so a test proves the expiry shape without paying the
-    /// session-start deadline's real five seconds.
+    /// Moves the daemon's one verdict deadline to `millis` from now, so a
+    /// test drives the expiry shape without paying the real deadline, or
+    /// holds a window open long enough to tell "waited" from "did not".
     ///
     /// Test-only: no production path changes a deadline it is itself bounded
     /// by, and one that did would want a message, not a setter.
     #[cfg(test)]
-    pub fn shrink_hand_verdict_wait(&self, millis: u64) {
-        self.hand_verdict_wait
-            .store(millis, std::sync::atomic::Ordering::Release);
+    pub fn reset_hand_verdict_deadline(&self, millis: u64) {
+        let from_open = self.opened_at.elapsed().as_millis() as u64;
+        self.hand_verdict_deadline
+            .store(from_open + millis, std::sync::atomic::Ordering::Release);
+    }
+
+    /// How many registrations are parked in [`Self::await_vouch_for`] right
+    /// now: the subscribers of the verdict's landing broadcast. The book's
+    /// own receiver is dropped at open, so every receiver counted is a
+    /// waiter.
+    ///
+    /// Test-only: a test polls it before landing a verdict, so the landing
+    /// provably answers a waiter rather than a registration that has not
+    /// begun to wait.
+    #[cfg(test)]
+    pub fn verdict_waiters(&self) -> usize {
+        self.verdict_landing.receiver_count()
     }
 
     /// Whether `address` may be published as a box's own under the verdict
@@ -1769,13 +1797,14 @@ impl LoopbackLeaseBook {
     /// inside the window would bind its declared ports at an address the
     /// surface may refuse at every bind: `EADDRNOTAVAIL` on a stock macOS
     /// host, exactly the refusal the verdict exists to keep a box from
-    /// publishing at. The registration path therefore waits for the verdict
-    /// ([`Self::await_vouch_for`]) before it gives up on the hand, bounded
-    /// by the session-start deadline, and publishes the interim only when
-    /// the wait answers unvouched — an absent verdict, or a walk that never
-    /// landed. With the verdict against it the hand publishes nothing and
-    /// the box's ask falls through, to the interim — and the gate reads the
-    /// record the same way it reads the hand: a publish standing at an
+    /// publishing at. A box's first finalize therefore waits for the
+    /// verdict ([`Self::await_vouch_for`]) before it gives up on the hand,
+    /// bounded by the daemon's one verdict deadline, and publishes the
+    /// interim only when the wait answers unvouched — an absent verdict, or
+    /// a walk that has not landed by the deadline; every other registration
+    /// reads the gate as it stands. With the verdict against it the hand
+    /// publishes nothing and the box stands at the interim — and the gate
+    /// reads the record the same way it reads the hand: a publish standing at an
     /// unvouched address asks again rather than standing at it, so no box
     /// holds an address a landed verdict contradicts.
     #[must_use]
@@ -1798,18 +1827,22 @@ impl LoopbackLeaseBook {
     /// namespace — a rename racing a finalize — are both answered with the
     /// one address, the second by the line the first wrote.
     ///
-    /// A **landed absent** verdict gates the ask before the record is read
-    /// (NET-123: an address the publish surface cannot bind is not grantable,
-    /// to a namespace that holds one any more than to one that does not); a
-    /// **pending** one does not, because the address a recorded namespace
-    /// holds was vouched for by the verdict that granted it — so the read
-    /// below comes first, and the resumed box's ask is answered from the
-    /// record whatever the deferred walk is doing (NET-013). Only an ask for
-    /// a namespace the record does not name waits on the state, and while it
-    /// is pending that ask is granted nothing.
+    /// Only a **landed present** verdict lets the ask reach the record. A
+    /// landed absent one answers [`LoopbackGrant::RangeAbsent`] (NET-123: an
+    /// address the publish surface cannot bind is not grantable, to a
+    /// namespace that holds one any more than to one that does not), and a
+    /// pending one answers [`LoopbackGrant::RangePending`] — for a namespace
+    /// the record names too: the verdict that granted that address was an
+    /// earlier daemon's, and nothing has measured this daemon's surface yet,
+    /// so no reserved-range address publishes under anything but a landed
+    /// present. The record is left as it is, so the resumed box's line
+    /// survives the window and the present landing's re-ask answers with it
+    /// (NET-013).
     pub fn grant(&self, namespace: LeaseNamespace) -> LoopbackGrant {
-        if self.verdict() == RangeVerdict::Absent {
-            return LoopbackGrant::RangeAbsent;
+        match self.verdict() {
+            RangeVerdict::Present => {}
+            RangeVerdict::Absent => return LoopbackGrant::RangeAbsent,
+            RangeVerdict::Pending => return LoopbackGrant::RangePending,
         }
         let Ok(mut held) = self.lock.lock() else {
             return LoopbackGrant::RecordUnavailable;
@@ -1844,14 +1877,6 @@ impl LoopbackLeaseBook {
                 );
             }
             return LoopbackGrant::Granted(address);
-        }
-        // A namespace the record does not name is the one the verdict gates:
-        // while it is pending, nothing has vouched for an address of the
-        // range, so none is spent on this ask — the asker publishes on the
-        // interim, and a rename or a re-finalize after the walk lands asks
-        // again.
-        if self.verdict() != RangeVerdict::Present {
-            return LoopbackGrant::RangePending;
         }
         // The pool the record's addresses are drawn against: the pure
         // allocator's restore ignores anything outside it, so a stale or
@@ -3319,18 +3344,19 @@ mod tests {
         );
     }
 
-    /// The pending window does not take a resumed box's address away from it
-    /// (NET-013): a namespace the record already names is answered with the
-    /// address it holds whatever the deferred probe is doing, so a daemon that
-    /// restarts inside its walk window — the shape a VM host's is, where an
-    /// attach right after `min up` brings a live box's actor up before the
-    /// forwarder-conducted walk has answered — re-derives the box's grant
-    /// rather than being told the range is absent. Only an ask the record
-    /// cannot answer waits on the verdict, and a landed absent verdict is the
-    /// one that refuses a recorded namespace too.
+    /// The pending window publishes no reserved-range address, not even a
+    /// recorded one, and takes no resumed box's address away from it either
+    /// (NET-013): a daemon that restarts inside its walk window — the shape a
+    /// VM host's is, where an attach right after `min up` brings a live box's
+    /// actor up before the forwarder-conducted walk has answered — answers
+    /// the resumed box's ask with the interim, because nothing has measured
+    /// this daemon's surface yet, but keeps the record's line, so the present
+    /// landing's re-ask answers with the very address the box held. A fresh
+    /// ask is answered the same way and spends nothing, and a landed absent
+    /// verdict refuses a recorded namespace too.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_pending_verdict_answers_a_recorded_namespace_and_withholds_a_fresh_one() {
+    fn a_pending_verdict_withholds_every_grant_and_keeps_the_recorded_line() {
         let tmp = tempfile::tempdir().unwrap();
         let state_root = lease_root(&tmp);
         let namespace = LeaseNamespace::Box {
@@ -3350,14 +3376,14 @@ mod tests {
         };
 
         // The restarted daemon, whose walk has not landed: the same ask the
-        // resume path makes is answered with the recorded address, and a box
-        // the record does not name is granted nothing — the interim, not a
-        // guess at an address nothing has vouched for.
+        // resume path makes is answered with the interim — no reserved-range
+        // address publishes under anything but a landed present — and so is a
+        // box the record does not name.
         let restarted = LoopbackLeaseBook::open(&state_root, RangeVerdict::Pending).unwrap();
         assert_eq!(
             restarted.grant(namespace),
-            LoopbackGrant::Granted(recorded),
-            "a resumed box finds its recorded address while the verdict is pending"
+            LoopbackGrant::RangePending,
+            "a resumed box publishes the interim while the verdict is pending"
         );
         assert_eq!(
             restarted.grant(fresh),
@@ -3365,18 +3391,19 @@ mod tests {
             "a namespace the record does not name waits for the verdict"
         );
         assert_eq!(
-            restarted.read().unwrap().len(),
-            1,
-            "the pending window spends nothing: the record carries the one grant it held"
+            restarted.read().unwrap(),
+            first.read().unwrap(),
+            "the pending window spends nothing and drops nothing: the record \
+             carries the one line it held"
         );
 
         // The walk lands present: both asks grant now, and the resumed box
-        // keeps the address it held through the window.
+        // gets back the address its line kept through the window.
         restarted.set_range_verdict(RangeVerdict::Present);
         assert_eq!(
             restarted.grant(namespace),
             LoopbackGrant::Granted(recorded),
-            "the landed verdict does not move a recorded namespace's address"
+            "the landed verdict restores a recorded namespace's address"
         );
         // The next address up: the one the allocator hands a fresh ask over a
         // pool whose lowest address is taken.
@@ -3458,13 +3485,13 @@ mod tests {
 
     /// The wait an unvouched hand takes (NET-123 §7.1): a registration
     /// holding a hand the verdict has not vouched for waits for the verdict
-    /// to land, bounded by the session-start deadline — a present verdict
-    /// landing inside the bound vouches for the hand, an absent one
-    /// refuses it at once, and a verdict that never lands has the bound
+    /// to land, bounded by the daemon's one verdict deadline — a present
+    /// verdict landing inside the bound vouches for the hand, an absent one
+    /// refuses it at once, and a verdict that never lands has the deadline
     /// answered as "not vouched" so the caller publishes the interim
-    /// instead of holding the session's start forever. The bound here is
-    /// shrunk to tens of milliseconds so the expiry is proven without the
-    /// real deadline's five seconds.
+    /// instead of holding the session's start forever. The deadline here is
+    /// moved to tens of milliseconds away so the expiry is proven without
+    /// the real deadline's five seconds.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unvouched_hand_waits_for_the_verdict_and_is_answered_by_the_bound() {
@@ -3472,14 +3499,25 @@ mod tests {
         let state_root = lease_root(&tmp);
         let handed = sessions::core::loopback::POOL_FIRST;
 
-        // A pending book whose wait is shrunk to the test's patience: the
-        // hand is unvouched, the verdict lands inside the bound, and the
-        // wait answers with the verdict, not with the clock.
-        let pending = LoopbackLeaseBook::open(&state_root, RangeVerdict::Pending).unwrap();
-        pending.shrink_hand_verdict_wait(2_000);
+        // A pending book whose deadline is far off: the hand is unvouched,
+        // the verdict lands inside the bound, and the wait answers with the
+        // verdict, not with the clock.
+        let pending = std::sync::Arc::new(
+            LoopbackLeaseBook::open(&state_root, RangeVerdict::Pending).unwrap(),
+        );
+        pending.reset_hand_verdict_deadline(30_000);
+        let waiting = {
+            let pending = std::sync::Arc::clone(&pending);
+            tokio::spawn(async move { pending.await_vouch_for(handed).await })
+        };
+        // Landed only once the waiter is parked, so the landing is what
+        // answers it — not a verdict it read before it began to wait.
+        while pending.verdict_waiters() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         pending.set_range_verdict(RangeVerdict::Present);
         assert!(
-            pending.await_vouch_for(handed).await,
+            waiting.await.unwrap(),
             "a verdict that lands inside the bound vouches for the hand"
         );
 
@@ -3494,19 +3532,99 @@ mod tests {
         // "not vouched", so the caller publishes the interim rather than
         // waiting for a walk that is not walking.
         let never = LoopbackLeaseBook::open(&state_root, RangeVerdict::Pending).unwrap();
-        never.shrink_hand_verdict_wait(50);
+        // Taken before the deadline is set, and the bar a few milliseconds
+        // short of it: the deadline is kept to the millisecond.
         let started = std::time::Instant::now();
+        never.reset_hand_verdict_deadline(50);
         assert!(
             !never.await_vouch_for(handed).await,
             "a verdict that never lands is answered by the bound, not vouched"
         );
         assert!(
-            started.elapsed() >= std::time::Duration::from_millis(50),
+            started.elapsed() >= std::time::Duration::from_millis(45),
             "the bound is what the expiry answer waited on"
         );
         assert!(
             never.await_vouch_for(Ipv4Addr::LOCALHOST).await,
             "an address outside the reserved range never waits at all"
+        );
+    }
+
+    /// The deadline is the daemon's, not each waiter's (NET-123 §7.1):
+    /// registrations that begin to wait at different moments all race the
+    /// one instant, so a late waiter is answered when the first one is —
+    /// not a whole wait after it began — and N waiters never cost N waits.
+    /// A landing likewise answers every waiter at once.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_hand_waiter_races_the_one_daemon_deadline() {
+        const WAITERS: usize = 4;
+        const STAGGER: std::time::Duration = std::time::Duration::from_millis(150);
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        let handed = sessions::core::loopback::POOL_FIRST;
+
+        // A deadline the waiters are staggered across: the last one begins
+        // to wait well after the first, with less than a whole wait left.
+        let never = std::sync::Arc::new(
+            LoopbackLeaseBook::open(&state_root, RangeVerdict::Pending).unwrap(),
+        );
+        let wait = STAGGER * u32::try_from(WAITERS).unwrap();
+        never.reset_hand_verdict_deadline(u64::try_from(wait.as_millis()).unwrap());
+        let started = std::time::Instant::now();
+        let mut waiters = Vec::new();
+        for _ in 0..WAITERS {
+            let book = std::sync::Arc::clone(&never);
+            waiters.push(tokio::spawn(async move {
+                let began = std::time::Instant::now();
+                let vouched = book.await_vouch_for(handed).await;
+                (vouched, began.elapsed())
+            }));
+            tokio::time::sleep(STAGGER / 2).await;
+        }
+        let mut last_waited = std::time::Duration::ZERO;
+        for waiter in waiters {
+            let (vouched, waited) = waiter.await.unwrap();
+            assert!(!vouched, "a deadline that passes answers 'not vouched'");
+            last_waited = waited;
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < wait * 2,
+            "every waiter returned by the one deadline ({wait:?}), not one wait \
+             each after it began: took {elapsed:?}"
+        );
+        assert!(
+            last_waited < wait,
+            "the last waiter was answered by the shared deadline, not a whole wait \
+             after it began: waited {last_waited:?}"
+        );
+
+        // A landing answers every parked waiter at once.
+        let pending = std::sync::Arc::new(
+            LoopbackLeaseBook::open(&state_root, RangeVerdict::Pending).unwrap(),
+        );
+        pending.reset_hand_verdict_deadline(30_000);
+        let waiters: Vec<_> = (0..WAITERS)
+            .map(|_| {
+                let book = std::sync::Arc::clone(&pending);
+                tokio::spawn(async move { book.await_vouch_for(handed).await })
+            })
+            .collect();
+        while pending.verdict_waiters() < WAITERS {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let landed = std::time::Instant::now();
+        pending.set_range_verdict(RangeVerdict::Present);
+        for waiter in waiters {
+            assert!(
+                waiter.await.unwrap(),
+                "the landing vouches for every waiter"
+            );
+        }
+        assert!(
+            landed.elapsed() < std::time::Duration::from_secs(10),
+            "the landing answered the waiters, not the deadline"
         );
     }
 

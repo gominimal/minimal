@@ -328,13 +328,14 @@ impl Manager {
             // of reaching the daemon behind it. So that arm is spawned here
             // and its verdict applied when it lands
             // (`land_range_verdict`): the book opens on the pending verdict
-            // (no *fresh* grant at an address nothing has vouched for; a
-            // namespace the record already names is still answered with the
-            // address it holds, NET-013) and the walk, once it has an answer,
-            // both un-withholds and hands the node its address, and re-points
-            // the publishes the window left standing — a hand the landing
-            // overrules moves onto the interim, an interim ask the landing
-            // upgrades to a grant — so no box holds an address the landed
+            // (no box publishes at an address nothing has vouched for; a
+            // namespace the record already names keeps its line, and the
+            // present landing restores it, NET-013) and the walk, once it
+            // has an answer, both un-withholds and hands the node its
+            // address, and re-points the publishes the window left
+            // standing — a hand the landing overrules moves onto the
+            // interim, an interim ask the landing upgrades to a grant or
+            // its hand — so no box holds an address the landed
             // verdict contradicts, and the interim never outstays the
             // window that made it.
             let (probe, shuttle) = match transport {
@@ -574,11 +575,12 @@ pub(crate) struct InterimUpgrade {
 /// verdict and every publish it contradicts — so it re-publishes each such
 /// box at the interim, name and route with it, and the box's attach binds
 /// where the surface listens instead of failing until destroy. The arm is
-/// the net the pending window's stricter gate leaves as a belt: no
-/// production path can publish a reserved-range address before a verdict
-/// vouches for it any more, but a publish the record already names (a
-/// resumed box's, answered whatever the state) is still stood down when the
-/// surface answers absent.
+/// a belt behind the pending window's gate: no production path publishes a
+/// reserved-range address under anything but a landed present verdict — a
+/// hand waits for one or stands at the interim, and a resumed box the
+/// record already names is answered with the interim until the present
+/// landing restores its recorded address — so a publish this arm finds is
+/// one a verdict vouched for and a later landing contradicts.
 ///
 /// A **present** landing moves every own-address publish standing at the
 /// interim onto the address it is owed: its own hand for a box a creator
@@ -592,18 +594,20 @@ pub(crate) struct InterimUpgrade {
 /// answerer's record under its own lock file — and the box can die inside
 /// that window: the apply re-checks, under the write lock, that the box
 /// still holds its name and still stands at the interim, and a box that
-/// does not has its drawn grant released unpublishd and nothing published
-/// — names are first-writer-owned, so a destroyed box's re-registered name
-/// would block the next box that takes it.
+/// does not has nothing published — names are first-writer-owned, so a
+/// destroyed box's re-registered name would block the next box that takes
+/// it — and, when its publish is gone (the destroyed box), its drawn grant
+/// released unpublished.
 ///
 /// The verdict is set **before** either arm runs, so a registration racing
 /// the landing reads the landed verdict: its hand is gated by
 /// [`crate::net::dns::LoopbackLeaseBook::vouches_for`] — and a hand that
 /// meets it unvouched is woken by the landing's broadcast, inside the
-/// session-start deadline it waits bounded by
-/// ([`crate::net::dns::LoopbackLeaseBook::await_vouch_for`]) — its ask by
-/// the verdict's own arm, and each sweep only re-publishes what still
-/// stands.
+/// daemon's one verdict deadline it waits bounded by
+/// ([`crate::net::dns::LoopbackLeaseBook::await_vouch_for`]), or re-reads
+/// the verdict under the registry's write lock before it publishes — its
+/// ask by the verdict's own arm, and each sweep only re-publishes what
+/// still stands.
 #[cfg(target_os = "linux")]
 fn land_range_verdict(
     book: &crate::net::dns::LoopbackLeaseBook,
@@ -673,17 +677,18 @@ pub(crate) fn draw_interim_upgrades(
         // grant from the pool: the hand is the host-side table's row, the
         // address the attach path's expose requests name, and a hand is
         // only ever replaced by `127.0.0.1` — so the landing's move for it
-        // is the return, not a substitution.
-        if let Some(hand) = publish.hand
-            && book.vouches_for(hand)
-        {
-            drawn.push(InterimUpgrade {
-                session: publish.session,
-                name: publish.name,
-                ports: publish.ports,
-                address: hand,
-                hand: true,
-            });
+        // is the return, not a substitution, and a hand the verdict does
+        // not vouch for leaves the box where it is, never drawing a grant.
+        if let Some(hand) = publish.hand {
+            if book.vouches_for(hand) {
+                drawn.push(InterimUpgrade {
+                    session: publish.session,
+                    name: publish.name,
+                    ports: publish.ports,
+                    address: hand,
+                    hand: true,
+                });
+            }
             continue;
         }
         match book.grant(crate::net::dns::LeaseNamespace::Box {
@@ -719,10 +724,15 @@ pub(crate) fn draw_interim_upgrades(
 /// rename or a later session, or its publish moved off the interim by its
 /// own next registration; names are first-writer-owned, so any of those
 /// means the move publishes nothing. `true` when the move was made, `false`
-/// when it was discarded — and the drawn grant released back through the
+/// when it was discarded. A discarded box whose publish is gone — the
+/// destroyed box — has the drawn grant released back through the
 /// answerer's channel, outside the registry's lock the same way the draw
 /// took it, so a dead box's landing cannot spend an address the pool would
-/// then hold spoken for.
+/// then hold spoken for. One whose publish still stands keeps the grant:
+/// the grant is idempotent by namespace, so a box that moved off the
+/// interim through its own re-registration stands at the very address the
+/// draw recorded, and a stopped or renamed one is answered with it at its
+/// next registration; releasing it would free an address a live box holds.
 #[cfg(target_os = "linux")]
 pub(crate) fn apply_interim_upgrade(
     book: &crate::net::dns::LoopbackLeaseBook,
@@ -732,11 +742,12 @@ pub(crate) fn apply_interim_upgrade(
     // The re-check, and the move, under the one write lock: no answer reads
     // a half-moved table, and no other registration can slip between the
     // check and the publish.
-    let applied = {
+    let (applied, publish_gone) = {
         let mut reg = registry.write().expect("hostname registry lock poisoned");
+        let standing = reg.published_own_address(upgrade.session);
         let box_still_exists = reg.name_held_by(upgrade.session, &upgrade.name)
-            && reg.published_own_address(upgrade.session) == Some(Ipv4Addr::LOCALHOST);
-        if !box_still_exists {
+            && standing == Some(Ipv4Addr::LOCALHOST);
+        let applied = if !box_still_exists {
             false
         } else {
             // The move is said out loud, naming the box and both addresses
@@ -760,18 +771,21 @@ pub(crate) fn apply_interim_upgrade(
             );
             reg.register_own_ip(upgrade.session, &upgrade.name, upgrade.ports.clone());
             true
-        }
+        };
+        (applied, standing.is_none())
     };
     if applied {
         return true;
     }
-    // The discard: publish nothing, and hand the drawn grant back. A hand is
-    // not released — it was never drawn from the pool, and the host-side
-    // table's row keeps it whatever this daemon does. The release runs
-    // outside the registry's lock, the same order the draw's grant took it
-    // in; its answer says which call actually took the line, the discard's
-    // or a destroy that got there first.
-    let released = if upgrade.hand {
+    // The discard: publish nothing, and hand the drawn grant back only when
+    // the box's publish is gone — the destroyed box. A box still standing
+    // somewhere keeps the grant (see the doc above). A hand is never
+    // released — it was never drawn from the pool, and the host-side table's
+    // row keeps it whatever this daemon does. The release runs outside the
+    // registry's lock, the same order the draw's grant took it in; its
+    // answer says which call actually took the line, the discard's or a
+    // destroy that got there first.
+    let released = if upgrade.hand || !publish_gone {
         None
     } else {
         book.release(crate::net::dns::LeaseNamespace::Box {
@@ -785,9 +799,9 @@ pub(crate) fn apply_interim_upgrade(
         to = %upgrade.address,
         released = ?released,
         action = "loopback-lease-discarded",
-        "the box died inside the landing's window; the publish it stood on \
-         is not moved, and the grant drawn for it — if one was drawn — is \
-         released unpublishd"
+        "the box moved or died inside the landing's window; the publish it \
+         stood on is not moved, and the grant drawn for a destroyed box is \
+         released unpublished"
     );
     false
 }
@@ -1383,10 +1397,17 @@ impl ManagerHandle {
     ///
     /// Test-only: no production path needs to *un-know* a verdict it has, and
     /// one that did would want a message, not a setter.
+    ///
+    /// The daemon's one verdict deadline restarts with it, as it does for a
+    /// daemon that has just started, so the window is the full
+    /// [`crate::net::dns::HAND_VERDICT_WAIT`] however long the harness took
+    /// to come up.
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn hold_range_verdict_pending(&self) {
         self.loopback
             .set_range_verdict(crate::net::dns::RangeVerdict::Pending);
+        self.loopback
+            .reset_hand_verdict_deadline(crate::net::dns::HAND_VERDICT_WAIT.as_millis() as u64);
     }
 
     /// Lands a range verdict with the arms the deferred walk runs when it
@@ -1413,16 +1434,25 @@ impl ManagerHandle {
         &self.loopback
     }
 
-    /// Shrinks the bound a registration holding an unvouched hand waits for
-    /// the verdict under, so a test proves the expiry shape — the interim
-    /// published when the deadline runs out — without paying the real
-    /// session-start deadline.
+    /// Moves the daemon's one verdict deadline to `millis` from now, so a
+    /// test proves the expiry shape — the interim published when the
+    /// deadline runs out — without paying the real deadline, or holds the
+    /// window open long enough to tell a registration that waited from one
+    /// that did not.
     ///
     /// Test-only: no production path changes a deadline it is itself bounded
     /// by.
     #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn shrink_hand_verdict_wait(&self, millis: u64) {
-        self.loopback.shrink_hand_verdict_wait(millis);
+    pub(crate) fn reset_hand_verdict_deadline(&self, millis: u64) {
+        self.loopback.reset_hand_verdict_deadline(millis);
+    }
+
+    /// How many registrations are waiting on the range verdict right now
+    /// ([`crate::net::dns::LoopbackLeaseBook::verdict_waiters`]), so a test
+    /// lands the verdict only once a registration provably waits for it.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn verdict_waiters(&self) -> usize {
+        self.loopback.verdict_waiters()
     }
 
     /// Lists the sessions known to this (minimald) instance.
