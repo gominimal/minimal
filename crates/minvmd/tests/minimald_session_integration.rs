@@ -26,6 +26,7 @@
 mod common;
 
 use std::io::{BufRead, BufReader};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -86,8 +87,7 @@ struct Guest {
 
 impl Drop for Guest {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        common::kill_group(&mut self.child);
     }
 }
 
@@ -106,6 +106,10 @@ impl Guest {
             // minimald boots as the initramfs `/init` (MINVMD_INITRAMFS, set by
             // the caller); the rootfs stays generic.
             .env("XDG_STATE_HOME", state.path())
+            // Its own process group, so teardown reaches the VMM child too;
+            // stdin off the terminal, or libkrun's console setup stops the group.
+            .process_group(0)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -125,8 +129,7 @@ impl Guest {
         });
 
         if !rx.recv_timeout(BOOT_TIMEOUT).unwrap_or(false) {
-            let _ = child.kill();
-            let _ = child.wait();
+            common::kill_group(&mut child);
             panic!(
                 "minimald_session_integration: no 'vm-up' within {} s; are \
                  MINVMD_KERNEL_PATH/MINVMD_ROOTFS_PATH/MINVMD_INITRAMFS set correctly \

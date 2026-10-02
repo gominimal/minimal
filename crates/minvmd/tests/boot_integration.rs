@@ -21,6 +21,7 @@ mod common;
 
 use serial_test::serial;
 use std::io::{BufRead, BufReader};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 /// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
@@ -70,6 +71,10 @@ fn boot_integration_ready_marker_round_trip() {
         // the tempdir, never the developer's real state dir.
         .env("HOME", state_dir.path())
         .env("XDG_STATE_HOME", state_dir.path())
+        // Its own process group, so teardown reaches the VMM child too; stdin
+        // off the terminal, or libkrun's console setup stops the group.
+        .process_group(0)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -90,8 +95,7 @@ fn boot_integration_ready_marker_round_trip() {
 
     let got_vm_up = rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false);
 
-    let _ = child.kill();
-    let _ = child.wait();
+    common::kill_group(&mut child);
 
     assert!(
         got_vm_up,

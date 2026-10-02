@@ -16,7 +16,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 
 use sha2::{Digest, Sha256};
 
@@ -43,6 +43,22 @@ repo = "https://github.com/gominimal/pkgs"
 branch = "main"
 locked_commit = "f4de33d06dada4edcf5076dded10e9c303cf597e"
 "#;
+
+/// Kills the process group `child` leads, then reaps `child`. A harness that
+/// spawns `minvmd boot --foreground` makes it a group leader
+/// (`process_group(0)`) so its `__krun-vmm` child dies with it: killing the
+/// parent alone reparents the VMM to init, where it keeps the VM running and
+/// holds the harness's inherited stdio open.
+#[expect(
+    clippy::let_underscore_must_use,
+    reason = "best-effort teardown: the group may already be gone"
+)]
+pub fn kill_group(child: &mut Child) {
+    let _ = Command::new("kill")
+        .args(["-KILL", &format!("-{}", child.id())])
+        .status();
+    let _ = child.wait();
+}
 
 /// The gvproxy switch binary a harness hands the minvmd it spawns as
 /// `MINVMD_GVPROXY_BIN`, or `None` when the harness should skip (neither the
