@@ -399,25 +399,28 @@ async fn session_start_loopback_probe(session_id: &SessionId) -> crate::net::loo
 /// record the moment it lands.
 const PROXY_PORT_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// NET-018's observability line, and NET-019's half said with it: the live
-/// name surface this daemon answers `*.min.internal` through, and that the
-/// hostname proxy keeps serving beside it — with the port a client that
-/// captured `HTTP(S)_PROXY` keeps routing through.
+/// NET-018's observability line, and NET-019's half said with it: the
+/// answerer this daemon holds bound — its half of the native condition —
+/// and that the hostname proxy keeps serving beside it, with the port a
+/// client that captured `HTTP(S)_PROXY` keeps routing through.
 ///
 /// Emitted once, from the answerer driver's serving tail (`server.rs`), at
-/// the moment the surface it names comes to be: the answerer's bind is the
+/// the moment the fact it names comes to be: the answerer's bind is the
 /// daemon's half of the native verdict, so that driver's success is the one
-/// point in this daemon's own log that can name a live surface. And it is
-/// the daemon's moment, not a request's — a daemon no client has ever asked
+/// point in this daemon's own log that can record it. And it is the
+/// daemon's moment, not a request's — a daemon no client has ever asked
 /// still logs it, where the first-RPC emission round 1 shipped needed a
 /// client to come and ask before the bundle had a line to tail.
 ///
-/// The wording stops at what this daemon can see: native DNS is live *from
-/// this namespace*, where the answerer answers the zone directly. Whether
-/// the *host's* processes resolve it that way is the host's half of the
-/// condition — the resolver hook and the published range, read by the one
-/// three-fact function both `min session activate` and `min ls` print from
-/// — and no line this daemon writes can say it for them.
+/// The wording stops at what this daemon can see, and claims no more: the
+/// answerer is bound on a port. Native DNS becomes the live name surface on
+/// the *host* only once the host's own resolver routes the zone to that
+/// answerer — the host's half of the condition (the resolver hook and the
+/// published range), which no line this daemon writes can read — so the
+/// line says exactly that and points at `min ls`, where the host's verdict
+/// is reported from the one three-fact function both verbs print from
+/// (and the session start logs its verdict beside its advisory, on the
+/// host that read it).
 ///
 /// The proxy's port may still be recording when the answerer binds — the
 /// two listeners are started together on detached drivers and neither waits
@@ -432,12 +435,13 @@ pub(crate) async fn log_live_name_surface(state: &ServerStateHandle, zone_answer
         None => "the hostname proxy is not serving (yet)".to_string(),
     };
     tracing::info!(
-        name_surface = "native",
+        answerer_bound = true,
         zone_answerer_port,
         proxy_serves = hostname_proxy_port.is_some(),
         hostname_proxy_port = ?hostname_proxy_port,
-        "the live name surface is native (this daemon's box-zone answerer \
-         is bound on 127.0.0.1:{zone_answerer_port}); {proxy_half}"
+        "this daemon's box-zone answerer is bound on 127.0.0.1:{zone_answerer_port}; \
+         native DNS is the live name surface on the host once its resolver routes \
+         the zone to it; `min ls` reports the host's surface; {proxy_half}"
     );
 }
 
@@ -3114,36 +3118,56 @@ mod tests {
             "the activation reply carries the same bound fact the list does"
         );
 
-        // The log names the live surface — with the basis this daemon can
-        // speak for, the bound answerer's port — and the proxy's half
-        // beside it. The assertions read the message, not the fields, whose
-        // quoting is the subscriber's business.
+        // The log says what this daemon knows and no more: the bound
+        // answerer and its port — the one fact the replies carry — that
+        // native DNS waits on the host's resolver before it is the live
+        // surface there, that `min ls` reports the host's verdict, and the
+        // proxy's half beside it. The assertions read the message, not the
+        // fields, whose quoting is the subscriber's business — except the
+        // one field the daemon's half is, which a bundle's reader greps.
         let log = log.contents();
-        let native_line = log
+        let answerer_line = log
             .lines()
-            .find(|line| line.contains("the live name surface is native"))
+            .find(|line| line.contains("box-zone answerer is bound"))
             .expect("the answerer's bind logs one line a diagnostics bundle can tail");
         let answerer_port = created
             .zone_answerer_port
             .expect("with the answerer up, the reply carries its port");
         assert!(
-            native_line.contains(&format!("is bound on 127.0.0.1:{answerer_port}")),
-            "the line names the bound answerer it speaks from: {native_line}"
+            answerer_line.contains("answerer_bound=true"),
+            "the line's field is the fact the daemon knows, not a surface verdict: {answerer_line}"
         );
         assert!(
-            native_line.contains("proxy_serves=true"),
-            "the line says the proxy still serves beside native DNS (NET-019): {native_line}"
+            answerer_line.contains(&format!("is bound on 127.0.0.1:{answerer_port}")),
+            "the line names the bound answerer and its port: {answerer_line}"
         );
         assert!(
-            native_line.contains("the hostname proxy keeps serving"),
-            "the line says the proxy keeps serving, in the words its reader reads: {native_line}"
+            answerer_line.contains("once its resolver routes the zone"),
+            "the line says native DNS waits on the host's resolver routing the zone: {answerer_line}"
+        );
+        assert!(
+            answerer_line.contains("`min ls` reports the host's surface"),
+            "the line points at where the host's verdict is reported: {answerer_line}"
+        );
+        assert!(
+            !answerer_line.contains("the live name surface is native"),
+            "the daemon cannot read the host's resolver, so the line must not claim its surface: \
+             {answerer_line}"
+        );
+        assert!(
+            answerer_line.contains("proxy_serves=true"),
+            "the line says the proxy still serves beside the answerer (NET-019): {answerer_line}"
+        );
+        assert!(
+            answerer_line.contains("the hostname proxy keeps serving"),
+            "the line says the proxy keeps serving, in the words its reader reads: {answerer_line}"
         );
         let port = created
             .hostname_proxy_port
             .expect("with the proxy up, the reply carries its port");
         assert!(
-            native_line.contains(&format!("127.0.0.1:{port}")),
-            "the line names the port a client keeps routing through: {native_line}"
+            answerer_line.contains(&format!("127.0.0.1:{port}")),
+            "the line names the port a client keeps routing through: {answerer_line}"
         );
 
         // NET-019 on the daemon's own proxy: the verdict that just reported
