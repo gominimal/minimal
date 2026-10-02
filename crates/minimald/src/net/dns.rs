@@ -859,6 +859,17 @@ impl HostnameRegistry {
             .is_some_and(|registration| registration.id == session_id)
     }
 
+    /// Whether `session_name` is registered to a session other than
+    /// `session_id`: the name a registration under the write lock must not
+    /// publish over. A name nobody holds yet — a box's first finalize, which
+    /// registers its name only after its publish — is not held by another.
+    #[must_use]
+    pub fn name_held_by_another(&self, session_id: SessionId, session_name: &str) -> bool {
+        self.by_session
+            .get(session_name)
+            .is_some_and(|registration| registration.id != session_id)
+    }
+
     /// Reports the lease an `OwnIp` box attached with (from the attach path)
     /// and registers the session's box name against it now, so the name routes
     /// exactly when the box is reachable. On a VM host the lease is the route;

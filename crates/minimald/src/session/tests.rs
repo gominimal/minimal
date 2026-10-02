@@ -4596,3 +4596,74 @@ async fn shared_address_port_collision_reported_at_finalize_without_attached_cli
         collision_lines[0]
     );
 }
+
+/// The write-lock promotion `register_hostname` runs after its wait, driven
+/// directly with no timers: a registration that took the `127.0.0.1` interim
+/// moves to its hand once the verdict vouches for it — whether the name is
+/// still unregistered (a first finalize) or already its own (a resume) —
+/// and stays on the interim under an absent verdict, or when another session
+/// holds the name.
+#[test]
+fn the_write_lock_promotion_moves_an_interim_to_a_vouched_hand_only() {
+    use crate::net::dns::{HostnameRegistry, LoopbackLeaseBook, RangeVerdict};
+    use std::collections::BTreeSet;
+    use std::net::Ipv4Addr;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state_root = paths::DaemonAbsPath::try_new(tmp.path().to_str().unwrap()).unwrap();
+    let present = LoopbackLeaseBook::open(&state_root, RangeVerdict::Present).unwrap();
+    let absent_tmp = tempfile::tempdir().unwrap();
+    let absent_root = paths::DaemonAbsPath::try_new(absent_tmp.path().to_str().unwrap()).unwrap();
+    let absent = LoopbackLeaseBook::open(&absent_root, RangeVerdict::Absent).unwrap();
+
+    let me = SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+    let other = SessionId::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+    let hand = Ipv4Addr::new(127, 0, 64, 9);
+    let interim = Some(Ipv4Addr::LOCALHOST);
+    let mut reg = HostnameRegistry::new("dev", false);
+
+    // Present, name not yet registered (a first finalize): the hand.
+    assert_eq!(
+        super::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
+        Some(hand)
+    );
+    // Absent: the hand is not vouched for, so the interim stands.
+    assert_eq!(
+        super::promote_interim_to_hand(&reg, &absent, me, "promo", interim, Some(hand)),
+        None
+    );
+    // Only an interim publish with a hand behind it moves.
+    assert_eq!(
+        super::promote_interim_to_hand(&reg, &present, me, "promo", Some(hand), Some(hand)),
+        None
+    );
+    assert_eq!(
+        super::promote_interim_to_hand(&reg, &present, me, "promo", interim, None),
+        None
+    );
+
+    // Present, the name already this session's own (a resume): the hand.
+    reg.publish_own_address(me, "promo", Ipv4Addr::LOCALHOST, BTreeSet::new());
+    reg.register_own_ip(me, "promo", BTreeSet::new());
+    assert!(reg.name_held_by(me, "promo"));
+    assert_eq!(
+        super::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
+        Some(hand)
+    );
+
+    // Present, but the session no longer holds the name — another box
+    // took it: no promotion over that box's name.
+    reg.withdraw_own_name(me, "promo");
+    reg.publish_own_address(
+        other,
+        "promo",
+        Ipv4Addr::new(127, 0, 64, 10),
+        BTreeSet::new(),
+    );
+    reg.register_own_ip(other, "promo", BTreeSet::new());
+    assert!(reg.name_held_by(other, "promo"));
+    assert_eq!(
+        super::promote_interim_to_hand(&reg, &present, me, "promo", interim, Some(hand)),
+        None
+    );
+}

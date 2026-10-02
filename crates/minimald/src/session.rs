@@ -970,10 +970,15 @@ impl Session {
                 // The box cannot have been destroyed under it: a destroy
                 // runs through this session's own mailbox, after this
                 // registration, and the hand is never released to a pool.
-                let published = match (published, handed) {
-                    (Some(std::net::Ipv4Addr::LOCALHOST), Some(hand))
-                        if self.loopback.vouches_for(hand) =>
-                    {
+                let published = match promote_interim_to_hand(
+                    &reg,
+                    &self.loopback,
+                    record.id,
+                    &name,
+                    published,
+                    handed,
+                ) {
+                    Some(hand) => {
                         tracing::warn!(
                             session_id = %record.id,
                             session_name = &name,
@@ -986,7 +991,7 @@ impl Session {
                         );
                         Some(hand)
                     }
-                    (published, _) => published,
+                    None => published,
                 };
                 reg.register_caller(record.id, &name, &record.policy, subnet);
                 let declared = crate::net::switch::declared_request_ports(Some(&record.policy));
@@ -3577,6 +3582,30 @@ impl WeakSessionHandle {
         // Drop the only strong sender so `upgrade()` returns `None`.
         drop(tx);
         Self(weak)
+    }
+}
+
+/// The write-lock promotion of a registration headed for the interim: the
+/// hand to publish instead of `127.0.0.1` when the verdict now vouches for
+/// it, or `None` to keep `published` as it stands. Called under the
+/// registry's write lock, so the verdict and the name are read together
+/// with the publish that follows. Only a publish standing at the interim
+/// with a hand behind it moves, and never over a name another session holds.
+fn promote_interim_to_hand(
+    reg: &crate::net::dns::HostnameRegistry,
+    book: &crate::net::dns::LoopbackLeaseBook,
+    session_id: sessions::SessionId,
+    name: &str,
+    published: Option<std::net::Ipv4Addr>,
+    handed: Option<std::net::Ipv4Addr>,
+) -> Option<std::net::Ipv4Addr> {
+    match (published, handed) {
+        (Some(std::net::Ipv4Addr::LOCALHOST), Some(hand))
+            if book.vouches_for(hand) && !reg.name_held_by_another(session_id, name) =>
+        {
+            Some(hand)
+        }
+        _ => None,
     }
 }
 
