@@ -18,7 +18,9 @@
 //! one of them can bind it. The one that does is the holder: it serves the
 //! zone from its own table *merged with every other daemon's registered
 //! rows*, which arrive over the answerer channel, a unix socket beside the
-//! daemon's state: a daemon that finds the port held connects, sends its
+//! daemon's state — a name two sources both hold is kept by the first
+//! writer and refused of the later, one warn per clash. A daemon that
+//! finds the port held connects, sends its
 //! table's zone rows as one line, keeps the connection open, and answers
 //! nothing itself — its rows answer through the holder. The connection is
 //! the registration's lifetime: when it drops, the holder retires its rows,
@@ -51,7 +53,7 @@
 //! class; one info line at start naming the listener this daemon holds or
 //! the holder it registered with.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, UdpSocket};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -150,8 +152,11 @@ struct RegisteredRow {
 }
 
 /// One registration over the channel: a whole table's zone rows, one line.
+/// The *message*, not the registration itself — that is the registrant's
+/// held connection ([`Registration`]), which outlives the line it arrived
+/// by for exactly as long as its rows are held.
 #[derive(Debug, Serialize, Deserialize)]
-struct Registration {
+struct RegistrationRequest {
     /// The sender's zone rows, in the sender's name order.
     rows: Vec<RegisteredRow>,
 }
@@ -230,18 +235,20 @@ impl RegisteredTables {
             .remove(&connection);
     }
 
-    /// Every registered row, flattened across the connections that filed
-    /// them, in name order within each.
-    fn rows(&self) -> Vec<RegisteredRow> {
+    /// Every registered row with the connection that filed it, flattened
+    /// across them in connection order — the earlier connection is the
+    /// earlier writer, which is the order the answerer's clash rule keeps
+    /// names in. The connection rides along so a refused row can be logged
+    /// naming the source that holds the name and the one that lost it.
+    fn rows(&self) -> Vec<(u64, RegisteredRow)> {
         self.rows
             .lock()
             .expect(
                 "the registered tables' lock is never held across a panic, so it cannot \
                  be poisoned",
             )
-            .values()
-            .flatten()
-            .cloned()
+            .iter()
+            .flat_map(|(connection, rows)| rows.iter().map(|row| (*connection, row.clone())))
             .collect()
     }
 }
@@ -259,6 +266,10 @@ struct HostAnswerer {
     registered: Arc<RegisteredTables>,
     /// The zone's SOA, carried by every negative (NET-124), built once.
     soa: Record,
+    /// The refused name clashes a warn has already named: one warn per clash,
+    /// not one per lookup, and a clash that clears is warnable again if it
+    /// comes back (see [`Self::zone_view`]).
+    warned: Mutex<BTreeSet<String>>,
 }
 
 impl HostAnswerer {
@@ -268,6 +279,7 @@ impl HostAnswerer {
             own,
             registered,
             soa: zone_soa(),
+            warned: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -406,17 +418,76 @@ impl HostAnswerer {
     /// host daemons registered over the channel folded in on top, the
     /// registered address re-gated so no registration can put an address
     /// in the zone the host may not be told (NET-127).
+    ///
+    /// A name two sources both hold is **not** folded twice: the first
+    /// writer keeps it and the later one is refused, so a clashing name's
+    /// answer is one fact, decided by the fold's order — this host's own
+    /// table, then the registrations in the order their connections filed
+    /// — and never by which row arrived last. The shared decision's
+    /// [`ZoneView::hold`] replaces, which is the behaviour a builder wants
+    /// over rows it knows are its own; here the rows come from daemons
+    /// this one does not control, so the fold refuses instead. Each
+    /// refusal is logged once per clash, at warn, naming the name and both
+    /// its sources — the keeper and the refused writer — because a name
+    /// two daemons both published is an operator's problem to see, not a
+    /// fact to settle by accident of arrival.
     fn zone_view(&self) -> ZoneView {
         let mut view = self.own.zone_view();
-        for row in self.registered.rows() {
+        // The source each folded name came from: the keeper a later writer
+        // is refused against, and the source the warn names.
+        let mut held: BTreeMap<String, String> = view
+            .rows()
+            .map(|(name, _)| (name.to_string(), OWN_TABLE.to_string()))
+            .collect();
+        let mut refused: BTreeSet<String> = BTreeSet::new();
+        for (connection, row) in self.registered.rows() {
+            let name = canonical(&row.name);
+            if let Some(kept_by) = held.get(&name) {
+                refused.insert(name.clone());
+                // One warn per standing clash, not one per lookup that
+                // meets it: the set keeps the clashes already named, and a
+                // clash that cleared is forgotten below so a returning one
+                // warns again. `insert` returns whether this pass is the
+                // first to see the clash, and that pass is the one that
+                // warns.
+                if self
+                    .warned
+                    .lock()
+                    .expect(
+                        "the clash set's lock is never held across a panic, so it cannot \
+                         be poisoned",
+                    )
+                    .insert(name.clone())
+                {
+                    tracing::warn!(
+                        component = COMPONENT,
+                        name = %name,
+                        kept_by = %kept_by,
+                        refused = %registration(connection),
+                        "refused a registered zone row for a name another source holds; \
+                         the first writer keeps the name, the later one answers nothing \
+                         here"
+                    );
+                }
+                continue;
+            }
+            held.insert(name.clone(), registration(connection));
             view.hold(
-                row.name,
+                name,
                 ZoneRow {
                     address: row.address.filter(|address| is_host_answerable(*address)),
                     live: row.live,
                 },
             );
         }
+        // A clash that cleared is warnable again if it comes back.
+        self.warned
+            .lock()
+            .expect(
+                "the clash set's lock is never held across a panic, so it cannot \
+                 be poisoned",
+            )
+            .retain(|name| refused.contains(name));
         view
     }
 
@@ -450,6 +521,27 @@ impl HostAnswerer {
         }
         reply.to_vec().ok()
     }
+}
+
+/// The source a name this host's own table holds is named by in the clash
+/// warn — this host-authored table, the fold's first writer.
+const OWN_TABLE: &str = "this host's own table";
+
+/// The source a name the registration `connection` filed is named by in
+/// the clash warn: which co-resident daemon's connection it rode, the only
+/// handle the holder has on a registrant that is not its own process.
+fn registration(connection: u64) -> String {
+    format!("zone registration {connection}")
+}
+
+/// The canonical form of a registered row's name, mirroring the shared
+/// decision's own normalization (lower-case, no root dot) — the one form the
+/// view holds names in, so the fold's clash rule compares in it and no
+/// registrant can slip a case variant of a held name past the rule and take
+/// a name another source keeps.
+fn canonical(name: &str) -> String {
+    let lowered = name.to_ascii_lowercase();
+    lowered.strip_suffix('.').unwrap_or(&lowered).to_string()
 }
 
 /// Where a datagram from `peer` originated (NET-006): the listener binds
@@ -536,7 +628,7 @@ fn read_line(stream: &mut UnixStream) -> io::Result<Option<String>> {
 
 /// Parses one registration line. A line that does not parse is refused, not
 /// fatal: the holder answers with the reason and drops the connection.
-fn parse_registration(line: &str) -> Result<Registration, String> {
+fn parse_registration(line: &str) -> Result<RegistrationRequest, String> {
     serde_json_lenient::from_str(line).map_err(|error| error.to_string())
 }
 
@@ -713,7 +805,7 @@ impl Registration {
     /// holder's ack: a registration that did not land is not held, and the
     /// error tells the caller to connect again.
     fn send(&mut self, rows: Vec<RegisteredRow>) -> io::Result<()> {
-        let mut line = serde_json_lenient::to_string(&Registration { rows }).map_err(|error| {
+        let mut line = serde_json_lenient::to_string(&RegistrationRequest { rows }).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("zone registration did not serialize: {error}"),
@@ -723,7 +815,7 @@ impl Registration {
         self.stream.write_all(line.as_bytes())?;
         self.stream.flush()?;
         let _ = self.stream.set_read_timeout(Some(REGISTER_READ_TIMEOUT));
-        let reply_line = read_line(&mut stream_into(&mut self.stream))?
+        let reply_line = read_line(&mut self.stream)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "the holder closed"))?;
         let reply: RegistrationReply = serde_json_lenient::from_str(reply_line.trim()).map_err(
             |error| {
@@ -750,11 +842,6 @@ impl Drop for Registration {
         // retires this registration's rows when its read ends.
         let _ = self.stream.shutdown(Shutdown::Both);
     }
-}
-
-/// The borrow `read_line` needs: the stream the registration is held by.
-fn stream_into(stream: &mut UnixStream) -> &mut UnixStream {
-    stream
 }
 
 /// Registers `rows` with the daemon holding the answerer port: one
@@ -808,17 +895,26 @@ pub fn spawn(registry: BoxRegistry, port: u16) -> io::Result<std::thread::JoinHa
 /// Acquires the machine's answerer port and serves it, or registers with
 /// the daemon that holds it, for this daemon's lifetime.
 ///
-/// The holder is whichever daemon bound the port first. A daemon that finds
-/// it held registers its rows and then re-checks the port on the registry's
+/// The holder is whichever daemon bound the port first, and a lone daemon
+/// is one at start: the bind is attempted before any wait, so the port is
+/// held the moment the daemon starts rather than after the first box
+/// registration or the [`PORT_RECHECK`] cadence. A daemon that finds the
+/// port held registers its rows and then re-checks it on the registry's
 /// change pings — a changed table re-registers with the holder, so a box
-/// published after this daemon started answers through the holder too — and
-/// on the [`PORT_RECHECK`] cadence, so a holder that exited is replaced
+/// published after this daemon started answers through the holder too —
+/// and on the [`PORT_RECHECK`] cadence, so a holder that exited is replaced
 /// within it and the zone is never orphaned. A port held by something that
 /// is not a holder — a native daemon, or a foreign process with no channel
 /// socket — is warned once and retried at the same cadence: the zone
 /// answers from that holder alone, and this daemon answers nothing.
 fn acquire_loop(registry: BoxRegistry, port: u16) {
-    let channel = resolve_channel_sock();
+    acquire_loop_at(registry, port, resolve_channel_sock());
+}
+
+/// The acquisition over a named channel socket, so the whole holder and
+/// registrant machinery is drivable where the channel is not the machine's
+/// own (the test below runs two daemons on one temporary channel).
+fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf) {
     // Subscribed before the first bind attempt, so no change lands unpinged
     // in the window before the port is decided. The holder drops it: its
     // own table answers live, so it has nothing to re-register, and the
@@ -827,7 +923,6 @@ fn acquire_loop(registry: BoxRegistry, port: u16) {
     let mut held: Option<Registration> = None;
     let mut warned = false;
     loop {
-        let changed = pings.recv_timeout(PORT_RECHECK);
         match UdpSocket::bind((Ipv4Addr::LOCALHOST, port)) {
             Ok(socket) => {
                 drop(held);
@@ -841,14 +936,17 @@ fn acquire_loop(registry: BoxRegistry, port: u16) {
                     "the zone answerer holds the host loopback: the box zone answers here, \
                      from this host-authored table"
                 );
+                // One table of registered rows, shared by the answers and
+                // the channel that fills them: a row another daemon
+                // registers must be the row a lookup is answered by, which
+                // two tables could never promise.
+                let registered = Arc::new(RegisteredTables::new());
                 let answerer =
-                    HostAnswerer::new(registry.clone(), Arc::new(RegisteredTables::new()));
+                    HostAnswerer::new(registry.clone(), Arc::clone(&registered));
                 // The channel is how other VM host daemons' tables reach
                 // these answers; a bind failure is warned and served
                 // around — the zone still answers, from this table alone.
-                if let Err(error) =
-                    hold_channel(&channel, Arc::new(RegisteredTables::new()))
-                {
+                if let Err(error) = hold_channel(&channel, registered) {
                     tracing::warn!(
                         component = COMPONENT,
                         %error,
@@ -894,18 +992,19 @@ fn acquire_loop(registry: BoxRegistry, port: u16) {
                             component = COMPONENT,
                             holder = %channel.display(),
                             rows = rows.len(),
-                            matches!("registered this table's zone rows with the holder")
+                            "re-registered this table's zone rows with the holder"
                         );
                     }
                     Err(error) if !warned => {
                         warned = true;
                         tracing::warn!(
                             component = COMPONENT,
+                            port,
                             %error,
                             channel = %channel.display(),
-                            "the answerer port is held and the holder's channel did not \
-                             answer; this daemon's names answer only from whoever holds \
-                             the port"
+                            "the zone answerer's port is held and the holder's channel did \
+                             not answer (a native minimald or a foreign process holds it); \
+                             this VM's box names are not answered on the host"
                         );
                     }
                     Err(error) => {
@@ -916,11 +1015,12 @@ fn acquire_loop(registry: BoxRegistry, port: u16) {
                         );
                     }
                 }
-                // A change re-registers through the loop's next pass; a
-                // cadence wake just re-checks the port. The holder does not
-                // live forever, and a daemon that outlives it takes the
-                // port.
-                let _ = changed;
+                // The wait belongs at the end of a pass that did not take
+                // the port: a change ping re-registers through the next
+                // pass, a cadence wake just re-checks the port — and the
+                // holder does not live forever, so a daemon that outlives
+                // one takes the port.
+                let _ = pings.recv_timeout(PORT_RECHECK);
             }
             Err(error) => {
                 tracing::warn!(
@@ -929,7 +1029,7 @@ fn acquire_loop(registry: BoxRegistry, port: u16) {
                     "could not bind the zone answerer's port; the box zone answers only \
                      from another VM host daemon's table"
                 );
-                std::thread::sleep(PORT_RECHECK);
+                let _ = pings.recv_timeout(PORT_RECHECK);
             }
         }
     }
