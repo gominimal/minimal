@@ -308,11 +308,39 @@ fi
 # ON PATH, because the CLI autospawns its daemon by bare name
 # (crates/minimal/src/autospawn.rs) and the pair must come from one build.
 #
+# The provider args follow the same fact as the daemon name below: a
+# VM-backed run must drive the CLI with `--provider local-minvmd`, because
+# the flag is what makes the CLI treat minvmd as minvmd for its OWN
+# bookkeeping too. `GlobalArgs::use_minvmd()`
+# (crates/minimal/src/cli.rs) is a strict check of the flag, and it gates
+# the box registration with the VM host daemon and its withdrawal (T66,
+# crates/minimal/src/cmd/session.rs): an own_ip box that activates without
+# them runs UNREGISTERED — the guest self-allocates its switch address
+# from the reserve instead of running on the one the daemon handed it, the
+# box-egress pool has no row to partition a share from, and the pool's
+# prescreen resets the box's connection to the proxy's address
+# (crates/switch/src/bep_host.rs) with nothing on the CLI's stderr naming
+# the cause. The proxy-source case below is where that stops being a
+# silent posture difference and becomes a failed proof. macOS resolves
+# the minvmd backend either way (`client_provider_kind` gates on the OS,
+# crates/minimal-client/src/lib.rs), so a run there is VM-backed with or
+# without the flag — and both of its lanes arrive here with no
+# E2E_MINIMAL_ARGS at all (the macOS CI lane exports none; the justfile's
+# e2e-env adds the args on Linux only), so the script supplies the flag
+# for them itself. An explicit E2E_MINIMAL_ARGS is kept verbatim, and
+# Linux is untouched: a Linux run without provider args is the native
+# lane and must stay exactly that.
+if [ "$(uname -s)" = Darwin ] && [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
+  E2E_MINIMAL_ARGS="--provider local-minvmd"
+fi
+#
 # The daemon that name resolves to on THIS run is `minimald` on a native
 # run and `minvmd` on a VM-backed one: macOS is always VM-backed (no native
 # minimald builds there), and a Linux run is VM-backed exactly when
-# E2E_MINIMAL_ARGS carries `--provider local-minvmd`, which every VM lane
-# passes (the justfile's e2e-env, the KVM lane, the VM smokes) — E2E_VM
+# E2E_MINIMAL_ARGS carries `--provider local-minvmd`, which the Linux VM
+# lanes pass up front (the justfile's e2e-env, the KVM lane, the VM
+# smokes) and the one that cannot — macOS, whose backend resolves with no
+# flag — is defaulted just above — E2E_VM
 # itself is deliberately not consulted: it marks teardown and log placement,
 # not the backend the CLI will spawn. Autospawn looks the daemon up on PATH
 # (a bare `Command::new`), never beside the CLI, so "findable" means ON
