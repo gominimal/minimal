@@ -901,10 +901,8 @@ mod tests {
         // The answerer's half: the daemon's own driver, serving the zone on
         // a free loopback port, its port recorded — the record the replies'
         // `answerer_bound` carries.
-        let compressed = crate::server::RetryBackoff::new(
-            Duration::from_millis(5),
-            Duration::from_millis(20),
-        );
+        let compressed =
+            crate::server::RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(20));
         crate::server::retry_zone_answerer_until_serving(
             state.clone(),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),

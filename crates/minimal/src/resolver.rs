@@ -910,11 +910,13 @@ pub(crate) async fn live_name_surface_at(
         return Some(LiveSurface::Proxy);
     }
     let range_present = range_present_on_host().await;
-    Some(if native_surface_at(hook, port, true, range_present, blocker.as_deref()) {
-        LiveSurface::Native
-    } else {
-        LiveSurface::Proxy
-    })
+    Some(
+        if native_surface_at(hook, port, true, range_present, blocker.as_deref()) {
+            LiveSurface::Native
+        } else {
+            LiveSurface::Proxy
+        },
+    )
 }
 
 /// [`live_name_surface_at`] with the detection this verb reads itself —
@@ -1227,13 +1229,7 @@ mod tests {
             "an unbound answerer cannot answer the zone natively"
         );
         assert!(
-            !native_surface_at(
-                &Hook::absent("test", "no hook"),
-                port,
-                true,
-                true,
-                blocker
-            ),
+            !native_surface_at(&Hook::absent("test", "no hook"), port, true, true, blocker),
             "a host whose resolver does not route the zone reads the proxy"
         );
         assert!(
@@ -1258,7 +1254,11 @@ mod tests {
         // for an answerer that serves.
         let detection = (routing_hook(), None);
         assert!(live_name_surface_at(&detection, None, true).await.is_none());
-        assert!(live_name_surface_at(&detection, Some(15353), false).await.is_none());
+        assert!(
+            live_name_surface_at(&detection, Some(15353), false)
+                .await
+                .is_none()
+        );
         assert!(live_name_surface(None, false).await.is_none());
     }
 
@@ -1292,20 +1292,17 @@ mod tests {
         // one the verdict calls the proxy.
         let detection = (routing_hook(), None);
         let advisory = session_advisory_at(&detection, Some(port), false);
-        assert!(advisory.is_none(), "a native verdict has no advisory: {advisory:?}");
+        assert!(
+            advisory.is_none(),
+            "a native verdict has no advisory: {advisory:?}"
+        );
         let blocked = (routing_hook(), Some("lookups bypass resolved".to_string()));
         assert!(
             session_advisory_at(&blocked, Some(port), false).is_some(),
             "the blocked hook is still the advisory's to say"
         );
         assert!(
-            !native_surface_at(
-                &blocked.0,
-                port,
-                true,
-                true,
-                blocked.1.as_deref()
-            ),
+            !native_surface_at(&blocked.0, port, true, true, blocked.1.as_deref()),
             "and it is the proxy the verdict names for the same read"
         );
     }

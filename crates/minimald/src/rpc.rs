@@ -425,10 +425,7 @@ const PROXY_PORT_SETTLE: std::time::Duration = std::time::Duration::from_secs(2)
 /// rather than at the instant of the bind; a proxy that has not landed by
 /// then is named as not serving, and its own startup line corrects the
 /// record when it does.
-pub(crate) async fn log_live_name_surface(
-    state: &ServerStateHandle,
-    zone_answerer_port: u16,
-) {
+pub(crate) async fn log_live_name_surface(state: &ServerStateHandle, zone_answerer_port: u16) {
     let hostname_proxy_port = settled_proxy_port(state).await;
     let proxy_half = match hostname_proxy_port {
         Some(port) => format!("the hostname proxy keeps serving on 127.0.0.1:{port}"),
@@ -3092,8 +3089,12 @@ mod tests {
             compressed,
         )
         .await;
-        crate::server::retry_zone_answerer_until_serving(server.state.clone(), loopback, compressed)
-            .await;
+        crate::server::retry_zone_answerer_until_serving(
+            server.state.clone(),
+            loopback,
+            compressed,
+        )
+        .await;
 
         // Both listeners up: the list and create replies report the
         // answerer bound, and the activation reply carries the same fact
