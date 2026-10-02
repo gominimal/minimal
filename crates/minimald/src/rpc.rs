@@ -3054,7 +3054,10 @@ mod tests {
     // assertions say `contains`, never `equals`: the capture buffer is
     // shared process-wide, and the line is deduped per verdict — whichever
     // test computes a verdict first is the one that logs it.
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the stand-in window has to cover the awaited list and create"
+    )]
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn name_surface_reported_when_both_deployed() {
