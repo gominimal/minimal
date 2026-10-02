@@ -475,9 +475,8 @@ where
     // revocation's terminations (NET-121) — are written to the switch as they
     // arrive. The task ends when the gate's last holder drops, and the relay
     // aborts it on the way out.
-    let reset_writer = resets_rx.map(|resets_rx| {
-        tokio::spawn(write_resets(resets_rx, Arc::clone(&sock_tx)))
-    });
+    let reset_writer =
+        resets_rx.map(|resets_rx| tokio::spawn(write_resets(resets_rx, Arc::clone(&sock_tx))));
     let switch_to_tap = tokio::spawn(relay_switch_to_tap(sock_rx, tap, gate));
     Ok(SwitchRelay {
         tap_to_switch,
@@ -1901,14 +1900,7 @@ fn rst_reply_frame(frame: &[u8], pkt: &L4Packet) -> Option<Vec<u8>> {
     };
     // The reset's destination is the packet's *source* — the peer the
     // refusal is for — so the Ethernet addresses hand over swapped.
-    Some(rst_frame(
-        *eth_src,
-        *eth_dst,
-        pkt.dst,
-        pkt.src,
-        seq,
-        ack,
-    ))
+    Some(rst_frame(*eth_src, *eth_dst, pkt.dst, pkt.src, seq, ack))
 }
 
 /// The reset [`rst_frame`] builds for a flow the gate recorded — the one a
@@ -1922,14 +1914,7 @@ fn rst_from_flow(tail: &InboundFlowTail) -> Vec<u8> {
     } else {
         (0, rst_ack(tail.seq, 0, tail.flags))
     };
-    rst_frame(
-        tail.src_mac,
-        tail.dst_mac,
-        tail.dst,
-        tail.src,
-        seq,
-        ack,
-    )
+    rst_frame(tail.src_mac, tail.dst_mac, tail.dst, tail.src, seq, ack)
 }
 
 /// Builds the Ethernet + IPv4 + UDP frame the relay writes back toward the
