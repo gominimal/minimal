@@ -804,6 +804,18 @@ impl BoxTable {
         )
     }
 
+    /// The switch's own address — the plan's gateway, the address the
+    /// resolver answers at ([`SwitchSubnet::dns_server`], which is the same
+    /// address) — as the octet array a frame's destination is compared by.
+    /// The one destination inside the fabric that is a control surface, not
+    /// a destination a box's egress rules decide: the gate refuses a frame
+    /// headed here on any port but the resolver's and the source row's
+    /// declared exposures, before any row or phase is consulted.
+    #[must_use]
+    pub fn gateway(&self) -> [u8; 4] {
+        self.subnet.gateway().octets()
+    }
+
     /// Files a withdrawal report: `sources` are the switch addresses whose
     /// relayed traffic the calling connection carried, and the connection is
     /// at its end — the guest closed it, it errored, or the gate refused

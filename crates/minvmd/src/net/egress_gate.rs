@@ -307,6 +307,25 @@ const DROP_WARN_MAX_TRACKED_PAIRS: usize = 1024;
 /// simply is not one the host published.
 const UNKNOWN_SOURCE_RULE: &str = "egress-unknown-source";
 
+/// The rule name for a frame headed to the switch's own address — the plan's
+/// gateway — on a port that is neither the resolver's (the one carve-out the
+/// frame rules admit there) nor a port the frame's source namespace declares
+/// as its own exposure. The switch's control surface is not a destination a
+/// box's egress rules decide (design §4.1, §7.1): whatever a box's rules
+/// allow, nothing at the gateway answers a box but its resolver and its own
+/// published reach, and a frame naming any other port there points at the
+/// switch itself — refused before any row or phase is consulted, in force in
+/// every phase, so no interim and no row can ever admit it.
+const SWITCH_CONTROL_RULE: &str = "egress-switch-control-surface";
+
+/// The port the resolver carve-out is keyed to at the gateway (NET-079):
+/// DNS. The switch's control-surface refusal excepts the resolver's port and
+/// nothing else of its own: a frame that falls past the exception is still
+/// decided by the row or the phase behind it, so the exception admits
+/// nothing on its own — a deny-all box's non-carve-out frame to the gateway
+/// is refused by its row as it would be anywhere else.
+const RESOLVER_PORT: u16 = 53;
+
 /// The rule name for the interim's admitted-unregistered source: a frame
 /// whose source is an address the plan could hand to a box but no published
 /// namespace holds, admitted by the announced interim
@@ -2041,6 +2060,10 @@ async fn relay_frames_to_switch(
         let summary = egress::summarize(&frame[..n]);
         let admitted = match gate_verdict(&summary, table, baseline, phase) {
             Ok(admitted) => admitted,
+            Err(GateDrop::SwitchControlSurface { src, dst_port }) => {
+                limiter.warn_switch_surface(src, dst_port);
+                continue;
+            }
             Err(dropped) => {
                 limiter.emit(summary.source(), dropped.rule());
                 continue;
@@ -2230,6 +2253,11 @@ enum GateAdmit {
 /// decorative. Families that carry no readable source address (IPv6,
 /// undeclared ethertypes, truncated frames) never reach the table: the shared
 /// verdict's own family drops decide them, under any rules, fail-closed.
+///
+/// One destination no row or phase decides either: the switch's own address
+/// ([`SWITCH_CONTROL_RULE`]), refused on every port but the resolver's and the
+/// source namespace's declared exposures, before the row's decision and the
+/// interim, in every phase.
 fn gate_verdict(
     summary: &FrameSummary,
     table: &BoxTable,
@@ -2250,6 +2278,29 @@ fn gate_verdict(
             FrameVerdict::Drop(reason) => Err(GateDrop::Verdict(reason)),
         };
     }
+    // The switch's own address is a control surface, not a destination a
+    // box's egress rules decide (design §4.1, §7.1). Every frame from a box
+    // to the gateway — the address the resolver answers at, and the only one
+    // gvproxy serves from inside the fabric — is refused on every port but
+    // the resolver's and the source namespace's declared exposures, whatever
+    // the rows and the phase would say about the rest of the frame: the
+    // check sits before the row's decision and before the interim, so no
+    // allow-all row and no announced concession can admit a frame at the
+    // switch's own address, and it reads no phase at all, so it binds
+    // unchanged when the per-box default binds. The exceptions fall through
+    // to the decision behind this check — the row's own rules or the phase —
+    // which still decides them, so the resolver's carve-out and a declared
+    // exposure admit exactly what they admitted before, and the refusal
+    // adds a ceiling without moving any floor.
+    let record = table.by_source(src);
+    if summary.destination() == Some(table.gateway()) {
+        let dst_port = summary.destination_port();
+        let declared_exposure =
+            record.as_ref().is_some_and(|record| record.admitted_ports().contains(&dst_port));
+        if dst_port != RESOLVER_PORT && !declared_exposure {
+            return Err(GateDrop::SwitchControlSurface { src, dst_port });
+        }
+    }
     // The namespace that holds the source decides its frames by its own
     // compiled rules — the shared verdict, unchanged, now made outside where
     // nothing inside can change it. One drop class defers to the in-guest
@@ -2266,7 +2317,7 @@ fn gate_verdict(
     // verdict reads no source from — a pin governs none of those, and the
     // guest lifts none of them either, so the host refusing them is parity,
     // not pre-emption.
-    if let Some(record) = table.by_source(src) {
+    if let Some(record) = record {
         return match egress::verdict(summary, record.egress()) {
             FrameVerdict::Admit => Ok(GateAdmit::Row),
             FrameVerdict::Drop(reason)
@@ -2291,9 +2342,10 @@ fn gate_verdict(
     Err(GateDrop::UnknownSource { src })
 }
 
-/// Why the gate dropped a frame: the shared verdict's reason, or the one class
-/// the host table adds — a source address no published namespace holds
-/// (NET-081's failure case).
+/// Why the gate dropped a frame: the shared verdict's reason, or one of the
+/// two classes the host table adds — a source address no published namespace
+/// holds (NET-081's failure case), and a frame the switch's own address would
+/// have received on a port nothing published answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateDrop {
     /// The shared frame verdict dropped it: the namespace's own rules, its
@@ -2304,6 +2356,16 @@ enum GateDrop {
         /// The source address no namespace holds.
         src: [u8; 4],
     },
+    /// The frame named the switch's own address on a port that is neither the
+    /// resolver's nor the source namespace's declared exposure: the switch's
+    /// control surface is not a destination a box's egress rules decide
+    /// ([`SWITCH_CONTROL_RULE`]).
+    SwitchControlSurface {
+        /// The source address the frame wore.
+        src: [u8; 4],
+        /// The port the frame named at the gateway.
+        dst_port: u16,
+    },
 }
 
 impl GateDrop {
@@ -2313,6 +2375,7 @@ impl GateDrop {
         match self {
             Self::Verdict(reason) => reason.rule(),
             Self::UnknownSource { .. } => UNKNOWN_SOURCE_RULE,
+            Self::SwitchControlSurface { .. } => SWITCH_CONTROL_RULE,
         }
     }
 }
@@ -2446,6 +2509,37 @@ impl DropLimiter {
                     rule_matched = rule,
                     "dropped frames from more distinct source addresses than the gate \
                      keeps a window per source for; one line per rule covers the rest",
+                );
+                true
+            }
+        }
+    }
+
+    /// Emits the warning for one frame the switch's own address would have
+    /// received: the same rate limit a drop's line answers to, keyed by the
+    /// source and the rule, and naming the port the frame gave the gateway —
+    /// the line a host reads to learn which port of the switch's control
+    /// surface a box was reaching for. Returns whether a line was written.
+    fn warn_switch_surface(&self, src: [u8; 4], dst_port: u16) -> bool {
+        match self.should_warn_at(Some(src), SWITCH_CONTROL_RULE, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named => {
+                tracing::warn!(
+                    source = %Ipv4Addr::from(src),
+                    port = dst_port,
+                    rule_matched = SWITCH_CONTROL_RULE,
+                    "dropped a frame to the switch's own address; its control surface is not \
+                     a destination a box's egress rules decide, and nothing answers a box \
+                     there but its resolver and its own declared exposures",
+                );
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    rule_matched = SWITCH_CONTROL_RULE,
+                    "dropped frames to the switch's own address from more distinct source \
+                     addresses than the gate keeps a window per source for; one line per \
+                     rule covers the rest",
                 );
                 true
             }
@@ -3198,6 +3292,121 @@ mod tests {
             1,
             "one drop line per source address per rule per interval, got: {}",
             h.log.contents()
+        );
+    }
+
+    /// The switch's own address is a control surface, not a destination a
+    /// box's egress rules decide (design §4.1, §7.1): a frame from a box to
+    /// the gateway on a port that is neither the resolver's nor one of the
+    /// box's declared exposures is dropped at the host-side gate, whatever
+    /// the box's rules allow — an absent `egress` section's allow-all
+    /// program and a declared allow-all section both — and the drop says so,
+    /// rate-limited, naming the box's address and the port. The resolver's
+    /// port still answers: DNS to the gateway reaches the switch for both
+    /// boxes. The check binds under the shipped announced phase and is not
+    /// gated on a row: an unregistered in-plan source's frame at the gateway
+    /// is refused too, where the interim would admit it anywhere else.
+    ///
+    /// The port the refusals name is the shape of the switch's control
+    /// surface as a box would reach for it — gvproxy serves its API on the
+    /// host-side unix socket only, and nothing else of the switch answers at
+    /// the gateway, so the refusal is keyed to the address and every port
+    /// but the two the design excepts; the test's port stands for whichever
+    /// port the API could ever be probed on.
+    #[tokio::test]
+    async fn box_cannot_reach_switch_api() {
+        // Two boxes whose rules allow everything: one whose declaration
+        // carries no `egress` section — the allow-all program
+        // [`sessions::core::egress::EgressRules::from_policy`] compiles for
+        // an absent one — and one whose `egress` section allows all
+        // explicitly. Neither row admits the gateway.
+        let registry = BoxRegistry::new(SUBNET);
+        let bare = [100, 64, 0, 9];
+        let open = [100, 64, 0, 10];
+        let unregistered = [100, 64, 0, 99];
+        registry.register(
+            BoxRegistration::new("bare", Ipv4Addr::from(bare), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
+        registry.register(
+            BoxRegistration::new("open", Ipv4Addr::from(open), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([9999])
+                .with_egress_policy(EgressPolicy::default()),
+        );
+        let mut h = gate_over(registry).await;
+
+        // Each box reaches for the switch's control surface at the gateway;
+        // a marker from the first box proves the gate decided all three
+        // frames before it, and none of the three arrived.
+        let api_port = 443;
+        let bare_probe = ipv4_frame(bare, 6, SUBNET.gateway().octets(), api_port);
+        let open_probe = ipv4_frame(open, 6, SUBNET.gateway().octets(), api_port);
+        let unregistered_probe =
+            ipv4_frame(unregistered, 6, SUBNET.gateway().octets(), api_port);
+        let marker = ipv4_frame(bare, 6, [10, 9, 9, 9], 80);
+        send_frame(&mut h.guest, &bare_probe).await;
+        send_frame(&mut h.guest, &open_probe).await;
+        send_frame(&mut h.guest, &unregistered_probe).await;
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the marker arrives; the three gateway probes do not"
+        );
+        expect_silence(&mut h.switch).await;
+
+        // The resolver's port still answers, for a box with no egress
+        // section and for a box with an allow-all one alike.
+        let bare_dns = ipv4_frame(bare, 17, SUBNET.gateway().octets(), 53);
+        let open_dns = ipv4_frame(open, 17, SUBNET.gateway().octets(), 53);
+        send_frame(&mut h.guest, &bare_dns).await;
+        send_frame(&mut h.guest, &open_dns).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            bare_dns,
+            "the no-egress-section box's resolver frame reaches the switch"
+        );
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            open_dns,
+            "the allow-all box's resolver frame reaches the switch"
+        );
+
+        // And the box's declared exposures are its own to use: the bare
+        // box's frame to the gateway on the port its row declares passes the
+        // refusal, decided by its allow-all rules behind it, while the open
+        // box's frame to the same port — a port its row does not declare —
+        // is refused like any other.
+        let bare_exposure = ipv4_frame(bare, 6, SUBNET.gateway().octets(), 8080);
+        let open_probe_port = ipv4_frame(open, 6, SUBNET.gateway().octets(), 8080);
+        send_frame(&mut h.guest, &bare_exposure).await;
+        send_frame(&mut h.guest, &open_probe_port).await;
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            bare_exposure,
+            "the declared exposure passes the refusal"
+        );
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the open box's undeclared port at the gateway is refused"
+        );
+        expect_silence(&mut h.switch).await;
+
+        // One rate-limited line per refusing source, naming the box's
+        // address and the port.
+        wait_for_log(&h.log, "egress-switch-control-surface").await;
+        let logged = h.log.contents();
+        for source in ["100.64.0.9", "100.64.0.10", "100.64.0.99"] {
+            assert!(
+                logged.contains(&format!("source={source}")),
+                "the drop line carries {source}'s address, got: {logged}"
+            );
+        }
+        assert!(
+            logged.contains("port=443"),
+            "the drop line carries the port the frame named, got: {logged}"
         );
     }
 
@@ -5012,6 +5221,71 @@ mod tests {
             gate_verdict(&undeclared, &table, &baseline, UNREGISTERED_SOURCE_PHASE),
             Err(GateDrop::Verdict(DropReason::UndeclaredSubnet {
                 dst: [203, 0, 113, 7],
+                proto: 6,
+            }))
+        );
+
+        // The switch's own address is not a row's or the phase's to decide:
+        // a frame to the gateway on a port that is neither the resolver's nor
+        // the source's declared exposure is refused under either phase,
+        // whatever the rows hold — the gateway is a control surface, and the
+        // interim that would admit this source anywhere else never sees the
+        // frame. Port 443 names nothing this row declares.
+        let surface = summarize(&ipv4_frame(LEASE, 6, SUBNET.gateway().octets(), 443));
+        assert_eq!(
+            gate_verdict(&surface, &table, &baseline, UNREGISTERED_SOURCE_PHASE),
+            Err(GateDrop::SwitchControlSurface {
+                src: LEASE,
+                dst_port: 443
+            })
+        );
+        assert_eq!(
+            gate_verdict(
+                &surface,
+                &table,
+                &baseline,
+                UnregisteredSourcePhase::InForce
+            ),
+            Err(GateDrop::SwitchControlSurface {
+                src: LEASE,
+                dst_port: 443
+            })
+        );
+        // An unregistered in-plan source would be the interim's to admit, but
+        // not at the gateway: the refusal is not gated on the row, so the
+        // announced concession never reaches a frame naming the switch's own
+        // address on a port nothing published answers.
+        let unregistered_surface =
+            summarize(&ipv4_frame([100, 64, 0, 99], 6, SUBNET.gateway().octets(), 443));
+        assert_eq!(
+            gate_verdict(
+                &unregistered_surface,
+                &table,
+                &baseline,
+                UNREGISTERED_SOURCE_PHASE
+            ),
+            Err(GateDrop::SwitchControlSurface {
+                src: [100, 64, 0, 99],
+                dst_port: 443
+            })
+        );
+        // The resolver's port is the one carve-out: DNS to the gateway passes
+        // the refusal and is decided behind it, admitted by the carve-out
+        // whatever the row's protocols allow.
+        let resolver = summarize(&ipv4_frame(LEASE, 17, SUBNET.gateway().octets(), 53));
+        assert!(matches!(
+            gate_verdict(&resolver, &table, &baseline, UNREGISTERED_SOURCE_PHASE),
+            Ok(GateAdmit::Row)
+        ));
+        // A declared exposure passes the refusal too, and is decided by the
+        // row behind it like any other frame: this row allows `10.0.0.0/8`
+        // only, so the gateway is an undeclared destination to it — the
+        // refusal added a ceiling without moving the row's own floor.
+        let exposure = summarize(&ipv4_frame(LEASE, 6, SUBNET.gateway().octets(), 8080));
+        assert_eq!(
+            gate_verdict(&exposure, &table, &baseline, UNREGISTERED_SOURCE_PHASE),
+            Err(GateDrop::Verdict(DropReason::UndeclaredSubnet {
+                dst: SUBNET.gateway().octets(),
                 proto: 6,
             }))
         );
