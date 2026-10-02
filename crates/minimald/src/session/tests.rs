@@ -4023,6 +4023,176 @@ async fn a_box_destroyed_inside_the_landing_window_is_not_resurrected() {
     );
 }
 
+/// The present landing runs on the deferred walk's own task, off every
+/// mailbox, so it is unordered against a destroy; this pins the shape the
+/// apply's runtime re-check exists for, in the order it happens. The
+/// landing's enumeration finds the box standing at the interim, the box is
+/// destroyed — its release finds no line, since the pending window granted
+/// it none — and only then does the draw's grant write a line for it. The
+/// apply must publish nothing and release that grant itself, exactly once.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_box_destroyed_between_enumeration_and_grant_is_released_once() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    manager.hold_range_verdict_pending();
+    let mut client = server.connect().await;
+    let id = finalize_own_ip_session(&mut client, "torn").await;
+    let registry = manager.hostnames();
+    let book = manager.loopback_book();
+
+    // The landing's first step: the verdict moves and the enumeration runs.
+    book.set_range_verdict(crate::net::dns::RangeVerdict::Present);
+    let standing = registry
+        .read()
+        .expect("registry lock")
+        .interim_own_publishes()
+        .into_iter()
+        .find(|publish| publish.session == id)
+        .expect("the enumeration finds the box at the interim");
+
+    // The destroy lands inside the window, before the draw's grant.
+    destroy_session(&mut client, id).await;
+
+    // The draw's grant, for the box the enumeration found.
+    let granted = match book.grant(crate::net::dns::LeaseNamespace::Box { session: id }) {
+        crate::net::dns::LoopbackGrant::Granted(address) => address,
+        other => panic!("a present book grants the drawn box: {other:?}"),
+    };
+    let upgrade = crate::sessions::InterimUpgrade {
+        session: standing.session,
+        name: standing.name,
+        ports: standing.ports,
+        address: granted,
+        hand: false,
+    };
+
+    assert!(
+        !crate::sessions::apply_interim_upgrade(book, &registry, &upgrade),
+        "a box destroyed inside the window is not re-published"
+    );
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(id),
+        None,
+        "no publish is resurrected"
+    );
+    assert!(
+        zone_answer_for(&server, "torn.min.internal")
+            .await
+            .is_none(),
+        "no name is registered for the destroyed box"
+    );
+
+    // Released exactly once: the destroy found no line to release, the
+    // discard released the grant, and nothing is left for a second release.
+    let logged = capture.contents();
+    let scoped = |action: &str| -> Vec<String> {
+        logged
+            .lines()
+            .filter(|line| {
+                line.contains(&format!("action=\"{action}\""))
+                    && line.contains(&format!("session_id={id}"))
+            })
+            .map(str::to_owned)
+            .collect()
+    };
+    assert!(
+        scoped("loopback-release").is_empty(),
+        "the destroy ran before the grant, so it released nothing"
+    );
+    let discarded = scoped("loopback-lease-discarded");
+    assert_eq!(discarded.len(), 1, "one discard: {discarded:?}");
+    assert!(
+        discarded[0].contains(&format!("released=Some({granted})")),
+        "the discard released the grant, got: {}",
+        discarded[0]
+    );
+    assert_eq!(
+        book.release(crate::net::dns::LeaseNamespace::Box { session: id }),
+        None,
+        "nothing is left to release a second time"
+    );
+}
+
+/// The registration's own promotion is ordered against a destroy by the
+/// session's mailbox, not by a runtime check: a first finalize waiting at
+/// the verdict deadline holds the actor, so a destroy sent meanwhile queues
+/// behind it. When the present landing wakes the wait, the box publishes at
+/// its hand first and the queued destroy removes it after — and no name is
+/// left.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_destroy_queued_behind_a_waiting_finalize_runs_after_the_promotion() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    manager.hold_range_verdict_pending();
+    manager.reset_hand_verdict_deadline(DEADLINE_HELD_OPEN_MS);
+    let mut client = server.connect().await;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
+    let id = create_handed_own_ip_session(
+        &mut client,
+        "queued",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        handed,
+    )
+    .await;
+
+    let mut finalize_client = server.connect().await;
+    let finalize = tokio::spawn(async move { finalize_session(&mut finalize_client, id).await });
+    await_verdict_waiter(&manager).await;
+    let mut destroy_client = server.connect().await;
+    let destroy = tokio::spawn(async move { destroy_session(&mut destroy_client, id).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !destroy.is_finished(),
+        "the destroy queues behind the finalize waiting on the verdict"
+    );
+
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+    finalize.await.expect("the finalize's task runs to its end");
+    destroy.await.expect("the destroy's task runs to its end");
+
+    let logged = capture.contents();
+    let lines: Vec<&str> = logged
+        .lines()
+        .filter(|line| line.contains(&format!("session_id={id}")))
+        .collect();
+    let registered = lines
+        .iter()
+        .position(|line| {
+            line.contains("action=\"registered\"") && line.contains(&format!("ip={handed}"))
+        })
+        .unwrap_or_else(|| panic!("the promotion to the hand must be logged, got: {lines:?}"));
+    let removed = lines
+        .iter()
+        .position(|line| line.contains("action=\"deregistered\""))
+        .unwrap_or_else(|| panic!("the destroy's removal must be logged, got: {lines:?}"));
+    assert!(
+        registered < removed,
+        "the promotion happens before the removal: {lines:?}"
+    );
+    assert_eq!(
+        manager
+            .hostnames()
+            .read()
+            .expect("registry lock")
+            .published_own_address(id),
+        None,
+        "the destroy withdrew the publish"
+    );
+    assert!(
+        zone_answer_for(&server, "queued.min.internal")
+            .await
+            .is_none(),
+        "no name is left"
+    );
+}
+
 /// The discard's other half: a box that moved off the interim through its
 /// own re-registration inside the landing's window — a rename here, whose
 /// re-ask is answered with the very grant the draw recorded, the grant

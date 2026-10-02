@@ -438,6 +438,14 @@ impl Manager {
                 // the ask but not shorten it, and would add a thread whose
                 // whole job is to wait on a lock the actor path already waits
                 // on inline.
+                //
+                // The landing runs on this spawned task — off the manager's
+                // mailbox and off every session actor's — so nothing orders
+                // it against a destroy, a stop, or a rename. The present
+                // arm's apply ([`apply_interim_upgrade`]) therefore re-checks
+                // each box under the registry's write lock before it
+                // publishes, and releases a grant drawn for a box whose
+                // publish is gone.
                 let book = Arc::clone(&loopback);
                 let registry = Arc::clone(&hostnames);
                 tokio::spawn(async move {
@@ -733,6 +741,12 @@ pub(crate) fn draw_interim_upgrades(
 /// interim through its own re-registration stands at the very address the
 /// draw recorded, and a stopped or renamed one is answered with it at its
 /// next registration; releasing it would free an address a live box holds.
+///
+/// The re-check is a runtime one, not an ordering argument: the landing
+/// runs on the deferred walk's own spawned task
+/// ([`crate::sessions::Manager::init`]), never through the manager's
+/// mailbox or a session actor's, so a destroy can land anywhere between
+/// the draw's enumeration, its grant, and this apply.
 #[cfg(target_os = "linux")]
 pub(crate) fn apply_interim_upgrade(
     book: &crate::net::dns::LoopbackLeaseBook,
