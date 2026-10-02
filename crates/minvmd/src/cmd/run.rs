@@ -308,6 +308,7 @@ fn run_foreground() -> Result<()> {
     use crate::cmd::MARKER_SOCK_ENV;
     use crate::image::resolve_boot_images;
     use crate::lifecycle::{Action, Lifecycle, next_state};
+    use crate::net::answerer::DEFAULT_ANSWERER_PORT;
     use crate::state::{StartingGuard, State, StateDir};
 
     // One span per supervised VM, like minimald's per-connection `conn` span:
@@ -483,6 +484,41 @@ fn run_foreground() -> Result<()> {
             );
         })
         .ok();
+
+    // The host answerer (NET-138): the box zone's answerer on the host
+    // loopback, answering from this host-authored table — the same
+    // semantics the native daemon's answerer gives, over the same shared
+    // decision — so the in-VM daemon starts no answerer of its own and the
+    // host's resolver has one answerer to be pointed at. The port is the
+    // machine's, not this VM's: when another VM host daemon on this host
+    // already holds it, this daemon registers its rows with that holder over
+    // the answerer channel and answers nothing itself, so a second VM's
+    // boxes answer too. Started beside the switch, before the guest boots,
+    // so the node row the registration above published answers from the
+    // moment the VM does — best-effort at startup, like the control socket:
+    // a thread that could not spawn is warned and the VM still boots, its
+    // names then answering from whatever daemon holds the port.
+    if let Err(error) = crate::net::answerer::spawn(boxes.clone(), DEFAULT_ANSWERER_PORT) {
+        tracing::warn!(
+            %error,
+            "failed to start the zone answerer; this VM's box names answer only from \
+             another VM host daemon's table, if one is running"
+        );
+    }
+
+    // The zone-table dump this daemon's diagnostics carry
+    // (`providers/local-minvmd0[/<vm>/]/zone.json`): the same view the
+    // answerer answers from, written at start and on every change, so a
+    // diagnostic bundle holds the table the answers were given by. Warned
+    // and booted without, like the answerer above: a missing diagnostic
+    // never fails a VM.
+    if let Err(error) = crate::diag::spawn(boxes.clone()) {
+        tracing::warn!(
+            %error,
+            "failed to start the zone-table dump; a diagnostic bundle carries no \
+             box-zone table for this VM"
+        );
+    }
 
     // Spawn + supervise the host gvproxy switch before the VMM child boots, so
     // its `-listen` switch socket exists when the gate relays into it for the
