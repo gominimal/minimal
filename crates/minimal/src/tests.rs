@@ -65,8 +65,15 @@ fn every_daemon_connection_is_classified() {
     assert_eq!(
         connect_site_inventory(env!("CARGO_MANIFEST_DIR")),
         [
+            // A box-name resolution probe: ungated while it finds nothing, but
+            // the VM that owns the name is gated on the reply that named it —
+            // the same ride-along shape `resolve_session_version_gated` uses.
+            "attach.rs::box_record_on = gated",
             "cmd/admin.rs::cmd_version = ungated",
             "cmd/list.rs::cmd_bare = gated",
+            // `min ls` reaches past the selected VM: the selected one keeps
+            // the gate, the others are listable ungated (see `ls_listings`).
+            "cmd/list.rs::list_vm = gated",
             "cmd/mod.rs::arm_activation_interrupt = ungated",
             "cmd/mod.rs::connect_daemon_unchecked = ungated",
             "cmd/net.rs::cmd_net_forward = gated",
@@ -94,6 +101,9 @@ fn every_create_session_asserts_the_daemon_build() {
         [
             "cmd/session.rs::activate_session = asserts",
             "task.rs::cmd_task_run = asserts",
+            // Not a client path: the two-VM fixture's own create. It asserts
+            // like the real ones, so the inventory stays "every site asserts".
+            "tests.rs::create_box_on = asserts",
         ]
     );
 }
@@ -1724,7 +1734,10 @@ async fn two_vms() -> (
 /// Create a named box on one VM's daemon — the CLI's own
 /// create/configure/finalize sequence, so the record is durable (an
 /// unfinalized one is reaped when the connection that created it drops) and
-/// therefore listed under the name given.
+/// therefore listed under the name given. The create asserts this build the
+/// way every other `CreateSession` in the crate does: the harness daemon is
+/// the same build, so the assertion holds, and the inventory test that stops
+/// a third client path from quietly passing `None` keeps reading "asserts".
 async fn create_box_on(
     server: &minimald::test_harness::TestServer,
     name: &str,
@@ -1750,7 +1763,7 @@ async fn create_box_on(
                 hooks_enabled: true,
                 attrs: Default::default(),
             },
-            must_match_version: None,
+            must_match_version: minimal_client::version_assertion(),
         })
         .await
     {
