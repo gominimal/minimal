@@ -469,6 +469,9 @@ async fn create_toolchain_session(sock_path: &Path) -> Result<sessions::SessionI
                 }),
                 None,
             ),
+            // No registration happened on this path: the box attaches as an
+            // unregistered one always has, drawing its own switch lease.
+            box_addresses: None,
             hooks_enabled: true,
             attrs: Default::default(),
         },
