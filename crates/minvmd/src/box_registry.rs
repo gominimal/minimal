@@ -836,6 +836,16 @@ impl BoxTable {
         self.subnet.gateway().octets()
     }
 
+    /// The subnet the rows live in — the node's own switch block, the one
+    /// slice of the fabric plane a box's frames may name as local reach
+    /// (a sibling, the host alias, the daemon), decided by the row's own
+    /// rules and the target's ingress rather than by the gate's
+    /// infrastructure rule ([`crate::net::egress_gate`]).
+    #[must_use]
+    pub fn subnet(&self) -> SwitchSubnet {
+        self.subnet
+    }
+
     /// Files a withdrawal report: `sources` are the switch addresses whose
     /// relayed traffic the calling connection carried, and the connection is
     /// at its end — the guest closed it, it errored, or the gate refused

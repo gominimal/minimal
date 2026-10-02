@@ -91,6 +91,19 @@
 //! flooding distinct spoofed addresses cannot turn the throttling into
 //! host-memory growth.
 //!
+//! Two destinations are refused before any row's rules are read, for every
+//! row and in every phase: the switch's own address, a control surface and
+//! not a destination a box's rules decide (`egress-switch-control-surface`,
+//! [`SWITCH_CONTROL_RULE`]), and the §5.3 infrastructure deny set — link-local
+//! and the metadata services in it, loopback, the fabric plane outside the
+//! node's own block, and RFC 1918 space the row's `allow_subnets` does not
+//! cover (`egress-infrastructure-destination`, [`INFRASTRUCTURE_RULE`]). The
+//! set applies to every box-plane packet, CIDR-admitted direct-IP flows
+//! included, so a row that declared DNS hosts — whose undeclared-destination
+//! drop the gate defers to the in-guest gate, where the resolution-time pins
+//! are — has no deferral here: the infrastructure drop is the host's own,
+//! whatever the row.
+//!
 //! Fail-closed faces the guest; the gate itself is what the host is left
 //! holding, so it stays up where it can. An accept failure the host can ride
 //! out — a momentary fd or memory shortage, a connection that died before it
@@ -109,17 +122,17 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use sessions::EgressDefaultPhase;
-use sessions::core::egress::{self, DropReason, FrameFamily, FrameSummary, FrameVerdict};
+use sessions::core::egress::{self, DropReason, FrameFamily, FrameSummary, FrameVerdict, Ipv4Cidr};
 use sessions::core::switch_request::{
     self, Applied, MAX_REQUEST_RECORDS, Record, Refusal, SwitchRequest, SwitchRow, SwitchTable,
     SwitchVerb,
 };
-use switch::{DEFAULT_MTU, RESERVED_LOCAL_RANGE};
+use switch::{DEFAULT_MTU, RESERVED_LOCAL_RANGE, SwitchSubnet};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
@@ -333,6 +346,93 @@ const RESOLVER_PORT: u16 = 53;
 /// the answer is truncated. A frame to the gateway in any other protocol has
 /// no resolver to be headed for, whatever its L4 bytes say.
 const RESOLVER_PROTOCOLS: [u8; 2] = [6, 17];
+
+/// The rule name for a frame headed into the infrastructure deny set (design
+/// §5.3, NET-067) as a host frame rule: the set applies to every box-plane
+/// packet, CIDR-admitted direct-IP flows included, so it is decided for every
+/// row, before the row's own rules and before the deferral a name-declaring
+/// row earns — no row, no `allow_subnets` entry, and no in-guest pin ever
+/// admits a frame here. The ranges are [`INFRASTRUCTURE_RANGES`]'; the one
+/// exemption is RFC 1918 under the row's `allow_subnets`, and the one
+/// carve-out is the node's own switch block ([`infrastructure_destination`]).
+const INFRASTRUCTURE_RULE: &str = "egress-infrastructure-destination";
+
+/// The ranges the host-side infrastructure rule refuses — the host frame
+/// rule's own copy of the §5.3 set, built beside the sessions crate's
+/// [`egress::InfrastructureDenySet`] rather than from it, because the two
+/// decide different things and the rebinding intersection relies on its own
+/// shape: that set names the gateway's two addresses as `/32`s (here the
+/// gateway is the control-surface rule's, [`SWITCH_CONTROL_RULE`], and the
+/// host alias is local reach inside the node's own block), refuses or admits
+/// the whole fabric plane by whether the name is a box-zone name (a frame has
+/// no name, and the plane's one admitted slice is the node's own block), and
+/// keeps its ranges private. The constants are the same, spelled as ranges.
+struct InfrastructureRanges {
+    /// Refused under every row: link-local and the metadata services living
+    /// in it, and loopback space.
+    fixed: [Ipv4Cidr; 2],
+    /// The plane the switch fabric draws its subnets from: refused outside
+    /// the node's own block, where another node's boxes, gateway, and daemon
+    /// live.
+    plane: Ipv4Cidr,
+    /// RFC 1918 space, refused unless the row's `allow_subnets` covers the
+    /// destination.
+    rfc1918: [Ipv4Cidr; 3],
+}
+
+/// The host-side infrastructure ranges, parsed once: the rule is on the
+/// per-frame path, and the ranges are constants.
+static INFRASTRUCTURE_RANGES: LazyLock<InfrastructureRanges> = LazyLock::new(|| {
+    // Every constant parses; the parses exist so the set's contents are
+    // spelled as ranges, not as byte arrays.
+    let cidr = |s: &'static str| Ipv4Cidr::parse(s).expect("a constant CIDR parses");
+    InfrastructureRanges {
+        fixed: [cidr("169.254.0.0/16"), cidr("127.0.0.0/8")],
+        plane: cidr("100.64.0.0/10"),
+        rfc1918: [
+            cidr("10.0.0.0/8"),
+            cidr("172.16.0.0/12"),
+            cidr("192.168.0.0/16"),
+        ],
+    }
+});
+
+/// Whether `dst` lies in the infrastructure deny set as the host frame rule
+/// holds it ([`INFRASTRUCTURE_RULE`]): a fixed range; the fabric plane
+/// outside `own_block`, the subnet the gate's rows live in — a frame to a
+/// sibling, to the host alias, or to the daemon inside the node's own block
+/// is local reach, decided by the row's CIDR rules and the target's ingress,
+/// never by this rule, and the gateway inside it is the control-surface
+/// rule's; or RFC 1918 space the row's `allow_subnets` does not cover.
+///
+/// `allow` is the row's compiled `allow_subnets`, `None` when the dimension
+/// is undeclared — allow-all, the shipped default (03-spec R2.1) — which
+/// counts as covering the destination, as the rebinding intersection's
+/// exemption holds it ([`egress::rebinding_admits`]): the two allow-all
+/// spellings, an undeclared dimension and `0.0.0.0/0`, compile to the same
+/// reach everywhere else in the verdict, and the host's rule must not split
+/// them, or veto a private address the guest's own gate pins for the same
+/// declaration. A declared list that does not cover the destination is the
+/// refusal: a developer who wants a box to reach the LAN says so by allowing
+/// the range, so neither a name rule nor the deferral can become a way
+/// around leaving it undeclared.
+fn infrastructure_destination(
+    dst: [u8; 4],
+    own_block: SwitchSubnet,
+    allow: Option<&[Ipv4Cidr]>,
+) -> bool {
+    let ranges = &*INFRASTRUCTURE_RANGES;
+    if ranges.fixed.iter().any(|cidr| cidr.contains(dst)) {
+        return true;
+    }
+    let in_own_block = (u32::from_be_bytes(dst) & u32::from(own_block.netmask()))
+        == u32::from(own_block.network());
+    if ranges.plane.contains(dst) && !in_own_block {
+        return true;
+    }
+    ranges.rfc1918.iter().any(|cidr| cidr.contains(dst))
+        && !allow.is_none_or(|list| list.iter().any(|cidr| cidr.contains(dst)))
+}
 
 /// The rule name for the interim's admitted-unregistered source: a frame
 /// whose source is an address the plan could hand to a box but no published
@@ -2166,6 +2266,10 @@ async fn relay_frames_to_switch(
                 limiter.warn_switch_surface(src, dst_port);
                 continue;
             }
+            Err(GateDrop::Infrastructure { src, dst, dst_port }) => {
+                limiter.warn_infrastructure(src, dst, dst_port);
+                continue;
+            }
             Err(dropped) => {
                 limiter.emit(summary.source(), dropped.rule());
                 continue;
@@ -2356,9 +2460,18 @@ enum GateAdmit {
 /// undeclared ethertypes, truncated frames) never reach the table: the shared
 /// verdict's own family drops decide them, under any rules, fail-closed.
 ///
-/// One destination no row or phase decides either: the switch's own address
-/// ([`SWITCH_CONTROL_RULE`]), refused for everything but TCP or UDP to the
-/// resolver's port, before the row's decision and the interim, in every phase.
+/// Two destinations no row decides either, in every phase. The switch's own
+/// address ([`SWITCH_CONTROL_RULE`]) is refused for everything but TCP or UDP
+/// to the resolver's port, before the row's decision and the interim. And the
+/// §5.3 infrastructure deny set ([`INFRASTRUCTURE_RULE`]) is refused for
+/// every row, between the source's routing and the row's own rules: the set
+/// applies to every box-plane packet, CIDR-admitted direct-IP flows included,
+/// so a row's `allow_subnets` admits nothing in it — RFC 1918 under an
+/// explicit allowance excepted — and the deferral a name-declaring row earns
+/// for its undeclared destinations never reaches it. The order is the
+/// contract: control surface, then the source (a baseline-decided node
+/// frame, a row, or the phase's unknown-source decision), then the
+/// infrastructure set, then the row's rules, then the deferral arm.
 fn gate_verdict(
     summary: &FrameSummary,
     table: &BoxTable,
@@ -2406,7 +2519,37 @@ fn gate_verdict(
             return Err(GateDrop::SwitchControlSurface { src, dst_port });
         }
     }
-    let record = table.by_source(src);
+    // No namespace holds the source. Inside the plan's lease block the
+    // announced interim admits it — an own-address box's lease is minted
+    // inside the VM, and the creator-side registration that will publish its
+    // row (T66, #1711) is the only thing that ever will — and the relay says
+    // so on every admit. Outside that block, or once the default binds,
+    // NET-081's failure case: an address no namespace holds never leaves the
+    // VM.
+    let Some(record) = table.by_source(src) else {
+        if phase == UnregisteredSourcePhase::Announced && table.is_allocatable(src) {
+            return Ok(GateAdmit::Unregistered { src });
+        }
+        return Err(GateDrop::UnknownSource { src });
+    };
+    // The infrastructure deny set, decided for every row before the row's
+    // own rules (design §5.3, NET-067): the host and the fabric, not
+    // destinations — link-local and the metadata services in it, loopback,
+    // the plane outside the node's own block, and RFC 1918 space the row's
+    // `allow_subnets` does not cover. Decided here, between the source's
+    // routing and the row's rules, so that no row admits it — an allow-all
+    // row's `0.0.0.0/0` included, the CIDR-admitted direct-IP flow the set
+    // names — and so that the deferral below never sees it: an undeclared
+    // destination inside the set is this drop, not the guest's to lift.
+    if let Some(dst) = summary.destination()
+        && infrastructure_destination(dst, table.subnet(), record.egress().allow_subnets())
+    {
+        return Err(GateDrop::Infrastructure {
+            src,
+            dst,
+            dst_port: summary.destination_port(),
+        });
+    }
     // The namespace that holds the source decides its frames by its own
     // compiled rules — the shared verdict, unchanged, now made outside where
     // nothing inside can change it. One drop class defers to the in-guest
@@ -2419,39 +2562,27 @@ fn gate_verdict(
     // way the two halves agree; making it here would drop every pinned frame
     // the guest admitted, a host-side veto over an admission the box's own
     // declaration granted. Everything else stays host-made: a denied
-    // destination, an undeclared protocol, a foreign source, a family the
+    // destination, an infrastructure destination (decided above, before this
+    // arm can see it), an undeclared protocol, a foreign source, a family the
     // verdict reads no source from — a pin governs none of those, and the
     // guest lifts none of them either, so the host refusing them is parity,
     // not pre-emption.
-    if let Some(record) = record {
-        return match egress::verdict(summary, record.egress()) {
-            FrameVerdict::Admit => Ok(GateAdmit::Row),
-            FrameVerdict::Drop(reason)
-                if matches!(reason, DropReason::UndeclaredSubnet { .. })
-                    && record.resolves_names() =>
-            {
-                Ok(GateAdmit::Row)
-            }
-            FrameVerdict::Drop(reason) => Err(GateDrop::Verdict(reason)),
-        };
+    match egress::verdict(summary, record.egress()) {
+        FrameVerdict::Admit => Ok(GateAdmit::Row),
+        FrameVerdict::Drop(reason)
+            if matches!(reason, DropReason::UndeclaredSubnet { .. }) && record.resolves_names() =>
+        {
+            Ok(GateAdmit::Row)
+        }
+        FrameVerdict::Drop(reason) => Err(GateDrop::Verdict(reason)),
     }
-    // No namespace holds the source. Inside the plan's lease block the
-    // announced interim admits it — an own-address box's lease is minted
-    // inside the VM, and the creator-side registration that will publish its
-    // row (T66, #1711) is the only thing that ever will — and the relay says
-    // so on every admit. Outside that block, or once the default binds,
-    // NET-081's failure case: an address no namespace holds never leaves the
-    // VM.
-    if phase == UnregisteredSourcePhase::Announced && table.is_allocatable(src) {
-        return Ok(GateAdmit::Unregistered { src });
-    }
-    Err(GateDrop::UnknownSource { src })
 }
 
 /// Why the gate dropped a frame: the shared verdict's reason, or one of the
-/// two classes the host table adds — a source address no published namespace
-/// holds (NET-081's failure case), and a frame the switch's own address would
-/// have received on a port nothing published answers.
+/// three classes the host table adds — a source address no published
+/// namespace holds (NET-081's failure case), a frame the switch's own address
+/// would have received on a port nothing published answers, and a frame
+/// headed into the infrastructure deny set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateDrop {
     /// The shared frame verdict dropped it: the namespace's own rules, its
@@ -2471,6 +2602,17 @@ enum GateDrop {
         /// The port the frame named at the gateway.
         dst_port: u16,
     },
+    /// The frame named a destination in the infrastructure deny set — the
+    /// host and the fabric, not a destination any row's rules admit
+    /// ([`INFRASTRUCTURE_RULE`]).
+    Infrastructure {
+        /// The source address the frame wore.
+        src: [u8; 4],
+        /// The destination inside the set.
+        dst: [u8; 4],
+        /// The port the frame named there, `0` when it carried none.
+        dst_port: u16,
+    },
 }
 
 impl GateDrop {
@@ -2479,6 +2621,7 @@ impl GateDrop {
     fn rule(&self) -> &'static str {
         match self {
             Self::Verdict(reason) => reason.rule(),
+            Self::Infrastructure { .. } => INFRASTRUCTURE_RULE,
             Self::UnknownSource { .. } => UNKNOWN_SOURCE_RULE,
             Self::SwitchControlSurface { .. } => SWITCH_CONTROL_RULE,
         }
@@ -2645,6 +2788,37 @@ impl DropLimiter {
                     "dropped frames to the switch's own address from more distinct source \
                      addresses than the gate keeps a window per source for; one line per \
                      rule covers the rest",
+                );
+                true
+            }
+        }
+    }
+
+    /// Emits the warning for one frame headed into the infrastructure deny
+    /// set: the same rate limit a drop's line answers to, keyed by the source
+    /// and the rule, and naming the destination and the port the frame gave
+    /// it — the line a host reads to learn which piece of the host or the
+    /// fabric a box was reaching for. Returns whether a line was written.
+    fn warn_infrastructure(&self, src: [u8; 4], dst: [u8; 4], dst_port: u16) -> bool {
+        match self.should_warn_at(Some(src), INFRASTRUCTURE_RULE, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named => {
+                tracing::warn!(
+                    source = %Ipv4Addr::from(src),
+                    destination = %Ipv4Addr::from(dst),
+                    port = dst_port,
+                    rule_matched = INFRASTRUCTURE_RULE,
+                    "dropped a frame to an infrastructure destination; the host and the \
+                     fabric are not destinations a box's egress rules admit",
+                );
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    rule_matched = INFRASTRUCTURE_RULE,
+                    "dropped frames to infrastructure destinations from more distinct \
+                     source addresses than the gate keeps a window per source for; one \
+                     line per rule covers the rest",
                 );
                 true
             }
@@ -3615,9 +3789,10 @@ mod tests {
     /// as a frame rule, before any row is consulted), a protocol its rules
     /// do not allow — aimed at the very destination the deferral lifts over
     /// TCP — and a source no row holds. The DNS rebinding intersection's
-    /// wider infrastructure deny set (NET-067) is not a frame rule the host
-    /// gate reads: it is decided at answer time, in the guest, so no frame
-    /// class of the host's carries it and this test claims nothing about it.
+    /// wider infrastructure deny set (NET-067) is the host's own frame rule
+    /// too, decided for every row before this one's rules are read; it is
+    /// pinned on its own, with the rows it is decided for, by
+    /// [`infrastructure_destinations_drop_on_the_host_for_every_row`].
     ///
     /// The registration itself says what is deferred, once, where the row
     /// enters the table (#1808 is the task that moves the decision
@@ -3704,6 +3879,131 @@ mod tests {
         assert!(
             !logged.contains("egress-undeclared-subnet"),
             "a deferred drop is not a host-side drop: no undeclared line, got: {logged}"
+        );
+    }
+
+    /// The §5.3 infrastructure deny set as a host frame rule
+    /// ([`INFRASTRUCTURE_RULE`]), decided for every row before the row's own
+    /// rules and before the deferral: a name-declaring row and a CIDR row
+    /// that allows `0.0.0.0/0` are both refused to the metadata service
+    /// (link-local) and to a box in another node's block of the fabric
+    /// plane, whatever their rules admit — the deferral lifts nothing here,
+    /// and neither does the widest allowance. The node's own block is the
+    /// carve-out: the same CIDR row reaches a sibling and the host alias,
+    /// local reach the row's rules and the target's ingress decide. RFC 1918
+    /// is the one exemption: a `10.0.0.0/8` destination is refused for the
+    /// name-declaring row, whose declared `allow_subnets` does not cover it
+    /// — the frame its deferral would otherwise have passed to the guest —
+    /// and admitted for a row whose `allow_subnets` names the range, for the
+    /// `0.0.0.0/0` row, and for a row with no `egress` section at all, whose
+    /// undeclared dimension is the shipped allow-all and covers it the way
+    /// the rebinding intersection's exemption holds it. Each drop names its
+    /// destination and port under the rule, rate-limited per source, so the
+    /// first refused frame of each source is the one whose line is read.
+    #[tokio::test]
+    async fn infrastructure_destinations_drop_on_the_host_for_every_row() {
+        let registry = BoxRegistry::new(SUBNET);
+        let open = [100, 64, 0, 10];
+        let lan = [100, 64, 0, 11];
+        let bare = [100, 64, 0, 12];
+        registry.register(
+            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    allow_subnets: Some(vec!["203.0.113.0/24".to_string()]),
+                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                    deny_subnets: None,
+                }),
+        );
+        registry.register(
+            BoxRegistration::new("open", Ipv4Addr::from(open), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    allow_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                    allow_dns_hosts: None,
+                    deny_subnets: None,
+                }),
+        );
+        tcp_lan_box(&registry, lan);
+        registry.register(
+            BoxRegistration::new("bare", Ipv4Addr::from(bare), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
+        let mut h = gate_over(registry).await;
+
+        // Local reach inside the node's own block, and RFC 1918 under an
+        // allowance: all admitted, each read back as sent.
+        let host_alias = SUBNET.host_alias().octets();
+        let admitted = [
+            ipv4_frame(open, 6, LEASE, 8080),
+            ipv4_frame(open, 6, host_alias, 80),
+            ipv4_frame(open, 6, [10, 1, 2, 3], 80),
+            ipv4_frame(lan, 6, [10, 1, 2, 3], 80),
+            ipv4_frame(bare, 6, [10, 1, 2, 3], 80),
+        ];
+        for frame in &admitted {
+            send_frame(&mut h.guest, frame).await;
+            assert_eq!(
+                &expect_frame(&mut h.switch).await,
+                frame,
+                "own-block and allowed-private destinations reach the switch"
+            );
+        }
+
+        // The refusals, the first of each source naming a different range,
+        // then every other pair; the marker after them proves all were
+        // decided before it and none passed.
+        let metadata = [169, 254, 169, 254];
+        let other_block = [100, 65, 0, 9];
+        let refused = [
+            ipv4_frame(LEASE, 6, [10, 1, 2, 3], 443),
+            ipv4_frame(open, 6, metadata, 80),
+            ipv4_frame(bare, 6, other_block, 80),
+            ipv4_frame(LEASE, 6, metadata, 80),
+            ipv4_frame(LEASE, 6, other_block, 80),
+            ipv4_frame(open, 6, other_block, 80),
+            ipv4_frame(bare, 6, metadata, 80),
+            ipv4_frame(lan, 6, metadata, 80),
+            ipv4_frame(lan, 6, other_block, 80),
+        ];
+        for frame in &refused {
+            send_frame(&mut h.guest, frame).await;
+        }
+        let marker = ipv4_frame(LEASE, 6, [203, 0, 113, 7], 443);
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "no infrastructure-bound frame reached the switch; the marker did"
+        );
+        expect_silence(&mut h.switch).await;
+
+        // The drops say so under the rule, naming the destination and the
+        // port, one line per source: the first refused frame of each.
+        wait_for_log(&h.log, "egress-infrastructure-destination").await;
+        let logged = h.log.contents();
+        for needle in [
+            "source=100.64.0.9",
+            "destination=10.1.2.3",
+            "port=443",
+            "source=100.64.0.10",
+            "destination=169.254.169.254",
+            "source=100.64.0.12",
+            "destination=100.65.0.9",
+            "port=80",
+            "rule_matched=\"egress-infrastructure-destination\"",
+        ] {
+            assert!(
+                logged.contains(needle),
+                "the drop lines carry {needle}, got: {logged}"
+            );
+        }
+        assert!(
+            !logged.contains("egress-undeclared-subnet"),
+            "the name-declaring row's private destination is the infrastructure drop, not \
+             a deferred one, got: {logged}"
         );
     }
 
@@ -5833,11 +6133,16 @@ mod tests {
         // the run path registers the node and T66 will register the boxes.
         let registry = BoxRegistry::new(SUBNET);
         tcp_box(&registry, "web", LEASE, vec!["10.0.0.0/8".to_string()]);
+        // db's subnet is TEST-NET-1: a second declared range the union must
+        // hold beside web's, spelled outside RFC 1918 so the host's
+        // infrastructure rule — which refuses private space a row's own
+        // allowance does not cover — never decides a spoof aimed at it
+        // before the row's rules do.
         tcp_box(
             &registry,
             "db",
             [100, 64, 0, 10],
-            vec!["192.168.0.0/16".to_string()],
+            vec!["192.0.2.0/24".to_string()],
         );
         // The deny-all box: no declared subnets, so its row admits nothing
         // but the resolver carve-out — the box a spoof must not unseal.
@@ -5849,7 +6154,7 @@ mod tests {
         let shipped = UNREGISTERED_SOURCE_PHASE;
         let resolver = SUBNET.dns_server().octets();
         let web_only = [10, 1, 2, 3];
-        let db_only = [192, 168, 4, 5];
+        let db_only = [192, 0, 2, 5];
         let outside = [203, 0, 113, 7];
         let stray = [100, 64, 0, 99];
         // The out-of-plan source keeps a literal of its own: `outside` above
@@ -6008,7 +6313,7 @@ mod tests {
         // so they are not bound here but named.
         let in_union = |dst: [u8; 4], proto: u8, port: u16| {
             let web = Ipv4Cidr::parse("10.0.0.0/8").expect("web's subnet parses");
-            let db = Ipv4Cidr::parse("192.168.0.0/16").expect("db's subnet parses");
+            let db = Ipv4Cidr::parse("192.0.2.0/24").expect("db's subnet parses");
             (proto == 6 && (web.contains(dst) || db.contains(dst)))
                 || (proto == 17 && dst == resolver && port == 53)
         };
@@ -6143,9 +6448,15 @@ mod tests {
             verdict_of(shipped, [100, 64, 0, 10], 6, db_only, 5432),
             Verdict::AdmittedByRow,
         );
+        // web's subnet is private space: a spoof wearing another row's
+        // address and aimed there is refused by the host's infrastructure
+        // rule, decided for every row before its own rules — the row's
+        // allowance does not cover the range, so the drop names that rule
+        // rather than the undeclared-subnet one. Dropped either way; the
+        // bound is what the pin keeps.
         assert_eq!(
             verdict_of(shipped, [100, 64, 0, 10], 6, web_only, 80),
-            Verdict::Dropped("egress-undeclared-subnet"),
+            Verdict::Dropped("egress-infrastructure-destination"),
         );
         assert_eq!(
             verdict_of(shipped, [100, 64, 0, 10], 6, outside, 443),
@@ -6157,7 +6468,7 @@ mod tests {
         );
         assert_eq!(
             verdict_of(shipped, [100, 64, 0, 11], 6, web_only, 80),
-            Verdict::Dropped("egress-undeclared-subnet"),
+            Verdict::Dropped("egress-infrastructure-destination"),
         );
         assert_eq!(
             verdict_of(shipped, [100, 64, 0, 11], 17, resolver, 53),
