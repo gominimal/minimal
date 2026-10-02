@@ -2589,6 +2589,15 @@ const AUDIT_ARCH: u32 = 0xc000_003e; // AUDIT_ARCH_X86_64
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const AUDIT_ARCH: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
 
+/// The 32-bit compat ABI the kernel also answers to on this architecture.
+/// The filter admits it under the same family rules as the native ABI so
+/// 32-bit binaries (gcc -m32, wine, i386 toolchain helpers) run inside a
+/// box instead of dying with SIGSYS on their first syscall.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const COMPAT_AUDIT_ARCH: u32 = 0x4000_0003; // AUDIT_ARCH_I386
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const COMPAT_AUDIT_ARCH: u32 = 0x4000_0028; // AUDIT_ARCH_ARM
+
 /// The x32 ABI shares `AUDIT_ARCH_X86_64` and marks its syscalls by setting
 /// this bit in `nr`, so a plain compare against `SYS_socket` would let an x32
 /// caller through.  The filter kills any such call instead.
@@ -2614,6 +2623,12 @@ pub struct SocketFamilyFilter {
 const SYS_SOCKET: i64 = libc::SYS_socket;
 #[cfg(target_os = "linux")]
 const SYS_SOCKETPAIR: i64 = libc::SYS_socketpair;
+/// The 32-bit multiplexed socket entry point.  The filter returns `ENOSYS`
+/// for it on the compat ABI because seccomp cannot read its address-family
+/// argument (it sits behind a pointer), and the filter already covers
+/// `socket(2)` and `socketpair(2)` individually.
+#[cfg(target_os = "linux")]
+const SYS_SOCKETCALL: i64 = 102; // __NR_socketcall on both i386 and arm
 
 /// Build the socket-family filter for a seal: a classic BPF seccomp program
 /// that admits the `socket()`/`socketpair()` calls whose address family the
@@ -2636,12 +2651,15 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
     // Return the default allow action when the syscall is not one we restrict
     // or when the address family is allowed.
     let allow_action = libc::SECCOMP_RET_ALLOW;
-    // A caller on a foreign ABI (another audit arch, or x32 on x86_64) dies
-    // with SIGSYS on its first syscall in every box, networked ones included:
-    // this check sits before the syscall-number dispatch, and the numbers
-    // would not mean the same thing on another ABI, so the filter kills
-    // rather than guesses.  A 32-bit binary in a host-address or own-address
-    // box dies here, where it ran before the seal reached every box.
+    // Return ENOSYS for socketcall(2) on the compat ABI: seccomp cannot read
+    // its address-family argument (it sits behind a pointer), and the filter
+    // already covers socket(2) and socketpair(2) individually, so a modern
+    // libc falls back to the direct syscalls.
+    let enosys_action = libc::SECCOMP_RET_ERRNO | (libc::ENOSYS as u32);
+    // A caller on a truly foreign ABI (neither the native audit arch, nor
+    // its 32-bit compat ABI, nor x32 on x86_64) dies with SIGSYS on its
+    // first syscall: the syscall numbers would not mean the same thing, so
+    // the filter kills rather than guessing.
     let kill_action = libc::SECCOMP_RET_KILL_PROCESS;
 
     // The families the seal admits, in the order the verdict tail compares
@@ -2688,42 +2706,68 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
 
     // Classic BPF seccomp program.  `jt` and `jf` are the number of
     // instructions to skip after the current one (0 means "fall through to the
-    // next instruction").  Indices below are for x86_64; aarch64 has no x32
-    // guard, so everything from the `SYS_socket` compare on sits two lower
-    // (relative jumps in that tail are unchanged).
+    // next instruction").
+    //
+    // Architecture dispatch:
+    //   0: load arch
+    //   1: native ABI?  → native path (load nr, then x32 guard on x86_64)
+    //   2: compat ABI?  → compat path (load nr, socketcall→ENOSYS, then
+    //                     skip to the socket dispatch past the x32 guard)
+    //   3: anything else → kill (truly foreign arch)
+    //
+    // Both paths converge at the socket dispatch (jeq SYS_SOCKET), then
+    // the verdict tail.  The compat path skips the x32 guard because the
+    // compat ABI has no x32 syscall-number offset.
     let mut filter: Vec<libc::sock_filter> = vec![
         // 0: load arch.
         load(OFFSET_ARCH),
-        // 1: native ABI -> 3; anything else -> 2.
-        jeq(AUDIT_ARCH, 1, 0),
-        // 2: kill: foreign ABI.
+        // 1: native ABI -> native path (skip 5); anything else -> 2.
+        jeq(AUDIT_ARCH, 5, 0),
+        // 2: compat ABI -> compat path (skip 1); anything else -> 3.
+        jeq(COMPAT_AUDIT_ARCH, 1, 0),
+        // 3: kill: truly foreign ABI.
         ret(kill_action),
-        // 3: load syscall number.
+        // --- compat path ---
+        // 4: load syscall number.
+        load(OFFSET_NR),
+        // 5: socketcall(2)?  → ENOSYS (6); else skip to socket dispatch.
+        //    On x86_64 the socket dispatch is at instruction 10 (past the
+        //    x32 guard at 8-9), so skip 4.  On aarch64 it is at
+        //    instruction 8 (no x32 guard), so skip 2.
+        #[cfg(target_arch = "x86_64")]
+        jeq(SYS_SOCKETCALL as u32, 0, 4),
+        #[cfg(target_arch = "aarch64")]
+        jeq(SYS_SOCKETCALL as u32, 0, 2),
+        // 6: ENOSYS for socketcall(2).
+        ret(enosys_action),
+        // --- native path ---
+        // 7: load syscall number.
         load(OFFSET_NR),
     ];
     #[cfg(target_arch = "x86_64")]
     {
-        // 4: nr >= X32_SYSCALL_BIT -> 5; else -> 6.
+        // 8: nr >= X32_SYSCALL_BIT -> 9; else -> 10.
         filter.push(libc::sock_filter {
             code: (libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K) as u16,
             jt: 0,
             jf: 1,
             k: X32_SYSCALL_BIT,
         });
-        // 5: kill: x32 ABI.
+        // 9: kill: x32 ABI.
         filter.push(ret(kill_action));
     }
-    // 6: socket() -> 8; else -> 7.
+    // --- socket dispatch (both paths converge here) ---
+    // socket() -> load arg0; else -> check socketpair.
     filter.push(jeq(SYS_SOCKET as u32, 1, 0));
-    // 7: socketpair() -> 8; anything else jumps past the whole verdict tail
-    // to the default allow — one skip per admitted-family verdict pair plus
-    // the refuse and allow returns that end it.
+    // socketpair() -> load arg0; anything else jumps past the whole verdict
+    // tail to the default allow — one skip per admitted-family verdict pair
+    // plus the refuse and allow returns that end it.
     filter.push(jeq(
         SYS_SOCKETPAIR as u32,
         0,
         (2 * admitted.len() + 2) as u8,
     ));
-    // 8: load arg0 (the address family).
+    // Load arg0 (the address family).
     filter.push(load(OFFSET_ARG0));
     // The verdict tail: both seals are allowlists, so each admitted family
     // gets an allow return and whatever is left over is refused.  The `none`
@@ -2739,7 +2783,7 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
     // The seal's verdict for every family it does not admit, EAFNOSUPPORT.
     filter.push(ret(refuse_action));
     // The default allow for every syscall that creates no socket, reached
-    // both by falling through and by instruction 7's jump.
+    // both by falling through and by the socketpair jump above.
     filter.push(ret(allow_action));
 
     SocketFamilyFilter {
@@ -3537,8 +3581,9 @@ mod tests {
     /// NET-038. The none-box filter refuses `AF_VSOCK` sockets (which bypass the
     /// network namespace) while still allowing the local `AF_UNIX` sockets the
     /// sandbox's own minenv socket depends on, leaves every other syscall alone,
-    /// and kills a caller on a foreign ABI rather than letting it through.  The
-    /// production runtime effect is proved by
+    /// admits the 32-bit compat ABI under the same family rules as the native
+    /// ABI, and kills a caller on a truly foreign ABI rather than letting it
+    /// through.  The production runtime effect is proved by
     /// `network_none_blocks_all_outside_sockets` in the minimald root integration
     /// harness; this unit test evaluates the program
     /// [`build_socket_family_filter`] produces and installs the production
@@ -3635,8 +3680,12 @@ mod tests {
             run_seccomp_program(&filter.program, nr as u32, arch, arg0)
         };
         let refuse = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
-        // AUDIT_ARCH_I386: the compat ABI an x86_64 kernel also answers to.
-        const FOREIGN_ARCH: u32 = 0x4000_0003;
+        let enosys = libc::SECCOMP_RET_ERRNO | (libc::ENOSYS as u32);
+        // AUDIT_ARCH_I386: the 32-bit compat ABI on x86_64, now admitted
+        // under the same family rules as the native ABI.
+        const COMPAT_ARCH: u32 = 0x4000_0003;
+        // AUDIT_ARCH_S390: a truly foreign arch the filter must still kill.
+        const FOREIGN_ARCH: u32 = 0x8000_0016;
 
         assert_eq!(
             run(libc::SYS_socket, AUDIT_ARCH, libc::AF_VSOCK as u32),
@@ -3658,10 +3707,35 @@ mod tests {
             libc::SECCOMP_RET_ALLOW,
             "a syscall that creates no socket must stay allowed"
         );
+        // The compat ABI is admitted under the same family rules as native.
+        assert_eq!(
+            run(libc::SYS_socket, COMPAT_ARCH, libc::AF_VSOCK as u32),
+            refuse,
+            "the compat ABI must refuse AF_VSOCK with EAFNOSUPPORT, not be killed"
+        );
+        assert_eq!(
+            run(libc::SYS_socket, COMPAT_ARCH, libc::AF_UNIX as u32),
+            libc::SECCOMP_RET_ALLOW,
+            "the compat ABI must keep AF_UNIX allowed"
+        );
+        assert_eq!(
+            run(libc::SYS_read, COMPAT_ARCH, 0),
+            libc::SECCOMP_RET_ALLOW,
+            "the compat ABI must allow a syscall that creates no socket"
+        );
+        // socketcall(2) returns ENOSYS on the compat ABI: seccomp cannot
+        // read its family argument, and the filter already covers the
+        // direct socket(2) and socketpair(2) syscalls individually.
+        assert_eq!(
+            run(SYS_SOCKETCALL, COMPAT_ARCH, 0),
+            enosys,
+            "socketcall(2) must return ENOSYS on the compat ABI"
+        );
+        // A truly foreign arch is still killed.
         assert_eq!(
             run(libc::SYS_socket, FOREIGN_ARCH, libc::AF_VSOCK as u32),
             libc::SECCOMP_RET_KILL_PROCESS,
-            "a foreign-ABI caller must be killed, not allowed"
+            "a truly foreign-ABI caller must be killed, not allowed"
         );
         #[cfg(target_arch = "x86_64")]
         assert_eq!(
