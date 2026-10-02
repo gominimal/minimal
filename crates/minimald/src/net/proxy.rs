@@ -860,6 +860,63 @@ mod tests {
         );
     }
 
+    /// NET-019: supersession is a verdict about what a client *reports*, not
+    /// about what the proxy does. Once both halves of NET-018's condition are
+    /// deployed — the box-zone answerer serving, the reserved local range
+    /// present — and the daemon therefore reports native DNS as the live
+    /// surface, a request through the proxy still routes: a client that
+    /// captured `HTTP(S)_PROXY` at activation keeps working, which is why the
+    /// verdict never stops the proxy.
+    ///
+    /// The answerer half is stood in for by a bound UDP socket on a free
+    /// loopback port — the verdict reads the port's presence, not the socket
+    /// behind it — and the range half is this host's real probe, which on
+    /// Linux reads present. The daemon-side test drives a real answerer
+    /// (`name_surface_reported_when_both_deployed` in `rpc`); this one holds
+    /// the proxy side: the real `serve` loop, a real route, after the verdict
+    /// has already said native.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn proxy_keeps_serving_after_supersession() {
+        use tokio::net::UdpSocket;
+
+        // The answerer half: serving on a free loopback port.
+        let answerer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let answerer_port = answerer.local_addr().unwrap().port();
+
+        // The published-addresss half: the real probe over the reserved
+        // range, whose presence is what a native host's loopback carries.
+        let probe = crate::net::loopback::probe();
+
+        // Both halves deployed: the daemon reports native DNS as the live
+        // name surface (NET-018) — the very verdict that would matter if it
+        // were the proxy's cue to stop.
+        assert_eq!(
+            crate::rpc::live_name_surface(Some(answerer_port), &probe),
+            minimald_rpc::NameSurface::Native,
+            "an answerer serving on a range-present host makes native DNS the live surface"
+        );
+
+        // And the proxy still serves beside it: the same route answers a
+        // request naming the host, through the same serve loop it always ran.
+        let backend_port = spawn_backend().await;
+        let shared = Arc::new(RwLock::new(HostnameRegistry::new("dev", false)));
+        shared
+            .write()
+            .unwrap()
+            .register_host_net(SessionId::nil(), "web");
+        let router = Router::new(Arc::clone(&shared), proxied_request_verdict);
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve(proxy, router));
+
+        let routed = proxy_get(proxy_addr, &format!("web.min.internal:{backend_port}")).await;
+        assert!(
+            routed.contains("200 OK"),
+            "native DNS is the reported surface, and the proxy still routes: {routed}"
+        );
+    }
+
     /// NET-001, end to end: on a VM host the daemon sits on the gvproxy switch,
     /// so an own-address box's `<name>.min.internal` routes to the box itself —
     /// its lease, with the requested port translated through the ingress

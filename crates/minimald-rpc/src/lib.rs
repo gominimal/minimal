@@ -224,6 +224,52 @@ pub struct ResourcePool {
     pub memory_bytes: u64,
 }
 
+/// The name surface a daemon reports as live for `*.min.internal` (NET-018):
+/// native DNS once host-OS resolution and published addresses are both
+/// deployed on the host it serves, the hostname proxy until then — and the
+/// proxy keeps serving either way, so a client that captured its port keeps
+/// routing (NET-019).
+///
+/// The daemon fills this from the two halves of that condition it can see:
+/// its box-zone answerer serving — the listener the host's resolver is
+/// pointed at, whose port it reports only once the answerer is up — and its
+/// bind probe finding the reserved local range present, the addresses
+/// published boxes hold ([`ListSessionsResponse::zone_answerer_port`] and
+/// [`CreateSessionResponse::interim_loopback`] carry the same two facts
+/// separately). `Native` therefore names the surface this daemon answers the
+/// zone from; whether the *host's resolver* is pointed at the answerer is the
+/// client's half to detect, and the advisory it prints (NET-122) is what
+/// points it there.
+///
+/// `Proxy` is the default, so a daemon that predates the field reports the
+/// surface that shipped first — the safe read, since no host may be told
+/// native DNS is live by a daemon that cannot see its own answerer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NameSurface {
+    /// The hostname proxy is the live surface: the daemon's answerer is not
+    /// serving, or its probe found the reserved local range absent, so a
+    /// `*.min.internal` name routes only through a request to the proxy.
+    #[default]
+    Proxy,
+    /// Native DNS is the live surface: the answerer is serving and the
+    /// reserved local range is present, so boxes answer at their own
+    /// addresses and the host's resolver can be pointed at the answerer for
+    /// the zone. The proxy still serves beside it (NET-019).
+    Native,
+}
+
+impl NameSurface {
+    /// The words the daemon's log line names the surface by.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Proxy => "hostname-proxy",
+            Self::Native => "native-dns",
+        }
+    }
+}
+
 /// The response to the [`ListSessions`] RPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListSessionsResponse {
@@ -265,6 +311,11 @@ pub struct ListSessionsResponse {
     /// the field, or while the answerer has not come up yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone_answerer_port: Option<u16>,
+    /// Which of the two naming surfaces is live, from [`NameSurface`] — read
+    /// that for the condition. Present on every daemon that knows the field;
+    /// a daemon that predates it decodes as the default, the proxy.
+    #[serde(default)]
+    pub name_surface: NameSurface,
 }
 
 impl OneshotSshRpc for ListSessions {
@@ -623,6 +674,13 @@ pub struct CreateSessionResponse {
     /// `None` prints the notice exactly as this reply's older readers did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_all_opt_out: Option<bool>,
+    /// Which of the two naming surfaces is live, from [`NameSurface`] — read
+    /// that for the condition. Carried on the activation reply, beside the
+    /// two ports and the interim flag it is derived from, because activation
+    /// is where the user is about to rely on the names the surface answers;
+    /// a daemon that predates the field decodes as the default, the proxy.
+    #[serde(default)]
+    pub name_surface: NameSurface,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -1623,7 +1681,15 @@ mod tests {
             // prints on it (NET-123) must not be able to silently drop off.
             interim_loopback: true,
             deny_all_opt_out: None,
+            // So does the surface: the line `min session activate` prints
+            // from it (NET-018) must not be able to silently drop off.
+            name_surface: NameSurface::Native,
         };
+        let json = serde_json_lenient::to_string(&resp).expect("serializes");
+        assert!(
+            json.contains(r#""name_surface":"native""#),
+            "a native-dns daemon must say so on the wire, got: {json}",
+        );
         assert_eq!(round_trip(&resp), resp);
     }
 
@@ -1642,6 +1708,7 @@ mod tests {
             hostname_proxy_port: None,
             zone_answerer_port: None,
             interim_loopback: false,
+            name_surface: NameSurface::Proxy,
         };
         let json = serde_json_lenient::to_string(&opted_out).expect("serializes");
         assert!(
@@ -1669,6 +1736,11 @@ mod tests {
     /// `deny_all_opt_out` rides the same reply and reads the same way — absent
     /// from a daemon that predates it, which is a daemon that cannot have
     /// opted out (NET-077), so the client prints the notice it always did.
+    /// `name_surface` rides the same replies and reads the same way — absent
+    /// from a daemon that predates it, which decodes as the proxy, the read
+    /// that changes nothing: an older daemon's silence is not evidence native
+    /// DNS is live, and a client that assumed it would drop the line that
+    /// points the host's resolver at the answerer (NET-018).
     #[test]
     fn responses_predating_hostname_routing_field_decode_as_absent() {
         let list: ListSessionsResponse =
@@ -1677,6 +1749,7 @@ mod tests {
         assert!(list.hostname_routing_unavailable.is_none());
         assert!(list.hostname_proxy_port.is_none());
         assert!(list.zone_answerer_port.is_none());
+        assert_eq!(list.name_surface, NameSurface::Proxy);
 
         let create: Errorable<CreateSessionResponse> = serde_json_lenient::from_str(
             r#"{"id":"00000000-0000-0000-0000-000000000001","daemon_version":"0.5.0"}"#,
@@ -1693,6 +1766,7 @@ mod tests {
                 // on the flag.
                 assert!(!c.interim_loopback);
                 assert!(c.deny_all_opt_out.is_none());
+                assert_eq!(c.name_surface, NameSurface::Proxy);
             }
             Errorable::Err { error } => panic!("expected Ok, got {error}"),
         }
@@ -1708,6 +1782,7 @@ mod tests {
             hostname_routing_unavailable: None,
             hostname_proxy_port: None,
             zone_answerer_port: None,
+            name_surface: NameSurface::Proxy,
             resource_pool: None,
             sessions: vec![],
         };
@@ -1743,6 +1818,16 @@ mod tests {
         let json = serde_json_lenient::to_string(&discovered).expect("serializes");
         let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
         assert_eq!(back.hostname_proxy_port, Some(41234));
+
+        // The list reply carries the native verdict the same way (NET-018):
+        // `min ls` reads it off this reply, not the activation one.
+        let native = ListSessionsResponse {
+            name_surface: NameSurface::Native,
+            ..resp.clone()
+        };
+        let json = serde_json_lenient::to_string(&native).expect("serializes");
+        let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
+        assert_eq!(back.name_surface, NameSurface::Native);
     }
 
     /// The reply a daemon that predates `daemon_version` sends must still
