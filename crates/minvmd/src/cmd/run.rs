@@ -500,11 +500,72 @@ fn run_foreground() -> Result<()> {
                 crate::net::resolve_gate_sock().context("resolving egress gate socket")?;
             crate::sock::remove_stale_socket(&gate_sock)
                 .context("removing stale egress gate socket")?;
+            // ── The Box Egress Proxy's delivery wiring (NET-132) ─────────────
+            // One token per boot, minted like the marker nonce above: the
+            // proof a delivered connection belongs to this boot, written
+            // ahead of every delivery's header. The peer receives it
+            // in-process, in the wire below; the stand-in acceptor — a
+            // test/e2e surface, never a production one — receives the same
+            // bytes over its start-up channel, so a same-uid host process
+            // that finds the socket's path can never hold the token too.
+            let token: [u8; switch::bep_host::TOKEN_LEN] = {
+                let mut buf = [0u8; switch::bep_host::TOKEN_LEN];
+                std::fs::File::open("/dev/urandom")
+                    .and_then(|mut f| f.read_exact(&mut buf))
+                    .context("reading /dev/urandom for the box egress proxy token")?;
+                buf
+            };
+            // The proxy's unix socket, named beside the switch and gate
+            // sockets the same way: the one path every delivered flow dials.
+            // Nothing listens there on a production boot — the proxy's own
+            // acceptor is a later task — so a box's connection to the
+            // proxy's address is reset, the acceptor-down answer the pool
+            // is specified to give.
+            let proxy_sock = switch_sock.with_file_name("gvproxy-bep.sock");
+            // MINVMD_BEP_STUB is the e2e lane's flag and nothing else's: it
+            // is what puts a stand-in acceptor at the path the wire names,
+            // so the lane can read what a delivery presents. The handle is
+            // underscore-bound: its serving thread owns the socket and
+            // outlives this block for the daemon's life, and the supervisor
+            // has nothing further to ask of it.
+            let _bep_stub = if std::env::var_os("MINVMD_BEP_STUB").is_some() {
+                let (start_tx, start_rx) = std::sync::mpsc::channel();
+                match crate::net::bep_stub::spawn(proxy_sock.clone(), start_rx) {
+                    Ok(stub) => {
+                        let _ = start_tx.send(crate::net::bep_stub::StubStart {
+                            token,
+                            daemon_pid: std::process::id(),
+                        });
+                        tracing::info!(
+                            sock = %proxy_sock.display(),
+                            "box egress proxy stand-in acceptor up (test/e2e surface)"
+                        );
+                        Some(stub)
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "failed to bind the box egress proxy stand-in acceptor"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            // The wire the peer carries: the acceptor's socket, this boot's
+            // token, and the per-source cap that is each registered box's
+            // share of the pool. The default cap is the recorded working
+            // value (spec NET-132), named here so the two cannot drift.
+            let wire = switch::bep_host::BepWire::new(proxy_sock, token)
+                .with_per_source_cap(switch::bep_host::DEFAULT_PER_SOURCE_CAP);
             match crate::net::HostGvproxy::spawn(
                 binary,
                 switch_sock,
                 crate::net::DEFAULT_DATAPATH_CHECK_INTERVAL,
                 &boxes,
+                wire,
+                std::sync::Arc::new(RegisteredBoxes::new(boxes.table())),
             ) {
                 Ok(gvproxy) => {
                     let subnet = boxes.subnet();
@@ -731,6 +792,30 @@ fn run_foreground() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The registered boxes a delivered connection is partitioned by
+/// (NET-132): the rows this supervisor's box table holds — every one a
+/// host-side fact the guest never asserts — polled by the pool every stack
+/// turn, so a row that lands grows its box's share within a turn and a row
+/// that leaves takes its sockets with it.
+pub struct RegisteredBoxes {
+    /// The registry's live read-only view: every registration and
+    /// withdrawal the table sees reaches the pool through it.
+    table: crate::box_registry::BoxTable,
+}
+
+impl RegisteredBoxes {
+    /// The source over `table`.
+    pub fn new(table: crate::box_registry::BoxTable) -> Self {
+        Self { table }
+    }
+}
+
+impl switch::bep_host::BepBoxSource for RegisteredBoxes {
+    fn box_switch_addresses(&self) -> Vec<std::net::Ipv4Addr> {
+        self.table.rows().iter().map(|row| row.switch_addr()).collect()
+    }
 }
 
 #[cfg(test)]
