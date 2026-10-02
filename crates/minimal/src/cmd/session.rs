@@ -126,6 +126,14 @@ pub(crate) fn vm_host_control_sock(global: &GlobalArgs) -> Option<std::path::Pat
         return None;
     }
     let ssh_sock = client::resolve_socket_path(global.minimal_dir.as_deref(), true).ok()?;
+    control_sock_beside(&ssh_sock)
+}
+
+/// The control socket beside an ssh socket a client already resolved (T66's
+/// rule, one definition for every caller): the VM host daemon serves both
+/// from the same provider dir, so the socket a listing or an activation
+/// reached a VM on is the one to find that VM's control socket beside.
+pub(crate) fn control_sock_beside(ssh_sock: &std::path::Path) -> Option<std::path::PathBuf> {
     ssh_sock
         .parent()
         .map(|dir| dir.join(minvmd::control::CONTROL_SOCK_FILE))
@@ -147,7 +155,18 @@ pub(crate) fn vm_host_control_sock(global: &GlobalArgs) -> Option<std::path::Pat
 pub(crate) async fn vm_host_answerer_status(
     global: &GlobalArgs,
 ) -> Option<minimald_rpc::ZoneAnswererStatus> {
-    let sock_path = vm_host_control_sock(global)?;
+    vm_host_answerer_status_at(vm_host_control_sock(global)).await
+}
+
+/// [`vm_host_answerer_status`]'s read over one control socket the caller
+/// resolved itself: the same bounded read, the same silence rules, over any
+/// VM host daemon's socket — `min ls` reads each listed VM's own state
+/// beside the ssh socket its listing reached that VM on (NET-057's
+/// enumeration), so the socket is the caller's to name.
+pub(crate) async fn vm_host_answerer_status_at(
+    sock_path: Option<std::path::PathBuf>,
+) -> Option<minimald_rpc::ZoneAnswererStatus> {
+    let sock_path = sock_path?;
     let read = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
         control_request_with_vm_host(&sock_path, minimald_rpc::BoxControlRequest::AnswererStatus),

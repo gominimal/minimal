@@ -1857,10 +1857,19 @@ async fn ls_shows_vm_per_box() {
     // line says which surface its own names answer through — here fed
     // straight to the formatter, the way the verdict a configured host's
     // reads decide arrives at it, with the host daemon answering through
-    // its proxy and the named VM through native DNS.
+    // its proxy and the named VM through native DNS. NET-138's answerer row
+    // is per VM for the same reason's host half: each VM's own control
+    // socket read decides its own row, so a VM whose minvmd holds the
+    // machine's port says so while a sibling registered with another
+    // daemon names that holder instead — one `Holder` and one `Registered`
+    // here, fed the same way.
     let surfaces = vec![
         Some(crate::resolver::LiveSurface::Proxy),
         Some(crate::resolver::LiveSurface::Native),
+    ];
+    let answerers = vec![
+        Some(minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 }),
+        Some(minimald_rpc::ZoneAnswererStatus::Registered { port: 7_656 }),
     ];
     let mut out = Vec::new();
     format_ls_across_vms(
@@ -1871,7 +1880,7 @@ async fn ls_shows_vm_per_box() {
         },
         &listings,
         &surfaces,
-        None,
+        &answerers,
     )
     .expect("rendering the two-VM listing");
     let table = String::from_utf8(out).expect("the listing is UTF-8");
@@ -1903,10 +1912,37 @@ async fn ls_shows_vm_per_box() {
         surface_line_of("alpha").contains("native DNS is the live name surface"),
         "the VM the hook routes to is named native:\n{table}"
     );
+    let answerer_row_of = |vm: &str| {
+        table
+            .lines()
+            .find(|l| l.starts_with("ZONE ANSWERER:") && l.contains(vm))
+            .unwrap_or_else(|| panic!("a ZONE ANSWERER line for {vm} in:\n{table}"))
+            .to_string()
+    };
+    assert!(
+        answerer_row_of("default")
+            .contains("this VM's minvmd holds it on 127.0.0.1:7656"),
+        "the VM whose minvmd holds the port says so, in its own row:\n{table}"
+    );
+    assert!(
+        answerer_row_of("alpha")
+            .contains("another VM host daemon holds it on 127.0.0.1:7656"),
+        "the registered VM names the holder, in its own row:\n{table}"
+    );
+    assert!(
+        !answerer_row_of("alpha").contains("this VM's minvmd holds it"),
+        "a VM registered with another daemon must not claim its own minvmd \
+         holds the port:\n{table}"
+    );
+    assert!(
+        !answerer_row_of("default").contains("another VM host daemon"),
+        "a holder must not be named as a sibling's registration:\n{table}"
+    );
 
     // One VM listed renders exactly the single-VM listing `min ls` has always
-    // printed — the surface line included, verdict and all: the column is a
-    // fact about a multi-VM host, not a new format.
+    // printed — the surface line included, verdict and all, and the VM's own
+    // answerer row with it: the column is a fact about a multi-VM host, not a
+    // new format.
     let single = &listings[1..];
     let mut delegated = Vec::new();
     format_ls_across_vms(
@@ -1917,7 +1953,7 @@ async fn ls_shows_vm_per_box() {
         },
         single,
         &surfaces[1..],
-        None,
+        &answerers[1..],
     )
     .expect("rendering the single-VM listing");
     let mut direct = Vec::new();
@@ -1929,7 +1965,7 @@ async fn ls_shows_vm_per_box() {
         },
         &single[0].resp,
         surfaces[1],
-        None,
+        answerers[1],
     )
     .expect("format_ls on the same listing");
     assert_eq!(
@@ -1952,7 +1988,7 @@ async fn ls_shows_vm_per_box() {
         },
         &listings,
         &[],
-        None,
+        &[],
     )
     .expect("rendering the two-VM listing as JSON");
     let listing: serde_json_lenient::Value =
@@ -2432,6 +2468,10 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
         VmListing {
             vm: vm.to_owned(),
             resp,
+            // A synthetic listing: no VM host daemon sits behind it, so
+            // there is no control socket to read a state from — the shape
+            // this render is fed, same as a listing that read none.
+            control_sock: None,
         }
     };
 
@@ -2457,7 +2497,7 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
         },
         &listings,
         &[],
-        None,
+        &[],
     )
     .expect("rendering the two-VM listing");
     let ls = String::from_utf8(out).expect("the listing is UTF-8");
