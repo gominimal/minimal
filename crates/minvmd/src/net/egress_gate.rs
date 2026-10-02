@@ -4396,7 +4396,7 @@ mod tests {
     /// phase (`Announced`) still admits in-plan lease-run sources, and the
     /// row-less reach it leaves is what that task retires.
     #[tokio::test]
-    async fn hostile_relay_on_a_registered_row_reaches_only_pinned_answers() {
+    async fn hostile_relay_reaches_only_the_pinned_answers() {
         let registry = BoxRegistry::new(SUBNET);
         registry.register(
             BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
