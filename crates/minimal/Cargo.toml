@@ -1,6 +1,6 @@
 [package]
 name = "minimal"
-description = "The min session CLI, which pairs with and talks to minimald."
+description = "The min CLI: sessions, tasks, loadouts, packages, networking, diagnostics and project setup, over SSH to minimald, auto-spawning minvmd where the daemon lives in a microVM."
 rust-version.workspace = true
 version.workspace = true
 edition.workspace = true

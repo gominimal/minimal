@@ -26,15 +26,13 @@ The CLI reference overview is [docs/reference/cli.md](docs/reference/cli.md).
 
 ## Workspace crates
 
-To list the workspace's crates and their descriptions, run:
-
-    cargo metadata --no-deps --format-version 1 \
-      | python3 -c "import json,sys
-    for p in sorted(json.load(sys.stdin)['packages'], key=lambda p: p['name']):
-        print('\t'.join([p['name'], p['description'] or '-']))"
-
-Use this when you need to know which crate is responsible for something, or
-where a change belongs.
+Run `just crates` to print the workspace's crates with their descriptions. Each
+description lives in that crate's `Cargo.toml`, so the list cannot drift from
+the code. Use it when you need to know which crate is responsible for
+something, or where a change belongs.
+[docs/architecture.md](docs/architecture.md) §3 adds which plane each crate
+belongs to (build, session, shared), and §0 explains those groupings and the
+product surface.
 
 ## Platform matrix
 
@@ -87,11 +85,11 @@ mac-buildable (see the comments in `.github/workflows/ci-macos.yml`).
   Homebrew (`brew install slp/krun/libkrun`) for the VM recipes (`just up`,
   `just test-vm`, `just e2e`); `jq`, `zstd`, and `cpio` (`brew install jq zstd
   cpio`) for the `artifacts`/`initramfs` scripts those recipes run.
-- **python3**, on any host running `just e2e` / `just e2e-native`: the session
-  e2e drives its interactive attaches through a real pty
-  ([scripts/e2e-attach-pty.py](scripts/e2e-attach-pty.py)), because only a tty
-  can answer the session-exit prompt. Stdlib only — no packages to install —
-  but the interpreter must be on `PATH`.
+- **python3**, on any host: `just crates` runs it (stdlib only). The session e2e
+  needs it too, because its interactive attaches run through a real pty
+  ([scripts/e2e-attach-pty.py](scripts/e2e-attach-pty.py)). Only a tty can
+  answer the session-exit prompt. No packages to install, but the interpreter
+  must be on `PATH`.
 
 ## justfile recipes
 
@@ -198,7 +196,7 @@ proves, `nightly` ships.
   [docs/ci-strategy.md](docs/ci-strategy.md).
 - **Do not restate an inventory.** Counts and lists of crates, workflows,
   binaries, and recipes are wrong as soon as one changes. Link to the document
-  that owns the list, or give the command that prints it (`cargo metadata`,
+  that owns the list, or give the command that prints it (`just crates`,
   `ls .github/workflows/`, `just --list`). The prose rules reject a stated
   count (`inventory.StatedCount`).
 

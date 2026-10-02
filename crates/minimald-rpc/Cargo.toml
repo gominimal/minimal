@@ -1,6 +1,6 @@
 [package]
 name = "minimald-rpc"
-description = "Wire contract for minimald's oneshot SSH RPCs and for the exec channel's request vocabulary."
+description = "The client/daemon wire contract: minimald's oneshot SSH RPC request/response types, the tagged exec-channel vocabulary, and the task-env and trace propagation keys. Transport-free (no russh, no tokio); the one contract both min and minimald build against."
 rust-version.workspace = true
 version = "0.0.1"
 edition.workspace = true
