@@ -17,6 +17,8 @@
 
 #![cfg(minvmd_libkrun)]
 
+mod common;
+
 use serial_test::serial;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
@@ -42,8 +44,8 @@ fn minvmd_bin() -> std::ffi::OsString {
 #[serial]
 #[ignore = "gated MINVMD_E2E=1; requires Mac with libkrun, kernel, and rootfs"]
 fn boot_integration_ready_marker_round_trip() {
-    if std::env::var("MINVMD_E2E").as_deref() != Ok("1") {
-        eprintln!("boot_integration: MINVMD_E2E != 1, skipping");
+    if !common::e2e() {
+        common::skip_or_fail("boot_integration", "MINVMD_E2E != 1");
         return;
     }
 

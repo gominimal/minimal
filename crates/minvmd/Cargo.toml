@@ -61,6 +61,7 @@ version.workspace = true
 
 [dev-dependencies]
 serial_test.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 russh-sftp.workspace = true
 

@@ -23,6 +23,8 @@
 
 #![cfg(minvmd_libkrun)]
 
+mod common;
+
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -58,8 +60,8 @@ const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
 /// Returns true if the e2e suite is enabled (`MINVMD_E2E=1`), asserting the
 /// required env vars are present when so.
 fn e2e_enabled() -> bool {
-    if std::env::var("MINVMD_E2E").as_deref() != Ok("1") {
-        eprintln!("minimald_session_integration: MINVMD_E2E != 1, skipping");
+    if !common::e2e() {
+        common::skip_or_fail("minimald_session_integration", "MINVMD_E2E != 1");
         return false;
     }
     for var in &[

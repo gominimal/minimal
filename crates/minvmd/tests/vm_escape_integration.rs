@@ -58,13 +58,13 @@
 //! - `#[ignore]` + `MINVMD_E2E=1`: skipped unless explicitly enabled.
 //! - `MINVMD_KERNEL_PATH`, `MINVMD_ROOTFS_PATH`, `MINVMD_INITRAMFS` must
 //!   point to the kernel, the GENERIC rootfs, and the minimald initramfs.
-//! - `MINVMD_GVPROXY_BIN` points at gvproxy when a switch is provided. When
-//!   it is absent the test skips like the other gates: minvmd boots the VM
-//!   switchless, there is no egress — declared, spoofed, or otherwise — and
-//!   the bound's landing edge does not exist to test. The harness lanes set
-//!   `MINVMD_E2E=1` but fetch gvproxy only for the session-e2e step after
-//!   them, so the absence is a skip, not a failure; the bound is proved
-//!   where the switch is provided (`just test-vm`, the nightly).
+//! - The gvproxy switch, from `common::gvproxy_bin`: `MINVMD_GVPROXY_BIN`
+//!   when set, else under `MINVMD_E2E=1` the pinned binary fetched by
+//!   `scripts/fetch-gvproxy.sh`, SHA-256-checked against
+//!   `vendor/gvproxy/gvproxy.lock`. Without the switch minvmd boots the VM
+//!   switchless and the bound's landing edge does not exist to test, so under
+//!   `MINVMD_E2E=1` a switch that cannot be had fails the test; the skip is
+//!   only for a run without `MINVMD_E2E=1`.
 
 #![cfg(minvmd_libkrun)]
 
@@ -79,6 +79,8 @@ use std::time::{Duration, Instant};
 
 use serial_test::serial;
 use tempfile::TempDir;
+
+mod common;
 
 /// Isolated `XDG_STATE_HOME` under /tmp: macOS's $TMPDIR is deep enough that
 /// `<tempdir>/minimal/providers/local-minvmd0/*.sock` would overflow sun_path.
@@ -118,12 +120,13 @@ const MINIMAL_SESSION_ID_ENV: &str = "MINIMAL_SESSION_ID";
 /// any head it does not classify as the frame stream.
 const GATE_SHUTTLE_HEAD: &[u8] = b"POST /connect HTTP/1.0\r\nHost: localhost\r\n\r\n";
 
-/// Returns true if the e2e suite is enabled (`MINVMD_E2E=1`), asserting the
-/// required env vars are present when so.
-fn e2e_enabled() -> bool {
-    if std::env::var("MINVMD_E2E").as_deref() != Ok("1") {
-        eprintln!("vm_escape_integration: MINVMD_E2E != 1, skipping");
-        return false;
+/// The gvproxy switch to boot with when the e2e suite is enabled
+/// (`MINVMD_E2E=1`), asserting the required env vars are present when so;
+/// `None` when the suite skips.
+fn e2e_enabled() -> Option<PathBuf> {
+    if !common::e2e() {
+        common::skip_or_fail("vm_escape_integration", "MINVMD_E2E != 1");
+        return None;
     }
     for var in &[
         "MINVMD_KERNEL_PATH",
@@ -137,23 +140,15 @@ fn e2e_enabled() -> bool {
     }
     // The switch is the gate's far end: without it the VM boots switchless and
     // there is no egress for anything — declared, spoofed, or otherwise — to
-    // reach, so the bound's landing edge does not exist to test. The harness
-    // lanes that run the ignored tests (`test-kvm`, the macOS harness step)
-    // set `MINVMD_E2E=1` but fetch gvproxy only for the session-e2e step
-    // after them, so an absent variable is a skip, like `MINVMD_E2E != 1`:
-    // the bound is proved where the switch is provided, and the lane stays
-    // green where it is not.
-    match std::env::var_os("MINVMD_GVPROXY_BIN") {
-        Some(_) => true,
-        None => {
-            eprintln!(
-                "vm_escape_integration: MINVMD_GVPROXY_BIN is not set, skipping: \
-                 without the switch there is no egress gate to test the bound at \
-                 (set it to the gvproxy binary to run the suite)"
-            );
-            false
-        }
+    // reach. Under MINVMD_E2E=1 the helper fetches the pinned switch or panics.
+    let gvproxy = common::gvproxy_bin();
+    if gvproxy.is_none() {
+        common::skip_or_fail(
+            "vm_escape_integration",
+            "no gvproxy switch, so no egress gate to test the bound at",
+        );
     }
+    gvproxy
 }
 
 /// A booted minimald guest VM, torn down on drop.
@@ -178,8 +173,9 @@ impl Drop for Guest {
 impl Guest {
     /// Boots `minvmd boot --foreground` with minimald as the guest init and
     /// blocks until the `vm-up` (READY) line, capturing the daemon's stdout
-    /// into the shared log. Panics on boot timeout.
-    fn boot() -> Guest {
+    /// into the shared log, with `gvproxy` as the VM's switch. Panics on boot
+    /// timeout.
+    fn boot(gvproxy: &Path) -> Guest {
         let state = short_state_dir();
         let sock_path = state
             .path()
@@ -195,6 +191,7 @@ impl Guest {
         let mut child = Command::new(exe)
             .args(["boot", "--foreground"])
             .env("XDG_STATE_HOME", state.path())
+            .env("MINVMD_GVPROXY_BIN", gvproxy)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -1085,12 +1082,12 @@ struct Attempt {
 /// resident union.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-#[ignore = "gated MINVMD_E2E=1; requires libkrun, kernel/rootfs/initramfs images, and MINVMD_GVPROXY_BIN"]
+#[ignore = "gated MINVMD_E2E=1; requires libkrun, kernel/rootfs/initramfs images, and the gvproxy switch"]
 async fn vm_escape_bounded_to_resident_union() {
-    if !e2e_enabled() {
+    let Some(gvproxy) = e2e_enabled() else {
         return;
-    }
-    let guest = Guest::boot();
+    };
+    let guest = Guest::boot(&gvproxy);
     let subnet = switch::DEFAULT_SUBNET;
     let alias = subnet.host_alias();
 
