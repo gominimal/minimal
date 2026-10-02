@@ -4188,6 +4188,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "fd-lock",
+ "hickory-proto",
  "libc",
  "minimald-rpc",
  "mlog",
