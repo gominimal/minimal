@@ -1223,6 +1223,87 @@ pub fn resolve_socket_path_named(
     )
 }
 
+/// One VM's daemon socket with the name that selects it: the pair a client
+/// needs to reach one VM's daemon in particular — `--vm` selects it, and a
+/// listing (NET-057) or a box-name resolution (NET-058) spans every entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmSocket {
+    /// The VM's name: [`paths::DEFAULT_VM_NAME`] for the default VM, the
+    /// subdirectory's name for a named one.
+    pub vm: String,
+    /// The socket that VM's daemon serves.
+    pub sock: std::path::PathBuf,
+}
+
+/// Enumerate every VM's socket on this host, default VM first: the default
+/// VM's provider dir plus one entry per named VM that has a state dir
+/// (NET-052's layout). A VM that is not running is still enumerated — its
+/// daemon simply is not answering, which each caller reports its own way —
+/// so the set is the host's, not the running half of it.
+///
+/// The native `minimald` backend hosts no VMs, so it enumerates nothing:
+/// callers fall back to [`resolve_socket_path`], the one socket that backend
+/// serves (and the path that refuses a named `--vm` there, as it must).
+/// Directories whose name breaks the naming rule are skipped rather than
+/// reported: the provider dir also holds non-VM trappings — `ssh.sock`, the
+/// reserved `guest/` payload dir — and a stray must not fail a listing.
+///
+/// # Errors
+///
+/// [`std::io::Error`] when `minimal_dir_override` is not usable or the
+/// provider dir cannot be read. A provider dir that does not exist yet
+/// (no VM created, ever) is not an error: the default VM is still reported,
+/// with a socket nothing serves yet.
+pub fn enumerate_vm_sockets(
+    minimal_dir_override: Option<&std::path::Path>,
+    use_minvmd: bool,
+) -> std::io::Result<Vec<VmSocket>> {
+    let base = resolve_state_base(minimal_dir_override)?;
+    let kind = client_provider_kind(use_minvmd);
+    if kind != paths::ProviderKind::Minvmd {
+        return Ok(Vec::new());
+    }
+    let provider = paths::provider_instance_dir(&base, kind, 0);
+    let dir = provider.as_utf8_path().as_std_path();
+    let mut vms = vec![VmSocket {
+        vm: paths::DEFAULT_VM_NAME.to_string(),
+        sock: dir.join(paths::SSH_SOCK_FILE),
+    }];
+    // Deterministic order for the named half: alphabetical, after the
+    // default VM's entry, so a resolution that reports the VMs it looked at
+    // always reports them in the same order.
+    let mut named: Vec<String> = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // No provider dir yet: no VM has ever been created on this host.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vms),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // `default` is the unnamed VM, already first; a name that breaks the
+        // rule is not a VM (see the provider dir's other trappings).
+        if name != paths::DEFAULT_VM_NAME && paths::validate_vm_name(name).is_ok() {
+            named.push(name.to_string());
+        }
+    }
+    named.sort_unstable();
+    for vm in named {
+        vms.push(VmSocket {
+            sock: dir.join(&vm).join(paths::SSH_SOCK_FILE),
+            vm,
+        });
+    }
+    Ok(vms)
+}
+
 /// Sends the process trace context as a `TRACEPARENT` channel env request.
 /// Best-effort and reply-less: trace propagation is a diagnostic aid, and a
 /// daemon predating the variable ignores unknown env names anyway.
@@ -1699,6 +1780,77 @@ mod tests {
             None => unsafe { std::env::remove_var("GIT_CEILING_DIRECTORIES") },
         }
         assert_eq!(plain_probe, None, "non-repo must probe to None");
+    }
+
+    /// Enumerating the host's VMs covers the default VM plus every named one
+    /// with a state dir — default first, the rest alphabetical — and skips the
+    /// trappings a provider dir also holds (NET-057 lists across every entry
+    /// this returns; NET-058's resolution probes them).
+    #[test]
+    fn enumerates_the_default_vm_then_every_named_one() {
+        let base = tempfile::tempdir().unwrap();
+        let provider = base.path().join("providers").join("local-minvmd0");
+        for vm in ["beta", "alpha"] {
+            std::fs::create_dir_all(provider.join(vm)).unwrap();
+        }
+        // The provider dir's own trappings: a socket file and a reserved,
+        // non-VM directory. Neither is a VM, and neither must fail the
+        // enumeration.
+        std::fs::write(provider.join("ssh.sock"), b"").unwrap();
+        std::fs::create_dir_all(provider.join("guest")).unwrap();
+
+        let vms = super::enumerate_vm_sockets(Some(base.path()), true).unwrap();
+        assert_eq!(
+            vms,
+            vec![
+                super::VmSocket {
+                    vm: "default".to_string(),
+                    sock: provider.join("ssh.sock"),
+                },
+                super::VmSocket {
+                    vm: "alpha".to_string(),
+                    sock: provider.join("alpha").join("ssh.sock"),
+                },
+                super::VmSocket {
+                    vm: "beta".to_string(),
+                    sock: provider.join("beta").join("ssh.sock"),
+                },
+            ]
+        );
+    }
+
+    /// A host with no provider dir yet still enumerates the default VM: a
+    /// socket nothing serves yet is a valid probe, not an error — the host's
+    /// set is enumerated, not the running half of it.
+    #[test]
+    fn a_host_with_no_provider_dir_still_lists_the_default_vm() {
+        let base = tempfile::tempdir().unwrap();
+        let vms = super::enumerate_vm_sockets(Some(base.path()), true).unwrap();
+        assert_eq!(
+            vms,
+            vec![super::VmSocket {
+                vm: paths::DEFAULT_VM_NAME.to_string(),
+                sock: base
+                    .path()
+                    .join("providers")
+                    .join("local-minvmd0")
+                    .join("ssh.sock"),
+            }]
+        );
+    }
+
+    /// The native `minimald` backend hosts no VMs, so it enumerates nothing:
+    /// callers fall back to the one socket that backend serves. (Linux-only,
+    /// as [`super::native_backend_refuses_a_named_vm`]: `client_provider_kind`
+    /// forces the minvmd kind on macOS, so a `false` there is not the native
+    /// backend.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_native_backend_enumerates_no_vms() {
+        let base = tempfile::tempdir().unwrap();
+        assert!(super::enumerate_vm_sockets(Some(base.path()), false)
+            .unwrap()
+            .is_empty());
     }
 
     /// An initialized repository with an unborn `HEAD` (no commits yet) still
