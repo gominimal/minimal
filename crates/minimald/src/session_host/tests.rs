@@ -2517,6 +2517,40 @@ async fn guest_launch_refuses_only_the_unplaced_host_address_box() {
     }
 }
 
+/// The mount table an unset knob resolves to is the daemon's own, read
+/// live: the knob's `None` is every production path, and the guest's
+/// host-address boxes rest on that resolution — a guest's own boot mounts
+/// the `nsdelegate` cgroup2 its tree sits on, and a launch that answered
+/// over *no* table read that real tree as not real and refused every
+/// host-address box in it as a broken image, which is what a native host
+/// without a tree never does and why the VM lanes were the only ones to
+/// see it. Pinned at the seam both halves of the launch answer over, the
+/// same one the stand-in launches above drive through the knob: `None`
+/// resolves to the daemon's own table, and a stand-in is answered over as
+/// itself, never widened to the host's.
+#[test]
+fn a_none_mountinfo_knob_answers_over_the_daemons_own_mount_table() {
+    let live = sandbox2::classifier::own_mountinfo();
+    if live.is_none() {
+        eprintln!(
+            "skipping a_none_mountinfo_knob_answers_over_the_daemons_own_mount_table: \
+             this host's mount table cannot be read, so the live resolution cannot \
+             be told apart from a dropped one here"
+        );
+        return;
+    }
+    assert_eq!(
+        super::launch_mountinfo(None),
+        live,
+        "a launch with no stand-in answers over the daemon's own, live mount table"
+    );
+    assert_eq!(
+        super::launch_mountinfo(Some("stand-in table".to_string())).as_deref(),
+        Some("stand-in table"),
+        "a stand-in table is answered over as itself"
+    );
+}
+
 /// NET-079's exception, for the boxes it is written for: on a native host
 /// that cannot decide per box, a host-address box declared deny-all or
 /// carrying an egress section runs anyway — never refused on the

@@ -2502,6 +2502,21 @@ impl Drop for BoxLeafGuard {
     }
 }
 
+/// The mount table a host-address launch answers over: the knob's when one
+/// was set, the daemon's own, read live, when none was — the knob's `None`
+/// is every production path ([`SandboxLauncher::classifier_mountinfo`]).
+///
+/// The distinction is not cosmetic. `None` handed through as "no table at
+/// all" makes [`sandbox2::classifier::tree_is_real`] say a real tree is not
+/// real — it answers from the table — so a guest, whose own boot mounted the
+/// `nsdelegate` cgroup2 the tree sits on, would refuse every host-address
+/// box it launched as a broken image, while a native host without a tree
+/// kept running boxes unenforced: the one table read here is what both
+/// halves of the launch — the decision and the placement — answer over.
+fn launch_mountinfo(knob: Option<String>) -> Option<String> {
+    knob.or_else(sandbox2::classifier::own_mountinfo)
+}
+
 /// Creates the classifier leaf this session's host-address box is placed in
 /// (NET-079), under the tree the privileged step installs on a native host
 /// (`scripts/install-host-classifier.sh`) and the guest daemon mounts for
@@ -3136,18 +3151,27 @@ impl SessionLauncher for SandboxLauncher {
         // The whole decision is kept, not only its verdict bit: the refusal
         // and the advice below say which box they are for out of the cause
         // that produced it, so the launch's words and the start-up line
-        // name the same ground.
+        // name the same ground. The knob's `None` — every production path —
+        // is the daemon's own mount table read live here, never "no table
+        // at all": a launch that answered over no table would read even a
+        // guest's `nsdelegate` cgroup2 as not real and refuse every
+        // host-address box in it as a broken image, so the live read and
+        // the decision share this one blocking hop, and the same one table
+        // is what the placement below answers over too.
         let (leaf, decision) = if matches!(network_mode, NetworkMode::HostNet) {
             let root = classifier_root.clone();
-            let mountinfo = classifier_mountinfo.clone();
-            let decision = tokio::task::spawn_blocking(move || {
-                crate::net::classifier::decide_now(&root, mountinfo.as_deref(), guest)
+            let knob = classifier_mountinfo.clone();
+            let (mountinfo, decision) = tokio::task::spawn_blocking(move || {
+                let mountinfo = launch_mountinfo(knob);
+                let decision =
+                    crate::net::classifier::decide_now(&root, mountinfo.as_deref(), guest);
+                (mountinfo, decision)
             })
             .await
             .map_err(io::Error::other)?;
             let leaf = create_session_leaf(
                 &classifier_root,
-                classifier_mountinfo.as_deref(),
+                mountinfo.as_deref(),
                 guest,
                 &session_id,
                 &session_name,
