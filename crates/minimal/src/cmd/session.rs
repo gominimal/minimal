@@ -678,33 +678,45 @@ pub(crate) async fn activate_session(
     // from it.
     if let Some(answerer_port) = created.zone_answerer_port {
         let detection = crate::resolver::session_detection().await;
-        let name_advisory = crate::resolver::session_advisory_at(
-            &detection,
-            Some(answerer_port),
-            created.interim_loopback,
-        );
-        if let Some(advisory) = &name_advisory {
-            eprintln!("{advisory}");
-        }
         // NET-018: name the live surface at the moment the user is about to
         // rely on the names — decided in the one function both verbs share
-        // (`resolver`), from the same detection the advisory read: this
+        // (`resolver`), from the same detection the advisory reads: this
         // host's hook (and the stub-bypass blocker that says whether its
         // lookups consult what the hook configures), the daemon's
         // answerer-bound report, and the reserved range on this host's own
-        // loopback. `None` — the answerer not bound — prints nothing: no
-        // native surface to name, and the ports and the advisory above
-        // have told the proxy's story. The proxy's half is said with the
-        // native arm either way (NET-019): the `HTTP(S)_PROXY` recipes
-        // this activation prints keep working beside native DNS, so
-        // nothing already captured goes stale.
-        if let Some(verdict) = crate::resolver::live_name_surface_with_range_at(
+        // loopback. Decided before the advisory prints only so the range
+        // its read holds can be the advisory's too — one probe, one host —
+        // while the printed order stays the advisory's and then the
+        // surface's. `None` — the answerer not bound — prints nothing: no
+        // native surface to name, and the ports and the advisory have told
+        // the proxy's story. The proxy's half is said with the native arm
+        // either way (NET-019): the `HTTP(S)_PROXY` recipes this activation
+        // prints keep working beside native DNS, so nothing already
+        // captured goes stale.
+        let surface_verdict = crate::resolver::live_name_surface_with_range_at(
             &detection,
             Some(answerer_port),
             created.answerer_bound,
         )
-        .await
-        {
+        .await;
+        // The advisory shares that verdict's range read: the daemon's
+        // interim flag is not this host's range fact — on a VM-backed host
+        // it reads the guest's loopback, which always carries the range —
+        // so a hook that routes over a loopback that lacks the range is
+        // told the range is what is missing, not left with a silent
+        // advisory beside a verdict that names the proxy for exactly that.
+        let name_advisory = crate::resolver::session_advisory_at(
+            &detection,
+            Some(answerer_port),
+            created.interim_loopback,
+            surface_verdict
+                .as_ref()
+                .and_then(|verdict| verdict.range_present),
+        );
+        if let Some(advisory) = &name_advisory {
+            eprintln!("{advisory}");
+        }
+        if let Some(verdict) = surface_verdict {
             // The host-side record of that verdict, the half the daemon's own
             // log cannot make: a daemon can name only the answerer *it* binds
             // (see the daemon's `log_live_name_surface`), so the surface this

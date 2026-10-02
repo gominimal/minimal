@@ -798,14 +798,16 @@ pub(crate) fn command(port: u16) -> String {
 }
 
 /// The advisory for one session start, as a function of the hook state, the
-/// daemon's interim verdict, and whether anything blocks the command
+/// daemon's interim verdict, whether the reserved local range read present
+/// on this host's own loopback, and whether anything blocks the command
 /// (NET-122, NET-123's interim arm). Pure.
 ///
 /// `None` — nothing to say — when the hook already routes the zone to this
-/// answerer, the daemon did not publish at the interim, *and* nothing
-/// blocks the command. Otherwise the advisory says what is missing and
-/// names the exact command. The interim re-surfaces the advisory even when
-/// the hook routes (NET-123: "re-surface
+/// answerer, the daemon did not publish at the interim, the range read
+/// present on this host's own loopback, *and* nothing blocks the command.
+/// Otherwise the advisory says what is missing and names the exact command.
+/// The interim re-surfaces the advisory even when the hook routes (NET-123:
+/// "re-surface
 /// the advisory of NET-122"): a session on the interim is a fact the user
 /// has no other way to see. The interim fact names the step that ends it:
 /// installing the range on the host — by design §7.1 the job of the same
@@ -814,6 +816,18 @@ pub(crate) fn command(port: u16) -> String {
 /// command the advisory names is therefore said to configure the resolver,
 /// and the range fact stands beside it rather than under it, so a user who
 /// ran the command is not told it ended the interim. String assembly only.
+///
+/// `range_present` is this host's own read of the range — the one read the
+/// live-surface verdict shares with this advisory (see
+/// [`session_advisory_at`]) — and not the daemon's interim flag, which on a
+/// VM-backed host reads the guest's loopback and always says present, so a
+/// daemon's `false` cannot vouch for the host whose names the verdict
+/// decides. A read that says absent keeps the advisory from falling quiet
+/// on a hook that routes — the very state whose verdict names the proxy for
+/// exactly that missing range — and adds the fact saying so. `None`, no
+/// read made, claims nothing: the advisory stays quiet where it did, the
+/// one start that reaches its quiet arm without a read being a reply whose
+/// answerer is not bound, where no verdict prints beside it to disagree.
 ///
 /// `blocker` names why the command would do nothing on this host — a host
 /// whose lookups never reach the resolver the command configures — in which
@@ -828,6 +842,7 @@ pub(crate) fn advisory_at(
     hook: &Hook,
     port: u16,
     interim: bool,
+    range_present: Option<bool>,
     blocker: Option<&str>,
 ) -> Option<String> {
     // A hook routing this answerer's port is configured, but only on a
@@ -836,8 +851,15 @@ pub(crate) fn advisory_at(
     // would tell the user their resolver is set up while no host process's
     // lookup consults it, and `*.{ZONE}` would not resolve — NET-122's
     // WHILE clause is about the resolver that works, not the one whose
-    // configuration is on paper.
-    if hook.routes(port) && !interim && blocker.is_none() {
+    // configuration is on paper. The range beside them is the host's own
+    // read, the verdict's read: a hook that routes over a loopback that
+    // lacks the range is a host the verdict calls the proxy, and the
+    // advisory says the range is what is missing there rather than
+    // staying quiet on the daemon's interim flag, which on a VM-backed
+    // host reads the guest's loopback — always present — and not the host
+    // the names resolve on.
+    if hook.routes(port) && !interim && !matches!(range_present, Some(false)) && blocker.is_none()
+    {
         return None;
     }
     let mut facts = Vec::new();
@@ -851,6 +873,19 @@ pub(crate) fn advisory_at(
         facts.push(format!(
             "this session publishes at the shared 127.0.0.1 interim: the \
              reserved local range {} is not installed on this host's loopback",
+            range_text()
+        ));
+    } else if matches!(range_present, Some(false)) {
+        // The same missing range without the interim behind it: the daemon
+        // published this session from the range — its flag says no interim —
+        // so the names that resolve answer with addresses from a range this
+        // host's loopback does not carry, and the host cannot reach them.
+        // The verdict says the proxy for exactly this fact (NET-018); the
+        // advisory says the fact.
+        facts.push(format!(
+            "the reserved local range {} is not installed on this host's \
+             loopback, so this session's box names resolve to addresses this \
+             host cannot reach",
             range_text()
         ));
     }
@@ -889,21 +924,35 @@ pub(crate) fn advisory_at(
 /// at, so the advisory stays quiet rather than naming a command that
 /// cannot work. `interim_loopback` is the daemon's NET-123 verdict: its
 /// session-start bind probe found the reserved range absent and it
-/// published this session at the 127.0.0.1 interim. On a host whose
-/// `/etc/resolv.conf` bypasses systemd-resolved's stub *and* whose
-/// `hosts:` lookups do not consult `nss-resolve`, the advisory says so and
-/// names no command (see [`session_detection`]): none would reach host
-/// lookups there.
+/// published this session at the 127.0.0.1 interim. `range_present` is
+/// *this* host's own read of the same range — the read the surface verdict
+/// the same start decides, passed back here so both lines draw the one
+/// fact from the one probe: the daemon's interim flag is not that fact on
+/// a VM-backed host, where it reads the guest's loopback and always says
+/// present, and a host whose own loopback lacks the range is one the
+/// verdict calls the proxy, so the advisory must say the range is what is
+/// missing there instead of going quiet. `None`, no read made, claims
+/// nothing (see [`advisory_at`]). On a host whose `/etc/resolv.conf`
+/// bypasses systemd-resolved's stub *and* whose `hosts:` lookups do not
+/// consult `nss-resolve`, the advisory says so and names no command (see
+/// [`session_detection`]): none would reach host lookups there.
 ///
 /// Printed once per session start, to stderr; never prompts.
 pub(crate) fn session_advisory_at(
     detection: &(Hook, Option<String>),
     zone_answerer_port: Option<u16>,
     interim_loopback: bool,
+    range_present: Option<bool>,
 ) -> Option<String> {
     let port = zone_answerer_port?;
     let (hook, blocker) = detection;
-    advisory_at(hook, port, interim_loopback, blocker.as_deref())
+    advisory_at(
+        hook,
+        port,
+        interim_loopback,
+        range_present,
+        blocker.as_deref(),
+    )
 }
 
 /// The surface a `*.{ZONE}` name resolves through on this host, as the two
@@ -968,7 +1017,9 @@ pub(crate) struct LiveSurfaceVerdict {
 /// the verdict — `min session activate`'s form: the session start reads
 /// this host's resolver state once (see [`session_advisory_at`]) and
 /// decides the advisory, this verdict, and the log that records it from
-/// that one read.
+/// that one read, carrying [`LiveSurfaceVerdict::range_present`] back to
+/// the advisory so the two lines draw the range from the one probe and
+/// cannot disagree about the host whose loopback it read.
 ///
 /// `None` — nothing to print — when the daemon's answerer is not bound in
 /// its own namespace (`answerer_bound` false, or the reply carrying no
@@ -1216,7 +1267,7 @@ mod tests {
         let port = 15353;
         // An unconfigured host is advised, with the exact command to run.
         let unconfigured = Hook::absent("test", "no hook for the zone");
-        let advisory = advisory_at(&unconfigured, port, false, None)
+        let advisory = advisory_at(&unconfigured, port, false, None, None)
             .expect("an unconfigured host must be advised");
         for marker in command_markers(port) {
             assert!(
@@ -1229,17 +1280,19 @@ mod tests {
             "an advisory never asks a question — it names a command: {advisory}"
         );
 
-        // A hook already routing this answerer is not advised again.
+        // A hook already routing this answerer is not advised again — on a
+        // host whose own loopback carries the range, the quiet arm's every
+        // fact holds.
         let configured = Hook::configured("test", Some(port), "routes the zone");
         assert!(
-            advisory_at(&configured, port, false, None).is_none(),
+            advisory_at(&configured, port, false, Some(true), None).is_none(),
             "a configured host must not be re-advised"
         );
 
         // A hook routing a *stale* port is advised: the command points the
         // resolver at this daemon's answerer, not the old one's.
         let stale = Hook::configured("test", Some(port - 1), "routes the zone elsewhere");
-        let advisory = advisory_at(&stale, port, false, None)
+        let advisory = advisory_at(&stale, port, false, None, None)
             .expect("a stale hook must be re-advised for this answerer's port");
         for marker in command_markers(port) {
             assert!(
@@ -1250,7 +1303,7 @@ mod tests {
 
         // NET-123's interim arm: a session published at the 127.0.0.1
         // interim re-surfaces the advisory even when the hook routes.
-        let interim = advisory_at(&configured, port, true, None)
+        let interim = advisory_at(&configured, port, true, None, None)
             .expect("the interim must re-surface the advisory");
         assert!(
             interim.contains("127.0.0.1 interim"),
@@ -1287,7 +1340,7 @@ mod tests {
     async fn session_advisory_agrees_with_the_hook_it_detected() {
         let port = 15353;
         let detection = session_detection().await;
-        let advisory = session_advisory_at(&detection, Some(port), false);
+        let advisory = session_advisory_at(&detection, Some(port), false, None);
         let (hook, blocker) = &detection;
         if hook.routes(port) && blocker.is_none() {
             assert!(advisory.is_none(), "configured host must not be advised");
@@ -1318,7 +1371,7 @@ mod tests {
         // port to point a command at, so nothing is printed rather than a
         // command that cannot work.
         let detection = session_detection().await;
-        assert!(session_advisory_at(&detection, None, false).is_none());
+        assert!(session_advisory_at(&detection, None, false, None).is_none());
     }
 
     /// A routing hook for the answerer's port, the state a host is in once
@@ -1427,19 +1480,36 @@ mod tests {
         // has nothing to say about, and a host the advisory must warn is
         // one the verdict calls the proxy.
         let detection = (routing_hook(), None);
-        let advisory = session_advisory_at(&detection, Some(port), false);
+        let advisory = session_advisory_at(&detection, Some(port), false, Some(true));
         assert!(
             advisory.is_none(),
             "a native verdict has no advisory: {advisory:?}"
         );
         let blocked = (routing_hook(), Some("lookups bypass resolved".to_string()));
         assert!(
-            session_advisory_at(&blocked, Some(port), false).is_some(),
+            session_advisory_at(&blocked, Some(port), false, Some(true)).is_some(),
             "the blocked hook is still the advisory's to say"
         );
         assert!(
             !native_surface_at(&blocked.0, port, true, true, blocked.1.as_deref()),
             "and it is the proxy the verdict names for the same read"
+        );
+        // The range-absent arm, the one state the daemon's interim flag
+        // cannot vouch for: on a VM-backed host that flag reads the guest's
+        // loopback, which always carries the range, so a host whose own
+        // loopback lacks it is one only this host's read can name — and the
+        // two lines must read it the one way. The verdict calls the proxy
+        // for exactly this fact, so the advisory says the range is what is
+        // missing rather than staying quiet on the daemon's `false`.
+        let absent = session_advisory_at(&detection, Some(port), false, Some(false))
+            .expect("a host whose own loopback lacks the range is the advisory's to say");
+        assert!(
+            absent.contains("is not installed on this host's loopback"),
+            "the advisory names the missing range: {absent}"
+        );
+        assert!(
+            !native_surface_at(&detection.0, port, true, false, None),
+            "and the verdict for the same read is the proxy's, not native"
         );
     }
 
@@ -1656,7 +1726,7 @@ mod tests {
         assert!(blocker.contains(RESOLVED_STUB), "{blocker}");
 
         let hook = Hook::absent("test", "no link carries a routing domain for the zone");
-        let advisory = advisory_at(&hook, 15353, false, Some(&blocker))
+        let advisory = advisory_at(&hook, 15353, false, None, Some(&blocker))
             .expect("a stub-bypassing host is still advised");
         assert!(
             advisory.contains(&blocker),
@@ -1678,7 +1748,7 @@ mod tests {
         // nothing is missing there, so the note carries no dangling `; `
         // where a fact would sit and no dead command either.
         let routed = Hook::configured("test", Some(15353), "the routing domain routes the zone");
-        let advisory = advisory_at(&routed, 15353, false, Some(&blocker))
+        let advisory = advisory_at(&routed, 15353, false, None, Some(&blocker))
             .expect("a bypassing host is advised even when its hook routes");
         assert_eq!(
             advisory,
@@ -1753,7 +1823,7 @@ mod tests {
 
         // Which is the whole point: that host's advisory names the command.
         let hook = Hook::absent("test", "no link carries a routing domain for the zone");
-        let advisory = advisory_at(&hook, 15353, false, None)
+        let advisory = advisory_at(&hook, 15353, false, None, None)
             .expect("an nss-resolve host is advised the command");
         assert!(
             advisory.contains("sudo"),
