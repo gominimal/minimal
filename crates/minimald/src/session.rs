@@ -818,6 +818,16 @@ impl Session {
                 // miss and both ask are still safe, the ask idempotent by
                 // namespace and answered with the address the first one
                 // recorded.
+                //
+                // A VM-backed box publishes at the address the VM host
+                // daemon handed its registration (T66) — the host's slice of
+                // the reserved local range, not a grant this daemon's in-guest
+                // book could hand out — so the handed address stands in for
+                // the lease before the lease is ever asked for, and the
+                // attach path's expose requests name exactly it as their
+                // `local`. It is never drawn from the pool: the host-side
+                // table's row owns it, so neither the grant's info line nor
+                // the release at destroy runs for a handed box.
                 let already_published = {
                     let reg = self
                         .hostnames
@@ -825,8 +835,12 @@ impl Session {
                         .expect("hostname registry lock poisoned");
                     reg.published_own_address(record.id)
                 };
-                let published =
-                    already_published.or_else(|| self.lease_loopback_address(record, &name));
+                let handed = record
+                    .box_addresses
+                    .map(|addresses| addresses.loopback_address);
+                let published = already_published
+                    .or(handed)
+                    .or_else(|| self.lease_loopback_address(record, &name));
                 let mut reg = self
                     .hostnames
                     .write()
