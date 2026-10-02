@@ -4409,6 +4409,212 @@ mod tests {
         );
     }
 
+    /// The admission table's other lifetime: the entry a box's answers fill
+    /// is dropped with the row that declared them **and** with the relay
+    /// connection whose lookups filled it. The relay retires the boxes whose
+    /// traffic it carried at its end, beside the withdrawal report that ends
+    /// their rows, and the two retirements do not ride together: the report
+    /// waits on the drainer, and the pins do not, so a shuttle connection's
+    /// close leaves the box's old grants dead however the row's own
+    /// retirement races.
+    ///
+    /// The drainer is deliberately not running here, so the closed
+    /// connection's row is still the published one when the next connection
+    /// arrives — the sharpest shape of the retire, and the one a hostile
+    /// relay would try first: close the connection, keep the row, and hope
+    /// the pin outlives the close. It does not; and the row a re-attachment
+    /// re-registers at the same address starts fail-closed too, until its
+    /// own lookups pin again — nothing inside the VM can hand the box its
+    /// old grants back across a reconnect.
+    #[tokio::test]
+    async fn a_closed_relay_connection_retires_the_pins_it_filled() {
+        let registry = BoxRegistry::new(SUBNET);
+        // The DNS box of the other proofs: names beside a narrow allowed
+        // subnet, so the pinned destination is the one thing the pin arm
+        // lifts for it.
+        let weather_box =
+            BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    allow_subnets: Some(vec!["203.0.113.0/24".to_string()]),
+                    allow_dns_hosts: Some(vec!["example.com".to_string()]),
+                    deny_subnets: None,
+                });
+        registry.register(weather_box.clone());
+        // No drainer, and the reports the test's to read: the row the
+        // connection carries stays published once the connection ends, so
+        // the retire is watched on the record the entry was built from, not
+        // on the row's absence.
+        let reports = registry
+            .take_withdrawal_reports()
+            .expect("the withdrawal reports' receiver is taken once");
+        let mut h = gate_over(registry.clone()).await;
+
+        // The box's own lookup and the reply it received: the entry for its
+        // row holds its pin, and the pinned destination is admitted while
+        // the connection that carried the lookup lives. One declared frame
+        // first, so the connection has the box's traffic to attribute.
+        let marker = ipv4_frame(LEASE, 6, [203, 0, 113, 7], 443);
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the box's declared frame reaches the switch"
+        );
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        let lookup = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(LEASE),
+            40000,
+            SUBNET.dns_server(),
+            53,
+            &dns_pins::tests::dns_query("example.com"),
+        );
+        let reply = dns_pins::tests::udp_payload_frame(
+            SUBNET.dns_server(),
+            53,
+            Ipv4Addr::from(LEASE),
+            40000,
+            &dns_pins::tests::dns_response("example.com", &[answer]),
+        );
+        send_frame(&mut h.guest, &lookup).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            lookup,
+            "the box's own query reaches the switch, byte for byte"
+        );
+        send_frame(&mut h.switch, &reply).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            reply,
+            "the reply reaches the box in full"
+        );
+        wait_for_log(&h.log, "filled the box's host-side DNS admission table").await;
+        let pinned = ipv4_frame(LEASE, 6, answer.octets(), 443);
+        send_frame(&mut h.guest, &pinned).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            pinned,
+            "the pinned destination is admitted while the connection lives"
+        );
+
+        // The retire itself, driven directly — the table's own answer to
+        // the connection's end, for the same row: after it, the address
+        // the box's own answer pinned is refused.
+        let record = h.table.by_source(LEASE).expect("the box's row is held");
+        assert!(
+            h.pins
+                .admits_frame(&record, answer.octets(), None, Instant::now()),
+            "before the retire, the box's own answer admits for its row"
+        );
+        h.pins.retire(&[LEASE]);
+        assert!(
+            !h.pins
+                .admits_frame(&record, answer.octets(), None, Instant::now()),
+            "the retire leaves the pinned address refused for the same row"
+        );
+
+        // And the same retire as the relay performs it, at the connection's
+        // end: the box looks up again — so the entry holds a live pin at the
+        // moment the connection ends — and the connection closes.
+        send_frame(&mut h.guest, &lookup).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            lookup,
+            "the box's second lookup reaches the switch"
+        );
+        send_frame(&mut h.switch, &reply).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            reply,
+            "the second reply reaches the box in full"
+        );
+        send_frame(&mut h.guest, &pinned).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            pinned,
+            "the re-pinned destination is admitted while the connection lives"
+        );
+        h.guest.shutdown().await.expect("closing the guest's side");
+
+        // The report is the relay's own word that its end ran — the retire
+        // happens beside it, before it — so waiting for it is waiting for
+        // the retire, and the report names the box whose traffic the
+        // connection carried.
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        let report = loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the withdrawal report is not filed within {DEADLINE:?}"
+            );
+            match reports.try_recv() {
+                Ok(report) => break report,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("the withdrawal channel is down; nothing will file a report")
+                }
+            }
+        };
+        assert_eq!(
+            report,
+            vec![LEASE],
+            "the closed relay's report names the box whose traffic it carried"
+        );
+
+        // The same row, still published — no drainer has acted on the
+        // report — and its address is refused: the entry the closed
+        // connection's lookups filled decides nothing now. A hostile relay
+        // that closed and reopened the connection, keeping the row, holds
+        // none of the box's old grants on the new one.
+        let (mut guest, mut switch) = connect_over(&h).await;
+        send_frame(&mut guest, &pinned).await;
+        send_frame(&mut guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            marker,
+            "the closed connection's pins retired with it: the pinned address \
+             is refused for the very row it was pinned for; the marker did"
+        );
+        expect_silence(&mut switch).await;
+
+        // And the row a re-attachment re-registers at the same address —
+        // the newest declaration, same names — starts fail-closed too: its
+        // pins are its own lookups' to earn, and nothing hands them back.
+        registry.register(weather_box);
+        send_frame(&mut guest, &pinned).await;
+        send_frame(&mut guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            marker,
+            "the re-registered row inherits nothing: fail-closed until its \
+             own lookups pin again; the marker did"
+        );
+        expect_silence(&mut switch).await;
+
+        // Until its own lookup pins again — over the new connection, whose
+        // replies fill the new row's entry.
+        send_frame(&mut guest, &lookup).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            lookup,
+            "the re-registered row's own lookup reaches the switch"
+        );
+        send_frame(&mut switch, &reply).await;
+        assert_eq!(
+            expect_frame(&mut guest).await,
+            reply,
+            "its reply reaches the box in full"
+        );
+        send_frame(&mut guest, &pinned).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            pinned,
+            "the re-registered row's own answer pins its destination again"
+        );
+    }
+
     /// The §5.3 infrastructure deny set as a host frame rule
     /// ([`INFRASTRUCTURE_RULE`]), decided for every row before the row's own
     /// rules and before the deferral: a name-declaring row and a CIDR row

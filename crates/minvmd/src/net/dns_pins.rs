@@ -807,6 +807,7 @@ pub(crate) mod tests {
     //! refuses any frame whose claimed lengths do not bound its payload.
 
     use std::net::Ipv4Addr;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
@@ -1347,6 +1348,120 @@ pub(crate) mod tests {
         assert!(
             !pins.admits_frame(&record, admitted.octets(), Some(&new_flow), past),
             "a new flow past the window is refused, the used pin notwithstanding"
+        );
+    }
+
+    /// An entry dies with the row it was built from, and a replacement row
+    /// registered at the same switch address — a new [`BoxRecord`], the
+    /// shape a re-attachment's re-registration takes — starts from a fresh
+    /// one: none of the pins or the established flows the replaced row's own
+    /// lookups earned admit for the row that took the address, until its own
+    /// lookup pins again. The guard is the entry's identity check
+    /// ([`DnsPins::entry`]): the entry a row's answers fill is kept only
+    /// while the row the table holds *is* the row it was built from, so a
+    /// newer declaration at the same address never inherits an older one's
+    /// grants — and the replaced row's record, should anything consult it,
+    /// holds nothing either.
+    #[test]
+    fn a_replacement_row_inherits_neither_pins_nor_flows() {
+        let registry = BoxRegistry::new(SUBNET);
+        let names = vec!["example.com".to_string()];
+        dns_box(&registry, "weather", LEASE, names.clone(), Vec::new());
+        let table = registry.table();
+        let first = table
+            .by_source(LEASE)
+            .expect("the published box's row is held");
+        let pins = DnsPins::new(SUBNET);
+        let limiter = DropLimiter::new();
+        let now = Instant::now();
+
+        // The box's own lookup, and the flow it opened through the answer:
+        // a pin inside the window, and a flow that rides past it — the
+        // retention the row earned by using what its answer named.
+        let answer = Ipv4Addr::new(93, 184, 216, 34);
+        observe(
+            &pins,
+            &table,
+            LEASE,
+            "example.com",
+            &[answer],
+            &limiter,
+            now,
+        );
+        let flow = l4_of(&tcp_frame(
+            Ipv4Addr::from(LEASE),
+            40000,
+            answer,
+            443,
+            0x02, // SYN: a flow's opening segment
+        ));
+        assert!(
+            pins.admits_frame(&first, answer.octets(), None, now),
+            "the box's own answer admits for the row that asked"
+        );
+        assert!(
+            pins.admits_frame(&first, answer.octets(), Some(&flow), now),
+            "the flow the box opened through its pin is established"
+        );
+        let past = now + DNS_ADMISSION_WINDOW + Duration::from_secs(1);
+        assert!(
+            pins.admits_frame(&first, answer.octets(), Some(&flow), past),
+            "the established flow rides past the window's edge for the row \
+             that opened it"
+        );
+
+        // The replacement row: the same switch address, the same declared
+        // names, a new record — a re-registration's shape. It holds none of
+        // the replaced row's grants: not the window pin, and not the flow
+        // that rode past the window either, even inside the retention that
+        // carried it for the row that opened it.
+        dns_box(&registry, "weather", LEASE, names, Vec::new());
+        let second = table
+            .by_source(LEASE)
+            .expect("the re-registered box's row is held");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the re-registration is a new record at the same address"
+        );
+        assert!(
+            !pins.admits_frame(&second, answer.octets(), None, now),
+            "the replacement row inherits none of the replaced row's pins"
+        );
+        assert!(
+            !pins.admits_frame(&second, answer.octets(), Some(&flow), past),
+            "the replacement row inherits none of the replaced row's \
+             established flows, however long the retention carried them"
+        );
+        assert!(
+            !pins.admits_frame(&first, answer.octets(), None, now),
+            "the replaced row's record admits nothing either: the entry it \
+             filled is not kept for it behind the row that replaced it"
+        );
+
+        // Until its own lookup pins again: the replacement row's own answer
+        // admits for it — the same address, the same flow, both earned
+        // rather than inherited.
+        observe(
+            &pins,
+            &table,
+            LEASE,
+            "example.com",
+            &[answer],
+            &limiter,
+            now,
+        );
+        assert!(
+            pins.admits_frame(&second, answer.octets(), None, now),
+            "the replacement row's own lookup earns its pin again"
+        );
+        assert!(
+            pins.admits_frame(&second, answer.octets(), Some(&flow), now),
+            "and its own use of the answer establishes its own flow"
+        );
+        assert!(
+            pins.admits_frame(&second, answer.octets(), Some(&flow), past),
+            "the flow the replacement row established rides past its window, \
+             as the replaced row's did for it"
         );
     }
 
