@@ -836,6 +836,31 @@ pub(crate) mod tests {
         }
     }
 
+    /// The box that allows the toolchain's remote hosts and, by address,
+    /// nothing else: TCP declared, no subnets, only `egress.allow_dns_hosts`
+    /// (NET-068's hostname-only allowlist).
+    ///
+    /// The TCP-only protocol rule does not block DNS resolution: the relay's
+    /// verdict carves out UDP/53 to the resolver before it checks protocol
+    /// rules (NET-079), so `allow_protocols: Some([Tcp])` still lets the box
+    /// resolve every allowed name.
+    fn toolchain_hosts_egress() -> sessions::SessionPolicy {
+        sessions::SessionPolicy {
+            egress: Some(sessions::EgressPolicy {
+                allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                allow_subnets: Some(Vec::new()),
+                allow_dns_hosts: Some(
+                    sessions::NET068_TOOLCHAIN_EGRESS_HOSTS
+                        .iter()
+                        .map(|h| (*h).to_string())
+                        .collect(),
+                ),
+                deny_subnets: None,
+            }),
+            ingress: None,
+        }
+    }
+
     /// The box that allows `github.com` over UDP: the same name-only grant as
     /// [`github_only_egress`], with the one protocol a UDP flow needs declared
     /// — the idle-bound proofs' box, since a UDP flow is the one that carries
@@ -1199,6 +1224,150 @@ pub(crate) mod tests {
             !gate.admits_destination([198, 51, 100, 7], t0),
             "an address the box never resolved is not admitted"
         );
+    }
+
+    /// NET-068: a hostname-only allowlist naming the toolchain's remote hosts
+    /// admits every resolved address for those names and for nothing else.
+    /// Each allowed name's reply is forwarded to the box, its answers are
+    /// pinned, and TCP flows to those addresses complete; an equally resolved
+    /// address for a name outside the allowlist is refused.
+    #[tokio::test]
+    async fn toolchain_hosts_admitted_by_gate() {
+        let mut harness = spawn_test_relay(&toolchain_hosts_egress());
+
+        // Every allowed toolchain host resolves, gets its reply forwarded, and
+        // has its addresses pinned. We use one representative address per name
+        // — the gate treats each name independently (per-name cap and matching),
+        // so the shape is the same for every host.
+        let toolchain = [
+            ("github.com.", Ipv4Addr::new(140, 82, 121, 3)),
+            ("codeload.github.com.", Ipv4Addr::new(140, 82, 113, 10)),
+            (
+                "raw.githubusercontent.com.",
+                Ipv4Addr::new(185, 199, 108, 133),
+            ),
+            ("registry.npmjs.org.", Ipv4Addr::new(104, 16, 26, 34)),
+            ("pypi.org.", Ipv4Addr::new(151, 101, 128, 223)),
+            ("files.pythonhosted.org.", Ipv4Addr::new(146, 75, 38, 223)),
+            ("registry-1.docker.io.", Ipv4Addr::new(44, 205, 64, 79)),
+            ("auth.docker.io.", Ipv4Addr::new(3, 94, 213, 199)),
+            (
+                "production.cloudflare.docker.com.",
+                Ipv4Addr::new(104, 16, 124, 175),
+            ),
+            (
+                "production.cloudfront.docker.com.",
+                Ipv4Addr::new(18, 238, 238, 89),
+            ),
+        ];
+        // The names here pair each host with a representative address, so
+        // they cannot be read off the shared constant; they are held to it
+        // instead, so a host added there fails here until it is exercised.
+        let exercised: Vec<&str> = toolchain
+            .iter()
+            .map(|(name, _)| name.trim_end_matches('.'))
+            .collect();
+        assert_eq!(
+            exercised,
+            sessions::NET068_TOOLCHAIN_EGRESS_HOSTS,
+            "every NET-068 toolchain host is exercised, in the constant's order"
+        );
+        for (index, (name, address)) in toolchain.iter().enumerate() {
+            // A unique source port per name so the DNS conntrack windows do not collide.
+            let src_port = 40000 + u16::try_from(index).unwrap();
+
+            let query = udp_payload_frame(
+                LEASE,
+                src_port,
+                RESOLVER,
+                53,
+                &dns_query(name, RecordType::A),
+            );
+            harness.box_end.write_all(&query).unwrap();
+            let forwarded =
+                tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                    .await
+                    .expect("the query is forwarded")
+                    .expect("the switch side stays open");
+            assert_eq!(
+                forwarded, query,
+                "query for {name} reaches the resolver verbatim"
+            );
+
+            let response = dns_response(name, &[*address]);
+            let response_frame = udp_payload_frame(RESOLVER, 53, LEASE, src_port, &response);
+            harness
+                .switch
+                .write_all(&wire_frame(&response_frame))
+                .await
+                .unwrap();
+            let passed = read_box_frame(&harness)
+                .await
+                .expect("the reply itself passes through to the box");
+            assert_eq!(
+                passed, response_frame,
+                "reply for {name} is never kept from the box"
+            );
+
+            // The pinned address completes a TCP flow — the only thing the
+            // toolchain needs from each allowed name. Use a distinct, bounded
+            // ephemeral source port so each flow is separate in the conntrack.
+            let tcp_src_port = 50000 + u16::try_from(index).unwrap();
+            let connect = egress_tcp_segment(LEASE, tcp_src_port, *address, 443, SYN);
+            harness.box_end.write_all(&connect).unwrap();
+            let out =
+                tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                    .await
+                    .expect("a toolchain address is reachable for the window")
+                    .expect("the switch side stays open");
+            assert_eq!(out, connect, "{address} resolved from {name} is admitted");
+        }
+
+        // An address resolved for a name the box did not declare is not
+        // admitted. Under the shipped interim, the query is forwarded and only
+        // the resulting pin is withheld; the architecture's design would refuse
+        // the resolution itself. Either way the TCP flow is dropped, so the
+        // assertion holds for both behaviours.
+        let undeclared_query = udp_payload_frame(
+            LEASE,
+            41000,
+            RESOLVER,
+            53,
+            &dns_query("not-in-allowlist.example.", RecordType::A),
+        );
+        harness.box_end.write_all(&undeclared_query).unwrap();
+        let forwarded =
+            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                .await
+                .expect("query for an undeclared name is forwarded")
+                .expect("the switch side stays open");
+        assert_eq!(
+            forwarded, undeclared_query,
+            "resolution itself is never blocked, only the resulting pin"
+        );
+        let response = dns_response(
+            "not-in-allowlist.example.",
+            &[Ipv4Addr::new(198, 51, 100, 7)],
+        );
+        let response_frame = udp_payload_frame(RESOLVER, 53, LEASE, 41000, &response);
+        harness
+            .switch
+            .write_all(&wire_frame(&response_frame))
+            .await
+            .unwrap();
+        let _ = read_box_frame(&harness)
+            .await
+            .expect("the undeclared name's reply passes through");
+
+        let undeclared_connect = egress_tcp_frame(LEASE, Ipv4Addr::new(198, 51, 100, 7), 443);
+        let sentinel = arp_frame(LEASE);
+        harness.box_end.write_all(&undeclared_connect).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay keeps deciding")
+            .expect("the switch side stays open");
+        assert_eq!(next, sentinel, "an undeclared name's address is refused");
     }
 
     /// Design §5.3's conntrack-aware retention, with NET-066's window as its
