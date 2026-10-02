@@ -633,11 +633,12 @@ plaintext host swap is the only reading that conforms; it is not an architecture
 reserve, and the zram pool's worst-case footprint is part of that reserve (BRES-007, BRES-012).
 The architecture gains a clarifying clause; the spec needs nothing more.
 
-**On a small x86_64 host the constant wins and the source reads `derived`.** Just above 4 GiB,
-the cap that keeps 4 GiB for the machine outside falls below today's constant. The constant wins
-(BRES-001), and the source reads `derived` (BRES-006) because the derivation ran. Reading
-`default` whenever the result equals the constant was rejected because it widens the epic's
-condition. Letting the reserve win was rejected because it breaks "small hosts keep current
+**Just above the small-host line, the constant wins and the source reads `derived`.** On an
+x86_64 host a little above 4 GiB (twice the constant), the cap that keeps 4 GiB for the machine
+outside falls below today's constant. The constant wins (BRES-001), and the source reads
+`derived` (BRES-006's "otherwise") because the derivation ran. At or below 4 GiB the derivation
+does not run, and the source reads `default` (BRES-006). Reading `default` whenever the result
+equals the constant, above that line too, was rejected because it widens the epic's condition. Letting the reserve win was rejected because it breaks "small hosts keep current
 behaviour".
 
 **The same counters on both hosts.** The sampler and the `min ls` figures read the files the
