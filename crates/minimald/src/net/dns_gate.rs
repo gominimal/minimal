@@ -6,6 +6,20 @@
 //! gate is what turns "the box allows `github.com`" into "the box reaches
 //! the addresses `github.com` resolved to, and nothing else".
 //!
+//! Two tables hold that admission now, one per leg of the path a box's
+//! frames take (NET-081). On a VM-backed host the *deciding* copy is the
+//! host-side one, `minvmd`'s `net::dns_pins`: the box's frames reach it
+//! outside the VM, and it decides an undeclared destination against the DNS
+//! replies the box's own lookups received — filled from the same answers,
+//! held to the same intersection and the same numbers, all of them read
+//! from the one place both legs hold them, [`sessions::core::egress`] — so
+//! nothing inside the VM, not even a relay replaced with a hostile one,
+//! can widen a box's destinations. This gate is then the *precision* copy
+//! inside the VM: it still intercepts the box's queries, answers the
+//! record types v1 does not carry (NET-136) itself, and pins from the same
+//! replies under the same rules, so the decision is exact at the relay for
+//! the path the box actually rides.
+//!
 //! Three jobs, one per requirement:
 //!
 //! * **Pinning** (NET-066) — every DNS reply from the box's own resolver
@@ -194,7 +208,12 @@ const COMPONENT: &str = "dns-gate";
 /// 600 s, capped at 24 h); the module doc states that departure and its
 /// reason. An established flow does not depend on it at all — see
 /// [`admits_flow`].
-pub(crate) const ADMISSION_WINDOW: Duration = Duration::from_secs(5 * 60);
+///
+/// This leg does not own the number: both admission tables hold the same
+/// window, and both read it from the one place it lives,
+/// [`sessions::core::egress::DNS_ADMISSION_WINDOW`], so a pin can never
+/// outlive its window on one leg while it lives on in the other.
+pub(crate) const ADMISSION_WINDOW: Duration = sessions::core::egress::DNS_ADMISSION_WINDOW;
 
 /// Design §5.3's cap on a name's admitted addresses: at most this many per
 /// name per family, fail closed. A reply whose A records run past the cap
@@ -206,7 +225,10 @@ pub(crate) const ADMISSION_WINDOW: Duration = Duration::from_secs(5 * 60);
 /// rather than to what its resolver chose to say. Only IPv4 addresses are
 /// ever admitted here (AAAA is answered NODATA, NET-136), so the family
 /// half of the cap is the IPv4 half alone.
-const MAX_ADDRESSES_PER_NAME: usize = 32;
+///
+/// Both admission tables hold the same cap, read from
+/// [`sessions::core::egress::DNS_MAX_ADDRESSES_PER_NAME`].
+const MAX_ADDRESSES_PER_NAME: usize = sessions::core::egress::DNS_MAX_ADDRESSES_PER_NAME;
 
 /// Sweep expired admissions once the table crosses this many entries — the
 /// per-box backstop behind the per-name cap, bounding memory without a
@@ -232,7 +254,10 @@ const TCP_RST: u8 = 0x04;
 /// (`tcp_flags` is zero for it). The bound exists so a flow the box leaked
 /// cannot hold its pin for the rest of the box's uptime, which ends the whole
 /// table anyway.
-const FLOW_IDLE_CAP: Duration = Duration::from_secs(24 * 60 * 60);
+///
+/// Both admission tables hold the same retention cap, read from
+/// [`sessions::core::egress::DNS_FLOW_IDLE_CAP`].
+const FLOW_IDLE_CAP: Duration = sessions::core::egress::DNS_FLOW_IDLE_CAP;
 
 /// Sweep idle flows once the table crosses this many entries: the bound's
 /// *memory* half, reclaiming entries no frame ever comes back to look up.

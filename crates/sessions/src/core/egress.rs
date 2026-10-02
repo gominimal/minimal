@@ -40,10 +40,17 @@
 //! Beside the frame verdict sits its name-level counterpart, the DNS
 //! rebinding intersection (NET-066, NET-067): the pure decision of which
 //! addresses a name *resolved to* may ever be admitted for a box, once the
-//! box's denies and the infrastructure deny set are subtracted. The relay
-//! (not this module) holds the admission window; what lives here is the
+//! box's denies and the infrastructure deny set are subtracted. The
+//! admission table itself is not here — it is relay state, and there are
+//! two relays holding it, the host-side table that decides a box's
+//! destinations outside the VM (NET-081) and the in-VM precision copy —
+//! so the numbers both tables are bounded by live here, as constants,
+//! that neither leg can drift from the other: the window, the per-name
+//! address cap and the used-pin retention. What else lives here is the
 //! arithmetic the window stores the results of, kept pure and free of
 //! resolver I/O so the NET-067 harness can exhaust it.
+
+use std::time::Duration;
 
 use crate::{EgressPolicy, IpProto};
 
@@ -59,6 +66,40 @@ const ETHERTYPE_IPV6: u16 = 0x86DD;
 const IPPROTO_UDP: u8 = 17;
 /// The port DNS is served on: the resolver carve-out's port (NET-079).
 const DNS_PORT: u16 = 53;
+
+/// How long an address a DNS reply admitted stays admitted, from the
+/// instant of the reply the box's own lookup received. The two admission
+/// tables — the host-side one that decides a DNS-resolving box's
+/// destinations outside the VM (NET-081) and the in-VM precision copy
+/// (NET-066) — both hold exactly this window, reading it here, so a pin
+/// can never outlive its window on one leg while it lives on in the other.
+///
+/// It is a *fixed* window where design §5.3's is TTL-bounded — floored at
+/// 600 s, capped at 24 h, a proposal in the design text — and the gates
+/// record that departure at the constant's use site; what the floor buys
+/// (covering the gap between resolution and use) is covered for
+/// established flows by [`DNS_FLOW_IDLE_CAP`] below.
+pub const DNS_ADMISSION_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// Design §5.3's cap on one name's admitted addresses, at most this many
+/// at once, fail closed: a reply whose A records run past the cap has its
+/// tail refused, so a hostile or pathological answer cannot grow the box's
+/// grant one address at a time. The cap counts what a name *holds* — an
+/// admission whose window has passed is released before the cap is spent —
+/// so a name whose resolved address set rotates keeps its grant. Both
+/// admission tables hold the same cap, reading it here.
+pub const DNS_MAX_ADDRESSES_PER_NAME: usize = 32;
+
+/// How long a pin the box *used* keeps its admitted destination past the
+/// window: design §5.3's conntrack-aware retention, the one staleness
+/// bound on an established flow. The first frame a pin admits establishes
+/// the flow, and the flow keeps its destination until it ends — a FIN or
+/// RST, or this cap reclaiming a flow nothing has ridden for a day — so a
+/// long `git clone` or keep-alive to an allowed name is not severed at the
+/// window's edge. It is also the only release a UDP flow ever gets, UDP
+/// carrying no close signal to read. Both admission tables hold the same
+/// cap, reading it here.
+pub const DNS_FLOW_IDLE_CAP: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Which L2 family a frame belongs to — the first fact the verdict needs,
 /// because three of the four families are decided without any rules.
