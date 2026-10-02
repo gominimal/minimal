@@ -109,6 +109,11 @@
 #   native_resolution_without_proxy_env
 #                                    NET-009/122/123: the advisory, the probe,
 #                                    and host-OS resolution with no proxies
+#   native_resolution_from_host_answerer_on_vm_host
+#                                    NET-124..128/138 on a VM-backed lane:
+#                                    the VM host daemon answers the zone on
+#                                    the host loopback and the in-VM daemon
+#                                    owns no answerer
 #   hostnames_recover_and_two_daemons_route NET-020..027 warning, recovery,
 #                                   two daemons on one machine routing
 #   retired_surfaces_gone            NET-109/110: the retired surfaces are gone,
@@ -3713,13 +3718,14 @@ fi
 # they survive regardless.
 #
 # Lane gating, by observed fact as ever:
-#   * The advisory and its command assert on EVERY lane — the CLI detects the
-#     hook host-side, whatever side the daemon is on.
+#   * The advisory and its command assert on the NATIVE lane only — the
+#     in-VM daemon starts no zone answerer and publishes none through the
+#     forwarder (NET-138), so a VM session's create response carries no
+#     answerer port and the CLI prints no advisory for it; the VM lanes'
+#     answerer subject is native_resolution_from_host_answerer_on_vm_host.
 #   * The daemon's probe record and the host half (run the command, resolve)
-#     are native-only: a VM lane's daemon and answerer live in the guest, so
-#     its log is guest-side (`hook_log_readable`) and its answerer is not
-#     this host's loopback. The KVM/macOS lanes assert the advisory; the
-#     native lane proves the whole path.
+#     are native-only with it: a native daemon's log is host-side
+#     (`hook_log_readable`) and its answerer is this host's loopback.
 #   * The host half needs `resolvectl`, `getent` and passwordless `sudo`, and
 #     a skip is only honest on a developer host (the proxy case's gate
 #     doctrine); a CI native lane that cannot run the command is a red lane.
@@ -3732,6 +3738,16 @@ fi
 #     the quiet was right.
 # ---------------------------------------------------------------------------
 proof_native_resolution_without_proxy_env() {
+  # VM-backed lanes: the in-VM daemon starts no zone answerer (NET-138) and
+  # publishes none through the forwarder — the box zone on those hosts is the
+  # VM host daemon's answerer's, and the case named
+  # native_resolution_from_host_answerer_on_vm_host is that lane's own. This
+  # proof's subject is a NATIVE daemon's answerer and the host resolver it
+  # configures, which no VM lane has.
+  if [ -n "$E2E_VM" ]; then
+    echo "native resolution without proxy settings SKIPPED (VM-backed lane: the in-VM daemon starts no answerer; native_resolution_from_host_answerer_on_vm_host is this lane's case)"
+    return 0
+  fi
   echo "::group::native min.internal resolution with no proxy settings (NET-009, NET-122, NET-123)"
 
   # The daemon's file log, newest first (one file per calendar day).
@@ -3775,7 +3791,7 @@ proof_native_resolution_without_proxy_env() {
     sleep 0.25
   done
   if [ -z "$native_port" ]; then
-    if [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; then
+    if [ -z "${CI:-}" ]; then
       echo "::warning::native-resolution proof SKIPPED — this host's daemon never owned its zone answerer"
       echo "  (a dev host running another minimald holds the ports; with no answerer port there"
       echo "   is no command to name, and NET-122's advisory correctly stays quiet)"
@@ -3865,7 +3881,7 @@ proof_native_resolution_without_proxy_env() {
     native_bypassed=yes
     echo "advisory said this host's lookups bypass systemd-resolved's stub (NET-122 detection):"
     echo "  $(grep -F -- 'bypass systemd-resolved' "$native_err" 2>/dev/null | head -n1)"
-    if [ -n "${CI:-}" ] || [ -n "$E2E_VM" ]; then
+    if [ -n "${CI:-}" ]; then
       echo "::error::this lane's host bypasses systemd-resolved's stub, so NET-009 cannot be proved on it"
       echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
       echo "--- /etc/resolv.conf ---"; cat /etc/resolv.conf 2>&1 || true
@@ -3879,7 +3895,7 @@ proof_native_resolution_without_proxy_env() {
     # interim), so this is a dev host that configured the zone against this
     # daemon before. CI's fresh runners never see it, which is why it is an
     # error there.
-    if [ -n "${CI:-}" ] || [ -n "$E2E_VM" ]; then
+    if [ -n "${CI:-}" ]; then
       echo "::error::no advisory on the activate's stderr, and this lane's resolver is not configured for the zone (NET-122)"
       echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
       fail
@@ -3919,12 +3935,10 @@ proof_native_resolution_without_proxy_env() {
   fi
 
   # ---- the host half: run the command, then resolve with no proxy env -----
-  if [ -n "$E2E_VM" ]; then
-    echo "host half SKIPPED (VM-backed target: the answerer is guest-side; the native lane proves it)"
-  elif ! command -v resolvectl >/dev/null 2>&1 \
-       || ! command -v ip >/dev/null 2>&1 \
-       || ! command -v getent >/dev/null 2>&1 \
-       || ! sudo -n true >/dev/null 2>&1; then
+  if ! command -v resolvectl >/dev/null 2>&1 \
+     || ! command -v ip >/dev/null 2>&1 \
+     || ! command -v getent >/dev/null 2>&1 \
+     || ! sudo -n true >/dev/null 2>&1; then
     if [ -z "${CI:-}" ]; then
       echo "::warning::native-resolution host half SKIPPED — this host cannot run the advisory's command"
       echo "  (needs resolvectl, ip, getent and passwordless sudo; CI's native lane has all four)"
@@ -4053,6 +4067,174 @@ proof_native_resolution_without_proxy_env() {
 
   mnl session destroy --force "$native_sid" >/dev/null 2>&1 || true
   echo "native min.internal resolution with no proxy settings OK (${native_proved:-advisory race} — each printed)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# The box zone on a VM-backed host, answered by the VM host daemon on the HOST
+# loopback (NET-124..NET-128, NET-138). VM-lane only — a native lane's daemon
+# answers the zone itself, and the case above proves that. Both halves read
+# the way a person reads them:
+#
+#   * The in-VM daemon owns no answerer (NET-138): on a VM-backed host the
+#     zone is the host's to answer, so the guest daemon starts no answerer
+#     and publishes none through the forwarder — `min ls` carries no ZONE
+#     ANSWERER line for a VM session to point a resolver at.
+#   * The VM host daemon's answerer answers a zone name on the host, and dig
+#     reads the wire a host resolver would. The name is the node's own
+#     namespace row — the row the VM host daemon authors itself at start,
+#     host-side, before any session exists — so the proof holds on every VM
+#     lane, including ones that exercise only the vsock bridge; the row's
+#     address is the host loopback, and the answer carries the short TTL the
+#     zone's clients are promised (NET-126). The port is the one the
+#     answerer's own start record names: the listener it holds, or the
+#     machine's answerer port when another VM host daemon holds it and this
+#     table's rows answer through it.
+#
+# A VM lane that cannot produce the answer FAILS, not skips: this case is the
+# box zone's whole story on those lanes.
+# ---------------------------------------------------------------------------
+proof_native_resolution_from_host_answerer_on_vm_host() {
+  if [ -z "$E2E_VM" ]; then
+    echo "native resolution from the host answerer SKIPPED (VM-backed lane only; a native lane answers the zone from its own daemon)"
+    return 0
+  fi
+  echo "::group::native min.internal resolution from the VM host daemon's answerer (NET-124..NET-128, NET-138)"
+
+  # dig, the wire a host resolver reads. A lane without it cannot assert this
+  # case's subject at all — a red lane in CI, an honest skip on a dev host
+  # (the gate doctrine every host half in this script uses).
+  if ! command -v dig >/dev/null 2>&1; then
+    if [ -n "${CI:-}" ]; then
+      echo "::error::a CI VM lane must have dig to read the host answerer's answer"
+      fail
+    fi
+    echo "::warning::host-answerer resolution SKIPPED — no dig on this host to read the answerer's wire with"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # Warm the lane: `min ls` is the call that autospawns the VM host daemon —
+  # the answerer serves beside it — and boots the guest behind it.
+  if ! mnl ls >/dev/null 2>&1; then
+    echo "::error::'min ls' could not bring this VM lane's daemon up (the host answerer serves beside it)"
+    fail
+  fi
+
+  # NET-138, the in-VM half. Capture-then-grep, never `mnl ls | grep`: grep's
+  # early exit SIGPIPEs the CLI.
+  host_answerer_ls="$(mnl ls 2>/dev/null || true)"
+  if printf '%s\n' "$host_answerer_ls" | grep -q -- 'ZONE ANSWERER'; then
+    echo "::error::the in-VM daemon still names a zone answerer in min ls — on a VM-backed host it must start none (NET-138)"
+    echo "--- min ls ---"; printf '%s\n' "$host_answerer_ls"
+    fail
+  fi
+  echo "the in-VM daemon owns no answerer: min ls carries no ZONE ANSWERER line (NET-138)"
+
+  # The VM host daemon's own log candidates, newest first: the answerer is a
+  # host process, so its start record sits beside the daemon's in minvmd's
+  # file log; the detached supervisor's run.log is the fallback (the fsr
+  # case's candidate list).
+  host_answerer_log_candidates() {
+    find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null | sort -r
+    printf '%s\n' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/run.log"
+  }
+
+  # The answerer's start record, whichever of the three states it left: the
+  # listener it holds, the registration with a holder, or the warn that the
+  # port is held by something with no channel. Polled because a standalone
+  # run of this case can race the daemon's first boot.
+  host_answerer_records=""
+  for _ in $(seq 1 40); do
+    host_answerer_records=""
+    while IFS= read -r host_answerer_cand; do
+      [ -f "$host_answerer_cand" ] || continue
+      host_answerer_records="${host_answerer_records}
+$(grep -h -- 'zone-answerer' "$host_answerer_cand" 2>/dev/null || true)"
+    done < <(host_answerer_log_candidates)
+    printf '%s\n' "$host_answerer_records" | grep -qF \
+      -e 'holds the host loopback' \
+      -e "registered this table's zone rows with it" \
+      -e "this VM's box names are not answered on the host" \
+      && break
+    sleep 0.5
+  done
+
+  host_answerer_port=""
+  if printf '%s\n' "$host_answerer_records" | grep -qF -- 'holds the host loopback'; then
+    host_answerer_port="$(printf '%s\n' "$host_answerer_records" \
+      | grep -F -- 'holds the host loopback' | tail -n1 \
+      | sed -n 's/.*"listener":"127\.0\.0\.1:\([0-9][0-9]*\)".*/\1/p')"
+    if [ -z "$host_answerer_port" ]; then
+      echo "::error::the answerer's serving record names no listener port to read the zone from"
+      echo "--- record ---"; printf '%s\n' "$host_answerer_records" | grep -F -- 'holds the host loopback' | tail -n1
+      fail
+    fi
+    echo "the VM host daemon holds the machine's answerer port: 127.0.0.1:$host_answerer_port"
+  elif printf '%s\n' "$host_answerer_records" | grep -qF -- "registered this table's zone rows with it"; then
+    host_answerer_port=7656
+    echo "another VM host daemon on this machine holds the answerer port; this VM's rows answer through it at 127.0.0.1:$host_answerer_port"
+  elif printf '%s\n' "$host_answerer_records" | grep -qF -- "this VM's box names are not answered on the host"; then
+    # The port is held by a daemon with no channel (a native minimald, a
+    # foreign process): this VM's names genuinely do not answer on the host,
+    # so there is no answer to read — on a lane that is the defect this case
+    # exists to catch; on a dev host sharing its machine with a native daemon
+    # it is that machine's honest state.
+    if [ -n "${CI:-}" ]; then
+      echo "::error::the VM host daemon's answerer could not take the machine's port (a daemon with no channel holds it), so this VM's box names are not answered on the host"
+      printf '%s\n' "$host_answerer_records" | grep -F -- 'zone-answerer' | tail -n5
+      fail
+    fi
+    echo "::warning::host-answerer resolution SKIPPED — this machine's answerer port is held by a daemon with no channel, so this VM's box names are not answered on the host"
+    echo "::endgroup::"
+    return 0
+  else
+    echo "::error::no zone-answerer start record in the VM host daemon's log after 20 s — the answerer neither holds the port nor says why it cannot"
+    echo "--- minvmd log (zone-answerer lines) ---"
+    printf '%s\n' "$host_answerer_records" | grep -F -- 'zone-answerer' | tail -n5
+    echo "--- minvmd log candidates ---"
+    while IFS= read -r host_answerer_cand; do
+      echo "--- $host_answerer_cand ---"; tail -10 "$host_answerer_cand" 2>/dev/null || echo "(no such file)"
+    done < <(host_answerer_log_candidates)
+    fail
+  fi
+
+  # The node's own namespace row — the name the VM host daemon authors at
+  # start — must answer at the host loopback, within the short TTL.
+  host_answerer_name="minimald.min.internal"
+  host_answerer_reply="$(dig +time=2 +tries=1 +noall +answer "@127.0.0.1" \
+    -p "$host_answerer_port" "$host_answerer_name" A 2>/dev/null || true)"
+  if [ -z "$host_answerer_reply" ]; then
+    echo "::error::$host_answerer_name did not answer at 127.0.0.1:$host_answerer_port on the host"
+    echo "--- dig (no answer) ---"
+    dig +time=2 +tries=1 "@127.0.0.1" -p "$host_answerer_port" "$host_answerer_name" A 2>&1 || true
+    echo "--- minvmd log (zone-answerer lines, tail) ---"
+    printf '%s\n' "$host_answerer_records" | grep -F -- 'zone-answerer' | tail -n5
+    fail
+  fi
+  echo "dig @127.0.0.1 -p $host_answerer_port $host_answerer_name A:"
+  printf '%s\n' "$host_answerer_reply" | sed 's/^/  /'
+
+  # One A record at the node row's loopback address, within the short TTL.
+  # Parsed field-wise (dig pads its columns, so no literal substring).
+  if ! printf '%s\n' "$host_answerer_reply" \
+      | awk '$4 == "A" && $5 == "127.0.0.1" { found = 1 } END { exit !found }'; then
+    echo "::error::the answer is not the node row's loopback address (got: '$host_answerer_reply')"
+    fail
+  fi
+  host_answerer_ttl="$(printf '%s\n' "$host_answerer_reply" | awk '$4 == "A" { print $2; exit }')"
+  case "$host_answerer_ttl" in
+    ''|*[!0-9]*)
+      echo "::error::could not read the answer's TTL (got: '$host_answerer_ttl')"
+      fail
+      ;;
+  esac
+  if [ "$host_answerer_ttl" -gt 15 ]; then
+    echo "::error::the answer's TTL is $host_answerer_ttl s — the zone's answers are promised short (≤ 15 s), so a withdrawn box stops resolving fast"
+    fail
+  fi
+
+  echo "native min.internal resolution from the VM host daemon's answerer OK (no in-VM answerer, host answers at 127.0.0.1:$host_answerer_port, TTL ${host_answerer_ttl}s)"
   echo "::endgroup::"
 }
 
@@ -7009,6 +7191,7 @@ case "${1:-}" in
     proof_fresh_arm64_kvm_activate_local_minvmd
     proof_linux_stock_install_runs_vm_boxes
     proof_native_resolution_without_proxy_env
+    proof_native_resolution_from_host_answerer_on_vm_host
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
     proof_proxy_refuses_like_direct
@@ -7019,6 +7202,7 @@ case "${1:-}" in
   lifecycle | session_exec | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
     | network_posture_from_stock_install | native_resolution_without_proxy_env \
+    | native_resolution_from_host_answerer_on_vm_host \
     | hostnames_recover_and_two_daemons_route \
     | min_internal_names_through_proxy | proxy_refuses_like_direct | retired_surfaces_gone \
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
@@ -7032,6 +7216,7 @@ case "${1:-}" in
     echo "  cases: lifecycle session_exec session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run hooks"
     echo "         skip_scaffold sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
     echo "         network_posture_from_stock_install native_resolution_without_proxy_env"
+    echo "         native_resolution_from_host_answerer_on_vm_host"
     echo "         fresh_linux_kvm_activate_local_minvmd fresh_arm64_kvm_activate_local_minvmd"
     echo "         linux_stock_install_runs_vm_boxes"
     echo "         hostnames_recover_and_two_daemons_route"
