@@ -666,57 +666,69 @@ pub(crate) async fn activate_session(
     // start's. One read of this host's resolver state decides both this and
     // the surface verdict below it, so the two lines cannot disagree about
     // one host.
-    let detection = crate::resolver::session_detection().await;
-    let name_advisory = crate::resolver::session_advisory_at(
-        &detection,
-        created.zone_answerer_port,
-        created.interim_loopback,
-    );
-    if let Some(advisory) = &name_advisory {
-        eprintln!("{advisory}");
-    }
-    // NET-018: name the live surface at the moment the user is about to rely
-    // on the names — decided in the one function both verbs share
-    // (`resolver`), from the same detection the advisory read: this host's
-    // hook (and the stub-bypass blocker that says whether its lookups
-    // consult what the hook configures), the daemon's answerer-bound
-    // report, and the reserved range on this host's own loopback. `None` —
-    // the answerer not bound — prints nothing: no native surface to name,
-    // and the ports and the advisory above have told the proxy's story.
-    // The proxy's half is said with the native arm either way (NET-019):
-    // the `HTTP(S)_PROXY` recipes this activation prints keep working
-    // beside native DNS, so nothing already captured goes stale.
-    if let Some(answerer_port) = created.zone_answerer_port
-        && let Some(verdict) = crate::resolver::live_name_surface_with_range_at(
+    //
+    // Both lines are the answerer's port's to print: the advisory has no
+    // command to name without one, the verdict no answerer whose surface to
+    // decide, so a create that reports none — the answerer still coming up,
+    // or a daemon that predates the field — prints neither and reads
+    // nothing. That keeps the no-port activate the zero-cost start it was
+    // before either line read this host: the detection below is two
+    // `resolvectl` queries under a five-second bound, and a wedged
+    // systemd-resolved must not be waited out for lines that cannot print
+    // from it.
+    if let Some(answerer_port) = created.zone_answerer_port {
+        let detection = crate::resolver::session_detection().await;
+        let name_advisory = crate::resolver::session_advisory_at(
+            &detection,
+            Some(answerer_port),
+            created.interim_loopback,
+        );
+        if let Some(advisory) = &name_advisory {
+            eprintln!("{advisory}");
+        }
+        // NET-018: name the live surface at the moment the user is about to
+        // rely on the names — decided in the one function both verbs share
+        // (`resolver`), from the same detection the advisory read: this
+        // host's hook (and the stub-bypass blocker that says whether its
+        // lookups consult what the hook configures), the daemon's
+        // answerer-bound report, and the reserved range on this host's own
+        // loopback. `None` — the answerer not bound — prints nothing: no
+        // native surface to name, and the ports and the advisory above
+        // have told the proxy's story. The proxy's half is said with the
+        // native arm either way (NET-019): the `HTTP(S)_PROXY` recipes
+        // this activation prints keep working beside native DNS, so
+        // nothing already captured goes stale.
+        if let Some(verdict) = crate::resolver::live_name_surface_with_range_at(
             &detection,
             Some(answerer_port),
             created.answerer_bound,
         )
         .await
-    {
-        // The host-side record of that verdict, the half the daemon's own
-        // log cannot make: a daemon can name only the answerer *it* binds
-        // (see the daemon's `log_live_name_surface`), so the surface this
-        // host's own reads decided — and the three facts behind it, with
-        // the range as the one fact only this read holds — is logged here,
-        // at the start that printed it, beside the daemon's line. `min`
-        // filters at `warn` unless `RUST_LOG` is set, so the line is visible
-        // under `RUST_LOG=info`. Logged, never printed: the line
-        // below is the user's. `min ls` does not log its verdict — a list
-        // re-reads the host every run, and the record that matters is the
-        // one at the starts that rely on the names.
-        tracing::info!(
-            surface = ?verdict.surface,
-            hook_routes = detection.0.routes(answerer_port),
-            blocker = ?detection.1,
-            answerer_bound = created.answerer_bound,
-            range_present = ?verdict.range_present,
-            "session start decided the live name surface for this host"
-        );
-        eprintln!(
-            "{}",
-            crate::resolver::name_surface_line(verdict.surface, created.hostname_proxy_port)
-        );
+        {
+            // The host-side record of that verdict, the half the daemon's own
+            // log cannot make: a daemon can name only the answerer *it* binds
+            // (see the daemon's `log_live_name_surface`), so the surface this
+            // host's own reads decided — and the three facts behind it, with
+            // the range as the one fact only this read holds — is logged here,
+            // at the start that printed it, beside the daemon's line. `min`
+            // filters at `warn` unless `RUST_LOG` is set, so the line is visible
+            // under `RUST_LOG=info`. Logged, never printed: the line
+            // below is the user's. `min ls` does not log its verdict — a list
+            // re-reads the host every run, and the record that matters is the
+            // one at the starts that rely on the names.
+            tracing::info!(
+                surface = ?verdict.surface,
+                hook_routes = detection.0.routes(answerer_port),
+                blocker = ?detection.1,
+                answerer_bound = created.answerer_bound,
+                range_present = ?verdict.range_present,
+                "session start decided the live name surface for this host"
+            );
+            eprintln!(
+                "{}",
+                crate::resolver::name_surface_line(verdict.surface, created.hostname_proxy_port)
+            );
+        }
     }
     let id = created.id;
 
