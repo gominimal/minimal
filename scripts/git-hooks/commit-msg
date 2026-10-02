@@ -15,9 +15,19 @@ if command -v npx >/dev/null 2>&1 && [ -f commitlint.config.cjs ] &&
   exec npx --no-install commitlint --edit "$msg"
 fi
 
-awk '
-  /^#/ { next }
-  NR == 1 && length > 100 { print "commit-msg: subject is " length " columns (max 100)"; bad = 1 }
-  NR > 1 && length > 100 { print "commit-msg: body line " NR " is " length " columns (max 100)"; bad = 1 }
+# `#` lines are skipped only when an editor ran: git strips them after this hook
+# then, but keeps them under -m/-F (GIT_EDITOR=":"), where CI lints them.
+# commitlint measures UTF-16 code units, so count in bytes (LC_ALL=C, the same
+# in every awk) and convert: drop UTF-8 continuation bytes, add one per 4-byte
+# (astral) sequence.
+LC_ALL=C awk '
+  /^#/ && ENVIRON["GIT_EDITOR"] != ":" { next }
+  {
+    n = length($0)
+    s = $0; n -= gsub(/[\200-\277]/, "", s)
+    s = $0; n += gsub(/[\360-\364]/, "", s)
+  }
+  NR == 1 && n > 100 { print "commit-msg: subject is " n " columns (max 100)"; bad = 1 }
+  NR > 1 && n > 100 { print "commit-msg: body line " NR " is " n " columns (max 100)"; bad = 1 }
   END { exit bad }
 ' "$msg"
