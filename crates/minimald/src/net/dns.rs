@@ -1560,18 +1560,7 @@ pub struct LoopbackLeaseBook {
     /// for it. Seeded with the verdict the book opens on and moved beside
     /// the atomic by [`LoopbackLeaseBook::set_range_verdict`], so the two
     /// never disagree.
-    ///
-    /// A watch `send` with no receiver is dropped on the floor by the
-    /// channel itself, so the book holds the receiver it opened the
-    /// channel with ([`Self::verdict_witness`]) for its lifetime: a
-    /// landing is stored — and read by the next waiter — even when no
-    /// registration happens to be waiting on it yet.
     verdict_landing: tokio::sync::watch::Sender<RangeVerdict>,
-    /// The receiver [`Self::verdict_landing`] opened the channel with,
-    /// held only to keep the channel open (see the sender's doc); nothing
-    /// ever reads it.
-    #[allow(dead_code)]
-    verdict_witness: tokio::sync::watch::Receiver<RangeVerdict>,
     /// How long [`LoopbackLeaseBook::await_vouch_for`] waits before it
     /// answers a still-pending verdict with "not vouched", in milliseconds
     /// (an atomic because the wait is async and the setter is test-only):
@@ -1639,14 +1628,13 @@ impl LoopbackLeaseBook {
             .write(true)
             .open(lock_path.as_std_path())?;
         let lock = std::fs::File::open(lock_path.as_std_path()).map(fd_lock::RwLock::new)?;
-        let (verdict_landing, verdict_witness) = tokio::sync::watch::channel(verdict);
+        let (verdict_landing, _) = tokio::sync::watch::channel(verdict);
         Ok(Self {
             record,
             staging,
             lock: std::sync::Mutex::new(Some(lock)),
             verdict: std::sync::atomic::AtomicU8::new(verdict.key()),
             verdict_landing,
-            verdict_witness,
             hand_verdict_wait: std::sync::atomic::AtomicU64::new(
                 HAND_VERDICT_WAIT.as_millis() as u64
             ),
@@ -1696,7 +1684,12 @@ impl LoopbackLeaseBook {
     pub fn set_range_verdict(&self, verdict: RangeVerdict) {
         self.verdict
             .store(verdict.key(), std::sync::atomic::Ordering::Release);
-        let _ = self.verdict_landing.send(verdict);
+        // `send_replace` — not `send`: a watch `send` with no receiver
+        // subscribed is dropped on the floor by the channel itself, and a
+        // landing often arrives while nothing waits on it (no session, or
+        // every box standing on the interim), so the registration that
+        // subscribes afterwards must still read the verdict that landed.
+        self.verdict_landing.send_replace(verdict);
     }
 
     /// Waits for the verdict to vouch for `address`, bounded by the
