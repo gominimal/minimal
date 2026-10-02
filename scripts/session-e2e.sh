@@ -4792,10 +4792,11 @@ proof_switch_steers_proxy_mac_frames_to_the_host_stack() {
   fi
 
   # RST proves the peer received the frame and answered; a non-RST fast refusal
-  # would mean the switch dropped or mis-routed it.
-  rst="$(mnl session exec "$bep_sid" \
+  # would mean the switch dropped or mis-routed it. The probe's body is not
+  # read: the verdict is the refusal its stderr names.
+  mnl session exec "$bep_sid" \
     "python3 -c \"import socket; s=socket.socket(); s.settimeout(5); s.connect(('$proxy_ip', 443)); s.close()\"" \
-    2>"$WORK/bep-mac-probe.err" || true)"
+    2>"$WORK/bep-mac-probe.err" || true
   # The python connect will raise ConnectionRefusedError when the RST arrives,
   # which on the exec path is a non-zero exit but no stdout body.
   if grep -q "ConnectionRefusedError\|Connection refused" "$WORK/bep-mac-probe.err" || \
