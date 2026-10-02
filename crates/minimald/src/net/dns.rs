@@ -63,6 +63,8 @@ use sessions::core::egress::EgressRules;
 #[cfg(target_os = "linux")]
 use sessions::core::loopback::LoopbackAllocator;
 use sessions::{SessionId, SessionPolicy};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 use super::SwitchSubnet;
 
@@ -381,6 +383,24 @@ pub struct SharedPortCollision {
     pub other: String,
 }
 
+/// One own-address publish standing at the `127.0.0.1` interim (NET-123
+/// §7.1), as the present landing's sweep reads it: the box's stable id, the
+/// name its ports re-register under, the ports its declaration publishes,
+/// and the hand a creator gave it — `None` for a box nobody handed an
+/// address, which is the box the sweep grants a pool address to.
+#[derive(Debug, Clone)]
+pub struct InterimPublish {
+    /// The session whose box owns the publish.
+    pub session: SessionId,
+    /// The box name the move re-registers.
+    pub name: String,
+    /// The ports the box's declaration publishes.
+    pub ports: BTreeSet<u16>,
+    /// The loopback address a creator handed the box, if one did: the
+    /// move's target for a handed box — its own hand, never a fresh grant.
+    pub hand: Option<Ipv4Addr>,
+}
+
 /// Who a proxied request came from (NET-070): the live session the request's
 /// peer address names, at the switch lease its box holds, with the compiled
 /// egress rules its own outbound frames are decided by — the same rules a
@@ -508,6 +528,20 @@ pub struct HostnameRegistry {
     /// address of its own to stand in with — the shared-address interim this
     /// table once recorded beside it is gone with that default.
     own_published: HashMap<SessionId, OwnPublished>,
+    /// The loopback address a creator handed each own-address box, by stable
+    /// session id (T66, NET-123 §7.1): recorded at the box's registration
+    /// whether the publish lands at it or at the `127.0.0.1` interim — a
+    /// hand the pending verdict had not vouched for is the one publish that
+    /// can be standing at the interim while an address the box owns exists
+    /// — so a present landing's sweep moves a handed box standing at the
+    /// interim back to its **own hand**, never to a grant drawn from the
+    /// pool: the hand is the host-side table's row, an address this
+    /// daemon's book never owned, and "a hand is only ever replaced by
+    /// `127.0.0.1`" is the rule that keeps the publish and the attach
+    /// path's forwards (which name the hand as their `local`) at one
+    /// address. Dropped with the publish at
+    /// [`Self::unpublish_own_address`].
+    hands: HashMap<SessionId, Ipv4Addr>,
     /// Sessions whose box has stopped (NET-128): its name stays *held* —
     /// answered, not absent, so a stopped box is never mistaken for one that
     /// never existed — but a name it shares with the node answers NODATA, so
@@ -562,6 +596,7 @@ impl HostnameRegistry {
             on_switch,
             node: Ipv4Addr::LOCALHOST,
             own_published: HashMap::new(),
+            hands: HashMap::new(),
             stopped: HashSet::new(),
             by_host: HashMap::new(),
             by_session: HashMap::new(),
@@ -768,26 +803,60 @@ impl HostnameRegistry {
     }
 
     /// The own-address publishes standing at the `127.0.0.1` interim
-    /// (NET-123), as `(session id, session_name, ports)` — the boxes a
-    /// **present** verdict landing re-asks for. The interim is the ask's
-    /// own answer for a verdict that had not landed, never an address a hand
-    /// named (a VM host hands addresses of the range's slice), so the landing
-    /// that replaces the verdict is the one moment those asks upgrade to a
-    /// grant — for the boxes it finds live; a box whose publish the landing
+    /// (NET-123 §7.1) — the boxes a **present** verdict landing moves off it.
+    /// The interim is the ask's own answer for a verdict that had not
+    /// landed, never an address the box owns, so the landing that replaces
+    /// the verdict is the one moment those asks upgrade — to the box's own
+    /// hand for a box a creator handed one (never a grant from the pool: a
+    /// hand is only ever replaced by `127.0.0.1`), to a grant for a box
+    /// nobody handed an address. Each row carries the hand with it, so the
+    /// sweep's move needs no second read. A box whose publish the landing
     /// misses, because it was stopped across the landing, asks again at its
     /// next finalize, which does not short-circuit on the interim either.
     #[must_use]
-    pub fn interim_own_publishes(&self) -> Vec<(SessionId, String, BTreeSet<u16>)> {
+    pub fn interim_own_publishes(&self) -> Vec<InterimPublish> {
         self.own_published
             .iter()
             .filter(|(_, own)| own.address == Ipv4Addr::LOCALHOST)
             .filter_map(|(id, own)| {
-                self.by_session
+                let (name, _) = self
+                    .by_session
                     .iter()
-                    .find(|(_, registration)| registration.id == *id)
-                    .map(|(name, _)| (*id, name.clone(), own.ports.clone()))
+                    .find(|(_, registration)| registration.id == *id)?;
+                Some(InterimPublish {
+                    session: *id,
+                    name: name.clone(),
+                    ports: own.ports.clone(),
+                    hand: self.hands.get(id).copied(),
+                })
             })
             .collect()
+    }
+
+    /// Records the loopback address a creator handed this own-address box
+    /// (T66, NET-123 §7.1) — called at every registration that finds a hand
+    /// on the box's record, whatever address the publish lands at, because
+    /// the hand is the box's own address whether it is standing at it or
+    /// waiting on the interim for the verdict that vouches for it. The
+    /// present landing's sweep reads it through
+    /// [`Self::interim_own_publishes`] to move a handed box back to its own
+    /// hand instead of drawing it a grant; it is dropped with the publish at
+    /// [`Self::unpublish_own_address`].
+    pub fn record_own_hand(&mut self, session_id: SessionId, address: Ipv4Addr) {
+        self.hands.insert(session_id, address);
+    }
+
+    /// Whether `session_name` is still registered **to `session_id`** — the
+    /// re-check a present landing's publish runs under the write lock before
+    /// it re-registers the name (names are first-writer-owned, so a box that
+    /// died inside the landing's window must not have its name re-claimed
+    /// over the next box that takes it). Gated by id rather than the name
+    /// alone, exactly as [`Self::withdraw_own_name`] gates its withdrawal.
+    #[must_use]
+    pub fn name_held_by(&self, session_id: SessionId, session_name: &str) -> bool {
+        self.by_session
+            .get(session_name)
+            .is_some_and(|registration| registration.id == session_id)
     }
 
     /// Reports the lease an `OwnIp` box attached with (from the attach path)
@@ -929,9 +998,12 @@ impl HostnameRegistry {
     /// for the session actor to release into the allocator (NET-010) — the
     /// lease's other half, at the same place the release is logged. A box
     /// whose publish is gone stops answering at the address: its name is
-    /// withdrawn by [`Self::deregister`] in the same deregister.
+    /// withdrawn by [`Self::deregister`] in the same deregister. The box's
+    /// recorded hand goes with the publish: a landing's sweep must not find
+    /// a hand for a box that no longer exists.
     pub fn unpublish_own_address(&mut self, session_id: SessionId) -> Option<Ipv4Addr> {
         self.stopped.remove(&session_id);
+        self.hands.remove(&session_id);
         self.own_published
             .remove(&session_id)
             .map(|own| own.address)
@@ -1438,6 +1510,12 @@ impl RangeVerdict {
 /// the `minvmd` boundary, the host answerer of #1772 is the arbiter, and this
 /// book is the per-root cache it will write through. See the module comment
 /// for the bound this interim has and the work that closes the cross-root gap.
+///
+/// The book also carries the half NET-123 §7.1 asks of a registration that
+/// holds a hand the verdict has not vouched for: a bounded wait for the
+/// verdict to land ([`LoopbackLeaseBook::await_vouch_for`]), so the name
+/// publishes once at its final address rather than moving under a live
+/// session's clients.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct LoopbackLeaseBook {
@@ -1474,7 +1552,49 @@ pub struct LoopbackLeaseBook {
     /// interim and never handed an address nothing has vouched for, while a
     /// box the record already names keeps its address (NET-013).
     verdict: std::sync::atomic::AtomicU8,
+    /// The verdict's landing, broadcast to the registrations waiting on it
+    /// ([`LoopbackLeaseBook::await_vouch_for`]): the atomic above is the
+    /// zero-latency read the synchronous paths (the grant, the vouch) take,
+    /// and this is the wake-up the one async path takes, so a registration
+    /// holding an unvouched hand is woken by the landing rather than polling
+    /// for it. Seeded with the verdict the book opens on and moved beside
+    /// the atomic by [`LoopbackLeaseBook::set_range_verdict`], so the two
+    /// never disagree.
+    ///
+    /// A watch `send` with no receiver is dropped on the floor by the
+    /// channel itself, so the book holds the receiver it opened the
+    /// channel with ([`Self::verdict_witness`]) for its lifetime: a
+    /// landing is stored — and read by the next waiter — even when no
+    /// registration happens to be waiting on it yet.
+    verdict_landing: tokio::sync::watch::Sender<RangeVerdict>,
+    /// The receiver [`Self::verdict_landing`] opened the channel with,
+    /// held only to keep the channel open (see the sender's doc); nothing
+    /// ever reads it.
+    #[allow(dead_code)]
+    verdict_witness: tokio::sync::watch::Receiver<RangeVerdict>,
+    /// How long [`LoopbackLeaseBook::await_vouch_for`] waits before it
+    /// answers a still-pending verdict with "not vouched", in milliseconds
+    /// (an atomic because the wait is async and the setter is test-only):
+    /// the session-start deadline the client already bounds its
+    /// box-control requests at — [`HAND_VERDICT_WAIT`] — so a finalize that
+    /// waits for the deferred walk stays inside the caller it answers. The
+    /// bound is spent only by a verdict that never lands; a landing wakes
+    /// the waiter at once.
+    hand_verdict_wait: std::sync::atomic::AtomicU64,
 }
+
+/// How long a registration holding an unvouched hand waits for the range
+/// verdict to land (NET-123 §7.1): the session-start deadline the client's
+/// box-control requests are already bounded at — 5 s — the one bound a
+/// session's start is held to, so a finalize that waits for the deferred
+/// walk never out-waits the client it answers. A verdict that lands inside
+/// it publishes the hand; one that does not publishes the `127.0.0.1`
+/// interim, which the present landing's sweep upgrades to the hand it now
+/// vouches for. Test-only code shrinks the wait
+/// ([`LoopbackLeaseBook::shrink_hand_verdict_wait`]) so the expiry shape is
+/// proven without paying the bound.
+#[cfg(target_os = "linux")]
+const HAND_VERDICT_WAIT: Duration = Duration::from_secs(5);
 
 #[cfg(target_os = "linux")]
 impl LoopbackLeaseBook {
@@ -1519,11 +1639,17 @@ impl LoopbackLeaseBook {
             .write(true)
             .open(lock_path.as_std_path())?;
         let lock = std::fs::File::open(lock_path.as_std_path()).map(fd_lock::RwLock::new)?;
+        let (verdict_landing, verdict_witness) = tokio::sync::watch::channel(verdict);
         Ok(Self {
             record,
             staging,
             lock: std::sync::Mutex::new(Some(lock)),
             verdict: std::sync::atomic::AtomicU8::new(verdict.key()),
+            verdict_landing,
+            verdict_witness,
+            hand_verdict_wait: std::sync::atomic::AtomicU64::new(
+                HAND_VERDICT_WAIT.as_millis() as u64,
+            ),
         })
     }
 
@@ -1564,40 +1690,104 @@ impl LoopbackLeaseBook {
     /// granted at an address nothing has vouched for — and the walk, once it
     /// has an answer, applies it here. Only the verdict moves: no grant is
     /// made or taken back by this call, and a book that already holds the
-    /// verdict it is asked for changes nothing.
+    /// verdict it is asked for changes nothing. The move is broadcast beside
+    /// the store, so a registration waiting on
+    /// [`Self::await_vouch_for`] is woken by it.
     pub fn set_range_verdict(&self, verdict: RangeVerdict) {
         self.verdict
             .store(verdict.key(), std::sync::atomic::Ordering::Release);
+        let _ = self.verdict_landing.send(verdict);
+    }
+
+    /// Waits for the verdict to vouch for `address`, bounded by the
+    /// session-start deadline (NET-123 §7.1) — the registration path a handed
+    /// box takes when the verdict it must be vouched by has not landed yet.
+    ///
+    /// A verdict already landed answers at once: **present** vouches for an
+    /// address of the range, **absent** does not, and an address outside the
+    /// range needs no verdict either way. Only a **pending** verdict waits,
+    /// and it waits only until the deadline — a walk that has not answered
+    /// by then is answered as "not vouched", so the caller publishes the
+    /// `127.0.0.1` interim rather than holding the session's start for a
+    /// probe the landing sweep will settle the moment it lands. A waiter
+    /// woken late re-reads the verdict before the deadline decides, so a
+    /// verdict landing in the same instant as the bound is still answered by
+    /// the verdict, not by the clock.
+    pub async fn await_vouch_for(&self, address: Ipv4Addr) -> bool {
+        if !in_reserved_local_range(address) {
+            return true;
+        }
+        let wait = std::time::Duration::from_millis(
+            self.hand_verdict_wait
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
+        let deadline = tokio::time::Instant::now() + wait;
+        let mut landing = self.verdict_landing.subscribe();
+        loop {
+            match *landing.borrow_and_update() {
+                RangeVerdict::Present => return true,
+                RangeVerdict::Absent => return false,
+                RangeVerdict::Pending => {}
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                // The bound spent and the verdict still walking: answered as
+                // not vouched, so the caller publishes the interim — the
+                // landing's sweep upgrades it when the walk finally lands.
+                return false;
+            }
+            if tokio::time::timeout(remaining, landing.changed())
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+
+    /// Shrinks the bound [`Self::await_vouch_for`] waits to, in
+    /// milliseconds, so a test proves the expiry shape without paying the
+    /// session-start deadline's real five seconds.
+    ///
+    /// Test-only: no production path changes a deadline it is itself bounded
+    /// by, and one that did would want a message, not a setter.
+    #[cfg(test)]
+    pub fn shrink_hand_verdict_wait(&self, millis: u64) {
+        self.hand_verdict_wait
+            .store(millis, std::sync::atomic::Ordering::Release);
     }
 
     /// Whether `address` may be published as a box's own under the verdict
-    /// this book holds (NET-123): the gate a handed address goes through
-    /// before it stands in for a lease.
+    /// this book holds (NET-123 §7.1): the gate a handed address goes
+    /// through before it stands in for a lease.
     ///
     /// An address outside the reserved local range needs no vouching — the
     /// hand that carried it chose it — while one from the range is
-    /// publishable only until the host's publish surface has *measured* the
-    /// range absent. The measurement is the one this book holds: the
+    /// publishable only once the host's publish surface has *measured* the
+    /// range bindable. The measurement is the one this book holds: the
     /// daemon-start probe's on a native host, the forwarder-conducted walk's
-    /// on a microVM one. A verdict still pending does not withdraw it, because
-    /// a hand has a provenance of its own — the VM host daemon's table row,
-    /// keyed by the box's switch address, which a resumed box keeps its
-    /// address on inside the walk's window (NET-013) — while a landed absent
-    /// verdict is the surface's own answer over it: the VM host daemon hands
-    /// slice addresses of the range without measuring the host's loopback —
-    /// the root fix is the host daemon measuring before it hands (#1818),
-    /// this gate the interim until it lands — so a box that published its
-    /// hand verbatim would bind its declared ports at an address the surface
-    /// cannot bind: `EADDRNOTAVAIL` at every bind on a stock macOS host,
-    /// exactly the refusal the verdict exists to keep a box from publishing
-    /// at. With the verdict against it the hand publishes nothing and the
-    /// box's ask falls through, to the interim — and the gate reads the
-    /// record the same way it reads the hand: a publish the window left at
-    /// an unvouched address asks again rather than standing at it, so no
-    /// box holds an address a landed verdict contradicts.
+    /// on a microVM one — and **only a landed present verdict vouches**. A
+    /// pending one does not, because the VM host daemon hands slice
+    /// addresses of the range without measuring the host's loopback at all
+    /// — the root fix is the host daemon measuring before it hands (#1818),
+    /// this gate the interim until it lands — so a hand's provenance (the
+    /// host-side table row, which a resumed box keeps its address on,
+    /// NET-013) is not a measurement, and a box that published it verbatim
+    /// inside the window would bind its declared ports at an address the
+    /// surface may refuse at every bind: `EADDRNOTAVAIL` on a stock macOS
+    /// host, exactly the refusal the verdict exists to keep a box from
+    /// publishing at. The registration path therefore waits for the verdict
+    /// ([`Self::await_vouch_for`]) before it gives up on the hand, bounded
+    /// by the session-start deadline, and publishes the interim only when
+    /// the wait answers unvouched — an absent verdict, or a walk that never
+    /// landed. With the verdict against it the hand publishes nothing and
+    /// the box's ask falls through, to the interim — and the gate reads the
+    /// record the same way it reads the hand: a publish standing at an
+    /// unvouched address asks again rather than standing at it, so no box
+    /// holds an address a landed verdict contradicts.
     #[must_use]
     pub fn vouches_for(&self, address: Ipv4Addr) -> bool {
-        !in_reserved_local_range(address) || self.verdict() != RangeVerdict::Absent
+        !in_reserved_local_range(address) || self.verdict() == RangeVerdict::Present
     }
 
     /// Grants `namespace` an address from the host's pool, or answers with
@@ -3220,18 +3410,21 @@ mod tests {
         );
     }
 
-    /// The verdict gate a VM host daemon's hand goes through (NET-123): the
-    /// hand names a slice address of the reserved local range without
+    /// The verdict gate a VM host daemon's hand goes through (NET-123 §7.1):
+    /// the hand names a slice address of the reserved local range without
     /// measuring the loopback it binds on, so the guest's verdict decides
-    /// whether it is publishable. A verdict still walking trusts the hand's
-    /// own provenance — the host-side table row a resumed box keeps its
-    /// address on inside the window (NET-013) — while a verdict that has
-    /// landed absent is the publish surface's own answer over it: an address
-    /// the surface cannot bind is not publishable, whatever handed it. An
-    /// address outside the range needs no vouching at all.
+    /// whether it is publishable — and **only a landed verdict does**: a
+    /// present one vouches, a pending one does not (the hand's provenance —
+    /// the host-side table row a resumed box keeps its address on,
+    /// NET-013 — is a fact about who chose the address, not a measurement
+    /// of the surface it binds on), and an absent one is the surface's own
+    /// answer against it. An address outside the range needs no vouching at
+    /// all. The registration path that meets an unvouched hand waits for
+    /// the verdict to land rather than publishing either address — that
+    /// wait is the test below this one.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_landed_absent_verdict_withdraws_the_vouching_a_handed_range_address_needs() {
+    fn only_a_landed_present_verdict_vouches_for_a_handed_range_address() {
         let tmp = tempfile::tempdir().unwrap();
         let state_root = lease_root(&tmp);
         let handed = sessions::core::loopback::POOL_FIRST;
@@ -3244,15 +3437,16 @@ mod tests {
         );
 
         // A microVM daemon's book inside the walk's window: nothing has
-        // measured the surface yet, so the hand's provenance stands.
+        // measured the surface yet, and provenance is not a measurement, so
+        // the hand is not publishable until the walk answers.
         let pending = LoopbackLeaseBook::open(&state_root, RangeVerdict::Pending).unwrap();
         assert!(
-            pending.vouches_for(handed),
-            "the pending window trusts the hand's provenance"
+            !pending.vouches_for(handed),
+            "a pending verdict has not vouched for the hand, however it was chosen"
         );
 
         // The walk lands absent — the stock-macOS shape, where no alias of
-        // the range binds — and the same hand is no longer publishable: the
+        // the range binds — and the same hand is still not publishable: the
         // box that publishes it verbatim would bind its declared ports at an
         // address every bind refuses.
         pending.set_range_verdict(RangeVerdict::Absent);
@@ -3266,6 +3460,60 @@ mod tests {
         assert!(
             pending.vouches_for(Ipv4Addr::LOCALHOST),
             "an address outside the reserved range needs no vouching"
+        );
+    }
+
+    /// The wait an unvouched hand takes (NET-123 §7.1): a registration
+    /// holding a hand the verdict has not vouched for waits for the verdict
+    /// to land, bounded by the session-start deadline — a present verdict
+    /// landing inside the bound vouches for the hand, an absent one
+    /// refuses it at once, and a verdict that never lands has the bound
+    /// answered as "not vouched" so the caller publishes the interim
+    /// instead of holding the session's start forever. The bound here is
+    /// shrunk to tens of milliseconds so the expiry is proven without the
+    /// real deadline's five seconds.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unvouched_hand_waits_for_the_verdict_and_is_answered_by_the_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_root = lease_root(&tmp);
+        let handed = sessions::core::loopback::POOL_FIRST;
+
+        // A pending book whose wait is shrunk to the test's patience: the
+        // hand is unvouched, the verdict lands inside the bound, and the
+        // wait answers with the verdict, not with the clock.
+        let pending = LoopbackLeaseBook::open(&state_root, RangeVerdict::Pending).unwrap();
+        pending.shrink_hand_verdict_wait(2_000);
+        pending.set_range_verdict(RangeVerdict::Present);
+        assert!(
+            pending.await_vouch_for(handed).await,
+            "a verdict that lands inside the bound vouches for the hand"
+        );
+
+        // An absent verdict answers at once, with no wait to spend.
+        let absent = LoopbackLeaseBook::open(&state_root, RangeVerdict::Absent).unwrap();
+        assert!(
+            !absent.await_vouch_for(handed).await,
+            "a landed absent verdict answers the wait with 'not vouched' at once"
+        );
+
+        // A verdict that never lands: the bound is spent and answered as
+        // "not vouched", so the caller publishes the interim rather than
+        // waiting for a walk that is not walking.
+        let never = LoopbackLeaseBook::open(&state_root, RangeVerdict::Pending).unwrap();
+        never.shrink_hand_verdict_wait(50);
+        let started = std::time::Instant::now();
+        assert!(
+            !never.await_vouch_for(handed).await,
+            "a verdict that never lands is answered by the bound, not vouched"
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(50),
+            "the bound is what the expiry answer waited on"
+        );
+        assert!(
+            never.await_vouch_for(Ipv4Addr::LOCALHOST).await,
+            "an address outside the reserved range never waits at all"
         );
     }
 

@@ -861,22 +861,29 @@ impl Session {
                 // the release at destroy runs for a handed box.
                 //
                 // The hand still goes through the verdict the host's publish
-                // surface holds (NET-123): the VM host daemon hands slice
-                // addresses without measuring the loopback they bind on —
-                // the root fix is the host daemon measuring before it hands
-                // (#1818), the verdict this gate reads the interim until it
-                // lands — and on a host whose surface cannot bind the range
-                // the hand names an address no bind will ever hold.
-                // [`vouches_for`] is the gate — a pending verdict trusts the
-                // hand's own provenance (the host-side row, which a resumed
-                // box keeps its address on inside the walk's window,
-                // NET-013), a landed absent one overrules it — so an
-                // unvouched hand publishes nothing and the ask below answers
-                // the box with the interim rather than binding forwards at
-                // an address the surface refuses. The recorded publish reads
-                // through the same gate (the first filter above): a hand the
-                // window vouched and the landing has since overruled does
-                // not survive in the registry either.
+                // surface holds (NET-123 §7.1): the VM host daemon hands
+                // slice addresses without measuring the loopback they bind
+                // on — the root fix is the host daemon measuring before it
+                // hands (#1818) — and on a host whose surface cannot bind
+                // the range the hand names an address no bind will ever
+                // hold. [`vouches_for`] is the gate, and only a **landed
+                // present** verdict passes it: a pending one has measured
+                // nothing, and the hand's own provenance (the host-side
+                // row, which a resumed box keeps its address on, NET-013)
+                // is a fact about who chose the address, not about the
+                // surface it binds on. So a hand the verdict has not
+                // vouched for is not published and not refused either —
+                // the registration waits for the verdict to land, bounded
+                // by the session-start deadline
+                // ([`Self::hand_or_interim`]), so the name publishes once
+                // at its final address: at the hand when the walk lands
+                // present inside the bound, at the interim when it lands
+                // absent or never lands — and the present landing's sweep
+                // upgrades an interim-standing handed box back to its own
+                // hand when the verdict arrives late. The recorded publish
+                // reads through the same gate (the first filter above): a
+                // hand the landing has since overruled does not survive in
+                // the registry either.
                 let already_published = {
                     let reg = self
                         .hostnames
@@ -885,13 +892,12 @@ impl Session {
                     reg.published_own_address(record.id)
                         // The verdict the book holds gates the recorded
                         // publish exactly as it gates the fresh hand below
-                        // (NET-123): a publish that outlived a verdict
-                        // landing against it — the pending window vouched
-                        // the hand, the walk has since overruled it — names
-                        // an address the surface cannot bind, and the
-                        // record's memory of it must not keep the box
-                        // standing there. The ask below answers with the
-                        // interim instead.
+                        // (NET-123): a publish that outlived the verdict
+                        // that vouched for it — a landing has overruled it
+                        // since — names an address the surface cannot bind,
+                        // and the record's memory of it must not keep the
+                        // box standing there. The ask below answers with
+                        // the interim instead.
                         .filter(|address| self.loopback.vouches_for(*address))
                         // The `127.0.0.1` interim is the surface's answer,
                         // never an address the box owns, so a publish
@@ -904,17 +910,34 @@ impl Session {
                 };
                 let handed = record
                     .box_addresses
-                    .map(|addresses| addresses.loopback_address)
-                    .filter(|address| self.loopback.vouches_for(*address));
-                let published = already_published
-                    .or(handed)
-                    .or_else(|| self.lease_loopback_address(record, &name));
+                    .map(|addresses| addresses.loopback_address);
+                let published = if already_published.is_some() {
+                    already_published
+                } else {
+                    match handed {
+                        // The hand goes through the verdict the host's
+                        // publish surface holds (NET-123 §7.1) — under a
+                        // verdict that has vouched for it, at the hand;
+                        // under one that has not, through the bounded wait
+                        // that keeps the name from publishing twice.
+                        Some(hand) => self.hand_or_interim(record, &name, hand).await,
+                        None => self.lease_loopback_address(record, &name),
+                    }
+                };
                 let mut reg = self
                     .hostnames
                     .write()
                     .expect("hostname registry lock poisoned");
                 reg.register_caller(record.id, &name, &record.policy, subnet);
                 let declared = crate::net::switch::declared_request_ports(Some(&record.policy));
+                if let Some(hand) = handed {
+                    // The hand is the box's own address whether this
+                    // publish lands at it or at the interim the wait's
+                    // expiry stands it on: recorded so the present landing's
+                    // sweep moves a handed box off the interim back to its
+                    // own hand, never to a grant drawn from the pool.
+                    reg.record_own_hand(record.id, hand);
+                }
                 if let Some(address) = published {
                     // One warn line per port another box at the same address
                     // also publishes (NET-129): intrinsic to the shared-address
@@ -950,6 +973,55 @@ impl Session {
         if matches!(record.network, sessions::NetworkMode::OwnIp) {
             self.report_unrecorded_publishes();
         }
+    }
+
+    /// Resolves a hand the verdict has not vouched for (NET-123 §7.1): wait
+    /// for the verdict to land, bounded by the session-start deadline
+    /// ([`crate::net::dns::LoopbackLeaseBook::await_vouch_for`]), so the
+    /// name publishes **once** at its final address rather than moving
+    /// under the clients a live session already has.
+    ///
+    /// A verdict that lands present inside the bound vouches for the hand
+    /// and the publish is at it — the shape a finalize meets when the walk
+    /// answers while it is asking. One that lands absent answers the wait
+    /// at once with "not vouched", and one that never lands has the bound
+    /// itself answered: both shapes fall through to the ask, whose answer
+    /// for a host whose surface cannot bind the range is the `127.0.0.1`
+    /// interim — the address a host can listen on whatever its `lo0`
+    /// carries — with the hand→interim move said out loud, naming the box
+    /// and both addresses. The present landing's sweep upgrades a handed
+    /// box standing at that interim back to its own hand when the verdict
+    /// finally vouches for it
+    /// ([`crate::sessions::land_range_verdict`]'s present arm).
+    ///
+    /// Called outside every registry lock — the wait is async, and the ask
+    /// below it is a read-modify-write of the answerer's record under its
+    /// lock file — the same order the lease ask itself follows.
+    #[cfg(target_os = "linux")]
+    async fn hand_or_interim(
+        &self,
+        record: &Record,
+        name: &str,
+        hand: std::net::Ipv4Addr,
+    ) -> Option<std::net::Ipv4Addr> {
+        if self.loopback.await_vouch_for(hand).await {
+            return Some(hand);
+        }
+        let published = self.lease_loopback_address(record, name);
+        if published.is_some() {
+            tracing::warn!(
+                session_id = %record.id,
+                session_name = name,
+                from = %hand,
+                to = %std::net::Ipv4Addr::LOCALHOST,
+                action = "loopback-hand-to-interim",
+                "the hand's range is not vouched for by a landed present \
+                 verdict; the box's publish — name and route with it — \
+                 moves to the 127.0.0.1 interim, and the present landing \
+                 upgrades it to the hand once the verdict vouches"
+            );
+        }
+        published
     }
 
     /// One warn line per reserved-range address a live publish holds on this
