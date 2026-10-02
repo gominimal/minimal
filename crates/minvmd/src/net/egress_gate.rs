@@ -344,14 +344,15 @@ const RESOLVER_PROTOCOLS: [u8; 2] = [6, 17];
 /// registration whose rows end the interim.
 const UNREGISTERED_SOURCE_RULE: &str = "egress-unregistered-source";
 
-/// The rule name for a request head the gate refuses to relay. Two shapes
+/// The rule name for a request head the gate refuses to relay. Three shapes
 /// share it: a request-target outside the gate's allow-list — gvproxy's
 /// switch socket carries other verbs there, the `/tunnel` hijack among them —
-/// and a control head whose body the gate cannot frame, chunked or split
-/// across two disagreeing `Content-Length`s. Neither is the daemon's own
-/// client's shape, so the head is refused before anything of it is written
-/// on, and the refusal is rate-limited like a frame drop: a guest can attempt
-/// it on a fresh connection as cheaply as it can send a frame.
+/// a control head whose body the gate cannot frame, chunked or split across
+/// two disagreeing `Content-Length`s, and a control head whose declared body
+/// the guest then withholds past the bound ([`relay_control`]). None is the
+/// daemon's own client's shape, so the head is refused before anything of it
+/// is written on, and the refusal is rate-limited like a frame drop: a guest
+/// can attempt it on a fresh connection as cheaply as it can send a frame.
 const UNDECLARED_VERB_RULE: &str = "egress-undeclared-verb";
 
 /// The rule name for the publish half's interim admission: a switch publish
@@ -719,6 +720,7 @@ impl EgressGate {
                 baseline,
                 limiter,
                 forwards,
+                HANDSHAKE_TIMEOUT,
                 phase,
             )),
         })
@@ -819,6 +821,18 @@ impl AcceptFailure {
 /// live relays are counted against [`MAX_LIVE_RELAYS`], so a guest that opens
 /// connections and then sits idle — precisely the peer this gate exists to
 /// contain — cannot pin host sockets and tasks without bound.
+///
+/// `handshake_timeout` is the bound every connection is served under
+/// ([`serve_connection`]); it is a parameter only so a test can shrink it,
+/// and the one caller outside this module's tests passes
+/// [`HANDSHAKE_TIMEOUT`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the source, the switch socket, the table, the baseline, the limiter, the \
+              publish ledger, the bound and the phase are each a distinct input to \
+              every relay the loop spawns; grouping them would name the bundle \
+              without naming the members"
+)]
 async fn accept_loop<A: GuestSource>(
     mut source: A,
     switch_sock: PathBuf,
@@ -826,6 +840,7 @@ async fn accept_loop<A: GuestSource>(
     baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
     forwards: Arc<PublishedForwards>,
+    handshake_timeout: Duration,
     phase: UnregisteredSourcePhase,
 ) {
     let mut relays = JoinSet::new();
@@ -890,7 +905,7 @@ async fn accept_loop<A: GuestSource>(
             baseline.clone(),
             Arc::clone(&limiter),
             Arc::clone(&forwards),
-            HANDSHAKE_TIMEOUT,
+            handshake_timeout,
             phase,
         ));
     }
@@ -904,11 +919,13 @@ async fn accept_loop<A: GuestSource>(
 /// connection lives, until the guest or the switch goes away.
 ///
 /// `handshake_timeout` bounds everything up to and including the head the
-/// frame stream's relay starts from, and, on a control connection, the wait
-/// on a guest gone silent past its request and the drain of the answer that
-/// follows the request's end. It is a parameter only so a test can shrink
-/// it; every caller outside this module's tests reaches a connection through
-/// [`accept_loop`], which passes [`HANDSHAKE_TIMEOUT`].
+/// frame stream's relay starts from, and, on a control connection, the read
+/// of the body the head declared, the wait on a guest gone silent past its
+/// request and the drain of the answer that follows the request's end. It is
+/// a parameter only so a test can shrink it; every caller outside this
+/// module's tests reaches a connection through [`accept_loop`], which passes
+/// the bound it was given — [`HANDSHAKE_TIMEOUT`] from
+/// [`EgressGate::spawn_with_phase`].
 #[expect(
     clippy::too_many_arguments,
     reason = "the two sockets, the table, the baseline, the limiter, the publish \
@@ -1145,14 +1162,18 @@ async fn relay_frames(
 /// next spoke. The response leg ending is the only thing on this side that
 /// knows, so whichever leg ends first takes the relay down with it.
 ///
-/// The request leg's own wait is bounded past the body, where the guest's
-/// silence is at its widest: the guest has no reason to speak while it waits
-/// for the answer, so the probe that ends the leg on a byte past the request
-/// runs under `drain_timeout` as well. A guest that spoke its one request
-/// and then waits — its normal posture — no longer holds the relay, the dial
-/// and the socket halves for the gate's lifetime on a switch that neither
-/// answers nor hangs up: the leg ends at the bound, and the release runs
-/// through the same bounded drain [`finish_control`] gives every other end.
+/// The request leg's own waits are bounded, the body's read and the wait
+/// past it both. Past the body the guest's silence is at its widest: it has
+/// no reason to speak while it waits for the answer, so the probe that ends
+/// the leg on a byte past the request runs under `drain_timeout` as well,
+/// and the body's read runs under the same bound, so a guest that declares a
+/// body and withholds it is refused like one that closed mid-body rather
+/// than holding the relay and its [`MAX_LIVE_RELAYS`] slot. A guest that
+/// spoke its one request and then waits — its normal posture — no longer
+/// holds the relay, the dial and the socket halves for the gate's lifetime
+/// on a switch that neither answers nor hangs up: the leg ends at the bound,
+/// and the release runs through the same bounded drain [`finish_control`]
+/// gives every other end.
 ///
 /// Whichever way the request leg ends, the exchange's answer is still owed:
 /// the switch's side is half-closed, so gvproxy sees the request's end and
@@ -1184,14 +1205,46 @@ async fn relay_control(
 ) {
     // The request is read whole before anything is decided: the head framed
     // its body by count, so the body is read exactly — and a guest that
-    // never finished it has published nothing to decide.
-    let Some(request) = read_control_body(&mut guest, body).await else {
-        // The guest's side ended mid-body. Nothing was written on — the head
-        // went out with no request behind it — so gvproxy holds no request to
-        // answer, and the relay comes down without the drain a finished
-        // request owes.
-        return;
-    };
+    // never finished it has published nothing to decide. The read runs under
+    // `drain_timeout`, the bound this leg already gives a guest gone quiet
+    // past its request: the head was read under the handshake's bound and the
+    // body is the same peer's next bytes, so a guest that declares a body and
+    // then withholds it is the silent guest again, this time holding the
+    // relay task, the gate's dial, both socket halves and one of the
+    // [`MAX_LIVE_RELAYS`] slots — and enough of those closes the gate to every
+    // guest connection after. The bound is what returns the slot.
+    let request =
+        match tokio::time::timeout(drain_timeout, read_control_body(&mut guest, body)).await {
+            Ok(Some(request)) => request,
+            Ok(None) => {
+                // The guest's side ended mid-body. Nothing was written on —
+                // the head went out with no request behind it — so gvproxy
+                // holds no request to answer, and the relay comes down
+                // without the drain a finished request owes.
+                return;
+            }
+            Err(_) => {
+                // Withheld past the bound: refused exactly as a guest that
+                // closed mid-body is — nothing was written on, gvproxy holds
+                // no request to answer, the relay comes down with the return
+                // — and said so under the rule a head the gate cannot frame is
+                // refused under, at the frame drops' cadence: a guest can
+                // attempt it on a fresh connection as cheaply as it can send
+                // a frame, and the refusal must not become the flood.
+                if limiter.should_warn_at(None, UNDECLARED_VERB_RULE, Instant::now())
+                    != WarnDecision::Silent
+                {
+                    tracing::warn!(
+                        rule_matched = UNDECLARED_VERB_RULE,
+                        declared_body = body,
+                        read_timeout = ?drain_timeout,
+                        "a control body was withheld past the bound; \
+                         the egress gate refused the request",
+                    );
+                }
+                return;
+            }
+        };
     let decision = match decide_control_request(verb, &request, &table, phase, forwards) {
         Ok(decision) => decision,
         Err(refused) => {
@@ -4933,6 +4986,7 @@ mod tests {
             NodePlaneBaseline::built_in(SUBNET),
             Arc::new(DropLimiter::new()),
             Arc::new(PublishedForwards::new()),
+            HANDSHAKE_TIMEOUT,
             UNREGISTERED_SOURCE_PHASE,
         ));
         (feed, accept, log, guard)
@@ -5143,6 +5197,140 @@ mod tests {
         assert_eq!(
             seen, declared,
             "a connection past a freed one is relayed again"
+        );
+    }
+
+    /// A guest that sends a control head declaring a body and then withholds
+    /// the body is refused at the bound, and its relay slot comes back. The
+    /// head is read under the handshake's bound, but the body is the same
+    /// untrusted peer's next bytes: unbounded, the read would hold the relay
+    /// task, the gate's dial, both socket halves and one of the
+    /// [`MAX_LIVE_RELAYS`] slots for the gate's lifetime, and enough such
+    /// connections would have the accept loop refuse every guest connection
+    /// after them, frame relays included. So the whole cap is filled with
+    /// withheld bodies: each is closed within the bound with nothing written
+    /// on the switch, and the next guest connection — one past what the cap
+    /// would have refused — is served and relays.
+    #[tokio::test]
+    async fn withheld_control_body_releases_the_relay_slot() {
+        // The bound shrunk from [`HANDSHAKE_TIMEOUT`] — the one every real
+        // connection reads under — so the release is watched in milliseconds
+        // rather than five seconds.
+        let bound = Duration::from_millis(200);
+        assert!(
+            bound < HANDSHAKE_TIMEOUT,
+            "the release must be watched in less time than the real bound allows"
+        );
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let table = registry.table();
+        let dir = TempDir::new().expect("a tempdir is creatable");
+        let switch_sock = dir.path().join("gvproxy-switch.sock");
+        let listener = UnixListener::bind(&switch_sock).expect("binding the stand-in switch");
+        let (log, _guard) = capture_log();
+        let (feed, _accept) = {
+            let (feed, script) = mpsc::unbounded_channel();
+            let accept = tokio::spawn(accept_loop(
+                ScriptedGuests(script),
+                switch_sock.clone(),
+                table,
+                NodePlaneBaseline::built_in(SUBNET),
+                Arc::new(DropLimiter::new()),
+                Arc::new(PublishedForwards::new()),
+                bound,
+                UNREGISTERED_SOURCE_PHASE,
+            ));
+            (feed, accept)
+        };
+
+        // Every slot the gate has, taken by a guest that declares a body and
+        // sends none of it: a valid control head, a `Content-Length` the gate
+        // is willing to read, and then silence.
+        let head =
+            b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\r\n";
+        let mut withheld = Vec::with_capacity(MAX_LIVE_RELAYS);
+        for _ in 0..MAX_LIVE_RELAYS {
+            let (mut guest, gate_end) = UnixStream::pair().expect("pairing the guest's socket");
+            feed.send(Ok(gate_end))
+                .expect("the accept loop is listening");
+            guest
+                .write_all(head)
+                .await
+                .expect("writing the control head");
+            let (switch, _) = listener.accept().await.expect("accepting the gate's dial");
+            withheld.push((guest, switch));
+        }
+
+        // Within the bound every one of them is refused: the switch side sees
+        // the dial closed with nothing written on it, and the guest's side is
+        // closed too, not left hanging.
+        for (mut guest, mut switch) in withheld {
+            let mut probe = [0u8; 1];
+            match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+                Ok(Ok(0)) => {}
+                Ok(Ok(n)) => panic!("{n} byte(s) of a withheld-body request reached the switch"),
+                Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+                Err(_) => panic!("a withheld control body held the relay past {DEADLINE:?}"),
+            }
+            match tokio::time::timeout(DEADLINE, guest.read(&mut probe)).await {
+                Ok(Ok(0)) => {}
+                Ok(Ok(n)) => panic!("the gate left {n} byte(s) for a refused guest to read"),
+                Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset => {}
+                Ok(Err(e)) => panic!("reading the guest end failed: {e}"),
+                Err(_) => panic!("the gate left a withheld-body guest's connection hanging"),
+            }
+        }
+        // Said so, once, under the rule a head the gate cannot frame is
+        // refused under — the same line for all of them, at the frame drops'
+        // cadence.
+        wait_for_log(&log, "a control body was withheld past the bound").await;
+        let logged = log.contents();
+        assert!(
+            logged.contains("rule_matched=\"egress-undeclared-verb\"")
+                && logged.contains(&format!("read_timeout={bound:?}")),
+            "the refusal names its rule and the bound it waited out, got: {logged}"
+        );
+        assert_eq!(
+            logged
+                .matches("a control body was withheld past the bound")
+                .count(),
+            1,
+            "the refusal is rate-limited to one line, got: {logged}"
+        );
+
+        // The slots came back: a connection past what the cap would have
+        // refused is served — the gate dials the switch for it, forwards its
+        // upgrade head, and relays its frame.
+        let (mut guest, gate_end) = UnixStream::pair().expect("pairing the guest's socket");
+        feed.send(Ok(gate_end))
+            .expect("the accept loop is listening");
+        guest
+            .write_all(CONNECT_REQUEST)
+            .await
+            .expect("writing the upgrade head");
+        let (mut switch, _) = match tokio::time::timeout(DEADLINE, listener.accept()).await {
+            Ok(accepted) => accepted.expect("accepting the gate's dial"),
+            Err(_) => {
+                panic!("the gate refused a connection after the withheld bodies were released")
+            }
+        };
+        let mut seen = vec![0u8; CONNECT_REQUEST.len()];
+        read_within(&mut switch, &mut seen).await;
+        assert_eq!(
+            seen, CONNECT_REQUEST,
+            "the upgrade head is forwarded verbatim"
+        );
+        let declared = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
+        send_frame(&mut guest, &declared).await;
+        let relayed = expect_frame(&mut switch).await;
+        assert_eq!(
+            relayed, declared,
+            "a connection past the released slots relays"
+        );
+        assert!(
+            !log.contents().contains("egress-connection-cap"),
+            "no connection was refused at the cap, got: {}",
+            log.contents()
         );
     }
 
