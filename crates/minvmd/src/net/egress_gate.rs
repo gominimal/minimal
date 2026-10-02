@@ -1378,18 +1378,12 @@ async fn relay_control(
     // leaves the ledger with it — the publication is gone. The note is taken
     // after the write: a forward the gate could not deliver published
     // nothing, and attributes nothing.
-    match verb {
-        ControlVerb::Expose => {
-            if let Some(Record::Port(listener)) = decision.request.records().next() {
-                forwards.note_published(listener, decision.request.switch_addr());
-            }
+    match (verb, forward_listener(verb, &request)) {
+        (ControlVerb::Expose, Some(listener)) => {
+            forwards.note_published(listener, decision.request.switch_addr());
         }
-        ControlVerb::Unexpose => {
-            if let Some(Record::Port(listener)) = decision.request.records().next() {
-                forwards.note_retracted(listener);
-            }
-        }
-        ControlVerb::DnsAdd => {}
+        (ControlVerb::Unexpose, Some(listener)) => forwards.note_retracted(listener),
+        _ => {}
     }
     let mut response = tokio::spawn(copy_switch_to_guest(switch_rx, guest_tx));
     // The legs race, as the frame relay's do: the switch's side can end under
@@ -1610,8 +1604,11 @@ struct ControlDecision {
 /// that listener into a refusal.
 #[derive(Debug, Default)]
 struct PublishedForwards {
-    applied: Mutex<Vec<(u16, [u8; 4])>>,
+    applied: Mutex<Vec<(Listener, [u8; 4])>>,
 }
+
+/// A forwarder listener: its loopback address and port.
+type Listener = ([u8; 4], u16);
 
 /// How many applied publishes' attributions the ledger keeps.
 const PUBLISHED_FORWARDS_TRACKED: usize = 1024;
@@ -1629,7 +1626,7 @@ impl PublishedForwards {
     /// listener, so a second publish for a held listener never becomes live —
     /// and the ledger is bounded oldest-first, so the honest handful never
     /// reaches the bound.
-    fn note_published(&self, listener: u16, addr: [u8; 4]) {
+    fn note_published(&self, listener: Listener, addr: [u8; 4]) {
         let mut applied = self.lock();
         if applied.iter().any(|(held, _)| *held == listener) {
             return;
@@ -1643,20 +1640,20 @@ impl PublishedForwards {
     /// Drops the attribution an applied retraction's listener carried: the
     /// publication is gone, and a later retraction of the same listener has
     /// nothing left to name.
-    fn note_retracted(&self, listener: u16) {
+    fn note_retracted(&self, listener: Listener) {
         self.lock().retain(|(held, _)| *held != listener);
     }
 
     /// The address the applied publish of `listener` was applied at, when
     /// one is in the ledger.
-    fn address_of(&self, listener: u16) -> Option<[u8; 4]> {
+    fn address_of(&self, listener: Listener) -> Option<[u8; 4]> {
         self.lock()
             .iter()
             .find(|(held, _)| *held == listener)
             .map(|(_, addr)| *addr)
     }
 
-    fn lock(&self) -> MutexGuard<'_, Vec<(u16, [u8; 4])>> {
+    fn lock(&self) -> MutexGuard<'_, Vec<(Listener, [u8; 4])>> {
         self.applied.lock().expect(
             "the ledger's lock is held only across a lookup or an update, never across a panic",
         )
@@ -2005,13 +2002,14 @@ fn summarize_unexpose(
     let Ok(parsed) = serde_json_lenient::from_slice::<UnexposeBody>(body) else {
         return Err(malformed(None));
     };
-    let Ok(local_port) = loopback_port(&parsed.local) else {
+    let Ok(listener) = loopback_listener(&parsed.local) else {
         return Err(malformed(Some(parsed.local)));
     };
+    let (_, local_port) = listener;
     if !is_client_protocol(&parsed.protocol) {
         return Err(malformed(Some(parsed.protocol)));
     }
-    let published_at = forwards.address_of(local_port);
+    let published_at = forwards.address_of(listener);
     SwitchRequest::of(
         SwitchVerb::Retract,
         published_at.unwrap_or([0, 0, 0, 0]),
@@ -2111,12 +2109,41 @@ fn summarize_dns_add(
 /// body the gate summarizes: the host binds forwarders on the loopback the
 /// daemon names, and only the daemon's own client names these two.
 fn loopback_port(local: &str) -> Result<u16, ()> {
+    loopback_listener(local).map(|(_, port)| port)
+}
+
+/// The forwarder listener a `local` names: its loopback address, in either
+/// of [`loopback_port`]'s two spellings, and its port. A listener is the
+/// pair, not the port: two boxes publishing one port at their own leased
+/// addresses are two listeners, and the publish ledger keys them apart
+/// ([`PublishedForwards`]).
+fn loopback_listener(local: &str) -> Result<Listener, ()> {
     let (host, port) = local.rsplit_once(':').ok_or(())?;
     let addr = Ipv4Addr::from_str(host).map_err(|_| ())?;
     if addr != Ipv4Addr::LOCALHOST && !in_reserved_local_range(addr) {
         return Err(());
     }
-    port.parse::<u16>().map_err(|_| ())
+    Ok((addr.octets(), port.parse::<u16>().map_err(|_| ())?))
+}
+
+/// The listener a forward-carrying control body names, for the publish
+/// ledger: the expose's or unexpose's `local`. `None` for a zone-add, and
+/// for a body that does not parse (one the decision already refused).
+fn forward_listener(verb: ControlVerb, body: &[u8]) -> Option<Listener> {
+    let local = match verb {
+        ControlVerb::Expose => {
+            serde_json_lenient::from_slice::<ExposeBody>(body)
+                .ok()?
+                .local
+        }
+        ControlVerb::Unexpose => {
+            serde_json_lenient::from_slice::<UnexposeBody>(body)
+                .ok()?
+                .local
+        }
+        ControlVerb::DnsAdd => return None,
+    };
+    loopback_listener(&local).ok()
 }
 
 /// Whether `addr` falls in [`RESERVED_LOCAL_RANGE`] — the block published
@@ -7247,6 +7274,57 @@ mod tests {
             }
             expect_teardown(&mut guest).await;
         }
+    }
+
+    /// A forwarder listener is its loopback address and port, not the port:
+    /// two boxes publishing one port at their own reserved-range leases are
+    /// two listeners, and the ledger attributes each one's retraction to the
+    /// address its own publish was applied at. Keyed by port alone, the
+    /// second publish was dropped as a duplicate and the second box's
+    /// retraction was attributed to the first box.
+    #[test]
+    fn two_boxes_publishing_one_port_keep_their_own_attribution() {
+        let (network, _) = switch::RESERVED_LOCAL_RANGE;
+        let base = u32::from(network);
+        let first = Ipv4Addr::from(base + 9);
+        let second = Ipv4Addr::from(base + 10);
+        let expose = |host: Ipv4Addr| {
+            format!(r#"{{"local":"{host}:8080","remote":"100.64.0.9:8080","protocol":"tcp"}}"#)
+        };
+        let unexpose = |host: Ipv4Addr| format!(r#"{{"local":"{host}:8080","protocol":"tcp"}}"#);
+
+        let a = super::forward_listener(super::ControlVerb::Expose, expose(first).as_bytes())
+            .expect("the first box's listener parses");
+        let b = super::forward_listener(super::ControlVerb::Expose, expose(second).as_bytes())
+            .expect("the second box's listener parses");
+        assert_ne!(a, b, "one port at two leases is two listeners");
+        assert_eq!(
+            super::forward_listener(super::ControlVerb::Unexpose, unexpose(second).as_bytes()),
+            Some(b),
+            "a teardown names the listener its publish named"
+        );
+
+        let ledger = super::PublishedForwards::new();
+        ledger.note_published(a, [100, 64, 0, 9]);
+        ledger.note_published(b, [100, 64, 0, 10]);
+        assert_eq!(ledger.address_of(a), Some([100, 64, 0, 9]));
+        assert_eq!(
+            ledger.address_of(b),
+            Some([100, 64, 0, 10]),
+            "the second box's publish is its own, not a duplicate of the first"
+        );
+
+        ledger.note_retracted(b);
+        assert_eq!(
+            ledger.address_of(b),
+            None,
+            "the second box's publish is gone"
+        );
+        assert_eq!(
+            ledger.address_of(a),
+            Some([100, 64, 0, 9]),
+            "retracting one box's listener leaves the other box's attribution"
+        );
     }
 
     /// A declared port's forward is the host's for the session's lifetime:
