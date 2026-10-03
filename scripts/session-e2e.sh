@@ -633,6 +633,36 @@ minvmd_log_lines() {
   find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log.*' -type f \
     -exec grep -h -- "$1" {} + 2>/dev/null
 }
+# The record proving a box's HOST ROW ended, named for the box. A row has TWO
+# writers of its end, and both are the design (NET-138: "a box's attachment to
+# the switch ends or its creator destroys it"; NET-133: "a box's row goes with
+# its shuttle connection"), so this takes either record:
+#   * the creator's withdrawal request — the CLI's destroy or interrupt guard
+#     asking minvmd over the control socket, which writes the INFO record
+#     "withdrew the box's host row; its addresses admit nothing" —
+#   * the same request arriving AFTER the gate already ended the row: the
+#     box's sandbox teardown drops its per-box shuttle connection, the host
+#     egress gate reports the address its admitted frames were attributed to,
+#     and the drainer removes the row — with no record of its own — so the
+#     creator's request then finds no row and the daemon writes the DEBUG
+#     record "no host row held at the withdrawn switch address; already
+#     withdrawn", which answers the goal state ("no row at the named switch
+#     address") as a success. The box-register proof pins its daemon to
+#     `warn,minvmd=debug` so this second record is read here too.
+# Either way the row is gone; prints the matching line, nothing when neither
+# writer recorded one.
+box_row_end_record() {
+  local name="$1" rec=""
+  rec="$(minvmd_log_lines \
+    "withdrew the box's host row; its addresses admit nothing" \
+    | grep -F "\"box\":\"$name\"" | tail -n1)"
+  if [ -z "$rec" ]; then
+    rec="$(minvmd_log_lines \
+      'no host row held at the withdrawn switch address; already withdrawn' \
+      | grep -F "\"box\":\"$name\"" | tail -n1)"
+  fi
+  printf '%s' "$rec"
+}
 
 # The sandbox proof below forks a real session sandbox, which needs
 # unprivileged user namespaces. On Ubuntu 24.04+ the AppArmor restriction
@@ -1476,10 +1506,19 @@ proof_own_ip_egress_declared_and_enforced() {
 #     quiets the whole run to `warn`, which drops the INFO records every
 #     assertion below reads. The case stops the daemon first so its own
 #     activation autospawns a fresh one, pinned command-locally to
-#     `warn,minvmd=info` (the established idiom — drive_installed_vm_pair
-#     and the native-resolution case) — the CLI's stdout stays quiet for
-#     the session-id extraction. The case stops the daemon again on its way
-#     out, so the pinned filter never leaks into the rest of the lane.
+#     `warn,minvmd=debug` (the established idiom, one level deeper) — the
+#     CLI's stdout stays quiet for the session-id extraction, while the
+#     daemon still records the withdrawal of a row that ended before the
+#     creator's request arrived (a DEBUG record; see the next bullet). The
+#     case stops the daemon again on its way out, so the pinned filter
+#     never leaks into the rest of the lane.
+#   * A row's end has TWO writers and the withdrawal assertions below take
+#     either one (`box_row_end_record`): the creator's request answered with
+#     a row (INFO), or the same request finding the gate's attachment-end
+#     drainer had already ended the row when the box's sandbox teardown
+#     dropped its shuttle connection (DEBUG "already withdrawn" — the goal
+#     state either way). Which one wins the destroy below is a race the
+#     design blesses on purpose: both ends are a withdrawn row.
 #
 # The Ctrl-C half interrupts in [create returned, session Active] — the
 # window the CLI's interrupt guard covers. It cannot sleep its way in from
@@ -1500,7 +1539,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   local boxreg_start="" boxreg_dst="" boxreg_try="" boxreg_dst_out=""
   local boxreg_dst_rc="" boxreg_live_dst="" boxreg_withdrawn=""
   local boxreg_withdraw_addr="" boxreg_ctrlc_armed="" boxreg_ctrlc_rc=""
-  local boxreg_ctrlc_gone="" boxreg_declared_sid=""
+  local boxreg_ctrlc_switch="" boxreg_ctrlc_gone="" boxreg_declared_sid=""
   local boxreg_declared_switch="" boxreg_declared_out="" boxreg_declared_rc=""
   local boxreg_declared_reach_ok="" boxreg_refuse_start_ms=""
   local boxreg_refuse_rc="" boxreg_refuse_elapsed_ms="" boxreg_refuse_status=""
@@ -1543,7 +1582,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   mnl stop --force >/dev/null 2>&1 || true
 
   # ---- (a) create registers the box with the VM host daemon ----------------
-  boxreg_sid="$(cd "$BOXREG_SEED_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . \
+  boxreg_sid="$(cd "$BOXREG_SEED_DIR" && RUST_LOG="warn,minvmd=debug" mnl session activate . \
     --no-prompt --name e2e-box-reg --network own_ip 2>"$WORK/boxreg-activate.err")" || {
     echo "::error::'min session activate --network own_ip' (no provider flag) failed"
     cat "$WORK/boxreg-activate.err" 2>/dev/null || true
@@ -1639,17 +1678,26 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   fi
 
   # ---- (b) destroy withdraws the row ---------------------------------------
-  mnl session destroy --force "$boxreg_sid" >/dev/null 2>"$WORK/boxreg-destroy.err" \
+  # Either writer counts (`box_row_end_record`): the daemon ends the row when
+  # the box's sandbox teardown drops its per-box shuttle connection, and the
+  # CLI's own withdrawal request lands alongside that — whoever answers first,
+  # the row ends with a record naming the box and its switch address.
+  mnl session destroy --force "$boxreg_sid" \
+    >"$WORK/boxreg-destroy.out" 2>"$WORK/boxreg-destroy.err" \
     || { echo "::error::'min session destroy' failed"; cat "$WORK/boxreg-destroy.err" 2>/dev/null || true; fail; }
   for _ in $(seq 1 40); do
-    boxreg_withdrawn="$(minvmd_log_lines \
-      "withdrew the box's host row; its addresses admit nothing" \
-      | grep -F '"box":"e2e-box-reg"' | tail -n1)"
+    boxreg_withdrawn="$(box_row_end_record e2e-box-reg)"
     [ -n "$boxreg_withdrawn" ] && break
     sleep 0.25
   done
   if [ -z "$boxreg_withdrawn" ]; then
-    echo "::error::the VM host daemon's log carries no withdrawal record for box 'e2e-box-reg' after 'min session destroy'"
+    echo "::error::the VM host daemon's log carries no record of the row of box 'e2e-box-reg' ending after 'min session destroy' — neither the creator's withdrawal (INFO) nor the same request finding the gate's attachment-end drainer already ended the row (DEBUG \"already withdrawn\")"
+    echo "--- 'min session destroy' output ---"
+    cat "$WORK/boxreg-destroy.out" 2>/dev/null || true
+    cat "$WORK/boxreg-destroy.err" 2>/dev/null || true
+    echo "--- minvmd log (tail) ---"
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log.*' -type f \
+      -exec tail -n 40 {} + 2>/dev/null || true
     fail
   fi
   boxreg_withdraw_addr="$(printf '%s\n' "$boxreg_withdrawn" \
@@ -1674,7 +1722,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   # ignores SIGINT; exec the binary so the pid is `min`'s and Ctrl-C reaches
   # it.
   # shellcheck disable=SC2086
-  ( cd "$BOXREG_CTRLC_SEED_DIR" && exec min ${E2E_MINIMAL_ARGS:-} session activate . \
+  ( cd "$BOXREG_CTRLC_SEED_DIR" && RUST_LOG="warn,minvmd=debug" exec min ${E2E_MINIMAL_ARGS:-} session activate . \
     --no-prompt --name e2e-box-ctrlc --network own_ip ) \
     >"$WORK/boxreg-ctrlc.out" 2>"$WORK/boxreg-ctrlc.err" &
   BOXREG_CTRLC_PID=$!
@@ -1715,6 +1763,8 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
     BOXREG_CTRLC_PID=""
     fail
   fi
+  boxreg_ctrlc_switch="$(printf '%s\n' "$boxreg_record" \
+    | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
   echo "interrupt window: the create returned and the row is registered; sending Ctrl-C"
   kill -INT "$BOXREG_CTRLC_PID" 2>/dev/null || true
   for _ in $(seq 1 120); do
@@ -1744,18 +1794,32 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
     cat "$WORK/boxreg-ctrlc.err" 2>/dev/null || true
     fail
   fi
+  # The guard's withdrawal request is the only writer of this row's end — no
+  # sandbox exists yet, so no shuttle connection has ever opened and the gate's
+  # attachment-end drainer has nothing to report — but `box_row_end_record`
+  # still takes either shape, for the row that ends before the request lands
+  # (a respawned daemon, say).
   for _ in $(seq 1 40); do
-    boxreg_withdrawn="$(minvmd_log_lines \
-      "withdrew the box's host row; its addresses admit nothing" \
-      | grep -F '"box":"e2e-box-ctrlc"' | tail -n1)"
+    boxreg_withdrawn="$(box_row_end_record e2e-box-ctrlc)"
     [ -n "$boxreg_withdrawn" ] && break
     sleep 0.25
   done
   if [ -z "$boxreg_withdrawn" ]; then
-    echo "::error::the VM host daemon's log carries no withdrawal record for box 'e2e-box-ctrlc' after the Ctrl-C"
+    echo "::error::the VM host daemon's log carries no record of the row of box 'e2e-box-ctrlc' ending after the Ctrl-C — the guard's withdrawal request left no trace of the row ending, by either writer"
+    echo "--- interrupted activation (stderr) ---"
+    cat "$WORK/boxreg-ctrlc.err" 2>/dev/null || true
+    echo "--- minvmd log (tail) ---"
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log.*' -type f \
+      -exec tail -n 40 {} + 2>/dev/null || true
     fail
   fi
+  boxreg_withdraw_addr="$(printf '%s\n' "$boxreg_withdrawn" \
+    | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
   echo "VM host daemon record: $boxreg_withdrawn"
+  if [ "$boxreg_withdraw_addr" != "$boxreg_ctrlc_switch" ]; then
+    echo "::error::the withdrawal names switch address ${boxreg_withdraw_addr:-<none>}, not the $boxreg_ctrlc_switch the interrupted registration allocated — a different row"
+    fail
+  fi
   # And the half-built session must be gone, not left holding the name: the
   # guard aborted it and the daemon's reap is the backstop. The id never
   # reached stdout (the guard exits before the id is printed), so the NAME
@@ -1781,7 +1845,7 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
   # register request carries the expanded declaration verbatim, so the row
   # the VM host daemon holds for this box is the declared one the host gate
   # decides by.
-  boxreg_declared_sid="$(cd "$BOXREG_SEED_DIR" && mnl session activate . --no-prompt \
+  boxreg_declared_sid="$(cd "$BOXREG_SEED_DIR" && RUST_LOG="warn,minvmd=debug" mnl session activate . --no-prompt \
     --name e2e-box-declared --network own_ip \
     --allow-subnets 203.0.113.0/24 \
     --allow-dns-hosts example.com \
@@ -1884,20 +1948,33 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
     fi
   fi
 
-  # The declared box's row ends like the bare one's, in the daemon's record.
-  mnl session destroy --force "$boxreg_declared_sid" >/dev/null 2>&1 || true
+  # The declared box's row ends like the bare one's, in the daemon's record —
+  # by either writer, same as (b) above.
+  mnl session destroy --force "$boxreg_declared_sid" \
+    >"$WORK/boxreg-declared-destroy.out" 2>"$WORK/boxreg-declared-destroy.err" \
+    || { echo "::error::'min session destroy' failed for the declared box"; cat "$WORK/boxreg-declared-destroy.err" 2>/dev/null || true; fail; }
   for _ in $(seq 1 40); do
-    boxreg_withdrawn="$(minvmd_log_lines \
-      "withdrew the box's host row; its addresses admit nothing" \
-      | grep -F '"box":"e2e-box-declared"' | tail -n1)"
+    boxreg_withdrawn="$(box_row_end_record e2e-box-declared)"
     [ -n "$boxreg_withdrawn" ] && break
     sleep 0.25
   done
   if [ -z "$boxreg_withdrawn" ]; then
-    echo "::error::the declared box's row was not withdrawn by its destroy"
+    echo "::error::the declared box's row was not withdrawn by its destroy — no record by either writer"
+    echo "--- 'min session destroy' output ---"
+    cat "$WORK/boxreg-declared-destroy.out" 2>/dev/null || true
+    cat "$WORK/boxreg-declared-destroy.err" 2>/dev/null || true
+    echo "--- minvmd log (tail) ---"
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log.*' -type f \
+      -exec tail -n 40 {} + 2>/dev/null || true
     fail
   fi
+  boxreg_withdraw_addr="$(printf '%s\n' "$boxreg_withdrawn" \
+    | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
   echo "VM host daemon record: $boxreg_withdrawn"
+  if [ "$boxreg_withdraw_addr" != "$boxreg_declared_switch" ]; then
+    echo "::error::the declared box's withdrawal names switch address ${boxreg_withdraw_addr:-<none>}, not the $boxreg_declared_switch its registration allocated — a different row"
+    fail
+  fi
 
   # Leave the lane as the case found it: the daemon this case pinned is
   # stopped, so the next command's autospawn carries the harness's own filter
