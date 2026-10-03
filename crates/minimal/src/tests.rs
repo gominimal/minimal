@@ -2225,6 +2225,50 @@ async fn a_stopped_vm_does_not_hold_a_listing() {
     );
 }
 
+/// The fallback listing's control-sock gate keys on the backend the daemon
+/// connection resolves through, never on `use_minvmd()` — the same rule every
+/// other VM-backed gate keys on: the flag is how Linux asks for the VM host,
+/// while macOS reaches it with no flag at all, so a gate keyed on the flag
+/// would find no control socket for exactly the host whose every invocation
+/// is VM-backed, and the one entry `min ls` falls back to there would carry
+/// no answerer state to read.
+#[test]
+fn fallback_listing_control_sock_keys_on_provider_kind() {
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    let sock = state.path().join("ssh.sock");
+    // The unflagged invocation resolves through the platform's default
+    // backend, so the expectation is that backend's — `client_provider_kind`'s
+    // own reading, whatever host this runs on: on Linux the native backend
+    // hosts no VM host daemon, while macOS has no native backend at all and
+    // every invocation is minvmd-backed, flag or no flag.
+    let unflagged = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(state.path().to_path_buf()),
+        config_dir: None,
+        provider: None,
+        no_input: true,
+        vm: None,
+    };
+    assert_eq!(
+        fallback_control_sock(&unflagged, &sock).is_some(),
+        client::client_provider_kind(false) == paths::ProviderKind::Minvmd,
+        "an unflagged fallback carries a control socket exactly when the \
+         backend it resolves through is minvmd"
+    );
+    // `--provider local-minvmd` asks for the VM host whatever the platform's
+    // default backend is, so the fallback always resolves the control socket
+    // beside the daemon socket it just listed through.
+    let control = fallback_control_sock(&vm_globals(state.path(), None), &sock)
+        .expect("`--provider local-minvmd` always resolves a control socket");
+    assert_eq!(
+        control,
+        sock.parent()
+            .unwrap()
+            .join(minvmd::control::CONTROL_SOCK_FILE),
+        "the control socket sits beside the daemon socket the listing resolved"
+    );
+}
+
 /// NET-058: a box name resolves to the VM that owns it with no global flag —
 /// across every VM's socket, since the selected VM's daemon has just said it
 /// does not know the name. The resolution covers the selected VM too (a

@@ -373,14 +373,30 @@ pub(crate) async fn ls_listings(global: &GlobalArgs) -> Result<Vec<VmListing>, a
             // The native backend reaches here with no VM host daemon to
             // read a state from; a VM backend falls back to the selected
             // VM's own dir, where its control socket sits.
-            control_sock: if global.use_minvmd() {
-                crate::cmd::session::control_sock_beside(&sock)
-            } else {
-                None
-            },
+            control_sock: fallback_control_sock(global, &sock),
         });
     }
     Ok(listings)
+}
+
+/// The VM-host control socket the fallback listing pairs with its one entry
+/// (NET-138), keyed on the backend the daemon connection resolves through —
+/// the same rule [`hostname_proxy_start_vm`] states — and never on
+/// [`GlobalArgs::use_minvmd`]: the flag is how Linux asks for the VM host,
+/// while macOS reaches it with no flag at all, so a gate keyed on the flag
+/// would find no control socket for exactly the host whose every invocation
+/// is VM-backed, and the one entry `min ls` falls back to there would carry
+/// no answerer state to read. `sock` is the daemon socket the listing
+/// already resolved; the control socket sits beside it, in the same provider
+/// dir.
+#[must_use]
+pub fn fallback_control_sock(
+    global: &GlobalArgs,
+    sock: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    (super::session::daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
+        .then(|| super::session::control_sock_beside(sock))
+        .flatten()
 }
 
 /// The selected daemon's `ListSessions` reply, from its socket, gated as `min
