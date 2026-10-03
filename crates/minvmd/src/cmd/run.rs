@@ -549,11 +549,82 @@ fn run_foreground() -> Result<()> {
                 crate::net::resolve_gate_sock().context("resolving egress gate socket")?;
             crate::sock::remove_stale_socket(&gate_sock)
                 .context("removing stale egress gate socket")?;
+            // ── The Box Egress Proxy's delivery wiring (NET-132) ─────────────
+            // One token per boot, minted like the marker nonce above: the
+            // proof a delivered connection belongs to this boot, written
+            // ahead of every delivery's header. The peer receives it
+            // in-process, in the wire below; the stand-in acceptor — a
+            // test/e2e surface, never a production one — receives the same
+            // bytes over its start-up channel, so a same-uid host process
+            // that finds the socket's path can never hold the token too.
+            let token: [u8; switch::bep_host::TOKEN_LEN] = {
+                let mut buf = [0u8; switch::bep_host::TOKEN_LEN];
+                std::fs::File::open("/dev/urandom")
+                    .and_then(|mut f| f.read_exact(&mut buf))
+                    .context("reading /dev/urandom for the box egress proxy token")?;
+                buf
+            };
+            // The proxy's unix socket, named beside the switch and gate
+            // sockets the same way: the one path every delivered flow dials.
+            // Nothing listens there on a production boot — the proxy's own
+            // acceptor is a later task — and nothing binds the pool on one
+            // either (`bep_box_source` below), so a box's connection to
+            // the proxy's address is reset, the acceptor-down answer the
+            // pool is specified to give.
+            let proxy_sock = switch_sock.with_file_name("gvproxy-bep.sock");
+            // MINVMD_BEP_STUB is the e2e lane's flag and nothing else's: it
+            // is what puts a stand-in acceptor at the path the wire names,
+            // so the lane can read what a delivery presents — and the bind
+            // below is what decides, through the handle it leaves, whether
+            // the pool is partitioned by the table's box rows at all. The
+            // handle is underscore-bound: its serving thread owns the
+            // socket and outlives this block for the daemon's life, and
+            // the supervisor has nothing further to ask of it.
+            let stub_enabled = std::env::var_os("MINVMD_BEP_STUB").is_some();
+            let _bep_stub = if stub_enabled {
+                let (start_tx, start_rx) = std::sync::mpsc::channel();
+                match crate::net::bep_stub::spawn(proxy_sock.clone(), start_rx) {
+                    Ok(stub) => {
+                        let _ = start_tx.send(crate::net::bep_stub::StubStart {
+                            token,
+                            daemon_pid: std::process::id(),
+                        });
+                        tracing::info!(
+                            sock = %proxy_sock.display(),
+                            "box egress proxy stand-in acceptor up (test/e2e surface)"
+                        );
+                        Some(stub)
+                    }
+                    Err(error) => {
+                        // Fail the boot, the same argument the
+                        // switch-spawn failure beside this block makes: a
+                        // boot under the flag exists to be probed through
+                        // the stand-in, and a boot without one leaves the
+                        // lane waiting on a socket that never comes —
+                        // every probe below it failing in terms of an
+                        // acceptor that was never there. The bind happens
+                        // on the calling thread precisely so this is where
+                        // its failure surfaces.
+                        return Err(error)
+                            .context("binding the box egress proxy stand-in acceptor");
+                    }
+                }
+            } else {
+                None
+            };
+            // The wire the peer carries: the acceptor's socket, this boot's
+            // token, and the per-source cap that is each registered box's
+            // share of the pool. The default cap is the recorded working
+            // value (spec NET-132), named here so the two cannot drift.
+            let wire = switch::bep_host::BepWire::new(proxy_sock, token)
+                .with_per_source_cap(switch::bep_host::DEFAULT_PER_SOURCE_CAP);
             match crate::net::HostGvproxy::spawn(
                 binary,
                 switch_sock,
                 crate::net::DEFAULT_DATAPATH_CHECK_INTERVAL,
                 &boxes,
+                wire,
+                bep_box_source(_bep_stub.is_some(), boxes.table()),
             ) {
                 Ok(gvproxy) => {
                     let subnet = boxes.subnet();
@@ -566,8 +637,18 @@ fn run_foreground() -> Result<()> {
                     Some(gvproxy)
                 }
                 // An own-IP VM cannot work without the switch: fail loudly. A
-                // non-own-IP boot tolerates it (same as a missing binary below).
-                Err(error) if crate::cmd::own_ip_requested() => {
+                // non-own-IP production boot tolerates a switch that will not
+                // come up (same as a missing binary below) — sessions still
+                // run, without guest egress. The stand-in's flag carries the
+                // same argument as own-IP: it is the e2e lane's and nothing
+                // else's, and a boot under it exists to be probed through
+                // this switch. Worse, the stand-in is bound before the switch
+                // is spawned, so a degraded boot looks healthy to a lane that
+                // waits on the stand-in's socket — every probe below it then
+                // fails in terms of a peer that was never there. Fail here,
+                // where the cause is and the error names it, not three steps
+                // later in a box's blank answer.
+                Err(error) if crate::cmd::own_ip_requested() || stub_enabled => {
                     return Err(error).context("spawning host gvproxy switch");
                 }
                 Err(error) => {
@@ -710,7 +791,7 @@ fn run_foreground() -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    {
+    let mark_running = (|| -> Result<()> {
         let mut lock = state_dir
             .lifecycle_lock()
             .context("opening lifecycle lock")?;
@@ -734,6 +815,13 @@ fn run_foreground() -> Result<()> {
                 booted_ram_mib: Some(booted_ram_mib),
             })
             .context("writing Running state")?;
+        Ok(())
+    })();
+    if let Err(e) = mark_running {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+        // guard drops here → StartingGuard resets state to Stopped (R4.6)
     }
     guard.commit();
     tracing::info!(pid = child_pid, "VM is up; supervisor is running");
@@ -795,6 +883,72 @@ fn run_foreground() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The registered boxes a delivered connection is partitioned by
+/// (NET-132): the box rows this supervisor's box table holds — every one
+/// a host-side fact the guest never asserts — polled by the pool every
+/// stack turn, so a row that lands grows its box's share within a turn
+/// and a row that leaves takes its sockets with it. The guest node
+/// namespace's row is not one of them, so it buys no share (see the
+/// [`BepBoxSource`](switch::bep_host::BepBoxSource) impl).
+pub struct RegisteredBoxes {
+    /// The registry's live read-only view: every registration and
+    /// withdrawal the table sees reaches the pool through it.
+    table: crate::box_registry::BoxTable,
+}
+
+impl RegisteredBoxes {
+    /// The source over `table`.
+    pub fn new(table: crate::box_registry::BoxTable) -> Self {
+        Self { table }
+    }
+}
+
+impl switch::bep_host::BepBoxSource for RegisteredBoxes {
+    fn box_switch_addresses(&self) -> Vec<std::net::Ipv4Addr> {
+        // The guest node namespace's row is the VM's own root netns, the
+        // daemon's tap — never a box, and a share in its name would
+        // partition the pool by a row no box ever speaks from. Its
+        // address is fixed, the subnet's daemon address, which sits
+        // outside the hand-out run every client box is allocated from,
+        // so excluding that one address names exactly the node row.
+        let node_addr = self.table.subnet().daemon_ip();
+        self.table
+            .rows()
+            .iter()
+            .map(|row| row.switch_addr())
+            .filter(|addr| *addr != node_addr)
+            .collect()
+    }
+}
+
+/// The box source the peer's pool is partitioned by: the table's box rows
+/// when a stand-in acceptor actually bound at the wire's path, and
+/// [`switch::bep_host::NoBoxes`] — no row, no share, no socket — when one
+/// did not.
+///
+/// A socket in the pool is a lane onto the host for the box whose share
+/// holds it, and nothing yet stands between one and whatever reaches it:
+/// the credentialed-only gate rule (NET-145, T45, #1665) is still ahead.
+/// So a production boot hands the peer an empty source and the pool binds
+/// nothing — a box's connection to the proxy's address meets the stack's
+/// own reset — until that rule lands and lets the shares bind. The
+/// stand-in's own boot (`MINVMD_BEP_STUB`, the e2e lane's flag and nothing
+/// else's) is the one wiring that registers rows, and only a lane that
+/// asked for it gets them; the caller passes the stand-in's own handle —
+/// whether one is bound, not whether the flag that asks for one was set —
+/// so the pool can never be partitioned by a path nothing is listening on.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn bep_box_source(
+    stand_in_bound: bool,
+    table: crate::box_registry::BoxTable,
+) -> std::sync::Arc<dyn switch::bep_host::BepBoxSource> {
+    if stand_in_bound {
+        std::sync::Arc::new(RegisteredBoxes::new(table))
+    } else {
+        std::sync::Arc::new(switch::bep_host::NoBoxes)
+    }
 }
 
 /// The node's proxy and answerer ports, assigned by the VM host before the VM
@@ -1151,5 +1305,65 @@ mod tests {
             },
             None => unsafe { std::env::remove_var(crate::vm::NODE_ANSWERER_PORT_ENV) },
         }
+    }
+
+    /// NET-132/T69: a production boot binds no pool socket. The
+    /// credentialed-only gate rule (T45, #1665) is still ahead, so the
+    /// supervisor hands the peer an empty box source — rows registered or
+    /// not, the node namespace's row included — and the pool a peer would
+    /// build holds nothing. The stand-in's wiring is the one that
+    /// registers rows, and only a lane that asked for it gets them.
+    #[tokio::test]
+    async fn production_wiring_leaves_pool_len_zero_with_rows_registered() {
+        let subnet = switch::SwitchSubnet::default();
+        let registry = crate::box_registry::BoxRegistry::new(subnet);
+        registry.register_node_namespace(7654, 7656);
+        registry
+            .register_client_box(crate::box_registry::ClientBoxSpec {
+                name: "box-a".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+            })
+            .expect("the plan has a switch address to hand out");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wire = switch::bep_host::BepWire::new(
+            dir.path().join("proxy.sock"),
+            [0u8; switch::bep_host::TOKEN_LEN],
+        )
+        .with_per_source_cap(switch::bep_host::DEFAULT_PER_SOURCE_CAP);
+
+        // The production wiring: rows sit in the table — the node
+        // namespace's and a client box's — and still buy no share.
+        let mut lane = switch::bep_host::test_util::TestLane::new(
+            subnet,
+            wire.clone(),
+            super::bep_box_source(false, registry.table()),
+        );
+        for _ in 0..2 {
+            lane.step().await;
+        }
+        assert_eq!(
+            lane.pool_len(),
+            0,
+            "a production boot binds no pool socket, rows registered or not"
+        );
+
+        // The stand-in's wiring registers rows, and only the boxes': one
+        // client box, one share — the node namespace's row adds none.
+        let mut stub_lane = switch::bep_host::test_util::TestLane::new(
+            subnet,
+            wire,
+            super::bep_box_source(true, registry.table()),
+        );
+        for _ in 0..2 {
+            stub_lane.step().await;
+        }
+        assert_eq!(
+            stub_lane.pool_len(),
+            switch::bep_host::DEFAULT_PER_SOURCE_CAP,
+            "the stand-in's wiring registers the boxes' shares, and only \
+             the boxes'"
+        );
     }
 }
