@@ -458,7 +458,9 @@ pub(crate) async fn activate_session(
     // Scaffold-offer a missing `minimal.toml` only after loadouts resolve:
     // a bad `--loadout` must error before anything prints, so the user is
     // never told the session is proceeding and then that it is not.
-    if offer_scaffold {
+    // `--sync none` never sends a `minimal.toml`, so offering to create
+    // one there would only write a file the session then ignores.
+    if offer_scaffold && !matches!(args.sync, Some(SyncMode::None)) {
         offer_mfile_scaffold(
             &utf8_path,
             global,
@@ -862,7 +864,16 @@ pub(crate) async fn activate_session(
     // the daemon then composes against an empty workspace and the
     // caller is on their own for getting files there.
     match sync_mode {
-        SyncMode::None => {}
+        SyncMode::None => {
+            // `--sync none` skips the upload, so the daemon composes against
+            // an empty workspace and the project's `minimal.toml` — packages,
+            // vars, patches, hooks — is silently dropped. Say so when there
+            // is a config to lose, so the default-config session is not a
+            // surprise.
+            if let Some(notice) = sync_none_notice(&utf8_path) {
+                eprintln!("{notice}");
+            }
+        }
         SyncMode::Tarball if skip_empty_or_home => {
             // An empty directory has nothing to sync, and `$HOME` is far
             // too much to ship on a stray confirmation keypress — and if
