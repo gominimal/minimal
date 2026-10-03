@@ -1969,7 +1969,15 @@ fn rst_from_flow(tail: &InboundFlowTail) -> Vec<u8> {
     } else {
         (0, refusal::seq_acknowledging(tail.seq, 0, tail.flags))
     };
-    refusal::tcp_reset_frame(tail.src_mac, tail.dst_mac, tail.dst, tail.src, seq, ack, true)
+    refusal::tcp_reset_frame(
+        tail.src_mac,
+        tail.dst_mac,
+        tail.dst,
+        tail.src,
+        seq,
+        ack,
+        true,
+    )
 }
 
 /// The reset the shared builder assembles for a flow the gate recorded,
@@ -1982,8 +1990,20 @@ fn rst_from_flow(tail: &InboundFlowTail) -> Vec<u8> {
 /// and the acknowledgement is the peer's own latest one.
 fn rst_toward_box_from_flow(tail: &InboundFlowTail) -> Vec<u8> {
     let seq = refusal::seq_acknowledging(tail.seq, tail.payload_len, tail.flags);
-    let ack = if tail.flags & refusal::TCP_ACK != 0 { tail.ack } else { 0 };
-    refusal::tcp_reset_frame(tail.dst_mac, tail.src_mac, tail.src, tail.dst, seq, ack, true)
+    let ack = if tail.flags & refusal::TCP_ACK != 0 {
+        tail.ack
+    } else {
+        0
+    };
+    refusal::tcp_reset_frame(
+        tail.dst_mac,
+        tail.src_mac,
+        tail.src,
+        tail.dst,
+        seq,
+        ack,
+        true,
+    )
 }
 
 /// Builds the Ethernet + IPv4 + UDP frame the relay writes back toward the
@@ -3526,11 +3546,8 @@ pub(crate) mod tests {
         );
         // The shared emitter, with a small quota and a window short enough to
         // watch roll inside a test: the same audit, tightened for the proof.
-        gate.refusals = refusal::RefusalEmitter::new(
-            refusal::REFUSAL_ROWS,
-            4,
-            Duration::from_millis(50),
-        );
+        gate.refusals =
+            refusal::RefusalEmitter::new(refusal::REFUSAL_ROWS, 4, Duration::from_millis(50));
         let mut resets = gate
             .take_resets()
             .expect("a gate's reset channel is taken exactly once");
@@ -3556,16 +3573,25 @@ pub(crate) mod tests {
                 !refused_syn(&gate, PEER),
                 "the flooder has spent its window's quota"
             );
-            assert!(resets.try_recv().is_err(), "a suppressed refusal writes nothing");
+            assert!(
+                resets.try_recv().is_err(),
+                "a suppressed refusal writes nothing"
+            );
         }
         assert_eq!(
-            capture.contents().matches("source=100.64.0.5 refusals=1").count(),
+            capture
+                .contents()
+                .matches("source=100.64.0.5 refusals=1")
+                .count(),
             1,
             "the window's opening line: {}",
             capture.contents()
         );
         assert_eq!(
-            capture.contents().matches("source=100.64.0.5 refusals=4").count(),
+            capture
+                .contents()
+                .matches("source=100.64.0.5 refusals=4")
+                .count(),
             1,
             "the line for the refusal that spent the quota: {}",
             capture.contents()
@@ -3576,7 +3602,10 @@ pub(crate) mod tests {
         assert!(refused_syn(&gate, OTHER_PEER), "the flooder degrades alone");
         assert!(resets.try_recv().is_ok(), "the sibling's refusal is queued");
         assert_eq!(
-            capture.contents().matches("source=100.64.0.6 refusals=1").count(),
+            capture
+                .contents()
+                .matches("source=100.64.0.6 refusals=1")
+                .count(),
             1,
             "the sibling's own line, in the same window: {}",
             capture.contents()
@@ -3592,7 +3621,10 @@ pub(crate) mod tests {
         // Two lines for the spent window, one for the window after it, and
         // not one per refusal anywhere.
         assert_eq!(
-            capture.contents().matches("source=100.64.0.5 refusals=").count(),
+            capture
+                .contents()
+                .matches("source=100.64.0.5 refusals=")
+                .count(),
             3,
             "the flooder's lines are the window's, not the refusals': {}",
             capture.contents()
@@ -3650,11 +3682,15 @@ pub(crate) mod tests {
             "another peer's refused connection is still answered behind the flood"
         );
         assert_eq!(
-            flood_resets, refusal::REFUSALS_PER_WINDOW as usize,
+            flood_resets,
+            refusal::REFUSALS_PER_WINDOW as usize,
             "the flooder spent exactly its window's quota, then degraded to a timeout"
         );
         assert_eq!(
-            capture.contents().matches("source=100.64.0.5 refusals=1\n").count(),
+            capture
+                .contents()
+                .matches("source=100.64.0.5 refusals=1\n")
+                .count(),
             1,
             "the flood's window says its opening line: {}",
             capture.contents()

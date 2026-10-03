@@ -316,7 +316,11 @@ pub fn refused_tcp_reset(frame: &[u8], segment: &Segment) -> Option<Vec<u8>> {
         // A bare SYN carries no payload worth counting: its one sequence
         // number of weight is the flag's own, which
         // [`seq_acknowledging`] adds.
-        (0, seq_acknowledging(segment.seq, 0, segment.tcp_flags), true)
+        (
+            0,
+            seq_acknowledging(segment.seq, 0, segment.tcp_flags),
+            true,
+        )
     };
     Some(tcp_reset_frame(
         *eth_src,
@@ -596,13 +600,10 @@ impl RefusalEmitter {
         } else {
             // The table is full of live rows: collapse into the rule's
             // bucket, with this refusal's source in whatever line it says.
-            let bucket = limiter
-                .overflow
-                .entry(rule)
-                .or_insert(Overflow {
-                    window_started: now,
-                    resets: 0,
-                });
+            let bucket = limiter.overflow.entry(rule).or_insert(Overflow {
+                window_started: now,
+                resets: 0,
+            });
             return self.account(&mut bucket.window_started, &mut bucket.resets, refusal, now);
         };
         self.account(&mut slot.window_started, &mut slot.resets, refusal, now)
@@ -773,7 +774,11 @@ mod tests {
     /// wire definition verifies, recomputed from the RFC texts rather than
     /// the builders' own helpers.
     fn assert_checksums_verify_on_the_wire(frame: &[u8]) {
-        assert_eq!(rfc1071(&frame[ETH_HDR..ETH_HDR + 20]), 0, "the IPv4 header checksum must verify");
+        assert_eq!(
+            rfc1071(&frame[ETH_HDR..ETH_HDR + 20]),
+            0,
+            "the IPv4 header checksum must verify"
+        );
         let src = &frame[ETH_HDR + 12..ETH_HDR + 16];
         let dst = &frame[ETH_HDR + 16..ETH_HDR + 20];
         let segment = &frame[ETH_HDR + 20..];
@@ -784,7 +789,11 @@ mod tests {
         covered.push(IPPROTO_TCP);
         covered.extend_from_slice(&(segment.len() as u16).to_be_bytes());
         covered.extend_from_slice(segment);
-        assert_eq!(rfc1071(&covered), 0, "the TCP checksum must verify on the wire");
+        assert_eq!(
+            rfc1071(&covered),
+            0,
+            "the TCP checksum must verify on the wire"
+        );
     }
 
     /// The TCP header of a frame the builders produce (Ethernet + 20-byte
@@ -805,7 +814,10 @@ mod tests {
         // addressed to the peer it refuses, never steered at a third party.
         assert_eq!(&reset[0..6], &syn[6..12]);
         assert_eq!(&reset[6..12], &syn[0..6]);
-        assert_eq!(&reset[ETH_HDR + 12..ETH_HDR + 16], LEASE.octets().as_slice());
+        assert_eq!(
+            &reset[ETH_HDR + 12..ETH_HDR + 16],
+            LEASE.octets().as_slice()
+        );
         assert_eq!(&reset[ETH_HDR + 16..ETH_HDR + 20], PEER.octets().as_slice());
         let tcp = tcp_of(&reset);
         assert_eq!(&tcp[0..2], 9999u16.to_be_bytes());
@@ -859,14 +871,17 @@ mod tests {
         let segment = classify(&datagram).expect("a UDP frame classifies");
         assert!(segment.is_udp());
         assert!(segment.is_first_packet());
-        let reply = refused_udp_port_unreachable(&datagram, &segment)
-            .expect("a datagram is answered");
+        let reply =
+            refused_udp_port_unreachable(&datagram, &segment).expect("a datagram is answered");
         // Addressed back to the datagram's source, from the address that
         // refused it, with the observed addresses swapped.
         assert_eq!(&reply[0..6], &datagram[6..12]);
         assert_eq!(&reply[6..12], &datagram[0..6]);
         assert_eq!(reply[ETH_HDR + 9], IPPROTO_ICMP);
-        assert_eq!(&reply[ETH_HDR + 12..ETH_HDR + 16], LEASE.octets().as_slice());
+        assert_eq!(
+            &reply[ETH_HDR + 12..ETH_HDR + 16],
+            LEASE.octets().as_slice()
+        );
         assert_eq!(&reply[ETH_HDR + 16..ETH_HDR + 20], PEER.octets().as_slice());
         let icmp = &reply[ETH_HDR + 20..];
         // Destination unreachable, port unreachable — the datagram itself
@@ -890,8 +905,16 @@ mod tests {
         assert!(!icmp.contains(&0xab));
         // The ICMP checksum covers the message the datagram's kernel
         // verifies.
-        assert_eq!(rfc1071(icmp), 0, "the ICMP checksum must verify on the wire");
-        assert_eq!(rfc1071(&reply[ETH_HDR..ETH_HDR + 20]), 0, "the IPv4 header checksum must verify");
+        assert_eq!(
+            rfc1071(icmp),
+            0,
+            "the ICMP checksum must verify on the wire"
+        );
+        assert_eq!(
+            rfc1071(&reply[ETH_HDR..ETH_HDR + 20]),
+            0,
+            "the IPv4 header checksum must verify"
+        );
 
         // A TCP segment is not answered with a port-unreachable, and a
         // frame too short for the quote's start is answered with nothing.
@@ -976,8 +999,14 @@ mod tests {
         let b = Ipv4Addr::new(100, 64, 0, 2);
         let c = Ipv4Addr::new(100, 64, 0, 3);
         let d = Ipv4Addr::new(100, 64, 0, 4);
-        assert!(matches!(emitter.refuse(&refusal_from(a), t0), Outcome::Emit(_)));
-        assert!(matches!(emitter.refuse(&refusal_from(b), t0), Outcome::Emit(_)));
+        assert!(matches!(
+            emitter.refuse(&refusal_from(a), t0),
+            Outcome::Emit(_)
+        ));
+        assert!(matches!(
+            emitter.refuse(&refusal_from(b), t0),
+            Outcome::Emit(_)
+        ));
         // The table is full and both rows are live: a third source collapses
         // into the rule's bucket — still answered, its own source in its
         // line.
@@ -1002,8 +1031,14 @@ mod tests {
         // source, which then holds a row of its own: evidenced by C's quota
         // being its own, not the bucket's.
         let t1 = t0 + Duration::from_millis(60);
-        assert!(matches!(emitter.refuse(&refusal_from(a), t1), Outcome::Emit(_)));
-        assert!(matches!(emitter.refuse(&refusal_from(c), t1), Outcome::Emit(_)));
+        assert!(matches!(
+            emitter.refuse(&refusal_from(a), t1),
+            Outcome::Emit(_)
+        ));
+        assert!(matches!(
+            emitter.refuse(&refusal_from(c), t1),
+            Outcome::Emit(_)
+        ));
         assert_eq!(emitter.refuse(&refusal_from(c), t1), Outcome::Quiet);
         match emitter.refuse(&refusal_from(c), t1) {
             Outcome::Emit(line) => assert!(line.ends_with("refusals=3")),

@@ -9,7 +9,11 @@
 //! of the switch subnet, so the leg terminates those frames itself: one smoltcp
 //! [`Interface`] over a channel-backed [`Device`], answering ARP for the leg's
 //! address, resetting TCP to unlistened proxy ports, and sending ICMP
-//! port-unreachable for UDP at the address.
+//! port-unreachable for UDP at the address. Every reset and every ICMP reply
+//! is charged to the shared refusal audit ([`crate::refusal`]) in the one
+//! line format the other refusal legs use — one line when a window opens and
+//! one when a source's quota is spent — so a box hammering the address loses
+//! only its own replies.
 //!
 //! [`BepDevice`] is that [`Device`]: a pair of unbounded tokio channels, one
 //! raw Ethernet frame per message on each. [`BepDevice::pair`] hands the
@@ -55,6 +59,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::refusal;
 use crate::{DEFAULT_MTU, MacAddr, SwitchSubnet};
 use smoltcp::iface::{Config as InterfaceConfig, Interface, SocketSet};
 use smoltcp::phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
@@ -218,6 +223,11 @@ pub struct BepHost {
     sockets: SocketSet<'static>,
     ip: Ipv4Address,
     mac: EthernetAddress,
+    /// The shared refusal audit ([`refusal::RefusalEmitter`]): every reset and
+    /// port-unreachable this leg sends is charged to its source's quota, and
+    /// the audit says one line when a window opens and one when the quota is
+    /// spent, in the same line format every refusal leg uses.
+    refusals: refusal::RefusalEmitter,
 }
 
 impl fmt::Debug for BepHost {
@@ -257,6 +267,7 @@ impl BepHost {
             sockets: SocketSet::new(vec![]),
             ip,
             mac,
+            refusals: refusal::RefusalEmitter::default(),
         }
     }
 
@@ -360,6 +371,30 @@ impl BepHost {
         self.send_arp(reply, source_hardware_addr);
     }
 
+    /// Charge a reply to the box at `source` to the shared refusal audit and
+    /// say whether the reply is still owed: [`refusal::Outcome::Emit`] warns
+    /// in the one shared line format and the reply is owed,
+    /// [`refusal::Outcome::Quiet`] already said this window's lines and the
+    /// reply is owed, and [`refusal::Outcome::Suppressed`] means the source
+    /// has spent this window's quota — the caller drops the segment and
+    /// answers nothing.
+    fn audit_refusal(&self, source: Ipv4Address, port: u16) -> bool {
+        let refusal = refusal::Refusal {
+            class: refusal::UNLISTENED_PROXY_PORT,
+            source: Ipv4Addr::from(u32::from_be_bytes(source.octets())),
+            address: Ipv4Addr::from(u32::from_be_bytes(self.ip.octets())),
+            about: refusal::About::Port(port),
+        };
+        match self.refusals.refuse(&refusal, std::time::Instant::now()) {
+            refusal::Outcome::Suppressed => false,
+            refusal::Outcome::Quiet => true,
+            refusal::Outcome::Emit(line) => {
+                tracing::warn!("{line}");
+                true
+            }
+        }
+    }
+
     fn handle_tcp(&self, src_mac: EthernetAddress, ip_repr: Ipv4Repr, tcp_payload: &[u8]) {
         let tcp = match TcpPacket::new_checked(tcp_payload) {
             Ok(tcp) => tcp,
@@ -369,6 +404,12 @@ impl BepHost {
         // segment that carries RST. The segment is dropped before any reset
         // field is computed, so it leaves no frame and no log line behind.
         if tcp.rst() {
+            return;
+        }
+        if !self.audit_refusal(ip_repr.src_addr, tcp.dst_port()) {
+            // The source has spent this window's quota of replies. Dropping
+            // the segment quietly keeps the peer from amplifying a flood, and
+            // only the flooding source loses its replies.
             return;
         }
         let seq = tcp.seq_number();
@@ -412,11 +453,6 @@ impl BepHost {
                 );
             },
         );
-        tracing::debug!(
-            src = %Ipv4Addr::from(u32::from_be_bytes(ip_repr.src_addr.octets())),
-            dst_port = tcp.dst_port(),
-            "sent TCP reset for unlistened proxy port"
-        );
     }
 
     fn handle_udp(&self, src_mac: EthernetAddress, ip_repr: Ipv4Repr, udp_payload: &[u8]) {
@@ -424,8 +460,12 @@ impl BepHost {
             Ok(udp) => udp,
             Err(_) => return,
         };
-        let src_port = udp.src_port();
         let dst_port = udp.dst_port();
+        if !self.audit_refusal(ip_repr.src_addr, dst_port) {
+            // The source has spent this window's quota of replies; the
+            // datagram is dropped as quietly as a refused TCP segment.
+            return;
+        }
         let original_ip_header_len = 20_usize;
         let original_total_len = (original_ip_header_len + udp.len() as usize) as u16;
         let original_src = ip_repr.src_addr;
@@ -477,12 +517,6 @@ impl BepHost {
                 let checksum = !checksum;
                 icmp_buf[2..4].copy_from_slice(&checksum.to_be_bytes());
             },
-        );
-        tracing::debug!(
-            src = %Ipv4Addr::from(u32::from_be_bytes(original_src.octets())),
-            src_port,
-            dst_port,
-            "sent ICMP port-unreachable for UDP to proxy address"
         );
     }
 
@@ -742,6 +776,55 @@ mod tests {
     use smoltcp::wire::{
         ArpOperation, ArpPacket, EthernetFrame, EthernetProtocol, Icmpv4Packet, UdpRepr,
     };
+    use std::sync::{Arc, Mutex};
+
+    /// A minimal WARN-and-up subscriber for tests that assert on the shared
+    /// refusal audit's lines. The crate carries no `tracing-subscriber`
+    /// behind `stack-peer`, so the test module rolls its own: `enabled`
+    /// filters to WARN so only the audit's lines reach the log, and `event`
+    /// records each line's message.
+    #[derive(Clone, Default)]
+    struct WarnLog(Arc<Mutex<Vec<String>>>);
+
+    /// Records an event's `message` field — the shared audit's whole line.
+    struct MessageField<'a>(&'a mut String);
+
+    impl tracing::field::Visit for MessageField<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+            if field.name() == "message" {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, "{value:?}");
+            }
+        }
+    }
+
+    impl WarnLog {
+        /// The lines said so far, in order.
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().expect("the test owns the log").clone()
+        }
+    }
+
+    impl tracing::Subscriber for WarnLog {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = String::new();
+            event.record(&mut MessageField(&mut line));
+            self.0.lock().expect("the test owns the log").push(line);
+        }
+    }
+
+    /// Capture every WARN line the current thread emits while the guard
+    /// lives. The stack answers on the test's own thread, so the thread-local
+    /// default subscriber is the one that sees the audit.
+    fn capture_warn_lines() -> (WarnLog, tracing::subscriber::DefaultGuard) {
+        let log = WarnLog::default();
+        let guard = tracing::subscriber::set_default(log.clone());
+        (log, guard)
+    }
 
     /// One ARP request frame, as a box on the plan would send it: broadcast,
     /// from the asker's switch-derived MAC, asking who has `target_ip`.
