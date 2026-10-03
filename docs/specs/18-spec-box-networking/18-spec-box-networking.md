@@ -623,10 +623,10 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minvmd admit_report_refused_outside_range_or_under_deny
     <!-- S10a/AC1; prose 51; unwanted; an absent or `deny` stance, an absent range, or a port outside the range refuses; the in-VM daemon unwinds the publish it reported, so the refusal leaves no partial mapping (NET-047) -->
-  - IF the in-VM daemon reports a runtime port for a row that already holds the per-row cap of runtime ports, or reports for a row faster than the per-row report rate THEN THE SYSTEM SHALL refuse the report and keep the port out of the table.
+  - IF the in-VM daemon reports a runtime port for admission to a row that already holds the per-row cap of runtime ports, or reports admissions for a row faster than the per-row report rate THEN THE SYSTEM SHALL refuse the report and keep the port out of the table.
     tier:   T0
     verify: cargo nextest run -p minvmd admit_report_refused_past_row_cap_or_rate
-    <!-- S10a/AC1; prose 51; unwanted; design §7.6 bounds the guest-to-host channel to fixed, size-bounded status messages; a range can span tens of thousands of ports, so the cap bounds what one row's reports can grow the table to; the in-VM daemon unwinds the refused publish, so the refusal leaves no partial mapping (NET-047) -->
+    <!-- S10a/AC1; prose 51; unwanted; design §7.6 bounds the guest-to-host channel to fixed, size-bounded status messages; a range can span tens of thousands of ports, so the cap bounds what one row's reports can grow the table to; working values [proposed]: 256 runtime ports per row and 10 admit reports per second per row; a withdrawal report is never refused by the cap or rate, because it can only narrow; the in-VM daemon unwinds the refused publish, so the refusal leaves no partial mapping (NET-047) -->
   - WHEN a box's attachment to the switch ends or its creator destroys it THE SYSTEM SHALL withdraw its row within 60 seconds.
     tier:   T0
     verify: cargo nextest run -p minvmd host_table_row_withdrawn_within_60s_of_box_end
