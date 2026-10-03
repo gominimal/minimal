@@ -1953,7 +1953,7 @@ mod tests {
             "the command is the privileged step's install: {command}"
         );
         assert!(
-            command.starts_with("sudo "),
+            command.contains("sudo bash ./install-host-classifier.sh"),
             "the command is the one a person runs, spelled exactly: {command}"
         );
 
