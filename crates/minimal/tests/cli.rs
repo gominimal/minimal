@@ -22,7 +22,9 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 #[tokio::test]
 async fn version_succeeds_with_daemon_running() {
     let (_daemon, args) = setup().await;
-    cmd_version(&args).await.unwrap();
+    cmd_version(&args, &mut std::io::stdout().lock())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -36,7 +38,9 @@ async fn version_succeeds_without_daemon() {
         vm: None,
     };
     // Should print client version and note daemon is unreachable, but return Ok.
-    cmd_version(&args).await.unwrap();
+    cmd_version(&args, &mut std::io::stdout().lock())
+        .await
+        .unwrap();
 }
 
 // --- ls ---

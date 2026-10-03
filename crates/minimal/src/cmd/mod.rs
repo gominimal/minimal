@@ -98,7 +98,9 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
         Some(Command::Login(args)) => {
             cmd_login(&cli.global_args, args, &mut std::io::stdout().lock()).await
         }
-        Some(Command::Version) => cmd_version(&cli.global_args).await,
+        Some(Command::Version) => {
+            cmd_version(&cli.global_args, &mut std::io::stdout().lock()).await
+        }
         Some(Command::Spin(args)) => cmd_spin(&cli.global_args, args).await,
         Some(Command::Init(args)) => cmd_init(&cli.global_args, args)
             .await

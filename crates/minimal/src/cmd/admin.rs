@@ -245,8 +245,15 @@ pub async fn cmd_spin(_global: &GlobalArgs, args: SpinArgs) -> Result<(), anyhow
 /// the daemon version and stdlib version. Unlike other commands, this does
 /// not autospawn the daemon — it is a lightweight diagnostic that should
 /// report versions without starting a VM.
-pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
-    println!("Client: minimal {}", version::LONG_VERSION);
+///
+/// The output goes to the caller's writer rather than to stdout directly,
+/// so a reader that has gone away (e.g. `min version | head -1`) surfaces
+/// as a broken-pipe error instead of a `println!` panic.
+pub async fn cmd_version<W: std::io::Write>(
+    global: &GlobalArgs,
+    out: &mut W,
+) -> Result<(), anyhow::Error> {
+    writeln!(out, "Client: minimal {}", version::LONG_VERSION)?;
 
     let sock = match client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd())
     {
@@ -277,8 +284,8 @@ pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
         }
     };
 
-    println!("Server: minimald {}", resp.long_version);
-    println!("Stdlib: {}", resp.stdlib_version);
+    writeln!(out, "Server: minimald {}", resp.long_version)?;
+    writeln!(out, "Stdlib: {}", resp.stdlib_version)?;
 
     Ok(())
 }
