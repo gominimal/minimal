@@ -77,7 +77,7 @@
 #![cfg(minvmd_libkrun)]
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -1232,63 +1232,121 @@ fn spoofed_flow(gate_sock: &Path, flow: &SpoofedFlow, deadline: Duration) -> Res
 
 // --- the destination: a host TCP listener behind the switch's NAT ---
 
+/// How long an accepted connection is held open waiting for its sender's
+/// bytes. The NAT dials this listener when the SYN arrives, *before* the
+/// handshake it is proxying has completed — gvisor-tap-vsock's TCP forwarder
+/// dials the backend and only then creates the endpoint that answers the SYN
+/// — so a connection's clock starts before its sender has seen the SYN-ACK it
+/// must answer before it can push. Any budget shorter than the longest
+/// `wait_for` closes the connection under a sender still mid-handshake, and
+/// the marker it then pushes has nowhere to land (#1845).
+const CONNECTION_BUDGET: Duration = Duration::from_secs(30);
+
 /// A host TCP listener the fabric's NAT maps the host alias's port to. Every
 /// connection's first bytes are the marker its sender sent; the shared list
-/// is what the test's verdicts read.
+/// is what the test's verdicts read. Each connection is read on its own
+/// thread, so a sender slow to push — or one that never pushes — holds up
+/// neither the accept loop nor another sender's marker.
 struct HostListener {
     seen: Arc<Mutex<Vec<String>>>,
+    /// What each connection did, in arrival order: the account a failure
+    /// reads to say whether a marker's connection was never dialed, was
+    /// dialed and stayed silent, or arrived after the wait gave up.
+    log: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Reads one accepted connection, recording what arrives as it arrives. A
+/// read timeout is not an end: the sender may still be completing the
+/// handshake this connection was dialed for, so the read is retried until the
+/// sender closes, the connection's budget runs out, or the listener stops.
+fn read_marker(
+    mut conn: TcpStream,
+    seen: &Mutex<Vec<String>>,
+    log: &Mutex<Vec<String>>,
+    stop: &AtomicBool,
+    started: Instant,
+) {
+    let accepted = started.elapsed();
+    // Logged on arrival, not only on departure: a connection still open when
+    // a wait gives up is the whole distinction between a marker the fabric
+    // never carried and one it carried too late.
+    log.lock()
+        .expect("log lock is held only across an append")
+        .push(format!(
+            "a connection was accepted at +{:.1}s",
+            accepted.as_secs_f64()
+        ));
+    conn.set_nonblocking(false)
+        .expect("setting the connection blocking");
+    conn.set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("setting the connection read timeout");
+    let end = Instant::now() + CONNECTION_BUDGET;
+    let mut buf = [0u8; 256];
+    let mut got = 0;
+    let ended = loop {
+        if stop.load(Ordering::Relaxed) {
+            break "the listener stopped";
+        }
+        if Instant::now() >= end {
+            break "the connection budget ran out";
+        }
+        match conn.read(&mut buf[got..]) {
+            Ok(0) => break "the sender closed its side",
+            Ok(n) => {
+                got += n;
+                // Pushed on every read, not once at the end: a marker is
+                // readable the moment its bytes are, and the wait that reads
+                // it is already running.
+                seen.lock()
+                    .expect("seen lock is held only across an append")
+                    .push(String::from_utf8_lossy(&buf[..got]).into_owned());
+                if got >= buf.len() {
+                    break "the buffer filled";
+                }
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(_) => break "the read failed",
+        }
+    };
+    log.lock()
+        .expect("log lock is held only across an append")
+        .push(format!(
+            "the connection accepted at +{:.1}s read {got} bytes and ended at \
+             +{:.1}s because {ended}",
+            accepted.as_secs_f64(),
+            started.elapsed().as_secs_f64()
+        ));
 }
 
 impl HostListener {
     fn spawn(listener: TcpListener) -> HostListener {
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
         let handle = {
             let seen = Arc::clone(&seen);
+            let log = Arc::clone(&log);
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
                 listener
                     .set_nonblocking(true)
                     .expect("setting the listener nonblocking");
+                let mut readers = Vec::new();
                 loop {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
                     match listener.accept() {
-                        Ok((mut conn, _)) => {
-                            conn.set_nonblocking(false)
-                                .expect("setting the connection blocking");
-                            conn.set_read_timeout(Some(Duration::from_secs(2)))
-                                .expect("setting the connection read timeout");
-                            let mut buf = [0u8; 256];
-                            let mut got = 0;
-                            loop {
-                                match conn.read(&mut buf[got..]) {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        got += n;
-                                        if got >= buf.len() {
-                                            break;
-                                        }
-                                    }
-                                    Err(e)
-                                        if matches!(
-                                            e.kind(),
-                                            ErrorKind::WouldBlock | ErrorKind::TimedOut
-                                        ) =>
-                                    {
-                                        break;
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-                            if got > 0 {
-                                seen.lock()
-                                    .expect("seen lock is held only across an append")
-                                    .push(String::from_utf8_lossy(&buf[..got]).into_owned());
-                            }
+                        Ok((conn, _)) => {
+                            let seen = Arc::clone(&seen);
+                            let log = Arc::clone(&log);
+                            let stop = Arc::clone(&stop);
+                            readers.push(std::thread::spawn(move || {
+                                read_marker(conn, &seen, &log, &stop, started);
+                            }));
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(100));
@@ -1296,13 +1354,33 @@ impl HostListener {
                         Err(_) => break,
                     }
                 }
+                // The readers come off with the accept loop: the stop they
+                // poll is the one that ended it, so each is at most one read
+                // timeout from returning.
+                for reader in readers {
+                    let _ = reader.join();
+                }
             })
         };
         HostListener {
             seen,
+            log,
             stop,
             handle: Some(handle),
         }
+    }
+
+    /// What every connection that reached the listener did — the account a
+    /// failed wait reads to say why its marker never arrived.
+    fn report(&self) -> String {
+        let log = self
+            .log
+            .lock()
+            .expect("log lock is held only across this read");
+        if log.is_empty() {
+            return "no connection has finished at the listener".to_string();
+        }
+        log.join("; ")
     }
 
     /// Whether a marker whose text contains `needle` has arrived yet.
@@ -1508,7 +1586,8 @@ async fn vm_escape_bounded_to_resident_union() {
                 assert!(
                     listener.wait_for(&flow.marker, Duration::from_secs(10)),
                     "the spoofed flow from {src} completed its handshake but its \
-                     marker never reached the host listener"
+                     marker never reached the host listener; the listener saw: {}",
+                    listener.report()
                 );
                 // The gate's own line for the admit: the diagnostics a host
                 // reads the interim's posture out of, naming the source the
