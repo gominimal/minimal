@@ -6298,6 +6298,20 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
   # fetches this same run completed are the live control, so the leg is
   # never skipped for network conditions: a host that cannot reach the
   # internet fails them first.
+  #
+  # This leg pins the CURRENT behaviour against a known gap — and the
+  # connect timeout (curl exit 28) is that current behaviour, not the shape
+  # the box is supposed to have: under the shipped interim the query for a
+  # name egress.allow_dns_hosts does not match is forwarded and only the
+  # resulting pin is withheld (crates/minimald/src/net/dns_gate.rs), so the
+  # resolution is honest, the address comes back, and the connect to it is
+  # then dropped unanswered under the box's egress rules until --max-time
+  # runs out. Design §5.3 instead refuses such a name at resolution, but
+  # spec 18 has no requirement for that yet. When
+  # https://github.com/gominimal/minimal/issues/1869 lands, this leg flips
+  # with it, deliberately: the refusal moves to the lookup itself and the
+  # assertion narrows to curl exit 6 (could not resolve host), fast —
+  # which is the shape the gate owes a hostname-only box.
   goa_x_before="$(goa_log_lines)"
   goa_x_start="$(now_ms)"
   mnl session exec "$goa_t_sid" \
@@ -6683,6 +6697,13 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
   goa_zone_leg "$goa_p1_sid" "peer1-to-peer2-unpublished" \
     "http://$GOA_P2_NAME.min.internal:$GOA_CLOSED_PORT/" "" \
     "box-zone connection decided at connect" target_pass refused
+  # The silent drop this leg pins is NET-062's own shape, and it is pinned
+  # per NET-062: a connect the source's own egress rules refuse is dropped
+  # with no reset, so nothing answers and curl runs out its --max-time. When
+  # spec 18 amends NET-062 into an active reject, this leg is meant to flip
+  # with it, deliberately — the connect's exit moves from curl's timeout to
+  # its refused-connection shape, and the elapsed floor goes with it —
+  # because the shape the leg pins is the requirement's, not the case's own.
   goa_zone_leg "$goa_z_sid" "nofabric-to-peer2" \
     "http://$GOA_P2_NAME.min.internal:$GOA_P2_PORT/" "" \
     "network policy violation" "" dropped
