@@ -7216,7 +7216,9 @@ proof_two_named_vms_on_one_machine() {
   # launcher baseline package every box ships at /usr/bin, and the response
   # is written by the SESSION's shell so the Content-Length can never drift
   # from the body it frames. $1 = the runner (mnl or two_vm_mn), $2 = the
-  # session id, $3 = the listen port, $4 = the marker to answer with.
+  # session id, $3 = the listen port, $4 = the marker to answer with, $5 =
+  # the VM the box lives on, $6 = the box's name — the pair the error lines
+  # below name, so a red run's annotation says WHICH VM's story it carries.
   #
   # The socat probe's failure is two stories, and only one is about socat: an
   # exec that never reached the box (its own stderr) reads the same as a box
@@ -7226,20 +7228,46 @@ proof_two_named_vms_on_one_machine() {
   # — and the two beats below say which story it is: the ls row carries the
   # session's own status, the /usr/bin peek says whether the box was
   # populated at all.
+  #
+  # The probe's first exec is also the box's MINT: a box mints at its first
+  # exec (crates/minimald/src/exec.rs services the request by ensuring the
+  # host), and this case is the only one in the lane whose exec runs against
+  # a freshly booted VM whose guest store is still empty — the shared
+  # session's mint warmed the default VM, but the named VM's guest has to
+  # redo the whole cold fetch beside a VM already holding the machine. So
+  # the probe retries its exec, bounded, in the shape the harness already
+  # gives a fresh activate's first exec (the policy gate's exec retry): a
+  # mint that fell over on a switch still settling gets its window, and the
+  # verdict itself is never loosened — socat must answer before the beats
+  # that need it run.
   two_vm_start_responder() {
-    local runner="$1" sid="$2" port="$3" marker="$4" ready
-    "$runner" session exec "$sid" 'test -x /usr/bin/socat' \
-      >/dev/null 2>"$WORK/two-vm-socat.err" \
-      || {
-        echo "::error::the session has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"
-        echo "--- probe stderr (empty means the box answered, without socat) ---"
-        cat "$WORK/two-vm-socat.err" 2>/dev/null || true
-        echo "--- the session's ls row (its status) ---"
-        "$runner" ls 2>/dev/null | grep -F -- "$sid" || true
-        echo "--- the box's /usr/bin (first entries) ---"
-        "$runner" session exec "$sid" 'ls /usr/bin' 2>&1 | head -n 20 || true
-        fail
-      }
+    local runner="$1" sid="$2" port="$3" marker="$4" vm="$5" box="$6"
+    local attempt probe_ok="" ready
+    for attempt in 1 2 3; do
+      if "$runner" session exec "$sid" 'test -x /usr/bin/socat' \
+          >/dev/null 2>"$WORK/two-vm-socat.err"; then
+        probe_ok=1
+        break
+      fi
+      [ "$attempt" -lt 3 ] || break
+      echo "probe: box $box on VM $vm — exec attempt $attempt failed; giving the mint its window and retrying"
+      sleep 2
+    done
+    if [ -z "$probe_ok" ]; then
+      tw_socat_err="$(cat "$WORK/two-vm-socat.err" 2>/dev/null || true)"
+      if [ -n "$tw_socat_err" ]; then
+        echo "::error::box $box on VM $vm: the exec itself failed — the box never answered: $(printf '%s' "$tw_socat_err" | head -n1 | cut -c1-160)"
+      else
+        echo "::error::box $box on VM $vm: the box answered but has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"
+      fi
+      echo "--- probe stderr (empty means the box answered, without socat) ---"
+      printf '%s\n' "$tw_socat_err"
+      echo "--- the session's ls row (its status) ---"
+      "$runner" ls 2>/dev/null | grep -F -- "$sid" || true
+      echo "--- the box's /usr/bin (first entries) ---"
+      "$runner" session exec "$sid" 'ls /usr/bin' 2>&1 | head -n 20 || true
+      fail
+    fi
     "$runner" session exec "$sid" \
       "body=$marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200" \
       >/dev/null 2>"$WORK/two-vm-responder.err" \
@@ -7428,8 +7456,8 @@ print("yes" if any(s.get("vm") == sys.argv[1] for s in doc["sessions"]) else "no
   echo "published proxy ports (min ls): default 127.0.0.1:$tw_port_a · $tw_name 127.0.0.1:$tw_port_b"
 
   # ---- the in-box responders the routing matrix answers through ------------
-  two_vm_start_responder mnl "$tw_a_sid" "$TWO_VM_A_PORT" "$TWO_VM_A_MARKER"
-  two_vm_start_responder two_vm_mn "$tw_b_sid" "$TWO_VM_B_PORT" "$TWO_VM_B_MARKER"
+  two_vm_start_responder mnl "$tw_a_sid" "$TWO_VM_A_PORT" "$TWO_VM_A_MARKER" default "$TWO_VM_A_NAME"
+  two_vm_start_responder two_vm_mn "$tw_b_sid" "$TWO_VM_B_PORT" "$TWO_VM_B_MARKER" "$tw_name" "$TWO_VM_B_NAME"
 
   # ---- NET-059: both names route at the same time, each through its VM -----
   # From the HOST, through each VM's published port — the only surface the
