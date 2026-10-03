@@ -1,5 +1,6 @@
 [package]
 name = "stdlib"
+description = "The embedded Minimal standard library."
 version = "0.0.21"
 rust-version.workspace = true
 license.workspace = true
