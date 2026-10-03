@@ -1415,8 +1415,7 @@ mod tests {
         );
 
         // The answerer's UDP probe is unchanged by the TCP probe's second
-        // check: a free UDP port is handed as asked, as the held one below is
-        // refused.
+        // check: a free UDP port is handed as asked.
         let freed_udp = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
         let free_udp = freed_udp.local_addr().unwrap().port();
         drop(freed_udp);
