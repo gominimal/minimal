@@ -1516,7 +1516,7 @@ pub(crate) fn read_held_filter(root: &Path) -> Reading {
             because: "the daemon holds no loopback listener for its effect probe".to_string(),
         };
     }
-    read_over(root, &endpoints)
+    read_over(root, &endpoints, true)
 }
 
 /// Reads the table's effect on this host (NET-079, design §7.4): the probe,
@@ -1530,13 +1530,21 @@ pub(crate) fn read_held_filter(root: &Path) -> Reading {
 /// names its enforcement — while anything else is the state a person
 /// reading the log has to see: a control leg that did not connect, or a
 /// family that connected, timed out or failed with an errno outside the
-/// reject set, is the launch's own line to carry.
-fn read_over(root: &Path, endpoints: &[(Family, SocketAddr)]) -> Reading {
+/// reject set, is the launch's own line to carry. The two lanes carry it
+/// at their own levels: a guest's reading is its boot's own product, and a
+/// launch that reads anything but a refusal is the one line a bundle
+/// carries of why that guest refuses every deny-all host-address box, so
+/// it is a warn there — while the native lane is T48's (#1805) and keeps
+/// the level it chose, an info a person reading a host they installed
+/// sees without being alarmed by the launch's own record beside it.
+fn read_over(root: &Path, endpoints: &[(Family, SocketAddr)], guest: bool) -> Reading {
     let reading = probe_effect(root, endpoints);
     if matches!(reading, Reading::Refused(_)) {
         tracing::debug!(probe = %reading.record(), "the classifier table refused the probe's connection out of a deny leaf");
-    } else {
+    } else if guest {
         tracing::warn!(probe = %reading.record(), "read the classifier table's effect on this host");
+    } else {
+        tracing::info!(probe = %reading.record(), "read the classifier table's effect on this host");
     }
     reading
 }
@@ -1563,7 +1571,7 @@ pub fn read_filter(root: &Path) -> Reading {
         .iter()
         .filter_map(|(family, listener)| listener.local_addr().ok().map(|addr| (*family, addr)))
         .collect();
-    read_over(root, &endpoints)
+    read_over(root, &endpoints, false)
 }
 
 /// The check (NET-079, design §7.4): whether this host can decide a
