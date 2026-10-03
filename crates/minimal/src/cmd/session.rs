@@ -760,6 +760,21 @@ pub(crate) async fn activate_session(
     }
     let id = created.id;
 
+    // NET-079: the host's verdict on whether it can decide a host-address
+    // box's egress per box, spelled by the daemon — the side that read the
+    // host — and printed verbatim, so the terminal, the daemon's log line
+    // for this same create, and the start all say the same thing. The
+    // advisory names the cause, the state it leaves the box in, and, when
+    // the missing privileged step is the cause, the exact command that
+    // installs it; it is never a prompt (see
+    // [`classifier_advisory_start_line`]). Printed after the session exists
+    // and before the work on it, like the notice below it, so a host that
+    // cannot decide per box is named at the start that runs there and not
+    // only in a log the person was not reading.
+    if let Some(advisory) = classifier_advisory_start_line(&created) {
+        eprintln!("{advisory}");
+    }
+
     // The coming-change notice (NET-076), printed while the deny-all egress
     // default is announced but not yet in force. Scoped to the box it would
     // change — an own-address session that declared no egress — on a daemon
@@ -1578,6 +1593,28 @@ pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'
         ),
         sessions::EgressDefaultPhase::InForce => None,
     }
+}
+
+/// The classifier advisory a create reply carries (NET-079), as the line
+/// the activation prints: this host's cause in words for why it cannot
+/// decide a host-address box's egress verdict per box, the state that
+/// leaves the box in, and — when the missing privileged step is the cause —
+/// the exact command that installs it. The daemon spelled it, because the
+/// daemon is the side that read the host; the start prints it verbatim, so
+/// the terminal, the daemon's own log line for the same create, and the
+/// start all say the same thing. `None` from a host that decides per box
+/// and from a daemon that predates the field: nothing to print then, the
+/// way the other create-reply facts read.
+///
+/// The advisory is never a prompt: it names what a person may run, and
+/// running it — and any privilege prompt it carries — is the person's act,
+/// never the session start's, so the activation prints it and goes on
+/// without waiting for an answer.
+#[must_use]
+pub fn classifier_advisory_start_line(
+    created: &minimald_rpc::CreateSessionResponse,
+) -> Option<&str> {
+    created.classifier_advisory.as_deref()
 }
 
 /// Render a session's effective policy as its rules: the egress the gate
@@ -2517,6 +2554,113 @@ mod tests {
         assert!(
             rendered.contains("egress\n  allow all\n"),
             "an opted-out bare box must show allow-all: {rendered}"
+        );
+    }
+
+    /// The create reply the activation reads, with only the fields this
+    /// test's lines depend on set: an id and a version to satisfy the skew
+    /// gate, the classifier advisory, and the enforcement the same create
+    /// recorded.
+    fn create_reply(
+        advisory: Option<&str>,
+        egress_enforcement: Option<&str>,
+    ) -> minimald_rpc::CreateSessionResponse {
+        minimald_rpc::CreateSessionResponse {
+            id: sessions::SessionId::nil(),
+            daemon_version: Some("0.7.0".to_string()),
+            hostname_routing_unavailable: None,
+            hostname_proxy_port: None,
+            zone_answerer_port: None,
+            answerer_bound: false,
+            interim_loopback: false,
+            deny_all_opt_out: None,
+            classifier_advisory: advisory.map(str::to_string),
+            egress_enforcement: egress_enforcement.map(str::to_string),
+        }
+    }
+
+    /// NET-079: the advisory a create reply carries is the line the
+    /// activation prints, verbatim — with the exact command that installs
+    /// the classifier's privileged step when the step is the cause, spelled
+    /// by the daemon so the command the terminal shows is the one that ends
+    /// it — and it is never a prompt: no question in the line, nothing for
+    /// the start to wait on. A cause no command ends still names the cause
+    /// and never an install. A host that decides per box, or a daemon that
+    /// predates the field, prints nothing at all.
+    #[test]
+    fn activate_prints_classifier_advisory() {
+        // The reply a step-missing host sends: the daemon's own spelling,
+        // with the command on the last line so the thing a person copies
+        // is the command, verbatim.
+        let step_missing = create_reply(
+            Some(
+                "note: this host cannot decide a host-address box's egress verdict \
+                 per box: the classifier's privileged step is not installed on this \
+                 host. While it cannot, its host-address boxes run unenforced — \
+                 whatever the boxes' declarations say. Install the classifier's \
+                 privileged step with:\n  sudo scripts/install-host-classifier.sh \
+                 --user runner --cohort-address 10.0.0.0/16 --node-plane-address \
+                 10.0.1.0/24",
+            ),
+            Some("none"),
+        );
+        let line = classifier_advisory_start_line(&step_missing)
+            .expect("a step-missing host's create must print its advisory");
+        assert_eq!(
+            line,
+            step_missing.classifier_advisory.as_deref().unwrap(),
+            "the start prints the daemon's spelling verbatim, so the log, the \
+             reply, and the terminal cannot disagree"
+        );
+        assert!(
+            line.contains("sudo scripts/install-host-classifier.sh"),
+            "the missing privileged step is the cause, so the advisory must \
+             carry the exact command that installs it: {line}"
+        );
+        assert!(
+            !line.contains('?'),
+            "the advisory names what a person may run; it never asks: {line}"
+        );
+
+        // A host that cannot confine: the cause is still named, and no
+        // install can end it, so the line names none.
+        let cannot_confine = create_reply(
+            Some(
+                "note: this host cannot decide a host-address box's egress verdict \
+                 per box: no cgroup2 mount with nsdelegate covers the classifier \
+                 tree, so a box could migrate out of its leaf. While it cannot, \
+                 its host-address boxes run unenforced — whatever the boxes' \
+                 declarations say.",
+            ),
+            Some("none"),
+        );
+        let line = classifier_advisory_start_line(&cannot_confine)
+            .expect("a host that cannot confine still gets its advisory");
+        assert!(
+            line.contains("no cgroup2 mount with nsdelegate covers the classifier tree"),
+            "the advisory must name this cause in words too: {line}"
+        );
+        assert!(
+            !line.contains("install-host-classifier"),
+            "no command ends this cause, so the advisory must name none: {line}"
+        );
+        assert!(
+            !line.contains('?'),
+            "the advisory names what a person may run; it never asks: {line}"
+        );
+
+        // A host that decides per box, or a daemon that predates the field:
+        // nothing to print, the way the other create-reply facts read.
+        let decided = create_reply(None, Some("per_box"));
+        assert!(
+            classifier_advisory_start_line(&decided).is_none(),
+            "a decided host's create carries no advisory, so its start prints none"
+        );
+        let pre_field = create_reply(None, None);
+        assert!(
+            classifier_advisory_start_line(&pre_field).is_none(),
+            "a daemon that predates the field carries no advisory, so its \
+             start prints none"
         );
     }
 
