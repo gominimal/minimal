@@ -1629,9 +1629,9 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
 
   # The daemon's file log is JSON lines (crates/mlog/src/lib.rs), so every
   # needle below is the JSON spelling of the field or message it pins — and
-  # the box's id is part of the record needle, because a whole-lane run has
-  # already recorded a node-plane fetch for the sandbox proof's own `min
-  # add`, and this proof must pin ITS box's record, not any other's.
+  # the box's id is part of the record needle, because any earlier proof
+  # whose own `min add` fetched records a node-plane fetch of its own, and
+  # this proof must pin ITS box's record, not any other's.
   # `|| true` because a find -exec whose grep finds nothing exits nonzero,
   # and the callers assert on the captured text.
   net080_log() { # $1 = the fixed string; prints the matching daemon-log lines
@@ -1696,12 +1696,9 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
 
   # ---- the install: this proof's tree and table ---------------------------
   # The daemon is stopped first, so the one this proof drives starts under
-  # the install and under this proof's RUST_LOG: the node-plane record and
-  # the launch line are INFO records from minimald::net::classifier and
-  # minimald::session_host, a daemon's filter comes from RUST_LOG at
-  # autospawn, and the lane's default filter would drop both before they
-  # reached the file this proof reads them from. The command-local
-  # assignment below keeps the rest of the lane at its own filter.
+  # the install: its launches' placement probes and its own fetches both
+  # happen with the tree and the table in force, and the warm-up below
+  # starts it with the filter and the package cache this proof needs.
   mnl stop --force >/dev/null 2>&1 || true
   # Set before the install, so a death between its nft transaction and its
   # last note still leaves the teardown a table to remove.
@@ -1732,22 +1729,43 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   fi
   echo "marker: the table's presence marker is in place — minimald records a per-box verdict only while it is there"
 
-  # ---- the box: a host-address box declared deny-all ----------------------
-  # deny 0.0.0.0/0 is the CLI's deny-all spelling for a host-address box, the
-  # same explicit stand-in NET-074's e2e case names for the in-force default
-  # the phase does not yet ship.
+  # ---- this proof's own project: the seed the box is declared against -----
   NET080_SEED_DIR="$(hook_mktemp /tmp/mnl80.XXXXXX)"
   hook_seed_preamble >"$NET080_SEED_DIR/minimal.toml"
   mkdir "$NET080_SEED_DIR/.git"
-  net080_sid="$(cd "$NET080_SEED_DIR" && RUST_LOG="warn,minimald::exec=info,minimald::net::classifier=info,minimald::session_host=info" \
-    mnl session activate . --no-prompt --name e2e-net080-deny-all \
-    --network host_ip --deny-subnets 0.0.0.0/0 2>"$WORK/net080-activate.err")" || {
-    echo "::error::'min session activate --network host_ip --deny-subnets 0.0.0.0/0' failed under the loaded table"
-    cat "$WORK/net080-activate.err" 2>/dev/null || true
+
+  # ---- the daemon, started and placed BEFORE the box it will launch ------
+  # The launch the activate performs runs its placement probe with this
+  # daemon as it is then: a daemon outside the delegated slice probes
+  # EACCES, and its box runs unenforced with no leaf of its own — so the
+  # placement must already be in place before the box exists. The warm-up
+  # is a daemon-touching call that starts no session, so the daemon this
+  # proof drives autospawns on it; it is detached, so it keeps the spawn
+  # env below for its whole life, while the shell running the proof — and
+  # every case after it, on every exit path, `fail` included — keeps the
+  # env it came in with (the box-names case documents the same one-call
+  # pattern). Nothing after the warm-up can spawn a daemon.
+  #
+  # The filter: the two records this proof reads are INFO records from
+  # minimald::net::classifier and minimald::session_host, a daemon's filter
+  # comes from RUST_LOG at autospawn, and the lane's default filter would
+  # drop both before they reached the file this proof reads them from.
+  #
+  # The package cache: the lane's is warm by now — its proofs share one,
+  # and CI restores it across runs — and a fully-cached add fetches
+  # nothing, so no fetch and no record. This proof's daemon resolves its
+  # cache into an empty dir of its own, under $WORK so it shares the state
+  # dir's device (the daemon hardlinks built packages from its cache into
+  # the session rootfs, and a hardlink cannot cross filesystems).
+  net080_rust_log="warn,minimald::exec=info,minimald::net::classifier=info,minimald::session_host=info"
+  net080_cache="$WORK/net080-cache"
+  if ! RUST_LOG="$net080_rust_log" XDG_CACHE_HOME="$net080_cache" \
+      mnl ls >/dev/null 2>"$WORK/net080-warm.err"; then
+    echo "::error::this proof's daemon did not come up under its own filter and its own empty package cache"
+    cat "$WORK/net080-warm.err" 2>/dev/null || true
     fail
-  }
-  net080_sid="$(printf '%s\n' "$net080_sid" | tail -n1 | tr -d '\r')"
-  echo "activate: the host-address box $net080_sid is declared deny-all (deny 0.0.0.0/0)"
+  fi
+  echo "warm: the daemon this proof drives is up, started under this proof's filter and against an empty package cache of its own"
 
   # ---- the daemon's placement: the one migration it cannot make itself ----
   # A native daemon starts wherever its starter left it (user.slice), so the
@@ -1755,11 +1773,11 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   # hierarchy root — the barrier that stops a box climbing out is the same
   # fact that stops the daemon climbing in. The installer's --pid step is
   # the supported placement, and the placement probe is per launch, so the
-  # next box this daemon launches is decided on a leaf of its own. Found
-  # off /proc, keyed on comm (a cmdline match would take an editor holding
-  # a file under crates/minimald for the daemon itself) and on this
-  # account, so another account's daemon is never placed in this proof's
-  # tree.
+  # next box this daemon launches — the one the activate below creates — is
+  # decided on a leaf of its own. Found off /proc, keyed on comm (a cmdline
+  # match would take an editor holding a file under crates/minimald for the
+  # daemon itself) and on this account, so another account's daemon is
+  # never placed in this proof's tree.
   net080_daemons=""
   for net080_proc in /proc/[0-9]*; do
     [ -r "$net080_proc/comm" ] || continue
@@ -1790,6 +1808,21 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
     fail
   fi
   echo "place: $min_daemon $net080_pid is inside the slice, so the next box it launches is decided on a leaf of its own"
+
+  # ---- the box: the activate launches it, into a leaf of the placed
+  # daemon's tree, under the table this proof loaded. The daemon is up
+  # already, so this call runs at the lane's own filter. deny 0.0.0.0/0 is
+  # the CLI's deny-all spelling for a host-address box, the same explicit
+  # stand-in NET-074's e2e case names for the in-force default the phase
+  # does not yet ship.
+  net080_sid="$(cd "$NET080_SEED_DIR" && mnl session activate . --no-prompt --name e2e-net080-deny-all \
+    --network host_ip --deny-subnets 0.0.0.0/0 2>"$WORK/net080-activate.err")" || {
+    echo "::error::'min session activate --network host_ip --deny-subnets 0.0.0.0/0' failed under the loaded table"
+    cat "$WORK/net080-activate.err" 2>/dev/null || true
+    fail
+  }
+  net080_sid="$(printf '%s\n' "$net080_sid" | tail -n1 | tr -d '\r')"
+  echo "activate: the host-address box $net080_sid is declared deny-all (deny 0.0.0.0/0), launched by a daemon already inside the slice"
 
   # ---- the capability gate: this proof drives a box, so a host that cannot
   # run one cannot run it. Observed fact, degraded on a developer host, a
@@ -1892,8 +1925,10 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   echo "install: 'min add $ADD_TOOL' completed inside the deny-all box and made it runnable ('$ADD_TOOL_MARKER' round-tripped) — the daemon fetched it on this same host"
 
   # ---- the node-plane record: the line the requirement is for. The needle
-  # names this box (see net080_log): the earlier proofs' own installs
-  # recorded fetches of their own, and this proof pins THIS box's.
+  # names this box (see net080_log): any earlier proof whose own add fetched
+  # records a fetch of its own, and this proof pins THIS box's — and the
+  # fetch it pins is this proof's own, because the daemon above was started
+  # against an empty package cache, so this add had to fetch.
   net080_records="$(net080_log "\"box_id\":\"$net080_sid\"")"
   if [ -z "$net080_records" ]; then
     echo "::error::the daemon log has no record naming this box: the daemon's own fetch was not recorded"
