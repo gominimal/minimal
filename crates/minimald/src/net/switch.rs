@@ -3131,6 +3131,7 @@ pub(crate) mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         };
         let gate = SessionGate::for_session(
             "100.64.0.9".into(),
