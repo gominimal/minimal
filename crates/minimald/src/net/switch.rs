@@ -2587,6 +2587,7 @@ pub(crate) mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         };
         let gate = SessionGate::for_session(
             "100.64.0.9".into(),
@@ -2752,6 +2753,7 @@ pub(crate) mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         };
         let gate =
             SessionGate::for_session(LEASE.to_string(), LEASE, &policy, SwitchSubnet::default());
@@ -2968,6 +2970,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -3104,6 +3107,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         };
         let mut harness = spawn_test_relay(&policy);
 
@@ -3134,6 +3138,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         };
         let mut harness = spawn_test_relay(&policy);
         let peer = Ipv4Addr::new(10, 1, 2, 3);
@@ -3201,6 +3206,7 @@ pub(crate) mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         };
         let mut harness = spawn_test_relay(&policy);
 
@@ -3406,6 +3412,7 @@ pub(crate) mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -3817,6 +3824,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -3834,6 +3842,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -3853,6 +3862,7 @@ pub(crate) mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
             }),
+            credentialed_upstream: None,
         }
     }
 

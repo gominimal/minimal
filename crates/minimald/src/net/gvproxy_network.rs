@@ -1130,6 +1130,7 @@ mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -1160,6 +1161,7 @@ mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -2207,6 +2209,7 @@ mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         };
         // Finalize has already run (NET-011): the creator handed the box's
         // published address, finalize recorded the hand, and the
@@ -2483,6 +2486,7 @@ mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         };
         // Finalize has already run (NET-011): the creator handed the box's
         // published address, finalize recorded the hand, and the

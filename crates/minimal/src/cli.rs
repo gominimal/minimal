@@ -524,6 +524,15 @@ pub struct ActivateArgs {
     /// denied.
     #[arg(long = "deny-subnets", value_name = "CIDR")]
     pub deny_subnets: Vec<String>,
+    /// Declare a credentialed upstream for this box (NET-134): the Box
+    /// Egress Proxy's listener becomes the box's infrastructure, reachable
+    /// whatever its `--allow-*`/`--deny-*` rules say. Without the flag every
+    /// frame this box sends to the proxy's address is dropped at the
+    /// host-side gate. The steering the proxy applies and the credentials it
+    /// redeems are the proxy document's; this declares the lane, nothing
+    /// more.
+    #[arg(long)]
+    pub credentialed_upstream: bool,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
     /// Repeatable. If any `--loadout` is specified, defaults from
     /// `[loadouts].default_loadouts` in the client config are ignored.
