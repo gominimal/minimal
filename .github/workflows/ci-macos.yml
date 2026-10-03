@@ -13,6 +13,13 @@ on:
         branches: ["main", "release/**"]
     pull_request:
         branches: ["main", "release/**"]
+    # A merge-queue build runs ONLY the ci-macos-success aggregator, which
+    # reports green with every gating job skipped. ci-macos-success is a
+    # required check, so the queue still needs this trigger to see it, but the
+    # lane's work happens on the PR run (path-filtered) and on the push to main
+    # after the merge, which runs the full lane. The single self-hosted runner
+    # is the queue's bottleneck, and queue builds have not caught a macOS
+    # failure the PR run missed.
     merge_group:
         branches: ["main", "release/**"]
     workflow_dispatch:
@@ -45,42 +52,25 @@ permissions:
 
 jobs:
     changes:
+        # Merge-queue builds run only the aggregator; see `merge_group` above.
+        if: github.event_name != 'merge_group'
         runs-on: ubuntu-latest
         timeout-minutes: 5
         outputs:
-            # A failed filter on a merge-queue build reads as "macOS changed",
-            # so a filter fault runs the full lane instead of skipping it.
-            macos: ${{ steps.filter.outcome == 'failure' && 'true' || steps.filter.outputs.macos }}
+            macos: ${{ steps.filter.outputs.macos }}
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
-            - name: Fetch the merge-queue base
-              # A queue group's head is main's base_sha plus the queued PRs'
-              # squashes. Diffing the two trees needs only the base commit
-              # itself, not history, so one shallow fetch suffices. The diff
-              # covers every PR in the group, so a group runs the full lane
-              # whenever any of its PRs touches the macOS surface.
-              if: github.event_name == 'merge_group'
-              continue-on-error: true
-              env:
-                  BASE_SHA: ${{ github.event.merge_group.base_sha }}
-              run: git fetch --no-tags --depth=1 origin "$BASE_SHA"
             - name: Detect macOS-relevant changes
               id: filter
-              # v3.0.2, SHA-pinned. On pull_request dorny reads the PR file
-              # list via the API. On merge_group it diffs the group's base and
-              # head commits fetched above; a failure there falls back to the
-              # full lane (see `outputs.macos`). Pushes to main, dispatches
-              # and scheduled calls run everything regardless, so main keeps
-              # a full post-merge run.
-              if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
-              continue-on-error: ${{ github.event_name == 'merge_group' }}
+              # v3.0.2, SHA-pinned. Runs ONLY on pull_request, where dorny
+              # reads the PR file list via the API (a push would need a local
+              # diff our shallow, credential-free checkout cannot provide) —
+              # and pushes to main / dispatches run everything regardless.
+              if: github.event_name == 'pull_request'
               uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d
               with:
-                  # Empty on pull_request, where dorny uses the PR's own base.
-                  base: ${{ github.event.merge_group.base_sha }}
-                  ref: ${{ github.event.merge_group.head_sha }}
                   filters: |
                       macos:
                         - "crates/minvmd/**"
@@ -106,7 +96,7 @@ jobs:
 
     artifacts:
         needs: [changes]
-        if: (github.event_name != 'pull_request' && github.event_name != 'merge_group') || needs.changes.outputs.macos == 'true'
+        if: github.event_name != 'merge_group' && (github.event_name != 'pull_request' || needs.changes.outputs.macos == 'true')
         # Build the `minimal` CLI from THIS repo's sources, then materialize the
         # guest kernel + rootfs against the repo's own .minimal/minimal.toml. Both
         # are cache pulls keyed by the pinned upstream commit (not compiles): the
@@ -264,8 +254,8 @@ jobs:
         # as pass, so this does not wedge the required check.
         if: >-
             ${{ vars.RUN_MACOS_CI != 'false'
-            && ((github.event_name != 'pull_request' && github.event_name != 'merge_group')
-                || (github.event_name == 'merge_group' && needs.changes.outputs.macos == 'true')
+            && github.event_name != 'merge_group'
+            && (github.event_name != 'pull_request'
                 || (needs.changes.outputs.macos == 'true'
                     && github.event.pull_request.head.repo.full_name == github.repository)) }}
         needs: [changes, artifacts, unit]
@@ -469,7 +459,7 @@ jobs:
         # macOS-sensitive crates; widen to --workspace once the tree is
         # mac-buildable. Kept lean (private repo: macOS minutes bill at 10x).
         needs: [changes]
-        if: (github.event_name != 'pull_request' && github.event_name != 'merge_group') || needs.changes.outputs.macos == 'true'
+        if: github.event_name != 'merge_group' && (github.event_name != 'pull_request' || needs.changes.outputs.macos == 'true')
         runs-on: macos-latest
         timeout-minutes: 45
         env:
