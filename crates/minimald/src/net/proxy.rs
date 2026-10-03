@@ -565,19 +565,9 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest<'_>> {
     // carries a full URI (`GET http://host:port/path HTTP/1.1`). The URI
     // authority takes precedence over any `Host:` header (RFC 9112 §3.2.3).
     let path = parts.next()?;
-    let (authority_from_uri, absolute_form) = if let Some(rest) = path
-        .strip_prefix("http://")
-        .or_else(|| path.strip_prefix("https://"))
-    {
-        // The URI authority is everything up to the next `/`, `?`, or `#`.
-        let authority_end = rest
-            .find('/')
-            .or_else(|| rest.find('?'))
-            .or_else(|| rest.find('#'))
-            .unwrap_or(rest.len());
-        (Some(&rest[..authority_end]), true)
-    } else {
-        (None, false)
+    let (authority_from_uri, absolute_form) = match split_absolute_form(path) {
+        Some((authority, _)) => (Some(authority), true),
+        None => (None, false),
     };
 
     let authority = if let Some(auth) = authority_from_uri {
@@ -680,6 +670,19 @@ fn strip_h2c_upgrade(head: &[u8]) -> Cow<'_, [u8]> {
     Cow::Owned(out)
 }
 
+/// Splits an absolute-form request target (`http://authority/path?query`)
+/// into its authority and the rest, or `None` for any other form. The
+/// authority ends at the first `/`, `?`, or `#` (RFC 3986 §3.2); the rest
+/// keeps the path and query, minus any fragment, which is never sent.
+fn split_absolute_form(target: &str) -> Option<(&str, &str)> {
+    let rest = target
+        .strip_prefix("http://")
+        .or_else(|| target.strip_prefix("https://"))?;
+    let rest = rest.split_once('#').map_or(rest, |(before, _)| before);
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    Some(rest.split_at(authority_end))
+}
+
 /// Rewrites an absolute-form request line to origin-form (RFC 9112 §3.2.2):
 /// `GET http://host:port/path?query HTTP/1.1` becomes `GET /path?query HTTP/1.1`.
 /// The scheme and authority are dropped; the path (and any query) is kept, so
@@ -707,28 +710,17 @@ fn rewrite_absolute_form(head: &[u8]) -> Cow<'_, [u8]> {
         return Cow::Borrowed(head);
     };
 
-    let Some(rest_uri) = target
-        .strip_prefix("http://")
-        .or_else(|| target.strip_prefix("https://"))
-    else {
+    let Some((_, origin_target)) = split_absolute_form(target) else {
         return Cow::Borrowed(head);
-    };
-    // The origin-form target is the path (and query) after the authority.
-    let path_start = rest_uri
-        .find('/')
-        .or_else(|| rest_uri.find('?'))
-        .or_else(|| rest_uri.find('#'))
-        .unwrap_or(rest_uri.len());
-    let origin_target = &rest_uri[path_start..];
-    let origin_target = if origin_target.is_empty() {
-        "/"
-    } else {
-        origin_target
     };
 
     let mut out = Vec::with_capacity(head.len());
     out.extend_from_slice(method.as_bytes());
     out.push(b' ');
+    // An empty path is sent as `/` (RFC 9112 §3.2.1), ahead of any query.
+    if !origin_target.starts_with('/') {
+        out.push(b'/');
+    }
     out.extend_from_slice(origin_target.as_bytes());
     out.push(b' ');
     out.extend_from_slice(version.as_bytes());
@@ -1534,6 +1526,37 @@ mod tests {
         };
         assert_eq!(status, 0, "reading the socket option must succeed");
         value
+    }
+
+    /// An absolute-form target's authority ends at its first `/` or `?`, and
+    /// the rewrite keeps path and query, drops any fragment, and supplies the
+    /// `/` an empty path needs, so a query-only target stays origin-form.
+    #[test]
+    fn absolute_form_targets_split_and_rewrite_to_origin_form() {
+        let parsed =
+            parse_request(b"GET http://web.min.internal?next=/a HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+        assert!(parsed.absolute_form);
+        assert_eq!(parsed.authority, "web.min.internal");
+
+        let rewrite =
+            |head: &[u8]| String::from_utf8(rewrite_absolute_form(head).into_owned()).unwrap();
+        assert_eq!(
+            rewrite(b"GET http://web.min.internal:8080/p?q=1#frag HTTP/1.1\r\nHost: x\r\n\r\nbody"),
+            "GET /p?q=1 HTTP/1.1\r\nHost: x\r\n\r\nbody"
+        );
+        assert_eq!(
+            rewrite(b"GET http://web.min.internal?next=/a HTTP/1.1\r\n\r\n"),
+            "GET /?next=/a HTTP/1.1\r\n\r\n"
+        );
+        assert_eq!(
+            rewrite(b"GET http://web.min.internal HTTP/1.1\r\n\r\n"),
+            "GET / HTTP/1.1\r\n\r\n"
+        );
+        assert_eq!(
+            rewrite(b"GET /already HTTP/1.1\r\n\r\n"),
+            "GET /already HTTP/1.1\r\n\r\n"
+        );
     }
 
     /// `CONNECT` carries the authority in its request line; a plain method
