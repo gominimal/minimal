@@ -4250,10 +4250,10 @@ mod tests {
         AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb, DROP_WARN_MAX_TRACKED_PAIRS,
         DROP_WARN_MIN_INTERVAL, DropLimiter, EgressGate, GateAdmit, GateDrop, GuestSource,
         GuestSpeak, HANDSHAKE_TIMEOUT, MALFORMED_PUBLISH_RULE, MAX_HEAD, MAX_LIVE_RELAYS,
-        MAX_NAMED_TARGET, PublishedForwards, Record, UNDECLARED_PUBLISH_RECORD_RULE,
+        MAX_NAMED_TARGET, PublishedForwards, Record, ReplyTables, UNDECLARED_PUBLISH_RECORD_RULE,
         UNDECLARED_RETRACT_RULE, UNREGISTERED_PUBLISH_RULE, UNREGISTERED_SOURCE_PHASE,
         UNREGISTERED_SOURCE_RULE, UnregisteredSourcePhase, WarnDecision, accept_loop, dns_pins,
-        gate_verdict, max_frame, render_record, serve_connection, ReplyTables,
+        gate_verdict, max_frame, render_record, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
     use crate::net::baseline::{BaselineCategory, NodeBaselinePhase, NodePlaneBaseline};
@@ -5322,7 +5322,11 @@ mod tests {
             dial,
             "the gate delivers the forwarder's dial toward the box's published port"
         );
-        wait_for_log(&h.log, "recorded the box's first inbound flow at its admitted port").await;
+        wait_for_log(
+            &h.log,
+            "recorded the box's first inbound flow at its admitted port",
+        )
+        .await;
         assert_eq!(
             h.replies.record_count_of(LEASE),
             Some(1),
@@ -5442,7 +5446,11 @@ mod tests {
             noise,
             "the refused dial never reached the box; the frame behind it did"
         );
-        wait_for_log(&h.log, "refused an inbound flow at the box's reply-flow cap").await;
+        wait_for_log(
+            &h.log,
+            "refused an inbound flow at the box's reply-flow cap",
+        )
+        .await;
         assert_eq!(
             h.replies.refused_at_cap_of(LEASE),
             Some(1),
@@ -5613,7 +5621,11 @@ mod tests {
             connect,
             "the gate delivers the client's connect at the published port"
         );
-        wait_for_log(&h.log, "recorded the box's first inbound flow at its admitted port").await;
+        wait_for_log(
+            &h.log,
+            "recorded the box's first inbound flow at its admitted port",
+        )
+        .await;
         assert_eq!(
             h.replies.record_count_of(LEASE),
             Some(1),

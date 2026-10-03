@@ -4827,9 +4827,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// TCP FIN and RST, the flags the reply-flow record's end reads.
+    /// TCP FIN, one of the flags the reply-flow record's end reads (`RST`
+    /// is shared with the ingress-gate proofs above).
     const FIN: u8 = 0x01;
-    const RST: u8 = 0x04;
 
     /// The answer proofs' box: every destination its own egress rules refuse
     /// — `allow_subnets` declared empty, the drop the box's answers must not
@@ -5001,10 +5001,22 @@ pub(crate) mod tests {
         assert_eq!(records(&harness), 1, "a mid-stream segment opened nothing");
 
         // A bare SYN to a port the box did not publish is refused by the
-        // ingress gate before it is ever delivered — and records nothing.
+        // ingress gate before it is ever delivered — answered toward the
+        // client with the kernel's own connection-refused reset (NET-014)
+        // — and records nothing.
         let refused = egress_tcp_segment(client, 51001, LEASE, 9999, SYN);
         deliver_inbound(&mut harness, &refused).await;
         assert_not_delivered(&mut harness).await;
+        // The refusal's own answer, drained here so the switch side holds
+        // nothing but the frames the next steps watch for: a reset from
+        // the box's refused port back to the client, the one frame a
+        // refused connect writes, never a record.
+        let reset =
+            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                .await
+                .expect("the refused connect is answered, not timed out")
+                .expect("the switch side stays open");
+        assert_eq!(reset[47], 0x14, "RST|ACK: the client's refusal");
         assert_eq!(records(&harness), 1, "a refused connect recorded nothing");
 
         // A UDP datagram to the published UDP port opens one; the same
