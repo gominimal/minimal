@@ -1270,6 +1270,8 @@ fn sync_none_drops_project_config_true_when_mfile_up_tree() {
     std::fs::create_dir_all(&subdir).unwrap();
 
     assert!(sync_none_drops_project_config(&subdir));
+    let notice = sync_none_notice(&subdir).expect("a config to drop gets a notice");
+    assert!(notice.contains("minimal.toml is not sent"), "{notice}");
 }
 
 /// With no mfile anywhere up the tree, `--sync none` has nothing to
@@ -1286,6 +1288,7 @@ fn sync_none_drops_project_config_false_when_no_mfile() {
     };
     let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
     assert!(!sync_none_drops_project_config(path));
+    assert_eq!(sync_none_notice(path), None);
 }
 
 /// With no mfile anywhere up the tree, `resolve_upload_root` returns the

@@ -458,7 +458,9 @@ pub(crate) async fn activate_session(
     // Scaffold-offer a missing `minimal.toml` only after loadouts resolve:
     // a bad `--loadout` must error before anything prints, so the user is
     // never told the session is proceeding and then that it is not.
-    if offer_scaffold {
+    // `--sync none` never sends a `minimal.toml`, so offering to create
+    // one there would only write a file the session then ignores.
+    if offer_scaffold && !matches!(args.sync, Some(SyncMode::None)) {
         offer_mfile_scaffold(
             &utf8_path,
             global,
@@ -865,11 +867,8 @@ pub(crate) async fn activate_session(
             // vars, patches, hooks — is silently dropped. Say so when there
             // is a config to lose, so the default-config session is not a
             // surprise.
-            if sync_none_drops_project_config(&utf8_path) {
-                eprintln!(
-                    "--sync none: this project's minimal.toml is not sent; the session uses a \
-                     default configuration (its packages, vars, patches and hooks are not applied)"
-                );
+            if let Some(notice) = sync_none_notice(&utf8_path) {
+                eprintln!("{notice}");
             }
         }
         SyncMode::Tarball if skip_empty_or_home => {
