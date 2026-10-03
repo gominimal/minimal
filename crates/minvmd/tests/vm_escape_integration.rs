@@ -1257,6 +1257,25 @@ struct HostListener {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// The gate's own account of a connection, for a marker that never arrived.
+/// Which lines are present is the discriminator: an `egress-unregistered-source`
+/// line and nothing else means the gate admitted the frames and the loss is
+/// past it, while an ingress-leg line means the relay came off on the switch
+/// side and anything the guest had buffered went with it (#1847).
+fn gate_account(guest: &Guest) -> String {
+    let lines = guest.log_lines(&[
+        "egress-unregistered-source",
+        "egress-unknown-source",
+        "egress gate",
+        "ingress leg",
+        "switch closed its side",
+    ]);
+    if lines.is_empty() {
+        return "nothing; the gate logged no line for this flow".to_string();
+    }
+    lines.join(" | ")
+}
+
 /// Reads one accepted connection, recording what arrives as it arrives. A
 /// read timeout is not an end: the sender may still be completing the
 /// handshake this connection was dialed for, so the read is retried until the
@@ -1586,8 +1605,10 @@ async fn vm_escape_bounded_to_resident_union() {
                 assert!(
                     listener.wait_for(&flow.marker, Duration::from_secs(10)),
                     "the spoofed flow from {src} completed its handshake but its \
-                     marker never reached the host listener; the listener saw: {}",
-                    listener.report()
+                     marker never reached the host listener; the listener saw: \
+                     {}; the gate said: {}",
+                    listener.report(),
+                    gate_account(&guest)
                 );
                 // The gate's own line for the admit: the diagnostics a host
                 // reads the interim's posture out of, naming the source the
