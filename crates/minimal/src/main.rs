@@ -104,6 +104,10 @@ async fn run() -> ExitCode {
             .init();
     }
 
+    // Only `version` writes its output through a fallible writer; a broken
+    // pipe from any other command (e.g. a daemon socket) is a real failure.
+    let quiet_on_closed_pipe = matches!(cli.command, Some(minimal::Command::Version));
+
     if let Err(e) = minimal::run(cli).await {
         // A task's non-zero exit (`min task run`) is a status to relay, not
         // an error to print — the task's own output already streamed through
@@ -113,7 +117,7 @@ async fn run() -> ExitCode {
         }
         // A reader that went away (`min version | head -1`) is not an error
         // worth reporting: exit quietly with the shell's SIGPIPE convention.
-        if is_broken_pipe(&e) {
+        if quiet_on_closed_pipe && is_broken_pipe(&e) {
             return ExitCode::from(141);
         }
         eprintln!("error: {e:#}");
