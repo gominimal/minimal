@@ -122,6 +122,37 @@ pub(crate) async fn append(state_dir: &Path, record: &DecisionRecord) {
         );
         return;
     }
+    // `symlink_metadata`, not `metadata`: the state volume is guest-writable
+    // on a VM host, so the directory itself is attacker-controlled — the same
+    // reason `crate::diag`'s audit collector refuses a symlinked file, and
+    // the write must hold the line the read already does. `create_dir_all`
+    // above follows links, so a planted `audit/` symlink to a directory
+    // passes it; unchecked, every append below would land through the link,
+    // in a target of someone else's choosing.
+    if let Some(parent) = path.parent() {
+        let refused = match tokio::fs::symlink_metadata(parent).await {
+            Ok(md) if md.is_dir() => None,
+            Ok(md) => Some(
+                if md.file_type().is_symlink() {
+                    "the audit directory is a symlink, not a real directory"
+                } else {
+                    "the audit directory is not a real directory"
+                }
+                .to_string(),
+            ),
+            Err(e) => Some(e.to_string()),
+        };
+        if let Some(reason) = refused {
+            tracing::warn!(
+                box = %record.box_name,
+                port = record.port,
+                error = %reason,
+                "the dynamic ingress decision could not be audited: the audit \
+                 directory could not be made"
+            );
+            return;
+        }
+    }
     // Serialization of a plain derived struct cannot fail; the guard is for
     // the day the record grows a type that can.
     let Ok(mut line) = serde_json_lenient::to_string(record) else {
@@ -134,12 +165,16 @@ pub(crate) async fn append(state_dir: &Path, record: &DecisionRecord) {
         return;
     };
     line.push('\n');
-    let mut file = match tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await
-    {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create(true).append(true);
+    // `O_NOFOLLOW`: the file the log's own path names must be the log, not a
+    // symlink planted in its place — the state volume is guest-writable, and
+    // an append through a link writes somewhere else with this daemon's
+    // privileges. Opened exactly the way `diagnostics::bundle::
+    // open_regular_nofollow` opens this same file for reading.
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = match options.open(&path).await {
         Ok(file) => file,
         Err(e) => {
             tracing::warn!(
@@ -236,5 +271,85 @@ mod tests {
             refused["reason"], "dynamic ingress is denied for this box",
             "the refusal carries the typed error the caller read: {refused}"
         );
+    }
+
+    /// The write side of the symlink guard the read side already had (the
+    /// review thread on `append`): the state volume is guest-writable on a
+    /// VM host, so a planted link — `decisions.log` itself, or the whole
+    /// `audit/` directory — must not steer the daemon's appends into a
+    /// target of someone else's choosing. Each case is refused, the warn
+    /// line says the loss, and the target the link named is untouched.
+    #[tokio::test]
+    async fn audit_append_refuses_a_symlinked_log() {
+        let capture = crate::test_harness::captured_log();
+        let record = DecisionRecord {
+            ts: chrono::Utc::now().to_rfc3339(),
+            box_name: "web".to_string(),
+            port: 3000,
+            decision: sessions::DynamicIngress::Ask,
+            decided_by: DecidedBy::BoxPolicy,
+            outcome: DecisionOutcome::Refused,
+            reason: None,
+        };
+
+        // The file itself: `audit/decisions.log` is a symlink to a file
+        // elsewhere that carries content of its own.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let state_dir = dir.path();
+            std::fs::create_dir_all(state_dir.join("audit")).unwrap();
+            let planted = dir.path().join("planted.log");
+            std::fs::write(&planted, "planted\n").unwrap();
+            std::os::unix::fs::symlink(&planted, log_path(state_dir)).unwrap();
+
+            append(state_dir, &record).await;
+
+            assert_eq!(
+                std::fs::read_to_string(&planted).unwrap(),
+                "planted\n",
+                "a symlinked log must leave its target untouched"
+            );
+            assert!(
+                std::fs::symlink_metadata(log_path(state_dir))
+                    .expect("the log path still stands")
+                    .file_type()
+                    .is_symlink(),
+                "the refused append must not replace the symlink with a log"
+            );
+            let log = capture.contents();
+            assert!(
+                log.contains("the dynamic ingress decision could not be audited"),
+                "the symlinked file is a warned-about loss, not a silent one: {log}"
+            );
+        }
+
+        // The directory: `audit/` itself is a symlink to a directory
+        // elsewhere, which `create_dir_all` follows and so cannot catch.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let state_dir = dir.path();
+            let planted_dir = dir.path().join("planted");
+            std::fs::create_dir_all(&planted_dir).unwrap();
+            std::os::unix::fs::symlink(&planted_dir, state_dir.join("audit")).unwrap();
+
+            append(state_dir, &record).await;
+
+            assert!(
+                !planted_dir.join("decisions.log").exists(),
+                "a symlinked audit directory must leave its target untouched"
+            );
+            let log = capture.contents();
+            assert!(
+                log.contains("the audit directory is a symlink, not a real directory"),
+                "the symlinked directory names its reason: {log}"
+            );
+            assert!(
+                log.contains(
+                    "the dynamic ingress decision could not be audited: the audit \
+                     directory could not be made"
+                ),
+                "the symlinked directory is a warned-about loss: {log}"
+            );
+        }
     }
 }
