@@ -23,6 +23,14 @@ pub enum Redaction {
     /// A streamed source exceeded its cap; only the leading portion was
     /// captured and the rest was discarded mid-stream.
     Truncated,
+    /// Free-text credential scrubbing was applied; the content may differ
+    /// from the original.
+    Scrubbed,
+    /// Only the trailing portion of a large file was captured, and
+    /// free-text credential scrubbing changed it: both [`Self::TailCapped`]
+    /// and [`Self::Scrubbed`] hold, so a reader still sees the file is
+    /// partial.
+    TailCappedScrubbed,
 }
 
 /// Top-level manifest, serialized as the bundle's `manifest.json`.
