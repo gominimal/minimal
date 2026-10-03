@@ -1406,8 +1406,8 @@ mod tests {
                         ..Default::default()
                     };
                     let decision = dynamic_ingress_decision(Some(&ingress), port);
-                    let listen =
-                        IngressRules::from_policy(Some(&ingress)).listen_verdict(IpProto::Tcp, port);
+                    let listen = IngressRules::from_policy(Some(&ingress))
+                        .listen_verdict(IpProto::Tcp, port);
                     // The agreement the shared derivation buys: the watcher
                     // publishes exactly the ports the expose decision allows.
                     let allowed = decision == Ok(DynamicIngress::Allow);
@@ -1423,9 +1423,7 @@ mod tests {
                     // And the refusal names its own fact, stance before
                     // range, in the words `min net expose` prints.
                     let expected_decision = match stance {
-                        None | Some(DynamicIngress::Deny) => {
-                            Err(ExposeRefusal::DeniedByPolicy)
-                        }
+                        None | Some(DynamicIngress::Deny) => Err(ExposeRefusal::DeniedByPolicy),
                         Some(DynamicIngress::Ask) => Err(ExposeRefusal::AskNeedsAnswer),
                         Some(DynamicIngress::Allow) => match range {
                             None => Err(ExposeRefusal::NoDynamicRange),

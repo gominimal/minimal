@@ -326,18 +326,49 @@ impl ListenWatcher {
     /// this returns, no port the box's processes published by listening is
     /// published any more. The declared forwards are not this call's:
     /// they come down with the attachment's own teardown (NET-121).
-    pub async fn stop(self) {
+    pub async fn stop(mut self) {
         #[expect(
             clippy::let_underscore_must_use,
             reason = "the loop may already have ended; the join below is what reports that"
         )]
         let _ = self.stop.send(true);
-        if let Err(join) = self.task.await {
+        // The task is awaited by reference, not moved out of `self` — the
+        // [`Drop`] below ends the watcher a host that never reaches this
+        // stop leaves, and the drop at this stop's end finds a loop that
+        // has already finished.
+        if let Err(join) = (&mut self.task).await {
             tracing::warn!(
                 error = %join,
                 "the listen-publication watcher ended without withdrawing everything"
             );
         }
+    }
+}
+
+impl Drop for ListenWatcher {
+    /// The ending a host that never reached its mainloop's stop gives its
+    /// watcher: dropped, not stopped — a host build abandoned, a future
+    /// cancelled mid-flight. The drop is the loop's stop signal, so the poll
+    /// ends and the loop runs the same withdrawal every stop runs: the gate
+    /// refusing each port first, the forward coming down after, everything
+    /// it published — no forward a box's processes published by listening
+    /// outlives the watcher, whichever way the watcher ended.
+    ///
+    /// The signal is all the guard sends; the task is not aborted, on
+    /// purpose. The withdrawal is the loop's own last act, and the loop is
+    /// the only owner of the forwards map — an abort would kill it
+    /// mid-withdrawal and leave every forward still standing on the switch
+    /// for the switch's lifetime, the outcome the stop exists to prevent.
+    /// Dropping the task's handle detaches it, so it finishes its epilogue
+    /// the way `Host::mainloop`'s own kill does (the session's
+    /// detach-over-abort choice, held here for the same reason).
+    fn drop(&mut self) {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the loop may already have ended, and nothing here awaits its \
+                      join to report that — the drop's caller is gone"
+        )]
+        let _ = self.stop.send(true);
     }
 }
 
@@ -1836,8 +1867,11 @@ mod tests {
         assert_eq!(first_attempt.path, "/services/forwarder/expose");
         assert_eq!(first_attempt.local, format!("{PUBLISHED}:{port}"));
         soon(|| {
-            !lines_saying(&lines.contents(), "publishing a listening port on the switch failed")
-                .is_empty()
+            !lines_saying(
+                &lines.contents(),
+                "publishing a listening port on the switch failed",
+            )
+            .is_empty()
         })
         .await;
 
@@ -1847,8 +1881,11 @@ mod tests {
         drop(listener);
         tokio::time::sleep(Duration::from_millis(700)).await;
         assert_eq!(
-            lines_saying(&lines.contents(), "publishing a listening port on the switch failed")
-                .len(),
+            lines_saying(
+                &lines.contents(),
+                "publishing a listening port on the switch failed"
+            )
+            .len(),
             1,
             "the closed listener's streak said its one failure and no more"
         );
@@ -1871,8 +1908,11 @@ mod tests {
             "the new server's publish is asked for like any fresh appearance"
         );
         soon(|| {
-            lines_saying(&lines.contents(), "publishing a listening port on the switch failed")
-                .len()
+            lines_saying(
+                &lines.contents(),
+                "publishing a listening port on the switch failed",
+            )
+            .len()
                 == 2
         })
         .await;
@@ -2093,6 +2133,52 @@ mod tests {
             1,
             "the refusal is said once across the passes, got: {log}"
         );
+        server.abort();
+    }
+
+    /// The watcher a host never stopped — dropped or abandoned before its
+    /// mainloop reached the stop — ends itself: no poll outlives the
+    /// watcher, and everything it published comes down the way a stop takes
+    /// it down, so no runtime-published forward outlives the watcher
+    /// whichever way its host ended.
+    #[tokio::test]
+    async fn dropping_a_watcher_stops_its_poll() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let (watcher, gate, server, mut served) = started_watcher(&dir, &permit_policy(port));
+
+        let published = next_served(&mut served).await;
+        assert_eq!(published.path, "/services/forwarder/expose");
+        assert_eq!(published.local, format!("{PUBLISHED}:{port}"));
+        soon(|| gate.admits_tcp(port)).await;
+
+        // Dropped, not stopped: the ending a host build abandoned mid-flight
+        // gives its watcher.
+        drop(watcher);
+
+        // The drop ends the poll, and the loop runs the stop's own last act:
+        // the gate refuses the port first, the forward comes down after.
+        soon(|| !gate.admits_tcp(port)).await;
+        let withdrawn = next_served(&mut served).await;
+        assert_eq!(withdrawn.path, "/services/forwarder/unexpose");
+        assert_eq!(withdrawn.local, format!("{PUBLISHED}:{port}"));
+
+        // And the loop is gone, not merely quiet: the box's server restarts
+        // on the same port — the appearance a still-polling watcher would
+        // publish again — and several poll intervals later nothing has been
+        // asked for it.
+        drop(listener);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let again = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
+            .expect("the box's server restarts on its own port");
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let records = drained(&mut served);
+        assert!(
+            records.is_empty(),
+            "a dropped watcher never polls again: {records:?}"
+        );
+        drop(again);
         server.abort();
     }
 
