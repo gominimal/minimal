@@ -2876,11 +2876,22 @@ fn write_resolv_conf(rootfs: &Path, resolver: &network::Resolver) -> Result<(), 
 ///
 /// The rewrite is atomic: the body is written to a temp file in the same
 /// directory and renamed over the target, so a concurrent writer or reader
-/// never sees a truncated or missing file.
+/// never sees a truncated or missing file. Writers within this process are
+/// serialized across the whole read-merge-rename, and each call stages under
+/// its own temp name, so concurrent calls neither collide on the temp nor
+/// drop an entry another call merged in.
 fn write_hosts(rootfs: &Path, hosts: &[network::HostEntry]) -> Result<(), Error> {
+    static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     if hosts.is_empty() {
         return Ok(());
     }
+    // A poisoned lock only means another writer panicked mid-call; the file
+    // on disk is still whole (the rename is atomic), so carry on.
+    let _guard = WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let etc_hosts = rootfs.join("etc").join("hosts");
     fs::create_dir_all(rootfs.join("etc"))
         .map_err(|e| Error::IO("creating /etc", rootfs.join("etc"), e))?;
@@ -2899,10 +2910,18 @@ fn write_hosts(rootfs: &Path, hosts: &[network::HostEntry]) -> Result<(), Error>
         }
         body.push_str(&format!("{}\t{}\n", entry.address, entry.name));
     }
-    let temp = etc_hosts.with_file_name(format!("hosts.tmp{}", std::process::id()));
-    fs::write(&temp, &body).map_err(|e| Error::IO("writing /etc/hosts temp", temp.clone(), e))?;
-    fs::rename(&temp, &etc_hosts)
-        .map_err(|e| Error::IO("renaming /etc/hosts into place", etc_hosts, e))
+    let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = etc_hosts.with_file_name(format!("hosts.tmp{}.{seq}", std::process::id()));
+    let written = fs::write(&temp, &body)
+        .map_err(|e| Error::IO("writing /etc/hosts temp", temp.clone(), e))
+        .and_then(|()| {
+            fs::rename(&temp, &etc_hosts)
+                .map_err(|e| Error::IO("renaming /etc/hosts into place", etc_hosts, e))
+        });
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    written
 }
 
 /// Whether `body` already answers `entry` — a line whose whitespace-separated
@@ -3234,6 +3253,48 @@ mod tests {
             "127.0.0.1\tlocalhost\n",
             "the package cache file must be untouched"
         );
+    }
+
+    /// Concurrent `write_hosts` calls over one rootfs keep the shipped lines
+    /// and every call's entry, and none fails on a shared temp file.
+    #[test]
+    fn write_hosts_concurrent_writers_lose_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path().to_path_buf();
+        let etc_hosts = rootfs.join("etc").join("hosts");
+        fs::create_dir_all(rootfs.join("etc")).unwrap();
+        fs::write(&etc_hosts, "127.0.0.1\tlocalhost\n").unwrap();
+
+        let writers: Vec<_> = (0..16u8)
+            .map(|i| {
+                let rootfs = rootfs.clone();
+                std::thread::spawn(move || {
+                    let entry = network::HostEntry {
+                        name: format!("box{i}.min.internal"),
+                        address: std::net::Ipv4Addr::new(10, 0, 0, i),
+                    };
+                    write_hosts(&rootfs, &[entry])
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap().expect("no writer fails");
+        }
+
+        let body = fs::read_to_string(&etc_hosts).unwrap();
+        assert!(body.starts_with("127.0.0.1\tlocalhost\n"), "{body}");
+        for i in 0..16u8 {
+            assert!(
+                body.contains(&format!("10.0.0.{i}\tbox{i}.min.internal\n")),
+                "entry {i} missing: {body}"
+            );
+        }
+        let leftovers: Vec<_> = fs::read_dir(rootfs.join("etc"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "hosts")
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
     }
 
     /// 017-011. A host that cannot make the namespace the plan needs fails the
