@@ -564,6 +564,10 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minimald unenforcing_native_host_runs_host_ip_box_unenforced
     <!-- design §7.4; state-driven; the explicit exception to this requirement's deny and to NET-080's node-plane record: on that host there is no classifier, so there is no verdict to fail closed on, and the architecture's ruling on the native install step rejected turning the missing step into a hard failure for a mode whose chooser accepted the reduced tier; whether such a box may run there is policy's call on the recorded attribute, not the box host's; the box's declaration is enforced the moment the host can decide per box -->
+  - WHILE the box host decides per box, WHEN a host-address box is created with an `egress` declaration the box host's classifier cannot enforce THE SYSTEM SHALL refuse the creation with an error naming each unenforced rule.
+    tier:   T0
+    verify: cargo nextest run -p minimald per_box_host_refuses_unenforceable_host_ip_declaration
+    <!-- design §4.1 and §7.4; state+event; interim, retired when the classifier enforces a host-address box's declared address rules on its cgroup; the classifier decides addresses, never names, and enforces only the deny-all verdict, so any `deny_subnets` entry and any allow list short of every allow list present and empty is a rule it cannot enforce; reporting per-box enforcement over an unenforced declaration is a false claim, and the refusal replaces it with an honest one while own-address boxes stay the restricted mode; distinct from the sub-requirement above, which governs a host that cannot decide per box, where the box runs unenforced and is never refused on that ground: this one governs a host that decides per box but not for this declaration's shape -->
 
 - **NET-080** WHILE a host-address box is declared deny-all THE SYSTEM SHALL complete the daemon's own package fetch on the same host and record it as node-plane traffic.
   tier:     T0
@@ -738,6 +742,19 @@ included, with every refusal logged (NET-001 to NET-004).
   tier:     T0
   verify:   cargo nextest run -p sessions egress_on_host_ip_box_accepted
   <!-- S9b/AC2; ubiquitous; supersedes the shipped 03-spec R2.1 rule that `egress` on a HostNet PTask is a parse-time error, which the daemon's session RPC still enforces; NET-079 and NET-080 presuppose this; NET-065 keeps the `none` rejection -->
+
+- **NET-140** WHEN a box is activated with `--deny-all-egress` THE SYSTEM SHALL declare every allow list in its `egress` section present and empty.
+  tier:     T0
+  verify:   cargo nextest run -p minimal deny_all_egress_flag_declares_every_allow_list_empty
+  <!-- S9b/AC2; event-driven; one argument group defines the flag for every command that takes the egress flags, with one meaning, and it conflicts with every `--allow-*` and `--deny-*` flag; an empty value for any of those flags stays a validation error and never becomes an empty list; in the box spec form deny-all is every allow list present and empty and an absent list stays unset, so the spec loader keeps the two apart; an unset section on a host-address box admits everything because no requirement narrows it (NET-120), which makes this flag the CLI's one deny-all declaration for that mode; mixed forms such as no addresses but some names are not offered, since the classifier decides addresses, never names -->
+  - WHILE a box's `egress` section is declared deny-all THE SYSTEM SHALL show `deny-all` in `min session policy`.
+    tier:   T0
+    verify: cargo nextest run -p minimal policy_shows_declared_deny_all
+    <!-- state-driven; the display NET-075 requires for the own-address default, here for a declaration; on a host-address box it sits beside the box's per-box enforcement value -->
+  - WHILE a box has no `egress` section THE SYSTEM SHALL show its effective default by name in `min session policy`, marked as a default and not as a declaration.
+    tier:   T0
+    verify: cargo nextest run -p minimal policy_shows_unset_egress_as_named_default
+    <!-- state-driven; the effective default is `deny-all` for an own-address box under the deny-all default (NET-075) and `allow-all` for a host-address box or under the opt-out (NET-077); the policy view never shows an unset section as nothing, since a declared deny-all and an unset section admit opposite things -->
 
 - **NET-121** WHEN a box is published THE SYSTEM SHALL bind a forwarder for each ingress port its declaration names before its name is registered, and hold that forwarder until the box stops.
   tier:     T0
