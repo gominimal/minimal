@@ -26,11 +26,19 @@
 //! registry is [`crate::control`] — the host daemon's control socket, over
 //! which the activating client registers a box and reads the addresses the
 //! allocation hands back.
+//!
+//! This registry is also the proxy's attachment source (NET-133): when the
+//! host hands it the attachment table
+//! ([`BoxRegistry::feeding_proxy_attachments`]), every box row it publishes
+//! is an attachment issued ahead of the row and every retirement takes the
+//! attachment with it — the same host-side facts, the same trust boundary,
+//! the one writer.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 use sessions::EgressPolicy;
 use sessions::core::egress::EgressRules;
@@ -405,6 +413,12 @@ pub struct BoxRegistry {
     /// (the node's own row among them), it just cannot allocate for a
     /// client box.
     loopback_slice: Option<switch::LoopbackSlice>,
+    /// The proxy's attachment table this registry feeds (NET-133), when the
+    /// host handed one over: every box row published here is an attachment
+    /// first and every row retired here retires its attachment with it.
+    /// `None` for a registry that feeds no proxy — a table-less registry
+    /// still publishes rows, it just gives no attachments.
+    attachments: Option<crate::bep_attach::Attachments>,
 }
 
 /// A clone shares the live rows, the allocation cursors, and the withdrawal
@@ -424,6 +438,7 @@ impl Clone for BoxRegistry {
             next_switch_addr: Arc::clone(&self.next_switch_addr),
             next_loopback_addr: Arc::clone(&self.next_loopback_addr),
             loopback_slice: self.loopback_slice,
+            attachments: self.attachments.clone(),
         }
     }
 }
@@ -449,7 +464,28 @@ impl BoxRegistry {
                 loopback_slice.map_or(0, |slice| u32::from(slice.first())),
             )),
             loopback_slice,
+            attachments: None,
         }
+    }
+
+    /// Hands this registry the proxy's attachment table to feed
+    /// (NET-133): from here on every box row it publishes is an attachment
+    /// issued ahead of the row — the proxy holds the box before its first
+    /// connection could arrive — and every row it retires takes the
+    /// attachment with it, ahead of the row's own removal. Returns `self`,
+    /// for the supervisor's call chain.
+    ///
+    /// The table is the host's own; feeding it is the registry's one write
+    /// path, so the attachments stay sourced from the host-side creator
+    /// alone: nothing the guest says reaches either table (NET-138's
+    /// boundary, which NET-133 borrows for the proxy).
+    #[must_use]
+    pub fn feeding_proxy_attachments(
+        mut self,
+        attachments: crate::bep_attach::Attachments,
+    ) -> Self {
+        self.attachments = Some(attachments);
+        self
     }
 
     /// The subnet this registry's rows are addressed on.
@@ -512,6 +548,22 @@ impl BoxRegistry {
             admitted_ports: registration.admitted_ports,
             declared_names: registration.declared_names,
         });
+        // NET-133: the box's proxy attachment is issued from the row's own
+        // host facts — the name, both addresses, the id minted from them —
+        // and issued **before** the row is visible, so the proxy holds the
+        // box ahead of its first connection: the box-egress pool's
+        // listeners are partitioned by rows, a delivered connection can only
+        // exist once the row made the box a share, and the share comes a
+        // pool turn after the row. The guest node's own namespace is not a
+        // box: its row buys no share in the pool (the same one address
+        // `RegisteredBoxes` excludes) and no attachment either — the plan
+        // keeps that address outside the run every client box is handed
+        // from, so excluding it names exactly the node row.
+        if let Some(attachments) = &self.attachments
+            && record.switch_addr != self.subnet.daemon_ip()
+        {
+            attachments.issue(record.name(), record.switch_addr, record.loopback_addr);
+        }
         self.rows
             .write()
             .expect("the row lock is never held across a panic, so it cannot be poisoned")
@@ -542,6 +594,10 @@ impl BoxRegistry {
     /// default binds. The row is gone either way, and a re-registration starts
     /// from the newest declaration.
     pub fn withdraw(&self, switch_addr: Ipv4Addr) -> Option<Arc<BoxRecord>> {
+        // The box's end is observed here — the drainer's arrival of the
+        // relay's report — so the withdrawal's own line measures itself
+        // against this instant (NET-133's bound).
+        self.retire_proxy_attachment(switch_addr, Instant::now());
         let removed = self
             .rows
             .write()
@@ -549,6 +605,24 @@ impl BoxRegistry {
             .remove(&switch_addr.octets());
         self.retired(&removed);
         removed
+    }
+
+    /// Retires the proxy attachment issued for `switch_addr`, when this
+    /// registry feeds a table and one is held: the host-side half of the
+    /// requirement's "the attachment is the box's row, withdrawn with it"
+    /// (NET-133). Retired **before** the row it goes with, so a delivery
+    /// racing the box's end finds no attachment and is refused rather than
+    /// attributed to a namespace the table no longer holds.
+    ///
+    /// `box_ended` is the instant this process observed the box's end —
+    /// the drainer's arrival of the relay's report, or the creator's
+    /// withdrawal request reaching the control socket — and the one line
+    /// the withdrawal logs measures itself against, so a tail can see a
+    /// withdrawal that did not keep the requirement's bound.
+    fn retire_proxy_attachment(&self, switch_addr: Ipv4Addr, box_ended: Instant) {
+        if let Some(attachments) = &self.attachments {
+            attachments.withdraw(switch_addr, box_ended);
+        }
     }
 
     /// Registers a client box: allocates its switch address from the plan's
@@ -623,7 +697,8 @@ impl BoxRegistry {
     /// [`WithdrawError`]. The withdrawn addresses are not returned to the
     /// allocation cursors — spent for good, as [`Self::register_client_box`]
     /// documents — and what their frames do next is the gate phase's to say
-    /// ([`Self::withdraw`]).
+    /// ([`Self::withdraw`]). The box's proxy attachment goes with the row
+    /// (NET-133), retired under the same row lock that removes it.
     ///
     /// This is the host-side half of the withdrawal a destroyed or failed
     /// activation sends over the control socket
@@ -662,6 +737,14 @@ impl BoxRegistry {
                 asked_loopback: loopback_addr,
             });
         }
+        // The attachment goes with the row (NET-133), retired inside the
+        // same critical section that removes the row: a registration
+        // landing after cannot retire the new box's attachment, and one
+        // landing before is the row the proof above matched. This is the
+        // one path that holds a row lock across the attachment table's —
+        // every other path takes the two locks one at a time, never
+        // together — so the order never inverts.
+        self.retire_proxy_attachment(switch_addr, Instant::now());
         let removed = rows.remove(&switch_addr.octets());
         drop(rows);
         self.retired(&removed);
@@ -1090,12 +1173,15 @@ impl BoxTable {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use sessions::IpProto;
     use sessions::core::egress::FrameVerdict;
     use switch::SwitchSubnet;
+    use tokio::io::AsyncWriteExt;
 
     use crate::net::egress_gate::test_support::{
-        arp_frame, expect_frame, expect_silence, gate_over, ipv4_frame, send_frame,
+        DEADLINE, arp_frame, expect_frame, expect_silence, gate_over, ipv4_frame, send_frame,
     };
 
     use super::*;
@@ -1591,6 +1677,172 @@ mod tests {
             sessions::core::zone_answer::decide(&a, &registry.zone_view()),
             sessions::core::zone_answer::Verdict::Nxdomain,
             "a withdrawn namespace's name is held by nothing"
+        );
+    }
+
+    /// NET-133's trust boundary, on the proxy's attachments: the guest never
+    /// sources one. The registry is the attachment table's one writer, and
+    /// what that means behaviourally is that no amount of guest traffic
+    /// changes what the proxy holds: frames driven through a live gate,
+    /// hostile ones included, leave the attachments exactly as the
+    /// registrations issued them — the same traffic, frame for frame, that
+    /// `host_table_never_sourced_from_guest` proves leaves the rows alone.
+    #[tokio::test]
+    async fn proxy_attachment_never_sourced_from_guest() {
+        // One published box, declared as a real one is, and the guest node
+        // beside it — the shape run.rs boots with — over a registry that
+        // feeds the proxy's table.
+        let attachments = crate::bep_attach::Attachments::new();
+        let registry = BoxRegistry::new(SUBNET).feeding_proxy_attachments(attachments.clone());
+        let lease = [100, 64, 0, 9];
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(lease), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![IpProto::Tcp]),
+                    allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                    allow_dns_hosts: None,
+                    deny_subnets: None,
+                }),
+        );
+        registry.register_node_namespace(7654);
+        let mut harness = gate_over(registry).await;
+
+        // The host's own issuances, before any guest byte is written: the
+        // published box's attachment, and no attachment for the node
+        // namespace, which is not a box.
+        let before = attachments.rows();
+        assert_eq!(
+            before.len(),
+            1,
+            "the registry issued one attachment: the published box's, not the \
+             node namespace's"
+        );
+        assert!(
+            attachments.by_source(SUBNET.daemon_ip().octets()).is_none(),
+            "the guest node's namespace is not a box: its row buys no attachment"
+        );
+
+        // Guest-side traffic, hostile included — the same set the row
+        // table's own test drives: a frame the published box did not
+        // declare, a frame from an address no namespace holds but the plan
+        // could lease, a frame carrying the node namespace's own address,
+        // an ARP announcing a foreign address, and the marker after them
+        // that proves the whole lot was decided before the comparison.
+        let undeclared = ipv4_frame(lease, 6, [203, 0, 113, 7], 443);
+        let unknown = ipv4_frame([100, 64, 0, 99], 6, [10, 1, 2, 3], 80);
+        let node_frame = ipv4_frame(SUBNET.daemon_ip().octets(), 6, [10, 1, 2, 3], 80);
+        let foreign_arp = arp_frame([203, 0, 113, 7]);
+        let marker = ipv4_frame(lease, 6, [10, 1, 2, 3], 80);
+        for frame in [&undeclared, &unknown, &node_frame, &foreign_arp] {
+            send_frame(&mut harness.guest, frame).await;
+        }
+        send_frame(&mut harness.guest, &marker).await;
+        // What the gate admitted, in order — the made-up lease by the
+        // announced interim, the node namespace's frame by its own row,
+        // and the published box's marker: everything was decided.
+        assert_eq!(
+            expect_frame(&mut harness.switch).await,
+            unknown,
+            "the announced interim admits an in-plan lease no row holds"
+        );
+        assert_eq!(
+            expect_frame(&mut harness.switch).await,
+            node_frame,
+            "the node namespace's frame is decided by its own row"
+        );
+        assert_eq!(
+            expect_frame(&mut harness.switch).await,
+            marker,
+            "the marker arrives: everything before it was decided"
+        );
+        expect_silence(&mut harness.switch).await;
+
+        // The attachments are exactly what the host issued: no guest frame
+        // issued, replaced, or withdrew one.
+        let after = attachments.rows();
+        assert_eq!(
+            before, after,
+            "no guest frame reached the attachment table: it is written by \
+             the registry alone, and never sourced from the guest"
+        );
+        assert!(
+            attachments.by_source(lease).is_some(),
+            "the published box's attachment survived the guest's traffic"
+        );
+        assert!(
+            attachments.by_source([100, 64, 0, 99]).is_none(),
+            "the guest's made-up address bought no attachment — the interim \
+             that admitted its frame attached nothing either"
+        );
+    }
+
+    /// NET-133: an ended box's attachment is withdrawn within the
+    /// requirement's bound of its end. The event the withdrawal keys to is
+    /// the same one the row's own withdrawal keys to (NET-138, the row
+    /// test above): the box's own shuttle connection — the one its frames
+    /// travel by — ending, reported by the relay and applied by the
+    /// registry's drainer, so the attachment goes with the row. From the
+    /// moment the drainer applies the report the proxy attributes nothing
+    /// to the box, even though the box's revocation was never recorded
+    /// anywhere: the attachment that would have named it is gone. Here that
+    /// is immediate — the report rides the same close that ended the
+    /// traffic, and the poll bounds it at the harness's deadline, nowhere
+    /// near the requirement's own.
+    #[tokio::test]
+    async fn proxy_attachment_withdrawn_within_60s_of_box_end() {
+        let attachments = crate::bep_attach::Attachments::new();
+        let registry = BoxRegistry::new(SUBNET).feeding_proxy_attachments(attachments.clone());
+        let lease = [100, 64, 0, 9];
+        registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::from(lease),
+            Ipv4Addr::LOCALHOST,
+        ));
+        registry.spawn_withdrawal_drainer();
+        let mut harness = gate_over(registry).await;
+
+        // The box's attachment is held before its traffic: issued by the
+        // registration, ahead of the row.
+        let attachment = attachments
+            .by_source(lease)
+            .expect("the registration issued the box's attachment");
+        assert_eq!(attachment.switch_addr(), Ipv4Addr::from(lease));
+        assert_ne!(
+            attachment.box_id(),
+            crate::bep_attach::NO_BOX_ID,
+            "the attachment names the box, not the no-claim value"
+        );
+
+        // The box's frame, admitted by its row: the traffic the
+        // connection will attribute.
+        let frame = ipv4_frame(lease, 6, [10, 1, 2, 3], 80);
+        send_frame(&mut harness.guest, &frame).await;
+        assert_eq!(
+            expect_frame(&mut harness.switch).await,
+            frame,
+            "the box's declared frame reaches the switch"
+        );
+
+        // The box's connection ends: the guest closes its side.
+        harness
+            .guest
+            .shutdown()
+            .await
+            .expect("closing the guest's side");
+
+        // The attachment goes with it, and the row goes with the
+        // attachment: withdrawn together, the attachment first.
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        while attachments.by_source(lease).is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the attachment outlived its shuttle connection past {DEADLINE:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            harness.table.by_source(lease).is_none(),
+            "the row went with the attachment: the two are withdrawn together"
         );
     }
 }
