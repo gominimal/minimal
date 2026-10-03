@@ -2252,23 +2252,43 @@ impl Session {
             )));
         }
 
-        // The publish rides the address pair a VM host's registration handed
-        // the box (T66): the loopback address its declaration publishes on,
-        // and the switch address its forwards deliver to. A box nobody handed
-        // a pair — a native host's self-allocated box, whose lease the
-        // registry holds but keeps private — has nowhere to publish, and the
-        // daemon has no default of its own to stand in with (NET-010), so
-        // the request is refused rather than bound at an address nobody
-        // chose for this box.
-        let Some(addresses) = record.box_addresses else {
-            return Err(ExposeFailure::Refused(ExposeRefusal::NoPublishedAddress));
+        // The publish rides the address pair the box's declared ports bind
+        // with: the loopback address its declaration publishes on, and the
+        // switch address its forwards deliver to. A VM host's registration
+        // handed the box that pair (T66). A native host's self-allocated box
+        // was handed none, so it rides what the hostname registry holds for
+        // its session instead (design §7.1): the address the box published
+        // at — where its declared ports bind and its name answers — and the
+        // lease its running PTask reported, which those same forwards
+        // deliver to. A box with neither — nothing published, or no PTask
+        // attached to deliver to — has nowhere to publish, and the daemon
+        // has no default of its own to stand in with (NET-010), so the
+        // request is refused rather than bound at an address nobody chose
+        // for this box.
+        let (loopback_address, switch_address) = match record.box_addresses {
+            Some(addresses) => (addresses.loopback_address, addresses.switch_address),
+            None => {
+                let registry = self
+                    .hostnames
+                    .read()
+                    .expect("hostname registry lock poisoned");
+                match (
+                    registry.published_own_address(record.id),
+                    registry.own_lease(record.id),
+                ) {
+                    (Some(published), Some(lease)) => (published, lease),
+                    _ => {
+                        return Err(ExposeFailure::Refused(ExposeRefusal::NoPublishedAddress));
+                    }
+                }
+            }
         };
 
         let control = self.switch_control().await;
         let forwarder = match expose_dynamic(
             &control,
-            addresses.loopback_address,
-            addresses.switch_address,
+            loopback_address,
+            switch_address,
             port,
             sessions::IpProto::Tcp,
             None,
