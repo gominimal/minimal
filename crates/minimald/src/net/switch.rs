@@ -1642,6 +1642,9 @@ impl SessionGate {
             // withdraw and no connection of this publication to end.
             return 0;
         }
+        // The publication's reply-flow records go with it: a reply on a
+        // withdrawn port is new traffic the box's own rules decide.
+        self.flows.end_tcp_port(port);
         self.terminate_port(port)
     }
 
@@ -1864,6 +1867,15 @@ impl ReplyFlowGate {
             .lock()
             .expect("the reply-flow lock is held only across one decision")
             .clear();
+    }
+
+    /// Ends the recorded TCP flows of one withdrawn port
+    /// ([`SessionGate::withdraw_published`]).
+    fn end_tcp_port(&self, port: u16) {
+        self.flows
+            .lock()
+            .expect("the reply-flow lock is held only across one decision")
+            .end_port(IPPROTO_TCP, port);
     }
 
     /// The per-box cap, read from the table so a harness-shrunk cap is the
@@ -3163,8 +3175,22 @@ pub(crate) mod tests {
 
         // The listener closes: the admission goes with it, the declared
         // port's stays.
+        let reply = egress_tcp_segment(Ipv4Addr::new(100, 64, 0, 9), 9999, SRC, 40000, SYN | ACK);
+        assert!(
+            gate.reply_admits_frame(&reply),
+            "the box's answer on the recorded flow passes"
+        );
         assert_eq!(gate.withdraw_published(9999), 0, "no connection was held");
         assert!(!gate.admits_tcp(9999));
+        assert_eq!(
+            gate.inbound_flow_records(),
+            0,
+            "the withdrawal ends the port's reply-flow records"
+        );
+        assert!(
+            !gate.reply_admits_frame(&reply),
+            "a reply on a withdrawn port is no longer admitted as one"
+        );
         assert!(gate.admits_tcp(80), "the declaration's port is still held");
         // Withdrawing something never published is a no-op, and withdrawing
         // a declared port changes nothing: its admission is not the

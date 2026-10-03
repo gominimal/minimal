@@ -1592,6 +1592,15 @@ impl ReplyFlows {
         self.flows.clear();
     }
 
+    /// Ends the records of one published port: the flows that arrived at
+    /// `port` over `proto`. A port whose publication is withdrawn takes its
+    /// admissions with it, as [`Self::clear`] does for the whole box, so a
+    /// reply the box still owes on it is new traffic its own rules decide.
+    pub fn end_port(&mut self, proto: u8, port: u16) {
+        self.flows
+            .retain(|tuple, _| !(tuple.proto == proto && tuple.dst_port == port));
+    }
+
     /// How many live records the box holds.
     #[must_use]
     pub fn len(&self) -> usize {
