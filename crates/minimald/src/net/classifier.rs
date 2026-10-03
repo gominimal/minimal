@@ -1016,6 +1016,34 @@ pub fn decide_now(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision
     decide(root, mountinfo, guest, || read_filter(root))
 }
 
+/// NET-080: the node-plane record for the daemon's own leaf — one line per
+/// fetch the daemon itself makes, naming the host it fetched, which is the
+/// line a diagnostics bundle's daemon-log tail reads each fetch from. One
+/// call per fetch, the caller naming the host it fetched from or for.
+///
+/// The fetch a `min add` inside a host-address box triggers is the
+/// *daemon's*, never the box's: the build runs in the daemon's own process,
+/// in the leaf it entered at start — a sibling of the cohort, never inside
+/// it — so the refusing rule that matches a deny-all box's subtree cannot
+/// reach it and the fetch completes on the same host while the box reaches
+/// nothing (the root lane proves that leg live under a loaded table). The
+/// fact is otherwise invisible: a fetch that completes says nothing about
+/// which identity carried it, and a person reading a bundle for why the
+/// box's install worked while the box's own connects are refused has this
+/// record to answer with. One line per fetch, at info, with the host and
+/// the leaf it left from — a fetch is an event, not a meter, so no byte
+/// counts and no deduplication: each fetch is recorded, and nothing else
+/// is.
+pub fn record_node_plane_fetch(host: &str) {
+    tracing::info!(
+        host = %host,
+        leaf = sandbox2::classifier::DAEMON_LEAF,
+        "the daemon's own fetch is node-plane traffic, from its own leaf \
+         beside the cohort: never a box's, so a deny-all host-address box's \
+         declaration refuses nothing of it"
+    );
+}
+
 /// Whether the cohort's two subtrees are there as the step delegates them:
 /// each directory with its delegation-contract files. Their absence is the
 /// step not having run, not a host that cannot confine — the covering
@@ -1802,6 +1830,238 @@ mod tests {
             deny_out.last(),
             Some(&"reject with icmpx admin-prohibited"),
             "a connect the box itself opens is refused, actively: {deny_out:?}"
+        );
+    }
+
+    /// Whether a rendered `socket cgroupv2 level <N> "<path>"` match covers
+    /// `cgroup`: the kernel's own prefix semantics, which is what decides
+    /// whether a rule in the loaded table reaches a leaf — the first N
+    /// components of the socket's cgroup equal the N components the match's
+    /// path names, so a rule reaches a leaf at that depth and every leaf
+    /// under it, and no leaf whose own path diverges inside those components.
+    fn cgroup_match_covers(rule: &str, cgroup: &str) -> bool {
+        let level = rule
+            .split("level ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|level| level.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("a rendered match names its level: {rule}"));
+        let named = rule
+            .split('"')
+            .nth(1)
+            .unwrap_or_else(|| panic!("a rendered match names its cgroup path: {rule}"))
+            .split('/')
+            .collect::<Vec<_>>();
+        assert_eq!(
+            named.len(),
+            level,
+            "the rendered match's level is the depth of the path it names: {rule}"
+        );
+        let of = cgroup.split('/').collect::<Vec<_>>();
+        of.len() >= level && of[..level] == named[..]
+    }
+
+    /// Captures what this process writes to its log, so a test can read the
+    /// record the way a diagnostics bundle's daemon-log tail does.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+        type Writer = LogCapture;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// NET-080: the daemon's own package fetch survives a deny-all
+    /// host-address box on the same host, and is recorded as node-plane
+    /// traffic. Both halves are driven over the one tree: the box is
+    /// *resident* — its declaration is the one that admits no destination,
+    /// its leaf in the deny subtree — and the daemon is in its own leaf,
+    /// entered the way it enters it at start, from which the connection a
+    /// fetch makes completes. The rendered table is why it completes: the
+    /// one rule that refuses matches the deny subtree by cgroup path, and
+    /// the daemon's leaf is not under that path, while the node plane's own
+    /// rule in the classify chain does match the daemon's leaf, so the fetch
+    /// is classed as the node plane's and leaves as its identity (the root
+    /// lane proves that leg live under a loaded table). The record is the
+    /// half a person reads: one info line per fetch, with the host fetched
+    /// and the leaf it left from, because a fetch that completes says
+    /// nothing about which identity carried it.
+    #[test]
+    fn daemon_fetch_survives_cohort_deny() {
+        // The tree as a host has it: the step's subtrees, the loaded table's
+        // marker with its recorded mask, and one deny-all host-address box
+        // resident in the deny subtree.
+        let mount = standin_mount();
+        let root = mount.root.clone();
+        installed_cohort(&root);
+        let deny_all = sessions::EgressPolicy::deny_all();
+        assert_eq!(
+            verdict_of(Some(&deny_all)),
+            Verdict::Deny,
+            "the resident box is declared deny-all, so its leaf sits in the \
+             subtree the refusing rule matches"
+        );
+        let resident = sandbox2::classifier::create_box_leaf(&root, "a session", Verdict::Deny)
+            .expect("the launch makes the deny-all box's leaf");
+
+        // The daemon's own leaf, entered the way the daemon enters it at
+        // start. Over the stand-in tree the entry is the placement the daemon
+        // performs — its own pid into its leaf's `cgroup.procs` — and the
+        // leaf needs the delegation-contract files modelled into it, because
+        // nothing behind the stand-in makes them at mkdir.
+        let daemon = sandbox2::classifier::daemon_leaf(&root);
+        std::fs::create_dir_all(&daemon).expect("the step makes the daemon's own leaf");
+        model_delegation_files(&daemon);
+        sandbox2::classifier::enter_daemon_leaf(&root)
+            .expect("the daemon enters its own leaf, in the tree the box is resident in");
+
+        // The fetch's leg: a connection the daemon opens from its own leaf,
+        // to the listener this test holds standing in for the registry host
+        // its packages come from. It completes with the deny-all box
+        // resident on the same tree — which, over a stand-in tree with no
+        // table behind it, is the whole a live leg can say; the rendered
+        // table below is the authority for what a loaded one does with the
+        // same leaf.
+        let registry = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("a loopback listener standing in for the registry host");
+        let fetched = registry.local_addr().expect("the registry host's address");
+        let fetch = TcpStream::connect(fetched).expect(
+            "the daemon's own fetch completes: no rule that refuses a deny-all \
+             box's connections reaches the daemon's leaf",
+        );
+        drop(fetch);
+
+        // The rendered spelling of a cgroup on this tree, relative to the
+        // cgroup2 mount the table renders its matches from, so the paths
+        // below and the paths in the table are the same paths.
+        let mount_root = mount
+            .root
+            .parent()
+            .expect("the tree root sits on the cgroup2 mount")
+            .to_path_buf();
+        let rendered = |cgroup: &Path| {
+            cgroup
+                .strip_prefix(&mount_root)
+                .expect("the cgroup is under the mount the table renders from")
+                .to_string_lossy()
+                .into_owned()
+        };
+        let box_path = rendered(&resident);
+        let daemon_path = rendered(&daemon);
+
+        // The refusing rule reaches the box and not the daemon: it matches
+        // the deny subtree the resident box's leaf is in, at the level the
+        // kernel prefixes by, and the daemon's leaf diverges from that path a
+        // component above it — the sibling-of-the-cohort placement
+        // `enter_daemon_leaf` performs is what makes that so.
+        let ruleset = rendered_ruleset();
+        let output = chain_rules(&ruleset, "output");
+        assert_eq!(
+            output.len(),
+            1,
+            "one rule refuses, the deny subtree's: {output:?}"
+        );
+        let refusing = output[0];
+        let deny_subtree = rendered(
+            resident
+                .parent()
+                .expect("the box's leaf sits in the deny subtree"),
+        );
+        assert!(
+            refusing.contains(&format!("\"{deny_subtree}\"")),
+            "the refusing rule matches the deny subtree the resident box's leaf \
+             is in: {refusing}"
+        );
+        assert!(
+            cgroup_match_covers(refusing, &box_path),
+            "the refusing rule reaches the deny-all box's own leaf ({box_path}): {refusing}"
+        );
+        assert!(
+            !cgroup_match_covers(refusing, &daemon_path),
+            "the refusing rule cannot reach the daemon's leaf ({daemon_path}), \
+             so no connection the daemon opens is routed into the chain that \
+             refuses: {refusing}"
+        );
+
+        // The node plane's own rule does match the daemon's leaf, so the
+        // fetch is classed as the node plane's — the half the cohort's rule
+        // decides for boxes, decided here for the daemon, and the identity
+        // the fetch leaves as.
+        let classify = chain_rules(&ruleset, "classify");
+        let node_plane = classify
+            .iter()
+            .find(|rule| rule.contains(&format!("\"{}\"", tree_root_name())))
+            .unwrap_or_else(|| panic!("the node plane is classed by its own rule: {classify:?}"));
+        assert!(
+            cgroup_match_covers(node_plane, &daemon_path),
+            "the node plane's rule matches the daemon's own leaf \
+             ({daemon_path}), so the daemon's fetch is classed as the node \
+             plane's: {node_plane}"
+        );
+
+        // The record, one line per fetch: the leg above is the fetch, and the
+        // daemon records it with the host it fetched — here the address the
+        // leg went to, then a second fetch to a named registry host, so the
+        // per-fetch half is pinned and not only the spelling. Read the way a
+        // bundle's daemon-log tail reads it: two fetches, two lines, each at
+        // info, each naming its own host and the leaf the fetch left from.
+        let log = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let second = "pkgs.min.internal";
+        record_node_plane_fetch(&fetched.to_string());
+        record_node_plane_fetch(second);
+        let recorded = log.contents();
+        let lines: Vec<&str> = recorded
+            .lines()
+            .filter(|line| line.contains("node-plane traffic"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "one record per fetch, two fetches: {recorded}"
+        );
+        for (line, host) in lines
+            .iter()
+            .zip([&fetched.to_string(), &second.to_string()])
+        {
+            assert!(
+                line.contains("INFO"),
+                "the record is at the level a bundle's tail reads: {line}"
+            );
+            assert!(
+                line.contains(host.as_str()),
+                "the record names the host fetched: {line}"
+            );
+            assert!(
+                line.contains(sandbox2::classifier::DAEMON_LEAF),
+                "the record names the leaf the fetch left from: {line}"
+            );
+        }
+        assert!(
+            lines[0].contains(&fetched.to_string()) && !lines[0].contains(second),
+            "the first record is the first fetch, not a summary: {lines:?}"
         );
     }
 
