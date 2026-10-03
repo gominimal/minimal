@@ -9223,8 +9223,10 @@ proof_own_ip_deny_all_box_answers_published_port() {
 #
 # Three beats, one box each, every listen, publish, detach and probe printed
 # with its outcome — and a failing run's `min bug` bundle (see `fail`) carries
-# the zone dump (net/zone.json) and the daemon log whose records this case
-# reads.
+# the zone dump and the daemon log whose records this case reads: the daemon's
+# own net/zone.json and minimald log ride inside the bundle's nested
+# daemon-diag archive (providers/local-minimald0/guest/daemon-diag.tar.zst),
+# with the daemon log again at the bundle's top level.
 #
 #   * the port half drives an own-address box whose ingress declaration names
 #     one port. The declaration binds its forwarder BEFORE the box's name is
@@ -9268,14 +9270,14 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
   # The names, ports and markers. Ports are fixed on purpose — the execs that
   # start and probe each listener must agree — and clear of every band the
   # proofs around this one use (18080-18088, 18090-18093, 19090/19091).
-  PO_BOX_NAME="e2e-port-publish"      # the own-address box the port half drives
+  PO_BOX_NAME="e2e-port-publish"       # the own-address box the port half drives
   PO_OUTLIVE_NAME="e2e-port-outlive"   # the host-address box the detach half drives
-  PO_EXT=18096                        # the declared — published — port
-  PO_UNDECLARED=18097                 # a listen no declaration names
-  PO_DETACH_PORT=18098                # the detach box's server, on the shared loopback
-  PO_MARKER="PO_PUBLISH_OK"           # what the port half's box answers with
-  PO_OUTLIVE_MARKER="PO_OUTLIVE_OK"   # what the detach box answers with
-  PO_RUN_MARKER="PO_RUN_BOX_LIVE"     # what the run task prints from inside its box
+  PO_EXT=18096                         # the declared — published — port
+  PO_UNDECLARED=18097                  # a listen no declaration names
+  PO_DETACH_PORT=18098                 # the detach box's server, on the shared loopback
+  PO_MARKER="PO_PUBLISH_OK"            # what the port half's box answers with
+  PO_OUTLIVE_MARKER="PO_OUTLIVE_OK"    # what the detach box answers with
+  PO_RUN_MARKER="PO_RUN_BOX_LIVE"      # what the run task prints from inside its box
   PO_SAVED_RUST_LOG=""
   # One verdict, read by the beats that need a session sandbox: the port and
   # detach halves' exec gates set it to 0 when this host cannot spawn one, and
