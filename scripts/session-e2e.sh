@@ -829,6 +829,29 @@ if grep -q "unsupported command" "$lookalike_err"; then
   echo "--- stderr ---"; cat "$lookalike_err"
   fail
 fi
+# The session default LANG must name a locale the rootfs actually ships:
+# `C.UTF-8` is absent from the session rootfs, so every setlocale caller
+# warned "Cannot set LC_CTYPE to default locale". `en_US.UTF-8` is the
+# canonical alias of the shipped `en_US.utf8`, so `locale` must run clean.
+lang_out="$(mnl session exec "$sid" 'echo $LANG' 2>"$WORK/exec-lang.err")" || {
+  echo "::error::'min session exec $sid echo \$LANG' failed"
+  echo "--- stderr ---"; cat "$WORK/exec-lang.err" 2>/dev/null || true
+  fail
+}
+if [ "$lang_out" != "en_US.UTF-8" ]; then
+  echo "::error::session LANG is '$lang_out' (expected 'en_US.UTF-8')"
+  fail
+fi
+mnl session exec "$sid" 'locale' >"$WORK/exec-locale.out" 2>"$WORK/exec-locale.err" || {
+  echo "::error::'min session exec $sid locale' failed"
+  echo "--- stderr ---"; cat "$WORK/exec-locale.err" 2>/dev/null || true
+  fail
+}
+if grep -q "Cannot set" "$WORK/exec-locale.err"; then
+  echo "::error::'locale' warned it could not set the session locale"
+  echo "--- stderr ---"; cat "$WORK/exec-locale.err"
+  fail
+fi
 echo "session exec proof OK"
 echo "::endgroup::"
 }
