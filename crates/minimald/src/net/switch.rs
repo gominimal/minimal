@@ -901,8 +901,10 @@ impl ForeignSourceReject {
 /// switch keeps today's target-ingress-only behavior.
 ///
 /// Values are [`Weak`]: a gate lives exactly as long as its relay, so a dead
-/// relay's entry answers nothing and needs no deregistration — leases are never
-/// reused. The table still sweeps its dead entries past a threshold, the
+/// relay's entry answers nothing and needs no deregistration. A drawn lease is
+/// handed again only once no live entry here, and no flow any live gate
+/// records, names it ([`address_referenced`]), so a dead entry is all a reused
+/// address can meet, and the new holder's relay overwrites it. The table still sweeps its dead entries past a threshold, the
 /// [`UdpConntrack`] pattern, so it never grows without bound. Per-process:
 /// boxes behind a *different* daemon are not seen from here, and their
 /// connections decide on the target's ingress alone.
@@ -930,6 +932,26 @@ fn live_gate(addr: Ipv4Addr) -> Option<Arc<SessionGate>> {
         .expect("live gate table poisoned")
         .get(&addr)
         .and_then(Weak::upgrade)
+}
+
+/// Whether anything this daemon's relays hold still names `addr`: a live
+/// gate published under it, or a flow some live gate tracks with it as the
+/// peer (an outbound UDP flow, an inbound TCP flow's tail, or a terminated
+/// flow's tail) inside that record's TTL. The allocator hands a released
+/// draw again only when this is false, so no state left from the address's
+/// last holder can admit traffic for its next one. DNS admission windows
+/// are not consulted: the infrastructure deny set refuses the switch plane
+/// (`100.64.0.0/10`), so a pin never holds a switch address.
+pub(super) fn address_referenced(addr: Ipv4Addr) -> bool {
+    let gates: Vec<Arc<SessionGate>> = {
+        let table = LIVE_GATES.lock().expect("live gate table poisoned");
+        if table.get(&addr).is_some_and(|weak| weak.strong_count() > 0) {
+            return true;
+        }
+        table.values().filter_map(Weak::upgrade).collect()
+    };
+    let now = Instant::now();
+    gates.iter().any(|gate| gate.references_peer(addr, now))
 }
 
 /// A PTask's compiled network policy, applied at the relay bridge — gvproxy
@@ -1192,6 +1214,30 @@ impl SessionGate {
         if flows.len() > INBOUND_FLOW_SWEEP_AT {
             flows.retain(|_, (seen, _)| now.duration_since(*seen) < INBOUND_FLOW_TTL);
         }
+    }
+
+    /// Whether any flow this gate tracks names `peer` as its remote end and
+    /// is still inside its TTL at `now` (see [`address_referenced`]).
+    fn references_peer(&self, peer: Ipv4Addr, now: Instant) -> bool {
+        let live = |seen: &Instant, ttl: Duration| now.duration_since(*seen) < ttl;
+        self.conntrack
+            .flows
+            .lock()
+            .expect("UdpConntrack mutex poisoned")
+            .iter()
+            .any(|(key, seen)| key.0 == peer && live(seen, UDP_FLOW_TTL))
+            || self
+                .inbound_flows
+                .lock()
+                .expect("gate inbound-flow lock poisoned")
+                .iter()
+                .any(|(key, (seen, _))| key.0 == peer && live(seen, INBOUND_FLOW_TTL))
+            || self
+                .terminated_flows
+                .lock()
+                .expect("gate terminated-flow lock poisoned")
+                .iter()
+                .any(|(key, (seen, _))| key.0 == peer && live(seen, TERMINATED_FLOW_TTL))
     }
 
     /// Revokes `port`'s ingress (NET-121): the gate admits it no longer, and
@@ -1795,7 +1841,7 @@ fn blocked_syn(frame: &[u8], allowed: &HashSet<u16>) -> Option<(u16, SocketAddrV
 /// TTL for a tracked outbound UDP flow: an egress datagram opens a window in which
 /// the matching reply is allowed back in. Long enough for real request/reply (DNS,
 /// QUIC handshakes) without keeping stale state around.
-const UDP_FLOW_TTL: Duration = Duration::from_secs(120);
+pub(super) const UDP_FLOW_TTL: Duration = Duration::from_secs(120);
 /// Sweep expired flows once the table crosses this many entries, bounding memory
 /// under a burst of distinct destinations without a background timer.
 const UDP_FLOW_SWEEP_AT: usize = 4096;
@@ -4176,6 +4222,7 @@ pub(crate) mod tests {
         let lease = PtaskLease {
             ip: Ipv4Addr::new(100, 64, 0, 2),
             mac: super::super::MacAddr::for_switch_ip(Ipv4Addr::new(100, 64, 0, 2)),
+            epoch: 1,
         };
         let cmds = tap_netns_commands("mtap0_2", 4321, lease, SwitchSubnet::default());
 
@@ -4463,5 +4510,48 @@ pub(crate) mod tests {
              an IPv4 header source and an ARP sender address alike, \
              whatever protocol the ARP claims — and forwards its own frames"
         );
+    }
+
+    /// The allocator's reference check: a released draw is handed again only
+    /// once no live gate row and no live gate's flow names it. A dead row is
+    /// what reuse leaves behind, and it answers nothing for the address's
+    /// next holder.
+    #[test]
+    fn address_referenced_follows_live_rows_and_peer_flows() {
+        // Addresses no other test publishes in the process-wide table.
+        let holder = Ipv4Addr::new(100, 64, 77, 2);
+        let peer = Ipv4Addr::new(100, 64, 77, 3);
+        let policy = sessions::SessionPolicy::default();
+        let gate = Arc::new(SessionGate::for_session(
+            holder.to_string(),
+            holder,
+            &policy,
+            SwitchSubnet::default(),
+        ));
+        register_live_gate(holder, &gate);
+        assert!(address_referenced(holder), "a live row names its address");
+        drop(gate);
+        assert!(live_gate(holder).is_none(), "a dead row answers nothing");
+        assert!(!address_referenced(holder), "a dead row holds nothing");
+
+        // A peer still holding a replied-UDP flow toward the address keeps
+        // it referenced until the peer's gate goes.
+        let peer_gate = Arc::new(SessionGate::for_session(
+            peer.to_string(),
+            peer,
+            &policy,
+            SwitchSubnet::default(),
+        ));
+        register_live_gate(peer, &peer_gate);
+        let datagram = udp_frame(peer, 40000, holder, 53);
+        peer_gate
+            .conntrack
+            .record_egress(&parse_ipv4_l4(&datagram).expect("the datagram parses"));
+        assert!(
+            address_referenced(holder),
+            "a live peer's UDP flow names the address"
+        );
+        drop(peer_gate);
+        assert!(!address_referenced(holder), "nothing names it any more");
     }
 }

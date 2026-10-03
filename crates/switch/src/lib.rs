@@ -28,6 +28,15 @@ pub const GATEWAY_MAC: MacAddr = MacAddr([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd]);
 /// [`SwitchSubnet::box_egress_proxy_address`] on that subnet.
 pub const BEP_MAC: MacAddr = MacAddr([0x52, 0x54, 0x00, 0x40, 0xff, 0xfc]);
 
+/// How long the Box Egress Proxy leg's smoltcp neighbour cache keeps an
+/// entry: smoltcp 0.14's `iface::neighbor::Cache::ENTRY_LIFETIME`, which the
+/// crate keeps `pub(crate)`, so it is restated here. A switch address handed
+/// again wears the same derived MAC ([`MacAddr::for_switch_ip`]), so an
+/// allocator that reuses addresses must quarantine a released one for longer
+/// than this, or the leg could still answer the new holder from the old
+/// holder's entry. Change it with the smoltcp version.
+pub const BEP_NEIGHBOUR_CACHE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// AF_VSOCK CID of the host as seen from inside a libkrun guest. Well-known:
 /// `VMADDR_CID_HOST == 2`. The per-PTask shuttle dials this CID to reach the
 /// host gvproxy switch (DM1/3/4).

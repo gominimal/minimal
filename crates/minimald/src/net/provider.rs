@@ -438,7 +438,7 @@ impl Network for OwnIpNetwork {
                 &self.switch,
                 tap_fd,
                 reserved.control,
-                reserved.lease.ip,
+                reserved.lease,
                 &self.identity,
                 self.policy.as_ref(),
                 self.own_address.as_ref(),
@@ -469,7 +469,7 @@ impl Network for OwnIpNetwork {
                 // decrement the switch's count below the truth.
                 return;
             };
-            if let Err(e) = self.switch.lock().await.detach(reserved.lease.ip).await {
+            if let Err(e) = self.switch.lock().await.detach(reserved.lease).await {
                 tracing::warn!(error = %e, "detaching OwnIp PTask after an abandoned launch");
             }
         })

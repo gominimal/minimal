@@ -13,8 +13,9 @@
 //! was pinned by the gvproxy v0.8.9 spike (`docs/spikes/2026-06-21-gvproxy-attachment.md`)
 //! and is implemented in [`switch`].
 //!
-//! Covers R1.4 (gvproxy child lifecycle), R1.6 (per-host IP allocation with no
-//! reuse), and R1.8 (structured tracing for every switch lifecycle event).
+//! Covers R1.4 (gvproxy child lifecycle), R1.6 (per-host IP allocation, each
+//! address to one live attach at a time, reused only under an allocation epoch
+//! and a quarantine), and R1.8 (structured tracing for every switch lifecycle event).
 
 pub mod answerer;
 pub mod dns;
@@ -49,11 +50,12 @@ pub mod classifier;
 #[cfg(feature = "networking-wg")]
 pub mod wg;
 
+use std::collections::VecDeque;
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
@@ -105,9 +107,10 @@ const TERM_GRACE: Duration = Duration::from_secs(5);
 pub enum NetError {
     /// The daemon's self-allocation reserve — the sub-run of the plan's PTask
     /// run it draws task sandboxes and unregistered boxes from — has no
-    /// address left. Explicit, never wrapped: a spent address stays spent.
+    /// address free: every one is held by a live attach, still inside its
+    /// reuse quarantine, or still named by a live gate row or flow.
     #[error(
-        "the self-allocation reserve on subnet {0} is exhausted; no daemon-side address remains"
+        "the self-allocation reserve on subnet {0} is exhausted; no daemon-side address is free"
     )]
     SubnetExhausted(SwitchSubnet),
     /// The host handed the box a switch address outside the plan's PTask run
@@ -170,11 +173,16 @@ pub enum NetError {
     Io(#[from] io::Error),
 }
 
-/// One PTask's place on the switch: a never-reused IP and its derived MAC.
+/// One PTask's place on the switch: an IP, its derived MAC, and the
+/// allocation epoch it was handed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtaskLease {
     pub ip: Ipv4Addr,
     pub mac: MacAddr,
+    /// The allocator's hand count when this lease was made. An address
+    /// handed again carries a new epoch, so equality names one hand of an
+    /// address, never the address alone.
+    pub epoch: u64,
 }
 
 /// Returned by [`SwitchClient::attach`].
@@ -212,8 +220,29 @@ pub fn self_allocation_run(subnet: SwitchSubnet) -> (u32, u32) {
     (first, first + reserve_len - 1)
 }
 
-/// Hands out unique switch addresses, never reusing a drawn one for the
-/// lifetime of the allocator (R1.6).
+/// How long a released drawn address waits before it may be handed again.
+///
+/// It outlasts every record that can still name the address once its
+/// holder is gone: a peer's replied-UDP flow (the relay's UDP flow TTL) and
+/// the Box Egress Proxy leg's neighbour-cache entry, which would otherwise
+/// answer the new holder, wearing the same derived MAC, from the old
+/// holder's entry. Both are asserted below at compile time. Waiting out the
+/// quarantine is necessary but not sufficient: [`IpAllocator`] also skips an
+/// address any live gate row or flow still names.
+pub const REUSE_QUARANTINE: Duration = Duration::from_secs(300);
+
+const _: () = assert!(
+    REUSE_QUARANTINE.as_millis() > ::switch::BEP_NEIGHBOUR_CACHE_LIFETIME.as_millis(),
+    "the reuse quarantine must outlast the BEP leg's neighbour-cache entry"
+);
+const _: () = assert!(
+    REUSE_QUARANTINE.as_millis() >= self::switch::UDP_FLOW_TTL.as_millis(),
+    "the reuse quarantine must outlast a replied-UDP flow"
+);
+
+/// Hands out switch addresses, each to one live attach at a time, and
+/// reuses a released drawn one only under an allocation epoch and a
+/// quarantine (R1.6).
 ///
 /// Two allocation shapes: [`Self::allocate`] draws a self-allocation from
 /// the plan run's lower half — the sub-run [`self_allocation_run`] reserves
@@ -224,13 +253,24 @@ pub fn self_allocation_run(subnet: SwitchSubnet) -> (u32, u32) {
 /// attachment's, handed or drawn alike: it joins the static-lease table the
 /// switch is configured from when the tap arrives and leaves with the attach
 /// ([`Self::release`], via [`SwitchClient::detach`]), so the table holds only
-/// live taps. The never-reuse rule is carried by the draw cursor, not by the
-/// table — `next` never regresses, so a withdrawn drawn address is never
-/// re-drawn, and it is never handed either (it sits in the reserve, which
-/// [`Self::hand`] refuses). A handed address, by contrast, is the registered
-/// box's — the host-side row is keyed by it — and the same box re-attaching
-/// re-hands it; that re-hand is not a reuse: it is the same row coming back,
-/// and the collision refusal guards only an address an attach still holds.
+/// live taps.
+///
+/// Every lease carries an allocation epoch, a counter that advances at each
+/// hand, so a lease names one hand of its address rather than the address
+/// alone. A release withdraws only the lease whose address *and* epoch it
+/// names: a stale release from an address's previous holder withdraws
+/// nothing of its next one.
+///
+/// A drawn address is reused, never shared. Release returns it to the
+/// reserve's free queue, and [`Self::allocate`] hands it again only when
+/// [`REUSE_QUARANTINE`] has passed since its release **and** no live gate
+/// row or flow still names it. Addresses are handed longest-free first: the
+/// cursor's never-drawn addresses before any released one, then released
+/// ones in release order, so the quarantine is the normal case rather than
+/// the edge. A handed address, by contrast, is the registered box's — the
+/// host-side row is keyed by it — and the same box re-attaching re-hands
+/// it: that re-hand is the same row coming back, and the collision refusal
+/// guards only an address an attach still holds.
 ///
 /// The interim this shape ships in: task sandboxes self-allocate from the
 /// reserve until the task registering every live box host-side (NET-138)
@@ -242,13 +282,17 @@ pub struct IpAllocator {
     /// This daemon's self-allocation reserve, inclusive — both bounds from
     /// [`self_allocation_run`]. `allocate` draws inside it and nothing else.
     reserve: (u32, u32),
-    /// The next host offset to draw for a self-allocation; only ever
-    /// advances, within the reserve.
+    /// The next never-drawn host offset in the reserve; only ever advances.
     next: u32,
-    /// Every address handed out, in allocation order. Doubles as the
-    /// static-lease table written into gvproxy's config, which therefore
-    /// holds only live taps: a lease leaves with its attach
-    /// ([`Self::release`]), handed or drawn alike.
+    /// Released drawn addresses with the instant each was released, oldest
+    /// release first: the order [`Self::allocate`] reuses them in.
+    released: VecDeque<(Ipv4Addr, Instant)>,
+    /// The last allocation epoch handed; the next hand takes one more.
+    epoch: u64,
+    /// Every live lease, in allocation order. Doubles as the static-lease
+    /// table written into gvproxy's config, which therefore holds only live
+    /// taps: a lease leaves with its attach ([`Self::release`]), handed or
+    /// drawn alike.
     leases: Vec<PtaskLease>,
 }
 
@@ -261,6 +305,8 @@ impl IpAllocator {
             next: subnet.first_ptask(),
             reserve: self_allocation_run(subnet),
             subnet,
+            released: VecDeque::new(),
+            epoch: 0,
             leases: Vec::new(),
         }
     }
@@ -281,32 +327,62 @@ impl IpAllocator {
         self.subnet
     }
 
-    /// Allocates the next free address and its derived MAC, drawing from the
-    /// daemon's self-allocation reserve — the plan run's lower half.
+    /// Allocates a free address and its derived MAC under a new epoch,
+    /// drawing from the daemon's self-allocation reserve — the plan run's
+    /// lower half.
     ///
-    /// Addresses are sequential and never reused, even after the PTask
-    /// detaches, so a stale frame from a torn-down PTask can never be
-    /// misdelivered to a freshly-attached one.
+    /// A never-drawn address is taken first, in order. Once the reserve has
+    /// been drawn through, the released address free longest is reused,
+    /// provided [`REUSE_QUARANTINE`] has passed since its release and no
+    /// live gate row or flow on this daemon's relays still names it, so a
+    /// stale frame or flow from a torn-down PTask can never be delivered to
+    /// or admitted for a freshly-attached one.
     ///
     /// # Errors
     ///
-    /// Returns [`NetError::SubnetExhausted`] once the reserve is used up —
-    /// explicitly, with no wrap and no reuse; a spent address stays spent.
+    /// Returns [`NetError::SubnetExhausted`] when no address in the reserve
+    /// is free: every one is held, still quarantined, or still referenced.
     pub fn allocate(&mut self) -> Result<PtaskLease, NetError> {
-        if self.next > self.reserve.1 {
-            return Err(NetError::SubnetExhausted(self.subnet));
-        }
-        let ip = Ipv4Addr::from(self.next);
-        self.next += 1;
+        self.allocate_at(Instant::now(), self::switch::address_referenced)
+    }
+
+    /// [`Self::allocate`] at `now`, with `referenced` saying whether a live
+    /// gate row or flow still names an address — the clock and the check
+    /// injected so the quarantine can be driven without waiting it out.
+    fn allocate_at(
+        &mut self,
+        now: Instant,
+        referenced: impl Fn(Ipv4Addr) -> bool,
+    ) -> Result<PtaskLease, NetError> {
+        let ip = if self.next <= self.reserve.1 {
+            let ip = Ipv4Addr::from(self.next);
+            self.next += 1;
+            ip
+        } else {
+            let reusable = self.released.iter().position(|&(ip, released_at)| {
+                now.saturating_duration_since(released_at) >= REUSE_QUARANTINE && !referenced(ip)
+            });
+            let Some((ip, _)) = reusable.and_then(|at| self.released.remove(at)) else {
+                return Err(NetError::SubnetExhausted(self.subnet));
+            };
+            ip
+        };
+        Ok(self.record(ip))
+    }
+
+    /// Records a lease for `ip` under the next epoch.
+    fn record(&mut self, ip: Ipv4Addr) -> PtaskLease {
+        self.epoch += 1;
         let lease = PtaskLease {
             ip,
             mac: MacAddr::for_switch_ip(ip),
+            epoch: self.epoch,
         };
         self.leases.push(lease);
-        Ok(lease)
+        lease
     }
 
-    /// Every lease handed out so far, oldest first.
+    /// Every live lease, oldest first.
     #[must_use]
     pub fn leases(&self) -> &[PtaskLease] {
         &self.leases
@@ -315,14 +391,12 @@ impl IpAllocator {
     /// Records `ip` as the switch address a registered box attaches at (T66):
     /// the VM host daemon allocated it into its table and handed it back, so
     /// the daemon mints nothing. The lease joins [`Self::leases`] — the
-    /// static-lease table the switch is configured from — and leaves with
-    /// the box's attach ([`Self::release`]), so the same box re-attaching
-    /// re-hands it: the host's persisted row still holds the address, and
-    /// detach never touches that row. A drawn lease ([`Self::allocate`])
-    /// leaves the same way, and its address is never seen again — the draw
-    /// cursor never regresses, and the reserve [`Self::hand`] refuses — so
-    /// the never-reuse rule (R1.6) is carried by the cursor, not by a lease
-    /// the table keeps for a tap that is gone.
+    /// static-lease table the switch is configured from — under a new epoch,
+    /// and leaves with the box's attach ([`Self::release`]), so the same box
+    /// re-attaching re-hands it: the host's persisted row still holds the
+    /// address, and detach never touches that row. A drawn lease
+    /// ([`Self::allocate`]) leaves the same way, and its address is never
+    /// handed here — it sits in the reserve, which this refuses.
     ///
     /// Three refusals, never a share:
     ///
@@ -368,30 +442,41 @@ impl IpAllocator {
                 holder: lease.mac,
             });
         }
-        let lease = PtaskLease {
-            ip,
-            mac: MacAddr::for_switch_ip(ip),
-        };
-        self.leases.push(lease);
-        Ok(lease)
+        Ok(self.record(ip))
     }
 
-    /// Withdraws the lease for `ip`, when the allocator holds one: the
-    /// attachment ended, so the lease ends with it — every attachment's,
-    /// handed or drawn alike. A handed address is free for the same box to
-    /// re-hand on the re-attach an in-process host rebuild or a restart
-    /// produces (T66): the host's persisted row still holds it, and nothing
-    /// here does. A drawn address is never re-drawn — the draw cursor never
-    /// regresses (R1.6), so a stale frame from a torn-down PTask can never be
-    /// misdelivered to a freshly-attached one — and never handed either: it
-    /// sits in the reserve [`Self::hand`] refuses. An address the allocator
-    /// never recorded withdraws nothing.
+    /// Withdraws `lease` — its address at its epoch — when the allocator
+    /// holds it: the attachment ended, so the lease ends with it, handed or
+    /// drawn alike. A lease from an earlier epoch of the same address
+    /// withdraws nothing, so a stale release cannot end the address's
+    /// current holder. A handed address is free for the same box to re-hand
+    /// on the re-attach an in-process host rebuild or a restart produces
+    /// (T66): the host's persisted row still holds it, and nothing here
+    /// does. A drawn address joins the reserve's free queue, to be handed
+    /// again under a new epoch once [`Self::allocate`]'s quarantine and
+    /// reference check both pass.
+    ///
+    /// The caller ends the lease's relay first (see the own-IP guard's
+    /// teardown), so its gate row, flows and admission windows go with it;
+    /// the reference check covers a relay still winding down.
     ///
     /// Returns whether a lease was withdrawn.
-    pub(crate) fn release(&mut self, ip: Ipv4Addr) -> bool {
-        let held = self.leases.iter().any(|lease| lease.ip == ip);
-        self.leases.retain(|lease| lease.ip != ip);
-        held
+    pub(crate) fn release(&mut self, lease: PtaskLease) -> bool {
+        self.release_at(lease, Instant::now())
+    }
+
+    /// [`Self::release`] at `now`, the clock injected as in
+    /// [`Self::allocate_at`].
+    fn release_at(&mut self, lease: PtaskLease, now: Instant) -> bool {
+        let Some(at) = self.leases.iter().position(|held| *held == lease) else {
+            return false;
+        };
+        self.leases.remove(at);
+        let (reserve_first, reserve_last) = self.reserve;
+        if (reserve_first..=reserve_last).contains(&u32::from(lease.ip)) {
+            self.released.push_back((lease.ip, now));
+        }
+        true
     }
 }
 
@@ -558,6 +643,7 @@ impl SwitchClient {
         tracing::info!(
             ip = %lease.ip,
             mac = %lease.mac,
+            epoch = lease.epoch,
             attached = self.attached,
             "attached OwnIp PTask to gvproxy switch"
         );
@@ -582,8 +668,9 @@ impl SwitchClient {
     /// for the same box, a refusal on mismatch — lands with the box id in
     /// the registration (T44, #1660, NET-133), which names it as the gap;
     /// until then this daemon attaches with whatever the create request
-    /// carries. A drawn lease, by contrast, is never re-drawn: the draw
-    /// cursor never regresses (the never-reuse rule). Everything else
+    /// carries. A drawn lease, by contrast, is reused only under a new
+    /// epoch and after the reuse quarantine ([`IpAllocator::allocate`]).
+    /// Everything else
     /// matches [`Self::attach`], including the DM2 config/spawn steps
     /// and the attach count.
     ///
@@ -609,6 +696,7 @@ impl SwitchClient {
         tracing::info!(
             ip = %lease.ip,
             mac = %lease.mac,
+            epoch = lease.epoch,
             attached = self.attached,
             "attached OwnIp PTask to gvproxy switch at its handed address"
         );
@@ -623,18 +711,23 @@ impl SwitchClient {
     /// address is the registered box's, keyed by the host-side row, so once
     /// the box's attach ends the same box re-attaching re-hands it — the
     /// collision refusal then guards only an address an attach still holds.
-    /// A drawn address is never re-drawn: the allocator's draw cursor never
-    /// regresses (R1.6), so the rule holds without the table keeping a lease
-    /// for a tap that is gone; see [`IpAllocator::release`]. When the last
-    /// one leaves, the switch is stopped.
+    /// A drawn address goes back to the reserve's free queue, handed again
+    /// only under a new epoch, after the reuse quarantine, and once nothing
+    /// still names it (R1.6); see [`IpAllocator::release`]. A lease from an
+    /// earlier epoch than the address's current one releases nothing. When
+    /// the last one leaves, the switch is stopped.
     ///
     /// # Errors
     ///
     /// Propagates teardown failures from [`stop`](Self::stop).
-    pub async fn detach(&mut self, released: Ipv4Addr) -> Result<(), NetError> {
+    pub async fn detach(&mut self, released: PtaskLease) -> Result<(), NetError> {
         self.attached = self.attached.saturating_sub(1);
         if self.allocator.release(released) {
-            tracing::debug!(ip = %released, "released the lease with the attach");
+            tracing::debug!(
+                ip = %released.ip,
+                epoch = released.epoch,
+                "released the lease with the attach"
+            );
         }
         tracing::info!(attached = self.attached, "detached OwnIp PTask from switch");
         if self.attached == 0 {
@@ -881,14 +974,14 @@ mod tests {
     }
 
     #[test]
-    fn allocate_never_reuses_after_logical_release() {
-        // The allocator has no `free`: addresses only ever advance, so even a
-        // long-lived process never hands the same address to two PTasks.
+    fn allocate_never_shares_an_address_between_live_leases() {
+        // Live leases never share an address, and each hand is a new epoch.
         let mut a = IpAllocator::new(SwitchSubnet::default());
-        let one = a.allocate().unwrap().ip;
-        let two = a.allocate().unwrap().ip;
-        let three = a.allocate().unwrap().ip;
-        assert!(one < two && two < three);
+        let one = a.allocate().unwrap();
+        let two = a.allocate().unwrap();
+        let three = a.allocate().unwrap();
+        assert!(one.ip < two.ip && two.ip < three.ip);
+        assert!(one.epoch < two.epoch && two.epoch < three.epoch);
     }
 
     #[test]
@@ -908,7 +1001,7 @@ mod tests {
         // run's ends are the switch crate's, read rather than restated: the
         // run splits at its midpoint, so this daemon's reserve is .2 alone
         // and the host's hand-out run is .3 — exhaustion is explicit on each
-        // side, with no wrap and no reuse.
+        // side while every address is held.
         let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
         let first = Ipv4Addr::from(subnet.first_ptask());
         let last = Ipv4Addr::from(subnet.last_ptask());
@@ -1056,20 +1149,24 @@ mod tests {
         assert_eq!(a.leases().len(), 1);
 
         // A drawn lease leaves the same way — a task sandbox's self-drawn
-        // address ends with its sandbox — and the never-reuse rule (R1.6) is
-        // carried by the cursor, not by the table: the next draw is a higher
-        // address, never the withdrawn one.
+        // address ends with its sandbox — and the next draw takes a
+        // never-drawn address before the withdrawn one (longest free first).
         let task = a.allocate().unwrap();
-        assert!(a.release(task.ip), "the drawn lease is withdrawn");
+        assert!(a.release(task), "the drawn lease is withdrawn");
         assert_eq!(a.leases(), &[lease], "only the handed lease remains");
         let redrawn = a.allocate().unwrap();
         assert_eq!(
             redrawn.ip,
             Ipv4Addr::new(100, 64, 0, 3),
-            "the withdrawn address is never re-drawn"
+            "a never-drawn address goes before the withdrawn one"
         );
-        // An address the allocator never recorded releases nothing.
-        assert!(!a.release(Ipv4Addr::new(100, 64, 200, 1)));
+        // A lease the allocator never recorded releases nothing.
+        let stranger = Ipv4Addr::new(100, 64, 200, 1);
+        assert!(!a.release(PtaskLease {
+            ip: stranger,
+            mac: MacAddr::for_switch_ip(stranger),
+            epoch: 1,
+        }));
         assert_eq!(a.leases().len(), 2);
 
         // A handed address an attach still holds refuses a second hand: the
@@ -1084,7 +1181,7 @@ mod tests {
         // again — the same address, the same derived MAC, the same row the
         // host-side table is keyed by — beside the draw that replaced the
         // withdrawn one.
-        assert!(a.release(handed_ip));
+        assert!(a.release(lease));
         assert_eq!(
             a.leases(),
             &[redrawn],
@@ -1095,6 +1192,7 @@ mod tests {
             .expect("the same box re-attaching re-hands its own address");
         assert_eq!(rehanded.ip, lease.ip);
         assert_eq!(rehanded.mac, lease.mac);
+        assert!(rehanded.epoch > lease.epoch, "the re-hand is a new epoch");
     }
 
     #[test]
@@ -1179,8 +1277,140 @@ mod tests {
         let result = switch.attach().await.expect("host-shuttle attach");
         assert_eq!(result.lease.ip, Ipv4Addr::new(100, 64, 0, 2));
         // No gvproxy child was spawned; detach decrements the count and
-        // withdraws the lease with the attach — the drawn address stays
-        // spent regardless, the draw cursor never regresses.
-        switch.detach(result.lease.ip).await.expect("detach");
+        // withdraws the lease with the attach.
+        switch.detach(result.lease).await.expect("detach");
+    }
+
+    /// A native daemon's switch: a /24 inside the default /16, whose
+    /// self-allocation reserve is `.2..=.126`.
+    fn native_slash24() -> SwitchSubnet {
+        SwitchSubnet::new(Ipv4Addr::new(100, 64, 37, 0), 24).unwrap()
+    }
+
+    #[test]
+    fn reuse_quarantine_outlasts_the_bep_neighbour_cache() {
+        // A reused address wears the same derived MAC, so the BEP leg's
+        // neighbour cache must have dropped the old holder's entry first.
+        assert!(REUSE_QUARANTINE > ::switch::BEP_NEIGHBOUR_CACHE_LIFETIME);
+        assert!(REUSE_QUARANTINE >= Duration::from_secs(300));
+    }
+
+    #[test]
+    fn a_thousand_launch_release_cycles_on_a_native_slash24_never_exhaust() {
+        let subnet = native_slash24();
+        let (first, last) = self_allocation_run(subnet);
+        assert_eq!(
+            (Ipv4Addr::from(first), Ipv4Addr::from(last)),
+            (
+                Ipv4Addr::new(100, 64, 37, 2),
+                Ipv4Addr::new(100, 64, 37, 126)
+            ),
+            "125 addresses: the reserve that used to be a lifetime cap"
+        );
+        // One launch every 3 s: the reserve's 125 addresses cover the
+        // 300 s quarantine at any pace slower than one per 2.4 s.
+        let step = Duration::from_secs(3);
+        let mut a = IpAllocator::new(subnet);
+        let mut now = Instant::now();
+        let mut released_at = std::collections::HashMap::new();
+        let mut last_epoch = 0;
+        for cycle in 0..1000 {
+            let lease = a
+                .allocate_at(now, |_| false)
+                .unwrap_or_else(|e| panic!("cycle {cycle} failed: {e}"));
+            assert!(lease.epoch > last_epoch, "every hand is a new epoch");
+            last_epoch = lease.epoch;
+            if let Some(at) = released_at.get(&lease.ip) {
+                assert!(
+                    now.duration_since(*at) >= REUSE_QUARANTINE,
+                    "cycle {cycle} re-handed {} inside the quarantine",
+                    lease.ip
+                );
+            }
+            assert!(a.release_at(lease, now));
+            released_at.insert(lease.ip, now);
+            now += step;
+        }
+        assert!(a.leases().is_empty());
+    }
+
+    #[test]
+    fn a_rehanded_address_carries_a_new_epoch_and_its_old_lease_ends_nothing() {
+        // A /29's reserve is one address, so every draw after the first is
+        // a re-hand of it.
+        let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
+        let mut a = IpAllocator::new(subnet);
+        let t0 = Instant::now();
+        let old = a.allocate_at(t0, |_| false).unwrap();
+        assert!(a.release_at(old, t0));
+        let new = a.allocate_at(t0 + REUSE_QUARANTINE, |_| false).unwrap();
+        assert_eq!((new.ip, new.mac), (old.ip, old.mac), "the same address");
+        assert!(new.epoch > old.epoch, "under a new epoch");
+        assert_ne!(new, old, "so the two leases are not the same lease");
+        // The old holder's lease admits nothing for the new one: a stale
+        // release ends nothing, and the static-lease table keeps the new
+        // holder's row.
+        assert!(!a.release_at(old, t0 + REUSE_QUARANTINE));
+        assert_eq!(a.leases(), &[new]);
+        assert!(a.release_at(new, t0 + REUSE_QUARANTINE));
+        assert!(a.leases().is_empty());
+    }
+
+    #[test]
+    fn no_rehand_inside_the_quarantine_or_while_referenced() {
+        let subnet = SwitchSubnet::new(Ipv4Addr::new(10, 0, 0, 0), 29).unwrap();
+        let mut a = IpAllocator::new(subnet);
+        let t0 = Instant::now();
+        let lease = a.allocate_at(t0, |_| false).unwrap();
+        // Held: nothing to hand.
+        assert!(matches!(
+            a.allocate_at(t0 + REUSE_QUARANTINE, |_| false),
+            Err(NetError::SubnetExhausted(_))
+        ));
+        assert!(a.release_at(lease, t0));
+        // Released, but inside the quarantine.
+        assert!(matches!(
+            a.allocate_at(
+                t0 + REUSE_QUARANTINE.saturating_sub(Duration::from_millis(1)),
+                |_| false
+            ),
+            Err(NetError::SubnetExhausted(_))
+        ));
+        // Past the quarantine, but a live gate row or flow still names it.
+        assert!(matches!(
+            a.allocate_at(t0 + REUSE_QUARANTINE, |ip| ip == lease.ip),
+            Err(NetError::SubnetExhausted(_))
+        ));
+        // Past the quarantine with nothing naming it: handed again.
+        let again = a.allocate_at(t0 + REUSE_QUARANTINE, |_| false).unwrap();
+        assert_eq!(again.ip, lease.ip);
+    }
+
+    #[test]
+    fn released_addresses_are_handed_longest_free_first() {
+        let mut a = IpAllocator::new(native_slash24());
+        let t0 = Instant::now();
+        let drawn: Vec<PtaskLease> =
+            std::iter::from_fn(|| a.allocate_at(t0, |_| false).ok()).collect();
+        assert_eq!(drawn.len(), 125, "the never-drawn addresses go first");
+        // Released out of address order, a second apart.
+        for (offset, index) in [7usize, 3, 5].into_iter().enumerate() {
+            let at = t0 + Duration::from_secs(offset as u64);
+            assert!(a.release_at(drawn[index], at));
+        }
+        let later = t0 + REUSE_QUARANTINE + Duration::from_secs(10);
+        let order: Vec<Ipv4Addr> = (0..3)
+            .map(|_| a.allocate_at(later, |_| false).unwrap().ip)
+            .collect();
+        assert_eq!(order, vec![drawn[7].ip, drawn[3].ip, drawn[5].ip]);
+        // A referenced address is skipped, not waited on: the next free one
+        // in release order goes instead.
+        assert!(a.release_at(drawn[9], later));
+        assert!(a.release_at(drawn[11], later));
+        let skip = drawn[9].ip;
+        let next = a
+            .allocate_at(later + REUSE_QUARANTINE, |ip| ip == skip)
+            .unwrap();
+        assert_eq!(next.ip, drawn[11].ip);
     }
 }
