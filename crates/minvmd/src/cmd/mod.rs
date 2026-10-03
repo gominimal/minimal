@@ -390,14 +390,19 @@ pub(crate) fn read_ready_beacon<R: std::io::BufRead>(
                         tracing::warn!(error = %e, "failed to parse SSH host key from beacon");
                     }
                     Ok(pubkey) => {
-                        // The host alias ssh connects with is the provider
-                        // directory's basename (the VM name for a named VM,
-                        // `local-minvmd0` for the default VM), so key the
-                        // known_hosts entry on it rather than a fixed
-                        // provider-instance name.
-                        let Some(host_alias) =
-                            known_hosts_path.parent().and_then(paths::ssh_host_alias)
-                        else {
+                        // Key the known_hosts entry on the alias ssh connects
+                        // with (`local-minvmd0` for the default VM,
+                        // `<vm>.local-minvmd0` for a named VM) rather than a
+                        // fixed provider-instance name. The path is always
+                        // `<provider dir>/known_hosts`, so a missing alias is
+                        // a programming error.
+                        let host_alias = known_hosts_path.parent().and_then(paths::ssh_host_alias);
+                        debug_assert!(
+                            host_alias.is_some(),
+                            "known_hosts path {} has no provider-dir parent",
+                            known_hosts_path.display(),
+                        );
+                        let Some(host_alias) = host_alias else {
                             tracing::warn!(
                                 path = %known_hosts_path.display(),
                                 "known_hosts path has no provider-dir parent; skipping key write",
@@ -410,12 +415,12 @@ pub(crate) fn read_ready_beacon<R: std::io::BufRead>(
                         // spawn (#782). Best-effort: a prune failure must not
                         // abort boot (R2.3).
                         if let Err(e) =
-                            paths::prune_known_hosts_entries(known_hosts_path, host_alias, 22)
+                            paths::prune_known_hosts_entries(known_hosts_path, &host_alias, 22)
                         {
                             tracing::warn!(error = %e, "failed to prune stale known_hosts entries");
                         }
                         match russh::keys::known_hosts::learn_known_hosts_path(
-                            host_alias,
+                            &host_alias,
                             22,
                             &pubkey,
                             known_hosts_path,
@@ -572,7 +577,11 @@ mod beacon_tests {
         let tmp = tempfile::tempdir().unwrap();
         // Default-VM layout: the known_hosts file sits directly in the
         // provider-instance dir, so the alias is its basename.
-        let known_hosts_path = tmp.path().join("local-minvmd0").join("known_hosts");
+        let known_hosts_path = tmp
+            .path()
+            .join("providers")
+            .join("local-minvmd0")
+            .join("known_hosts");
 
         read_ready_beacon(&mut reader, &known_hosts_path)
             .expect("read_ready_beacon must succeed with valid beacon");
@@ -602,9 +611,11 @@ mod beacon_tests {
 
         let tmp = tempfile::tempdir().unwrap();
         // Named-VM layout: the known_hosts file sits in the per-name
-        // subdirectory, so the alias is the VM name, not the provider name.
+        // subdirectory, so the alias is the VM name namespaced under the
+        // provider-instance name.
         let known_hosts_path = tmp
             .path()
+            .join("providers")
             .join("local-minvmd0")
             .join("alpha")
             .join("known_hosts");
@@ -615,12 +626,9 @@ mod beacon_tests {
         let contents =
             std::fs::read_to_string(&known_hosts_path).expect("known_hosts file must be created");
         assert!(
-            contents.contains("alpha"),
-            "known_hosts must contain the VM alias 'alpha', got: {contents:?}"
-        );
-        assert!(
-            !contents.contains("local-minvmd0"),
-            "known_hosts must not contain the provider name, got: {contents:?}"
+            contents.contains("alpha.local-minvmd0 "),
+            "known_hosts must key the entry on the namespaced alias \
+             'alpha.local-minvmd0', got: {contents:?}"
         );
     }
 
