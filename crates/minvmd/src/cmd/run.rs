@@ -675,7 +675,7 @@ fn run_foreground() -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    {
+    let mark_running = (|| -> Result<()> {
         let mut lock = state_dir
             .lifecycle_lock()
             .context("opening lifecycle lock")?;
@@ -699,6 +699,13 @@ fn run_foreground() -> Result<()> {
                 booted_ram_mib: Some(booted_ram_mib),
             })
             .context("writing Running state")?;
+        Ok(())
+    })();
+    if let Err(e) = mark_running {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+        // guard drops here → StartingGuard resets state to Stopped (R4.6)
     }
     guard.commit();
     tracing::info!(pid = child_pid, "VM is up; supervisor is running");
