@@ -1348,7 +1348,7 @@ impl SessionGate {
         if let refusal::Outcome::Emit(line) = &outcome {
             tracing::warn!("{line}");
         }
-        match outcome {
+        let queued = match outcome {
             // Past the quota: the source's refusals to lose are its own.
             refusal::Outcome::Suppressed => false,
             refusal::Outcome::Quiet | refusal::Outcome::Emit(_) => {
@@ -1358,7 +1358,18 @@ impl SessionGate {
                 self.send_reset(reset);
                 true
             }
+        };
+        // Windows that ended between refusals say their final count here: a
+        // count the source's closed window was still holding, which no
+        // further refusal from it will ever carry on a next window's opening
+        // line, is said once — at the window it belongs to — instead of
+        // being lost to the silence that ended it. Any refusal drives the
+        // sweep, because only a refusal between windows can tell that a
+        // window ended; the lines that land are the same one format.
+        for line in self.refusals.flush_expired(Instant::now()) {
+            tracing::warn!("{line}");
         }
+        queued
     }
 
     /// Hands a synthesized reset to the leg that writes to the switch. The
@@ -1499,6 +1510,21 @@ impl SessionGate {
     #[must_use]
     pub fn admits_direct_tcp(&self, port: u16) -> bool {
         self.allowed.contains(&port)
+    }
+}
+
+impl Drop for SessionGate {
+    /// The gate's teardown flush: every count its audit still holds unsaid is
+    /// said now, in the one audit format, because nothing after the gate
+    /// exists to carry one — a count the session's last window was still
+    /// holding would otherwise be the audit's one silent loss, dropped with
+    /// the gate that counted it. The last handle going away is the session's
+    /// own end: both relay legs are done with the gate, and the live-gate
+    /// table holds it only weakly.
+    fn drop(&mut self) {
+        for line in self.refusals.flush_pending() {
+            tracing::warn!("{line}");
+        }
     }
 }
 
