@@ -1009,6 +1009,32 @@ impl IngressRules {
             .any(|(declared, declared_port)| *declared == proto && *declared_port == port)
     }
 
+    /// What the box's dynamic stance and permit range say about one port
+    /// (NET-043/NET-047): the one derivation every runtime ingress surface
+    /// reads — the daemon's `min net expose` decision and the listen
+    /// verdict below both call it, so a port one surface publishes is a
+    /// port the other publishes too, for the same reason.
+    ///
+    /// The stance decides first and the range second, so a box that denies
+    /// never reveals whether the port would have been in range: absent or
+    /// `deny` is `Deny` (the deny-all default an absent setting means), `ask`
+    /// is `Ask` (nobody is there to answer it), and only an `allow` stance
+    /// reaches the range at all — an absent range permits nothing
+    /// (`NoRange`), a port outside it is named out of it
+    /// (`OutOfRange`), and a port inside it, at either bound, is `Allow`.
+    #[must_use]
+    pub fn dynamic_verdict(&self, port: u16) -> DynamicPortVerdict {
+        match self.dynamic {
+            None | Some(DynamicIngress::Deny) => DynamicPortVerdict::Deny,
+            Some(DynamicIngress::Ask) => DynamicPortVerdict::Ask,
+            Some(DynamicIngress::Allow) => match self.permitted {
+                None => DynamicPortVerdict::NoRange,
+                Some((low, high)) if low <= port && port <= high => DynamicPortVerdict::Allow,
+                Some(range) => DynamicPortVerdict::OutOfRange { range },
+            },
+        }
+    }
+
     /// The shared verdict for one port a process in the box is listening on,
     /// on the transport it listens with (NET-016): whether the listener
     /// watcher publishes it on the box's address, and what holds the port
@@ -1017,7 +1043,11 @@ impl IngressRules {
     /// `Publish` needs every fact the declaration gives: the box's dynamic
     /// stance is `allow`, the port falls inside the permit range — the
     /// range is inclusive at both ends, and an absent one permits nothing
-    /// — and no declaration names the port on the listener's transport. A
+    /// — and no declaration names the port on the listener's transport.
+    /// The stance and the range are [`IngressRules::dynamic_verdict`]'s to
+    /// derive, shared with the runtime `expose` decision, so the two
+    /// surfaces cannot part ways on a port; the declaration is the half
+    /// only this verdict adds. A
     /// declaration that names the port on the *other* transport alone is
     /// not that: its forward answers the protocol it was exposed with and
     /// never this listener's, so the port is not published already here —
@@ -1037,14 +1067,40 @@ impl IngressRules {
         if self.declares(proto, port) {
             return ListenVerdict::Declared;
         }
-        let permitted = self
-            .permitted
-            .is_some_and(|(low, high)| low <= port && port <= high);
-        if permitted && matches!(self.dynamic, Some(DynamicIngress::Allow)) {
-            return ListenVerdict::Publish;
+        match self.dynamic_verdict(port) {
+            DynamicPortVerdict::Allow => ListenVerdict::Publish,
+            DynamicPortVerdict::Deny
+            | DynamicPortVerdict::Ask
+            | DynamicPortVerdict::NoRange
+            | DynamicPortVerdict::OutOfRange { .. } => ListenVerdict::Deny,
         }
-        ListenVerdict::Deny
     }
+}
+
+/// What the box's dynamic stance and permit range say about one port
+/// (NET-043/NET-047) — the shared derivation behind both runtime ingress
+/// surfaces, spelled out one fact per variant so each surface can render its
+/// own typed refusal from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicPortVerdict {
+    /// The stance is `allow` and the port is inside the permit range: the
+    /// port may be published at runtime.
+    Allow,
+    /// The stance is absent or `deny`: the box declines every runtime
+    /// publish, and no range is read.
+    Deny,
+    /// The stance is `ask`: the publish waits on an answer nobody on this
+    /// surface can give, so it fails closed.
+    Ask,
+    /// The stance is `allow` but no range was opted in, so nothing is
+    /// permitted.
+    NoRange,
+    /// The stance is `allow` but the port falls outside the range that was
+    /// opted in, which is carried with the refusal so it can be named.
+    OutOfRange {
+        /// The range the box opted in, inclusive at both ends.
+        range: (u16, u16),
+    },
 }
 
 /// What the shared listen verdict says one listening port is (NET-016):
