@@ -695,7 +695,9 @@ impl DropReason {
             Self::Truncated => "egress-truncated-ipv4",
             Self::UndeclaredProtocol { .. } => "egress-undeclared-protocol",
             Self::DeniedSubnet { .. } => "egress-denied-subnet",
-            Self::UncredentialedProxyDestination { .. } => "egress-uncredentialed-proxy-destination",
+            Self::UncredentialedProxyDestination { .. } => {
+                "egress-uncredentialed-proxy-destination"
+            }
             Self::UndeclaredSubnet { .. } => "egress-undeclared-subnet",
         }
     }
@@ -1507,10 +1509,10 @@ mod tests {
         // a node-local proxy on a host with no gate beside the relay is
         // no more reachable through an absent egress section than a
         // VM-backed one's is.
-        let allow_all_laned = EgressRules::from_policy(None, RESOLVER, LEASE)
-            .with_credentialed_upstream(PROXY);
-        let allow_all_unlaned = EgressRules::from_policy(None, RESOLVER, LEASE)
-            .with_box_egress_proxy(PROXY);
+        let allow_all_laned =
+            EgressRules::from_policy(None, RESOLVER, LEASE).with_credentialed_upstream(PROXY);
+        let allow_all_unlaned =
+            EgressRules::from_policy(None, RESOLVER, LEASE).with_box_egress_proxy(PROXY);
         for (label, rules) in [
             ("an allow-all box that declared the lane", &allow_all_laned),
             ("an allow-all box that declared no lane", &allow_all_unlaned),
@@ -2253,8 +2255,7 @@ mod kani_proofs {
                 // still see, so it is not this drop's.
                 let non_listener = rules.proxy.is_some_and(|listener| {
                     dst == listener.addr
-                        && !(proto == listener.proto
-                            && summary.destination_port() == listener.port)
+                        && !(proto == listener.proto && summary.destination_port() == listener.port)
                 });
                 let protocols = rules
                     .allow_protocols
