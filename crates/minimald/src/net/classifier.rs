@@ -344,8 +344,12 @@ const REJECT_SET: [libc::c_int; 3] = [libc::EHOSTUNREACH, libc::EACCES, libc::EP
 /// How long the parent waits for one probe child's report: the child does
 /// one migration write and one loopback connect, both of which the kernel
 /// answers in its own time, so a child that outlives this will not report —
-/// and reads as [`Observed::TimedOut`], never as a refusal.
-const PROBE_DEADLINE: Duration = Duration::from_secs(1);
+/// and reads as [`Observed::TimedOut`], never as a refusal. A refused
+/// connect takes about a second: the ICMP reject for the first SYN lands
+/// while `connect()` still holds the socket, so the kernel records it as a
+/// soft error and `connect()` fails only at the first SYN retransmit
+/// (initial RTO, 1 s). Three seconds outlasts that retransmit with room.
+const PROBE_DEADLINE: Duration = Duration::from_secs(3);
 
 /// The migration file a child writes its own pid into: `cgroup.procs`, the
 /// file the kernel makes in every cgroup2 directory and the one a stand-in
@@ -2014,6 +2018,8 @@ mod tests {
         // a probe that cannot read the classification reads the step as
         // not installed, never as installed on the strength of a marker
         // whose table's bits it cannot name.
+        std::fs::remove_dir_all(root.join(TEST_CT_MARK_RECORD))
+            .expect("removing the recorded mask");
         std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
             .expect("the step writes the table's marker");
         assert_eq!(

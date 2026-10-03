@@ -2810,6 +2810,8 @@ async fn a_native_launch_over_either_probe_cause_runs_records_none_and_advises()
     }
     std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
         .expect("the step writes the marker");
+    std::fs::create_dir_all(root.join("ct-mark-mask-0x30000000"))
+        .expect("the step records the ct-mark mask beside the marker");
     let mountinfo = format!(
         "35 30 0:26 / {} rw,relatime shared:2 - cgroup2 cgroup2 rw,nsdelegate\n",
         mountpoint.display(),

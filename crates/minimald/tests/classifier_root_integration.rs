@@ -1124,7 +1124,11 @@ fn classifier_table_loads_on_this_kernel() {
     // connection is classed, the boxes subtree takes the cohort bit, the
     // rest of the slice the node bit behind a mask guard so the boxes
     // rule's mark is final, and every set writes the mask's two bits alone
-    // (the clear mask beside the bit each rule sets).
+    // (the clear mask beside the bit each rule sets). nft lists the set
+    // folded: `and 0xcfffffff or BIT` comes back as
+    // `& (0xcfffffff | BIT) | BIT` — `& 0xdfffffff | 0x10000000` for the
+    // cohort bit, `& 0xefffffff | 0x20000000` for the node bit — which
+    // clears and sets exactly the same bits, so that is the spelling pinned.
     let classify = table
         .split("chain classify {")
         .nth(1)
@@ -1132,7 +1136,8 @@ fn classifier_table_loads_on_this_kernel() {
     let classify = classify
         .lines()
         .take_while(|line| !line.trim_start().starts_with('}'))
-        .collect::<String>();
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         classify.contains("hook output priority mangle")
             || classify.contains("hook output priority -150"),
@@ -1148,8 +1153,7 @@ fn classifier_table_loads_on_this_kernel() {
     assert!(
         boxes_rule[0].contains("ct state new")
             && boxes_rule[0].contains("socket cgroupv2 level 2")
-            && boxes_rule[0].contains("0xcfffffff")
-            && boxes_rule[0].contains("0x10000000"),
+            && boxes_rule[0].contains("& 0xdfffffff | 0x10000000"),
         "the boxes subtree's rule classes a new connection with the cohort \
          bit, writing the mask's two bits and no others: {classify}"
     );
@@ -1163,8 +1167,7 @@ fn classifier_table_loads_on_this_kernel() {
         slice_rule[0].contains("ct state new")
             && slice_rule[0].contains("socket cgroupv2 level 1")
             && slice_rule[0].contains("0x30000000")
-            && slice_rule[0].contains("0xcfffffff")
-            && slice_rule[0].contains("0x20000000"),
+            && slice_rule[0].contains("& 0xefffffff | 0x20000000"),
         "the slice's own rule classes a new connection that no mark claims \
          yet with the node bit, the mask's own guard keeping a flow the \
          boxes rule already decided final: {classify}"
@@ -1180,7 +1183,8 @@ fn classifier_table_loads_on_this_kernel() {
     let postrouting = postrouting
         .lines()
         .take_while(|line| !line.trim_start().starts_with('}'))
-        .collect::<String>();
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         !postrouting.contains("socket"),
         "the postrouting chain translates by the mark alone — a socket-cgroup \
@@ -1643,8 +1647,10 @@ fn foreign_ct_mark_bits_survive_classification() {
         .port();
 
     // The witness: foreign bits 0x00000003, set on a new connection to
-    // that port before the classify chain runs (-200 against the mangle
-    // priority's -150), and the mark read back after it (-100), one
+    // that port before the classify chain runs (-180: after conntrack at
+    // -200, so the connection's ct exists to mark — an equal -200 hook would
+    // be inserted ahead of conntrack's and set nothing — and before
+    // classify at -150), and the mark read back after it (-100), one
     // counter per expectation. The set writes bits the install's mask
     // never names; the read names the two marks the legs must leave and
     // the one loss a leg must never show.
@@ -1654,7 +1660,7 @@ fn foreign_ct_mark_bits_survive_classification() {
         &format!(
             "table inet {witness} {{
     chain set_foreign {{
-        type filter hook output priority -200; policy accept;
+        type filter hook output priority -180; policy accept;
         oifname \"lo\" tcp dport {port} ct state new ct mark set ct mark or 0x00000003
     }}
     chain read_marks {{
@@ -1791,8 +1797,10 @@ fn install_refuses_an_overlapping_ct_mark_user() {
         String::from_utf8_lossy(&refused.stdout),
         String::from_utf8_lossy(&refused.stderr),
     );
+    // nft lists the fixture's `or` as `|`; either spelling is the rule.
     assert!(
-        refusal.contains("ct mark set ct mark or 0x10000000"),
+        refusal.contains("ct mark set ct mark | 0x10000000")
+            || refusal.contains("ct mark set ct mark or 0x10000000"),
         "the refusal names the rule it found: {refusal}"
     );
     assert!(
@@ -1805,8 +1813,10 @@ fn install_refuses_an_overlapping_ct_mark_user() {
     );
 
     // The escape, over the same standing user: the install goes through,
-    // and the mask it chose is the one it recorded beside the marker.
-    let escaped = install_over_scratch_with(&scratch, &account, &["--ct-mark-mask", "0x0000c000"]);
+    // and the mask it chose is the one it recorded beside the marker. The
+    // escape's bits avoid the fixture's, the default 0x30000000, Tailscale's
+    // 0x00ff0000 and kube-proxy's 0x4000/0x8000.
+    let escaped = install_over_scratch_with(&scratch, &account, &["--ct-mark-mask", "0x0c000000"]);
     assert!(
         escaped.status.success(),
         "the install goes through over the same standing user once told to class \
@@ -1815,7 +1825,7 @@ fn install_refuses_an_overlapping_ct_mark_user() {
         String::from_utf8_lossy(&escaped.stderr),
     );
     assert!(
-        scratch.join("ct-mark-mask-0x0000c000").is_dir(),
+        scratch.join("ct-mark-mask-0x0c000000").is_dir(),
         "the escaped install records the mask it classifies with, named as it \
          rendered it: {}",
         scratch.display()

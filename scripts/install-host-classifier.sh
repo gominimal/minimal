@@ -541,8 +541,9 @@ require_mask() {
     # parses rather than wrapping — which is exactly what must be refused
     # here, not silently classified with.
     mask_value=$((16#$(printf '%s' "$digits" | tr 'A-F' 'a-f')))
-    [ "$mask_value" -gt 0 ] && [ "$mask_value" -le $((0xffffffff)) ] ||
+    if [ "$mask_value" -le 0 ] || [ "$mask_value" -gt $((0xffffffff)) ]; then
         die "--ct-mark-mask must name bits inside the 32 a connection mark holds, got: $ct_mark_mask"
+    fi
     # Exactly two contiguous set bits: the mask is 3 shifted left by some k
     # in 0..30. Anything else — one bit, three or more, or two that are not
     # adjacent — is not a pair of identities and is refused.
@@ -728,6 +729,15 @@ verify_mount
 resolve_owner
 require_identities
 require_mask
+command -v nft >/dev/null 2>&1 ||
+    die "nft is this step's dependency: install it (e.g. apt install nftables) and run this step again"
+# The bits this install classifies with are nobody else's: whatever ruleset
+# the host carries is scanned for a ct-mark user of them, ours excepted,
+# and a conflict is refused, named, with the override — never installed
+# over, because a silent overwrite would corrupt both sides' facts. The
+# scan runs before anything is laid out, so a refused install touches
+# nothing on the host.
+scan_ct_mark_conflicts
 
 # mkdir, not install -d: on a cgroup2 mount mkdir is the operation itself (the
 # hierarchy decides its own permissions, there is no mode to set), and it is
@@ -776,13 +786,6 @@ compute_cgroup_paths
 # run left in one move. nft resolves the cgroups' paths against the
 # hierarchy at load, so a transaction naming a cgroup this step did not make
 # dies whole.
-command -v nft >/dev/null 2>&1 ||
-    die "nft is this step's dependency: install it (e.g. apt install nftables) and run this step again"
-# The bits this install classifies with are nobody else's: whatever ruleset
-# the host carries is scanned for a ct-mark user of them, ours excepted,
-# and a conflict is refused, named, with the override — never installed
-# over, because a silent overwrite would corrupt both sides' facts.
-scan_ct_mark_conflicts
 # The marker goes before the load, not after a failed one: it is the one
 # fact the daemon reads, and a marker that outlives a failed re-install
 # would vouch for a table this step did not render — the previous one —
