@@ -217,15 +217,23 @@ pub struct IngressPolicy {
     /// Inclusive port range within which dynamic port-mapping requests are
     /// accepted; `None` means dynamic mapping is disallowed.
     ///
-    /// Stored on the [`Record`] and returned verbatim by `GetSessionPolicy`,
-    /// but **not yet enforced**: dynamic port-mapping is split to #553. Until
-    /// then a set range is recorded configuration only, with no runtime effect.
+    /// Enforced on the listen-publication surface (NET-016, NET-017): under
+    /// a [`DynamicIngress::Allow`] stance, a port a process in the box
+    /// *listens* on is published on the box's address while it falls inside
+    /// this range — inclusively at both ends — and withdrawn when the
+    /// listener closes. The decision is the shared one in
+    /// [`core::egress::IngressRules`], which the daemon's listener watcher
+    /// applies and the Kani harness exhausts. Stored on the [`Record`] and
+    /// returned verbatim by `GetSessionPolicy`.
     pub dynamic_allowed_range: Option<(u16, u16)>,
     /// How dynamic port-mapping requests from inside the box are decided.
     /// `None` means the default deny-all applies.
     ///
-    /// Stored on the [`Record`] and returned verbatim by `GetSessionPolicy`,
-    /// but **not yet enforced**: the runtime evaluation is split to #553.
+    /// The gate on the whole listen-publication surface (NET-016, NET-138):
+    /// only `allow` publishes a port because a process listens on it. `ask`
+    /// routes the request to the attached human — listening alone is never
+    /// the human's yes — and `deny`, like an absent setting, keeps every
+    /// listening port unpublished.
     pub dynamic_ingress: Option<DynamicIngress>,
 }
 
@@ -476,19 +484,20 @@ pub enum PolicyError {
     /// An ingress `dynamic_allowed_range` was given with its lower bound above
     /// its upper bound (e.g. `(8443, 8000)`). The range is inclusive, so a
     /// reversed pair describes no ports; rejected at launch so the misconfig is
-    /// named where it can be fixed, rather than persisting on the `Record` until
-    /// #553's dynamic-port-mapping layer consumes it.
+    /// named where it can be fixed, rather than persisting on the `Record` as
+    /// a permit the listen-publication surface (NET-016) would silently read
+    /// as permitting nothing.
     #[error(
         "ingress dynamic_allowed_range lower bound {lo} exceeds upper bound \
          {hi}; the range is inclusive — set lo <= hi"
     )]
     InvalidDynamicRange { lo: u16, hi: u16 },
     /// An ingress `dynamic_allowed_range` lower bound is a privileged host port
-    /// (< 1024). The lower bound is the smallest host port a runtime mapping
-    /// request may publish, so the same rootless-privilege constraint that
-    /// rejects a static mapping's privileged `external_port` applies. Rejected at
-    /// launch so the misconfig is named where it can be fixed, rather than
-    /// surfacing opaquely when #553's dynamic-port-mapping layer consumes it.
+    /// (< 1024). The lower bound is the smallest host port a listen-published
+    /// port may publish (NET-016), so the same rootless-privilege constraint
+    /// that rejects a static mapping's privileged `external_port` applies.
+    /// Rejected at launch so the misconfig is named where it can be fixed,
+    /// rather than surfacing as a publication the forwarder cannot bind.
     #[error(
         "ingress dynamic_allowed_range lower bound {lo} is a privileged host \
          port; minimald refuses to publish host ports below 1024 — set a lower \
