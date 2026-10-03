@@ -42,6 +42,13 @@ russh.workspace = true
 russh-sftp.workspace = true
 serde.workspace = true
 serde_json_lenient.workspace = true
+# Sha256 of exactly the bytes the guest's boot load pipes to nft (NET-079):
+# the digest the load logs so a render's bytes can be compared off-host
+# without re-rendering anything. Hashing only, same trait the native lane's
+# cargo-digester uses.
+sha2.workspace = true
+# The digest's lowercase-hex spelling, the same one the cache's sha256s use.
+hex.workspace = true
 sysinfo.workspace = true
 tar.workspace = true
 tempfile.workspace = true
@@ -98,6 +105,11 @@ lcache.workspace = true
 # Property tests over the request parsers (NET spec, tiers: the T1 lane adds
 # this dev-dependency; see `net/proxy.rs` for the first property test).
 proptest.workspace = true
+# The classifier's decision memo and its held probe listeners are this
+# daemon's own process-global state; tests that read a launch's decision
+# through them (NET-079, `net/classifier.rs`, `net/provider.rs`) mark
+# themselves serial so no two of them race one memo.
+serial_test.workspace = true
 
 # The guest (initramfs pid-1) boot path is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]

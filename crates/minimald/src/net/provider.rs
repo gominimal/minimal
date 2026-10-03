@@ -215,6 +215,26 @@ impl Network for HostIpAddressNetwork {
                 // `/etc/hosts` at the host's loopback.
                 return sandbox2::HostNet.plan().await;
             }
+            // NET-079: a VM host that decides per box resolves a deny-all
+            // host-address box through the guest's own answerer, at the
+            // guest's loopback — the same address and port the loaded table's
+            // dstnat retargets that subtree's DNS-port lookups onto, so the
+            // carve-out the rule admits and the resolver the box is pointed
+            // at are one fact, and nothing outside resolves. The decision the
+            // launch just read is the gate: it is read fresh before every
+            // host-address launch, and a launch's plan follows its own
+            // decision — a guest whose boot's check or load failed, whose
+            // table is gone behind its marker, or whose probe did not read a
+            // refusal falls through to the node's DNS layer below, exactly
+            // as before this host could decide.
+            if self.verdict == sandbox2::config::Verdict::Deny
+                && crate::net::classifier::freshest_decision()
+                    .is_some_and(|decision| decision.can_decide_per_box())
+            {
+                return Ok(NetPlan::host().with_resolver(Resolver::Nameservers(vec![
+                    crate::net::classifier::ANSWERER_ADDRESS,
+                ])));
+            }
             // NET-003: on a VM host, 127.0.0.1 in the namespace a host-address
             // box shares is the guest's loopback, not the host's, and the host
             // resolver `/etc/hosts` would complement is unreachable. The node's
@@ -688,7 +708,12 @@ mod tests {
     /// deny-all keeps the host's resolver, and a deny-all box on a VM host
     /// keeps the node's DNS layer: the answerer is this host's loopback, which
     /// a box in the guest's namespace has no reach into.
+    ///
+    /// Serial because the VM-host half reads the decision memo, which the
+    /// test below writes on purpose: a `per_box` decision in it is what makes
+    /// that half answer differently, so the two must not race one memo.
     #[tokio::test]
+    #[serial_test::serial]
     async fn host_ip_box_resolves_through_answerer() {
         let deny_all = Some(sessions::SessionPolicy::new(
             Some(sessions::EgressPolicy::deny_all()),
@@ -766,6 +791,96 @@ mod tests {
             &Resolver::Nameservers(vec![crate::net::SwitchSubnet::default().dns_server()]),
             "a VM host's deny-all box resolves through the node's DNS layer"
         );
+    }
+
+    /// NET-079 on a VM host: the plan a deny-all host-address box gets follows
+    /// its launch's own decision — a guest that decided per box resolves the
+    /// box through its own answerer at 127.0.0.1, the one carve-out the loaded
+    /// table admits by address and port and the one its dstnat rule retargets
+    /// that subtree's DNS-port lookups onto; a guest that decided nothing —
+    /// a boot whose check or load failed, a table gone behind its marker, a
+    /// probe that read no refusal — keeps the node's DNS layer, exactly as
+    /// before it could decide. The gate is the decision the launch's reader
+    /// recorded, read fresh per launch: the same box on the same host
+    /// follows whichever decision its own launch read, and a box that is
+    /// not deny-all needs no carve-out enforced, so no decision changes
+    /// its resolver.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn guest_deny_all_box_resolves_through_answerer_once_decided() {
+        use crate::net::classifier::{Cause, Decision, note_decision};
+
+        let deny_all = Some(sessions::SessionPolicy::new(
+            Some(sessions::EgressPolicy::deny_all()),
+            None,
+        ));
+        let switch = counting_switch();
+        let subnet = crate::net::SwitchSubnet::default();
+        let plan = |policy| network_for(NetworkMode::HostNet, &switch, "s", policy, None, None);
+
+        // Undecided — a launch that has read no decision, or one that read an
+        // undecidable cause: the box resolves through the node's DNS layer at
+        // the switch gateway, the resolver it had before its guest could
+        // decide anything.
+        note_decision(&Decision::undecidable(Cause::GuestTableNotLoaded));
+        let undecidable = plan(deny_all.clone())
+            .plan()
+            .await
+            .expect("host-address plans do not fail");
+        assert_eq!(
+            undecidable.resolver(),
+            &Resolver::Nameservers(vec![subnet.dns_server()]),
+            "a guest that decides nothing keeps the node's DNS layer"
+        );
+
+        // Decided per box: the same box resolves through the guest's own
+        // answerer, the one destination the loaded table's deny chain admits
+        // and its dstnat rule retargets the subtree's lookups onto — the
+        // carve-out the table enforces and the resolver the plan names are
+        // one fact.
+        note_decision(&Decision::decided());
+        let decided = plan(deny_all.clone())
+            .plan()
+            .await
+            .expect("host-address plans do not fail");
+        assert_eq!(
+            decided.resolver(),
+            &Resolver::Nameservers(vec![crate::net::classifier::ANSWERER_ADDRESS]),
+            "a guest that decides per box resolves a deny-all box through its \
+             own answerer"
+        );
+
+        // The memo is the launch's own, never a default kept between them:
+        // the next launch that reads an undecidable decision falls back again.
+        note_decision(&Decision::undecidable(Cause::GuestTableNotLoaded));
+        let again = plan(deny_all)
+            .plan()
+            .await
+            .expect("host-address plans do not fail");
+        assert_eq!(
+            again.resolver(),
+            &Resolver::Nameservers(vec![subnet.dns_server()]),
+            "the decision is read per launch: a later undecidable reading \
+             falls back to the node's DNS layer"
+        );
+
+        // And the gate is the decision over a verdict that needs one: a box
+        // that is not deny-all runs unenforced whatever the host decided, so
+        // its resolver is the node's either way.
+        let plain = plan(None)
+            .plan()
+            .await
+            .expect("host-address plans do not fail");
+        assert_eq!(
+            plain.resolver(),
+            &Resolver::Nameservers(vec![subnet.dns_server()]),
+            "a box that is not deny-all has no carve-out to resolve through, \
+             decided or not"
+        );
+
+        // Leave the memo as nothing decided, so no later reader in this
+        // process inherits this test's decision.
+        note_decision(&Decision::undecidable(Cause::GuestTableNotLoaded));
     }
 
     /// NET-079's cgroup half, as the provider selects it: a host-address box's
