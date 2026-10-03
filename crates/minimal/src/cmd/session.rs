@@ -1982,12 +1982,14 @@ pub async fn cmd_session_setup_zed(
 ///
 /// Rows are in setup order — project first, then loadouts in the order
 /// they were applied. Teardown runs the reverse.
-pub(crate) async fn cmd_session_hooks(
-    global: &GlobalArgs,
-    args: HooksArgs,
-) -> Result<(), anyhow::Error> {
+pub async fn cmd_session_hooks(global: &GlobalArgs, args: HooksArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
     let mut client = connect_daemon(global).await?;
+
+    // Resolve the session first so a missing name produces the shared
+    // `No session found matching '<name>'` error, like every other session
+    // command, instead of the daemon's bare `no session found`.
+    resolve_session(&mut client, &args.session).await?;
 
     use minimald_rpc::{GetSessionHooks, GetSessionHooksRequest};
     let lookup: GetSessionHooksRequest = SessionLookup::parse(&args.session).into();
@@ -1998,7 +2000,11 @@ pub(crate) async fn cmd_session_hooks(
 
     let hooks = match resp {
         minimald_rpc::Errorable::Ok(hooks) => hooks,
-        minimald_rpc::Errorable::Err { error } => bail!("{error}"),
+        // A session that disappears between the lookup and this call still
+        // names what was asked for.
+        minimald_rpc::Errorable::Err { error: _ } => {
+            bail!("No session found matching '{}'", args.session)
+        }
     };
 
     if args.json {

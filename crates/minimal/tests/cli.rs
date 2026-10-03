@@ -1363,6 +1363,33 @@ async fn setup_opted_out() -> (
     (server, args, temp)
 }
 
+// --- session hooks ---
+
+/// `min session hooks` names the session it could not find, like every other
+/// session command: a missing name resolves through `resolve_session` first,
+/// so the error is `No session found matching '<name>'` rather than the
+/// daemon's bare `no session found`.
+#[tokio::test]
+async fn session_hooks_missing_session_names_the_lookup() {
+    let (_daemon, args) = setup().await;
+
+    let err = cmd_session_hooks(
+        &args,
+        HooksArgs {
+            session: "nosuch".to_string(),
+            json: false,
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "No session found matching 'nosuch'",
+        "a missing session must be named in the error"
+    );
+}
+
 // --- hostname routing warning (NET-020/NET-021/NET-022) ---
 //
 // The startup retry lives in `minimald::server` behind the Linux gate with the
