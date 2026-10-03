@@ -394,6 +394,19 @@ pub const REVOKED_INGRESS_PORT_RULE: &str = "revoked ingress port";
 /// socket of the peer's listens on.
 pub const UNLISTENED_PROXY_PORT_RULE: &str = "unlistened proxy port";
 
+/// Rule text for the box egress proxy's pre-screen refusing a connection from
+/// a source no registered row holds (NET-134): no row, no share, no socket.
+pub const NO_REGISTERED_ROW_RULE: &str = "no registered row";
+
+/// Rule text for the box egress proxy's pre-screen refusing a connection
+/// whose frame's source MAC is not the address's switch-derived MAC — the
+/// host-side leg of the same anti-spoof line the switch's static leases hold.
+pub const FOREIGN_SOURCE_MAC_RULE: &str = "foreign source mac";
+
+/// Rule text for the box egress proxy's pre-screen refusing a connection from
+/// a source already holding its share's cap of the listener pool.
+pub const SHARE_SPENT_RULE: &str = "per-source share spent";
+
 /// What a refusal answers for: the audit line's rule and its reason. A
 /// `Copy` pair of `&'static str`s — the vocabulary is the codebase's rule
 /// constants, which is also what bounds the emitter's overflow buckets
@@ -423,6 +436,27 @@ pub const REVOKED_PORT: Class = Class {
 pub const UNLISTENED_PROXY_PORT: Class = Class {
     rule: UNLISTENED_PROXY_PORT_RULE,
     reason: "no socket is listening on the port",
+};
+
+/// A connection the box egress proxy's pre-screen refused because no
+/// registered row holds its source: no row, no share, no socket.
+pub const NO_REGISTERED_ROW: Class = Class {
+    rule: NO_REGISTERED_ROW_RULE,
+    reason: "the source's box has no registered row",
+};
+
+/// A connection the box egress proxy's pre-screen refused because its frame
+/// arrived from a MAC the switch would never lease to the source address.
+pub const FOREIGN_SOURCE_MAC: Class = Class {
+    rule: FOREIGN_SOURCE_MAC_RULE,
+    reason: "the source MAC is not the address's switch-derived MAC",
+};
+
+/// A connection the box egress proxy's pre-screen refused because its source
+/// already holds its share's cap of the listener pool.
+pub const SHARE_SPENT: Class = Class {
+    rule: SHARE_SPENT_RULE,
+    reason: "the source already holds its share of the pool",
 };
 
 /// What the refused connection reached for, as the audit line names it: the

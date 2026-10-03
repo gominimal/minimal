@@ -2412,6 +2412,88 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
+    /// A minimal WARN-and-up subscriber for the tests that assert on the
+    /// shared refusal audit's lines. The crate carries no `tracing-subscriber`
+    /// behind `stack-peer`, so the test module rolls its own: `enabled`
+    /// filters to WARN so only the audit's lines reach the log, and `event`
+    /// records each line's message.
+    #[derive(Clone, Default)]
+    struct WarnLog(StdArc<StdMutex<Vec<String>>>);
+
+    /// Records an event's `message` field — the shared audit's whole line.
+    struct MessageField<'a>(&'a mut String);
+
+    impl tracing::field::Visit for MessageField<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+            if field.name() == "message" {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, "{value:?}");
+            }
+        }
+    }
+
+    impl WarnLog {
+        /// The lines said so far, in order.
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().expect("the test owns the log").clone()
+        }
+    }
+
+    impl tracing::Subscriber for WarnLog {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut line = String::new();
+            event.record(&mut MessageField(&mut line));
+            self.0.lock().expect("the test owns the log").push(line);
+        }
+
+        // The crate emits no span, so the span half of the trait is inert: a
+        // single id that nothing records into and nothing enters.
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Capture every WARN line the current thread emits while the guard
+    /// lives. The lane drives the stack on the test's own thread, so the
+    /// thread-local default subscriber is the one that sees the audit.
+    fn capture_warn_lines() -> (WarnLog, tracing::subscriber::DefaultGuard) {
+        let log = WarnLog::default();
+        let guard = tracing::subscriber::set_default(log.clone());
+        (log, guard)
+    }
+
+    /// The shared audit line a refusal of `class` from `source`, reaching
+    /// for `port` at `address`, says as the `refusals`th of its window —
+    /// spelled out here independently of the emitter, so a caller that
+    /// says a shape of its own fails against the one format rather than
+    /// against itself.
+    fn shared_line(
+        class: refusal::Class,
+        address: Ipv4Addr,
+        port: u16,
+        source: Ipv4Addr,
+        refusals: u32,
+    ) -> String {
+        format!(
+            "rule_matched=\"{rule}\" address={address} port={port} reason=\"{reason}\" \
+             source={source} refusals={refusals}",
+            rule = class.rule,
+            reason = class.reason,
+        )
+    }
+
     /// One ARP request frame: broadcast, asking who has `target_ip`. The
     /// sender pair — `sender_mac` at `sender_ip` — is the caller's to
     /// choose: a box's own switch-derived pair, or the spoofed claim a
@@ -3964,6 +4046,120 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// NET-014/NET-081/T70: the stack peer is the fourth caller of the
+    /// shared refusal audit. A SYN its pre-screen refuses is answered with
+    /// the shared builder's reset — compared byte for byte against the
+    /// builder's, not against a shape of the peer's own — says the one line
+    /// format every other refusal leg says, and is bounded per source: a
+    /// box that floods the address spends its own window's quota and loses
+    /// only its own replies, while a sibling's are untouched.
+    #[tokio::test]
+    async fn stack_peer_refusals_use_the_shared_emitter() {
+        let (log, _guard) = capture_warn_lines();
+        let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let box_ip = Ipv4Addr::from(subnet.first_ptask());
+        let box_mac = EthernetAddress(MacAddr::for_switch_ip(box_ip).0);
+        let sibling_ip = Ipv4Addr::from(subnet.first_ptask() + 1);
+        let sibling_mac = EthernetAddress(MacAddr::for_switch_ip(sibling_ip).0);
+
+        // No row is registered, so every SYN either source sends is the
+        // pre-screen's to refuse under the no-row rule.
+        let syn = tcp_syn_from(box_mac, box_ip, proxy_ip, 40_000, PROXY_PORT);
+        h.lane.inject_frame(syn.clone());
+        drive(&mut h.lane, 2).await;
+
+        // The refusal's answer is the shared builder's reset, byte for byte.
+        let outbound = h.lane.stack_outbound();
+        assert_eq!(
+            outbound.len(),
+            1,
+            "the refused SYN is answered with one reset and nothing else"
+        );
+        let segment = refusal::classify(&syn).expect("the SYN classifies");
+        let shared = refusal::refused_tcp_reset(&syn, &segment).expect("a SYN is answered");
+        assert_eq!(
+            outbound[0], shared,
+            "the peer writes the shared builder's reset, not a shape of its own"
+        );
+
+        // ... and the line it says is the shared audit's: the rule, the
+        // address, the port and the reason, with the count of resets written
+        // to that source this window — one line, not one per reset.
+        assert_eq!(
+            log.lines(),
+            vec![shared_line(
+                refusal::NO_REGISTERED_ROW,
+                proxy_ip,
+                PROXY_PORT,
+                box_ip,
+                1
+            )],
+            "the refusal says the one shared line format"
+        );
+
+        // The source's own quota: fifteen more refusals say nothing — the
+        // middle of its window — and the one that spends it says the line.
+        for port in 40_001u16..40_016 {
+            h.lane
+                .inject_frame(tcp_syn_from(box_mac, box_ip, proxy_ip, port, PROXY_PORT));
+            drive(&mut h.lane, 1).await;
+        }
+        assert_eq!(
+            h.lane.stack_outbound().len(),
+            16,
+            "one reset per refusal, sixteen of them"
+        );
+        assert_eq!(
+            log.lines(),
+            vec![
+                shared_line(refusal::NO_REGISTERED_ROW, proxy_ip, PROXY_PORT, box_ip, 1),
+                shared_line(refusal::NO_REGISTERED_ROW, proxy_ip, PROXY_PORT, box_ip, 16),
+            ],
+            "one line when the window opened and one when the quota was spent"
+        );
+
+        // Past the quota the source is answered with nothing at all, and
+        // nothing more is said: the flood spends its own refusals.
+        h.lane
+            .inject_frame(tcp_syn_from(box_mac, box_ip, proxy_ip, 40_100, PROXY_PORT));
+        drive(&mut h.lane, 1).await;
+        assert_eq!(
+            h.lane.stack_outbound().len(),
+            16,
+            "a source that has spent its window is answered with nothing"
+        );
+        assert_eq!(log.lines().len(), 2, "and nothing more is said");
+
+        // A sibling's refusals are untouched: its own row, its own quota, its
+        // own reset — one flooding box starves nobody else.
+        h.lane.inject_frame(tcp_syn_from(
+            sibling_mac,
+            sibling_ip,
+            proxy_ip,
+            40_000,
+            PROXY_PORT,
+        ));
+        drive(&mut h.lane, 1).await;
+        assert_eq!(
+            h.lane.stack_outbound().len(),
+            17,
+            "the sibling is still answered"
+        );
+        assert_eq!(
+            log.lines()[2],
+            shared_line(
+                refusal::NO_REGISTERED_ROW,
+                proxy_ip,
+                PROXY_PORT,
+                sibling_ip,
+                1
+            ),
+            "the sibling's refusal says its own line, on its own row"
+        );
     }
 
     /// NET-132/T69: a SYN from a registered address whose frame carries a
