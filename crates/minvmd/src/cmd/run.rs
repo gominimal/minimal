@@ -203,6 +203,8 @@ fn vmm_owned_by_live_supervisor(pid: u32) -> bool {
         // Cannot determine ownership: treat as owned so we keep waiting.
         return true;
     };
+    // SAFETY: kill(pid, 0) probes for process existence without delivering a
+    // signal.
     ppid != 1 && unsafe { libc::kill(ppid as libc::pid_t, 0) } == 0
 }
 
@@ -313,7 +315,7 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
             ),
             DetachPoll::LeakedVmm(pid) => bail!(
                 "the supervisor exited but a leaked __krun-vmm (pid {pid}) still holds the \
-                 alive lock; run `min stop` or kill {pid}, then retry"
+                 alive lock; run `min stop` (or `kill -9 {pid}`), then retry"
             ),
             DetachPoll::Keep => {}
         }
@@ -1021,6 +1023,21 @@ mod tests {
             super::vmm_owned_by_live_supervisor(nonexistent),
             "cannot-determine-owner must return true (keep waiting)"
         );
+    }
+
+    #[cfg(minvmd_libkrun)]
+    #[test]
+    fn vmm_with_live_non_init_parent_is_owned() {
+        // Our own process has a live parent (the test runner) that is not
+        // init, so it counts as owned on every platform — on macOS this
+        // needs the proc_pidinfo lookup, since /proc does not exist there.
+        // SAFETY: getppid() has no preconditions and cannot fail.
+        if unsafe { libc::getppid() } == 1 {
+            // Running as a direct child of init (e.g. a container pid-1
+            // runner): the premise does not hold.
+            return;
+        }
+        assert!(super::vmm_owned_by_live_supervisor(std::process::id()));
     }
 
     #[cfg(minvmd_libkrun)]
