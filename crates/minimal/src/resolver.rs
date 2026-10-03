@@ -65,6 +65,7 @@ pub(crate) use switch::RESERVED_LOCAL_RANGE;
 /// The resolver file the advisory's command writes on macOS. `nameserver`
 /// plus `port` is the format the loopback-alias spike verified against
 /// mDNSResponder (docs/spikes/2026-09-22-macos-loopback-alias.md).
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) const RESOLVER_FILE: &str = "/etc/resolver/min.internal";
 
 /// The label of the LaunchDaemon unit the macOS advisory command installs
@@ -74,16 +75,19 @@ pub(crate) const RESOLVER_FILE: &str = "/etc/resolver/min.internal";
 /// checks over both, all name these three constants — one definition beside
 /// the command that writes them, so the installed unit, the advisory that
 /// reinstalls it, and the bundle that reads it cannot drift apart.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) const RANGE_UNIT_LABEL: &str = "dev.minimal.local-range";
 
 /// The root-owned path the unit's program is installed at, inside the
 /// system-managed helper directory — a path no user can write (`/Library` is
 /// root-owned, and the custody walk below verifies every component of it).
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) const RANGE_PROGRAM_PATH: &str =
     "/Library/PrivilegedHelperTools/dev.minimal.local-range";
 
 /// The root-owned path the unit's plist is installed at: the plist launchd
 /// scans at boot, which is what makes the range re-apply at every one.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) const RANGE_PLIST_PATH: &str = "/Library/LaunchDaemons/dev.minimal.local-range.plist";
 
 /// The range program's template
@@ -92,22 +96,56 @@ pub(crate) const RANGE_PLIST_PATH: &str = "/Library/LaunchDaemons/dev.minimal.lo
 /// with one absolute-path `ifconfig` alias per usable host address of
 /// [`RESERVED_LOCAL_RANGE`]. The rendered program reads no argument, no
 /// environment variable and no file.
+#[cfg(any(test, target_os = "macos"))]
 const RANGE_PROGRAM_TEMPLATE: &str = include_str!("resolver/reserve-local-range.sh");
 
 /// The line of [`RANGE_PROGRAM_TEMPLATE`] the render replaces.
+#[cfg(any(test, target_os = "macos"))]
 const RANGE_ALIAS_PLACEHOLDER: &str = "@RANGE_ALIASES@";
 
 /// The unit's plist, as the command writes it: label [`RANGE_UNIT_LABEL`],
 /// ProgramArguments the root-owned program path alone, `RunAtLoad` true, no
 /// `KeepAlive`, no `UserName` (it runs as root), no environment variables.
+#[cfg(any(test, target_os = "macos"))]
 const RANGE_UNIT_PLIST: &str = include_str!("resolver/dev.minimal.local-range.plist");
 
 /// The heredoc delimiters the command carries the two files' bytes under.
 /// Distinctive enough that no rendered byte can close one early: the
 /// program's lines are `ifconfig` aliases and the plist's are XML, and
-/// neither can spell these.
+/// neither can spell these. The leading `\` in the command quotes the
+/// delimiter, so the body's lines are written byte for byte, never expanded.
+#[cfg(any(test, target_os = "macos"))]
 const RANGE_PROGRAM_HEREDOC: &str = "MINIMAL_RANGE_PROGRAM_EOF";
+#[cfg(any(test, target_os = "macos"))]
 const RANGE_PLIST_HEREDOC: &str = "MINIMAL_RANGE_PLIST_EOF";
+
+/// Whether the command the advisory names also reserves the local range:
+/// on macOS the one `sudo sh -c` writes the resolver file *and* installs
+/// the range unit (design §7.1's privileged step), so the advisory's lead
+/// sentence and its interim fact say so; on Linux the whole `127/8` is
+/// local to `lo`, the command configures the routing-domain link alone,
+/// and it takes no range step.
+#[cfg(any(test, target_os = "macos"))]
+const COMMAND_RESERVES_THE_RANGE: bool = true;
+#[cfg(any(test, not(target_os = "macos")))]
+const COMMAND_RESERVES_THE_RANGE: bool = false;
+
+/// The range program, rendered from [`RANGE_PROGRAM_TEMPLATE`] with one
+/// absolute-path `ifconfig` alias per usable host address of the reserved
+/// range ([`switch::loopback::range_hosts`], host parts 1 to 254 — the
+/// addresses the bind probe reads), filled in at render time. The rendered
+/// script reads no argument, no environment variable and no file, and
+/// applies exactly the reserved range and nothing else: the two-address
+/// alias form is the one the loopback-alias spike verified against lo0,
+/// each address a `/32`.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn range_program() -> String {
+    let aliases = switch::loopback::range_hosts()
+        .map(|addr| format!("/sbin/ifconfig lo0 alias {addr} 255.255.255.255"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    RANGE_PROGRAM_TEMPLATE.replace(RANGE_ALIAS_PLACEHOLDER, &aliases)
+}
 
 /// `/etc/resolv.conf`: the file every host process's lookup reads (through
 /// the `dns` NSS module), and so the one that must name resolved's stub for
