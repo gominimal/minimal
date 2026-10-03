@@ -1319,6 +1319,62 @@ pub(crate) fn clear_probe_listeners() {
         .clear();
 }
 
+/// The guest's own classifier boot, in the one order its halves can run in
+/// (NET-079): loopback up, then the listeners the effect probe connects to
+/// held for the daemon's life, then the table load.
+///
+/// The order is the whole point of the function. The guest's kernel leaves
+/// `lo` down until something brings it up, and nothing in the boot before
+/// this step does — the daemon's own egress step, which does, runs after
+/// READY — so a listener bound on `127.0.0.1` before it is a bind on an
+/// address a guest that has not brought its loopback up does not carry:
+/// `EADDRNOTAVAIL`, and with it a daemon that holds no V4 listener, reads
+/// its loaded table's effect as unknown, and refuses every deny-all
+/// host-address box for a cause its own boot could have ended. The bind
+/// keeps its tolerance for a family this host does not carry; the order,
+/// not a wider tolerance, is what makes the V4 listener hold.
+///
+/// Each step is still the boot's to attempt whatever the one before it did:
+/// a loopback that will not come up, and listeners that will not bind, are
+/// logged and the boot goes on — the load is not gated on the listeners, and
+/// the decision below is the fact's own reader, so a host that cannot hold
+/// its listeners says so per launch rather than never loading a table that
+/// is still the marker's own cause.
+///
+/// The steps are handed in because each is the guest's own to perform: the
+/// loopback is an interface this daemon brings up with the ioctls it has
+/// (`guest::bring_up_loopback`), the listeners are [`hold_probe_listeners`]'s
+/// to bind and drain, and the load is [`load_guest_table`]'s over the render
+/// the boot builds. A test hands in its own, so the order is what the test
+/// drives — and what it pins — rather than what it assumes.
+pub fn boot_guest_classifier(
+    bring_loopback_up: impl FnOnce() -> std::io::Result<()>,
+    hold: impl FnOnce() -> std::io::Result<Vec<(Family, SocketAddr)>>,
+    load: impl FnOnce() -> Result<GuestLoad, GuestLoadFailure>,
+) {
+    if let Err(cause) = bring_loopback_up() {
+        tracing::error!(
+            error = %cause,
+            "bringing the guest's loopback up for the probe's listeners: \
+             nothing binds 127.0.0.1 on a loopback that is down, so the \
+             table's effect may read as unreadable and host-address boxes \
+             will be refused"
+        );
+    }
+    if let Err(cause) = hold() {
+        tracing::error!(
+            error = %cause,
+            "holding the loopback listener the guest's effect probe connects \
+             to: without it the table's effect reads as unreadable, and \
+             host-address boxes will be refused"
+        );
+    }
+    // The load's own Result is dropped here: nothing branches on it — the
+    // decision is the fact's own reader, and every half of the load that
+    // fails has already said why in its own error line above.
+    let _ = load();
+}
+
 /// Reads the table's effect over the listeners this daemon holds: the
 /// guest's own reading, whose listener is its boot's, not one bound and
 /// dropped per probe — so the probe's evidence is about the table, never
@@ -3690,6 +3746,148 @@ mod tests {
             "the record goes with the marker: only a load that succeeds \
              writes either again"
         );
+    }
+
+    /// The guest's boot order, as the order the boot itself keeps
+    /// (NET-079): the loopback the probe's listeners bind on is up before
+    /// they are held — a guest's kernel leaves `lo` down until something
+    /// brings it up, and a bind on 127.0.0.1 over a loopback that is not up
+    /// is the `EADDRNOTAVAIL` the macOS guest logged — and the V4 listener
+    /// is there whenever the boot reaches its load, so the table a boot
+    /// loads is one whose effect a launch can read. Each half is still the
+    /// boot's to attempt whatever the one before it did: a loopback that
+    /// will not come up, and listeners that will not bind, are logged and
+    /// the load runs behind them, because the marker's table is still the
+    /// decision's own fact and the launch names what it reads.
+    #[test]
+    #[serial_test::serial]
+    fn the_guests_boot_holds_its_v4_listener_before_it_loads() {
+        let mount = standin_mount();
+        let root = &mount.root;
+        let guest_ip = IpAddr::V4(crate::net::SwitchSubnet::default().daemon_ip());
+        let params = guest_params(&mount, Some(&mount.mountinfo), guest_ip, guest_ip);
+        let accepted = tempfile::tempdir().expect("a temp dir holding the recording nft");
+        let nft = recording_nft(accepted.path(), &[]);
+
+        // The order the boot ran its halves in, and the listeners it held
+        // when its load began: recorded by the steps themselves, so what the
+        // test asserts is what the boot ran and not what it assumes.
+        let ran = std::cell::RefCell::new(Vec::new());
+        let held_at_load = std::cell::Cell::new(None::<Vec<(Family, SocketAddr)>>);
+        clear_probe_listeners();
+        boot_guest_classifier(
+            || {
+                ran.borrow_mut().push("loopback");
+                Ok(())
+            },
+            || {
+                ran.borrow_mut().push("listeners");
+                hold_probe_listeners()
+            },
+            || {
+                held_at_load.set(Some(
+                    HELD_PROBE_ENDPOINTS
+                        .lock()
+                        .expect("the probe's listeners are only held by this daemon")
+                        .clone(),
+                ));
+                ran.borrow_mut().push("load");
+                load_guest_table(&guest_bash(), &nft, &params)
+            },
+        );
+        assert_eq!(
+            *ran.borrow(),
+            ["loopback", "listeners", "load"],
+            "the boot brings its loopback up before it holds the probe's \
+             listeners, and holds them before it loads"
+        );
+        let held = held_at_load
+            .take()
+            .expect("the boot reached its load, so it reached it holding something");
+        assert!(
+            held.iter().any(|(family, _)| *family == Family::V4),
+            "the V4 listener the effect probe connects to is held whenever \
+             the guest's boot reaches its load: {held:?}"
+        );
+        assert!(
+            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            "the load the ordered boot ran wrote its marker"
+        );
+
+        // A loopback that will not come up is logged, not fatal: the boot
+        // still holds its listeners — the bind is the kernel's to refuse,
+        // and a host that allows it keeps the verdict the order is for — and
+        // still loads, because the marker's table is not the listeners'.
+        let cause = std::io::Error::other("the loopback would not come up");
+        let _ = std::fs::remove_dir_all(root.join(sandbox2::classifier::TABLE_MARKER));
+        let (ran, held_at_load) = (std::cell::RefCell::new(Vec::new()), std::cell::Cell::new(None));
+        boot_guest_classifier(
+            || {
+                ran.borrow_mut().push("loopback");
+                Err(cause)
+            },
+            || {
+                ran.borrow_mut().push("listeners");
+                hold_probe_listeners()
+            },
+            || {
+                held_at_load.set(Some(
+                    HELD_PROBE_ENDPOINTS
+                        .lock()
+                        .expect("the probe's listeners are only held by this daemon")
+                        .clone(),
+                ));
+                ran.borrow_mut().push("load");
+                load_guest_table(&guest_bash(), &nft, &params)
+            },
+        );
+        assert_eq!(
+            *ran.borrow(),
+            ["loopback", "listeners", "load"],
+            "a loopback that will not come up does not stop the boot: every \
+             half is still attempted, each naming its own failure on the log"
+        );
+        assert!(
+            held_at_load
+                .take()
+                .expect("the boot still reached its load")
+                .iter()
+                .any(|(family, _)| *family == Family::V4),
+            "the listeners are still held, so a host whose kernel allows the \
+             bind keeps the verdict the order is for"
+        );
+        assert!(
+            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            "the load is not gated on the loopback or the listeners: the \
+             marker's table is still the decision's own fact"
+        );
+
+        // And a hold that cannot bind is the same: logged, and the load
+        // still runs, so the tree it leaves is the fact a launch reads.
+        let _ = std::fs::remove_dir_all(root.join(sandbox2::classifier::TABLE_MARKER));
+        let ran = std::cell::RefCell::new(Vec::new());
+        boot_guest_classifier(
+            || {
+                ran.borrow_mut().push("loopback");
+                Ok(())
+            },
+            || {
+                ran.borrow_mut().push("listeners");
+                Err(std::io::Error::other(
+                    "no loopback listener could be held on this guest",
+                ))
+            },
+            || {
+                ran.borrow_mut().push("load");
+                load_guest_table(&guest_bash(), &nft, &params)
+            },
+        );
+        assert_eq!(*ran.borrow(), ["loopback", "listeners", "load"]);
+        assert!(
+            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            "a hold that cannot bind does not stop the load"
+        );
+        clear_probe_listeners();
     }
 
     /// Every half of the guest's load that fails is a half the boot must

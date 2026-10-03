@@ -705,29 +705,25 @@ async fn async_main() -> Result<(), MainError> {
         ),
     }
 
-    // NET-079: the guest's own boot load, after the tree above exists and
-    // before the decision below reads it — the one host whose table this
+    // NET-079: the guest's own classifier boot, after the tree above exists
+    // and before the decision below reads it — the one host whose table this
     // daemon loads itself, because its kernel is its image's alone and no
-    // person can run an installer inside a microVM. The load renders the
-    // installer's table for the tree this daemon just entered its own leaf
-    // of, checks it with `nft -c`, loads it in one transaction, and writes
-    // the presence marker only once it loaded; it logs its own outcome,
-    // check line and load line with the digest of the exact bytes it piped,
-    // and nothing here branches on it — the decision below is the fact's own
-    // reader, and a boot whose load failed reports the guest as unable to
-    // decide per box exactly as a native host without the step does. The
-    // listeners the guest's effect probe connects to are held first and for
-    // the daemon's life, because the probe's evidence is a port that is
-    // refused whenever a launch looks, not one the probe brings with it.
+    // person can run an installer inside a microVM. [`boot_guest_classifier`]
+    // runs it in the one order its halves can keep: loopback up first —
+    // nothing else in the boot has brought `lo` up by this point, and the
+    // probe's listener on 127.0.0.1 is a bind on an address a guest without
+    // its loopback up does not carry — then the listeners the effect probe
+    // connects to, held for the daemon's life because the probe's evidence
+    // is a port that is refused whenever a launch looks, not one the probe
+    // brings with it, then the load itself: the installer's table rendered
+    // for the tree this daemon just entered its own leaf of, checked with
+    // `nft -c`, loaded in one transaction, the presence marker written only
+    // once it loaded. The load logs its own outcome — check line and load
+    // line with the digest of the exact bytes it piped — and nothing here
+    // branches on it: the decision below is the fact's own reader, and a
+    // boot whose load failed reports the guest as unable to decide per box
+    // exactly as a native host without the step does.
     if guest::is_microvm_daemon() {
-        if let Err(cause) = minimald::net::classifier::hold_probe_listeners() {
-            tracing::error!(
-                error = %cause,
-                "holding the loopback listener the guest's effect probe \
-                 connects to: without it the table's effect reads as \
-                 unreadable, and host-address boxes will be refused"
-            );
-        }
         // NET-078's two source identities are the guest's own address on a
         // guest — the cohort and the node plane share it — but the render is
         // told them as the two inputs they are, never left to assume.
@@ -741,10 +737,16 @@ async fn async_main() -> Result<(), MainError> {
             ct_mark_mask: minimald::net::classifier::GUEST_CT_MARK_MASK,
             mountinfo_override: None,
         };
-        let _ = minimald::net::classifier::load_guest_table(
-            std::path::Path::new(minimald::net::classifier::GUEST_BASH),
-            std::path::Path::new(minimald::net::classifier::GUEST_NFT),
-            &render,
+        minimald::net::classifier::boot_guest_classifier(
+            guest::bring_up_loopback,
+            minimald::net::classifier::hold_probe_listeners,
+            || {
+                minimald::net::classifier::load_guest_table(
+                    std::path::Path::new(minimald::net::classifier::GUEST_BASH),
+                    std::path::Path::new(minimald::net::classifier::GUEST_NFT),
+                    &render,
+                )
+            },
         );
     }
 
