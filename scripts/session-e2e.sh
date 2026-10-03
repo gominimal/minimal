@@ -7789,7 +7789,7 @@ proof_own_ip_deny_all_box_answers_published_port() {
     da_denied_rc=$?
     echo "deny-all GET http://$DA_SIBLING_NAME.min.internal:$DA_SIB_INT/ -> curl exit $da_denied_rc: $(head -n1 "$WORK/da-denied.err" 2>/dev/null || true)"
     if [ "$da_denied_rc" -eq 0 ]; then
-      echo "::error::the deny-all box's own connect to the sibling completed (HTTP $(cat "$WORK/da-denied.out" 2>/dev/null | tail -n1)) — its dial escaped the 0.0.0.0/0 deny while its published port answers"
+      echo "::error::the deny-all box's own connect to the sibling completed (HTTP $(tail -n1 "$WORK/da-denied.out" 2>/dev/null)) — its dial escaped the 0.0.0.0/0 deny while its published port answers"
       cat "$WORK/da-denied.err" 2>/dev/null || true
       fail
     fi
