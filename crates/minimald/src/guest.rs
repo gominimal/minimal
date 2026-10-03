@@ -796,12 +796,18 @@ pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
         // delay the detach. The error is logged and swallowed — the data is
         // already synced, so a failed trim only strands extents for the
         // maintenance sweep to reclaim.
-        if let Err(error) = trim_state_volume(mountpoint) {
-            tracing::warn!(
+        match trim_state_volume(mountpoint) {
+            Ok(trimmed_bytes) => tracing::info!(
+                mountpoint,
+                trimmed_bytes,
+                "trimmed state volume on read-only mount before teardown"
+            ),
+            Err(error) => tracing::warn!(
                 mountpoint,
                 %error,
+                remounted_ro = true,
                 "trimming state volume before teardown (best-effort; already synced)"
-            );
+            ),
         }
     } else {
         tracing::warn!(
