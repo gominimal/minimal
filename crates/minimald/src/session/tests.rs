@@ -4895,3 +4895,577 @@ async fn register_hostname_promotes_an_interim_to_its_vouched_hand() {
          to: {promotion_line}"
     );
 }
+
+/// The box a `min net expose` request is decided against: an own-address box
+/// whose ingress declares a dynamic-ingress mode and port range, and whose
+/// creator handed it the address pair a publish needs (the T66 hand) — so the
+/// tests below pin the decision and the publish it leads to, not the
+/// plumbing around them. `mode: None` is the deny-all default a box that
+/// declared nothing runs under.
+fn dynamic_ingress_session_req(
+    name: &str,
+    switch: std::net::Ipv4Addr,
+    loopback: std::net::Ipv4Addr,
+    mode: Option<sessions::DynamicIngress>,
+    range: Option<(u16, u16)>,
+) -> minimald_rpc::CreateSessionRequest {
+    let mut request = own_ip_session_req(name);
+    let ingress = request
+        .config
+        .policy
+        .ingress
+        .as_mut()
+        .expect("own_ip_session_req always declares an ingress policy");
+    ingress.port_mappings.clear();
+    ingress.dynamic_ingress = mode;
+    ingress.dynamic_allowed_range = range;
+    request.config.box_addresses = Some(sessions::BoxAddresses {
+        switch_address: switch,
+        loopback_address: loopback,
+    });
+    request
+}
+
+/// Drives Create → ConfigureLoadout → FinalizeSession for a
+/// [`dynamic_ingress_session_req`] box and returns its id.
+async fn finalize_dynamic_ingress_session(
+    client: &mut TestClient,
+    name: &str,
+    switch: std::net::Ipv4Addr,
+    loopback: std::net::Ipv4Addr,
+    mode: Option<sessions::DynamicIngress>,
+    range: Option<(u16, u16)>,
+) -> SessionId {
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+    let id = client
+        .call::<CreateSession>(&dynamic_ingress_session_req(
+            name, switch, loopback, mode, range,
+        ))
+        .await
+        .unwrap()
+        .id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    finalize_session(client, id).await;
+    id
+}
+
+/// Reads one control request off `stream` — its head through the blank line,
+/// then exactly its `Content-Length` of body — mirroring the keep-alive
+/// framing [`crate::net::policy`] writes, so the stand-in forwarder below
+/// never blocks reading past what the daemon sent. `None` when the client
+/// went away mid-request.
+async fn read_control_request(stream: &mut tokio::net::UnixStream) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::with_capacity(256);
+    let mut scratch = [0u8; 512];
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        let n = stream.read(&mut scratch).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&scratch[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let body_len = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    let mut body = buf[head_end..].to_vec();
+    while body.len() < body_len {
+        let n = stream.read(&mut scratch).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&scratch[..n]);
+    }
+    let request_line = head.lines().next().unwrap_or_default().to_string();
+    Some(format!(
+        "{request_line}\n{}",
+        String::from_utf8_lossy(&body)
+    ))
+}
+
+/// A stand-in for the host gvproxy, bound at the daemon's switch control
+/// socket: serves one request per connection, answering each with `status`,
+/// and records every request it served as `"<request line>\n<body>"`. The
+/// harness never spawns a real forwarder, so binding here is what puts a
+/// control channel behind the publish verbs — a 500 answers the way the real
+/// forwarder answers a bind it cannot make.
+async fn fake_forwarder(
+    sock: std::path::PathBuf,
+    status: u16,
+) -> (
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use tokio::io::AsyncWriteExt;
+    if let Some(parent) = sock.parent() {
+        std::fs::create_dir_all(parent).expect("create the switch state dir");
+    }
+    let listener = tokio::net::UnixListener::bind(&sock).expect("bind the control socket");
+    let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = served.clone();
+    let server = tokio::spawn(async move {
+        // Sequential on purpose: the publish verbs open a fresh connection
+        // per request, so one connection served at a time is their shape.
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Some(request) = read_control_request(&mut stream).await else {
+                continue;
+            };
+            recorded.lock().expect("served lock").push(request);
+            let reason = if (200..300).contains(&status) {
+                "OK"
+            } else {
+                "Internal Server Error"
+            };
+            let _ = stream
+                .write_all(
+                    format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                )
+                .await;
+        }
+    });
+    (server, served)
+}
+
+/// NET-043: a port-publish request from inside a box is decided against the
+/// box's own `dynamic_ingress` setting, on the local daemon — the un-enrolled
+/// host's shape, where the same daemon that owns the switch answers the box
+/// with no host in the middle. A box that allows publishes its port; a box
+/// that declared nothing answers the deny-all default, and the switch is
+/// asked nothing at all for it. The channel hop the in-box `min net expose`
+/// takes is pinned by the session-channel test in `env`; this pins the
+/// decision that hop lands on, and the request a publish rides: exactly the
+/// shape a declared mapping with the same numbers takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_unenrolled_local_rpc_evaluates_dynamic_ingress() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 21),
+        std::net::Ipv4Addr::new(127, 0, 64, 21),
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let db = finalize_dynamic_ingress_session(
+        &mut client,
+        "db",
+        std::net::Ipv4Addr::new(100, 64, 128, 22),
+        std::net::Ipv4Addr::new(127, 0, 64, 22),
+        None,
+        None,
+    )
+    .await;
+    let manager = server.state.sessions_manager().await;
+    let web_handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the allowing box resolves");
+    let db_handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(db))
+        .await
+        .unwrap()
+        .expect("the unenrolled box resolves");
+    let sock = web_handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    // The allowing box publishes; the unenrolled box answers the deny-all
+    // default.
+    web_handle
+        .expose_dynamic(3000)
+        .await
+        .expect("a port the box's dynamic_ingress allows is published");
+    match db_handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::DeniedByPolicy,
+        )) => {}
+        other => panic!("the deny-all default refuses the request: {other:?}"),
+    }
+    forwarder.abort();
+
+    // Exactly one request reached the switch — the allowing box's — and it is
+    // the request a declared mapping with the same numbers takes: the
+    // runtime publish rides the same wire shape the declaration does.
+    let served = served.lock().expect("served lock");
+    assert_eq!(
+        served.len(),
+        1,
+        "a denied request asks the switch nothing: {served:?}"
+    );
+    let (line, body) = served[0]
+        .split_once('\n')
+        .expect("the served request carries its request line and body");
+    assert!(
+        line.starts_with("POST /services/forwarder/expose "),
+        "the publish rides the forwarder's expose verb: {served:?}"
+    );
+    let declared = crate::net::policy::expose_request(
+        &sessions::PortMapping {
+            external_port: 3000,
+            internal_port: 3000,
+            proto: sessions::IpProto::Tcp,
+        },
+        std::net::Ipv4Addr::new(127, 0, 64, 21),
+        std::net::Ipv4Addr::new(100, 64, 128, 21),
+    );
+    assert_eq!(
+        body,
+        String::from_utf8(serde_json_lenient::to_vec(&declared).unwrap()).unwrap(),
+        "the runtime publish is the request a declared mapping with the same \
+         numbers takes"
+    );
+}
+
+/// NET-044: the allowing box's publish is a fact, not a permission — the
+/// port is bound through the switch, the mapping is listed where
+/// `min session policy` reads it, and a second request for the same live port
+/// is refused as the duplicate it is, with the switch asked nothing for it.
+/// The publish says its own line in the daemon log, naming the box, the port,
+/// the decision, and the outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_allow_publishes_and_lists() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 21),
+        std::net::Ipv4Addr::new(127, 0, 64, 21),
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the allowing box resolves");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    let mapping = handle
+        .expose_dynamic(3000)
+        .await
+        .expect("the allowed port publishes");
+    let expected = minimald_rpc::LiveMapping {
+        local: "127.0.64.21:3000".to_string(),
+        internal_port: 3000,
+        proto: sessions::IpProto::Tcp,
+    };
+    assert_eq!(
+        mapping, expected,
+        "the mapping names the box's own address at its own port number"
+    );
+
+    // The port is published already, live: a second request for it would
+    // double-bind the same address, so it is refused as the duplicate it is.
+    match handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::AlreadyPublished(3000),
+        )) => {}
+        other => panic!("a second request for a live port is a duplicate: {other:?}"),
+    }
+    forwarder.abort();
+    assert_eq!(
+        served.lock().expect("served lock").len(),
+        1,
+        "one mapping is one request"
+    );
+
+    // The publish is listed where `min session policy` reads it, by name and
+    // by id alike.
+    let by_name: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Name(
+            "web".to_string(),
+        ))
+        .await;
+    assert_eq!(
+        by_name,
+        minimald_rpc::Errorable::Ok(vec![mapping.clone()]),
+        "the live mapping is listed beside the declaration, by name"
+    );
+    let by_id: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Id(web))
+        .await;
+    assert_eq!(
+        by_id,
+        minimald_rpc::Errorable::Ok(vec![mapping]),
+        "the live mapping is listed beside the declaration, by id"
+    );
+
+    // The one line the request leaves in the log, with the box, the port, the
+    // decision the box's setting made, and the outcome.
+    let logged = capture.contents();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("dynamic ingress expose") && line.contains("name=web"))
+        .unwrap_or_else(|| panic!("the publish must be logged, got: {logged}"));
+    assert!(
+        line.contains("port=3000")
+            && line.contains("decision=allow")
+            && line.contains("outcome=\"published\"")
+            && line.contains("local=127.0.64.21:3000"),
+        "the publish line names the box, the port, the decision and the \
+         outcome: {line}"
+    );
+}
+
+/// NET-044's deny arm: a denied request answers with the typed refusal, not a
+/// bare message — a caller can tell "this box denies dynamic ingress" apart
+/// from every other reason without parsing prose. Both halves of the default
+/// refuse: a box that declares deny explicitly, and a box that declared
+/// nothing at all. Neither asks the switch anything, and neither lists a
+/// mapping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_deny_typed_error() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let closed = finalize_dynamic_ingress_session(
+        &mut client,
+        "closed",
+        std::net::Ipv4Addr::new(100, 64, 128, 31),
+        std::net::Ipv4Addr::new(127, 0, 64, 31),
+        Some(sessions::DynamicIngress::Deny),
+        Some((3000, 3999)),
+    )
+    .await;
+    let bare = finalize_dynamic_ingress_session(
+        &mut client,
+        "bare",
+        std::net::Ipv4Addr::new(100, 64, 128, 32),
+        std::net::Ipv4Addr::new(127, 0, 64, 32),
+        None,
+        None,
+    )
+    .await;
+    let manager = server.state.sessions_manager().await;
+    let handles = [
+        manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(closed))
+            .await
+            .unwrap()
+            .expect("the denying box resolves"),
+        manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(bare))
+            .await
+            .unwrap()
+            .expect("the unenrolled box resolves"),
+    ];
+    let sock = handles[0]
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    for handle in &handles {
+        match handle.expose_dynamic(3000).await {
+            Err(crate::net::policy::ExposeFailure::Refused(
+                crate::net::policy::ExposeRefusal::DeniedByPolicy,
+            )) => {}
+            other => panic!("a denied request answers the typed refusal: {other:?}"),
+        }
+    }
+    forwarder.abort();
+    assert!(
+        served.lock().expect("served lock").is_empty(),
+        "a denied request asks the switch nothing"
+    );
+
+    // Neither box lists a mapping: the refusal published nothing.
+    let live: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Id(closed))
+        .await;
+    assert_eq!(
+        live,
+        minimald_rpc::Errorable::Ok(vec![]),
+        "the denying box lists nothing"
+    );
+    let live: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Name(
+            "bare".to_string(),
+        ))
+        .await;
+    assert_eq!(
+        live,
+        minimald_rpc::Errorable::Ok(vec![]),
+        "the unenrolled box lists nothing"
+    );
+
+    // Both refusals say their line, each naming the box, the port, the
+    // decision the box's setting made, and the reason.
+    let logged = capture.contents();
+    let refused: Vec<_> = logged
+        .lines()
+        .filter(|line| {
+            line.contains("dynamic ingress expose") && line.contains("outcome=\"refused\"")
+        })
+        .collect();
+    assert_eq!(
+        refused.len(),
+        2,
+        "one refused line per request, got: {logged}"
+    );
+    for line in &refused {
+        assert!(
+            line.contains("port=3000")
+                && line.contains("decision=deny")
+                && line.contains("reason=dynamic ingress is denied for this box"),
+            "the refusal names the port, the decision and the reason: {line}"
+        );
+    }
+}
+
+/// NET-047: a request that does not end in a publish leaves nothing behind —
+/// no half-bound port, no row the policy surfaces would lie about. The two
+/// ways a request fails: refused before the switch is asked (the port outside
+/// the box's declared range) and a publish the switch itself refused. The
+/// first asks the switch nothing; the second is one request that failed, and
+/// after it the list is empty and the port free to be asked again — a failed
+/// bind does not quietly claim its port as live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_rejected_leaves_no_partial_mapping() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 23),
+        std::net::Ipv4Addr::new(127, 0, 64, 23),
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the allowing box resolves");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    // The forwarder refuses every bind: the in-range request reaches it and
+    // fails there.
+    let (forwarder, served) = fake_forwarder(sock, 500).await;
+
+    // Out of range: refused before the switch is asked anything.
+    match handle.expose_dynamic(4500).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::OutOfRange {
+                requested: 4500,
+                range: (3000, 3999),
+            },
+        )) => {}
+        other => panic!("a port outside the declared range is refused: {other:?}"),
+    }
+    assert!(
+        served.lock().expect("served lock").is_empty(),
+        "an out-of-range request asks the switch nothing"
+    );
+
+    // In range, and the switch refuses the bind: the publish fails.
+    match handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Publish { port: 3000, .. }) => {}
+        other => panic!("a bind the switch refuses fails the publish: {other:?}"),
+    }
+    assert_eq!(
+        served.lock().expect("served lock").len(),
+        1,
+        "one mapping is one request, and a failed one leaves nothing to undo"
+    );
+
+    // Nothing is left behind: the list is empty, and the port is free to be
+    // asked again — the failed bind did not record itself as live.
+    let live: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Id(web))
+        .await;
+    assert_eq!(
+        live,
+        minimald_rpc::Errorable::Ok(vec![]),
+        "a rejected publish leaves no partial mapping"
+    );
+    match handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Publish { port: 3000, .. }) => {}
+        other => panic!("the failed bind left the port free to be asked again: {other:?}"),
+    }
+    assert_eq!(
+        served.lock().expect("served lock").len(),
+        2,
+        "the retry reached the switch again: nothing was recorded as live"
+    );
+    forwarder.abort();
+
+    // Both outcomes say their line, each naming why.
+    let logged = capture.contents();
+    let refused_line = logged
+        .lines()
+        .find(|line| {
+            line.contains("dynamic ingress expose")
+                && line.contains("outcome=\"refused\"")
+                && line.contains("port=4500")
+        })
+        .unwrap_or_else(|| panic!("the out-of-range refusal must be logged, got: {logged}"));
+    assert!(
+        refused_line
+            .contains("reason=port 4500 is outside this box's declared dynamic range 3000-3999"),
+        "the refusal names the port and the declared range: {refused_line}"
+    );
+    let failed_line = logged
+        .lines()
+        .find(|line| {
+            line.contains("dynamic ingress expose")
+                && line.contains("outcome=\"publish failed\"")
+                && line.contains("port=3000")
+        })
+        .unwrap_or_else(|| panic!("the failed publish must be logged, got: {logged}"));
+    assert!(
+        failed_line.contains("returned HTTP 500"),
+        "the failed publish names the switch's refusal: {failed_line}"
+    );
+}

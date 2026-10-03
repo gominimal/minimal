@@ -839,6 +839,46 @@ async fn serve_get_effective_session_policy(
         .await
 }
 
+/// `GetLiveIngress`: the live dynamic-ingress mappings a session's box
+/// published at runtime (NET-044) — the rows `min session policy` lists beside
+/// the declaration, which is what makes a publish visible rather than only
+/// permitted.
+///
+/// The live actor's own state, so this resolves the session where the policy
+/// RPCs read the record: [`Manager::get_session`] brings a known session's
+/// actor up if it has none running, and an actor holding no host answers an
+/// empty list — the honest answer for a box that is not running, since a
+/// publish lives only while its box does.
+async fn serve_get_live_ingress(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    minimald_rpc::GetLiveIngress
+        .handle_channel(c, async |req| {
+            let mngr = s.sessions_manager().await;
+            let predicate = match req {
+                minimald_rpc::GetLiveIngressRequest::Id(id) => SessionKeyPredicate::Id(id),
+                minimald_rpc::GetLiveIngressRequest::Name(name) => SessionKeyPredicate::Name(name),
+            };
+            let session = mngr
+                .get_session(predicate)
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            match session {
+                None => Ok(Errorable::Err {
+                    error: "no session found".to_string(),
+                }),
+                Some(session) => match session.live_ingress().await {
+                    Ok(live) => Ok(Errorable::Ok(live)),
+                    Err(e) => Ok(Errorable::Err {
+                        error: e.to_string(),
+                    }),
+                },
+            }
+        })
+        .await
+}
+
 /// `GetSessionHooks`: the lifecycle hooks composed into a session, each
 /// with the loadout or project that declared it.
 ///
@@ -1791,6 +1831,7 @@ pub async fn handle_ssh_rpc(
         | AbortSession::NAME
         | GetSessionPolicy::NAME
         | GetEffectiveSessionPolicy::NAME
+        | minimald_rpc::GetLiveIngress::NAME
         | minimald_rpc::GetSessionHooks::NAME
         | SessionDelta::NAME
         | GetSessionScreen::NAME
@@ -1876,6 +1917,9 @@ pub async fn handle_ssh_rpc(
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
         GetEffectiveSessionPolicy::NAME => {
             serve!(serve_get_effective_session_policy(s, channel))
+        }
+        minimald_rpc::GetLiveIngress::NAME => {
+            serve!(serve_get_live_ingress(s, channel))
         }
         minimald_rpc::GetSessionHooks::NAME => serve!(serve_get_session_hooks(s, channel)),
         SessionDelta::NAME => serve!(serve_session_delta(s, channel)),

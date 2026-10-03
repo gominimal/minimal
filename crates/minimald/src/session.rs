@@ -481,11 +481,47 @@ enum SessionMessage {
         opts: MaterializeOpts,
         reply: oneshot::Sender<Result<mpsc::Receiver<MaterializeUpdate>, std::io::Error>>,
     },
+    /// Publish `port` for this box at runtime (NET-043): the request a process
+    /// inside the box sends with its own `min net expose`, decided against the
+    /// box's `dynamic_ingress` setting and — when it allows — bound on the
+    /// switch and recorded as a live mapping (NET-044). Answered with the
+    /// published mapping, or the typed reason the request was refused.
+    ExposeDynamic {
+        port: u16,
+        reply:
+            oneshot::Sender<Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>>,
+    },
+    /// The live dynamic-ingress mappings this box published at runtime
+    /// (NET-044) — what the `GetLiveIngress` RPC serves. Empty for a box that
+    /// published none.
+    LiveIngress(oneshot::Sender<Vec<minimald_rpc::LiveMapping>>),
     /// Test-only inspection: an `Arc` clone of the held [`Composition`]
     /// (`None` in `Draft`, or `Active` without one post-restart). Lets tests
     /// assert composition contents without disturbing the lifecycle.
     #[cfg(test)]
     PeekComposition(oneshot::Sender<Option<Arc<Composition>>>),
+}
+
+/// One live dynamic-ingress publish (NET-044): the forwarder the switch
+/// accepted, paired with the mapping it published. Held together — not
+/// re-derived from the forwarder at read time — so the list
+/// [`SessionMessage::LiveIngress`] serves is exactly what the switch holds,
+/// and the teardown that unbinds the one is the list of the other.
+struct LiveIngressForward {
+    /// The daemon-owned forward: its unexpose releases the port.
+    forwarder: crate::net::policy::PortForwarder,
+    /// The mapping as the policy surfaces read it.
+    mapping: minimald_rpc::LiveMapping,
+}
+
+/// The row the policy surfaces read, not the forwarder's own internals —
+/// `PortForwarder` is a handle, and the mapping is the fact it published.
+impl fmt::Debug for LiveIngressForward {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LiveIngressForward")
+            .field("mapping", &self.mapping)
+            .finish()
+    }
 }
 
 /// Manages one session, from the moment its record is allocated: the create
@@ -521,11 +557,20 @@ pub struct Session {
 
     /// The daemon-scoped gvproxy switch, injected into each `SandboxLauncher`
     /// this session mints so an `OwnIp` PTask attaches to the one per-host
-    /// switch (R1.5). Read only by the production `session_launcher`
-    /// (`cfg(not(test))`); the `cfg(test)` mock launcher ignores it, so the
+    /// switch (R1.5). Read by the production `session_launcher`
+    /// (`cfg(not(test))`), and by the runtime port-publish path, which drives
+    /// the switch's forwarder through it (NET-043) in every build; the
+    /// `cfg(test)` mock launcher ignores it for launches, so the
     /// unused-field lint is silenced under test rather than threaded through.
     #[cfg_attr(test, allow(dead_code))]
     net_switch: Arc<Mutex<crate::net::SwitchClient>>,
+
+    /// The ports this box published at runtime with its own `min net expose`
+    /// (NET-044): one entry per port the box's `dynamic_ingress` allowed and
+    /// the switch accepted, held from the publish until the box stops, where
+    /// [`Session::stop_running`] unbinds them. A box that published none —
+    /// and one that is not running — holds an empty list.
+    live_ingress: Vec<LiveIngressForward>,
 
     /// The root of this session's operation tree - tracks long-running
     /// operations for display.
@@ -649,6 +694,9 @@ impl Session {
             // Forwards are registered as their channels open; a session
             // starts with none.
             forwards: Vec::new(),
+            // The same for the ports the box publishes at runtime: nothing is
+            // live until a `min net expose` inside it lands (NET-044).
+            live_ingress: Vec::new(),
             #[cfg(target_os = "linux")]
             hostnames,
             #[cfg(target_os = "linux")]
@@ -1546,6 +1594,16 @@ impl Session {
             SessionMessage::GetComposition(r) => {
                 let _ = r.send(self.composition());
             }
+            SessionMessage::ExposeDynamic { port, reply } => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
+                let _ = reply.send(self.expose_dynamic(port).await);
+            }
+            SessionMessage::LiveIngress(r) => {
+                let _ = r.send(self.live_ingress_snapshot());
+            }
             SessionMessage::GetRecord(r) => {
                 let _ = r.send(self.record.record().await.unwrap());
             }
@@ -2096,6 +2154,165 @@ impl Session {
         }
     }
 
+    /// Publishes `port` for this box at runtime (NET-043): the request a
+    /// process inside the box sends with its own `min net expose`, decided
+    /// against the box's `dynamic_ingress` setting and — when it allows —
+    /// bound on the switch and recorded as a live mapping (NET-044), which is
+    /// what `min session policy` lists beside the declaration.
+    ///
+    /// One info line per request, naming the box, the port, the decision its
+    /// `dynamic_ingress` setting made, and the outcome, so a diagnostics
+    /// bundle's daemon log tail carries every expose request with what became
+    /// of it.
+    async fn expose_dynamic(
+        &mut self,
+        port: u16,
+    ) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
+        let record = match self.record.record().await {
+            Ok(record) => record,
+            Err(e) => return Err(crate::net::policy::ExposeFailure::Publish { port, source: e }),
+        };
+        let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
+        // The setting the request is evaluated against (NET-043), spelled the
+        // way the record carries it: the deny-all default for a box that
+        // declared nothing.
+        let decision = record
+            .policy
+            .ingress
+            .as_ref()
+            .and_then(|ingress| ingress.dynamic_ingress)
+            .unwrap_or(sessions::DynamicIngress::Deny);
+        let outcome = self.publish_exposed_port(&record, port).await;
+        match &outcome {
+            Ok(mapping) => tracing::info!(
+                name = %box_name,
+                port,
+                decision = %decision,
+                outcome = "published",
+                local = %mapping.local,
+                "dynamic ingress expose"
+            ),
+            Err(crate::net::policy::ExposeFailure::Refused(refusal)) => tracing::info!(
+                name = %box_name,
+                port,
+                decision = %decision,
+                outcome = "refused",
+                reason = %refusal,
+                "dynamic ingress expose"
+            ),
+            Err(crate::net::policy::ExposeFailure::Publish { source, .. }) => tracing::info!(
+                name = %box_name,
+                port,
+                decision = %decision,
+                outcome = "publish failed",
+                reason = %source,
+                "dynamic ingress expose"
+            ),
+        }
+        outcome
+    }
+
+    /// The publish half of [`Session::expose_dynamic`], run once the request's
+    /// decision is known for the log. Everything the box can refuse without
+    /// asking the switch runs first — the policy decision (NET-043), the
+    /// live-duplicate check, and the address pair the publish needs — so a
+    /// refused request is refused with nothing bound and nothing asked
+    /// (NET-047). Only then is the switch asked to bind, and the forwarder is
+    /// recorded only once it accepted.
+    async fn publish_exposed_port(
+        &mut self,
+        record: &Record,
+        port: u16,
+    ) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
+        use crate::net::policy::{
+            ExposeFailure, ExposeRefusal, dynamic_ingress_decision, expose_dynamic,
+        };
+
+        // The box's own setting decides first (NET-043), whatever asked: the
+        // deny-all default when nothing was declared, and `ask` failing
+        // closed with nobody attached to answer (NET-045's prompt is the
+        // sibling path).
+        dynamic_ingress_decision(record.policy.ingress.as_ref(), port)
+            .map_err(ExposeFailure::Refused)?;
+
+        // The port is published already, live, by this box: a second request
+        // for it would double-bind the same address, so it is refused as the
+        // duplicate it is.
+        if self
+            .live_ingress
+            .iter()
+            .any(|live| live.mapping.internal_port == port)
+        {
+            return Err(ExposeFailure::Refused(ExposeRefusal::AlreadyPublished(
+                port,
+            )));
+        }
+
+        // The publish rides the address pair a VM host's registration handed
+        // the box (T66): the loopback address its declaration publishes on,
+        // and the switch address its forwards deliver to. A box nobody handed
+        // a pair — a native host's self-allocated box, whose lease the
+        // registry holds but keeps private — has nowhere to publish, and the
+        // daemon has no default of its own to stand in with (NET-010), so
+        // the request is refused rather than bound at an address nobody
+        // chose for this box.
+        let Some(addresses) = record.box_addresses else {
+            return Err(ExposeFailure::Refused(ExposeRefusal::NoPublishedAddress));
+        };
+
+        let control = self.switch_control().await;
+        let forwarder = match expose_dynamic(
+            &control,
+            addresses.loopback_address,
+            addresses.switch_address,
+            port,
+            sessions::IpProto::Tcp,
+            None,
+        )
+        .await
+        {
+            Ok(forwarder) => forwarder,
+            Err(source) => return Err(ExposeFailure::Publish { port, source }),
+        };
+        // Recorded only now, with the switch's acceptance in hand: a publish
+        // that failed leaves nothing in the list (NET-047), so the rows the
+        // policy surfaces read never name a port the switch is not holding.
+        let mapping = minimald_rpc::LiveMapping {
+            local: forwarder.local().to_string(),
+            internal_port: forwarder.internal_port(),
+            proto: sessions::IpProto::Tcp,
+        };
+        self.live_ingress.push(LiveIngressForward {
+            forwarder,
+            mapping: mapping.clone(),
+        });
+        Ok(mapping)
+    }
+
+    /// The switch's control channel, read off the daemon's shared switch under
+    /// a lock held only for the two sync reads — never across the publish it
+    /// feeds.
+    async fn switch_control(&self) -> crate::net::policy::ControlChannel {
+        let switch = self.net_switch.lock().await;
+        match switch.transport() {
+            crate::net::SwitchTransport::LocalSpawn => {
+                crate::net::policy::ControlChannel::Unix(switch.control_socket())
+            }
+            crate::net::SwitchTransport::HostShuttle { cid, port } => {
+                crate::net::policy::ControlChannel::Vsock { cid, port }
+            }
+        }
+    }
+
+    /// The live dynamic-ingress mappings, in publish order — the rows
+    /// `min session policy` lists beside the declaration (NET-044).
+    fn live_ingress_snapshot(&self) -> Vec<minimald_rpc::LiveMapping> {
+        self.live_ingress
+            .iter()
+            .map(|live| live.mapping.clone())
+            .collect()
+    }
+
     /// Tears down any runtime objects, such as the host or side ops. Shutdown
     /// of these objects is complete once awaited.
     ///
@@ -2109,6 +2326,18 @@ impl Session {
         // `Destroy` — come through here.
         for forward in std::mem::take(&mut self.forwards) {
             forward.abort();
+        }
+
+        // The ports the box published at runtime go with it too (NET-044):
+        // unbind each forward the switch accepted, so a box that stops leaves
+        // no live publish behind. Best-effort, like the declared forwards'
+        // teardown — `remove_ingress` logs a failed unexpose and moves on,
+        // since there is no caller left to propagate to.
+        let live = std::mem::take(&mut self.live_ingress);
+        if !live.is_empty() {
+            let control = self.switch_control().await;
+            let forwarders: Vec<_> = live.iter().map(|l| l.forwarder.clone()).collect();
+            crate::net::policy::remove_ingress(&control, &forwarders).await;
         }
 
         let inner = match &mut self.inner {
@@ -3344,6 +3573,52 @@ impl SessionHandle {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(SessionMessage::GetNetSwitch(send)).await;
+        recv.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
+        })
+    }
+
+    /// Publishes `port` for this box at runtime (NET-043) — the request the
+    /// in-box `min net expose` sends, decided against the box's
+    /// `dynamic_ingress` setting. Answers with the published mapping, or the
+    /// typed reason the request was refused. A dead actor lands on the
+    /// publish-failure arm: the box that would own the mapping is gone, so no
+    /// publish could be made.
+    pub(crate) async fn expose_dynamic(
+        &self,
+        port: u16,
+    ) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self
+            .0
+            .send(SessionMessage::ExposeDynamic { port, reply: send })
+            .await;
+        match recv.await {
+            Ok(reply) => reply,
+            Err(_) => Err(crate::net::policy::ExposeFailure::Publish {
+                port,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "session actor is gone",
+                ),
+            }),
+        }
+    }
+
+    /// The live dynamic-ingress mappings this box published at runtime
+    /// (NET-044) — the rows `min session policy` lists. Empty for a box that
+    /// published none. A dead actor maps to `NotConnected`.
+    pub(crate) async fn live_ingress(
+        &self,
+    ) -> Result<Vec<minimald_rpc::LiveMapping>, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        let _ = self.0.send(SessionMessage::LiveIngress(send)).await;
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "a closed oneshot carries no cause beyond the actor being gone"
+        )]
         recv.await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
         })
