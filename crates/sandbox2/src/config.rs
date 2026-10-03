@@ -592,10 +592,25 @@ impl Config {
         // directories are not lost. Every other variable stays literal.
         self.env_vars.iter().for_each(|(var, val)| {
             if var == "PATH" {
-                let expanded = val
-                    .replace("${PATH}", default_path)
-                    .replace("$PATH", default_path);
-                set(var, &expanded);
+                let expanded = val.replace("${PATH}", default_path);
+                let mut expanded_path = String::with_capacity(expanded.len());
+                let mut remaining = expanded.as_str();
+                while let Some(index) = remaining.find("$PATH") {
+                    expanded_path.push_str(&remaining[..index]);
+                    let after_reference = &remaining[index + "$PATH".len()..];
+                    let continues_variable = after_reference
+                        .chars()
+                        .next()
+                        .map_or(false, |ch| ch.is_ascii_alphanumeric() || ch == '_');
+                    if continues_variable {
+                        expanded_path.push_str("$PATH");
+                    } else {
+                        expanded_path.push_str(default_path);
+                    }
+                    remaining = after_reference;
+                }
+                expanded_path.push_str(remaining);
+                set(var, &expanded_path);
             } else {
                 set(var, val);
             }
@@ -1002,6 +1017,24 @@ mod tests {
         assert_eq!(
             literal.command_env().get("PATH").map(String::as_str),
             Some("/opt/bin"),
+        );
+    }
+
+    /// A `$PATH` reference is expanded only when the following character cannot
+    /// continue a variable name, so a longer reference such as `$PATH_SUFFIX`
+    /// stays literal instead of being corrupted into the default path.
+    #[test]
+    fn a_composed_path_keeps_longer_variable_references_literal() {
+        let mut config = session_config();
+        config
+            .env_vars
+            .insert("PATH".to_string(), "/opt/bin:$PATH_SUFFIX".to_string());
+
+        let env = config.command_env();
+
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/opt/bin:$PATH_SUFFIX"),
         );
     }
 
