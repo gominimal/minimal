@@ -476,10 +476,20 @@ mod tests {
     /// A registry the way the daemon fills it: a `HostNet` box `web` (its name
     /// routes to host loopback, R3.6) and an `OwnIp` box `api` attached at a
     /// switch lease (on a VM host its name routes straight to the lease,
-    /// NET-001; on a native host it keeps the published-loopback model).
+    /// NET-001; on a native host it keeps the published-loopback model at the
+    /// address its creator handed — the host loopback, used exactly as
+    /// handed).
     fn registry(on_switch: bool) -> HostnameRegistry {
         let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, on_switch);
         reg.register_host_net(SessionId::nil(), "web");
+        if !on_switch {
+            reg.publish_own_address(
+                SessionId::nil(),
+                "api",
+                Ipv4Addr::LOCALHOST,
+                std::collections::BTreeSet::new(),
+            );
+        }
         reg.report_own_address(
             SessionId::nil(),
             "api",

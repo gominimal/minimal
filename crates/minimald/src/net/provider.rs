@@ -47,9 +47,9 @@ impl OwnAddressReporter {
 
     /// Reports `lease` — with the box's ingress declaration as an
     /// external→internal port map — and registers `session_name`'s box name
-    /// against it, so the name routes exactly when the box is reachable.
-    /// Best-effort by construction: the registry is always held, and a
-    /// registration cannot fail.
+    /// against it, so the name routes exactly when the box is reachable. The
+    /// lease is always recorded; on a native host the registration follows it
+    /// only where the box has a published address to route at (NET-010).
     pub(crate) fn report(&self, session_name: &str, lease: Ipv4Addr, ports: BTreeMap<u16, u16>) {
         let mut registry = self
             .registry
@@ -59,16 +59,29 @@ impl OwnAddressReporter {
     }
 
     /// The host loopback address this box's declaration publishes on (NET-010):
-    /// the address finalize leased for it out of the daemon's slice of the
-    /// reserved local range, or the node's shared address until one is leased.
-    /// The attach path reads it here — rather than re-deriving one — so the
-    /// forwards it binds and the name the registry answers stay at the one
-    /// address the box owns.
-    pub(crate) fn published_address(&self) -> Ipv4Addr {
+    /// the address a creator handed the box and its record published — `None`
+    /// when nobody handed one, because the daemon has no address of its own to
+    /// stand in with. The attach path reads it here — rather than re-deriving
+    /// one — so the forwards it binds and the name the registry answers stay at
+    /// the one address the box owns, and a box nobody handed an address fails
+    /// its attach rather than publishing at a default.
+    pub(crate) fn published_address(&self) -> Option<Ipv4Addr> {
         self.registry
             .read()
             .expect("hostname registry lock poisoned")
-            .published_or_node(self.session_id)
+            .published_own_address(self.session_id)
+    }
+
+    /// Withdraws `session_name`'s box name if this session still owns it —
+    /// the failed attach's other half (NET-121): a bind that failed, or an
+    /// address nobody handed, leaves no name standing that says "reachable
+    /// here" over ports that are not.
+    pub(crate) fn withdraw(&self, session_name: &str) {
+        let mut registry = self
+            .registry
+            .write()
+            .expect("hostname registry lock poisoned");
+        registry.withdraw_own_name(self.session_id, session_name);
     }
 }
 
