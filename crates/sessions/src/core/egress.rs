@@ -1860,18 +1860,17 @@ mod tests {
         assert!(open.allow_subnets().is_none() && open.deny_subnets().is_none());
     }
 
-    /// NET-016's decision, read off the dimensions it is stated over: a
-    /// listening port is published exactly when the box's stance is
-    /// `allow` and the port falls inside the permit range — inclusively at
-    /// both ends — and a port the declaration already names on the
-    /// listener's transport is never the watcher's to publish or withdraw,
-    /// whatever the range says about it. A port the declaration names on
-    /// the other transport alone is not that: its forward answers the one
-    /// protocol it was exposed with, so the listener falls to the rules.
-    /// The exhaustive form of the same property is the ingress half of
+    /// NET-016's decision over the box's stance and the permit range: a
+    /// listening port is published exactly when the stance is `allow` and
+    /// the port falls inside the range — inclusively at both ends — and
+    /// listening alone is never the attached human's yes under any other
+    /// stance, range or no range. The declaration's own named ports are
+    /// the other half of the same decision, with their own test:
+    /// [`listen_verdict_never_touches_a_port_the_declaration_names`].
+    /// The exhaustive form of both halves is the ingress half of
     /// [`super::kani_proofs::kani_frame_verdict_admits_nothing_undeclared`].
     #[test]
-    fn listen_verdict_decides_from_the_declaration() {
+    fn listen_verdict_publishes_only_within_the_permitted_range() {
         let policy = IngressPolicy {
             port_mappings: vec![crate::PortMapping {
                 external_port: 18080,
@@ -1904,6 +1903,66 @@ mod tests {
             rules.listen_verdict(IpProto::Tcp, 3011),
             ListenVerdict::Deny
         );
+        // An absent stance — even with a range set — publishes nothing.
+        let no_stance = IngressRules::from_policy(Some(&IngressPolicy {
+            dynamic_allowed_range: Some((3000, 3010)),
+            dynamic_ingress: None,
+            ..policy.clone()
+        }));
+        assert_eq!(
+            no_stance.listen_verdict(IpProto::Tcp, 3005),
+            ListenVerdict::Deny
+        );
+        // `ask` and `deny` both hold the port back: listening alone is
+        // never the attached human's yes (NET-138).
+        for stance in [Some(DynamicIngress::Ask), Some(DynamicIngress::Deny)] {
+            let held_back = IngressRules::from_policy(Some(&IngressPolicy {
+                dynamic_ingress: stance,
+                ..policy.clone()
+            }));
+            assert_eq!(
+                held_back.listen_verdict(IpProto::Tcp, 3005),
+                ListenVerdict::Deny
+            );
+        }
+        // An absent range permits no port at all.
+        let no_range = IngressRules::from_policy(Some(&IngressPolicy {
+            dynamic_allowed_range: None,
+            ..policy
+        }));
+        assert_eq!(
+            no_range.listen_verdict(IpProto::Tcp, 3005),
+            ListenVerdict::Deny
+        );
+        // An absent policy is deny-all-external: nothing a process
+        // listens on is published.
+        let absent = IngressRules::from_policy(None);
+        assert_eq!(
+            absent.listen_verdict(IpProto::Tcp, 3005),
+            ListenVerdict::Deny
+        );
+    }
+
+    /// NET-016's decision over the declaration's own named ports: a port
+    /// the declaration already names on the listener's transport is
+    /// never the watcher's to publish or withdraw, whatever the range
+    /// says about it. A port the declaration names on the other transport
+    /// alone is not that: its forward answers the one protocol it was
+    /// exposed with, so the listener falls to the rules — the range and
+    /// stance half is
+    /// [`listen_verdict_publishes_only_within_the_permitted_range`].
+    #[test]
+    fn listen_verdict_never_touches_a_port_the_declaration_names() {
+        let policy = IngressPolicy {
+            port_mappings: vec![crate::PortMapping {
+                external_port: 18080,
+                internal_port: 8080,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: Some((3000, 3010)),
+            dynamic_ingress: Some(DynamicIngress::Allow),
+        };
+        let rules = IngressRules::from_policy(Some(&policy));
         // The declaration's own internal port is published already
         // (NET-121): the watcher has nothing to publish and nothing to
         // withdraw, whatever the range says.
@@ -1948,44 +2007,9 @@ mod tests {
             udp_declared_no_range.listen_verdict(IpProto::Tcp, 3005),
             ListenVerdict::Deny
         );
-        // An absent stance — even with a range set — publishes nothing.
-        let no_stance = IngressRules::from_policy(Some(&IngressPolicy {
-            dynamic_allowed_range: Some((3000, 3010)),
-            dynamic_ingress: None,
-            ..policy.clone()
-        }));
-        assert_eq!(
-            no_stance.listen_verdict(IpProto::Tcp, 3005),
-            ListenVerdict::Deny
-        );
-        // `ask` and `deny` both hold the port back: listening alone is
-        // never the attached human's yes (NET-138).
-        for stance in [Some(DynamicIngress::Ask), Some(DynamicIngress::Deny)] {
-            let held_back = IngressRules::from_policy(Some(&IngressPolicy {
-                dynamic_ingress: stance,
-                ..policy.clone()
-            }));
-            assert_eq!(
-                held_back.listen_verdict(IpProto::Tcp, 3005),
-                ListenVerdict::Deny
-            );
-        }
-        // An absent range permits no port at all.
-        let no_range = IngressRules::from_policy(Some(&IngressPolicy {
-            dynamic_allowed_range: None,
-            ..policy
-        }));
-        assert_eq!(
-            no_range.listen_verdict(IpProto::Tcp, 3005),
-            ListenVerdict::Deny
-        );
         // An absent policy is deny-all-external: nothing is declared on
-        // either transport, and nothing a process listens on is published.
+        // either transport either.
         let absent = IngressRules::from_policy(None);
-        assert_eq!(
-            absent.listen_verdict(IpProto::Tcp, 3005),
-            ListenVerdict::Deny
-        );
         assert_eq!(
             absent.declared(IpProto::Tcp).collect::<Vec<u16>>(),
             Vec::<u16>::new()
