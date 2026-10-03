@@ -86,7 +86,12 @@ pub trait Process: Send + 'static {
 #[derive(Debug, Clone)]
 pub struct TaskExec {
     pub task: String,
-    pub args: Option<args::ArgsSet>,
+    /// The task's declared arguments, as the client typed them after the
+    /// task name. Parsed against the task's `args` schema in
+    /// [`task_producer`], where the schema is first available. Empty when
+    /// the client sent none — an older `min`, or a task that declares no
+    /// args — in which case the task's defaults apply.
+    pub args: Vec<String>,
     /// The task's `env_vars`, already resolved against the invoking shell
     /// by the client and carried on the channel environment (see
     /// [`minimald_rpc::taskenv`]). Applied over the task's own
@@ -240,6 +245,30 @@ async fn attach_or_reap<P: Reapable>(
     }
 }
 
+/// Parse a task run's argv against the task's declared `args` schema.
+///
+/// Returns `None` when the task declares no args (nothing to bind), and
+/// `Some` otherwise — even for an empty argv, which `parse_argv_named`
+/// fills with the task's defaults. This mirrors the in-sandbox path in
+/// `mctx::env`, so a task using `%{arg}` resolves the same way whether it
+/// runs in-box or through the daemon.
+///
+/// `name` is the task's name, so a usage error shows the command the user
+/// can copy (`min task run <name> --arg <value>`), as `mip run` does.
+fn parse_task_args(
+    name: &str,
+    task: &mfile::Task,
+    argv: &[String],
+) -> Result<Option<args::ArgsSet>, String> {
+    if task.args.is_empty() {
+        return Ok(None);
+    }
+    task.args
+        .parse_argv_named(&format!("min task run {name}"), argv.iter().cloned())
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
 /// Producer side of [`TaskExec::exec`]. Inlined in one async fn so that
 /// `env` lives on a single stack frame across every spawn — that frame
 /// is alive for the whole life of this tokio task, which in turn is
@@ -263,7 +292,9 @@ async fn task_producer(
         if let Some(task) = ctx.minimal_file().task(&exec.task)
             && task.action.as_echo().is_some()
         {
-            let task = mctx::interpolate_task_strings(&task, exec.args.as_ref())
+            let parsed_args = parse_task_args(&exec.task, &task, &exec.args)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let task = mctx::interpolate_task_strings(&task, parsed_args.as_ref())
                 .map_err(|e| io::Error::other(e.to_string()))?;
             let text = task.action.as_echo().unwrap_or_default().to_string();
             if req_rx.recv().await.is_some() {
@@ -291,6 +322,12 @@ async fn task_producer(
             .task(graph, &exec.task)
             .map_err(|e| io::Error::other(e.to_string()))?
             .ok_or_else(|| io::Error::other(format!("No such task: {}", exec.task)))?;
+        // Parse the client's args against the task's declared schema. This
+        // is where the schema is first available: the dispatch arm only has
+        // the raw argv off the wire. An empty argv still parses, applying
+        // the task's defaults — the all-defaults case the issue reports.
+        let parsed_args = parse_task_args(&exec.task, &task, &exec.args)
+            .map_err(|e| io::Error::other(e.to_string()))?;
         // Values the client resolved against the invoking shell win over the
         // task's own declarations. That is what turns `{ inherit = true }`
         // into something the daemon can apply: resolving it here would read
@@ -334,7 +371,7 @@ async fn task_producer(
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
         let (_interactive, invocations) = env
-            .task_invocations(&task, exec.args.as_ref())
+            .task_invocations(&task, parsed_args.as_ref())
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -1414,7 +1451,11 @@ pub(crate) async fn handle_exec(
                 .instrument(span),
             );
         }
-        ExecRequest::TaskRun { task, owns_box } => {
+        ExecRequest::TaskRun {
+            task,
+            owns_box,
+            args,
+        } => {
             let task = task.trim().to_string();
             if task.is_empty() {
                 tracing::warn!(%session_id, "execution request rejected: task/run names no task");
@@ -1438,7 +1479,7 @@ pub(crate) async fn handle_exec(
                     session: session_handle,
                     channel_id: id,
                     exec: TaskExec {
-                        args: None,
+                        args,
                         // The name stays behind for the run-box-end log line.
                         task: task.clone(),
                         env: task_env,
@@ -2974,8 +3015,10 @@ mod tests {
         /// sequence a task run's client drives, shared by every test here
         /// that execs a task.
         ///
-        /// The mfile holds only `tasks.echo_ok`, whose entire output lives
-        /// in its declaration — no `[upstream]`, package graph, or sandbox:
+        /// The mfile holds only echo tasks — `tasks.echo_ok`, plus
+        /// `tasks.greet`, which declares one defaulted arg — whose entire
+        /// output lives in their declarations: no `[upstream]`, package
+        /// graph, or sandbox:
         /// the echo short-circuit never builds a graph, so nothing here
         /// reaches the (network-bound) package machinery. A task-only mfile
         /// gates nothing, so the loadout composes in one shot, and this
@@ -3003,7 +3046,10 @@ mod tests {
             server
                 .seed_workspace_mfile(
                     session_id,
-                    "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n",
+                    "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n\n\
+                     [tasks.greet]\n\
+                     args.name = { type = \"string\", default = \"world\" }\n\
+                     echo = \"hi %{name}\"\n",
                 )
                 .await;
 
@@ -3055,6 +3101,7 @@ mod tests {
                     &ExecRequest::TaskRun {
                         task: "echo_ok".to_string(),
                         owns_box: false,
+                        args: vec![],
                     }
                     .encode(),
                     &[],
@@ -3069,6 +3116,66 @@ mod tests {
                 "echo task should produce no stderr: {:?}",
                 out.stderr,
             );
+        }
+
+        /// A task run's args reach the task: the daemon parses the argv off
+        /// the wire against the task's declared `args`, so `%{name}` binds
+        /// to the default when none is given, to the value when one is, and
+        /// an undeclared flag fails the run rather than being dropped.
+        #[tokio::test]
+        async fn exec_binds_task_args_and_defaults() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let session_id = active_session_with_echo_task(&server, &mut client, "args-test").await;
+            let session_str = session_id.to_string();
+
+            let run = |args: Vec<String>| {
+                ExecRequest::TaskRun {
+                    task: "greet".to_string(),
+                    owns_box: false,
+                    args,
+                }
+                .encode()
+            };
+
+            // No args: the declared default applies.
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &run(vec![]),
+                    &[],
+                )
+                .await
+                .expect("a task/run request should be accepted");
+            assert_eq!(out.stdout, b"hi world\n");
+            assert_eq!(out.exit_status, Some(0));
+
+            // An explicit value overrides the default.
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &run(vec!["--name".into(), "Alice".into()]),
+                    &[],
+                )
+                .await
+                .expect("a task/run request should be accepted");
+            assert_eq!(out.stdout, b"hi Alice\n");
+            assert_eq!(out.exit_status, Some(0));
+
+            // An undeclared flag fails the run instead of being ignored.
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &run(vec!["--nope".into(), "x".into()]),
+                    &[],
+                )
+                .await
+                .expect("a task/run request should be accepted");
+            assert!(out.stdout.is_empty(), "stdout: {:?}", out.stdout);
+            assert_ne!(out.exit_status, Some(0));
         }
 
         /// NET-131: a box created for a run ends when the run's command
@@ -3101,6 +3208,7 @@ mod tests {
                     &ExecRequest::TaskRun {
                         task: "echo_ok".to_string(),
                         owns_box: true,
+                        args: vec![],
                     }
                     .encode(),
                     &[],
@@ -3161,6 +3269,7 @@ mod tests {
                     &ExecRequest::TaskRun {
                         task: "echo_ok".to_string(),
                         owns_box: false,
+                        args: vec![],
                     }
                     .encode(),
                     &[],
@@ -3202,6 +3311,7 @@ mod tests {
                     &ExecRequest::TaskRun {
                         task: "some_task".to_string(),
                         owns_box: false,
+                        args: vec![],
                     }
                     .encode(),
                     &[],
@@ -3221,6 +3331,7 @@ mod tests {
                     &ExecRequest::TaskRun {
                         task: String::new(),
                         owns_box: false,
+                        args: vec![],
                     }
                     .encode(),
                     &[],

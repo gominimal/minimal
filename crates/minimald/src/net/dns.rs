@@ -54,6 +54,7 @@
 //! the re-scope; an egress-proxy reachability check
 //! ([`super::proxy::bind_listener`]) replaces it.
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -669,6 +670,18 @@ impl HostnameRegistry {
                 hostname: hostname.clone(),
             },
         );
+        if let Some(existing) = self.by_host.get(&hostname)
+            && existing.session() != session_name
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                session_name,
+                hostname = %hostname,
+                owner = existing.session(),
+                action = "hostname-collision",
+                "hostname already routed for a different session name"
+            );
+        }
         self.by_host.insert(hostname.clone(), route);
         tracing::info!(
             session_id = %session_id,
@@ -1085,18 +1098,46 @@ impl HostnameRegistry {
     /// `registered` event did, and formats `ip` with `Display` to match it.
     pub fn deregister(&mut self, session_name: &str) -> Option<Hostname> {
         let Registration { id, hostname } = self.by_session.remove(session_name)?;
-        let route = self
-            .by_host
-            .remove(&hostname)
-            .expect("by_host is kept in sync with by_session by register");
-        tracing::info!(
-            session_id = %id,
-            session_name,
-            hostname = %hostname,
-            ip = %route.address(),
-            action = "deregistered",
-            "deregistered PTask hostname"
-        );
+        // Remove the host route only when it still belongs to this session.
+        // Two live sessions can fold to the same hostname: a named session
+        // whose name differs from another's only in ASCII case (records that
+        // predate case-insensitive name uniqueness), and, still today, two
+        // unnamed sessions whose project directories' basenames fold
+        // together (`/x/App` and `/y/app`), since `registry_name` falls back
+        // to the basename. The later registration owns the route, so the
+        // other session's deregistration must leave it in place.
+        match self.by_host.entry(hostname.clone()) {
+            Entry::Occupied(entry) if entry.get().session() == session_name => {
+                let route = entry.remove();
+                tracing::info!(
+                    session_id = %id,
+                    session_name,
+                    hostname = %hostname,
+                    ip = %route.address(),
+                    action = "deregistered",
+                    "deregistered PTask hostname"
+                );
+            }
+            Entry::Occupied(entry) => {
+                tracing::warn!(
+                    session_id = %id,
+                    session_name,
+                    hostname = %hostname,
+                    owner = entry.get().session(),
+                    action = "deregister-kept-route",
+                    "hostname route belongs to another session; leaving it in place"
+                );
+            }
+            Entry::Vacant(_) => {
+                tracing::warn!(
+                    session_id = %id,
+                    session_name,
+                    hostname = %hostname,
+                    action = "deregister-missing-route",
+                    "hostname route already absent at deregistration"
+                );
+            }
+        }
         Some(hostname)
     }
 
@@ -2796,6 +2837,43 @@ mod tests {
     fn deregister_unknown_session_is_a_noop() {
         let mut reg = HostnameRegistry::new("dev", false);
         assert_eq!(reg.deregister("ghost"), None);
+    }
+
+    /// Two sessions whose names differ only in ASCII case fold to the same
+    /// hostname. Deregistering the first must leave the second's route in
+    /// place, and deregistering the second must not panic.
+    #[test]
+    fn deregister_case_colliding_names_keeps_the_survivors_route() {
+        let mut reg = HostnameRegistry::new("dev", false);
+
+        reg.register_host_net(SessionId::nil(), "Case-R");
+        reg.register_host_net(SessionId::nil(), "case-r");
+
+        // The second registration overwrote the shared hostname route, so the
+        // name resolves to the second session.
+        assert_eq!(
+            reg.resolve("case-r.min.internal")
+                .map(|r| r.session().to_string()),
+            Some("case-r".to_string())
+        );
+
+        // Deregistering the first session must not withdraw the second's route.
+        assert_eq!(
+            reg.deregister("Case-R").map(|h| h.as_str().to_string()),
+            Some("case-r.min.internal".to_string())
+        );
+        assert_eq!(
+            reg.resolve("case-r.min.internal")
+                .map(|r| r.session().to_string()),
+            Some("case-r".to_string())
+        );
+
+        // Deregistering the second session removes the route without panicking.
+        assert_eq!(
+            reg.deregister("case-r").map(|h| h.as_str().to_string()),
+            Some("case-r.min.internal".to_string())
+        );
+        assert_eq!(reg.resolve("case-r.min.internal"), None);
     }
 
     // The answerer's lease record (NET-010): the host-global arbitration.
