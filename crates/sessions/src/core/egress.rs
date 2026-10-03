@@ -1563,21 +1563,6 @@ impl ReplyFlows {
         }
     }
 
-    /// Ends every record the box holds at `proto` and `port` — the records a
-    /// publication's retraction takes with its publication — retaining the
-    /// records whose protocol or destination port differ. The records are
-    /// keyed by the client's tuple, so the retracted publish's inside port is
-    /// the destination half of every record it earned, and they end here, in
-    /// the step the recording gate applies the retraction, rather than at the
-    /// next sweep or the row's next end: the next frame the box sends back on
-    /// one of them is decided by the rules, not by the record a publication
-    /// that no longer stands opened. A publish at any other port of the same
-    /// box keeps its records, and nothing here reaches another box's table.
-    pub fn end_port(&mut self, proto: u8, port: u16) {
-        self.flows
-            .retain(|tuple, _| tuple.protocol() != proto || tuple.destination_port() != port);
-    }
-
     /// Sweeps the expired records, at most once per
     /// [`REPLY_FLOW_SWEEP_INTERVAL`] and only when the table is at its cap —
     /// a healthy table pays nothing and a flooded one pays at most one sweep
