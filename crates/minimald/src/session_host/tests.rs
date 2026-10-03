@@ -3852,6 +3852,321 @@ async fn expose_ask_answered_after_the_stall_bound_publishes() {
     assert!(records[0].get("reason").is_none());
 }
 
+/// A dialog that ends without the human's answer is the daemon's refusal,
+/// not the human's (the review thread on `Binding::run`): a binding shed
+/// mid-dialog — its client stopped reading, so the host dropped it once the
+/// stall bound passed — used to break the dialog loop with the default
+/// [`Refused`](AskAnswer::Refused) answer and send that up as the human's
+/// own, so the audit recorded `attached-human` for a denial no human made.
+/// Here the stall bound is shortened, the dialog is left standing while the
+/// session prints more than [`ASK_HELD_OUTPUT`] into the pty and the client
+/// reads none of it, and the binding sheds mid-dialog: the ask ends with
+/// the typed nobody-is-attached refusal, the switch is asked nothing, and
+/// the decision is audited as the daemon's — because no human answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_ask_shed_mid_dialog_is_the_daemons_refusal() {
+    let capture = captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (web, handle) = dynamic_ingress_box(
+        &server,
+        &mut client,
+        "web",
+        Some(sessions::DynamicIngress::Ask),
+        Some((3000, 3999)),
+    )
+    .await;
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    // Attach the human the ask will be routed to, and prove the binding is
+    // live before asking: the mock shell's echo round-trips through it.
+    let mut channel = client.open_shell(web).await;
+    channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+    let mut live = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Data { data }) => {
+                    live.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&live).contains("got:hello") {
+                        return;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("the channel closed before the shell came up"),
+            }
+        }
+    })
+    .await
+    .expect("the attached shell should echo within the bound");
+
+    // Shorten the stall bound on the live host, so the shed this test drives
+    // fires in half a second rather than thirty.
+    let host = handle
+        .ensure_host("user".to_string())
+        .await
+        .expect("the attached box has a live host");
+    host.set_output_stall_timeout(Duration::from_millis(500))
+        .await;
+
+    // Ask off the test's own task: the reply waits on the human.
+    let asked = tokio::spawn(async move { handle.expose_dynamic(3000).await });
+
+    // The dialog has to be up before the client stops reading, so the shed
+    // lands inside it.
+    let rendered = await_ask_prompt(&mut channel).await;
+    let rendered = String::from_utf8_lossy(&rendered);
+    assert!(
+        rendered.contains("web asks to publish port 3000"),
+        "the dialog's lead-in names the box and the port: {rendered}"
+    );
+
+    // The client reads nothing from here on. The session prints more than
+    // one dialog's held-output bound ([`ASK_HELD_OUTPUT`]) into the pty
+    // while the human is nowhere, so the drain beside the dialog gives up,
+    // the mailbox fills behind it, and the stall bound sheds the binding
+    // with the dialog still standing.
+    host.feed_stdin(format!("{}\n", "x".repeat(120)).repeat(30000).into_bytes())
+        .await;
+
+    // The ask ends with the daemon's typed nobody-is-attached refusal — not
+    // the human's deny a shed used to answer with.
+    let refused = tokio::time::timeout(Duration::from_secs(30), asked)
+        .await
+        .expect("a dialog its binding was shed from must end the ask, not park it")
+        .expect("the spawned request should not panic")
+        .expect_err("a shed mid-dialog fails the ask closed");
+    match refused {
+        crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::AskNeedsAnswer,
+        ) => {}
+        other => panic!("the shed's refusal is the typed nobody-is-attached error: {other:?}"),
+    }
+    forwarder.abort();
+    assert!(
+        served.lock().expect("served lock").is_empty(),
+        "an ask nobody answered asks the switch nothing"
+    );
+
+    // The client's channel saw the shed itself — EOF, the shed exit status,
+    // and a close — so the refusal above is the one a shed answers with,
+    // not one a dialog that ended some other way produced.
+    let (mut eof, mut exit_status, mut closed) = (false, None, false);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Eof => eof = true,
+                russh::ChannelMsg::ExitStatus { exit_status: s } => exit_status = Some(s),
+                russh::ChannelMsg::Close => {
+                    closed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the shed binding's channel should close within the bound");
+    assert!(eof, "the channel must see EOF before it closes");
+    assert_eq!(
+        exit_status,
+        Some(SHED_EXIT_STATUS),
+        "a shed reports the status that has the client restore the terminal",
+    );
+    assert!(closed, "the channel should close after the shed");
+
+    // The prompt says its line, and the refusal is logged as the daemon's
+    // fail-closed decision — not the human's, which is what a shed used to
+    // be recorded as.
+    let log = capture.contents();
+    assert!(
+        log.contains("asking the attached client to allow a runtime port publish"),
+        "the prompt the human saw says its line: {log}"
+    );
+    assert!(
+        log.contains("outcome=\"refused\"") && log.contains("decided_by=daemon"),
+        "the refusal is logged as the daemon's fail-closed decision: {log}"
+    );
+
+    // And one audit record (NET-046) for the decision, naming the daemon as
+    // the decider — because the human the dialog was for never answered.
+    let records = audit_records(&server.state.minimal_state_dir().await).await;
+    assert_eq!(records.len(), 1, "one ask is one decision: {records:?}");
+    assert_eq!(records[0]["box"], "web");
+    assert_eq!(records[0]["port"], 3000);
+    assert_eq!(records[0]["decision"], "ask");
+    assert_eq!(
+        records[0]["decided_by"], "daemon",
+        "a dialog nobody answered is the daemon's decision: {records:?}"
+    );
+    assert_eq!(records[0]["outcome"], "refused");
+    assert_eq!(
+        records[0]["reason"], "dynamic ingress is set to ask and nobody is attached to answer",
+        "the audit record carries the typed error the caller read: {records:?}"
+    );
+}
+
+/// The same rule for a teardown mid-dialog: a second client attaching
+/// supersedes the binding whose dialog is standing, and the ask it was
+/// holding is the daemon's refusal too — not the superseded human's deny,
+/// which is what the ended dialog's default answer used to record it as.
+/// The first channel sees its supersede farewell, the ask ends with the
+/// typed nobody-is-attached refusal, the switch is asked nothing, and the
+/// decision is audited as the daemon's (NET-046).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_ask_superseded_mid_dialog_is_the_daemons_refusal() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (web, handle) = dynamic_ingress_box(
+        &server,
+        &mut client,
+        "web",
+        Some(sessions::DynamicIngress::Ask),
+        Some((3000, 3999)),
+    )
+    .await;
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    // Attach the human the ask will be routed to, and prove the binding is
+    // live before asking.
+    let mut channel = client.open_shell(web).await;
+    channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+    let mut live = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Data { data }) => {
+                    live.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&live).contains("got:hello") {
+                        return;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("the channel closed before the shell came up"),
+            }
+        }
+    })
+    .await
+    .expect("the attached shell should echo within the bound");
+
+    // Ask off the test's own task: the reply waits on the human.
+    let asked = tokio::spawn(async move { handle.expose_dynamic(3000).await });
+
+    let rendered = await_ask_prompt(&mut channel).await;
+    let rendered = String::from_utf8_lossy(&rendered);
+    assert!(
+        rendered.contains("web asks to publish port 3000"),
+        "the dialog's lead-in names the box and the port: {rendered}"
+    );
+
+    // A second shell on the same box supersedes the first binding, with its
+    // dialog still standing: the teardown it takes cannot wait for a human,
+    // so the dialog ends unanswered and the ask ends with it.
+    let mut second = client.open_shell(web).await;
+
+    // The ask ends with the daemon's typed nobody-is-attached refusal — not
+    // the human's deny the ended dialog's default answer used to send.
+    let refused = tokio::time::timeout(Duration::from_secs(30), asked)
+        .await
+        .expect("a dialog its binding was superseded from must end the ask, not park it")
+        .expect("the spawned request should not panic")
+        .expect_err("a teardown mid-dialog fails the ask closed");
+    match refused {
+        crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::AskNeedsAnswer,
+        ) => {}
+        other => panic!("the supersede's refusal is the typed nobody-is-attached error: {other:?}"),
+    }
+    forwarder.abort();
+    assert!(
+        served.lock().expect("served lock").is_empty(),
+        "an ask nobody answered asks the switch nothing"
+    );
+
+    // The first channel saw the supersede itself — its farewell and a close
+    // — so the refusal above is the one a teardown mid-dialog answers with.
+    let (mut superseded, mut closed) = (false, false);
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Data { data }) => {
+                    seen.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&seen)
+                        .contains("session attached to from a different connection")
+                    {
+                        superseded = true;
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    closed = true;
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the superseded binding's channel should close within the bound");
+    assert!(
+        superseded,
+        "the first client saw its supersede farewell: {}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(closed, "the channel should close after the supersede");
+
+    // The second binding took the box over, and is live to prove it.
+    second.data_bytes(b"still-here\n".to_vec()).await.unwrap();
+    let mut echoed = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match second.wait().await {
+                Some(russh::ChannelMsg::Data { data }) => {
+                    echoed.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&echoed).contains("got:still-here") {
+                        return;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("the channel closed before the new shell echoed"),
+            }
+        }
+    })
+    .await
+    .expect("the superseding client should hold a live shell");
+
+    // And one audit record (NET-046) for the decision, naming the daemon as
+    // the decider — no human answered, the dialog was torn down under them.
+    let records = audit_records(&server.state.minimal_state_dir().await).await;
+    assert_eq!(records.len(), 1, "one ask is one decision: {records:?}");
+    assert_eq!(records[0]["box"], "web");
+    assert_eq!(records[0]["port"], 3000);
+    assert_eq!(records[0]["decision"], "ask");
+    assert_eq!(
+        records[0]["decided_by"], "daemon",
+        "a dialog torn down mid-thought is the daemon's decision: {records:?}"
+    );
+    assert_eq!(records[0]["outcome"], "refused");
+    assert_eq!(
+        records[0]["reason"], "dynamic ingress is set to ask and nobody is attached to answer",
+        "the audit record carries the typed error the caller read: {records:?}"
+    );
+}
+
 /// NET-045's no-client case against a live host: the box is up and detached
 /// (NET-015), so the refusal has to come from the host that has nobody
 /// attached rather than the no-host shortcut. Attaches, detaches, asks — the
@@ -3922,6 +4237,16 @@ async fn expose_ask_after_detaching_is_refused_by_the_live_host() {
     );
     assert!(closed, "the channel should close after the detach chord");
 
+    // The host is live — asserted, not presumed, because a dead host would
+    // take the session's no-host shortcut and answer the same words from a
+    // different place, and this test exists to pin the live one. The probe
+    // goes through the session to the running host, and `Some` answers only
+    // from a live host.
+    tokio::time::timeout(Duration::from_secs(5), handle.get_attrs())
+        .await
+        .expect("the detached box's host probe should answer within its own bound")
+        .expect("the host that served the detach is still live, nobody attached to it");
+
     // The host is live and nobody is attached: the ask must be refused with
     // the typed nobody-is-attached error, not parked and not a plain
     // "no session" answer.
@@ -3951,6 +4276,20 @@ async fn expose_ask_after_detaching_is_refused_by_the_live_host() {
     assert!(
         log.contains("outcome=\"refused\"") && log.contains("decided_by=daemon"),
         "the refusal is logged as the daemon's fail-closed decision: {log}"
+    );
+    // And the refusal came from the live host's own nobody-attached branch —
+    // the plan's one info line per refusal for want of a client, naming the
+    // box and the port — which the session's no-host shortcut never says,
+    // so this line is what tells the two apart.
+    let refusing = log
+        .lines()
+        .find(|line| {
+            line.contains("refusing the runtime port publish ask for want of a client to answer it")
+        })
+        .unwrap_or_else(|| panic!("the live host that refused the ask should say its line: {log}"));
+    assert!(
+        refusing.contains("session=web") && refusing.contains("port=3000"),
+        "the refusal names the box and the port it was about: {refusing}"
     );
 
     // And the decision is audited (NET-046): the daemon decided it, because

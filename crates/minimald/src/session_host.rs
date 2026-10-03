@@ -77,10 +77,12 @@ const ASK_HELD_OUTPUT: usize = 4 * 1024 * 1024;
 /// `dynamic_ingress` is `ask`, so the request belongs to whoever is bound to
 /// this host's channel.
 ///
-/// Every way the dialog can end short of an explicit allow maps to
+/// Every answer short of an explicit allow is
 /// [`Refused`](Self::Refused) — a picked deny, a cancel, a client that went
-/// away mid-prompt: an unanswered ask is a refusal, never a publish nobody
-/// confirmed.
+/// away mid-prompt: an ask never publishes unconfirmed. A dialog that ended
+/// with no answer to give — nobody was attached to give one — carries no
+/// `AskAnswer` at all: the `None` around it is the daemon's fail-closed
+/// refusal, not the human's, and the audit says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AskAnswer {
     /// The human picked allow: the request proceeds to the publish it came
@@ -585,11 +587,15 @@ impl Binding {
                 // [`Self::render_farewell`], once the ask it interrupted is
                 // answered.
                 let mut farewell: Option<Farewell> = None;
-                // Every way a dialog ends without the human's allow maps to
-                // [`Refused`](AskAnswer::Refused) — so the fail-closed paths
-                // below need no code of their own, and the dialog's own
-                // result is the only thing that can move this off `Refused`.
-                let mut answer = AskAnswer::Refused;
+                // No answer until a human gives one. A dialog that ends
+                // without the human's choice — the shed below, a teardown,
+                // the host going away, a terminal that could not carry the
+                // dialog — is the daemon's refusal, not the human's: the
+                // reply sender drops unsent, the host reads no answer, and
+                // `resume_ask` records the daemon as the decider with the
+                // typed nobody-is-attached refusal. Only a dialog that
+                // completed with a choice in hand is the human's answer.
+                let mut answer: Option<AskAnswer> = None;
                 {
                     // Pinned outside the loop below, not rebuilt inside it: a
                     // select arm's future is re-created on every iteration
@@ -662,25 +668,36 @@ impl Binding {
                     tokio::select! {
                         _ = w.write_all(&held) => {},
                         () = self.shed.cancelled() => {
-                            // The asker going away before the answer is not
-                            // an error to relay: the reply's fate was always
-                            // the asker's.
-                            #[expect(
-                                clippy::let_underscore_must_use,
-                                reason = "the asker may be gone; its reply's fate was always its own"
-                            )]
-                            let _ = reply.send(answer);
+                            // The shed ends the dialog without the human's
+                            // answer unless the dialog had already completed
+                            // under them: send the answer if there is one,
+                            // and none otherwise — the dropped sender is what
+                            // the host reads as the nobody-attached case.
+                            if let Some(answer) = answer {
+                                #[expect(
+                                    clippy::let_underscore_must_use,
+                                    reason = "the asker may be gone; its reply's fate was always its own"
+                                )]
+                                let _ = reply.send(answer);
+                            }
                             break MainloopExitReason::Shed;
                         }
                     }
                 }
                 // The asker going away before the answer is not an error to
-                // relay: the reply's fate was always the asker's.
-                #[expect(
-                    clippy::let_underscore_must_use,
-                    reason = "the asker may be gone; its reply's fate was always its own"
-                )]
-                let _ = reply.send(answer);
+                // relay: the reply's fate was always the asker's. A dialog
+                // that ended without one — a teardown that could not wait
+                // for a human, a host already gone, a terminal that could
+                // not carry the dialog — drops the sender instead, which is
+                // the nobody-attached answer the host turns into the
+                // daemon's own fail-closed refusal.
+                if let Some(answer) = answer {
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "the asker may be gone; its reply's fate was always its own"
+                    )]
+                    let _ = reply.send(answer);
+                }
                 if let Some(farewell) = farewell {
                     break Self::render_farewell(farewell, &mut w).await;
                 }
@@ -978,10 +995,13 @@ impl Binding {
     /// attached human (NET-045): the exit prompt's own dialog, over the same
     /// channel halves, offering deny first so that a reflexive Enter — or any
     /// way the dialog can end without an explicit choice — fails the request
-    /// closed. An associated fn taking the facts piecewise, exactly like
-    /// [`Self::shell_exit_prompt`], because [`Self::run`] holds the channel
-    /// halves as locals.
-    async fn ask_prompt<R, W>(name: &str, port: u16, mut r: R, mut w: W) -> AskAnswer
+    /// closed. Answers with the answer the human gave; `None` when the
+    /// dialog could not be carried — a render or read that failed on I/O —
+    /// which is no answer rather than a deny, so the daemon owns the
+    /// refusal it becomes. An associated fn taking the facts piecewise,
+    /// exactly like [`Self::shell_exit_prompt`], because [`Self::run`]
+    /// holds the channel halves as locals.
+    async fn ask_prompt<R, W>(name: &str, port: u16, mut r: R, mut w: W) -> Option<AskAnswer>
     where
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
@@ -1004,11 +1024,18 @@ impl Binding {
             // Enter.
             .default(0);
         match select.interact(&mut r, &mut w).await {
-            Ok(async_dialog::Selection::At(1)) => AskAnswer::Allowed,
+            Ok(async_dialog::Selection::At(1)) => Some(AskAnswer::Allowed),
             // An explicit deny, a cancel (Ctrl-C, `q`, Escape), an EOF from a
-            // client that left mid-prompt, or a render/read failure: all of
-            // them are refusals — an unanswered ask never publishes.
-            _ => AskAnswer::Refused,
+            // client that left mid-prompt: the human's own deny — the
+            // fail-closed answer, now in their hand, of an ask that never
+            // publishes unconfirmed.
+            Ok(_) => Some(AskAnswer::Refused),
+            // A dialog that could not be carried to the terminal and back —
+            // a render or read that failed on I/O — answered nobody. That
+            // is the daemon's refusal, not the human's deny, so it comes
+            // back as no answer: the dropped reply makes `resume_ask`
+            // record the daemon as the decider.
+            Err(_) => None,
         }
     }
 
@@ -4883,6 +4910,17 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     // dialog nobody can see.
                     Message::AskExpose { port, reply } => match self.remote.as_ref() {
                         None => {
+                            // The plan's observability line: one info line per
+                            // refusal for want of a client, naming the box and
+                            // the port — and the one line the session-level
+                            // no-host shortcut never says, so a refusal read
+                            // off the log can be told to have come from a
+                            // live host that found nobody on it.
+                            tracing::info!(
+                                session = %self.session_name,
+                                port,
+                                "refusing the runtime port publish ask for want of a client to answer it"
+                            );
                             #[expect(
                                 clippy::let_underscore_must_use,
                                 reason = "the asker may already be gone; there is nothing to answer then"

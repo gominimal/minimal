@@ -2417,8 +2417,11 @@ impl Session {
                     crate::net::policy::ExposeRefusal::DeniedByPolicy,
                 ))
             }
-            // Nobody was attached to answer (NET-045's unwanted branch): the
-            // typed refusal, decided by the daemon.
+            // Nobody was attached to answer (NET-045's unwanted branch) — no
+            // binding to render the dialog, or one that ended mid-dialog
+            // without the human choosing, its reply sender dropped unsent: a
+            // shed, a teardown, the host going away. The typed refusal,
+            // decided by the daemon, because there was no human deciding.
             None => Err(crate::net::policy::ExposeFailure::Refused(
                 crate::net::policy::ExposeRefusal::AskNeedsAnswer,
             )),
