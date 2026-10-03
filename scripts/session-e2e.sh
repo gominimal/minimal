@@ -143,6 +143,14 @@
 #                                    a denied range, answers AAAA/HTTPS/SVCB
 #                                    empty, and lets boxes reach each other by
 #                                    name under both boxes' rules
+#   unpublished_port_refused_on_vm_host
+#                                    NET-014's VM-lane half: a peer box's
+#                                    connect to a box's unpublished port is
+#                                    refused within 5 s, never timed out,
+#                                    and where a published name reaches the
+#                                    box from the host the host's own
+#                                    connect through that name gets the
+#                                    same refusal
 #   proxy_sees_each_vm_box_by_its_switch_address
 #                                    NET-132: a box's connection to the
 #                                    proxy's address is delivered carrying
@@ -157,15 +165,16 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 E2E_VM="${E2E_VM:-}"
 
 # The three Linux fresh-install KVM proofs are documented as VM-backed cases
-# (NET-049/NET-051, plus the stock-install integration case) and are invoked
-# directly by their task test lines. When called that way, behave as if the
-# caller exported the KVM lane environment variables: E2E_VM=1 and
-# E2E_MINIMAL_ARGS="--provider local-minvmd". Without this the script's
-# min_daemon probe defaults to minimald on Linux and the standalone case fails
-# before it reaches the proof.
+# (NET-049/NET-051, plus the stock-install integration case), the
+# unpublished-port refusal proof is one by its own subject (NET-014 on the VM
+# host), and each is invoked directly by its task test line. When called that
+# way, behave as if the caller exported the KVM lane environment variables:
+# E2E_VM=1 and E2E_MINIMAL_ARGS="--provider local-minvmd". Without this the
+# script's min_daemon probe defaults to minimald on Linux and the standalone
+# case fails before it reaches the proof.
 case "${1:-}" in
   fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
-    | linux_stock_install_runs_vm_boxes)
+    | linux_stock_install_runs_vm_boxes | unpublished_port_refused_on_vm_host)
     E2E_VM="${E2E_VM:-1}"
     if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
       E2E_MINIMAL_ARGS="--provider local-minvmd"
@@ -226,6 +235,8 @@ RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
 GOA_T_SEED_DIR="" # the github-only allowlist proof's toolchain-box seed; removed on teardown
 GOA_SEED_DIR="" # its shared shell-stack seed (the denied-range and peer boxes); removed on teardown
+UPR_T_SEED_DIR="" # the unpublished-port refusal proof's target box; removed on teardown
+UPR_P_SEED_DIR="" # its peer box's seed; removed on teardown
 BOXREG_SEED_DIR="" # the box-registration proof's seed; removed on teardown
 BOXREG_CTRLC_SEED_DIR="" # its Ctrl-C seed (carries bulk data); removed on teardown
 BOXREG_CTRLC_PID="" # its interrupted activate; INT then KILL on teardown
@@ -568,6 +579,11 @@ teardown() {
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
   [ -n "$GOA_T_SEED_DIR" ] && rm -rf "$GOA_T_SEED_DIR"
   [ -n "$GOA_SEED_DIR" ] && rm -rf "$GOA_SEED_DIR"
+  # The unpublished-port refusal proof's two boxes: its own success path
+  # removes them too, but every failure path in it goes straight to `fail`,
+  # so the trap is the one place that always sees them.
+  [ -n "$UPR_T_SEED_DIR" ] && rm -rf "$UPR_T_SEED_DIR"
+  [ -n "$UPR_P_SEED_DIR" ] && rm -rf "$UPR_P_SEED_DIR"
   [ -n "$BOXREG_SEED_DIR" ] && rm -rf "$BOXREG_SEED_DIR"
   [ -n "$BOXREG_CTRLC_SEED_DIR" ] && rm -rf "$BOXREG_CTRLC_SEED_DIR"
   # The proxy-source proof's two boxes: their project dirs are removed on its
@@ -7764,6 +7780,312 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
 }
 
 # ---------------------------------------------------------------------------
+# NET-014 on the VM-backed host: a connection to a port a box has not
+# published is refused within 5 s, never timed out. The github-only case
+# above holds the connect-time conjunction's shape — its unpublished-port
+# zone leg included — on every lane that has a switch; THIS case is the VM
+# host's own half of the same requirement, driven where the fabric it
+# describes exists: boxes the VM host daemon registered, the in-guest relay
+# that answers their SYNs, and the host gate that fronts it. Two legs, one
+# transcript line each:
+#
+#   * the peer leg — a peer box connects to the target's UNPUBLISHED port by
+#     name and must be refused with the kernel's own connection-refused
+#     shape (curl exit 7, fast), never the connect timeout a silent drop
+#     reads as (exit 28). The control the same run completes first — the
+#     same peer reaching the target's PUBLISHED port by the same name — is
+#     what makes the refusal the port's and not weather: the fabric carried
+#     this peer to this box a moment before, so a fast refusal below can
+#     only be the unpublished port's own.
+#
+#   * the host leg — WHERE a published name reaches the box from the host.
+#     The control IS the condition: the host connects through
+#     `<name>.min.internal` to the target's published port, every proxy
+#     variable stripped from curl's environment, and the marker answers.
+#     Where that holds, the host's own connect through the same name to the
+#     UNPUBLISHED port must get the same refusal — the leg that shows the
+#     host gate passing a host-originated SYN through to the relay that
+#     resets it. Where it does not (today's KVM lane runs no host-side
+#     answerer, so no box name resolves there), the leg prints the observed
+#     fact and asserts nothing: the WHERE clause is the requirement's own,
+#     and a skip that says what it could not assert is the honest reading.
+#
+# Every refusal's audit line — the one shared format every leg's log tail
+# carries — rides the guest's serial console into the host-side boot log on
+# a VM lane, so each leg's window is printed beneath it: whichever leg
+# refused, the transcript shows the same `rule_matched=… address=… port=…
+# reason=… source=… refusals=N` line (printed, never asserted; the legs
+# assert the refused shape, and the window is the evidence of which leg
+# answered).
+proof_unpublished_port_refused_on_vm_host() {
+  local upr_t_sid="" upr_p_sid="" upr_ready=""
+  local upr_ctl_rc="" upr_ctl_status="" upr_ctl_body=""
+  local upr_ref_rc="" upr_ref_ms="" upr_ref_status="" upr_ref_err="" upr_ref_answered=""
+  local upr_hctl_rc="" upr_hctl_status="" upr_hctl_body=""
+  local upr_href_rc="" upr_href_ms="" upr_href_status="" upr_href_err="" upr_href_answered=""
+  local upr_before="" upr_start=""
+  local upr_t_name="e2e-unpub-target" upr_p_name="e2e-unpub-peer"
+  local upr_pub_port=18101 upr_closed_port=18102
+  local upr_marker="UNPUB_TARGET_OK"
+  echo "::group::an unpublished port is refused on a VM-backed host (NET-014)"
+
+  # This case is the VM lanes': the in-guest relay it drives and the host
+  # gate that fronts it exist only where the CLI is VM-backed. A native host's
+  # own relay refuses the same SYN — the github-only case's zone legs carry
+  # that half on a native lane — so a native run skips rather than prove the
+  # native path twice.
+  if [ -z "$E2E_VM" ]; then
+    echo "unpublished-port refusal on a VM host SKIPPED (native target: the in-guest relay this case drives and the host gate that fronts it exist only where the CLI is VM-backed; a native relay's own refusal is the github-only case's half on that lane)"
+    echo "::endgroup::"
+    return 0
+  fi
+  # The VM lanes' own prerequisite, scoped to the OS where it is the right
+  # criterion: a Linux VM boots on KVM (libkrun's Linux backend has no other
+  # tier), so the fresh-install KVM cases gate on /dev/kvm — while the macOS
+  # lane, which this case also runs on in the whole-lane order, hypervises
+  # through Hypervisor.framework and has no /dev/kvm at all. Probe the device
+  # only where it is the lane's tier, so a Linux box without KVM skips with
+  # the lane mismatch named instead of failing a boot it can never complete.
+  if [ "$(uname -s)" = Linux ] && { [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
+    echo "unpublished-port refusal on a VM host SKIPPED (no writable /dev/kvm: a Linux VM boots on KVM and this host has none — the case drives a VM-backed host, and a native host's own refusal is the github-only case's zone legs, not this case's subject)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "unpublished-port refusal on a VM host SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so no box has an address to be refused at)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The in-guest daemon's log on a VM lane: its stdout rides the guest's
+  # serial console into the host-side boot log — the same file `fail` dumps
+  # and the github-only case reads (goa_log's twin, and its note on the SGR
+  # codes the console layer paints applies here too: they are stripped at
+  # this one reader, so a record's fields read the same as the file shape).
+  upr_log() {
+    printf '%s\n' "${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-minvmd0/boot.log}"
+  }
+  upr_log_lines() {
+    local f
+    f="$(upr_log)"
+    if [ -n "$f" ] && [ -f "$f" ]; then wc -l < "$f"; else printf '0\n'; fi
+  }
+  upr_net_since() {
+    local f esc
+    f="$(upr_log)"
+    [ -n "$f" ] && [ -f "$f" ] || return 0
+    esc=$'\033'
+    tail -n "+$(($1 + 1))" "$f" | grep -F -- 'minimald::net::' \
+      | sed "s/${esc}[[0-9;]*m//g" || true
+  }
+  # The window's records, printed beneath the leg that owed them: poll ≤5 s
+  # for the wanted line (the serial console is asynchronous), then print
+  # whatever landed — the shared refusal audit line when the relay answered
+  # this leg's SYN, and the empty window that says it never saw one.
+  upr_print_net_since() {
+    local before="$1" want="$2" i w=""
+    for i in $(seq 1 20); do
+      w="$(upr_net_since "$before")"
+      case "$w" in *"$want"*) break ;; esac
+      sleep 0.25
+    done
+    if [ -n "$w" ]; then
+      printf '%s\n' "$w" | sed 's/^/daemon log: /'
+    else
+      echo "daemon log: (no minimald::net record in this window)"
+    fi
+  }
+
+  # Two seeds, two dirs on purpose: a path that already holds a live session
+  # mints no second one (the browser-path proof's own note), and this case
+  # needs two boxes at once.
+  UPR_T_SEED_DIR="$(hook_mktemp /tmp/mnlut.XXXXXX)"
+  UPR_P_SEED_DIR="$(hook_mktemp /tmp/mnlup.XXXXXX)"
+  hook_seed_preamble > "$UPR_T_SEED_DIR/minimal.toml"
+  hook_seed_preamble > "$UPR_P_SEED_DIR/minimal.toml"
+  mkdir "$UPR_T_SEED_DIR/.git" "$UPR_P_SEED_DIR/.git"
+
+  # Both boxes declare the fabric plane as their one allow entry — the
+  # source's half of the connect-time conjunction (a box-zone answer pins
+  # nothing, so a name's answer can never be the grant, NET-072) — and the
+  # target declares its one published port: the control the refusal below
+  # is read against, never a substitute for it.
+  upr_t_sid="$(cd "$UPR_T_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$upr_t_name" --network own_ip \
+    --allow-subnets 100.64.0.0/10 --allow-protocols tcp \
+    --ingress "$upr_pub_port:$upr_pub_port" \
+    2>"$WORK/upr-t-activate.err")" || {
+    echo "::error::'min session activate' for the unpublished-port target box failed"
+    echo "--- stderr ---"; cat "$WORK/upr-t-activate.err" 2>/dev/null || true
+    fail
+  }
+  upr_t_sid="$(printf '%s\n' "$upr_t_sid" | tail -n1 | tr -d '\r')"
+  upr_p_sid="$(cd "$UPR_P_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$upr_p_name" --network own_ip \
+    --allow-subnets 100.64.0.0/10 --allow-protocols tcp \
+    2>"$WORK/upr-p-activate.err")" || {
+    echo "::error::'min session activate' for the unpublished-port peer box failed"
+    echo "--- stderr ---"; cat "$WORK/upr-p-activate.err" 2>/dev/null || true
+    fail
+  }
+  upr_p_sid="$(printf '%s\n' "$upr_p_sid" | tail -n1 | tr -d '\r')"
+  echo "boxes: the target $upr_t_sid ($upr_t_name, publishing $upr_pub_port) and the peer $upr_p_sid ($upr_p_name)"
+
+  # The target's responder on its published port (the github-only proof's
+  # socat form verbatim: socat is a launcher baseline package every box
+  # ships at /usr/bin), proven up before any leg runs — a leg failing
+  # against a listener that never started reads as a policy refusal, which
+  # is the one thing it must not be confused with.
+  mnl session exec "$upr_t_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 \
+    || { echo "::error::the target box has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"; fail; }
+  mnl session exec "$upr_t_sid" \
+    "body=$upr_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/upr200" \
+    >/dev/null 2>"$WORK/upr-responder.err" || {
+    echo "::error::could not write the target box's responder response"
+    cat "$WORK/upr-responder.err" 2>/dev/null || true
+    fail
+  }
+  mnl session exec "$upr_t_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:$upr_pub_port,reuseaddr,fork SYSTEM:\"cat /home/upr200\" >/dev/null 2>&1 &" \
+    >/dev/null 2>"$WORK/upr-responder.err" || {
+    echo "::error::could not start the target box's responder"
+    cat "$WORK/upr-responder.err" 2>/dev/null || true
+    fail
+  }
+  upr_ready=""
+  for _ in $(seq 1 40); do
+    if [ "$(mnl session exec "$upr_t_sid" \
+      "curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$upr_pub_port/" \
+      2>/dev/null || true)" = "200" ]; then
+      upr_ready=1; break
+    fi
+    sleep 0.25
+  done
+  [ -n "$upr_ready" ] || {
+    echo "::error::the target box's responder never answered its own box — the legs below must not run against a listener that never started"
+    fail
+  }
+
+  # ---- the control: the peer reaches the published port by name ----------
+  # The same peer, the same name, the published port: this leg's completing
+  # in THIS run is what separates the refusal below from a dead fabric —
+  # the doctrine every enforcement proof here carries.
+  mnl session exec "$upr_p_sid" \
+    "curl -sS --max-time 8 -o /home/upr.body -w 'HTTP:%{http_code}' 'http://$upr_t_name.min.internal:$upr_pub_port/'" \
+    >"$WORK/upr-ctl.out" 2>"$WORK/upr-ctl.err"
+  upr_ctl_rc=$?
+  upr_ctl_status="$(cat "$WORK/upr-ctl.out" 2>/dev/null)"
+  upr_ctl_body="$(mnl session exec "$upr_p_sid" 'cat /home/upr.body' 2>/dev/null || true)"
+  echo "control: the peer's GET http://$upr_t_name.min.internal:$upr_pub_port/ (the published port) -> ${upr_ctl_status:-<none>} ${upr_ctl_body:-<no body>}"
+  if [ "$upr_ctl_rc" -ne 0 ] || [ "${upr_ctl_status:-}" != "HTTP:200" ] \
+     || [[ "$upr_ctl_body" != *"$upr_marker"* ]]; then
+    echo "::error::the peer never reached the target's published port by name — the refusal below could not be told from a dead fabric"
+    cat "$WORK/upr-ctl.err" 2>/dev/null || true
+    fail
+  fi
+
+  # ---- the peer leg: the unpublished port is refused, never timed out -----
+  upr_before="$(upr_log_lines)"
+  upr_start="$(now_ms)"
+  mnl session exec "$upr_p_sid" \
+    "curl -sS --max-time 5 -o /dev/null -w 'HTTP:%{http_code}' 'http://$upr_t_name.min.internal:$upr_closed_port/'" \
+    >"$WORK/upr-ref.out" 2>"$WORK/upr-ref.err"
+  upr_ref_rc=$?
+  upr_ref_ms=$(( $(now_ms) - upr_start ))
+  upr_ref_status="$(cat "$WORK/upr-ref.out" 2>/dev/null)"
+  upr_ref_err="$(tr '\n' ' ' < "$WORK/upr-ref.err" 2>/dev/null)"
+  # curl ALWAYS writes its -w line and writes `HTTP:000` when nothing
+  # answered, so any real status back is an answer (the egress proof's rule).
+  # Each failure names the observed facts itself, so the leg's one transcript
+  # line below states the outcome only once the shape is verified.
+  upr_ref_answered=0
+  [ "$upr_ref_rc" -eq 0 ] && upr_ref_answered=1
+  [ -n "${upr_ref_status:-}" ] && [ "$upr_ref_status" != "HTTP:000" ] && upr_ref_answered=1
+  if [ "$upr_ref_answered" -ne 0 ]; then
+    echo "::error::the peer's connect to the target's unpublished port ANSWERED (curl exit $upr_ref_rc, ${upr_ref_status:-<none>}, ${upr_ref_ms} ms) — a port nothing published must be refused, and the control above reached this same box's published port in this same run"
+    cat "$WORK/upr-ref.err" 2>/dev/null || true
+    fail
+  fi
+  if [ "$upr_ref_rc" -ne 7 ]; then
+    echo "::error::the peer's connect to the unpublished port ended in curl exit $upr_ref_rc after ${upr_ref_ms} ms, not the 7 of a refused connection — a silent drop reads as the connect timeout 28, the shape NET-014 retires, and the control above completed in this same run so the fabric is alive"
+    cat "$WORK/upr-ref.err" 2>/dev/null || true
+    fail
+  fi
+  if [ "$upr_ref_ms" -ge 5000 ]; then
+    echo "::error::the peer's refusal took ${upr_ref_ms} ms (curl exit $upr_ref_rc) — NET-014 asks for the refusal within 5 s, and a refusal that slow is a drop that read as the timeout"
+    cat "$WORK/upr-ref.err" 2>/dev/null || true
+    fail
+  fi
+  echo "peer leg: the peer box's connect to $upr_t_name.min.internal:$upr_closed_port (published by nothing) -> refused in ${upr_ref_ms} ms (curl exit $upr_ref_rc, never the timeout), while the control reached this same box's published port in this same run; curl: ${upr_ref_err:-<none>}"
+  upr_print_net_since "$upr_before" 'no ingress mapping'
+
+  # ---- the host leg: WHERE a published name reaches the box from the host -
+  # The control is the condition: the host connects through the target's
+  # NAME to its published port, every proxy variable stripped from curl's
+  # environment (NET-009's rule — no client anywhere needs configuring), and
+  # the marker must answer. A name that does not resolve (curl exit 6) or
+  # one whose published port does not answer from the host is the WHERE
+  # clause reading false on this host; the leg says so and asserts nothing.
+  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+    -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+    curl -sS --max-time 10 -o "$WORK/upr-hctl.body" -w 'HTTP:%{http_code}' \
+    "http://$upr_t_name.min.internal:$upr_pub_port/" \
+    >"$WORK/upr-hctl.out" 2>"$WORK/upr-hctl.err"
+  upr_hctl_rc=$?
+  upr_hctl_status="$(cat "$WORK/upr-hctl.out" 2>/dev/null)"
+  upr_hctl_body="$(cat "$WORK/upr-hctl.body" 2>/dev/null || true)"
+  if [ "$upr_hctl_rc" -eq 6 ]; then
+    echo "host leg: SKIPPED (no published name reaches the box from this host — $upr_t_name.min.internal did not resolve from the host with no proxy settings, curl exit 6: this host's resolver is not pointed at the box zone's answerer. Where one is, the host's own connect through the name to the unpublished port must get the same refusal — the host gate passing that SYN through to the relay that resets it)"
+  elif [ "$upr_hctl_rc" -ne 0 ] || [ "${upr_hctl_status:-}" != "HTTP:200" ] \
+     || [[ "$upr_hctl_body" != *"$upr_marker"* ]]; then
+    echo "host leg: SKIPPED (the name resolved but the published port did not answer from the host — curl exit $upr_hctl_rc, ${upr_hctl_status:-<none>}; without that control a refusal below could not be told from a dead route)"
+    echo "  (host curl: $(tr '\n' ' ' < "$WORK/upr-hctl.err" 2>/dev/null))"
+  else
+    echo "control: the host's GET through the name to the published port -> ${upr_hctl_status:-<none>} $upr_marker (the name reaches the box from the host)"
+    # The leg: the host's own connect through the same name to the
+    # UNPUBLISHED port, the same proxy-stripped curl, the same refusal.
+    upr_before="$(upr_log_lines)"
+    upr_start="$(now_ms)"
+    env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+      curl -sS --max-time 5 -o /dev/null -w 'HTTP:%{http_code}' \
+      "http://$upr_t_name.min.internal:$upr_closed_port/" \
+      >"$WORK/upr-href.out" 2>"$WORK/upr-href.err"
+    upr_href_rc=$?
+    upr_href_ms=$(( $(now_ms) - upr_start ))
+    upr_href_status="$(cat "$WORK/upr-href.out" 2>/dev/null)"
+    upr_href_err="$(tr '\n' ' ' < "$WORK/upr-href.err" 2>/dev/null)"
+    upr_href_answered=0
+    [ "$upr_href_rc" -eq 0 ] && upr_href_answered=1
+    [ -n "${upr_href_status:-}" ] && [ "$upr_href_status" != "HTTP:000" ] && upr_href_answered=1
+    if [ "$upr_href_answered" -ne 0 ]; then
+      echo "::error::the host's connect through the name to the unpublished port ANSWERED (curl exit $upr_href_rc, ${upr_href_status:-<none>}, ${upr_href_ms} ms) — the control above reached this same box's published port through this same name in this same run, so the unpublished port's answer is an enforcement hole"
+      cat "$WORK/upr-href.err" 2>/dev/null || true
+      fail
+    fi
+    if [ "$upr_href_rc" -ne 7 ]; then
+      echo "::error::the host's connect through the name ended in curl exit $upr_href_rc after ${upr_href_ms} ms, not the 7 of a refused connection — the same box answered its published port through the same name above, so a timeout shape here is the drop NET-014 retires"
+      cat "$WORK/upr-href.err" 2>/dev/null || true
+      fail
+    fi
+    if [ "$upr_href_ms" -ge 5000 ]; then
+      echo "::error::the host's refusal took ${upr_href_ms} ms (curl exit $upr_href_rc) — the same refusal the peer leg got in ${upr_ref_ms} ms, and one that slow is a drop that read as the timeout"
+      cat "$WORK/upr-href.err" 2>/dev/null || true
+      fail
+    fi
+    echo "host leg: the host's connect through $upr_t_name.min.internal:$upr_closed_port (the published name, the unpublished port) -> the same refusal, in ${upr_href_ms} ms (curl exit $upr_href_rc), the host gate passing this SYN through to the relay that reset it; curl: ${upr_href_err:-<none>}"
+    upr_print_net_since "$upr_before" 'no ingress mapping'
+  fi
+
+  mnl session destroy --force "$upr_t_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$upr_p_sid" >/dev/null 2>&1 || true
+  rm -rf "$UPR_T_SEED_DIR"; UPR_T_SEED_DIR=""
+  rm -rf "$UPR_P_SEED_DIR"; UPR_P_SEED_DIR=""
+  echo "unpublished port refused on a VM host OK (the peer box's connect to the target's unpublished port was refused within 5 s, never timed out; and where a published name reached the box from the host, the host's own connect through it got the same refusal)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # The proxy sees each VM box by its own switch address (NET-132): a box's
 # connection to the proxy's address is delivered to the proxy's unix socket
 # carrying the box's own switch address in the delivery header, so the proxy
@@ -10289,6 +10611,7 @@ case "${1:-}" in
     proof_switch_steers_proxy_mac_frames_to_the_host_stack
     proof_switch_answers_no_arp_for_the_proxy_address
     proof_github_only_allowlist
+    proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
     ;;
   lifecycle | session_exec | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
@@ -10302,7 +10625,8 @@ case "${1:-}" in
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes \
     | switch_steers_proxy_mac_frames_to_the_host_stack | switch_answers_no_arp_for_the_proxy_address \
-    | github_only_allowlist | proxy_sees_each_vm_box_by_its_switch_address)
+    | github_only_allowlist | unpublished_port_refused_on_vm_host \
+    | proxy_sees_each_vm_box_by_its_switch_address)
     "proof_$1"
     ;;
   *)
@@ -10319,7 +10643,8 @@ case "${1:-}" in
     echo "         hostnames_recover_and_two_daemons_route"
     echo "         min_internal_names_through_proxy proxy_refuses_like_direct retired_surfaces_gone"
     echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
-    echo "         github_only_allowlist proxy_sees_each_vm_box_by_its_switch_address"
+    echo "         github_only_allowlist unpublished_port_refused_on_vm_host"
+    echo "         proxy_sees_each_vm_box_by_its_switch_address"
     exit 2
     ;;
 esac
