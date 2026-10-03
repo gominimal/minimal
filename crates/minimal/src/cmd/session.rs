@@ -1766,15 +1766,13 @@ pub async fn cmd_session_setup_zed(
         minimal_client::attach::shell_quote(&sock.display().to_string()),
     );
 
-    // Same host identity as attach: the provider-instance alias the daemon
-    // keyed its known_hosts entry on, derived from the socket path so the two
+    // Same host identity as attach: the alias the daemon keyed its
+    // known_hosts entry on, derived from the socket path so the two
     // cannot disagree.
     let host = sock
         .parent()
-        .and_then(std::path::Path::file_name)
-        .and_then(|n| n.to_str())
-        .context("daemon socket path has no provider-dir parent")?
-        .to_string();
+        .and_then(paths::ssh_host_alias)
+        .context("daemon socket path has no provider-dir parent")?;
 
     let username = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))

@@ -182,13 +182,14 @@ pub fn attach_command(
     }
 
     // The SSH host identity must match the known_hosts entry the daemon wrote,
-    // which it keys on the provider-instance name — the provider dir's basename
-    // (`local-minimald<N>` / `local-minvmd<N>`). Derive it from the socket path
-    // so the client and daemon can never disagree on the name.
+    // which it keys on [`paths::ssh_host_alias`] (`local-minimald<N>` /
+    // `local-minvmd<N>` for the default VM, `<vm>.local-minvmd<N>` for a named
+    // VM).
+    // Derive it from the socket path so the client and daemon can never
+    // disagree on the name.
     let host_alias = sock
         .parent()
-        .and_then(std::path::Path::file_name)
-        .and_then(|n| n.to_str())
+        .and_then(paths::ssh_host_alias)
         .context("daemon socket path has no provider-dir parent")?;
     ssh.arg(host_alias);
 
@@ -248,6 +249,23 @@ mod tests {
             .collect();
         assert!(args.iter().any(|a| a == "-tt"));
         assert_eq!(args.last().map(String::as_str), Some("local-minimald0"));
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("ProxyCommand=") && a.contains("proxy --socket"))
+        );
+    }
+
+    /// A named VM's socket nests under a per-name subdirectory, so the ssh
+    /// host is the VM name namespaced under the provider-instance name.
+    #[test]
+    fn attach_command_targets_a_named_vm_alias() {
+        let sock = PathBuf::from("/tmp/x/providers/local-minvmd0/alpha/ssh.sock");
+        let cmd = attach_command(&sock, sessions::SessionId::nil(), None, None).unwrap();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.last().map(String::as_str), Some("alpha.local-minvmd0"));
         assert!(
             args.iter()
                 .any(|a| a.starts_with("ProxyCommand=") && a.contains("proxy --socket"))
