@@ -285,6 +285,9 @@ fn config_in(temp: &TempDir, deny_all_opt_out: bool) -> Config {
         // `None` derives the switch /24 from the instance id, the same
         // start path a real daemon takes.
         switch_subnet_octet: None,
+        // No identity dir: the harness persists nothing and takes no
+        // runtime-dir lock, deriving the octet from the per-start id.
+        daemon_identity_dir: None,
         deny_all_opt_out,
     }
 }
