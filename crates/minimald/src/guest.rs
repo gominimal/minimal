@@ -1582,8 +1582,8 @@ mod tests {
 
         // A handed port something already holds fails the probe, with the
         // port and its transport in the reason.
-        let error = probe_handed_node_port(Some(held))
-            .expect_err("a held port cannot bind for the probe");
+        let error =
+            probe_handed_node_port(Some(held)).expect_err("a held port cannot bind for the probe");
         assert!(
             error.to_string().contains(&held.to_string()),
             "the failure names the port it could not bind, got: {error}"

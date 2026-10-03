@@ -171,12 +171,13 @@ pub(crate) fn control_sock_beside(ssh_sock: &std::path::Path) -> Option<std::pat
 /// Never read through the in-VM daemon: a guest relaying a host fact is
 /// forgeable from inside the escape boundary, so the CLI asks the host
 /// daemon that owns the fact. `None` — nothing to surface — when this
-/// invocation is not on a VM-backed host — keyed on
-/// [`daemon_provider_kind`], the rule every VM-backed gate keys on — the
-/// socket is not there, the deadline passes, or the daemon predates the
-/// verb and refuses the line: each is the same honest silence a daemon
-/// still bringing its answerer up gets, and the verbs print nothing they
-/// cannot prove.
+/// invocation is not on a VM-backed host, the socket is not there, the
+/// deadline passes, or the daemon predates the verb and refuses the line:
+/// each is the same honest silence a daemon still bringing its answerer up
+/// gets, and the verbs print nothing they cannot prove. Whether the
+/// invocation is on a VM-backed host is [`daemon_provider_kind`]'s to say,
+/// the rule every VM-backed gate keys on — never `use_minvmd()` alone
+/// (NET-081's macOS half).
 pub(crate) async fn vm_host_answerer_status(
     global: &GlobalArgs,
 ) -> Option<minimald_rpc::ZoneAnswererStatus> {
