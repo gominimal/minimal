@@ -7163,10 +7163,29 @@ proof_two_named_vms_on_one_machine() {
   # is written by the SESSION's shell so the Content-Length can never drift
   # from the body it frames. $1 = the runner (mnl or two_vm_mn), $2 = the
   # session id, $3 = the listen port, $4 = the marker to answer with.
+  #
+  # The socat probe's failure is two stories, and only one is about socat: an
+  # exec that never reached the box (its own stderr) reads the same as a box
+  # whose mint came up short. `session activate` prints an id only once the
+  # session is Active (crates/minimal/src/cmd/session.rs finalizes before it
+  # does), so a half-materialized box here would be a product bug, not a race
+  # — and the two beats below say which story it is: the ls row carries the
+  # session's own status, the /usr/bin peek says whether the box was
+  # populated at all.
   two_vm_start_responder() {
     local runner="$1" sid="$2" port="$3" marker="$4" ready
-    "$runner" session exec "$sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 \
-      || { echo "::error::the session has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"; fail; }
+    "$runner" session exec "$sid" 'test -x /usr/bin/socat' \
+      >/dev/null 2>"$WORK/two-vm-socat.err" \
+      || {
+        echo "::error::the session has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"
+        echo "--- probe stderr (empty means the box answered, without socat) ---"
+        cat "$WORK/two-vm-socat.err" 2>/dev/null || true
+        echo "--- the session's ls row (its status) ---"
+        "$runner" ls 2>/dev/null | grep -F -- "$sid" || true
+        echo "--- the box's /usr/bin (first entries) ---"
+        "$runner" session exec "$sid" 'ls /usr/bin' 2>&1 | head -n 20 || true
+        fail
+      }
     "$runner" session exec "$sid" \
       "body=$marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200" \
       >/dev/null 2>"$WORK/two-vm-responder.err" \
@@ -7508,9 +7527,9 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   # nothing, silently, because a listing spanning every VM cannot error on
   # one that is down. And the default VM did not move: its box is still
   # listed, its daemon still running, its published port still routing its
-  # box's name. With only one VM left the table loses its VM column — the
-  # single-VM rendering every consumer of `min ls` has always read — so the
-  # default's row is asserted by its id alone.
+  # box's name. The table keeps its VM column whatever the count of VMs
+  # (every row prints it, crates/minimal/src/cmd/list.rs), so the default's
+  # row is asserted by its id alone — the identity no stop can move.
   tw_ls_after="$(mnl ls 2>&1)"
   if printf '%s\n' "$tw_ls_after" | grep -Fq -- "$tw_b_sid"; then
     echo "::error::the stopped named VM's box is still in the listing — a stopped VM must contribute nothing"
