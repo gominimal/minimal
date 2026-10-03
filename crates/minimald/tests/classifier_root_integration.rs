@@ -713,13 +713,14 @@ unsafe fn deny_leaf_connect_role(report: libc::c_int, server_port: u16) -> ! {
     }
     // The report, the errno the connect met: `connect-errno=` and four
     // zero-padded digits, the same spelling the backend's answer carries,
-    // so the proof reads both legs off one format.
+    // so the proof reads both legs off one format. The three pushes fill
+    // the nineteen bytes exactly, so the whole array is the report.
     let mut answer = [0u8; 19];
     let mut answer_len = 0;
     push(&mut answer, &mut answer_len, b"connect-errno=");
     push_dec4(&mut answer, &mut answer_len, errno);
     push(&mut answer, &mut answer_len, b"\n");
-    let wrote = write_all(report, &answer[..answer_len]);
+    let wrote = write_all(report, &answer);
     if !wrote {
         // SAFETY: the child ends here.
         unsafe { libc::_exit(2) };
@@ -1022,13 +1023,21 @@ struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl LogCapture {
     fn contents(&self) -> String {
-        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        String::from_utf8(self.0.lock().expect("the record capture's lock").clone())
+            .expect("the record capture holds what the formatter wrote, which is utf-8")
     }
 }
 
 impl std::io::Write for LogCapture {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
+        // The one failure the capture knows: a lock poisoned by a panic
+        // inside the proof itself, handed back as the write error it is
+        // rather than ended on.
+        let mut captured = self
+            .0
+            .lock()
+            .map_err(|poisoned| std::io::Error::other(poisoned.to_string()))?;
+        captured.extend_from_slice(buf);
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
