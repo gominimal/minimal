@@ -14,6 +14,8 @@
 
 #![cfg(minvmd_libkrun)]
 
+mod common;
+
 use serial_test::serial;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -35,8 +37,8 @@ const EXT4_INCOMPAT_RECOVER: u32 = 0x0004;
 const EXT4_MAGIC_OFFSET: u64 = 1080;
 
 fn e2e_enabled(test: &str) -> bool {
-    if std::env::var("MINVMD_E2E").as_deref() != Ok("1") {
-        eprintln!("{test}: MINVMD_E2E != 1, skipping");
+    if !common::e2e() {
+        common::skip_or_fail(test, "MINVMD_E2E != 1");
         return false;
     }
     for var in &[
