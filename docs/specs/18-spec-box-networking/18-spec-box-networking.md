@@ -667,7 +667,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-132** WHERE the host is VM-backed and runs a node-local Box Egress Proxy THE SYSTEM SHALL deliver a box's connection to the proxy at the proxy's own infrastructure address on the switch, beside the gateway, with the box's own switch address as its source.
   tier:     T0
   verify:   ./scripts/session-e2e.sh proxy_sees_each_vm_box_by_its_switch_address
-  <!-- design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the machine-internal path MUST preserve each box's own source address, a v1 conformance requirement of the un-enrolled profile; a node-local BEP's steered destination is the BEP's own address on the host side of the switch (design §7.1 line 240), a second infrastructure address beside the gateway rather than the gateway itself, because the gateway address terminates in the switch's own stack, which cannot hand a connection off; a leg that translated every box to the host's loopback would give the proxy one source for every box and every host process, and the Box Egress Proxy document's cross-box and host-shell refusals rest on the source; the proxy's address follows the switch's subnet, the second infrastructure address above the lease run -->
+  <!-- design §7.1 (v0.8.3) and Gatehouse §6.10 (v1.24): the machine-internal path MUST preserve each box's own source address, a v1 conformance requirement of the un-enrolled profile; a node-local BEP's steered destination is the BEP's own address on the host side of the switch (design §7.1 line 240), a second infrastructure address beside the gateway rather than the gateway itself, because the gateway address terminates in the switch's own stack, which cannot hand a connection off; a leg that translated every box to the host's loopback would give the proxy one source for every box and every host process, and the Box Egress Proxy document's cross-box and host-shell refusals rest on the source; the proxy's address follows the switch's subnet, the second infrastructure address above the lease run; proposed working values, tuned by the integration run: the proxy's listener answers on port 8118, a box may hold at most 16 connections to it at once, and the delivery's listener pool is partitioned per registered box so each box's share is that per-source cap, added at its registration and withdrawn with its row -->
   - IF a process outside every box connects to the proxy's listener THEN THE SYSTEM SHALL present it from no box's address.
     tier:   T0
     verify: cargo nextest run -p minvmd host_process_never_arrives_from_a_box_address
@@ -765,6 +765,10 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minimald absent_range_publishes_interim_and_readvises
     <!-- design §7.1; unwanted; the interim is a per-host state that the privileged step supersedes -->
+  - WHERE the host is macOS THE SYSTEM SHALL name, in NET-122's advisory command, a privileged step that installs a boot-time service, from root-owned non-user-writable paths and reading no configuration, which applies exactly the reserved local range to the host loopback at install and at every boot.
+    tier:   T0
+    verify: cargo nextest run -p minimal advisory_command_reserves_the_range_on_macos
+    <!-- design §7.1 (the privileged step, one command with one privilege elevation shared with the answerer unit); state+event; Linux takes no range step — the whole 127/8 binds on `lo` — and its command keeps the routing-domain link's routable-scope address, without which resolved never consults the routing domain -->
 
 - **NET-124** WHEN a lookup asks for a record type other than A for a name a box or node holds in the box zone THE SYSTEM SHALL answer NODATA.
   tier:     T0

@@ -69,8 +69,13 @@ hickory-proto.workspace = true
 [dev-dependencies]
 camino.workspace = true
 serial_test.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 russh-sftp.workspace = true
+# The Box Egress Proxy stand-in acceptor's tests drive the delivery against a
+# real registry (`bep_stub`, NET-132) on the switch crate's channel-wired
+# lane and box-side client — the same `test_util` the pool's own tests use.
+switch = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
