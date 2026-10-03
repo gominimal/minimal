@@ -2272,6 +2272,20 @@ mod tests {
             "cache.example.com",
             "a mirror that spells no port is named without one"
         );
+        let ipv6 = AnyUrl::Https(
+            common::fetchers::ReqwestUrl::try_from("https://[::1]:8080/prefix/index.shisha")
+                .expect("the IPv6 mirror URL parses"),
+        );
+        assert_eq!(
+            cache_host(&ipv6),
+            "[::1]:8080",
+            "host_str keeps an IPv6 mirror's brackets, so its port reads apart from the address"
+        );
+        assert_eq!(
+            cache_host(&ipv6),
+            url_host("https://[::1]:8080/prefix/index.shisha"),
+            "the cache and source spellings agree for the same IPv6 host"
+        );
         let bucket = AnyUrl::Gcs(common::fetchers::GcsUrl {
             bucket: "projects/_/buckets/minimal-cache".to_string(),
             object: String::new(),
