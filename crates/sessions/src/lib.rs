@@ -37,7 +37,7 @@ pub enum NetworkMode {
 
 /// An IP transport protocol, used in egress/ingress policy rules.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum IpProto {
     Tcp,
@@ -454,15 +454,17 @@ pub enum PolicyError {
          bound >= 1024"
     )]
     PrivilegedDynamicRange { lo: u16 },
-    /// An ingress port mapping publishes the same host port more than once.
-    /// gvproxy's static forwarder cannot bind the same host port to two
-    /// different box ports, so the duplicate is rejected at launch rather than
-    /// failing opaquely at attach.
+    /// An ingress port mapping publishes the same host port on the same
+    /// transport more than once. gvproxy's static forwarder binds one forward
+    /// per transport and host port, so the duplicate is rejected at launch
+    /// rather than failing opaquely at attach. The same host port on TCP and
+    /// on UDP is two distinct binds and is allowed.
     #[error(
-        "ingress port mapping publishes host port {external_port} more than \
-         once; each host port may appear in at most one ingress mapping"
+        "ingress port mapping publishes {proto:?} host port {external_port} \
+         more than once; each host port may appear in at most one ingress \
+         mapping per protocol"
     )]
-    DuplicateIngressPort { external_port: u16 },
+    DuplicateIngressPort { external_port: u16, proto: IpProto },
     /// An ingress port mapping targets box port 0. Port 0 is reserved and
     /// cannot receive forwarded connections, so it is rejected at launch
     /// rather than failing opaquely at attach.
@@ -471,6 +473,59 @@ pub enum PolicyError {
          choose an internal_port >= 1"
     )]
     InvalidIngressPort { internal_port: u16 },
+}
+
+/// The static ingress mapping checks [`Record::validate_policy`] runs before
+/// its mode check, so a malformed mapping is named wherever it appears.
+fn validate_port_mappings(mappings: &[PortMapping]) -> Result<(), PolicyError> {
+    // gvproxy's static forwarder only exposes TCP and UDP, so an ingress
+    // mapping with any other transport is a configuration error wherever it
+    // appears — reject it before the mode check so it never reaches the
+    // forwarder as a silently-defaulted protocol.
+    if let Some(proto) = mappings
+        .iter()
+        .map(|mapping| mapping.proto)
+        .find(|proto| !matches!(proto, IpProto::Tcp | IpProto::Udp))
+    {
+        return Err(PolicyError::UnsupportedIngressProtocol { proto });
+    }
+    // minimald refuses to publish a privileged host port (< 1024): binding
+    // one needs elevated privilege the rootless switch lacks, so reject it
+    // at validation time with a remediation rather than letting the expose
+    // fail opaquely against gvproxy.
+    if let Some(external_port) = mappings
+        .iter()
+        .map(|mapping| mapping.external_port)
+        .find(|&port| port < 1024)
+    {
+        return Err(PolicyError::PrivilegedPort { external_port });
+    }
+    // A host port may be published at most once per transport: gvproxy's
+    // static forwarder keys each forward by protocol and host address, so a
+    // second mapping of the same host port on the same transport fails to
+    // bind. It is rejected at launch rather than failing opaquely at attach.
+    // TCP and UDP on one host port are distinct binds and both stand.
+    let mut seen = std::collections::HashSet::new();
+    if let Some(mapping) = mappings
+        .iter()
+        .find(|mapping| !seen.insert((mapping.external_port, mapping.proto)))
+    {
+        return Err(PolicyError::DuplicateIngressPort {
+            external_port: mapping.external_port,
+            proto: mapping.proto,
+        });
+    }
+    // Box port 0 is reserved and cannot receive forwarded connections, so
+    // a mapping targeting it is rejected at launch rather than failing
+    // opaquely at attach.
+    if let Some(internal_port) = mappings
+        .iter()
+        .map(|mapping| mapping.internal_port)
+        .find(|&port| port == 0)
+    {
+        return Err(PolicyError::InvalidIngressPort { internal_port });
+    }
+    Ok(())
 }
 
 /// Whether `s` is a syntactically valid CIDR prefix (`<addr>/<prefix-len>`) for
@@ -697,9 +752,11 @@ impl Record {
     /// [`PolicyError::IngressRequiresOwnIp`] when a non-empty ingress policy is
     /// set on anything but an `OwnIp` `PTask`. Returns
     /// [`PolicyError::UnsupportedIngressProtocol`] for an ingress mapping whose
-    /// transport gvproxy's forwarder cannot expose, or
+    /// transport gvproxy's forwarder cannot expose,
     /// [`PolicyError::PrivilegedPort`] for one that publishes a host port below
-    /// 1024. For a `PTask` that accepts egress, returns
+    /// 1024, [`PolicyError::DuplicateIngressPort`] for a host port published
+    /// twice on one transport, or [`PolicyError::InvalidIngressPort`] for one
+    /// that targets box port 0. For a `PTask` that accepts egress, returns
     /// [`PolicyError::InvalidSubnet`] when an egress `allow_subnets` entry is
     /// not a valid CIDR prefix or [`PolicyError::InvalidDenySubnet`] when a
     /// `deny_subnets` entry is not, [`PolicyError::InvalidDynamicRange`] when
@@ -708,64 +765,8 @@ impl Record {
     /// privileged host port (< 1024). Does not validate `dynamic_ingress`, which
     /// is accepted on an `OwnIp` `PTask` and serialized verbatim.
     pub fn validate_policy(&self) -> Result<(), PolicyError> {
-        // gvproxy's static forwarder only exposes TCP and UDP, so an ingress
-        // mapping with any other transport is a configuration error wherever it
-        // appears — reject it before the mode check so it never reaches the
-        // forwarder as a silently-defaulted protocol.
-        if let Some(proto) = self.policy.ingress.as_ref().and_then(|ingress| {
-            ingress
-                .port_mappings
-                .iter()
-                .map(|mapping| mapping.proto)
-                .find(|proto| !matches!(proto, IpProto::Tcp | IpProto::Udp))
-        }) {
-            return Err(PolicyError::UnsupportedIngressProtocol { proto });
-        }
-        // minimald refuses to publish a privileged host port (< 1024): binding
-        // one needs elevated privilege the rootless switch lacks, so reject it
-        // at validation time with a remediation rather than letting the expose
-        // fail opaquely against gvproxy.
-        if let Some(external_port) = self.policy.ingress.as_ref().and_then(|ingress| {
-            ingress
-                .port_mappings
-                .iter()
-                .map(|mapping| mapping.external_port)
-                .find(|&port| port < 1024)
-        }) {
-            return Err(PolicyError::PrivilegedPort { external_port });
-        }
-        // A host port may be published at most once: gvproxy's static forwarder
-        // cannot bind the same host port to two different box ports, so a
-        // duplicate is rejected at launch rather than failing opaquely at
-        // attach. The comparison is on the host port alone, regardless of
-        // protocol, since the forwarder's bind is per host port.
-        if let Some(external_port) = self.policy.ingress.as_ref().and_then(|ingress| {
-            ingress
-                .port_mappings
-                .iter()
-                .map(|mapping| mapping.external_port)
-                .find(|&port| {
-                    ingress
-                        .port_mappings
-                        .iter()
-                        .filter(|m| m.external_port == port)
-                        .count()
-                        > 1
-                })
-        }) {
-            return Err(PolicyError::DuplicateIngressPort { external_port });
-        }
-        // Box port 0 is reserved and cannot receive forwarded connections, so
-        // a mapping targeting it is rejected at launch rather than failing
-        // opaquely at attach.
-        if let Some(internal_port) = self.policy.ingress.as_ref().and_then(|ingress| {
-            ingress
-                .port_mappings
-                .iter()
-                .map(|mapping| mapping.internal_port)
-                .find(|&port| port == 0)
-        }) {
-            return Err(PolicyError::InvalidIngressPort { internal_port });
+        if let Some(ingress) = &self.policy.ingress {
+            validate_port_mappings(&ingress.port_mappings)?;
         }
         // A none box has no network: there is nothing to enforce an egress or
         // ingress declaration on, so both are configuration errors (NET-065).
@@ -1174,9 +1175,9 @@ mod tests {
 
     #[test]
     fn duplicate_host_port_is_rejected() {
-        // Publishing the same host port twice — even with different protocols
-        // or different box ports — is rejected, since gvproxy's static
-        // forwarder cannot bind the same host port to two destinations.
+        // Publishing the same host port twice on one transport — even to
+        // different box ports — is rejected, since gvproxy's static forwarder
+        // cannot bind the same host port and protocol to two destinations.
         let ingress = IngressPolicy {
             port_mappings: vec![
                 PortMapping {
@@ -1197,15 +1198,16 @@ mod tests {
         assert_eq!(
             record.validate_policy(),
             Err(PolicyError::DuplicateIngressPort {
-                external_port: 18080
+                external_port: 18080,
+                proto: IpProto::Tcp,
             })
         );
     }
 
     #[test]
-    fn duplicate_host_port_across_protocols_is_rejected() {
-        // The duplicate check compares host port alone, regardless of
-        // protocol, since the forwarder's bind is per host port.
+    fn same_host_port_on_tcp_and_udp_is_allowed() {
+        // TCP and UDP on one host port are distinct binds: gvproxy keys each
+        // forward by protocol and host address, so both mappings stand.
         let ingress = IngressPolicy {
             port_mappings: vec![
                 PortMapping {
@@ -1223,12 +1225,7 @@ mod tests {
             dynamic_ingress: None,
         };
         let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
-        assert_eq!(
-            record.validate_policy(),
-            Err(PolicyError::DuplicateIngressPort {
-                external_port: 18080
-            })
-        );
+        assert!(record.validate_policy().is_ok());
     }
 
     #[test]
