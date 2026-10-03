@@ -502,28 +502,6 @@ enum SessionMessage {
     PeekComposition(oneshot::Sender<Option<Arc<Composition>>>),
 }
 
-/// One live dynamic-ingress publish (NET-044): the forwarder the switch
-/// accepted, paired with the mapping it published. Held together — not
-/// re-derived from the forwarder at read time — so the list
-/// [`SessionMessage::LiveIngress`] serves is exactly what the switch holds,
-/// and the teardown that unbinds the one is the list of the other.
-struct LiveIngressForward {
-    /// The daemon-owned forward: its unexpose releases the port.
-    forwarder: crate::net::policy::PortForwarder,
-    /// The mapping as the policy surfaces read it.
-    mapping: minimald_rpc::LiveMapping,
-}
-
-/// The row the policy surfaces read, not the forwarder's own internals —
-/// `PortForwarder` is a handle, and the mapping is the fact it published.
-impl fmt::Debug for LiveIngressForward {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LiveIngressForward")
-            .field("mapping", &self.mapping)
-            .finish()
-    }
-}
-
 /// Manages one session, from the moment its record is allocated: the create
 /// flow (compose → `Draft` → verdict → `Active`) runs as the
 /// [`SessionInner`] state machine, and the actor owns its record's writes
@@ -568,9 +546,12 @@ pub struct Session {
     /// The ports this box published at runtime with its own `min net expose`
     /// (NET-044): one entry per port the box's `dynamic_ingress` allowed and
     /// the switch accepted, held from the publish until the box stops, where
-    /// [`Session::stop_running`] unbinds them. A box that published none —
-    /// and one that is not running — holds an empty list.
-    live_ingress: Vec<LiveIngressForward>,
+    /// [`Session::stop_running`] unbinds them — or until the spawn they
+    /// deliver to ends, whose guard unbinds them beside its declared forwards
+    /// (the cell is shared with it through the launch's
+    /// [`crate::net::provider::OwnAddressReporter`]). A box that published
+    /// none — and one that is not running — holds an empty list.
+    live_ingress: crate::net::provider::RuntimeIngress,
 
     /// The root of this session's operation tree - tracks long-running
     /// operations for display.
@@ -696,7 +677,7 @@ impl Session {
             forwards: Vec::new(),
             // The same for the ports the box publishes at runtime: nothing is
             // live until a `min net expose` inside it lands (NET-044).
-            live_ingress: Vec::new(),
+            live_ingress: Default::default(),
             #[cfg(target_os = "linux")]
             hostnames,
             #[cfg(target_os = "linux")]
@@ -2242,33 +2223,56 @@ impl Session {
         // The port is published already, live, by this box: a second request
         // for it would double-bind the same address, so it is refused as the
         // duplicate it is.
-        if self
-            .live_ingress
-            .iter()
-            .any(|live| live.mapping.internal_port == port)
-        {
+        if self.live_ingress.publishes(port) {
             return Err(ExposeFailure::Refused(ExposeRefusal::AlreadyPublished(
                 port,
             )));
         }
 
-        // The publish rides the address pair a VM host's registration handed
-        // the box (T66): the loopback address its declaration publishes on,
-        // and the switch address its forwards deliver to. A box nobody handed
-        // a pair — a native host's self-allocated box, whose lease the
-        // registry holds but keeps private — has nowhere to publish, and the
-        // daemon has no default of its own to stand in with (NET-010), so
-        // the request is refused rather than bound at an address nobody
-        // chose for this box.
-        let Some(addresses) = record.box_addresses else {
-            return Err(ExposeFailure::Refused(ExposeRefusal::NoPublishedAddress));
+        // The publish rides the address pair the box's declared ports bind
+        // with: the loopback address its declaration publishes on, and the
+        // switch address its forwards deliver to. A VM host's registration
+        // handed the box that pair (T66). A native host's self-allocated box
+        // was handed none, so it rides what the hostname registry holds for
+        // its session instead (design §7.1): the address the box published
+        // at — where its declared ports bind and its name answers — and the
+        // lease its running PTask reported, which those same forwards
+        // deliver to. The two halves are refused apart, so the box's
+        // `min net expose` says which one is missing: nothing published is a
+        // capability gap — the daemon has no default of its own to stand in
+        // with (NET-010), so the request is refused rather than bound at an
+        // address nobody chose for this box — while no lease, or a spawn
+        // that has ended, is a box not attached yet, which starting it fixes.
+        let (loopback_address, switch_address) = match record.box_addresses {
+            Some(addresses) => (addresses.loopback_address, addresses.switch_address),
+            None => {
+                let registry = self
+                    .hostnames
+                    .read()
+                    .expect("hostname registry lock poisoned");
+                let Some(published) = registry.published_own_address(record.id) else {
+                    return Err(ExposeFailure::Refused(ExposeRefusal::NoPublishedAddress));
+                };
+                let Some(lease) = registry.own_lease(record.id) else {
+                    return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
+                };
+                (published, lease)
+            }
         };
+        // The lease is per-spawn: the registry keeps the last one reported
+        // until the box is destroyed, so a spawn that has ended leaves it
+        // behind. The runtime cell knows the spawn ended — its guard's
+        // teardown detached it — and a forward to the dead lease would
+        // deliver wherever the switch hands that address next.
+        if self.live_ingress.is_detached() {
+            return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
+        }
 
         let control = self.switch_control().await;
         let forwarder = match expose_dynamic(
             &control,
-            addresses.loopback_address,
-            addresses.switch_address,
+            loopback_address,
+            switch_address,
             port,
             sessions::IpProto::Tcp,
             None,
@@ -2281,15 +2285,24 @@ impl Session {
         // Recorded only now, with the switch's acceptance in hand: a publish
         // that failed leaves nothing in the list (NET-047), so the rows the
         // policy surfaces read never name a port the switch is not holding.
+        // A spawn that ended while the publish was in flight took the
+        // runtime forwards down already; this one is unbound here instead
+        // of recorded, so nothing outlives the lease it delivers to.
         let mapping = minimald_rpc::LiveMapping {
             local: forwarder.local().to_string(),
             internal_port: forwarder.internal_port(),
             proto: sessions::IpProto::Tcp,
         };
-        self.live_ingress.push(LiveIngressForward {
-            forwarder,
-            mapping: mapping.clone(),
-        });
+        if let Err(stale) = self
+            .live_ingress
+            .record(crate::net::provider::LiveIngressForward {
+                forwarder,
+                mapping: mapping.clone(),
+            })
+        {
+            crate::net::policy::remove_ingress(&control, &[stale.forwarder]).await;
+            return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
+        }
         Ok(mapping)
     }
 
@@ -2311,10 +2324,7 @@ impl Session {
     /// The live dynamic-ingress mappings, in publish order — the rows
     /// `min session policy` lists beside the declaration (NET-044).
     fn live_ingress_snapshot(&self) -> Vec<minimald_rpc::LiveMapping> {
-        self.live_ingress
-            .iter()
-            .map(|live| live.mapping.clone())
-            .collect()
+        self.live_ingress.snapshot()
     }
 
     /// Tears down any runtime objects, such as the host or side ops. Shutdown
@@ -2337,10 +2347,9 @@ impl Session {
         // no live publish behind. Best-effort, like the declared forwards'
         // teardown — `remove_ingress` logs a failed unexpose and moves on,
         // since there is no caller left to propagate to.
-        let live = std::mem::take(&mut self.live_ingress);
-        if !live.is_empty() {
+        let forwarders = self.live_ingress.take_all();
+        if !forwarders.is_empty() {
             let control = self.switch_control().await;
-            let forwarders: Vec<_> = live.iter().map(|l| l.forwarder.clone()).collect();
             crate::net::policy::remove_ingress(&control, &forwarders).await;
         }
 
@@ -3164,10 +3173,15 @@ impl Session {
             // The attach reports the lease through this, so the box's
             // `<name>.min.internal` proxy route exists exactly while the box
             // does (NET-001).
-            own_address: Some(crate::net::provider::OwnAddressReporter::new(
-                Arc::clone(&self.hostnames),
-                record.id,
-            )),
+            // It carries the box's runtime-publish cell too, so the spawn's
+            // guard unbinds those forwards with its declared ones (NET-044).
+            own_address: Some(
+                crate::net::provider::OwnAddressReporter::new(
+                    Arc::clone(&self.hostnames),
+                    record.id,
+                )
+                .with_runtime_ingress(self.live_ingress.clone()),
+            ),
             // The addresses the VM host daemon handed this box's registration
             // (T66), persisted on the record: the `OwnIp` attach reuses the
             // handed switch address instead of drawing one the host-side row
