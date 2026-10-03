@@ -5253,6 +5253,215 @@ async fn expose_allow_publishes_and_lists() {
     );
 }
 
+/// Drives Create → ConfigureLoadout → FinalizeSession for a native host's
+/// self-allocated box: the [`dynamic_ingress_session_req`] declaration with
+/// no `box_addresses` handed, so finalize publishes it at the answerer's
+/// grant and the hostname registry is the only place its address lives.
+async fn finalize_self_allocated_dynamic_ingress_session(
+    client: &mut TestClient,
+    name: &str,
+    mode: Option<sessions::DynamicIngress>,
+    range: Option<(u16, u16)>,
+) -> SessionId {
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+    let mut request = dynamic_ingress_session_req(
+        name,
+        std::net::Ipv4Addr::UNSPECIFIED,
+        std::net::Ipv4Addr::UNSPECIFIED,
+        mode,
+        range,
+    );
+    request.config.box_addresses = None;
+    let id = client.call::<CreateSession>(&request).await.unwrap().id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    finalize_session(client, id).await;
+    id
+}
+
+/// NET-044 on a native host: a self-allocated box carries no `box_addresses`,
+/// so its runtime publish rides what the hostname registry holds for its
+/// session (design §7.1) — the address the box published at, where its
+/// declared ports bind and its name answers, and the lease its running PTask
+/// reported, which those forwards deliver to. The request the switch is asked
+/// is exactly the one a declared mapping at that pair takes, and the mapping
+/// is listed where `min session policy` reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_self_allocated_box_publishes_at_its_registered_address() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let web = finalize_self_allocated_dynamic_ingress_session(
+        &mut client,
+        "selfweb",
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let manager = server.state.sessions_manager().await;
+    let registry = manager.hostnames();
+    let published = registry
+        .read()
+        .expect("registry lock")
+        .published_own_address(web)
+        .expect("finalize publishes a self-allocated box at the answerer's grant");
+    // The stand-in for the box's attach: its PTask reports the lease it
+    // attached with, as `finish_own_ip_attach` does.
+    let lease = std::net::Ipv4Addr::new(100, 64, 128, 41);
+    registry.write().expect("registry lock").report_own_address(
+        web,
+        "selfweb",
+        lease,
+        std::collections::BTreeMap::new(),
+    );
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the allowing box resolves");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    let mapping = handle
+        .expose_dynamic(3000)
+        .await
+        .expect("a self-allocated box's allowed port publishes");
+    forwarder.abort();
+    assert_eq!(
+        mapping,
+        minimald_rpc::LiveMapping {
+            local: format!("{published}:3000"),
+            internal_port: 3000,
+            proto: sessions::IpProto::Tcp,
+        },
+        "the mapping names the box's registered address at its own port number"
+    );
+
+    // The publish is the request a declared mapping at the same pair takes:
+    // bound at the registered address, delivered to the reported lease.
+    let served = served.lock().expect("served lock").clone();
+    assert_eq!(served.len(), 1, "one mapping is one request: {served:?}");
+    let (line, body) = served[0]
+        .split_once('\n')
+        .expect("the served request carries its request line and body");
+    assert!(
+        line.starts_with("POST /services/forwarder/expose "),
+        "the publish rides the forwarder's expose verb: {served:?}"
+    );
+    let declared = crate::net::policy::expose_request(
+        &sessions::PortMapping {
+            external_port: 3000,
+            internal_port: 3000,
+            proto: sessions::IpProto::Tcp,
+        },
+        published,
+        lease,
+    );
+    assert_eq!(
+        body,
+        String::from_utf8(serde_json_lenient::to_vec(&declared).unwrap()).unwrap(),
+        "the runtime publish binds where the declared ports bind"
+    );
+
+    let live: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Name(
+            "selfweb".to_string(),
+        ))
+        .await;
+    assert_eq!(
+        live,
+        minimald_rpc::Errorable::Ok(vec![mapping]),
+        "the live mapping is listed beside the declaration"
+    );
+}
+
+/// The typed refusals a self-allocated box still answers when the registry
+/// holds no address pair for it, each naming the half that is missing: no
+/// PTask has reported a lease to deliver to — the box is not attached yet,
+/// which starting it fixes — or the box holds no published address to bind
+/// at, a capability gap the daemon has no default to stand in for (NET-010).
+/// Neither is a policy deny, the switch is asked nothing, and no mapping is
+/// listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_self_allocated_box_without_a_registered_address_is_refused() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let web = finalize_self_allocated_dynamic_ingress_session(
+        &mut client,
+        "selfweb",
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let manager = server.state.sessions_manager().await;
+    let registry = manager.hostnames();
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the allowing box resolves");
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    // Published at the grant, but no PTask has reported a lease.
+    match handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::NotAttached,
+        )) => {}
+        other => panic!("a box with no reported lease is refused as not attached: {other:?}"),
+    }
+
+    // A lease reported, but the box's publish withdrawn.
+    {
+        let mut routes = registry.write().expect("registry lock");
+        routes.report_own_address(
+            web,
+            "selfweb",
+            std::net::Ipv4Addr::new(100, 64, 128, 42),
+            std::collections::BTreeMap::new(),
+        );
+        routes.unpublish_own_address(web);
+    }
+    match handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::NoPublishedAddress,
+        )) => {}
+        other => panic!("a box with no published address is refused: {other:?}"),
+    }
+    forwarder.abort();
+    assert!(
+        served.lock().expect("served lock").is_empty(),
+        "a refused request asks the switch nothing"
+    );
+
+    let live: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Id(web))
+        .await;
+    assert_eq!(
+        live,
+        minimald_rpc::Errorable::Ok(vec![]),
+        "a refused box lists nothing"
+    );
+}
+
 /// NET-044's deny arm: a denied request answers with the typed refusal, not a
 /// bare message — a caller can tell "this box denies dynamic ingress" apart
 /// from every other reason without parsing prose. Both halves of the default
