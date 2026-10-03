@@ -58,6 +58,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use common::fetchers::AnyUrl;
 use sandbox2::config::Verdict;
 
 /// The loopback address the box zone's answerer serves at — the one
@@ -1017,31 +1018,71 @@ pub fn decide_now(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision
 }
 
 /// NET-080: the node-plane record for the daemon's own leaf — one line per
-/// fetch the daemon itself makes, naming the host it fetched, which is the
-/// line a diagnostics bundle's daemon-log tail reads each fetch from. One
-/// call per fetch, the caller naming the host it fetched from or for.
+/// fetch the daemon itself makes, naming the box the fetch was made for,
+/// the host it left for, and the object it brought back, which is the line
+/// a diagnostics bundle's daemon-log tail reads each fetch from. One call
+/// per fetch, the caller naming the three.
 ///
 /// The fetch a `min add` inside a host-address box triggers is the
 /// *daemon's*, never the box's: the build runs in the daemon's own process,
 /// in the leaf it entered at start — a sibling of the cohort, never inside
 /// it — so the refusing rule that matches a deny-all box's subtree cannot
 /// reach it and the fetch completes on the same host while the box reaches
-/// nothing (the root lane proves that leg live under a loaded table). The
-/// fact is otherwise invisible: a fetch that completes says nothing about
-/// which identity carried it, and a person reading a bundle for why the
-/// box's install worked while the box's own connects are refused has this
-/// record to answer with. One line per fetch, at info, with the host and
-/// the leaf it left from — a fetch is an event, not a meter, so no byte
-/// counts and no deduplication: each fetch is recorded, and nothing else
-/// is.
-pub fn record_node_plane_fetch(host: &str) {
+/// nothing (the root lane's `snat_identity_is_seen_by_the_peer` reads the
+/// identity the node plane's own rule gives a real peer, under a loaded
+/// table). The fact is otherwise invisible: a fetch that completes says
+/// nothing about which identity carried it, and a person reading a bundle
+/// for why the box's install worked while the box's own connects are
+/// refused has this record to answer with. One line per fetch, at info,
+/// with the box, the host, the leaf it left from, and the object — a fetch
+/// is an event, not a meter, so no byte counts and no deduplication: each
+/// fetch is recorded, and nothing else is.
+pub fn record_node_plane_fetch(box_id: &str, host: &str, object: &str) {
     tracing::info!(
         host = %host,
-        leaf = sandbox2::classifier::DAEMON_LEAF,
+        leaf = %sandbox2::classifier::DAEMON_LEAF,
+        box_id = %box_id,
+        object = %object,
         "the daemon's own fetch is node-plane traffic, from its own leaf \
-         beside the cohort: never a box's, so a deny-all host-address box's \
-         declaration refuses nothing of it"
+         beside the cohort: never the box's, so a deny-all host-address \
+         box's declaration refuses nothing of it"
     );
+}
+
+/// The host a fetch location is fetched from, spelled for the two forms the
+/// configured remote cache takes: the mirror URL's own host, or the bucket
+/// a GCS location names. The mirror's URL is wrapped privately by
+/// `common`'s newtype, and the URL its `Debug` prints is the one spelling
+/// of it that reaches this crate, so the host is read from that print the
+/// way the URL's own parser would: between its scheme and the first
+/// delimiter. A `host()` accessor on the newtype would replace this with a
+/// reach through, and none is available without leaving the daemon's own
+/// files.
+pub(crate) fn cache_host(location: &AnyUrl) -> String {
+    match location {
+        AnyUrl::Https(https) => {
+            let printed = format!("{https:?}");
+            let url = printed
+                .strip_prefix("ReqwestUrl(")
+                .and_then(|inner| inner.strip_suffix(')'))
+                .unwrap_or(printed.as_str());
+            url_host(url).to_owned()
+        }
+        AnyUrl::Gcs(gcs) => gcs.bucket.clone(),
+    }
+}
+
+/// The host a URL names — its authority, between the scheme and the first
+/// path, query, or fragment delimiter — which is where a `FetchSource`
+/// fetch leaves for. A spelling with no scheme (a local source tarball)
+/// names no host and crosses no network: the record's object still carries
+/// the whole spelling, so the fetch is read whole from the two fields.
+pub(crate) fn url_host(url: &str) -> &str {
+    let Some((_, authority)) = url.split_once("://") else {
+        return "";
+    };
+    let end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
+    &authority[..end]
 }
 
 /// Whether the cohort's two subtrees are there as the step delegates them:
@@ -1897,13 +1938,17 @@ mod tests {
     /// entered the way it enters it at start, from which the connection a
     /// fetch makes completes. The rendered table is why it completes: the
     /// one rule that refuses matches the deny subtree by cgroup path, and
-    /// the daemon's leaf is not under that path, while the node plane's own
-    /// rule in the classify chain does match the daemon's leaf, so the fetch
-    /// is classed as the node plane's and leaves as its identity (the root
-    /// lane proves that leg live under a loaded table). The record is the
-    /// half a person reads: one info line per fetch, with the host fetched
-    /// and the leaf it left from, because a fetch that completes says
-    /// nothing about which identity carried it.
+    /// the daemon's leaf is not under that path, while the classify chain's
+    /// two rules divide the leaves between them — the cohort's rule, the
+    /// chain's first, which sets the final mark, covers the box's leaf and
+    /// never the daemon's, and the node plane's own rule, guarded by the
+    /// mask, matches the daemon's leaf, so the fetch is classed as the node
+    /// plane's and leaves as its identity (the root lane's
+    /// `snat_identity_is_seen_by_the_peer` reads that identity at a real
+    /// peer, under a loaded table). The record is the half a person reads:
+    /// one info line per fetch, with the box it was made for, the host
+    /// fetched, the leaf it left from, and the object, because a fetch that
+    /// completes says nothing about which identity carried it.
     #[test]
     fn daemon_fetch_survives_cohort_deny() {
         // The tree as a host has it: the step's subtrees, the loaded table's
@@ -1935,18 +1980,20 @@ mod tests {
 
         // The fetch's leg: a connection the daemon opens from its own leaf,
         // to the listener this test holds standing in for the registry host
-        // its packages come from. It completes with the deny-all box
-        // resident on the same tree — which, over a stand-in tree with no
-        // table behind it, is the whole a live leg can say; the rendered
-        // table below is the authority for what a loaded one does with the
-        // same leaf.
+        // its packages come from. Over the stand-in tree the leg shows the
+        // daemon's placement and nothing more — its leaf sits beside the
+        // cohort, so the tree's own layout confines nothing the daemon does
+        // — and claims nothing about enforcement, because no table is
+        // loaded here. What a loaded table does with the same leaves is the
+        // rendered ruleset below, and the live leg under one is the root
+        // lane's `snat_identity_is_seen_by_the_peer`, which reads the
+        // identity the fetch leaves as at a real peer.
         let registry = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .expect("a loopback listener standing in for the registry host");
         let fetched = registry.local_addr().expect("the registry host's address");
-        let fetch = TcpStream::connect(fetched).expect(
-            "the daemon's own fetch completes: no rule that refuses a deny-all \
-             box's connections reaches the daemon's leaf",
-        );
+        let fetch = TcpStream::connect(fetched)
+            .expect("the daemon opens the fetch's connection from its own leaf, \
+             which sits beside the cohort rather than inside it");
         drop(fetch);
 
         // The rendered spelling of a cgroup on this tree, relative to the
@@ -2001,11 +2048,34 @@ mod tests {
              refuses: {refusing}"
         );
 
+        // The classify chain's two rules divide the leaves between them, and
+        // the cohort's is the one that decides for boxes: it is the chain's
+        // first rule — the one the node plane's is guarded not to re-decide,
+        // so the mark it sets is final — and it matches the cohort at the
+        // level the daemon's leaf diverges above, so it covers the box's
+        // leaf and never the daemon's. A cohort rule rendered at the slice
+        // instead would take the daemon's leaf in with it, and these are the
+        // assertions that fail when it does.
+        let classify = chain_rules(&ruleset, "classify");
+        let cohort = classify.first().copied().unwrap_or_else(|| {
+            panic!("the cohort is classed by the chain's first rule: {classify:?}")
+        });
+        assert!(
+            cgroup_match_covers(cohort, &box_path),
+            "the cohort's classify rule, the final mark's setter, covers the \
+             deny-all box's leaf ({box_path}): {cohort}"
+        );
+        assert!(
+            !cgroup_match_covers(cohort, &daemon_path),
+            "the cohort's classify rule cannot cover the daemon's leaf \
+             ({daemon_path}), so the daemon's fetch is never classed as the \
+             cohort's: {cohort}"
+        );
+
         // The node plane's own rule does match the daemon's leaf, so the
         // fetch is classed as the node plane's — the half the cohort's rule
         // decides for boxes, decided here for the daemon, and the identity
         // the fetch leaves as.
-        let classify = chain_rules(&ruleset, "classify");
         let node_plane = classify
             .iter()
             .find(|rule| rule.contains(&format!("\"{}\"", tree_root_name())))
@@ -2017,12 +2087,20 @@ mod tests {
              plane's: {node_plane}"
         );
 
-        // The record, one line per fetch: the leg above is the fetch, and the
-        // daemon records it with the host it fetched — here the address the
-        // leg went to, then a second fetch to a named registry host, so the
-        // per-fetch half is pinned and not only the spelling. Read the way a
-        // bundle's daemon-log tail reads it: two fetches, two lines, each at
-        // info, each naming its own host and the leaf the fetch left from.
+        // The record, one line per fetch: the leg above is the fetch, made
+        // for the resident box, and the daemon records it with the box, the
+        // host it fetched, and the object — here the address the leg went to
+        // and the package it brought back, then a second fetch, of the
+        // registry's index, to a named host, so the per-fetch half is pinned
+        // and not only the spelling. The box is named the way the tree names
+        // it, by its leaf. Read the way a bundle's daemon-log tail reads it:
+        // two fetches, two lines, each at info, each naming its own host, the
+        // leaf the fetch left from, the box it was made for, and the object.
+        let box_id = resident
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("the box's leaf is named with its id")
+            .to_owned();
         let log = LogCapture::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(log.clone())
@@ -2030,8 +2108,10 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
         let second = "pkgs.min.internal";
-        record_node_plane_fetch(&fetched.to_string());
-        record_node_plane_fetch(second);
+        let fetched_object = "jq";
+        let second_object = "index";
+        record_node_plane_fetch(&box_id, &fetched.to_string(), fetched_object);
+        record_node_plane_fetch(&box_id, second, second_object);
         let recorded = log.contents();
         let lines: Vec<&str> = recorded
             .lines()
@@ -2042,10 +2122,10 @@ mod tests {
             2,
             "one record per fetch, two fetches: {recorded}"
         );
-        for (line, host) in lines
-            .iter()
-            .zip([&fetched.to_string(), &second.to_string()])
-        {
+        for (line, (host, object)) in lines.iter().zip([
+            (&fetched.to_string(), fetched_object),
+            (&second.to_string(), second_object),
+        ]) {
             assert!(
                 line.contains("INFO"),
                 "the record is at the level a bundle's tail reads: {line}"
@@ -2057,6 +2137,14 @@ mod tests {
             assert!(
                 line.contains(sandbox2::classifier::DAEMON_LEAF),
                 "the record names the leaf the fetch left from: {line}"
+            );
+            assert!(
+                line.contains(box_id.as_str()),
+                "the record names the box the fetch was made for: {line}"
+            );
+            assert!(
+                line.contains(object),
+                "the record names the object fetched: {line}"
             );
         }
         assert!(
