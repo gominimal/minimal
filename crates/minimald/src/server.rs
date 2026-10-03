@@ -19,6 +19,162 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
+/// File name under the daemon's per-instance directory
+/// ([`Config::daemon_identity_dir`]) that holds the stable identity from
+/// which the switch octet is derived. Written once on first start and read on
+/// every subsequent start, so the daemon's /24 stays the same across
+/// restarts. Keyed per instance, so each `--instance-num` on one state root
+/// hashes its own identity and keeps its own /24 whatever order the
+/// instances start in.
+const DAEMON_IDENTITY_FILE: &str = "daemon-identity";
+
+/// Runtime directory for per-octet switch locks: the per-user
+/// `XDG_RUNTIME_DIR`, else `/run` (writable for root). Each native daemon
+/// holds an exclusive lock on `<RUNTIME_DIR>/minimald-switch-<octet>.lock`
+/// for its lifetime, so a second daemon that would derive the same octet
+/// detects the collision and re-derives. Daemons run by different users see
+/// different runtime dirs, so they never see each other's locks.
+#[cfg(target_os = "linux")]
+fn switch_lock_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            // Fall back to /run on Linux when XDG_RUNTIME_DIR is unset
+            // (e.g. under sudo or in a container).
+            let run = std::path::PathBuf::from("/run");
+            run.is_dir().then_some(run)
+        })
+}
+
+/// Read the persisted daemon identity from `identity_dir`, or generate and
+/// persist a new one. Returns the identity string used for octet derivation.
+fn load_or_create_daemon_identity(identity_dir: &DaemonAbsPath) -> std::io::Result<String> {
+    let path = identity_dir
+        .as_utf8_path()
+        .as_std_path()
+        .join(DAEMON_IDENTITY_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(contents) if !contents.trim().is_empty() => return Ok(contents.trim().to_owned()),
+        // An empty file (say, from a crash before the first write landed) is
+        // regenerated like a missing one, so it cannot pin every start to the
+        // per-start fallback.
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let identity = common::random_alphanumeric(5);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Write a sibling temp file, sync it, and rename it into place, so a
+    // crash never leaves a truncated identity behind.
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut file, identity.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    // Sync the parent so the renamed entry itself survives a power loss.
+    // Best effort: the identity is already in place for this start, and a
+    // failure here only risks a new identity after a crash.
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+    }
+    Ok(identity)
+}
+
+/// Try to acquire an exclusive lock for `octet` under `lock_dir`, the
+/// runtime directory [`switch_lock_dir`] resolves. Returns `Ok(true)` when
+/// the lock was acquired (the octet is free), `Ok(false)` when another daemon
+/// holds it, and `Err` on I/O errors.
+#[cfg(target_os = "linux")]
+fn try_acquire_switch_octet(
+    lock_dir: Option<&std::path::Path>,
+    octet: u8,
+) -> std::io::Result<bool> {
+    let Some(dir) = lock_dir else {
+        // No runtime directory available — can't detect overlaps, but
+        // the daemon can still start.
+        return Ok(true);
+    };
+    let _ = std::fs::create_dir_all(dir);
+    let lock_path = dir.join(format!("minimald-switch-{octet}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)?;
+    let mut lock = fd_lock::RwLock::new(file);
+    match lock.try_write() {
+        // Skip the guard's unlock on drop.
+        Ok(guard) => std::mem::forget(guard),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    // The flock lives as long as its fd, so leak the file too: dropping it
+    // would close the fd and release the lock at once. The lock is held for
+    // the daemon's lifetime; the kernel releases it on process death.
+    std::mem::forget(lock);
+    Ok(true)
+}
+
+/// Derive a collision-free switch octet from `identity`. On the first
+/// collision, appends a counter to the identity and re-hashes, logging a
+/// warning. Gives up after 16 attempts (a hash collision across 16
+/// consecutive counters is astronomically unlikely; 16 daemons on one
+/// machine is the practical ceiling).
+#[cfg(target_os = "linux")]
+fn resolve_switch_octet(lock_dir: Option<&std::path::Path>, identity: &str) -> u8 {
+    let octet = octet_for_daemon_id(identity);
+    match try_acquire_switch_octet(lock_dir, octet) {
+        Ok(true) => return octet,
+        Ok(false) => {}
+        // The lock dir is unusable (say, a non-root daemon falling back to
+        // an unwritable /run): no lock can be taken for any octet, so say
+        // so once and take the derived octet without collision detection.
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                octet = octet,
+                "switch octet collision detection unavailable: {e}",
+            );
+            return octet;
+        }
+    }
+    // Collision: another daemon on this machine holds this octet.
+    // Re-derive with a counter appended to the identity.
+    for n in 1u32..16 {
+        let candidate = format!("{identity}-{n}");
+        let octet = octet_for_daemon_id(&candidate);
+        if try_acquire_switch_octet(lock_dir, octet).unwrap_or(true) {
+            tracing::warn!(
+                identity = %identity,
+                octet = octet,
+                attempt = n,
+                "switch octet collided with another daemon on this machine; \
+                 re-derived to {octet}",
+            );
+            return octet;
+        }
+    }
+    // Exhausted attempts — take the last octet anyway. The lock file
+    // acquisition failed for all 16 attempts, which means either 16+
+    // daemons are running or the runtime dir is unwritable. Log and
+    // proceed; the answerer's lease record arbitrates published addresses
+    // across daemons (NET-010).
+    let octet = octet_for_daemon_id(identity);
+    tracing::warn!(
+        identity = %identity,
+        octet = octet,
+        "could not acquire a unique switch octet after 16 attempts; \
+         proceeding with {octet} — published addresses are still \
+         arbitrated by the answerer's lease record (NET-010)",
+    );
+    octet
+}
+
 use crate::connection::Connection;
 use crate::sessions;
 
@@ -82,9 +238,11 @@ pub struct Config {
     /// The third octet of the /24 inside the default switch /16
     /// ([`crate::net::DEFAULT_SUBNET`]) that this daemon's gvproxy switch
     /// draws its `OwnIp` PTask leases from. `None` (the default) derives the
-    /// octet from the daemon instance id, so two daemons on one machine take
-    /// two different octets and with them two different switch /24s: their
-    /// PTask leases can never collide (NET-027's switch half).
+    /// octet from the daemon identity (persisted under
+    /// [`Config::daemon_identity_dir`] when set, else the per-start instance
+    /// id), so two daemons on one machine take two different octets and with
+    /// them two different switch /24s: their PTask leases can never collide
+    /// (NET-027's switch half).
     ///
     /// This octet no longer keys any *published* address: allocation in the
     /// reserved local range is host-global, arbitrated through the answerer's
@@ -100,6 +258,12 @@ pub struct Config {
     /// [`switch_subnet_for`]).
     #[serde(default)]
     pub switch_subnet_octet: Option<u8>,
+    /// The per-instance directory (`providers/local-minimald<N>`) that holds
+    /// the persisted daemon identity an unpinned native daemon derives its
+    /// switch octet from (the `daemon-identity` file). `None` persists
+    /// nothing and derives the octet from the per-start instance id.
+    #[serde(default)]
+    pub daemon_identity_dir: Option<DaemonAbsPath>,
 
     /// The daemon's opt-out of the deny-all egress default (NET-077). While
     /// the default is in force (see [`sessions::EGRESS_DEFAULT_PHASE`]), an
@@ -260,9 +424,11 @@ impl ServerState {
         // Construct the per-host switch once, here at daemon scope, so a single
         // gvproxy runs for the host and a single allocator never reuses an
         // address for the daemon's lifetime (R1.4/R1.6). Its config/socket/pid
-        // live under a dedicated subdir of the daemon state dir. The shared
-        // `Arc` is the single source of truth, injected into every per-launch
-        // `SandboxLauncher` through the sessions manager.
+        // live under `<state>/gvproxy/<daemon_id>/`, keyed per daemon instance
+        // so two native daemons sharing a state root never unlink each
+        // other's control socket or overwrite each other's config or pid
+        // file. The shared `Arc` is the single source of truth, injected into
+        // every per-launch `SandboxLauncher` through the sessions manager.
         // DM1/3/4 (in a libkrun VM): attach `OwnIp` PTasks to the host gvproxy
         // (owned by `minvmd`) over a vsock shuttle. DM2 (native Linux): spawn +
         // own gvproxy locally.
@@ -275,23 +441,38 @@ impl ServerState {
             crate::net::SwitchTransport::LocalSpawn
         };
         // This daemon's switch octet — pinned by the deployment, else derived
-        // from its instance id — names the /24 a switch it owns runs on (a
-        // native host, DM2); a microVM daemon carries the host's default /16
-        // whatever this says (see [`switch_subnet_for`]). It names nothing
+        // from the persisted daemon identity on native Linux, or from the
+        // per-start instance id in a microVM — names the /24 a switch it owns
+        // runs on (a native host, DM2); a microVM daemon carries the host's
+        // default /16 whatever this says (see [`switch_subnet_for`]). It names nothing
         // about published addresses: those are granted per host through the
         // answerer's lease record (NET-010, design §7.1), never keyed on the
         // daemon, so two daemons on one host cannot both start at one
         // address and no octet wrap-around can hand them one between them.
-        let slice_octet = config
-            .switch_subnet_octet
-            .unwrap_or_else(|| octet_for_daemon_id(&daemon_id));
+        //
+        // On native Linux, the octet is derived from an identity persisted
+        // in the daemon's instance dir (created once, reused on every start)
+        // so the daemon's /24 — and with it every own-address box's switch
+        // address and the host alias — stays fixed across restarts. A
+        // per-octet lock in the runtime dir detects collisions with another
+        // daemon on the same host and re-derives with a logged warning.
+        let slice_octet = config.switch_subnet_octet.unwrap_or_else(|| {
+            native_switch_octet(
+                config.in_microvm,
+                config.daemon_identity_dir.as_ref(),
+                &daemon_id,
+            )
+        });
         // The subnet this daemon's switch carries — decided by who owns the
         // gvproxy it attaches to; see [`switch_subnet_for`].
         let switch_subnet = switch_subnet_for(config.in_microvm, slice_octet);
         let net_switch = Arc::new(Mutex::new(
             crate::net::SwitchClient::with_subnet(
                 config.gvproxy_bin_path(),
-                minimal_state_dir.as_utf8_path().join("gvproxy"),
+                minimal_state_dir
+                    .as_utf8_path()
+                    .join("gvproxy")
+                    .join(&daemon_id),
                 switch_subnet,
             )
             .with_transport(transport)
@@ -431,6 +612,45 @@ fn octet_for_daemon_id(id: &str) -> u8 {
     // /24): a derived switch never reserves the same gateway, alias, or
     // daemon address the host gvproxy on a DM1 host already answers at.
     (hash % 254 + 1) as u8
+}
+
+/// The switch octet an unpinned daemon derives. On native Linux this is the
+/// stable, collision-checked path: the octet comes from an identity persisted
+/// in `identity_dir` (so restarts keep the same /24) and a per-octet lock
+/// detects another daemon on the same host holding the same block,
+/// re-deriving with a logged warning. A microVM daemon does not own
+/// its switch, so it never persists an identity or takes a lock — it carries
+/// the host's default /16 whatever octet this returns (see
+/// [`switch_subnet_for`]). With no `identity_dir`, nothing is persisted or
+/// locked and the octet comes from the per-start id.
+fn native_switch_octet(
+    in_microvm: bool,
+    identity_dir: Option<&DaemonAbsPath>,
+    daemon_id: &str,
+) -> u8 {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(identity_dir) = identity_dir.filter(|_| !in_microvm) else {
+            // A guest does not own its switch, so the octet is irrelevant to
+            // the /16 it carries; and with no identity dir there is nothing
+            // to persist. Derive from the per-start id as before — no
+            // identity file, no lock.
+            return octet_for_daemon_id(daemon_id);
+        };
+        let identity = load_or_create_daemon_identity(identity_dir).unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                "could not load daemon identity; falling back to random per-start id",
+            );
+            daemon_id.to_owned()
+        });
+        resolve_switch_octet(switch_lock_dir().as_deref(), &identity)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (in_microvm, identity_dir);
+        octet_for_daemon_id(daemon_id)
+    }
 }
 
 /// A thread-safe handle to the server state.
@@ -2132,6 +2352,7 @@ pub(crate) fn test_config(dir: &std::path::Path) -> Config {
         hostname_proxy_port: None,
         zone_answerer_port: None,
         switch_subnet_octet: None,
+        daemon_identity_dir: None,
         // The default every unit-test daemon runs: the rollout phase this
         // build ships, not opted out.
         deny_all_opt_out: false,
@@ -4160,6 +4381,100 @@ mod tests {
                 "{id} derived {octet}, which is outside 1..=254"
             );
         }
+    }
+
+    /// A native daemon's switch octet is stable across restarts: the
+    /// identity is persisted under the state root on first start and read
+    /// back on subsequent starts, so the derived /24 stays the same. Each
+    /// "start" uses its own lock dir, since the first start's lock is held
+    /// for the life of this test process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_switch_octet_is_stable_across_restarts() {
+        let dir = TempDir::new().unwrap();
+        let state_dir = DaemonAbsPath::try_new(
+            camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap(),
+        )
+        .unwrap();
+        let start = |state_dir: &DaemonAbsPath| {
+            let locks = TempDir::new().unwrap();
+            let identity = load_or_create_daemon_identity(state_dir).unwrap();
+            resolve_switch_octet(Some(locks.path()), &identity)
+        };
+        let first = start(&state_dir);
+        let second = start(&state_dir);
+        assert_eq!(
+            first, second,
+            "the switch octet must be stable across restarts"
+        );
+        assert!(
+            (1..=254).contains(&first),
+            "derived octet {first} is outside 1..=254"
+        );
+    }
+
+    /// An empty identity file is regenerated and persisted rather than
+    /// sending every start to the per-start fallback.
+    #[test]
+    fn empty_daemon_identity_file_is_regenerated() {
+        let dir = TempDir::new().unwrap();
+        let state_dir = DaemonAbsPath::try_new(
+            camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap(),
+        )
+        .unwrap();
+        let path = dir.path().join(DAEMON_IDENTITY_FILE);
+        std::fs::write(&path, "  \n").unwrap();
+        let identity = load_or_create_daemon_identity(&state_dir).unwrap();
+        assert!(!identity.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), identity);
+        assert_eq!(
+            load_or_create_daemon_identity(&state_dir).unwrap(),
+            identity
+        );
+    }
+
+    /// Two daemons on one machine that derive the same octet end up on
+    /// different blocks: the first holds the per-octet lock, so the second
+    /// re-derives.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn colliding_daemons_end_up_on_different_octets() {
+        let locks = TempDir::new().unwrap();
+        let first = resolve_switch_octet(Some(locks.path()), "same-identity");
+        let second = resolve_switch_octet(Some(locks.path()), "same-identity");
+        assert_eq!(first, octet_for_daemon_id("same-identity"));
+        assert_ne!(
+            first, second,
+            "a daemon whose octet is already held must re-derive to a different one"
+        );
+    }
+
+    /// A microVM daemon never persists an identity: its octet is always
+    /// derived from the per-start id, because the guest does not own its
+    /// switch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn microvm_daemon_never_persists_identity() {
+        let dir = TempDir::new().unwrap();
+        let state_dir = DaemonAbsPath::try_new(
+            camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap(),
+        )
+        .unwrap();
+        let first = native_switch_octet(true, Some(&state_dir), "per-start-id");
+        let second = native_switch_octet(true, Some(&state_dir), "different-per-start-id");
+        assert_ne!(
+            first, second,
+            "a microVM daemon must derive its octet from the per-start id, not a persisted identity"
+        );
+        // The identity file must not have been written.
+        let identity_path = state_dir
+            .as_utf8_path()
+            .as_std_path()
+            .join(DAEMON_IDENTITY_FILE);
+        assert!(
+            !identity_path.exists(),
+            "a microVM daemon must not persist a daemon identity"
+        );
     }
 
     /// NET-027: a configured third octet places the daemon's switch /24

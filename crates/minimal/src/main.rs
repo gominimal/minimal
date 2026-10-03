@@ -189,6 +189,7 @@ mod tests {
                 task: "build".to_string(),
                 path: None,
                 keep: false,
+                args: vec![],
             }),
         }));
         assert!(stdout_is_data_contract(&cmd));
