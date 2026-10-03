@@ -1,5 +1,6 @@
 [package]
 name = "version"
+description = "Shared build-time version identity for min, mip, minimald, and minvmd."
 rust-version.workspace = true
 version.workspace = true
 edition.workspace = true

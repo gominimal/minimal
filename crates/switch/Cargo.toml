@@ -1,5 +1,6 @@
 [package]
 name = "switch"
+description = "gvproxy-switch primitives: subnet arithmetic, MAC derivation, vsock constants, config rendering."
 rust-version.workspace = true
 version = "0.0.1"
 edition.workspace = true
