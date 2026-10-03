@@ -9279,6 +9279,9 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
   PO_OUTLIVE_MARKER="PO_OUTLIVE_OK"    # what the detach box answers with
   PO_RUN_MARKER="PO_RUN_BOX_LIVE"      # what the run task prints from inside its box
   PO_SAVED_RUST_LOG=""
+  # The run half's own pin, set when it restarts the daemon for its record
+  # (see the beat below): kept beside the port half's for the same reason.
+  PO_RUN_SAVED_RUST_LOG=""
   # One verdict, read by the beats that need a session sandbox: the port and
   # detach halves' exec gates set it to 0 when this host cannot spawn one, and
   # the run half — whose box IS a session — skips on it rather than failing a
@@ -9318,9 +9321,10 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     # modules the lane's `warn` filter drops, so a readable-log lane restarts
     # the daemon with them at info — the same restart the deny-all answer
     # proof runs — and puts the lane's filter back afterwards. A VM lane
-    # keeps its records (they are the guest's) and its filter. The lane's
-    # own default `minimald::exec=info` rides along: the run half below reads
-    # this same daemon's `run box ended` record on the same lane.
+    # keeps its records (they are the guest's) and its filter. The run half
+    # below reads its own record off this same daemon but pins its own module
+    # (it restarts for it): this half's pin is skipped along with this half
+    # on a lane with no switch, so nothing below may lean on it.
     if hook_log_readable; then
       mnl stop >/dev/null 2>&1 || true # a standalone run has no daemon yet
       PO_SAVED_RUST_LOG="${RUST_LOG:-}"
@@ -9797,6 +9801,33 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       echo "  (the same verdict the earlier beats' exec gates reached; on CI or a VM lane the gate fails instead)"
       return 0
     fi
+
+    # The `run box ended` record this half reads at its end is at info under
+    # `minimald::exec`, and a daemon's filter is fixed at its spawn — so the
+    # half that reads a record pins the module it lives in, the way the port
+    # half pins its two above. The port half's restart cannot stand in for
+    # this one: a lane with no switch skips that half outright, leaving the
+    # daemon running under whatever filter an earlier proof left it (the
+    # min.internal proof's drops this module's records and restores nothing),
+    # and a record the filter dropped has this half asserting a destroy with
+    # no record of firing. So pin this half's own module wherever the log is
+    # readable, and put the lane's filter back afterwards as the port half
+    # does. Nothing is live across the restart: both beats' boxes are
+    # destroyed by the time this beat starts, and sessions survive a daemon
+    # restart anyway (the restart proof pins that).
+    if hook_log_readable; then
+      mnl stop >/dev/null 2>&1 || true # a standalone run has no daemon yet
+      PO_RUN_SAVED_RUST_LOG="${RUST_LOG:-}"
+      export RUST_LOG="warn,minimald::exec=info"
+    fi
+    po_run_restore_log() {
+      # Guarded on the same predicate the pin was: a lane this half never
+      # pinned keeps the filter it arrived with.
+      if hook_log_readable; then
+        if [ -n "$PO_RUN_SAVED_RUST_LOG" ]; then export RUST_LOG="$PO_RUN_SAVED_RUST_LOG"; else unset RUST_LOG; fi
+      fi
+    }
+
     PO_TASK_SEED_DIR="$(mktemp -d /tmp/mnlpors.XXXXXX)"
     {
       awk '
@@ -9862,9 +9893,9 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     fi
     echo "run: the box ended with its run — no stranded session, client or no client (NET-131)"
     # The daemon-side end's own record, where the lane can read it: one line
-    # naming the session, the run and the exit its box ended with.
-    # `minimald::exec` is at info in this lane's default filter, and the port
-    # half's restart keeps it there, so no restart is owed for it.
+    # naming the session, the run and the exit its box ended with — at info
+    # under the module this half pinned the daemon to above, whatever filter
+    # the lane's earlier proofs left it running under.
     if hook_log_readable; then
       po_end_rec=""
       for _ in $(seq 1 20); do
@@ -9883,6 +9914,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       echo "run-box-ended log check skipped (guest-side daemon log on VM lane)"
     fi
     rm -rf "$PO_TASK_SEED_DIR"; PO_TASK_SEED_DIR=""
+    po_run_restore_log
     echo "run half OK (box created for the run, delisted when the run's client vanished)"
   }
   po_run_half
