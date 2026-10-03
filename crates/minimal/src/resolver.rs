@@ -2404,9 +2404,10 @@ mod tests {
     // not staged, not copied, not read from anywhere user-writable — and
     // the boot step loads last, so a re-run replaces the unit rather than
     // dying on its label. Pinned here on the text the render builds from
-    // the same templates the e2e runs; the macOS lane's
-    // `local_range_reserved_by_privileged_step` proves this command against
-    // a real launchd.
+    // the same templates the e2e runs; the operator-run
+    // `local_range_reserved_by_privileged_step` (MINIMAL_E2E_PRIVILEGED=1,
+    // a macOS host with passwordless sudo) proves this command against a
+    // real launchd.
     #[test]
     fn advisory_command_reserves_the_range_on_macos() {
         let command = macos_command(15353);
@@ -3013,8 +3014,8 @@ mod tests {
     /// the probe that read absent — the interim the advisory names — reads
     /// present once the step has run. Pinned purely, over the program's
     /// own bytes and the probe's injected bind (`probe_over`'s stand-in for
-    /// a loopback); the macOS lane's e2e case proves the same fact against
-    /// a real lo0.
+    /// a loopback); the operator-run e2e case (the local-range one, under
+    /// its opt-in) proves the same fact against a real lo0.
     #[test]
     fn bind_probe_reads_present_after_the_range_step() {
         // The addresses the program applies, parsed from its own bytes: the
