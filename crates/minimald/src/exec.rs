@@ -1119,12 +1119,19 @@ where
                                         child_stdin = None;
                                     }
                                 }
-                                Ok(_) = client_lost.wait_for(|lost| *lost), if client_watch_open => {
-                                    tracing::warn!(
-                                        %channel_id,
-                                        "exec: ssh client disconnected; killing child",
-                                    );
-                                    ssh_write_failed = true;
+                                res = client_lost.wait_for(|lost| *lost), if client_watch_open => {
+                                    if res.is_err() {
+                                        // Sender dropped without signalling:
+                                        // stop polling this branch so a
+                                        // dropped sender cannot spin the loop.
+                                        client_watch_open = false;
+                                    } else {
+                                        tracing::warn!(
+                                            %channel_id,
+                                            "exec: ssh client disconnected; killing child",
+                                        );
+                                        ssh_write_failed = true;
+                                    }
                                 }
                             }
                         }
