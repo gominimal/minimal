@@ -891,7 +891,7 @@ pub mod classifier {
         format!(
             "fetch install-host-classifier.sh from \
              https://raw.githubusercontent.com/gominimal/minimal/main/scripts/install-host-classifier.sh \
-             and run: sudo ./install-host-classifier.sh --user {account}"
+             and run: sudo bash ./install-host-classifier.sh --user {account}"
         )
     }
 
@@ -3967,6 +3967,11 @@ mod tests {
         );
         assert!(!hint.contains("/blob/"), "{hint}");
         assert!(!hint.contains("sudo scripts/"), "{hint}");
+        // A downloaded file has no executable bit, so the hint runs it via bash.
+        assert!(
+            hint.contains("sudo bash ./install-host-classifier.sh"),
+            "{hint}"
+        );
         assert!(hint.contains("--user "), "{hint}");
     }
 
