@@ -1016,7 +1016,16 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: A
     // next ping prunes the dead sender.
     let pings = registry.subscribe_table_pings();
     let mut held: Option<Registration> = None;
+    // Two once-only lines, each on a flag of its own: the warn that the port
+    // is held by something the channel cannot reach, and the info line that
+    // names the holder this table's rows first registered with. A pass that
+    // warned must not take the info line with it — a daemon that boots
+    // against a native minimald's hold and registers with the VM host daemon
+    // that takes the port after it would otherwise name its holder neither
+    // at a listener nor at a registration, and the diagnostics contract and
+    // the e2e's log greps read the info line.
     let mut warned = false;
+    let mut registered_once = false;
     loop {
         match UdpSocket::bind((Ipv4Addr::LOCALHOST, port)) {
             Ok(socket) => {
@@ -1070,12 +1079,12 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: A
                         held = Some(registration);
                     }),
                 };
-                let first = held.is_some() && !warned;
+                let first = held.is_some() && !registered_once;
                 match outcome {
                     Ok(()) => {
                         status.set(ZoneAnswererStatus::Registered { port });
                         if first {
-                            warned = true;
+                            registered_once = true;
                             tracing::info!(
                                 component = COMPONENT,
                                 holder = %channel.display(),
@@ -1173,10 +1182,47 @@ mod tests {
     use std::time::Instant;
 
     use hickory_proto::op::Query;
+    use tracing_subscriber::fmt::MakeWriter;
 
     use crate::box_registry::BoxRegistration;
 
     use super::*;
+
+    /// A `MakeWriter` accumulating everything written into a shared buffer, so
+    /// a test can assert on the structured fields a `tracing` event emitted —
+    /// the same scaffolding the native daemon's answerer tests build, because
+    /// the two answerers prove the same log lines.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl CaptureWriter {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl io::Write for CaptureWriter {
+        #[expect(
+            clippy::unwrap_in_result,
+            reason = "the lock is never poisoned: the capture's only other \
+                      holder unwraps it too, and a test that panics there \
+                      has already failed"
+        )]
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl MakeWriter<'_> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     /// The plan's default subnet: the one the daemon's own registry is
     /// built with, so a test registry's rows sit at the addresses
@@ -1875,6 +1921,105 @@ mod tests {
             ),
             ZoneAnswererStatus::PortHeldNoChannel { port },
             "a port held by a process with no channel is named as exactly that"
+        );
+    }
+
+    /// The first registration still names its holder at info when an earlier
+    /// pass warned: a daemon that boots against a port held by a process with
+    /// no channel — a native minimald, a foreign squatter — and later finds a
+    /// holder must announce that registration, because the diagnostics
+    /// contract's one info line is this daemon's or its listener's, and the
+    /// e2e's log greps read the info level. The warn's own once-only gate must
+    /// not take the registration's with it. Driven without racing the port
+    /// between two daemons: the foreign hold stays for the whole test, and it
+    /// is the channel that comes up beside it — the holder's half is all a
+    /// registration needs, so the daemon's next pass can only register, never
+    /// bind.
+    #[test]
+    fn a_warned_daemon_announces_its_first_registration() {
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        // The global default, not the thread-local one the crate's other
+        // captures use: the acquisition loop logs from its own thread. The
+        // default `fmt` filter is info, so the registration's info line is
+        // captured while the re-registration's debug line is not — the level
+        // split this test is about.
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("the capturing subscriber installs once per test process");
+
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        // A foreign hold on the answerer port — a plain socket, no channel
+        // answering beside it — kept for the whole test, so every pass the
+        // daemon makes finds the port held.
+        let held = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the hold binds loopback");
+        let port = held.local_addr().expect("the hold names its port").port();
+        let (registry, _) = web_registry();
+        // A clone shares the table and its change pings — the way a daemon's
+        // other threads reach the one registry its answerer holds — so a
+        // registration from here is a table change the loop is pinged for,
+        // exactly the way a live daemon's own callers wake it.
+        let pinger = registry.clone();
+        let daemon_channel = channel.clone();
+        let status = AnswererStatus::starting();
+        let probe = status.clone();
+        std::thread::Builder::new()
+            .name("test-zone-answerer-late-holder".to_string())
+            .spawn(move || acquire_loop_at(registry, port, daemon_channel, status))
+            .expect("the answerer's thread spawns");
+        assert_eq!(
+            await_status(
+                || probe.get(),
+                "the answerer never said why this VM's names answer nothing"
+            ),
+            ZoneAnswererStatus::PortHeldNoChannel { port },
+            "the first pass against a hold with no channel warns, exactly once"
+        );
+
+        // The holder comes up beside the hold: the channel alone, the half a
+        // registration needs, while the foreign socket keeps the port.
+        hold_channel(&channel, Arc::new(RegisteredTables::new()))
+            .expect("the holder's channel binds beside the foreign hold");
+        // A table change wakes the loop now, at its ping, rather than at the
+        // port-recheck cadence — the way a live daemon's box registration
+        // reaches the answerer — so the registration this test is about
+        // happens inside the wait below, not the next half minute.
+        pinger.register(BoxRegistration::new(
+            "late",
+            Ipv4Addr::new(100, 64, 0, 11),
+            Ipv4Addr::new(127, 0, 64, 11),
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let decided = probe.get();
+            if decided == (ZoneAnswererStatus::Registered { port }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the daemon never registered with the holder that came up \
+                 beside the hold (status: {decided:?})"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // The registration that got through is the first, so it is the info
+        // line naming the holder — on a line that names this test's channel,
+        // so a co-resident test's own registration cannot speak for it — and
+        // not the re-registration's debug line a warn-suppressed first
+        // registration would have been left with.
+        let log = buf.contents();
+        assert!(
+            log.lines().any(|line| {
+                line.contains("registered this table's zone rows with it")
+                    && line.contains(channel.to_string_lossy().as_ref())
+            }),
+            "the first registration after a warn must still name its holder \
+             at info, got: {log}"
         );
     }
 }
