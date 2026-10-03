@@ -483,10 +483,8 @@ pub enum ExposeRefusal {
     NoDynamicRange,
     /// The requested port lies outside the declared `dynamic_allowed_range`.
     OutOfRange { requested: u16, range: (u16, u16) },
-    /// The box holds no published address — neither the hand a VM host's
-    /// registration gave it (T66) nor an address the hostname registry
-    /// published for it — so there is nowhere to bind. A capability gap:
-    /// waiting does not fix it.
+    /// The box holds no address the hostname registry published for it, so
+    /// there is nowhere to bind. A capability gap: waiting does not fix it.
     NoPublishedAddress,
     /// The box has a published address but no running PTask attached to the
     /// switch — no lease reported yet, or the spawn that held one has ended —
@@ -558,6 +556,13 @@ pub enum ExposeFailure {
     /// environment's own name) is the one that can still say whose request
     /// this was in the one line the request owes the log.
     RecordUnreadable { port: u16, source: io::Error },
+    /// The session actor dropped the request's reply channel before
+    /// answering — the box is stopping or stopped, so nobody is home to
+    /// decide it. The switch was asked nothing and nothing was bound. Its
+    /// own arm — not `Publish` — because the actor never reached the bind:
+    /// a real `ENOTCONN` out of a bind the actor *did* attempt stays a
+    /// `Publish`, and conflating the two would log one request twice.
+    ActorGone { port: u16 },
 }
 
 impl fmt::Display for ExposeFailure {
@@ -571,6 +576,13 @@ impl fmt::Display for ExposeFailure {
                 write!(
                     f,
                     "reading the session record for port {port} failed: {source}"
+                )
+            }
+            Self::ActorGone { port } => {
+                write!(
+                    f,
+                    "the session actor for port {port} is gone; the box is \
+                     stopping or stopped"
                 )
             }
         }

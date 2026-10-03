@@ -1497,17 +1497,20 @@ impl SessionChannel {
     /// process inside the box sends to publish one of its ports. The session
     /// that owns this channel decides it against the box's `dynamic_ingress`
     /// setting and publishes when it allows (NET-044); the reply carries the
-    /// address the port was published on — said honestly: bound on the host,
-    /// but the box's own relay gate has not admitted the port yet, so a
-    /// connection to it is answered by the relay, not by the box — or the
-    /// typed refusal's own reason.
+    /// address the port was published on and, said honestly, whether a
+    /// connection to it is answered by the box yet — bound on the host, but
+    /// a port the box did not declare waits for its relay gate to admit it,
+    /// and until then the relay answers, not the box — or the typed
+    /// refusal's own reason.
     ///
     /// One info line per request on every path (NET-044's observability): the
     /// actor logs each request it sees, and this channel logs the ones no
-    /// actor can — a port that is not a number, a session that is gone, and
-    /// the record the actor could not read, whose line the actor cannot write
-    /// because the box's name lives in that record and this channel holds its
-    /// own copy. Every line names the box, the port as given, and the outcome.
+    /// actor can — a port that is not a number, a session that is gone, an
+    /// actor that dropped a request's reply channel before answering, and
+    /// the record the actor could not read, whose line the actor cannot
+    /// write because the box's name lives in that record and this channel
+    /// holds its own copy. Every line names the box, the port as given, and
+    /// the outcome.
     async fn expose_port(&self, stream: &mut UnixStream, port: &str) {
         let port_number = match port.parse::<u16>() {
             Ok(number) => number,
@@ -1552,6 +1555,20 @@ impl SessionChannel {
         };
         match session.expose_dynamic(port_number).await {
             Ok(mapping) => {
+                // The same admission set `serve_get_live_ingress` reads —
+                // `declared_ingress_ports`, on this channel's own fetch of
+                // the record — decides the reply's honesty (NET-047): a port
+                // the box declared was admitted when it attached, so it is
+                // reachable now; one published only at runtime waits for the
+                // gate. A record that does not read leaves the set empty, so
+                // the port reads as waiting — the fail-closed read the RPC
+                // gives the same box.
+                let record = session.record().await.ok();
+                let pending = !crate::net::switch::declared_ingress_ports(
+                    record.as_ref().map(|record| &record.policy),
+                    mapping.proto,
+                )
+                .contains(&mapping.internal_port);
                 #[expect(
                     clippy::let_underscore_must_use,
                     reason = "the reply channel is best-effort: a peer may be gone before \
@@ -1559,31 +1576,24 @@ impl SessionChannel {
                 )]
                 let _ = writeln!(
                     stream,
-                    "msg:published port {} at {}; not yet reachable",
-                    mapping.internal_port, mapping.local
+                    "msg:published port {} at {}{}",
+                    mapping.internal_port,
+                    mapping.local,
+                    if pending { "; not yet reachable" } else { "" }
                 );
             }
             Err(failure) => {
-                // The failures no actor saw, or the one the actor could not
-                // name: the record-read failure reached the actor but its
-                // line cannot be written there — the box's name lives in the
-                // record it could not read. The dead-actor failure never
-                // reached one. Every other failure already left its line in
-                // the actor, which saw the record; logging here too would
-                // make two lines for one request.
+                // The failures no actor could name, so this channel writes
+                // their lines itself: the record-read failure reached the
+                // actor but its line cannot be written there — the box's
+                // name lives in the record it could not read — and the
+                // dead-actor failure never reached one at all. Every other
+                // failure already left its line in the actor, which saw the
+                // record; logging here too would make two lines for one
+                // request.
                 match &failure {
-                    crate::net::policy::ExposeFailure::RecordUnreadable { .. } => {
-                        tracing::info!(
-                            name = %self.name,
-                            port = %port,
-                            outcome = "refused",
-                            reason = %failure,
-                            "dynamic ingress expose"
-                        );
-                    }
-                    crate::net::policy::ExposeFailure::Publish { source, .. }
-                        if source.kind() == std::io::ErrorKind::NotConnected =>
-                    {
+                    crate::net::policy::ExposeFailure::RecordUnreadable { .. }
+                    | crate::net::policy::ExposeFailure::ActorGone { .. } => {
                         tracing::info!(
                             name = %self.name,
                             port = %port,
@@ -2347,15 +2357,18 @@ mod tests {
         );
     }
 
-    /// NET-044's observability for the paths no session actor ever sees — the
+    /// NET-044's observability for the paths no session actor ever saw — the
     /// ones a `min net expose` request can take without one deciding it: a
-    /// port that is not a number, a session that is gone, and a record the
-    /// actor could not read, whose line the actor cannot write because the
-    /// box's name lives in the record it could not read. This channel holds
-    /// its own copy of the name, so it writes those lines; each request
-    /// leaves exactly one, naming the box, the port as given, and the
-    /// outcome. Every path the actor does see leaves its own line there,
-    /// pinned by the expose tests in `session`.
+    /// port that is not a number, a session that is gone, a reply channel an
+    /// actor dropped before answering, and a record the actor could not
+    /// read, whose line the actor cannot write because the box's name lives
+    /// in the record it could not read. This channel holds its own copy of
+    /// the name, so it writes those lines; each request leaves exactly one,
+    /// naming the box, the port as given, and the outcome. Every path the
+    /// actor did see — including a publish that failed, whatever the source
+    /// — leaves its own line there, pinned by the expose tests in `session`,
+    /// so the channel writes none for it: one request, one line, on every
+    /// path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn expose_logs_every_path_from_the_channel() {
         let capture = crate::test_harness::captured_log();
@@ -2439,8 +2452,58 @@ mod tests {
             "the reply is the typed record-read failure: {lines:?}"
         );
 
-        // One line per request across all three, each naming the box and the
-        // port as given.
+        // A publish that failed with `ENOTCONN` out of a bind the actor did
+        // attempt: the actor saw the request, so its line is the actor's and
+        // this channel must not add one — a real `ENOTCONN` there is a
+        // `Publish` failure, not the dead-actor failure it must not be
+        // conflated with. A stand-in actor answers it, then drops the reply
+        // channel of the next request, which no actor saw: that one is the
+        // `ActorGone` failure, and its line is this channel's.
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel_with(
+            crate::session::WeakSessionHandle::answering(vec![Err(
+                crate::net::policy::ExposeFailure::Publish {
+                    port: 3000,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "a bind answered ENOTCONN",
+                    ),
+                },
+            )]),
+            "bindweb",
+        );
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%3000", &mut ours).await;
+        drop(ours);
+        let lines = read_lines(&theirs);
+        assert_eq!(lines.len(), 1, "one reply: {lines:?}");
+        assert!(
+            lines[0].starts_with("error: publishing port 3000 failed:")
+                && lines[0].contains("a bind answered ENOTCONN"),
+            "the reply is the typed publish failure, source intact: {lines:?}"
+        );
+
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%3000", &mut ours).await;
+        drop(ours);
+        let lines = read_lines(&theirs);
+        assert_eq!(lines.len(), 1, "one reply: {lines:?}");
+        assert!(
+            lines[0].starts_with("error: the session actor for port 3000 is gone"),
+            "a reply channel the actor dropped is its own typed failure: {lines:?}"
+        );
+
+        // One line per request — four wrote one, and the ENOTCONN publish
+        // wrote none — each naming the box and the port as given.
         let logged = capture.contents();
         let expose: Vec<&str> = logged
             .lines()
@@ -2448,8 +2511,15 @@ mod tests {
             .collect();
         assert_eq!(
             expose.len(),
-            3,
+            4,
             "one line per request, including the ones no actor saw: {logged}"
+        );
+        assert!(
+            !logged
+                .lines()
+                .any(|line| line.contains("publishing port 3000 failed")),
+            "a publish the actor attempted is the actor's line to write, and \
+             this channel must not add one for the same request: {logged}"
         );
         assert!(
             expose[0].contains("name=web")
@@ -2475,6 +2545,94 @@ mod tests {
             "the record-read failure's line names the box, whose name the \
              unreadable record could not: {}",
             expose[2]
+        );
+        assert!(
+            expose[3].contains("name=bindweb")
+                && expose[3].contains("port=3000")
+                && expose[3].contains("outcome=\"refused\"")
+                && expose[3].contains("reason=the session actor for port 3000 is gone"),
+            "the dropped reply channel's line is this channel's, naming the \
+             box: {}",
+            expose[3]
+        );
+    }
+
+    /// The publish reply's honesty (NET-047) rides the same admission set the
+    /// live-ingress list reads — `declared_ingress_ports` — so a port the box
+    /// declared, admitted when it attached, is reachable the moment it
+    /// publishes and its reply says so, while a runtime-only port in the same
+    /// range is bound but not yet answered by the box, and its reply says
+    /// that. One box, one flow, no second list of declared ports to drift.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_reply_says_not_yet_reachable_only_for_runtime_ports() {
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        // The hand vouched for, so the registry publishes it: both publishes
+        // below bind at the box's own address.
+        let manager = server.state.sessions_manager().await;
+        manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+        let web = crate::session::tests::finalize_declared_dynamic_ingress_session(
+            &mut client,
+            "web",
+            std::net::Ipv4Addr::new(100, 64, 128, 51),
+            std::net::Ipv4Addr::new(127, 0, 64, 51),
+        )
+        .await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        handle
+            .ensure_host("tester".to_string())
+            .await
+            .expect("the box launches its host");
+        let sock = handle
+            .net_switch()
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .control_socket();
+        let (forwarder, served) = crate::session::tests::fake_forwarder(sock, 200).await;
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel_with(handle.downgrade(), "web");
+
+        // The declared port: the gate admitted it when the box attached, so
+        // the reply is a fact — reachable now, no caveat.
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%3000", &mut ours).await;
+        drop(ours);
+        assert_eq!(
+            read_lines(&theirs),
+            vec!["msg:published port 3000 at 127.0.64.51:3000"],
+            "a declared port's reply carries no reachability caveat"
+        );
+
+        // A runtime-only port in the same range: bound on the host, but the
+        // gate has not admitted it, so the reply says what it is.
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%3200", &mut ours).await;
+        drop(ours);
+        assert_eq!(
+            read_lines(&theirs),
+            vec!["msg:published port 3200 at 127.0.64.51:3200; not yet reachable"],
+            "a runtime-only port's reply says it is not yet reachable"
+        );
+        forwarder.abort();
+        assert_eq!(
+            served.lock().expect("served lock").len(),
+            2,
+            "one mapping is one request, and both publishes reached the switch"
         );
     }
 

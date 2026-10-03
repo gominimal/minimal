@@ -2207,6 +2207,12 @@ impl Session {
                 // that request owes the log is written by the env channel,
                 // which knows the box's name without the record.
             }
+            Err(crate::net::policy::ExposeFailure::ActorGone { .. }) => {
+                // Unreachable from this side: `ActorGone` is what the asker's
+                // handle answers when this actor dropped before replying, so
+                // no actor ever sees one in an outcome. The env channel writes
+                // that request's line.
+            }
         }
         outcome
     }
@@ -3666,9 +3672,10 @@ impl SessionHandle {
     /// Publishes `port` for this box at runtime (NET-043) — the request the
     /// in-box `min net expose` sends, decided against the box's
     /// `dynamic_ingress` setting. Answers with the published mapping, or the
-    /// typed reason the request was refused. A dead actor lands on the
-    /// publish-failure arm: the box that would own the mapping is gone, so no
-    /// publish could be made.
+    /// typed reason the request was refused. A dead actor is its own typed
+    /// failure — `ActorGone`, not `Publish` — because it never reached the
+    /// bind: the box that would own the mapping is gone, so no publish was
+    /// attempted and none could be reported as failed.
     pub(crate) async fn expose_dynamic(
         &self,
         port: u16,
@@ -3685,13 +3692,7 @@ impl SessionHandle {
             .await;
         match recv.await {
             Ok(reply) => reply,
-            Err(_) => Err(crate::net::policy::ExposeFailure::Publish {
-                port,
-                source: std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "session actor is gone",
-                ),
-            }),
+            Err(_) => Err(crate::net::policy::ExposeFailure::ActorGone { port }),
         }
     }
 
@@ -3976,6 +3977,46 @@ impl WeakSessionHandle {
         drop(tx);
         Self(weak)
     }
+
+    /// A handle to a stand-in "actor" that answers each expose request with
+    /// the next of `answers`, and drops the reply channel for any request
+    /// past them — the dead-actor path no live actor can be made to take on
+    /// demand. Test-only: lets the env channel's tests drive the typed
+    /// failures [`SessionHandle::expose_dynamic`] hands back, without
+    /// standing up a session whose publish genuinely fails. The stand-in
+    /// keeps its strong sender alive for the test's runtime, so `upgrade()`
+    /// holds; only messages it answers reach a reply.
+    #[cfg(test)]
+    pub(crate) fn answering(
+        answers: Vec<
+            Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
+        >,
+    ) -> Self {
+        let (tx, mut rx) = mpsc::channel::<SessionMessage>(1);
+        let weak = tx.downgrade();
+        tokio::spawn(async move {
+            // Hold the strong sender for the runtime the test lives in:
+            // without a live sender the channel closes and the asker's
+            // `upgrade()` fails before any answer is reached.
+            let _hold = tx;
+            let mut answers = answers.into_iter();
+            while let Some(message) = rx.recv().await {
+                // Past the script, no answer is sent: `reply` drops
+                // unanswered, which the asker types as the actor being gone.
+                if let SessionMessage::ExposeDynamic { reply, .. } = message
+                    && let Some(answer) = answers.next()
+                {
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "the asker whose request was answered is the env \
+                                  channel, which has no use for a send receipt"
+                    )]
+                    let _ = reply.send(answer);
+                }
+            }
+        });
+        Self(weak)
+    }
 }
 
 /// The write-lock promotion of a registration headed for the interim: the
@@ -4002,5 +4043,8 @@ fn promote_interim_to_hand(
     }
 }
 
+// `pub(crate)`: the env channel's tests reach the stand-in forwarder and the
+// session fixtures this module owns, so a reply's honesty is read against a
+// real session's publish rather than a parallel fixture of it.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -4957,6 +4957,71 @@ async fn finalize_dynamic_ingress_session(
     id
 }
 
+/// The box an expose reply's honesty is decided against: an own-address box
+/// that declares one published port *and* allows dynamic ingress over a range
+/// containing it, with the hand a publish needs — so one box's flow reaches
+/// both halves of the reply's predicate (NET-047): the declared port, which
+/// the gate admitted when the box attached, and a runtime-only port inside
+/// the range, which is still waiting for it. [`dynamic_ingress_session_req`]
+/// clears the declared mappings because its tests decide only runtime ones;
+/// this keeps one, which is the point.
+fn declared_and_dynamic_ingress_session_req(
+    name: &str,
+    switch: std::net::Ipv4Addr,
+    loopback: std::net::Ipv4Addr,
+) -> minimald_rpc::CreateSessionRequest {
+    let mut request = own_ip_session_req(name);
+    let ingress = request
+        .config
+        .policy
+        .ingress
+        .as_mut()
+        .expect("own_ip_session_req always declares an ingress policy");
+    ingress.port_mappings = vec![sessions::PortMapping {
+        external_port: 3000,
+        internal_port: 3000,
+        proto: sessions::IpProto::Tcp,
+    }];
+    ingress.dynamic_ingress = Some(sessions::DynamicIngress::Allow);
+    ingress.dynamic_allowed_range = Some((3000, 3999));
+    request.config.box_addresses = Some(sessions::BoxAddresses {
+        switch_address: switch,
+        loopback_address: loopback,
+    });
+    request
+}
+
+/// Drives Create → ConfigureLoadout → FinalizeSession for a
+/// [`declared_and_dynamic_ingress_session_req`] box and returns its id.
+/// `pub(crate)`: the env channel's tests drive a real session's publish to
+/// read the reply the box's own `min net expose` gets.
+pub(crate) async fn finalize_declared_dynamic_ingress_session(
+    client: &mut TestClient,
+    name: &str,
+    switch: std::net::Ipv4Addr,
+    loopback: std::net::Ipv4Addr,
+) -> SessionId {
+    use minimald_rpc::{ConfigureLoadout, ConfigureLoadoutRequest, CreateSession};
+    let id = client
+        .call::<CreateSession>(&declared_and_dynamic_ingress_session_req(
+            name, switch, loopback,
+        ))
+        .await
+        .unwrap()
+        .id;
+    crate::test_harness::unwrap_ready(
+        client
+            .call::<ConfigureLoadout>(&ConfigureLoadoutRequest {
+                session_id: id,
+                contribution: Default::default(),
+            })
+            .await
+            .unwrap(),
+    );
+    finalize_session(client, id).await;
+    id
+}
+
 /// Reads one control request off `stream` — its head through the blank line,
 /// then exactly its `Content-Length` of body — mirroring the keep-alive
 /// framing [`crate::net::policy`] writes, so the stand-in forwarder below
@@ -5006,10 +5071,27 @@ async fn read_control_request(stream: &mut tokio::net::UnixStream) -> Option<Str
 /// and records every request it served as `"<request line>\n<body>"`. The
 /// harness never spawns a real forwarder, so binding here is what puts a
 /// control channel behind the publish verbs — a 500 answers the way the real
-/// forwarder answers a bind it cannot make.
-async fn fake_forwarder(
+/// forwarder answers a bind it cannot make. `pub(crate)`: the env channel's
+/// tests drive a real session's publish through the same stand-in.
+pub(crate) async fn fake_forwarder(
     sock: std::path::PathBuf,
     status: u16,
+) -> (
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    scripted_forwarder(sock, vec![status]).await
+}
+
+/// A stand-in for the host gvproxy that answers each request with the next
+/// status of `script`, keeping the last for any request past them — so a test
+/// can have the switch accept one bind and refuse the next, the way the real
+/// forwarder answers a duplicate of a bind another forward already holds.
+/// Everything else is [`fake_forwarder`]'s contract: one request per
+/// connection, each recorded as `"<request line>\n<body>"`.
+async fn scripted_forwarder(
+    sock: std::path::PathBuf,
+    script: Vec<u16>,
 ) -> (
     tokio::task::JoinHandle<()>,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -5022,6 +5104,10 @@ async fn fake_forwarder(
     let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let recorded = served.clone();
     let server = tokio::spawn(async move {
+        let mut script: std::collections::VecDeque<u16> = script.into();
+        // The last status answers anything past the script, so a stand-in
+        // scripted for two requests still answers a third.
+        let last = *script.back().unwrap_or(&500);
         // Sequential on purpose: the publish verbs open a fresh connection
         // per request, so one connection served at a time is their shape.
         loop {
@@ -5032,6 +5118,7 @@ async fn fake_forwarder(
                 continue;
             };
             recorded.lock().expect("served lock").push(request);
+            let status = script.pop_front().unwrap_or(last);
             let reason = if (200..300).contains(&status) {
                 "OK"
             } else {
@@ -5727,6 +5814,174 @@ async fn expose_rejected_leaves_no_partial_mapping() {
     assert!(
         failed_line.contains("returned HTTP 500"),
         "the failed publish names the switch's refusal: {failed_line}"
+    );
+}
+
+/// NET-044 on the shared-address interim: under an absent range verdict every
+/// box publishes at `127.0.0.1`, so a runtime expose of a port another box
+/// already holds there cannot be made — the switch refuses the duplicate
+/// bind — and the refusal is the typed publish failure naming the port,
+/// never a fallback to another address and never a success for a forward
+/// nobody owns. The colliding box keeps no forward and lists no mapping, and
+/// the box that holds the address keeps its publish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_colliding_on_shared_address_is_a_bind_error() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    // An absent range: the interim both boxes publish at, so one address's
+    // port carries one forward at most.
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
+    let web = finalize_dynamic_ingress_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 31),
+        std::net::Ipv4Addr::new(127, 0, 64, 31),
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let db = finalize_dynamic_ingress_session(
+        &mut client,
+        "db",
+        std::net::Ipv4Addr::new(100, 64, 128, 32),
+        std::net::Ipv4Addr::new(127, 0, 64, 32),
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let web_handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+        .await
+        .unwrap()
+        .expect("the first box resolves");
+    let db_handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(db))
+        .await
+        .unwrap()
+        .expect("the second box resolves");
+    // Both boxes run: a publish needs a box standing behind it, and the
+    // collision below is one two live boxes make, not a box that cannot
+    // publish at all.
+    web_handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the first box launches its host");
+    db_handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the second box launches its host");
+    let sock = web_handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    // The switch accepts the first box's bind of the shared address's port
+    // and refuses the second box's bind of the same one — a 500, the way the
+    // real forwarder answers a bind it cannot make because another forward
+    // already holds the address.
+    let (forwarder, served) = scripted_forwarder(sock, vec![200, 500]).await;
+
+    let held = web_handle
+        .expose_dynamic(3000)
+        .await
+        .expect("the first box's publish holds the shared address's port");
+    assert_eq!(
+        held.local, "127.0.0.1:3000",
+        "under an absent range both boxes publish at the interim"
+    );
+
+    // The second box exposes the port the first holds: one address:port
+    // carries one forward, so this bind cannot be made, and the failure is
+    // the typed publish failure naming the port.
+    match db_handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Publish { port: 3000, source }) => {
+            assert!(
+                source.to_string().contains("returned HTTP 500"),
+                "the bind failure names the switch's refusal: {source}"
+            );
+        }
+        other => panic!(
+            "a bind on an address another box holds is the publish failure: {other:?}"
+        ),
+    }
+    forwarder.abort();
+
+    // The refused bind asked for exactly what it meant to bind — the shared
+    // address, delivered to the second box's own switch address — and asked
+    // nothing else: no retry at a fallback address.
+    let served = served.lock().expect("served lock").clone();
+    assert_eq!(
+        served.len(),
+        2,
+        "one request per publish, and no third for a fallback: {served:?}"
+    );
+    let (line, body) = served[1]
+        .split_once('\n')
+        .expect("the served request carries its request line and body");
+    assert!(
+        line.starts_with("POST /services/forwarder/expose "),
+        "the colliding publish rides the forwarder's expose verb: {served:?}"
+    );
+    let colliding = crate::net::policy::expose_request(
+        &sessions::PortMapping {
+            external_port: 3000,
+            internal_port: 3000,
+            proto: sessions::IpProto::Tcp,
+        },
+        std::net::Ipv4Addr::LOCALHOST,
+        std::net::Ipv4Addr::new(100, 64, 128, 32),
+    );
+    assert_eq!(
+        body,
+        String::from_utf8(serde_json_lenient::to_vec(&colliding).unwrap()).unwrap(),
+        "the refused bind is the request at the shared address, never a \
+         fallback one"
+    );
+
+    // No forward and no listed mapping for the colliding box; the box that
+    // holds the address keeps its publish.
+    let db_live: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Id(db))
+        .await;
+    assert_eq!(
+        db_live,
+        minimald_rpc::Errorable::Ok(vec![]),
+        "the colliding box lists no mapping: its bind was never made"
+    );
+    let web_live: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
+        .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Id(web))
+        .await;
+    assert_eq!(
+        web_live,
+        minimald_rpc::Errorable::Ok(vec![minimald_rpc::LiveMapping {
+            local: "127.0.0.1:3000".to_string(),
+            internal_port: 3000,
+            proto: sessions::IpProto::Tcp,
+            // The box declared no port mappings, so its relay gate admits
+            // nothing: the runtime publish reads pending.
+            pending: true,
+        }]),
+        "the first box's publish is untouched by the collision"
+    );
+
+    // The one line the failed publish owes the log: the box, the port, the
+    // decision its setting made, and the switch's refusal.
+    let logged = capture.contents();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("dynamic ingress expose") && line.contains("name=db"))
+        .unwrap_or_else(|| panic!("the failed publish must be logged, got: {logged}"));
+    assert!(
+        line.contains("port=3000")
+            && line.contains("decision=allow")
+            && line.contains("outcome=\"publish failed\"")
+            && line.contains("returned HTTP 500"),
+        "the failed publish names the box, the port, the decision and the \
+         switch's refusal: {line}"
     );
 }
 
