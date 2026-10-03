@@ -5387,12 +5387,13 @@ async fn expose_self_allocated_box_publishes_at_its_registered_address() {
     );
 }
 
-/// The typed refusal a self-allocated box still answers when the registry
-/// holds no address pair for it: no PTask has reported a lease to deliver to,
-/// or the box holds no published address to bind at. Either way the daemon
-/// has no default to stand in with (NET-010), so the request is refused as
-/// "no published address" — distinct from a policy deny — with the switch
-/// asked nothing and no mapping listed.
+/// The typed refusals a self-allocated box still answers when the registry
+/// holds no address pair for it, each naming the half that is missing: no
+/// PTask has reported a lease to deliver to — the box is not attached yet,
+/// which starting it fixes — or the box holds no published address to bind
+/// at, a capability gap the daemon has no default to stand in for (NET-010).
+/// Neither is a policy deny, the switch is asked nothing, and no mapping is
+/// listed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expose_self_allocated_box_without_a_registered_address_is_refused() {
     let server = TestServer::new().await;
@@ -5423,9 +5424,9 @@ async fn expose_self_allocated_box_without_a_registered_address_is_refused() {
     // Published at the grant, but no PTask has reported a lease.
     match handle.expose_dynamic(3000).await {
         Err(crate::net::policy::ExposeFailure::Refused(
-            crate::net::policy::ExposeRefusal::NoPublishedAddress,
+            crate::net::policy::ExposeRefusal::NotAttached,
         )) => {}
-        other => panic!("a box with no reported lease is refused: {other:?}"),
+        other => panic!("a box with no reported lease is refused as not attached: {other:?}"),
     }
 
     // A lease reported, but the box's publish withdrawn.
