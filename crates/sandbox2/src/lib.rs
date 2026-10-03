@@ -890,7 +890,7 @@ pub mod classifier {
             own_account().unwrap_or_else(|| "<the account this daemon runs as>".to_string());
         format!(
             "fetch install-host-classifier.sh from \
-             https://github.com/gominimal/minimal/blob/main/scripts/install-host-classifier.sh \
+             https://raw.githubusercontent.com/gominimal/minimal/main/scripts/install-host-classifier.sh \
              and run: sudo ./install-host-classifier.sh --user {account}"
         )
     }
@@ -3950,6 +3950,26 @@ mod tests {
     // NET-079: each host-address box in its own classifier leaf, kept there.
     // ---------------------------------------------------------------------
 
+    /// A stock install does not ship the classifier installer, so the hint
+    /// says where to fetch it — the raw file, not GitHub's HTML viewer page,
+    /// which a `curl` of the URL would save and `sudo` would then run — rather
+    /// than name a checkout-relative `scripts/` path, and still spells the
+    /// `--user` the daemon knows.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_install_hint_names_where_the_installer_lives() {
+        let hint = classifier::install_hint();
+        assert!(
+            hint.contains(
+                "https://raw.githubusercontent.com/gominimal/minimal/main/scripts/install-host-classifier.sh"
+            ),
+            "{hint}"
+        );
+        assert!(!hint.contains("/blob/"), "{hint}");
+        assert!(!hint.contains("sudo scripts/"), "{hint}");
+        assert!(hint.contains("--user "), "{hint}");
+    }
+
     /// The mount-table half of the confinement: which cgroup2 mounts a host's
     /// `mountinfo` names, which one a classifier tree lives on, and whether
     /// it carries `nsdelegate` — the option that makes a cgroup namespace a
@@ -3957,23 +3977,6 @@ mod tests {
     /// boxes at all (design §7.1). Pure over its input, so the reading a
     /// real host's mount table gives can be asserted against a mount table
     /// this test controls.
-    // A stock install does not ship the classifier installer, so the hint
-    // must say where to fetch it rather than name a checkout-relative
-    // `scripts/` path, and must still spell the `--user` the daemon knows.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_install_hint_names_where_the_installer_lives() {
-        let hint = classifier::install_hint();
-        assert!(
-            hint.contains(
-                "https://github.com/gominimal/minimal/blob/main/scripts/install-host-classifier.sh"
-            ),
-            "{hint}"
-        );
-        assert!(!hint.contains("sudo scripts/"), "{hint}");
-        assert!(hint.contains("--user "), "{hint}");
-    }
-
     #[cfg(target_os = "linux")]
     #[test]
     fn the_mount_table_names_the_cgroup2_mounts_and_their_nsdelegate() {

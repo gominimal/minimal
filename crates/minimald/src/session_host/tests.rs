@@ -1828,6 +1828,31 @@ fn only_the_guest_refuses_an_unplaceable_host_address_box() {
     }
 }
 
+/// The terminal banner for an unplaced host-address box is owed once per
+/// daemon run: owed until a write of it succeeds, and not after. A write
+/// that failed never marks it, so the next session still gets it. Driven
+/// over a local flag; the launch drives the daemon's static the same way.
+#[test]
+fn the_pty_advisory_is_owed_until_a_write_succeeds() {
+    use std::sync::atomic::AtomicBool;
+
+    let printed = AtomicBool::new(false);
+    assert!(
+        pty_advisory_due(&printed),
+        "the first advising launch in a daemon run prints the banner"
+    );
+    // A failed write: the launch checked, did not mark.
+    assert!(
+        pty_advisory_due(&printed),
+        "a write that failed leaves the banner owed to the next session"
+    );
+    mark_pty_advisory_printed(&printed);
+    assert!(
+        !pty_advisory_due(&printed),
+        "once a write succeeded, later launches print nothing"
+    );
+}
+
 /// A leaf a fresh launch finds, and what it may be (NET-079): a leftover
 /// from a daemon death the start sweep could not have seen — the daemon died
 /// between creating the leaf and spawning the box into it — or another
