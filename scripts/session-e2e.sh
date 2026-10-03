@@ -7209,7 +7209,13 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
     cred_host_log_tail
     cred_fail
   fi
-  if ! cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | grep -q -- "source=$nolane_ip"; then
+  # The line's source field is read in the file log's own shape: the detached
+  # daemon's sink is the flat-JSON layer both daemons share (the same
+  # `minvmd.log.<date>` the box-register proof greps for '"box":"…"'), which
+  # renders the field as `"source":"<addr>"` — a `source=<addr>` text grep
+  # matches nothing the daemon ever wrote and the assertion can never pass.
+  if ! cred_case_log | grep -- "egress-uncredentialed-proxy-destination" \
+    | grep -qF -- "\"source\":\"$nolane_ip\""; then
     echo "::error::the proxy-lane drop line does not name the no-lane box's own address ($nolane_ip) as the source"
     cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | tail -n5 | sed 's/^/  /'
     cred_fail
