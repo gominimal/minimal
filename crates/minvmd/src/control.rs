@@ -127,9 +127,12 @@ fn serve_connection(stream: UnixStream, boxes: &BoxRegistry) -> std::io::Result<
 
     // Check the peer's credentials: only the daemon's own uid may reach
     // the box table. The 0600 socket mode is the primary gate; this is
-    // defense in depth against a mis-moded file, a group- or
-    // world-writable provider directory, or a passed file descriptor.
-    if check_peer_credentials(&stream).is_err() {
+    // defense in depth against a mis-moded file or a group- or
+    // world-writable provider directory. The kernel captures the peer's
+    // credentials at connect time, so a descriptor a same-uid connector
+    // passes on still carries that connector's uid.
+    if let Err(error) = check_peer_credentials(&stream) {
+        tracing::debug!(%error, "control-socket peer check failed");
         return Ok(());
     }
 
@@ -189,7 +192,9 @@ fn check_peer_uid(peer_uid: u32) -> std::io::Result<()> {
     // Log the refusal once per distinct foreign uid.
     static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
     let first = {
-        let mut seen = SEEN.lock().unwrap();
+        let mut seen = SEEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         seen.get_or_insert_with(HashSet::new).insert(peer_uid)
     };
     if first {
@@ -213,7 +218,11 @@ fn check_peer_uid(peer_uid: u32) -> std::io::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: getsockopt with SO_PEERCRED reads the peer's pid/uid/gid
     // from the kernel; the kernel fills `cred` and `len` on success.

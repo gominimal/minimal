@@ -128,8 +128,8 @@ pub fn enforce_socket_permissions(socket_path: &std::path::Path) -> io::Result<(
 }
 
 /// Verify that `dir` is owned by the calling process's uid and has mode
-/// 0700. Refuse to start otherwise, with an error that names the directory
-/// and its actual owner and mode.
+/// 0700. Return `PermissionDenied` otherwise, naming the directory and its
+/// actual owner and mode.
 pub fn verify_provider_dir_ownership(dir: &std::path::Path) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
@@ -141,6 +141,7 @@ pub fn verify_provider_dir_ownership(dir: &std::path::Path) -> io::Result<()> {
         ));
     }
 
+    // SAFETY: geteuid has no preconditions and cannot fail.
     let my_uid = unsafe { libc::geteuid() };
     if meta.uid() != my_uid {
         return Err(io::Error::new(
