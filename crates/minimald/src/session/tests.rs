@@ -5904,9 +5904,7 @@ async fn expose_colliding_on_shared_address_is_a_bind_error() {
                 "the bind failure names the switch's refusal: {source}"
             );
         }
-        other => panic!(
-            "a bind on an address another box holds is the publish failure: {other:?}"
-        ),
+        other => panic!("a bind on an address another box holds is the publish failure: {other:?}"),
     }
     forwarder.abort();
 

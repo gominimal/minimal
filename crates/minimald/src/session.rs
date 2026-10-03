@@ -3988,9 +3988,7 @@ impl WeakSessionHandle {
     /// holds; only messages it answers reach a reply.
     #[cfg(test)]
     pub(crate) fn answering(
-        answers: Vec<
-            Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
-        >,
+        answers: Vec<Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<SessionMessage>(1);
         let weak = tx.downgrade();
