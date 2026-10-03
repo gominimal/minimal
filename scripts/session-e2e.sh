@@ -5005,11 +5005,29 @@ proof_github_only_allowlist() {
   # the default layer's inline prefix, so the window reads the same on both
   # shapes; the daemon logs plenty besides the probe while one is in flight
   # (SSH-handshake warnings chief among them), which the filter keeps out.
+  #
+  # The console layer also paints ANSI (tracing's default fmt layer turns it
+  # on unless NO_COLOR is set, and no lane sets it), and its field rendering
+  # then italicizes every field NAME and dims the `=` beside it: a record's
+  # `target_pass=false` reaches the boot log as
+  # `<italic>target_pass</italic><dimmed>=</dimmed>false`, so no `name=value`
+  # ever appears contiguously — the message and the value stay plain, which
+  # is why every earlier leg of this case matched fine while the first
+  # field assertion (the unpublished zone leg's) failed on both VM lanes.
+  # The SGR codes are stripped here, at the one reader both the assertions
+  # and the printed transcript go through, so a field reads the same on the
+  # console shape as on the file shape it was written against. The escape
+  # byte is generated at runtime and the pattern carries no backslash — a
+  # literal `\x1b` in the program is a GNU-ism, and `\[` is one GNU sed
+  # warns about itself, while the macOS lane's BSD sed reads neither; the
+  # bracket expression takes the `[` as a member instead.
   goa_net_since() {
-    local f
+    local f esc
     f="$(goa_log)"
     [ -n "$f" ] && [ -f "$f" ] || return 0
-    tail -n "+$(($1 + 1))" "$f" | grep -F -- 'minimald::net::' || true
+    esc=$'\033'
+    tail -n "+$(($1 + 1))" "$f" | grep -F -- 'minimald::net::' \
+      | sed "s/${esc}[[0-9;]*m//g" || true
   }
   # Polls (≤5 s) for the records since $1 to carry $2 ("" = any), prints
   # them for the transcript, and leaves them in GOA_RECORDS: the file writer
@@ -5045,8 +5063,11 @@ proof_github_only_allowlist() {
   # one (`session_id="100.64.0.10"`, the rendering the daemon's own unit
   # tests assert on) — and a native run reads the file log, where the same
   # field lands as JSON (`"target_pass":false`, `"session_id":"100.64.0.9"`).
-  # A field asserted on must hold in both, or a case that passes on one lane
-  # fails on the other for no reason either lane did anything to deserve.
+  # The console's inline fields are only bare after goa_net_since has
+  # stripped the layer's SGR paint off them, which is why every $1 this
+  # reads comes from there. A field asserted on must hold in both, or a case
+  # that passes on one lane fails on the other for no reason either lane did
+  # anything to deserve.
   goa_field_is() {
     case "$1" in
       *"$2=$3"* | *"$2=\"$3\""* | *"\"$2\":$3"* | *"\"$2\":\"$3\""*) return 0 ;;
@@ -5274,20 +5295,29 @@ GOA_PROBE_EOF
   # which are the only grants it could have reached anything by. One failed
   # fetch is retried once, because these four legs are the only ones in the
   # case whose failure can be a registry having a bad minute rather than
-  # the gate's — and a lone attempt cannot tell the two apart.
+  # the gate's — and a lone attempt cannot tell the two apart. The retry is
+  # idempotent: every command below clears its own destination before it
+  # starts, because an attempt killed by `timeout 90` (or failed under it)
+  # leaves a half-written destination behind, and `git clone` into an
+  # existing directory and `skopeo … dir:/tmp/hw` into a non-empty one both
+  # refuse deterministically — so a retry into the dirty destination would
+  # fail however the upstream was doing, and the second chance would never
+  # have been a real one.
   goa_fetch() {
     local label="$1" cmd="$2"
     local before out rc text
     before="$(goa_log_lines)"
     echo "fetch $label: $cmd"
-    out="$(mnl session exec "$goa_t_sid" "$cmd" 2>"$WORK/goa-$label.err")"
+    out="$(mnl session exec "$goa_t_sid" "$cmd" 2>"$WORK/goa-$label-1.err")"
     rc=$?
     if [ "$rc" -ne 0 ]; then
       # The retry keeps the window opening at the first attempt, so the
       # admissions either attempt produced are all in the one window this
-      # leg reads back.
+      # leg reads back, and each attempt keeps its own stderr so the
+      # classification below sees the first failure too — the retry's
+      # output alone cannot say which attempt a status came from.
       echo "  -> exit $rc on the first attempt; retrying once"
-      out="$(mnl session exec "$goa_t_sid" "$cmd" 2>"$WORK/goa-$label.err")"
+      out="$(mnl session exec "$goa_t_sid" "$cmd" 2>"$WORK/goa-$label-2.err")"
       rc=$?
     fi
     goa_print_net_since "$before" "admitted a resolved name"
@@ -5296,17 +5326,23 @@ GOA_PROBE_EOF
       # A 429 or a server-side 5xx from an upstream is their outage, not
       # this box's DNS gate, and the error line says so when the tool's own
       # output shows one — so a registry having a bad minute is not read as
-      # a gate regression. It is still a failure: the leg is never skipped
+      # a gate regression. The status is matched only inside the shapes a
+      # status arrives in — the reason phrases, an HTTP status line, or a
+      # `status`/`code`/`error` field carrying the number — because the same
+      # digits turn up in byte counts and sizes (`504 kB`) and a bare
+      # number match would let a gate regression pass itself off as an
+      # upstream outage. It is still a failure: the leg is never skipped
       # for it, and the retry above already gave the registry its second
       # chance.
       text="$out
-$(cat "$WORK/goa-$label.err" 2>/dev/null || true)"
-      if grep -qiE 'toomanyrequests|429|5(00|02|03|04)' <<<"$text"; then
-        echo "::error::$label did not complete (exit $rc), and its output carries a rate-limit or registry-server status (toomanyrequests/429/5xx) — the upstream looks unavailable, which is not this box's DNS gate, but the leg still fails"
+$(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
+      if grep -qiE 'too[ -]?many[ -]?requests|http/[0-9.]+ +(429|5[0-9][0-9])([^0-9]|$)|(status|code|error)["=: ]+e?(429|5[0-9][0-9])([^0-9]|$)|internal server error|bad gateway|service unavailable|gateway time-?out|server error' <<<"$text"; then
+        echo "::error::$label did not complete (exit $rc), and its output carries a rate-limit or registry-server status (429 or a 5xx in a status line, a status/code/error field, or a reason phrase) — the upstream looks unavailable, which is not this box's DNS gate, but the leg still fails"
       else
         echo "::error::$label did not complete (exit $rc) — a hostname-only allowlist must admit every host the tool touches; the window above names the hosts it did, so a host missing from it is the one to add to the declaration"
       fi
-      echo "--- stderr tail ---"; tail -20 "$WORK/goa-$label.err" 2>/dev/null || true
+      echo "--- stderr tail (first attempt) ---"; tail -20 "$WORK/goa-$label-1.err" 2>/dev/null || true
+      echo "--- stderr tail (retry) ---"; tail -20 "$WORK/goa-$label-2.err" 2>/dev/null || true
       fail
     fi
     if [[ "$GOA_RECORDS" != *"admitted a resolved name"* ]]; then
@@ -5314,10 +5350,10 @@ $(cat "$WORK/goa-$label.err" 2>/dev/null || true)"
       fail
     fi
   }
-  goa_fetch "git" "/usr/bin/timeout 90 git clone --depth 1 https://github.com/octocat/Hello-World /tmp/hello-world"
-  goa_fetch "npm" "/usr/bin/timeout 90 sh -c 'mkdir -p /tmp/npm-stub && cd /tmp/npm-stub && npm install is-odd --prefix .'"
-  goa_fetch "pip" "/usr/bin/timeout 90 pip3 install --target /tmp/pip-stub requests"
-  goa_fetch "skopeo" "/usr/bin/timeout 90 skopeo --insecure-policy copy docker://docker.io/library/hello-world dir:/tmp/hw"
+  goa_fetch "git" "rm -rf /tmp/hello-world && /usr/bin/timeout 90 git clone --depth 1 https://github.com/octocat/Hello-World /tmp/hello-world"
+  goa_fetch "npm" "/usr/bin/timeout 90 sh -c 'rm -rf /tmp/npm-stub && mkdir -p /tmp/npm-stub && cd /tmp/npm-stub && npm install is-odd --prefix .'"
+  goa_fetch "pip" "rm -rf /tmp/pip-stub && /usr/bin/timeout 90 pip3 install --target /tmp/pip-stub requests"
+  goa_fetch "skopeo" "rm -rf /tmp/hw && /usr/bin/timeout 90 skopeo --insecure-policy copy docker://docker.io/library/hello-world dir:/tmp/hw"
 
   # ---- the title's other half: a name the declaration does not name ---------
   # The fetches above are the allowed half; the other half is that a name
