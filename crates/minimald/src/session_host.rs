@@ -596,6 +596,22 @@ impl Binding {
                 // typed nobody-is-attached refusal. Only a dialog that
                 // completed with a choice in hand is the human's answer.
                 let mut answer: Option<AskAnswer> = None;
+                // Whether the dialog's last write was cut short, presumed
+                // yes until the arm that ran the dialog to completion says
+                // otherwise: every other way out of the select below drops
+                // the dialog future wherever it stood, mid-write included.
+                // That matters because russh's channel writer keeps an
+                // interrupted write's state — `ChannelTx` parks its send in
+                // `send_fut` and answers the next `write_all` with the
+                // *interrupted* write's byte count, a count that can run
+                // past a shorter buffer's end and panics tokio's
+                // `write_all` there (`split_at`: mid > len). The shed
+                // notice and every farewell are shorter buffers, so the
+                // binding would die mid-epilogue and leave the client
+                // hanging on a channel that never closes. The state is
+                // per-writer, so the writer is replaced rather than
+                // trusted: see the refresh below.
+                let mut interrupted_write = true;
                 {
                     // Pinned outside the loop below, not rebuilt inside it: a
                     // select arm's future is re-created on every iteration
@@ -614,6 +630,10 @@ impl Binding {
                             // iteration's shed arm closes the channel.
                             answered = &mut dialog => {
                                 answer = answered;
+                                // The dialog ran to completion: its writes
+                                // all drained, so the writer beneath it is
+                                // clean.
+                                interrupted_write = false;
                                 break;
                             }
                             () = self.shed.cancelled() => break,
@@ -660,28 +680,43 @@ impl Binding {
                         }
                     }
                 }
+                if interrupted_write {
+                    // A fresh writer from the same channel half, because the
+                    // interrupted one may still hold a write the select
+                    // dropped mid-send. Its cost is that chunk alone: it goes
+                    // unsent with its window space, at most
+                    // `max_packet_size` bytes, and only ever on a client that
+                    // stopped reading.
+                    w = ws.make_writer();
+                }
                 // The output that arrived while the human thought, delivered
                 // now the terminal is the relay's again — raced against the
                 // shed like every other write, so a client that stopped
                 // reading cannot park the binding in its own flush.
                 if !held.is_empty() {
-                    tokio::select! {
-                        _ = w.write_all(&held) => {},
-                        () = self.shed.cancelled() => {
-                            // The shed ends the dialog without the human's
-                            // answer unless the dialog had already completed
-                            // under them: send the answer if there is one,
-                            // and none otherwise — the dropped sender is what
-                            // the host reads as the nobody-attached case.
-                            if let Some(answer) = answer {
-                                #[expect(
-                                    clippy::let_underscore_must_use,
-                                    reason = "the asker may be gone; its reply's fate was always its own"
-                                )]
-                                let _ = reply.send(answer);
-                            }
-                            break MainloopExitReason::Shed;
+                    let flushed = tokio::select! {
+                        _ = w.write_all(&held) => true,
+                        () = self.shed.cancelled() => false,
+                    };
+                    if !flushed {
+                        // The flush may have been dropped mid-send, and the
+                        // shed notice is the shorter buffer that would trip
+                        // the interrupted write's stale byte count: a fresh
+                        // writer, then the shed exit.
+                        w = ws.make_writer();
+                        // The shed ends the dialog without the human's
+                        // answer unless the dialog had already completed
+                        // under them: send the answer if there is one,
+                        // and none otherwise — the dropped sender is what
+                        // the host reads as the nobody-attached case.
+                        if let Some(answer) = answer {
+                            #[expect(
+                                clippy::let_underscore_must_use,
+                                reason = "the asker may be gone; its reply's fate was always its own"
+                            )]
+                            let _ = reply.send(answer);
                         }
+                        break MainloopExitReason::Shed;
                     }
                 }
                 // The asker going away before the answer is not an error to
@@ -773,9 +808,17 @@ impl Binding {
                         BindingMsg::Stdin(b) => {
                             // Raced against the shed: this is where a client
                             // that stopped draining parks the binding.
-                            tokio::select! {
-                                _ = w.write_all(&b) => {},
-                                () = self.shed.cancelled() => break MainloopExitReason::Shed,
+                            let delivered = tokio::select! {
+                                _ = w.write_all(&b) => true,
+                                () = self.shed.cancelled() => false,
+                            };
+                            if !delivered {
+                                // Dropped mid-send like the dialog and the
+                                // held flush: a fresh writer, so the shed
+                                // notice is not answered with the
+                                // interrupted write's byte count.
+                                w = ws.make_writer();
+                                break MainloopExitReason::Shed;
                             }
                         },
                         BindingMsg::AskExpose { port, reply } => {
@@ -871,7 +914,11 @@ impl Binding {
         if shed {
             // Bounded: the client stopped draining, so this write can park
             // exactly as the one that got the binding shed. The notice is
-            // lost then, but the close below still goes out.
+            // lost then, but the close below still goes out. The writer is a
+            // fresh one whenever a write was cut short mid-send — the mainloop
+            // replaces it at every race it drops, because russh's channel
+            // writer otherwise answers this short buffer with the interrupted
+            // write's byte count and tokio's `write_all` panics past its end.
             let _ =
                 tokio::time::timeout(crate::session::HOST_PROBE_TIMEOUT, w.write_all(SHED_NOTICE))
                     .await;

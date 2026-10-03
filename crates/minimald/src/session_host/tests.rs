@@ -3958,10 +3958,11 @@ async fn expose_ask_shed_mid_dialog_is_the_daemons_refusal() {
     // The client's channel saw the shed itself — EOF, the shed exit status,
     // and a close — so the refusal above is the one a shed answers with,
     // not one a dialog that ended some other way produced.
-    let (mut eof, mut exit_status, mut closed) = (false, None, false);
+    let (mut eof, mut exit_status, mut closed, mut drained) = (false, None, false, Vec::new());
     tokio::time::timeout(Duration::from_secs(30), async {
         while let Some(msg) = channel.wait().await {
             match msg {
+                russh::ChannelMsg::Data { data } => drained.extend_from_slice(&data),
                 russh::ChannelMsg::Eof => eof = true,
                 russh::ChannelMsg::ExitStatus { exit_status: s } => exit_status = Some(s),
                 russh::ChannelMsg::Close => {
@@ -3981,6 +3982,21 @@ async fn expose_ask_shed_mid_dialog_is_the_daemons_refusal() {
         "a shed reports the status that has the client restore the terminal",
     );
     assert!(closed, "the channel should close after the shed");
+
+    // The shed notice is the channel's last words, and it must survive the
+    // write the shed dropped mid-send: russh's channel writer keeps an
+    // interrupted write's state and would answer this shorter buffer with
+    // the interrupted write's byte count — tokio's `write_all` panics past
+    // the notice's end, the binding dies mid-epilogue, and the client hangs
+    // on a channel that never closes. The flood above is what put a write
+    // mid-send when the shed took it, so this is the proof the binding
+    // leaves a usable writer in its place instead.
+    let tail = String::from_utf8_lossy(&drained[drained.len().saturating_sub(400)..]);
+    assert!(
+        tail.contains("the terminal stopped keeping up with session output"),
+        "the shed notice should still reach the client after the flood; \
+         the channel's last bytes: {tail}"
+    );
 
     // The prompt says its line, and the refusal is logged as the daemon's
     // fail-closed decision — not the human's, which is what a shed used to
