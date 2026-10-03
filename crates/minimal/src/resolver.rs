@@ -1258,11 +1258,12 @@ async fn host_hook() -> Hook {
 /// to the exact state the custody checks ([`range_step_over`]) verify,
 /// whatever a previous attempt or a tampered host left there. The boot step
 /// loads last: `launchctl bootout` of the old unit first — guarded, because
-/// a first run has nothing to boot out — then `bootstrap` into the system
-/// domain, which runs the program now (the range is present on this boot)
-/// and registers [`RANGE_UNIT_PLIST`]'s `RunAtLoad` to re-apply it at every
-/// boot after. A re-run replaces the unit and re-runs the program rather
-/// than dying on a label collision.
+/// a first run has nothing to boot out — then `bootstrap` loads the new unit
+/// into the system domain, where launchd starts it at once, asynchronously,
+/// so the range appears on the loopback within about a second of the
+/// command returning, and [`RANGE_UNIT_PLIST`]'s `RunAtLoad` re-applies it
+/// at every boot after. A re-run replaces the unit and re-runs the program
+/// rather than dying on a label collision.
 ///
 /// The whole payload rides inside the one pair of single quotes that
 /// `sh -c` takes it under, so neither body the heredocs write may carry an
@@ -2538,9 +2539,10 @@ mod tests {
         );
         // The boot step loads last: the old unit is booted out first — so a
         // re-run replaces it and re-runs the program rather than dying on
-        // the label collision — then the new one is bootstrapped into the
-        // system domain, which runs the program now and registers
-        // RunAtLoad to re-apply the range at every boot after.
+        // the label collision — then the new one is bootstrapped, which
+        // loads it into the system domain, where launchd starts it at once,
+        // asynchronously, so the range appears within about a second, and
+        // its RunAtLoad re-applies the range at every boot after.
         let bootout_at = command.find(&bootout).expect("the boot-out step is named");
         let bootstrap = format!("launchctl bootstrap system {RANGE_PLIST_PATH}");
         let bootstrap_at = command
