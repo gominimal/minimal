@@ -1541,9 +1541,10 @@ pub fn declared_request_ports(policy: Option<&sessions::SessionPolicy>) -> BTree
 /// (NET-084). A session that declared a credentialed upstream (NET-134)
 /// carries its lane too: the Box Egress Proxy's address on `subnet`, so the
 /// relay — the first leg a box's frame must clear, before it ever reaches
-/// the shared switch — admits it beside the rules exactly as the host-side
-/// gate on the far side does, and a deny-all box that declared the lane
-/// reaches the proxy's acceptor while the same rules hold everything else.
+/// the shared switch — admits the proxy's listener beside the rules exactly
+/// as the host-side gate on the far side does, and a deny-all box that
+/// declared the lane reaches the proxy's acceptor while the same rules hold
+/// everything else, the listener's port and protocol included.
 #[must_use]
 pub fn compiled_egress(
     policy: Option<&sessions::SessionPolicy>,
@@ -1573,8 +1574,11 @@ pub fn compiled_egress(
 /// NET-062..064 tier requires, and reusing it verbatim is what keeps exactly
 /// one admit-or-drop function in the tree. The rules are address- and
 /// protocol-shaped — never port-shaped, the resolver carve-out aside, which a
-/// TCP frame cannot match — so the port names the connection without
-/// changing the verdict.
+/// TCP frame cannot match, and the credentialed lane's one listener aside
+/// (NET-134: a lane's proxy is admitted as the (address, port, protocol)
+/// triple, so a TCP frame to the proxy's address carries the port the
+/// verdict reads) — so the port names the connection without changing the
+/// verdict anywhere else.
 ///
 /// The synthesized frame carries the rules' own lease as its source (NET-084):
 /// it stands for a frame the box itself put on the wire, so the verdict's
@@ -3032,12 +3036,13 @@ pub(crate) mod tests {
     /// NET-134 on the relay leg, the first of the two a box's frame must
     /// clear to reach the Box Egress Proxy's listener: a deny-all box that
     /// declared a credentialed upstream has its frame to the proxy's
-    /// address forwarded to the switch — where the host-side gate's lane
+    /// listener forwarded to the switch — where the host-side gate's lane
     /// arm decides it on the far side — while the same rules hold every
-    /// other destination, the host alias on the same switch included,
-    /// dropped and unanswered. Without the declaration the same rules drop
-    /// the proxy's address too: the lane is granted by the declaration
-    /// alone, and the refusal a lane-less box meets at the address is the
+    /// other destination, the other ports and protocols at the proxy's own
+    /// address included, and the host alias on the same switch, dropped
+    /// and unanswered. Without the declaration the same rules drop the
+    /// listener's frame too: the lane is granted by the declaration alone,
+    /// and the refusal a lane-less box meets at the listener is the
     /// host-side gate's, never a substitute the rules make.
     #[tokio::test]
     async fn credentialed_lane_reaches_the_proxy_address_under_deny_all() {
@@ -3062,9 +3067,14 @@ pub(crate) mod tests {
         };
         let mut harness = spawn_test_relay(&deny_all);
 
-        // The lane's half: the frame to the proxy's address is forwarded
-        // verbatim, whatever the deny-all says about the address.
-        let to_proxy = egress_tcp_frame(LEASE, proxy, 8118);
+        // The lane's half: the frame to the proxy's listener is forwarded
+        // verbatim, whatever the deny-all says about the address — the
+        // relay's own pin of the listener's port, the number the host-side
+        // listener actually listens on (the e2e case connects through the
+        // real one and is where the two spellings of the number are proved
+        // to agree).
+        let listener = egress::PROXY_LISTENER_PORT;
+        let to_proxy = egress_tcp_frame(LEASE, proxy, listener);
         harness.box_end.write_all(&to_proxy).unwrap();
         let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
             .await
@@ -3072,14 +3082,32 @@ pub(crate) mod tests {
             .expect("the switch side stays open");
         assert_eq!(
             first, to_proxy,
-            "a frame to the proxy's address is forwarded beside the deny-all"
+            "a frame to the proxy's listener is forwarded beside the deny-all"
+        );
+
+        // The lane admits the listener, not the address: TCP to another
+        // port at the proxy's address and UDP to the listener's own port
+        // both fall to the rules, which deny them, so only the ARP sentinel
+        // behind them comes through.
+        let other_port = egress_tcp_frame(LEASE, proxy, 443);
+        let other_proto = udp_frame(LEASE, 40000, proxy, listener);
+        let sentinel = arp_frame(LEASE);
+        harness.box_end.write_all(&other_port).unwrap();
+        harness.box_end.write_all(&other_proto).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, sentinel,
+            "the lane holds everything at the proxy's address but the listener"
         );
 
         // And nowhere else: the same box's frame to the host alias drops
         // without an answer — the ARP sentinel behind it is the one thing
         // that comes through, and nothing is written back toward the box.
-        let refused = egress_tcp_frame(LEASE, SwitchSubnet::default().host_alias(), 8118);
-        let sentinel = arp_frame(LEASE);
+        let refused = egress_tcp_frame(LEASE, SwitchSubnet::default().host_alias(), listener);
         harness.box_end.write_all(&refused).unwrap();
         harness.box_end.write_all(&sentinel).unwrap();
         let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
@@ -3088,7 +3116,7 @@ pub(crate) mod tests {
             .expect("the switch side stays open");
         assert_eq!(
             next, sentinel,
-            "the deny-all holds everywhere but the proxy's address"
+            "the deny-all holds everywhere but the proxy's listener"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
         set_nonblocking(harness.box_end.as_raw_fd()).unwrap();
@@ -3099,8 +3127,8 @@ pub(crate) mod tests {
             "a frame the rules refuse is dropped, not reset: got {read:?}"
         );
 
-        // The declaration is the only thing that opens the address: the
-        // same deny-all without a lane drops the proxy's frame the same
+        // The declaration is the only thing that opens the listener: the
+        // same deny-all without a lane drops the listener's frame the same
         // way, so it never reaches the host gate that would refuse it.
         let unlaned = sessions::SessionPolicy {
             credentialed_upstream: None,
@@ -3115,7 +3143,7 @@ pub(crate) mod tests {
             .expect("the switch side stays open");
         assert_eq!(
             first, sentinel,
-            "without the declaration the proxy's address is any other destination"
+            "without the declaration the proxy's listener is any other destination"
         );
     }
 
