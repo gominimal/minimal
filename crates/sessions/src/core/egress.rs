@@ -1299,8 +1299,13 @@ impl ReplyFlows {
                 self.flows.remove(&tuple);
                 return InboundFlow::Ended;
             } else {
+                // A UDP record the box already answered stays on the replied
+                // window: the client's next datagram refreshes it, never
+                // demotes it to the unreplied one.
                 let window = if tuple.proto == IPPROTO_TCP {
                     self.tcp_idle_cap
+                } else if record.replied {
+                    self.udp_replied_window
                 } else {
                     self.udp_unreplied_window
                 };
@@ -2411,6 +2416,37 @@ mod tests {
             InboundFlow::Untracked
         );
         assert_eq!(flows.len(), 1, "no mid-stream segment opened a record");
+    }
+
+    /// A UDP record the box answered stays on the replied window: the
+    /// client's next datagram refreshes it there, and never demotes it to the
+    /// unreplied window, so the box's answer past that shorter window is still
+    /// a reply.
+    #[test]
+    fn answered_udp_record_keeps_replied_window_on_inbound_refresh() {
+        let t0 = Instant::now();
+        let client = [203, 0, 113, 7];
+        let mut flows = ReplyFlows::new();
+        let opening = FlowTuple::new(IPPROTO_UDP, client, 51000, LEASE, 8080);
+        assert_eq!(
+            flows.observe_inbound(opening, 0, t0),
+            InboundFlow::Recorded { filled: false }
+        );
+        assert!(flows.reply_admits(opening.reversed(), 0, t0));
+        let next = t0 + Duration::from_secs(1);
+        assert_eq!(
+            flows.observe_inbound(opening, 0, next),
+            InboundFlow::Refreshed
+        );
+        let past_unreplied = next + REPLY_UDP_UNREPLIED_WINDOW + Duration::from_secs(1);
+        assert!(
+            past_unreplied < next + REPLY_UDP_REPLIED_WINDOW,
+            "the probe sits between the two windows"
+        );
+        assert!(
+            flows.reply_admits(opening.reversed(), 0, past_unreplied),
+            "an answered record refreshed by the client keeps the replied window"
+        );
     }
 }
 
