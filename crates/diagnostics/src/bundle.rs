@@ -177,6 +177,12 @@ impl<W: BundleSink> BundleWriter<W> {
 
     /// Copies up to the last `cap` bytes of `src` to `path`. Files over the
     /// cap are recorded as tail-capped; smaller ones as unredacted copies.
+    ///
+    /// Content is scrubbed line-wise through
+    /// [`crate::redact::scrub_secrets`] before writing, so credentials that
+    /// landed in log tails before this fix are cleaned too. When any line
+    /// was changed the manifest records [`Redaction::Scrubbed`] rather than
+    /// `None`, or [`Redaction::TailCappedScrubbed`] rather than `TailCapped`.
     pub async fn add_file_tail(
         &mut self,
         path: &str,
@@ -200,12 +206,18 @@ impl<W: BundleSink> BundleWriter<W> {
             .read_to_end(&mut contents)
             .await
             .with_context(|| format!("reading {}", src.display()))?;
-        let redaction = if capped {
-            Redaction::TailCapped
-        } else {
-            Redaction::None
+
+        // Scrub line-wise so a credential in a log tail is cleaned even when
+        // it was logged before this fix.
+        let scrubbed = scrub_lines(&contents);
+        let was_scrubbed = scrubbed != contents;
+        let redaction = match (capped, was_scrubbed) {
+            (true, true) => Redaction::TailCappedScrubbed,
+            (true, false) => Redaction::TailCapped,
+            (false, true) => Redaction::Scrubbed,
+            (false, false) => Redaction::None,
         };
-        self.add_bytes(path, &contents, redaction).await
+        self.add_bytes(path, &scrubbed, redaction).await
     }
 
     /// Records something deliberately withheld from the bundle.
@@ -329,6 +341,29 @@ impl<W: BundleSink> BundleWriter<W> {
         self.writing = false;
         written.with_context(|| format!("adding {full}"))
     }
+}
+
+/// Runs [`crate::redact::scrub_secrets`] on each line of `input`,
+/// preserving line endings byte for byte. A line left unchanged is copied
+/// verbatim.
+///
+/// A line that is not valid UTF-8 (a tail cut mid-character, a binary
+/// write) is still scrubbed, through a lossy decoding: if that finds a
+/// credential the lossy, scrubbed line is written, so one bad byte cannot
+/// carry a secret through.
+fn scrub_lines(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    for line in input.split_inclusive(|&b| b == b'\n') {
+        let body_len = line.strip_suffix(b"\n").map_or(line.len(), <[u8]>::len);
+        let (body, ending) = line.split_at(body_len);
+        let text = String::from_utf8_lossy(body);
+        match crate::redact::scrub_secrets(&text) {
+            std::borrow::Cow::Borrowed(_) => out.extend_from_slice(body),
+            std::borrow::Cow::Owned(scrubbed) => out.extend_from_slice(scrubbed.as_bytes()),
+        }
+        out.extend_from_slice(ending);
+    }
+    out
 }
 
 /// Joins a caller-supplied group with a collector's fixed relative path.
@@ -551,6 +586,73 @@ pub(crate) mod tests {
         w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
             .await
             .unwrap();
+    }
+
+    /// Clean lines keep their line endings around a scrubbed one, and a line
+    /// that is not valid UTF-8 is still scrubbed.
+    #[test]
+    fn scrub_lines_keeps_lines_apart_and_scrubs_invalid_utf8() {
+        let input = b"first\r\nsecond\ntoken=abc\nlast";
+        assert_eq!(
+            scrub_lines(input),
+            b"first\r\nsecond\ntoken=<redacted:len=3>\nlast".to_vec()
+        );
+
+        let clean = b"a\n\xff\xfe binary\n";
+        assert_eq!(scrub_lines(clean), clean.to_vec());
+
+        let out = scrub_lines(b"\xffcut password=hunter2\n");
+        assert!(
+            !out.windows(7).any(|w| w == b"hunter2"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[tokio::test]
+    async fn add_file_tail_scrubs_credentials() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("minimald.log");
+        std::fs::write(
+            &log,
+            "2024-01-01T00:00:00Z  INFO exec request command=min://argv [\"sh\",\"-c\",\"curl -H 'Authorization: Bearer ghp_FAKETOKEN' https://x/\"]\n",
+        )
+        .unwrap();
+        let out = tmp.path().join("b.tar.zst");
+
+        let mut w = BundleWriter::create(&out, "r", "test-version")
+            .await
+            .unwrap();
+        w.add_file_tail("logs/minimald.log", &log, 1024)
+            .await
+            .unwrap();
+        w.add_file_tail("logs/capped.log", &log, 40).await.unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+
+        let files = unpack_bundle(&out, "r").await;
+        let contents = std::str::from_utf8(&files["logs/minimald.log"]).unwrap();
+        assert!(
+            !contents.contains("ghp_FAKETOKEN"),
+            "token must be scrubbed, got: {contents}"
+        );
+        assert!(
+            contents.contains("<redacted:len=13>"),
+            "token must be replaced with placeholder, got: {contents}"
+        );
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        assert_eq!(
+            manifest["collected"][0]["redaction"], "scrubbed",
+            "manifest must record scrubbed redaction"
+        );
+        let capped = std::str::from_utf8(&files["logs/capped.log"]).unwrap();
+        assert!(!capped.contains("FAKETOKEN"), "got: {capped}");
+        assert_eq!(
+            manifest["collected"][1]["redaction"], "tail-capped-scrubbed",
+            "a capped, scrubbed tail must still read as partial"
+        );
     }
 
     /// A write cancelled part-way through its tar record must not be followed
