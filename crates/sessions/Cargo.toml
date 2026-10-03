@@ -1,5 +1,6 @@
 [package]
 name = "sessions"
+description = "Session domain types shared by min and minimald: loadouts, lifecycle hooks and the client/daemon composition pipeline, the session's network mode and policy (including the pure egress verdict), on-disk session state, and the JSON wire forms of all of these."
 rust-version.workspace = true
 version = "0.0.1"
 edition.workspace = true
