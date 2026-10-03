@@ -654,8 +654,15 @@ fn update_modal(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
         } => match key.code {
             KeyCode::Enter => {
                 model.action = None;
+                let unchanged = model
+                    .entry(&target)
+                    .and_then(|e| e.name.as_deref())
+                    .is_some_and(|name| name == input.trim());
                 if input.trim().is_empty() {
                     model.status = Some("rename cancelled: empty name".to_string());
+                    Vec::new()
+                } else if unchanged {
+                    model.status = Some("rename cancelled: name unchanged".to_string());
                     Vec::new()
                 } else {
                     vec![Effect::Rename(target, input.trim().to_string())]
@@ -1445,6 +1452,19 @@ mod tests {
             effects
                 .iter()
                 .any(|e| matches!(e, Effect::Rename(k, n) if k.id == id(1) && n == "api-stagingx"))
+        );
+    }
+
+    #[test]
+    fn rename_with_unchanged_name_sends_nothing() {
+        let mut model = two_providers();
+        update(&mut model, key(KeyCode::Down));
+        update(&mut model, key(KeyCode::Char('r')));
+        let effects = update(&mut model, key(KeyCode::Enter));
+        assert!(effects.is_empty());
+        assert_eq!(
+            model.status.as_deref(),
+            Some("rename cancelled: name unchanged")
         );
     }
 
