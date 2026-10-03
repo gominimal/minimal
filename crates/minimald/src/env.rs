@@ -1492,6 +1492,12 @@ impl SessionChannel {
     /// that owns this channel decides it against the box's `dynamic_ingress`
     /// setting and publishes when it allows (NET-044); the reply carries the
     /// address the port was published on, or the typed refusal's own reason.
+    ///
+    /// A box decided `ask` makes this wait (NET-045): the session routes the
+    /// ask to whoever is attached — this peer's own terminal, when it is the
+    /// client the human answered from — and the reply that lands here is the
+    /// applied answer: the mapping the human allowed, or the typed refusal
+    /// for a deny and for nobody being attached to answer.
     async fn expose_port(&self, stream: &mut UnixStream, port: &str) {
         let Ok(port) = port.parse::<u16>() else {
             #[expect(

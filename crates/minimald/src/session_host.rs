@@ -8,7 +8,7 @@
 use async_dialog::Selection;
 use russh::Channel;
 use russh::server::Msg;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::io::{Read, Write};
@@ -51,6 +51,44 @@ const CHORD_FLUSH_IDLE: std::time::Duration = std::time::Duration::from_millis(5
 /// changed since activation. Exposed for the same test-await purpose as
 /// [`SHELL_EXIT_PROMPT`].
 pub(crate) const SHELL_EXIT_NO_CHANGES: &str = "No files changed since activation.";
+
+/// Header of the dialog a runtime port-publish request decided `ask` renders
+/// over the channel (NET-045), asking the attached human whether the box may
+/// publish the port. Exposed so tests can await its appearance in the
+/// channel output before answering, for the same purpose as
+/// [`SHELL_EXIT_PROMPT`]. The lead-in line above it names the box and the
+/// port.
+pub(crate) const ASK_PROMPT: &str = "Allow the publish to the host?";
+
+/// How much session output one ask dialog (NET-045) parks on the binding's
+/// behalf while the human thinks. The dialog runs beside a drain of the
+/// binding's mailbox rather than on top of it — a dialog that let the mailbox
+/// fill would wedge the pty feed behind it (see [`Binding::run`]) — but a
+/// drain is still a park, so it has a bound. Past it the mailbox fills as it
+/// does for any client that stopped keeping up, and the host's stall bound
+/// ([`OUTPUT_STALL_TIMEOUT`]) — not this park — decides what happens to the
+/// binding. This side has no byte park of its own to compare against; the
+/// size is a memory bound chosen so that a dialog with a slow human survives
+/// anything a session realistically prints while one is up, without letting a
+/// chatty box hold an unbounded buffer hostage to an answer.
+const ASK_HELD_OUTPUT: usize = 4 * 1024 * 1024;
+
+/// What the attached human answered to the ask dialog (NET-045): the box's
+/// `dynamic_ingress` is `ask`, so the request belongs to whoever is bound to
+/// this host's channel.
+///
+/// Every way the dialog can end short of an explicit allow maps to
+/// [`Refused`](Self::Refused) — a picked deny, a cancel, a client that went
+/// away mid-prompt: an unanswered ask is a refusal, never a publish nobody
+/// confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AskAnswer {
+    /// The human picked allow: the request proceeds to the publish it came
+    /// for.
+    Allowed,
+    /// The human picked deny, cancelled, or left: the request fails closed.
+    Refused,
+}
 
 /// How many changed-file rows the shell-exit prompt lists before folding the
 /// rest into an "and N more" line, keeping the prompt readable on a 24-row
@@ -162,8 +200,56 @@ fn log_session_contents(
     }
 }
 
+/// Why the binding's mainloop ended. Declared at module scope because the
+/// loop's head — the ask dialog (NET-045) — can end it too: a teardown that
+/// arrives mid-dialog renders through [`Binding::render_farewell`], which
+/// names the exit it ends in.
+#[derive(Debug, PartialEq, Eq)]
+enum MainloopExitReason {
+    /// The host is gone: no session left to relay for.
+    HostGone,
+    /// The client detached.
+    Detach,
+    /// Another connection attached, superseding this one.
+    Superceded,
+    /// The session process ended; the shell-exit prompt was raised.
+    ProcessExited,
+    /// The daemon is shutting down.
+    Shutdown,
+    /// The host shed this binding: its mailbox stopped taking session output
+    /// within [`OUTPUT_STALL_TIMEOUT`].
+    Shed,
+}
+
+/// What a binding told to end itself renders, and the mainloop exit it ends
+/// in — the one rendering the four [`BindingMsg`] teardown variants share,
+/// written once so the mainloop's own arm and the ask dialog a teardown
+/// interrupts (NET-045) say the same farewell whichever side of a dialog the
+/// message lands on.
+enum Farewell {
+    /// The session process ended; the shell-exit prompt follows.
+    ProcessExit {
+        cause: TeardownCause,
+        unwind_codes: Vec<u8>,
+    },
+    /// Another connection attached; this one stands down.
+    Superceded(Vec<u8>),
+    /// The daemon is shutting down.
+    DaemonShutdown(Vec<u8>),
+    /// The client detached.
+    Detach(Vec<u8>),
+}
+
 enum BindingMsg {
     Stdin(Vec<u8>),
+    /// Ask the attached human whether the box may publish `port` at runtime
+    /// (NET-045): the box's `dynamic_ingress` is `ask`, so this binding
+    /// renders the exit prompt's dialog on the bound client and replies with
+    /// the answer it brought. See [`Binding::ask_prompt`].
+    AskExpose {
+        port: u16,
+        reply: oneshot::Sender<AskAnswer>,
+    },
     /// The session was renamed while this binding is attached, so the archive
     /// the shell-exit prompt's save-then-delete lane writes carries the new
     /// name rather than the one cloned in at [`Binding::spawn`].
@@ -473,20 +559,137 @@ impl Binding {
         let (mut rs, ws) = self.channel.split();
         let mut w = ws.make_writer();
 
-        #[derive(Debug, PartialEq, Eq)]
-        enum MainloopExitReason {
-            HostGone,
-            Detach,
-            Superceded,
-            ProcessExited,
-            Shutdown,
-            Shed,
-        }
-
         // Reading from the remote stops once it sends EOF;
         // the loop lives on to keep forwarding stdout.
         let mut remote_open = true;
+        // The asks whose dialogs this loop's head renders one at a time
+        // (NET-045), stashed by the select arm below because a dialog needs
+        // the channel halves the select's own futures are borrowing.
+        let mut pending_asks: VecDeque<(u16, oneshot::Sender<AskAnswer>)> = VecDeque::new();
         let exit_reason = loop {
+            if let Some((port, reply)) = pending_asks.pop_front() {
+                tracing::info!(
+                    port,
+                    "asking the attached client to allow a runtime port publish"
+                );
+                // The lead-in names the box as it stood when the dialog
+                // started: a rename that lands mid-dialog takes effect for
+                // what follows it, not for a line already on the screen.
+                let dialog_name = self.name.clone();
+                // The session output that arrives while the human thinks,
+                // parked — see the drain below — and flushed once the
+                // terminal is the relay's again.
+                let mut held: Vec<u8> = Vec::new();
+                // A teardown cannot wait for a human: the one that arrived
+                // mid-dialog is taken aside here and rendered, through
+                // [`Self::render_farewell`], once the ask it interrupted is
+                // answered.
+                let mut farewell: Option<Farewell> = None;
+                // Every way a dialog ends without the human's allow maps to
+                // [`Refused`](AskAnswer::Refused) — so the fail-closed paths
+                // below need no code of their own, and the dialog's own
+                // result is the only thing that can move this off `Refused`.
+                let mut answer = AskAnswer::Refused;
+                {
+                    // Pinned outside the loop below, not rebuilt inside it: a
+                    // select arm's future is re-created on every iteration
+                    // the loop takes, and a dialog re-created per parked
+                    // chunk would re-render from scratch under the human's
+                    // hands — lead-in and all — for every burst the drain
+                    // took.
+                    let dialog = Self::ask_prompt(&dialog_name, port, rs.make_reader(), &mut w);
+                    tokio::pin!(dialog);
+                    loop {
+                        tokio::select! {
+                            // Raced against the shed: a client that stopped
+                            // reading is not a client to wait on, and the
+                            // host has already discarded this binding — so
+                            // the ask fails closed here and the next
+                            // iteration's shed arm closes the channel.
+                            answered = &mut dialog => {
+                                answer = answered;
+                                break;
+                            }
+                            () = self.shed.cancelled() => break,
+                            // The drain beside the dialog. The host keeps
+                            // feeding the pty into this binding's mailbox,
+                            // and stops reading the pty while the mailbox is
+                            // full — so a dialog that let the mailbox fill
+                            // would wedge the box behind it and shed the
+                            // human after [`OUTPUT_STALL_TIMEOUT`], the one
+                            // client the dialog exists for. Instead the
+                            // output parks in `held`, bounded by
+                            // [`ASK_HELD_OUTPUT`]: past it the mailbox fills
+                            // as it does for any client that stopped keeping
+                            // up, and the stall bound — not an unbounded
+                            // park — decides what happens to this binding.
+                            msg = self.receiver.recv(), if held.len() < ASK_HELD_OUTPUT => {
+                                match msg {
+                                    Some(BindingMsg::Stdin(b)) => held.extend_from_slice(&b),
+                                    Some(BindingMsg::Rename(name)) => self.name = name,
+                                    Some(BindingMsg::AskExpose { port, reply }) => {
+                                        pending_asks.push_back((port, reply));
+                                    }
+                                    Some(BindingMsg::TeardownDueToProcessExit { cause, unwind_codes }) => {
+                                        farewell = Some(Farewell::ProcessExit { cause, unwind_codes });
+                                        break;
+                                    }
+                                    Some(BindingMsg::TeardownDueToSuperceded(unwind_codes)) => {
+                                        farewell = Some(Farewell::Superceded(unwind_codes));
+                                        break;
+                                    }
+                                    Some(BindingMsg::TeardownDueToDaemonShutdown(unwind_codes)) => {
+                                        farewell = Some(Farewell::DaemonShutdown(unwind_codes));
+                                        break;
+                                    }
+                                    Some(BindingMsg::TeardownDueToDetach(unwind_codes)) => {
+                                        farewell = Some(Farewell::Detach(unwind_codes));
+                                        break;
+                                    }
+                                    // The host is gone: no session left to
+                                    // publish for, and nobody to answer for.
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+                }
+                // The output that arrived while the human thought, delivered
+                // now the terminal is the relay's again — raced against the
+                // shed like every other write, so a client that stopped
+                // reading cannot park the binding in its own flush.
+                if !held.is_empty() {
+                    tokio::select! {
+                        _ = w.write_all(&held) => {},
+                        () = self.shed.cancelled() => {
+                            // The asker going away before the answer is not
+                            // an error to relay: the reply's fate was always
+                            // the asker's.
+                            #[expect(
+                                clippy::let_underscore_must_use,
+                                reason = "the asker may be gone; its reply's fate was always its own"
+                            )]
+                            let _ = reply.send(answer);
+                            break MainloopExitReason::Shed;
+                        }
+                    }
+                }
+                // The asker going away before the answer is not an error to
+                // relay: the reply's fate was always the asker's.
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may be gone; its reply's fate was always its own"
+                )]
+                let _ = reply.send(answer);
+                if let Some(farewell) = farewell {
+                    break Self::render_farewell(farewell, &mut w).await;
+                }
+                // The dialog's drain may have taken another ask while this
+                // one stood, and nothing more arrives to wake the select
+                // below — so the next dialog renders off this turn, not off
+                // a message that is already spent.
+                continue;
+            }
             tokio::select! {
                 // Remote (ssh channel) => session stdin.
                 res = rs.wait(), if remote_open => match res {
@@ -558,52 +761,31 @@ impl Binding {
                                 () = self.shed.cancelled() => break MainloopExitReason::Shed,
                             }
                         },
+                        BindingMsg::AskExpose { port, reply } => {
+                            // Stashed rather than rendered here: the select's
+                            // own arms borrow the channel halves (`rs.wait()`
+                            // among them), and the dialog needs both — so the
+                            // ask suspends the relay for the next iteration's
+                            // head, where no arm's future is alive. One at a
+                            // time, front to back: a second ask queues behind
+                            // the first and takes its turn.
+                            pending_asks.push_back((port, reply));
+                        },
                         BindingMsg::Rename(name) => self.name = name,
                         BindingMsg::TeardownDueToProcessExit { cause, unwind_codes } => {
-                            // Before the notices below and before the
-                            // shell-exit prompt further down: both render into
-                            // the terminal the session process just left, and
-                            // it may well have left mouse reporting on (#1210).
-                            let _ = w.write_all(&unwind_codes).await;
-                            // `shown` records whether the user was told
-                            // anything beyond the prompt itself: a suppressed
-                            // notice leaves no other trace, and the expected
-                            // case is deliberately silent.
-                            let notices = cause.notices();
-                            let errno = cause.pty_err.as_ref().and_then(std::io::Error::raw_os_error);
-                            tracing::info!(
-                                cause = if cause.pty_err.is_some() { "pty-error" } else { "process-reaped" },
-                                ?errno,
-                                abnormal = cause.exit.as_ref().is_some_and(ExitReason::is_abnormal),
-                                exit_reason = cause.exit.as_ref().map_or("", |r| r.reason.as_str()),
-                                exit_code = ?cause.exit.as_ref().map(|r| r.code),
-                                shown = !notices.is_empty(),
-                                "raising the shell-exit prompt",
-                            );
-                            // `\r\n`: the remote terminal is in raw mode, so a
-                            // bare newline stair-steps off the right margin.
-                            if !notices.is_empty() {
-                                let _ = w.write_all(b"\r\n").await;
-                                for notice in &notices {
-                                    let _ = w.write_all(format!("{notice}\r\n").as_bytes()).await;
-                                }
-                            }
-                            break MainloopExitReason::ProcessExited;
+                            break Self::render_farewell(
+                                Farewell::ProcessExit { cause, unwind_codes },
+                                &mut w,
+                            ).await;
                         }
                         BindingMsg::TeardownDueToSuperceded(unwind_codes) => {
-                            let _ = w.write_all(&unwind_codes).await;
-                            let _ = w.write_all(b"\r\nDisconnecting - session attached to from a different connection\r\n").await;
-                            break MainloopExitReason::Superceded;
+                            break Self::render_farewell(Farewell::Superceded(unwind_codes), &mut w).await;
                         }
                         BindingMsg::TeardownDueToDaemonShutdown(unwind_codes) => {
-                            let _ = w.write_all(&unwind_codes).await;
-                            let _ = w.write_all(b"\r\nDisconnecting - minimald is shutting down\r\n").await;
-                            break MainloopExitReason::Shutdown;
+                            break Self::render_farewell(Farewell::DaemonShutdown(unwind_codes), &mut w).await;
                         }
                         BindingMsg::TeardownDueToDetach(unwind_codes) => {
-                            let _ = w.write_all(&unwind_codes).await;
-                            let _ = w.write_all(b"\r\nDetaching from session.\r\n").await;
-                            break MainloopExitReason::Detach;
+                            break Self::render_farewell(Farewell::Detach(unwind_codes), &mut w).await;
                         }
                     };
 
@@ -718,6 +900,116 @@ impl Binding {
             )
             .await;
         delta.archive_changed(files, dest.to_path_buf()).await
+    }
+
+    /// Renders a farewell — the unwind codes first, then whatever it has to
+    /// say — and names the mainloop exit it ends in. The one rendering shared
+    /// by the mainloop's four teardown arms and by the ask dialog
+    /// (NET-045) a teardown interrupts, so the client sees the same farewell
+    /// whichever side of a dialog the message lands on. An associated fn
+    /// taking the writer piecewise, exactly like [`Self::ask_prompt`], because
+    /// [`Self::run`] holds the channel halves as locals.
+    async fn render_farewell<W>(farewell: Farewell, w: &mut W) -> MainloopExitReason
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        match farewell {
+            Farewell::ProcessExit {
+                cause,
+                unwind_codes,
+            } => {
+                // Before the notices below and before the shell-exit prompt
+                // that follows the mainloop: both render into the terminal
+                // the session process just left, and it may well have left
+                // mouse reporting on (#1210).
+                let _ = w.write_all(&unwind_codes).await;
+                // `shown` records whether the user was told anything beyond
+                // the prompt itself: a suppressed notice leaves no other
+                // trace, and the expected case is deliberately silent.
+                let notices = cause.notices();
+                let errno = cause
+                    .pty_err
+                    .as_ref()
+                    .and_then(std::io::Error::raw_os_error);
+                tracing::info!(
+                    cause = if cause.pty_err.is_some() { "pty-error" } else { "process-reaped" },
+                    ?errno,
+                    abnormal = cause.exit.as_ref().is_some_and(ExitReason::is_abnormal),
+                    exit_reason = cause.exit.as_ref().map_or("", |r| r.reason.as_str()),
+                    exit_code = ?cause.exit.as_ref().map(|r| r.code),
+                    shown = !notices.is_empty(),
+                    "raising the shell-exit prompt",
+                );
+                // `\r\n`: the remote terminal is in raw mode, so a bare
+                // newline stair-steps off the right margin.
+                if !notices.is_empty() {
+                    let _ = w.write_all(b"\r\n").await;
+                    for notice in &notices {
+                        let _ = w.write_all(format!("{notice}\r\n").as_bytes()).await;
+                    }
+                }
+                MainloopExitReason::ProcessExited
+            }
+            Farewell::Superceded(unwind_codes) => {
+                let _ = w.write_all(&unwind_codes).await;
+                let _ = w
+                    .write_all(
+                        b"\r\nDisconnecting - session attached to from a different connection\r\n",
+                    )
+                    .await;
+                MainloopExitReason::Superceded
+            }
+            Farewell::DaemonShutdown(unwind_codes) => {
+                let _ = w.write_all(&unwind_codes).await;
+                let _ = w
+                    .write_all(b"\r\nDisconnecting - minimald is shutting down\r\n")
+                    .await;
+                MainloopExitReason::Shutdown
+            }
+            Farewell::Detach(unwind_codes) => {
+                let _ = w.write_all(&unwind_codes).await;
+                let _ = w.write_all(b"\r\nDetaching from session.\r\n").await;
+                MainloopExitReason::Detach
+            }
+        }
+    }
+
+    /// The ask a runtime port-publish request decided `ask` renders to the
+    /// attached human (NET-045): the exit prompt's own dialog, over the same
+    /// channel halves, offering deny first so that a reflexive Enter — or any
+    /// way the dialog can end without an explicit choice — fails the request
+    /// closed. An associated fn taking the facts piecewise, exactly like
+    /// [`Self::shell_exit_prompt`], because [`Self::run`] holds the channel
+    /// halves as locals.
+    async fn ask_prompt<R, W>(name: &str, port: u16, mut r: R, mut w: W) -> AskAnswer
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        // `\r\n`: the remote terminal is in raw mode, so a bare newline
+        // stair-steps off the right margin.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a client that cannot take the lead-in line cannot take the dialog either; \
+                      the dialog's own result is the answer to relay"
+        )]
+        let _ = w
+            .write_all(format!("\r\n{name} asks to publish port {port}.\r\n").as_bytes())
+            .await;
+        let select = async_dialog::Select::new()
+            .with_prompt(ASK_PROMPT)
+            .items(["Deny", "Allow"])
+            // Deny stands highlighted: the answer the box's own posture
+            // would have given, so nothing publishes because someone held
+            // Enter.
+            .default(0);
+        match select.interact(&mut r, &mut w).await {
+            Ok(async_dialog::Selection::At(1)) => AskAnswer::Allowed,
+            // An explicit deny, a cancel (Ctrl-C, `q`, Escape), an EOF from a
+            // client that left mid-prompt, or a render/read failure: all of
+            // them are refusals — an unanswered ask never publishes.
+            _ => AskAnswer::Refused,
+        }
     }
 
     /// The shell-exit prompt, run after the session process ends: leads with
@@ -1177,9 +1469,36 @@ enum Message {
     /// Answered straight off the parser — no PTY resize, no I/O relay.
     GetScreen(oneshot::Sender<minimald_rpc::ScreenSnapshot>),
 
+    /// Ask the attached human whether the box may publish `port` at runtime
+    /// (NET-045): the box's `dynamic_ingress` is `ask`, so the bound client
+    /// decides. Answered with the answer the human gave, or `None` when
+    /// nobody is attached — a box outlives its client, and an unanswered ask
+    /// is a refusal, never a publish.
+    AskExpose {
+        port: u16,
+        reply: oneshot::Sender<Option<AskAnswer>>,
+    },
+
     SetTitleCallback(String),
     VisualBellCallback,
     AudibleBellCallback,
+    /// Test-only: shorten this host's stall bound ([`OUTPUT_STALL_TIMEOUT`])
+    /// so a test can prove in milliseconds what the real bound would take the
+    /// full 30 s to decide. The bound lives on the host, not the binding, so
+    /// a test whose host was built inside a session reaches it through its
+    /// [`HostHandle`].
+    #[cfg(test)]
+    SetOutputStallTimeout(std::time::Duration),
+    /// Test-only: feed bytes into the session's pty as though a client had
+    /// typed them, but without going through the ssh channel — which is the
+    /// point: an ask dialog holds the channel's reader, so a test that needs
+    /// the session to print *while a dialog is up* has no keystroke to do it
+    /// with. The bytes queue straight into the pty's write buffer (see
+    /// [`queue_stdin`]); queued writes, never awaited ones, so the actor's
+    /// loop stays free to keep serving — exactly what a test relying on the
+    /// stall bound needs it to keep doing.
+    #[cfg(test)]
+    FeedStdin(Vec<u8>),
 }
 
 /// Renders a vt100 cell color into the string form the
@@ -1549,6 +1868,59 @@ impl HostHandle {
         }
         recv.await
             .unwrap_or(minimald_rpc::SessionDeltaResponse::Unavailable)
+    }
+
+    /// Asks the attached human whether the box may publish `port` at runtime
+    /// (NET-045), and answers with what they said: the bound client renders
+    /// the exit prompt's own dialog and picks. `None` when nobody is
+    /// attached — no binding, a binding that cannot take the ask, or a host
+    /// that went away before answering — which is the caller's fail-closed
+    /// case, not an error to report: the typed refusal the request ends with
+    /// says nobody is attached to answer.
+    ///
+    /// Unbounded by design: the human's answer is the only bound an ask has,
+    /// so callers that must not park on it await this off the actor the
+    /// request belongs to (see how [`crate::session`] routes the ask).
+    pub(crate) async fn ask_expose(&self, port: u16) -> Option<AskAnswer> {
+        let (send, recv) = oneshot::channel();
+        if self
+            .sender
+            .send(Message::AskExpose { port, reply: send })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        // A dropped answer means the host tore its binding down mid-prompt:
+        // nobody is attached to answer any more.
+        recv.await.ok().flatten()
+    }
+
+    /// Test-only: shorten this host's stall bound so a test can prove in
+    /// milliseconds what [`OUTPUT_STALL_TIMEOUT`] would otherwise take the
+    /// full 30 s to decide.
+    #[cfg(test)]
+    pub(crate) async fn set_output_stall_timeout(&self, timeout: std::time::Duration) {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the host may already be gone; the test's own bound then decides"
+        )]
+        let _ = self
+            .sender
+            .send(Message::SetOutputStallTimeout(timeout))
+            .await;
+    }
+
+    /// Test-only: feed bytes into the session's pty as though a client had
+    /// typed them, without going through the ssh channel — so a test can have
+    /// the session print while an ask dialog holds the channel's reader.
+    #[cfg(test)]
+    pub(crate) async fn feed_stdin(&self, bytes: Vec<u8>) {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the host may already be gone; the test's own bounds then decide"
+        )]
+        let _ = self.sender.send(Message::FeedStdin(bytes)).await;
     }
 }
 
@@ -4503,6 +4875,72 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     Message::GetScreen(s) => {
                         let _ = s.send(self.screen_snapshot());
                     }
+                    // NET-045: forward the ask to the attached client, whose
+                    // binding renders the exit prompt's own dialog. Nobody
+                    // attached — no binding, or one whose mailbox is wedged —
+                    // answers `None` so the session refuses with the typed
+                    // nobody-is-attached error rather than hanging on a
+                    // dialog nobody can see.
+                    Message::AskExpose { port, reply } => match self.remote.as_ref() {
+                        None => {
+                            #[expect(
+                                clippy::let_underscore_must_use,
+                                reason = "the asker may already be gone; there is nothing to answer then"
+                            )]
+                            let _ = reply.send(None);
+                        }
+                        Some((tx, ..)) => {
+                            let (binding_reply, binding_recv) = oneshot::channel();
+                            match tx
+                                .send_timeout(
+                                    BindingMsg::AskExpose {
+                                        port,
+                                        reply: binding_reply,
+                                    },
+                                    crate::session::HOST_PROBE_TIMEOUT,
+                                )
+                                .await
+                            {
+                                // The human may sit at the dialog for as long
+                                // as they like, so only the hand-off is
+                                // bounded. The answer is awaited on a spawned
+                                // task, never inside this loop: a host parked
+                                // on a human stops pumping the pty and stops
+                                // answering probes, and the probes that
+                                // decide `is_alive` would report a live host
+                                // dead.
+                                Ok(()) => {
+                                    tokio::spawn(async move {
+                                        // The binding dropping mid-prompt — a
+                                        // detach, a shed, a daemon shutdown —
+                                        // is the nobody-attached case again.
+                                        let answer = binding_recv.await.ok();
+                                        tracing::info!(port, answer = ?answer, "the attached client answered the runtime port publish ask");
+                                        #[expect(
+                                            clippy::let_underscore_must_use,
+                                            reason = "the asker may already be gone; there is nothing to answer then"
+                                        )]
+                                        let _ = reply.send(answer);
+                                    });
+                                }
+                                Err(send_error) => {
+                                    // The ask never reached a human. On a
+                                    // timeout the message comes back here
+                                    // (binding-level reply and all) and drops
+                                    // with this arm; on a closed mailbox the
+                                    // binding is already gone. Either way the
+                                    // host-level answer below is what the
+                                    // asker sees: nobody is attached.
+                                    tracing::warn!(port, error = %send_error, "the ask could not reach the attached client");
+                                    #[expect(
+                                        clippy::let_underscore_must_use,
+                                        reason = "the asker may already be gone; there is nothing to answer then"
+                                    )]
+                                    let _ = reply.send(None);
+                                }
+                            }
+                        }
+                    },
                     Message::CommandInSession {
                         program,
                         args,
@@ -4521,6 +4959,18 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                         tokio::spawn(async move {
                             let _ = s.send(crate::session_delta::assess(root, delta).await);
                         });
+                    }
+                    #[cfg(test)]
+                    Message::SetOutputStallTimeout(timeout) => {
+                        self.output_stall_timeout = timeout;
+                    }
+                    #[cfg(test)]
+                    Message::FeedStdin(bytes) => {
+                        // Queued, not awaited: a pty whose input side is
+                        // wedged (the shell is blocked on an output side that
+                        // nobody is draining) must not park this loop, which
+                        // a test may be relying on to shed a binding on time.
+                        queue_stdin(&mut self.stdin_buf, bytes);
                     }
                 }
             },
