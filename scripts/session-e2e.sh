@@ -8045,14 +8045,17 @@ proof_two_named_vms_on_one_machine() {
   # the VM the box lives on, $6 = the box's name — the pair the error lines
   # below name, so a red run's annotation says WHICH VM's story it carries.
   #
-  # The socat probe's failure is two stories, and only one is about socat: an
+  # The socat probe's failure is three stories, and only one is about socat: an
   # exec that never reached the box (its own stderr) reads the same as a box
-  # whose mint came up short. `session activate` prints an id only once the
+  # whose mint came up short, and an ssh that refused the VM guest's host key
+  # never reached the box either — but says so in its stderr, so it is told
+  # apart from both below. `session activate` prints an id only once the
   # session is Active (crates/minimal/src/cmd/session.rs finalizes before it
   # does), so a half-materialized box here would be a product bug, not a race
-  # — and the two beats below say which story it is: the ls row carries the
+  # — and the beats below say which story it is: the ls row carries the
   # session's own status, the /usr/bin peek says whether the box was
-  # populated at all.
+  # populated at all, and a host-key refusal dumps the record the pin read
+  # against beside the alias ssh asked for.
   #
   # The probe's first exec is also the box's MINT: a box mints at its first
   # exec (crates/minimald/src/exec.rs services the request by ensuring the
@@ -8068,10 +8071,21 @@ proof_two_named_vms_on_one_machine() {
   two_vm_start_responder() {
     local runner="$1" sid="$2" port="$3" marker="$4" vm="$5" box="$6"
     local attempt probe_ok="" ready
+    local tw_err="" tw_kh_dir="" tw_kh_alias="" tw_kh_rec=""
     for attempt in 1 2 3; do
       if "$runner" session exec "$sid" 'test -x /usr/bin/socat' \
           >/dev/null 2>"$WORK/two-vm-socat.err"; then
         probe_ok=1
+        break
+      fi
+      tw_err="$(cat "$WORK/two-vm-socat.err" 2>/dev/null || true)"
+      # An ssh host-key refusal is not a mint still settling: the record the
+      # pin reads is written by the VM's own host daemon as the guest reaches
+      # READY (crates/minvmd/src/cmd/mod.rs), before the bridge socket ever
+      # serves, so no window can produce it later. Retry only what a window
+      # can change.
+      if printf '%s' "$tw_err" | grep -Fiq "host key"; then
+        echo "probe: box $box on VM $vm — ssh refused the VM guest's host key before the box; not retrying (the record is written at boot, never minted)"
         break
       fi
       [ "$attempt" -lt 3 ] || break
@@ -8080,13 +8094,39 @@ proof_two_named_vms_on_one_machine() {
     done
     if [ -z "$probe_ok" ]; then
       tw_socat_err="$(cat "$WORK/two-vm-socat.err" 2>/dev/null || true)"
+      # The exec's own transport, named when it is the story: the ssh the exec
+      # rides pins the VM guest's host key against the record sitting beside
+      # THIS VM's bridge socket (crates/minimal-client/src/attach.rs), asking
+      # for the alias that socket's parent directory names — the provider
+      # directory's basename for the default VM, the VM's own name for a named
+      # one — while the record answers to whatever host the daemon keyed it
+      # on. A refusal at the key is a transport fact, not a box fact, so both
+      # aliases go in the error line and the record itself below.
+      if printf '%s' "$tw_socat_err" | grep -Fiq "host key"; then
+        if [ "$vm" = default ]; then tw_kh_dir="$tw_root"; else tw_kh_dir="$tw_root/$vm"; fi
+        tw_kh_alias="$(basename "$tw_kh_dir")"
+        tw_kh_rec="$(awk 'NR==1 { print $1; exit }' "$tw_kh_dir/known_hosts" 2>/dev/null || true)"
+      fi
       if [ -n "$tw_socat_err" ]; then
-        echo "::error::box $box on VM $vm: the exec itself failed — the box never answered: $(printf '%s' "$tw_socat_err" | head -n1 | cut -c1-160)"
+        if [ -n "$tw_kh_alias" ]; then
+          echo "::error::box $box on VM $vm: the exec was refused at the VM guest's host key before the box — ssh pinned host alias '$tw_kh_alias' against the record beside this VM's socket, which answers to '${tw_kh_rec:-<none>}' (the record is dumped below)"
+        else
+          echo "::error::box $box on VM $vm: the exec itself failed — the box never answered: $(printf '%s' "$tw_socat_err" | head -n1 | cut -c1-160)"
+        fi
       else
         echo "::error::box $box on VM $vm: the box answered but has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"
       fi
       echo "--- probe stderr (empty means the box answered, without socat) ---"
       printf '%s\n' "$tw_socat_err"
+      if [ -n "$tw_kh_dir" ]; then
+        echo "--- VM $vm's recorded guest host key ($tw_kh_dir/known_hosts) ---"
+        if [ -f "$tw_kh_dir/known_hosts" ]; then
+          cat "$tw_kh_dir/known_hosts"
+          echo "ssh was asked for host alias '$tw_kh_alias'; the record's own host is '${tw_kh_rec:-<empty>}'"
+        else
+          echo "(absent — a missing record waives the pin rather than refusing it, so the refusal is not the record's doing)"
+        fi
+      fi
       echo "--- the session's ls row (its status) ---"
       "$runner" ls 2>/dev/null | grep -F -- "$sid" || true
       echo "--- the box's /usr/bin (first entries) ---"
