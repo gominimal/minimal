@@ -1487,31 +1487,57 @@ pub(crate) async fn session_via_ssh(
     // it. When the local reader closes (e.g. `head -1`), the write to
     // stdout fails with BrokenPipe; we kill ssh and exit 141 (128+SIGPIPE)
     // rather than leaving the remote process running indefinitely (#815).
+    //
+    // Unlike the `exec()` this replaced, `min` is now ssh's parent, so a
+    // signal sent only to this PID (`kill <pid>`, a supervisor reaping its
+    // direct child) would orphan ssh with its stdout closed and the remote
+    // command running on. Catch the termination signals and take ssh down
+    // with us. The handlers go in before the spawn so there is no window.
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let mut sighup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
     ssh.stdout(std::process::Stdio::piped());
     let mut child = tokio::process::Command::from(ssh)
         .spawn()
         .context("failed to spawn ssh")?;
     let ssh_stdout = child.stdout.take().context("ssh stdout not piped")?;
     let mut local_stdout = tokio::io::stdout();
-    let status = match relay_exec_stdout(ssh_stdout, &mut local_stdout).await {
-        Ok(()) => {
-            // ssh stdout closed cleanly; wait for the child and propagate
-            // its exit status.
-            child.wait().await.context("ssh exited")?
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-            // Local reader closed; kill ssh and exit 141.
-            let _ = child.kill().await;
-            std::process::exit(141);
-        }
-        Err(e) => {
-            // Any other relay failure leaves ssh with nobody reading its
-            // output; stop it so the remote command does not outlive us.
-            let _ = child.kill().await;
-            return Err(e).context("relaying ssh stdout");
-        }
+    let signo = tokio::select! {
+        relayed = relay_exec_stdout(ssh_stdout, &mut local_stdout) => match relayed {
+            Ok(()) => {
+                // ssh stdout closed cleanly; wait for the child and propagate
+                // its exit status.
+                let status = child.wait().await.context("ssh exited")?;
+                std::process::exit(exit_code_of(status));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                // Local reader closed; kill ssh and exit 141.
+                kill_ssh(&mut child).await;
+                std::process::exit(141);
+            }
+            Err(e) => {
+                // Any other relay failure leaves ssh with nobody reading its
+                // output; stop it so the remote command does not outlive us.
+                kill_ssh(&mut child).await;
+                return Err(e).context("relaying ssh stdout");
+            }
+        },
+        _ = sigterm.recv() => SignalKind::terminate().as_raw_value(),
+        _ = sighup.recv() => SignalKind::hangup().as_raw_value(),
+        _ = sigint.recv() => SignalKind::interrupt().as_raw_value(),
     };
-    std::process::exit(exit_code_of(status));
+    kill_ssh(&mut child).await;
+    std::process::exit(128 + signo);
+}
+
+/// Kill the exec path's ssh child and reap it.
+async fn kill_ssh(child: &mut tokio::process::Child) {
+    // A failed kill means ssh has already exited, so there is nothing left
+    // to stop; record it and carry on to this process's own exit.
+    if let Err(e) = child.kill().await {
+        tracing::debug!(error = %e, "ssh kill failed; it had already exited");
+    }
 }
 
 /// A child's exit status as this process's exit code, following the shell's
