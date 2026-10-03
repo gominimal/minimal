@@ -70,34 +70,39 @@ fn load_or_create_daemon_identity(minimal_state_dir: &DaemonAbsPath) -> std::io:
     }
 }
 
-/// Try to acquire an exclusive lock for `octet` under the machine-wide
-/// runtime directory. Returns `Ok(true)` when the lock was acquired (the
-/// octet is free), `Ok(false)` when another daemon holds it, and `Err` on
-/// I/O errors.
+/// Try to acquire an exclusive lock for `octet` under `lock_dir`, the
+/// machine-wide runtime directory. Returns `Ok(true)` when the lock was
+/// acquired (the octet is free), `Ok(false)` when another daemon holds it,
+/// and `Err` on I/O errors.
 #[cfg(target_os = "linux")]
-fn try_acquire_switch_octet(octet: u8) -> std::io::Result<bool> {
-    let Some(dir) = switch_lock_dir() else {
+fn try_acquire_switch_octet(
+    lock_dir: Option<&std::path::Path>,
+    octet: u8,
+) -> std::io::Result<bool> {
+    let Some(dir) = lock_dir else {
         // No runtime directory available — can't detect overlaps, but
         // the daemon can still start.
         return Ok(true);
     };
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::create_dir_all(dir);
     let lock_path = dir.join(format!("minimald-switch-{octet}.lock"));
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(&lock_path)?;
-    match fd_lock::RwLock::new(file).try_write() {
-        Ok(_guard) => {
-            // The guard is leaked intentionally: the lock must be held for
-            // the daemon's lifetime. The kernel releases it on process death.
-            std::mem::forget(_guard);
-            Ok(true)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
-        Err(e) => Err(e),
+    let mut lock = fd_lock::RwLock::new(file);
+    match lock.try_write() {
+        // Skip the guard's unlock on drop.
+        Ok(guard) => std::mem::forget(guard),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+        Err(e) => return Err(e),
     }
+    // The flock lives as long as its fd, so leak the file too: dropping it
+    // would close the fd and release the lock at once. The lock is held for
+    // the daemon's lifetime; the kernel releases it on process death.
+    std::mem::forget(lock);
+    Ok(true)
 }
 
 /// Derive a collision-free switch octet from `identity`. On the first
@@ -106,9 +111,9 @@ fn try_acquire_switch_octet(octet: u8) -> std::io::Result<bool> {
 /// consecutive counters is astronomically unlikely; 16 daemons on one
 /// machine is the practical ceiling).
 #[cfg(target_os = "linux")]
-fn resolve_switch_octet(identity: &str) -> u8 {
+fn resolve_switch_octet(lock_dir: Option<&std::path::Path>, identity: &str) -> u8 {
     let octet = octet_for_daemon_id(identity);
-    if try_acquire_switch_octet(octet).unwrap_or(true) {
+    if try_acquire_switch_octet(lock_dir, octet).unwrap_or(true) {
         return octet;
     }
     // Collision: another daemon on this machine holds this octet.
@@ -116,7 +121,7 @@ fn resolve_switch_octet(identity: &str) -> u8 {
     for n in 1u32..16 {
         let candidate = format!("{identity}-{n}");
         let octet = octet_for_daemon_id(&candidate);
-        if try_acquire_switch_octet(octet).unwrap_or(true) {
+        if try_acquire_switch_octet(lock_dir, octet).unwrap_or(true) {
             tracing::warn!(
                 identity = %identity,
                 octet = octet,
@@ -588,7 +593,7 @@ fn native_switch_octet(in_microvm: bool, minimal_state_dir: &DaemonAbsPath, daem
             );
             daemon_id.to_owned()
         });
-        resolve_switch_octet(&identity)
+        resolve_switch_octet(switch_lock_dir().as_deref(), &identity)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -4178,7 +4183,9 @@ mod tests {
 
     /// A native daemon's switch octet is stable across restarts: the
     /// identity is persisted under the state root on first start and read
-    /// back on subsequent starts, so the derived /24 stays the same.
+    /// back on subsequent starts, so the derived /24 stays the same. Each
+    /// "start" uses its own lock dir, since the first start's lock is held
+    /// for the life of this test process.
     #[cfg(target_os = "linux")]
     #[test]
     fn native_switch_octet_is_stable_across_restarts() {
@@ -4187,15 +4194,36 @@ mod tests {
             camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap(),
         )
         .unwrap();
-        let first = native_switch_octet(false, &state_dir, "per-start-id");
-        let second = native_switch_octet(false, &state_dir, "different-per-start-id");
+        let start = |state_dir: &DaemonAbsPath| {
+            let locks = TempDir::new().unwrap();
+            let identity = load_or_create_daemon_identity(state_dir).unwrap();
+            resolve_switch_octet(Some(locks.path()), &identity)
+        };
+        let first = start(&state_dir);
+        let second = start(&state_dir);
         assert_eq!(
             first, second,
-            "the switch octet must be stable across restarts even when the per-start id changes"
+            "the switch octet must be stable across restarts"
         );
         assert!(
             (1..=254).contains(&first),
             "derived octet {first} is outside 1..=254"
+        );
+    }
+
+    /// Two daemons on one machine that derive the same octet end up on
+    /// different blocks: the first holds the per-octet lock, so the second
+    /// re-derives.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn colliding_daemons_end_up_on_different_octets() {
+        let locks = TempDir::new().unwrap();
+        let first = resolve_switch_octet(Some(locks.path()), "same-identity");
+        let second = resolve_switch_octet(Some(locks.path()), "same-identity");
+        assert_eq!(first, octet_for_daemon_id("same-identity"));
+        assert_ne!(
+            first, second,
+            "a daemon whose octet is already held must re-derive to a different one"
         );
     }
 
