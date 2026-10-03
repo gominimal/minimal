@@ -104,6 +104,12 @@
 #                                    switch the install placed, with the VM
 #                                    host daemon's start record naming them
 #   min_internal_names_through_proxy NET-001..004 through the shipped proxy
+#   own_ip_deny_all_box_answers_published_port
+#                                    NET-040's answer half: a deny-all box
+#                                    with a published port answers a host
+#                                    client through the forwarder, the
+#                                    hostname proxy and a sibling box, while
+#                                    its own outbound connect still drops
 #   proxy_refuses_like_direct        the proxy refuses exactly as the switch
 #                                    does: paired direct/proxied attempts,
 #                                    h2 closed, h2c stripped (NET-069..071, 135)
@@ -231,6 +237,9 @@ RECOVER_SWITCH_HOLD="" # where beat C parks it mid-proof
 RETIRED_SEED_DIR="" # seeded by the retired-surfaces proof below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
+DA_ORIGIN_SEED_DIR="" # the deny-all answer proof's origin box seed; teardown
+DA_TARGET_SEED_DIR="" # its deny-all target box's seed; removed on teardown
+DA_SIBLING_SEED_DIR="" # its sibling box's seed; removed on teardown
 GOA_T_SEED_DIR="" # the github-only allowlist proof's toolchain-box seed; removed on teardown
 GOA_SEED_DIR="" # its shared shell-stack seed (the denied-range and peer boxes); removed on teardown
 BOXREG_SEED_DIR="" # the box-registration proof's seed; removed on teardown
@@ -574,6 +583,9 @@ teardown() {
   [ -n "$SECOND_SEED_DIR" ] && rm -rf "$SECOND_SEED_DIR"
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
+  [ -n "$DA_ORIGIN_SEED_DIR" ] && rm -rf "$DA_ORIGIN_SEED_DIR"
+  [ -n "$DA_TARGET_SEED_DIR" ] && rm -rf "$DA_TARGET_SEED_DIR"
+  [ -n "$DA_SIBLING_SEED_DIR" ] && rm -rf "$DA_SIBLING_SEED_DIR"
   [ -n "$GOA_T_SEED_DIR" ] && rm -rf "$GOA_T_SEED_DIR"
   [ -n "$GOA_SEED_DIR" ] && rm -rf "$GOA_SEED_DIR"
   [ -n "$BOXREG_SEED_DIR" ] && rm -rf "$BOXREG_SEED_DIR"
@@ -8897,6 +8909,459 @@ proof_min_internal_names_through_proxy() {
 }
 
 # ---------------------------------------------------------------------------
+# A deny-all own-address box ANSWERS the connections its published port
+# received (NET-040's answer half), while its own outbound connect is still a
+# silent drop (NET-062). The deny-all declaration is the explicit stand-in
+# the egress proof uses for the coming in-force default (`--deny-subnets
+# 0.0.0.0/0`): every destination the box itself dials is dropped as
+# undeclared, so the only thing that can lift one of its answers is a
+# reply-flow record a client's opening packet earned when a gate delivered
+# it — which is the whole point of this case: a published port is useless if
+# answering it counts as egress. Both gates decide by the same reverse-tuple
+# rule (the record the in-VM relay's ingress leg opens, the record the host
+# gate's ingress leg opens beside its admission table), and on a VM-backed
+# host every leg rides both, because a box's tap relays through the vsock
+# shuttle to the host-side switch minvmd fronts.
+#
+# Three clients reach the box's lease, each a different route, and each must
+# get the box's own answer back:
+#   * a host client through the forwarder — the listener the switch bound at
+#     the box's granted address out of the reserved local range (NET-010),
+#     never assumed: read from the daemon's expose record where the log is
+#     readable, and on a Linux VM lane (whose daemon log is the guest's) from
+#     the host's own socket table instead. A macOS VM host has neither, so
+#     that one lane names the leg skipped; the KVM lane carries it, and the
+#     host gate's unit tests pin the forwarder's dial recording the flow its
+#     answer reverses.
+#   * through the hostname proxy, which dials the lease at the mapped
+#     internal port — the shape the min.internal proof proved routes.
+#   * from a sibling box, dialing the lease directly — gated on E2E_VM like
+#     every between-box pair (the parity proof's reasoning: off a VM lane's
+#     fabric a lease is not dialable), a gate that carries the still-dropped
+#     leg with it, since the peer that leg needs is that same sibling.
+# The still-dropped assertion is the case's second half: the control (the
+# sibling's responder answering through the proxy, and the sibling's own
+# dial of the deny-all box completing) proves the destination and the route,
+# so the deny-all box's own connect to the sibling ending in a connect
+# timeout with no reset is its egress verdict and nothing else. An answer
+# half that goes red while the drop half is green is a policy hole in the
+# reply rule; a drop half that goes red while the answers are green is a
+# gate that no longer drops. Either failure is the one this case exists to
+# catch.
+proof_own_ip_deny_all_box_answers_published_port() {
+  echo "::group::a deny-all own-address box answers its published port (NET-040 answer half)"
+
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "deny-all answer proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The box opens /dev/net/tun for its in-namespace tap; without the device
+  # its session program cannot spawn, and a host that is itself a sandbox
+  # cannot mknod one either. Skip rather than fail: the failure would say
+  # nothing about this branch, and the native CI lane — where the tap root
+  # integration harness already builds a tap — runs the case for real.
+  if [ ! -c /dev/net/tun ]; then
+    echo "deny-all answer proof SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The names, ports and markers. Ports are fixed on purpose — the execs that
+  # start and probe each responder must agree — and clear of every band the
+  # proofs around this one use (18080-18088, 19090/19091).
+  DA_TARGET_NAME="e2e-deny-all-answer"    # the deny-all box, its port published
+  DA_SIBLING_NAME="e2e-deny-all-sibling"  # the peer its own connect attempts
+  DA_ORIGIN_NAME="e2e-deny-all-origin"    # the host-address box, the request origin
+  DA_EXT=18090                            # the target's published (host-facing) port
+  DA_INT=18091                            # the target's in-box responder
+  DA_SIB_EXT=18092                        # the sibling's published port
+  DA_SIB_INT=18093                        # the sibling's in-box responder
+  DA_TARGET_MARKER="DA_ANSWER_OK"         # what the target answers every client with
+  DA_SIBLING_MARKER="DA_SIBLING_OK"       # what the sibling answers
+  DA_SAVED_RUST_LOG=""
+
+  # The two host-side binds the ingress declarations publish. The claim is
+  # the harness's own: a host that already answers on either owes the case a
+  # failure, not a silent wrong-port run.
+  for da_port in "$DA_EXT" "$DA_SIB_EXT"; do
+    if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$da_port/" 2>/dev/null; then
+      echo "::error::127.0.0.1:$da_port already answers on this host; the deny-all answer proof needs $DA_EXT and $DA_SIB_EXT free"
+      fail
+    fi
+  done
+
+  # The daemon's filter comes from RUST_LOG at spawn, and this lane runs it
+  # at `warn` — which drops the two records this case reads where it can: the
+  # expose record (`minimald::net::gvproxy_network`) and the box's first
+  # inbound-flow record (`minimald::net::switch`). Restart so the daemon this
+  # case talks to runs with those at info, the way the min.internal proof
+  # restarts for its records, and put the lane's filter back afterwards so
+  # the proofs after this one see the filter they see today. A VM lane keeps
+  # its records (they are the guest's) and its filter: the statuses and the
+  # host's own socket table carry the assertions there.
+  if hook_log_readable; then
+    mnl stop >/dev/null 2>&1 || true # a standalone run has no daemon yet
+    DA_SAVED_RUST_LOG="${RUST_LOG:-}"
+    export RUST_LOG="warn,minimald::net::gvproxy_network=info,minimald::net::switch=info"
+  fi
+
+  # The request origin: a host-address box, sharing its host's loopback —
+  # which is how it reaches the proxy at all, on every lane.
+  DA_ORIGIN_SEED_DIR="$(hook_mktemp /tmp/mnldo.XXXXXX)"
+  hook_seed_preamble > "$DA_ORIGIN_SEED_DIR/minimal.toml"
+  mkdir "$DA_ORIGIN_SEED_DIR/.git"
+  da_origin_sid="$(cd "$DA_ORIGIN_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$DA_ORIGIN_NAME" 2>"$WORK/da-origin-activate.err")" || {
+    echo "::error::'min session activate' for the deny-all answer proof's origin box failed"
+    echo "--- stderr ---"; cat "$WORK/da-origin-activate.err" 2>/dev/null || true
+    fail
+  }
+  da_origin_sid="$(printf '%s\n' "$da_origin_sid" | tail -n1 | tr -d '\r')"
+
+  # ---- capability gates: what THIS host can run ----------------------------
+  # The same two gates the min.internal and parity proofs run, for the same
+  # reasons: this case needs a session sandbox AND this run's daemon owning
+  # the proxy, and a host can lack either. A skip is honest only on a
+  # developer host — a lane that exists to run these assertions and cannot
+  # is a red lane, not a degraded proof.
+  da_gate_can_skip() { [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; }
+  if ! mnl session exec "$da_origin_sid" 'true' >"$WORK/da-execgate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$da_origin_sid" 'true' >"$WORK/da-execgate.err" 2>&1; }; then
+    if da_gate_can_skip; then
+      echo "::warning::deny-all answer proof SKIPPED — this host cannot run a session sandbox"
+      echo "  (exec: $(head -n1 "$WORK/da-execgate.err" 2>/dev/null || true))"
+      echo "  on CI or a VM lane this gate fails instead"
+      mnl session destroy --force "$da_origin_sid" >/dev/null 2>&1 || true
+      if [ -n "$DA_SAVED_RUST_LOG" ]; then export RUST_LOG="$DA_SAVED_RUST_LOG"; else unset RUST_LOG; fi
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::this lane cannot run a session sandbox, so no probe inside a box can run: nothing this case asserts can be asserted"
+    echo "  (exec: $(head -n1 "$WORK/da-execgate.err" 2>/dev/null || true))"
+    fail
+  fi
+  da_bind_taken=0
+  for da_bind_try in 1 2 3 4 5; do
+    da_ls_out="$(mnl ls 2>&1)"
+    case "$da_ls_out" in
+      *"session hostnames will not route"*) da_bind_taken=1 ;;
+      *) da_bind_taken=0; break ;;
+    esac
+    [ "$da_bind_try" = 5 ] || sleep 3
+  done
+  if [ "$da_bind_taken" -eq 1 ]; then
+    if da_gate_can_skip; then
+      echo "::warning::deny-all answer proof SKIPPED — another daemon owns 127.0.0.1:7654 on this host"
+      echo "  the proxy leg needs this run's daemon to own :7654; on CI or a VM lane this gate fails instead"
+      mnl session destroy --force "$da_origin_sid" >/dev/null 2>&1 || true
+      if [ -n "$DA_SAVED_RUST_LOG" ]; then export RUST_LOG="$DA_SAVED_RUST_LOG"; else unset RUST_LOG; fi
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::another daemon owns 127.0.0.1:7654, so this run's daemon cannot route session hostnames"
+    echo "--- min ls ---"; printf '%s\n' "$da_ls_out"
+    fail
+  fi
+
+  # The deny-all box itself: own-address, egress denied by the explicit
+  # deny-all stand-in, one ingress mapping published. socat carries the
+  # in-box responder exactly the way every proof here runs one: a launcher
+  # baseline package at /usr/bin, one fixed 200 whose body is the marker,
+  # written by the SESSION's shell so the Content-Length can never drift
+  # from the body it frames, and `nohup ... &` — the documented detach
+  # form — so the listener outlives the exec that starts it. The readiness
+  # curl is the box's OWN loopback, which never touches its tap, so the
+  # deny-all policy is not in the picture for it — binding and probing a
+  # loopback listener inside a box is not egress.
+  DA_TARGET_SEED_DIR="$(hook_mktemp /tmp/mnldt.XXXXXX)"
+  hook_seed_preamble > "$DA_TARGET_SEED_DIR/minimal.toml"
+  mkdir "$DA_TARGET_SEED_DIR/.git"
+  da_target_sid="$(cd "$DA_TARGET_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$DA_TARGET_NAME" --network own_ip \
+    --deny-subnets 0.0.0.0/0 \
+    --ingress "$DA_EXT:$DA_INT" 2>"$WORK/da-target-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --deny-subnets 0.0.0.0/0 --ingress ...' failed"
+    echo "--- stderr ---"; cat "$WORK/da-target-activate.err" 2>/dev/null || true
+    fail
+  }
+  da_target_sid="$(printf '%s\n' "$da_target_sid" | tail -n1 | tr -d '\r')"
+
+  # Starts the in-box responder at $2 answering $3 and waits for its readiness.
+  da_responder() { # $1 sid, $2 listen port, $3 marker
+    mnl session exec "$1" 'test -x /usr/bin/socat' >/dev/null 2>&1 \
+      || { echo "::error::the session has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"; fail; }
+    mnl session exec "$1" \
+      "body=$3; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/da-http200" \
+      >/dev/null 2>"$WORK/da-responder.err" \
+      || { echo "::error::could not write the in-box responder's response"; cat "$WORK/da-responder.err" 2>/dev/null || true; fail; }
+    mnl session exec "$1" \
+      "nohup /usr/bin/socat TCP-LISTEN:$2,reuseaddr,fork SYSTEM:\"cat /home/da-http200\" >/dev/null 2>&1 &" \
+      >/dev/null 2>"$WORK/da-responder.err" \
+      || { echo "::error::could not start the in-box responder"; cat "$WORK/da-responder.err" 2>/dev/null || true; fail; }
+    for _ in $(seq 1 40); do
+      if [ "$(mnl session exec "$1" \
+        "curl -sS --max-time 5 -o /home/da-ready.body -w '%{http_code}' http://127.0.0.1:$2/" \
+        2>/dev/null || true)" = "200" ]; then
+        return 0
+      fi
+      sleep 0.25
+    done
+    echo "::error::the in-box responder never answered a direct curl — no client is in the picture yet, so this is the box's own loopback"
+    echo "--- socat exec stderr ---"; cat "$WORK/da-responder.err" 2>/dev/null || true
+    fail
+  }
+  da_responder "$da_target_sid" "$DA_INT" "$DA_TARGET_MARKER"
+
+  # ---- leg 1: a host client through the forwarder --------------------------
+  # The listener the switch bound for the box's published port, at the box's
+  # granted address. On a lane whose daemon log is readable that address is
+  # in the expose record (NET-040's observability record, one per mapping).
+  # On a Linux VM lane the record is the guest's, so the listener is read
+  # from the host's own socket table: /proc/net/tcp spells an IPv4 socket's
+  # local address as the address' four octets in little-endian order with the
+  # port in big-endian hex — 127.64.0.14:18086 reads `0E00407F:46A6` — so
+  # the match pins the port, the LISTEN state, and the loopback half of
+  # either spelling the publish surface can bind a box's port at: `127.64.0.x`,
+  # the reserved local range a granted publish answers on (NET-010), or
+  # `127.0.0.1`, the interim a publish stands at where the surface's range
+  # verdict read the range absent (NET-123). The KVM lane lands absent: the
+  # range walk rides the same shuttle the publishes do, and the host gate
+  # refuses every one of its probe rounds — the probe's `remote` is a
+  # placeholder, so no registered row holds the address its publish is keyed
+  # at — so the interim is that lane's own answer, not a broken publish.
+  # The reserved-range arm is tried first and stays for a lane whose verdict
+  # lands present, and the marker the dial below demands keeps either
+  # spelling honest: a stray host listener at the same port does not carry
+  # this box's answer. A macOS VM host has neither a readable record nor
+  # /proc, so that leg names itself skipped there.
+  da_daemon_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null \
+      | sort | tail -n1
+  }
+  da_pub_addr=""
+  if hook_log_readable; then
+    da_log="$(da_daemon_log)"
+    da_rec=""
+    for _ in $(seq 1 10); do
+      da_rec="$(grep -h -- 'exposed ingress port on the host loopback' "$da_log" 2>/dev/null \
+        | grep -F "\"session\":\"$DA_TARGET_NAME\"" | tail -n1)"
+      [ -n "$da_rec" ] && break
+      sleep 0.25
+    done
+    if [ -z "$da_rec" ]; then
+      echo "::error::no expose record in the daemon log names the deny-all box's session — the published port has no host address to dial"
+      echo "--- daemon log (tail) ---"; tail -20 "$da_log" 2>/dev/null || true
+      fail
+    fi
+    da_pub_addr="$(published_loopback_host "$da_log" "$DA_TARGET_NAME")"
+    echo "expose record: $da_rec"
+  elif [ -r /proc/net/tcp ]; then
+    da_row=""
+    for _ in $(seq 1 40); do
+      da_row="$(awk -v want="$(printf '%04X' "$DA_EXT")" \
+        'substr($2, 7, 2) == "7F" && substr($2, 5, 2) == "40" && substr($2, 3, 2) == "00" \
+         && $4 == "0A" && index($2, ":" want) == 9 { print $2 }' /proc/net/tcp 2>/dev/null | tail -n1)"
+      if [ -z "$da_row" ]; then
+        da_row="$(awk -v want="$(printf '%04X' "$DA_EXT")" \
+          'substr($2, 1, 8) == "0100007F" \
+           && $4 == "0A" && index($2, ":" want) == 9 { print $2 }' /proc/net/tcp 2>/dev/null | tail -n1)"
+      fi
+      [ -n "$da_row" ] && break
+      sleep 0.25
+    done
+    if [ -z "$da_row" ]; then
+      echo "::error::no listener in the host's socket table sits on this host's loopback at port $DA_EXT — neither an address of the reserved local range nor the 127.0.0.1 interim — so the switch never bound the deny-all box's published port"
+      echo "--- /proc/net/tcp (loopback listeners) ---"
+      awk 'substr($2, 7, 2) == "7F" && $4 == "0A" { print }' \
+        /proc/net/tcp 2>/dev/null | head -20
+      fail
+    fi
+    da_pub_addr="$(printf '%d.%d.%d.%d' \
+      "0x${da_row:6:2}" "0x${da_row:4:2}" "0x${da_row:2:2}" "0x${da_row:0:2}")"
+    if [ "$da_pub_addr" = "127.0.0.1" ]; then
+      echo "host listener: $da_pub_addr:$DA_EXT (read from the host's own socket table — this lane's daemon log is the guest's; the publish stands at the 127.0.0.1 interim, this surface's absent range verdict)"
+    else
+      echo "host listener: $da_pub_addr:$DA_EXT (read from the host's own socket table — this lane's daemon log is the guest's; the reserved local range)"
+    fi
+  else
+    echo "forwarder leg SKIPPED on this lane: the daemon's expose record is the guest's and this host has no /proc to read its socket table from — the Linux KVM lane asserts this leg, and the host gate's unit tests pin the forwarder's dial recording the flow its answer reverses"
+  fi
+
+  if [ -n "$da_pub_addr" ]; then
+    # The forwarder's dial is the sharpest client of the three: it arrives
+    # NAT'd from the switch's own address, so the box's answer to it names
+    # the gateway — the one destination the gates' control-surface rules
+    # refuse for everything but the resolver — and it passes anyway, because
+    # the record a delivered opening packet earned is consulted ahead of
+    # that refusal.
+    da_fwd="$(curl -sS --max-time 20 -o "$WORK/da-forwarder.body" \
+      -w '%{http_code}' "http://$da_pub_addr:$DA_EXT/" 2>"$WORK/da-forwarder.err")"
+    da_fwd_rc=$?
+    echo "forwarder: GET http://$da_pub_addr:$DA_EXT/ -> HTTP ${da_fwd:-<none>} (curl exit $da_fwd_rc)"
+    if [ "$da_fwd_rc" -ne 0 ] || [ "$da_fwd" != "200" ]; then
+      echo "::error::a host client through the forwarder did not get the deny-all box's answer — the box's replies to its published port's connections are being dropped as its own egress"
+      echo "--- curl stderr ---"; cat "$WORK/da-forwarder.err" 2>/dev/null || true
+      fail
+    fi
+    da_body="$(cat "$WORK/da-forwarder.body" 2>/dev/null || true)"
+    if [[ "$da_body" != *"$DA_TARGET_MARKER"* ]]; then
+      echo "::error::the forwarder's answer does not carry the deny-all box's marker (got: '${da_body:-<empty>}')"
+      fail
+    fi
+  fi
+
+  # NET-040's answer-side observability, where the log is readable: one line
+  # at the box's first inbound-flow record, naming the port the flow arrived
+  # at — the record that says the published port has begun answering. The
+  # port is asserted, not just shown: the min.internal proof's own-address
+  # box recorded at its own port earlier in the lane, so a record without
+  # the port check could pass on a stale line.
+  if hook_log_readable; then
+    da_first=""
+    for _ in $(seq 1 10); do
+      da_first="$(grep -h -- "recorded the box's first inbound flow at its published port" \
+        "$(da_daemon_log)" 2>/dev/null | tail -n1)"
+      [ -n "$da_first" ] && break
+      sleep 0.25
+    done
+    if [ -z "$da_first" ]; then
+      echo "::error::the daemon never logged the deny-all box's first inbound-flow record — the gate's ingress leg did not record the forwarder's dial"
+      echo "--- daemon log (tail) ---"; tail -20 "$(da_daemon_log)" 2>/dev/null || true
+      fail
+    fi
+    case "$da_first" in
+      *'"port":'"$DA_INT"' '* | *'"port":'"$DA_INT"','* | *'"port":'"$DA_INT"'}'*) ;;
+      *)
+        echo "::error::the first inbound-flow record does not name the internal port the forwarder's dial arrived at (want $DA_INT)"
+        echo "--- record ---"; printf '%s\n' "$da_first"
+        fail
+        ;;
+    esac
+    echo "daemon log: $da_first"
+  fi
+
+  # ---- leg 2: through the hostname proxy -----------------------------------
+  # The origin box asks the shipped proxy for the deny-all box's name at its
+  # PUBLISHED port; the proxy resolves the name and dials the lease at the
+  # mapped internal port — a client whose connection the box's ingress
+  # admitted, so the box's answer rides the record that dial earned.
+  da_proxy_out="$(mnl session exec "$da_origin_sid" \
+    "curl -sS --max-time 20 -x http://127.0.0.1:7654 -o /home/da-proxy.body -w '%{http_code}' 'http://$DA_TARGET_NAME.min.internal:$DA_EXT/'" \
+    2>"$WORK/da-proxy.err")"
+  da_proxy_rc=$?
+  da_proxy_status="$(printf '%s\n' "$da_proxy_out" | tail -n1 | tr -d '\r\n')"
+  echo "proxy: GET http://$DA_TARGET_NAME.min.internal:$DA_EXT/ via 127.0.0.1:7654 -> HTTP ${da_proxy_status:-<none>}"
+  if [ "$da_proxy_rc" -ne 0 ] || [ "$da_proxy_status" != "200" ]; then
+    echo "::error::the request through the hostname proxy did not get the deny-all box's answer (curl exit $da_proxy_rc)"
+    echo "--- curl stderr ---"; cat "$WORK/da-proxy.err" 2>/dev/null || true
+    fail
+  fi
+  da_proxy_body="$(mnl session exec "$da_origin_sid" 'cat /home/da-proxy.body' 2>/dev/null || true)"
+  if [[ "$da_proxy_body" != *"$DA_TARGET_MARKER"* ]]; then
+    echo "::error::the proxy's answer does not carry the deny-all box's marker (got: '${da_proxy_body:-<empty>}')"
+    fail
+  fi
+
+  # ---- legs 3 and 4: between boxes (E2E_VM, like every between-box pair) ---
+  if [ -n "$E2E_VM" ]; then
+    DA_SIBLING_SEED_DIR="$(hook_mktemp /tmp/mnlds.XXXXXX)"
+    hook_seed_preamble > "$DA_SIBLING_SEED_DIR/minimal.toml"
+    mkdir "$DA_SIBLING_SEED_DIR/.git"
+    da_sibling_sid="$(cd "$DA_SIBLING_SEED_DIR" && mnl session activate . --no-prompt \
+      --name "$DA_SIBLING_NAME" --network own_ip \
+      --ingress "$DA_SIB_EXT:$DA_SIB_INT" 2>"$WORK/da-sibling-activate.err")" || {
+      echo "::error::'min session activate --network own_ip --ingress ...' for the sibling box failed"
+      echo "--- stderr ---"; cat "$WORK/da-sibling-activate.err" 2>/dev/null || true
+      fail
+    }
+    da_sibling_sid="$(printf '%s\n' "$da_sibling_sid" | tail -n1 | tr -d '\r')"
+    da_responder "$da_sibling_sid" "$DA_SIB_INT" "$DA_SIBLING_MARKER"
+
+    # The control for leg 4, first: the sibling's responder and its publish
+    # answer through the proxy — the shape the min.internal proof proved
+    # routes — so the destination leg 4 attempts is live on this run.
+    da_ctrl_out="$(mnl session exec "$da_origin_sid" \
+      "curl -sS --max-time 20 -x http://127.0.0.1:7654 -o /home/da-ctrl.body -w '%{http_code}' 'http://$DA_SIBLING_NAME.min.internal:$DA_SIB_EXT/'" \
+      2>"$WORK/da-ctrl.err")"
+    da_ctrl_rc=$?
+    da_ctrl_status="$(printf '%s\n' "$da_ctrl_out" | tail -n1 | tr -d '\r\n')"
+    echo "control: GET http://$DA_SIBLING_NAME.min.internal:$DA_SIB_EXT/ via the proxy from an ungated box -> HTTP ${da_ctrl_status:-<none>}"
+    if [ "$da_ctrl_rc" -ne 0 ] || [ "$da_ctrl_status" != "200" ]; then
+      echo "::error::the control request to the sibling did not complete — the drop asserted below would not be the deny-all box's own verdict"
+      echo "--- curl stderr ---"; cat "$WORK/da-ctrl.err" 2>/dev/null || true
+      fail
+    fi
+    da_ctrl_body="$(mnl session exec "$da_origin_sid" 'cat /home/da-ctrl.body' 2>/dev/null || true)"
+    if [[ "$da_ctrl_body" != *"$DA_SIBLING_MARKER"* ]]; then
+      echo "::error::the control's answer does not carry the sibling's marker (got: '${da_ctrl_body:-<empty>}')"
+      fail
+    fi
+
+    # Leg 3: the sibling dials the deny-all box's lease directly, at the
+    # internal port the mapping publishes — the gate's inbound half admits
+    # exactly those, so a second client's connection is recorded the same
+    # way the first two were.
+    da_sib_out="$(mnl session exec "$da_sibling_sid" \
+      "curl -sS --max-time 20 -o /home/da-sib.body -w '%{http_code}' 'http://$DA_TARGET_NAME.min.internal:$DA_INT/'" \
+      2>"$WORK/da-sib.err")"
+    da_sib_rc=$?
+    da_sib_status="$(printf '%s\n' "$da_sib_out" | tail -n1 | tr -d '\r\n')"
+    echo "sibling: GET http://$DA_TARGET_NAME.min.internal:$DA_INT/ direct from a peer box -> HTTP ${da_sib_status:-<none>}"
+    if [ "$da_sib_rc" -ne 0 ] || [ "$da_sib_status" != "200" ]; then
+      echo "::error::a sibling box dialing the deny-all box's lease directly did not get its answer"
+      echo "--- curl stderr ---"; cat "$WORK/da-sib.err" 2>/dev/null || true
+      fail
+    fi
+    da_sib_body="$(mnl session exec "$da_sibling_sid" 'cat /home/da-sib.body' 2>/dev/null || true)"
+    if [[ "$da_sib_body" != *"$DA_TARGET_MARKER"* ]]; then
+      echo "::error::the sibling's answer does not carry the deny-all box's marker (got: '${da_sib_body:-<empty>}')"
+      fail
+    fi
+
+    # Leg 4: the deny-all box's own outbound connect to the very peer that
+    # just reached it — the same destination the control proved answers and
+    # the mirrored dial above proved a peer reaches — ends in a connect
+    # timeout with no reset: the silent drop NET-062 binds, read from the
+    # same box whose answers just passed. An answer here is the policy hole:
+    # the box's own dial escaping its deny while its published port answers.
+    mnl session exec "$da_target_sid" \
+      "curl -sS --max-time 5 -o /home/da-denied.body -w '%{http_code}' 'http://$DA_SIBLING_NAME.min.internal:$DA_SIB_INT/'" \
+      >"$WORK/da-denied.out" 2>"$WORK/da-denied.err"
+    da_denied_rc=$?
+    echo "deny-all GET http://$DA_SIBLING_NAME.min.internal:$DA_SIB_INT/ -> curl exit $da_denied_rc: $(head -n1 "$WORK/da-denied.err" 2>/dev/null || true)"
+    if [ "$da_denied_rc" -eq 0 ]; then
+      echo "::error::the deny-all box's own connect to the sibling completed (HTTP $(tail -n1 "$WORK/da-denied.out" 2>/dev/null)) — its dial escaped the 0.0.0.0/0 deny while its published port answers"
+      cat "$WORK/da-denied.err" 2>/dev/null || true
+      fail
+    fi
+    if [ "$da_denied_rc" -ne 28 ]; then
+      echo "::error::the deny-all box's own connect did not end in a connect timeout (curl exit $da_denied_rc, expected 28) — its egress gate did not drop it silently"
+      cat "$WORK/da-denied.err" 2>/dev/null || true
+      fail
+    fi
+    if grep -qi 'reset by peer' "$WORK/da-denied.err" 2>/dev/null; then
+      echo "::error::the deny-all box's connection to the sibling was reset by the destination — the SYN escaped the deny and reached a responder this run's control proved answers"
+      cat "$WORK/da-denied.err" 2>/dev/null || true
+      fail
+    fi
+
+    mnl session destroy --force "$da_sibling_sid" >/dev/null 2>&1 || true
+  else
+    echo "sibling half SKIPPED (no E2E_VM: between-box dials need the guest fabric — the same gate the parity proof uses)"
+  fi
+
+  mnl session destroy --force "$da_target_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$da_origin_sid" >/dev/null 2>&1 || true
+  rm -rf "$DA_TARGET_SEED_DIR" "$DA_ORIGIN_SEED_DIR" "${DA_SIBLING_SEED_DIR:-}"
+  DA_TARGET_SEED_DIR="" DA_ORIGIN_SEED_DIR="" DA_SIBLING_SEED_DIR=""
+  if [ -n "$DA_SAVED_RUST_LOG" ]; then export RUST_LOG="$DA_SAVED_RUST_LOG"; else unset RUST_LOG; fi
+  echo "deny-all own-address box answers its published port OK (forwarder, proxy, sibling — and its own connect still dropped)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # The hostname proxy honours the switch's rules, end to end (NET-069, NET-070,
 # NET-071, NET-135). The rule is parity, and parity is proved by PAIRS: the
 # same target attempted directly and through the proxy, the two attempts
@@ -10481,6 +10946,7 @@ case "${1:-}" in
     proof_box_name_resolves_natively_without_proxy
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
+    proof_own_ip_deny_all_box_answers_published_port
     proof_proxy_refuses_like_direct
     proof_retired_surfaces_gone
     proof_switch_steers_proxy_mac_frames_to_the_host_stack
@@ -10496,7 +10962,8 @@ case "${1:-}" in
     | local_range_reserved_by_privileged_step \
     | box_name_resolves_natively_without_proxy \
     | hostnames_recover_and_two_daemons_route \
-    | min_internal_names_through_proxy | proxy_refuses_like_direct | retired_surfaces_gone \
+    | min_internal_names_through_proxy | own_ip_deny_all_box_answers_published_port \
+    | proxy_refuses_like_direct | retired_surfaces_gone \
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes \
     | switch_steers_proxy_mac_frames_to_the_host_stack | switch_answers_no_arp_for_the_proxy_address \
@@ -10516,7 +10983,8 @@ case "${1:-}" in
     echo "         fresh_linux_kvm_activate_local_minvmd fresh_arm64_kvm_activate_local_minvmd"
     echo "         linux_stock_install_runs_vm_boxes"
     echo "         hostnames_recover_and_two_daemons_route"
-    echo "         min_internal_names_through_proxy proxy_refuses_like_direct retired_surfaces_gone"
+    echo "         min_internal_names_through_proxy own_ip_deny_all_box_answers_published_port"
+    echo "         proxy_refuses_like_direct retired_surfaces_gone"
     echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
     echo "         github_only_allowlist proxy_sees_each_vm_box_by_its_switch_address"
     echo "         published_proxy_routes_from_host"
