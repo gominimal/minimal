@@ -304,6 +304,18 @@ impl Index {
         self.name_to_id.get(name.as_ref())
     }
 
+    /// Returns the session ID whose name folds to `name` under ASCII
+    /// case-insensitivity, if any. Session names are unique under the same
+    /// fold the box hostname uses, so a name that differs from an existing
+    /// one only by letter case is a collision.
+    pub fn find_by_name_folded<S: AsRef<str>>(&self, name: S) -> Option<&SessionId> {
+        let name = name.as_ref();
+        self.name_to_id
+            .iter()
+            .find(|(existing, _)| existing.eq_ignore_ascii_case(name))
+            .map(|(_, id)| id)
+    }
+
     /// Returns the session ID corresponding to the given short name, if known.
     pub fn find_by_short<S: AsRef<str>>(&self, name: S) -> Option<&SessionId> {
         self.short_to_id.get(name.as_ref())
@@ -791,7 +803,7 @@ impl Loader for DiskLoader {
     fn create(&mut self, mut record: Record) -> Result<Self::Key, std::io::Error> {
         if let Some(name) = &record.name {
             validate_session_name(name)?;
-            if self.index.name_to_id.contains_key(name) {
+            if self.index.find_by_name_folded(name).is_some() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
                     format!("a session with name `{name}` already exists"),
@@ -897,10 +909,11 @@ impl Loader for DiskLoader {
             validate_session_name(name)?;
         }
 
-        // Collision check: if the new name belongs to a *different*
-        // session, refuse. Same-id same-name is a no-op, not a collision.
+        // Collision check: if the new name folds to a *different*
+        // session's name, refuse. Same-id same-name is a no-op, not a
+        // collision.
         if let Some(name) = &new_name
-            && let Some(other_id) = self.index.find_by_name(name).copied()
+            && let Some(other_id) = self.index.find_by_name_folded(name).copied()
             && other_id != id
         {
             return Err(std::io::Error::new(
@@ -1194,6 +1207,20 @@ mod tests {
     }
 
     #[test]
+    fn create_errors_on_case_only_name_collision() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        loader.create(sample_record()).unwrap();
+        let mut record = sample_record();
+        record.name = Some("MY-SESSION".to_string());
+        assert_eq!(
+            loader.create(record).err().map(|e| e.kind()),
+            Some(ErrorKind::AlreadyExists)
+        );
+    }
+
+    #[test]
     fn validate_session_name_accepts_ordinary_names() {
         assert!(validate_session_name("debug-qa").is_ok());
         assert!(validate_session_name("my session").is_ok());
@@ -1371,6 +1398,47 @@ mod tests {
         );
         // The failed rename left the original name intact.
         assert_eq!(loader.find_by_name("my-session").unwrap(), Some(first));
+    }
+
+    #[test]
+    fn rename_errors_on_case_only_name_collision() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let first = loader.create(sample_record()).unwrap();
+        loader
+            .create({
+                let mut record = sample_record();
+                record.name = Some("other".to_string());
+                record
+            })
+            .unwrap();
+
+        // "OTHER" folds to "other", so renaming the first session onto it fails.
+        assert_eq!(
+            loader
+                .rename(&first, "OTHER".to_string())
+                .err()
+                .map(|e| e.kind()),
+            Some(ErrorKind::AlreadyExists)
+        );
+        // The failed rename left the original name intact.
+        assert_eq!(loader.find_by_name("my-session").unwrap(), Some(first));
+    }
+
+    #[test]
+    fn rename_to_own_case_variant_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        loader.rename(&key, "MY-SESSION".to_string()).unwrap();
+
+        assert_eq!(
+            loader.get(&key).unwrap().record().name.as_deref(),
+            Some("MY-SESSION")
+        );
+        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), Some(key));
     }
 
     #[test]
