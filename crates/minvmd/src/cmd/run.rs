@@ -1002,23 +1002,94 @@ const NODE_DEFAULT_PROXY_PORT: u16 = 7654;
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 const NODE_DEFAULT_ANSWERER_PORT: u16 = 7656;
 
+/// Why a preferred node port was not handed, when it was not: the probe that
+/// refused it — the wildcard bind, or the loopback connect that follows it.
+/// The two strings are the assignment's own vocabulary
+/// ([`log_node_port_assignment`]), so a boot that lands off the default port
+/// says which check refused it rather than only that something did.
+///
+/// The bind probe refused the port: something holds it at an address the bind
+/// conflicts with — every host's wildcard listener, and on Linux a loopback
+/// listener too.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const SKIP_BIND_REFUSED: &str = "bind refused";
+
+/// A listener answered the connect probe on the loopback address: another
+/// VM's hostname surface, which on macOS the wildcard bind succeeds over
+/// without ever seeing.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const SKIP_LOOPBACK_ANSWERING: &str = "a listener is already answering on loopback";
+
+/// One node port's assignment: the port handed to the guest, the port the
+/// assignment preferred, and — when the two differ — which probe refused the
+/// preferred one. The last two fields are the assignment's log line.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodePortAssignment {
+    /// The port handed to the guest: the value every consumer binds.
+    port: u16,
+    /// The port the assignment preferred: the default probed first, or the
+    /// operator's pin, which skips the probe entirely.
+    preferred: u16,
+    /// Why `preferred` was not handed, when it was not.
+    skipped: Option<&'static str>,
+}
+
+impl NodePortAssignment {
+    /// The operator's pin: no probe ran, so the pin is both the preferred and
+    /// the handed port.
+    #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+    fn pinned(port: u16) -> Self {
+        Self {
+            port,
+            preferred: port,
+            skipped: None,
+        }
+    }
+}
+
 /// Assigns both node ports: TCP for the proxy, UDP for the answerer. The
 /// operator's override ([`crate::vm::NODE_PROXY_PORT_ENV`] /
 /// [`crate::vm::NODE_ANSWERER_PORT_ENV`] set in this supervisor's own env)
 /// wins over the probe, and the one resolved pair is what both the guest
 /// handoff (the VMM child's env) and the node row's own publishes are
-/// written from — handed == registered, never two resolutions.
+/// written from — handed == registered, never two resolutions. Each port's
+/// assignment logs one line ([`log_node_port_assignment`]), which is where a
+/// host running two VMs — or a VM beside a native daemon — says which of the
+/// defaults it took and which it had to give up.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn assign_node_ports() -> Result<NodePorts> {
     let proxy = match node_port_override(crate::vm::NODE_PROXY_PORT_ENV)? {
-        Some(proxy) => proxy,
+        Some(proxy) => NodePortAssignment::pinned(proxy),
         None => assign_node_port(NODE_DEFAULT_PROXY_PORT, false)?,
     };
     let answerer = match node_port_override(crate::vm::NODE_ANSWERER_PORT_ENV)? {
-        Some(answerer) => answerer,
+        Some(answerer) => NodePortAssignment::pinned(answerer),
         None => assign_node_port(NODE_DEFAULT_ANSWERER_PORT, true)?,
     };
-    Ok(NodePorts { proxy, answerer })
+    log_node_port_assignment("hostname proxy", proxy);
+    log_node_port_assignment("zone answerer", answerer);
+    Ok(NodePorts {
+        proxy: proxy.port,
+        answerer: answerer.port,
+    })
+}
+
+/// One line per node-port assignment: the port the assignment preferred, the
+/// port handed to the guest, and — when the preferred port was skipped — the
+/// probe that refused it. The skip reason is the half a shared host needs:
+/// two VMs and a native daemon can all want the default proxy port, so a boot
+/// that landed elsewhere says so here, in the supervisor's own log, rather
+/// than leaving a hostname surface that never answered to be found there.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn log_node_port_assignment(surface: &str, assigned: NodePortAssignment) {
+    tracing::info!(
+        surface,
+        preferred = assigned.preferred,
+        handed = assigned.port,
+        skip_reason = assigned.skipped.unwrap_or(""),
+        "assigned the node port"
+    );
 }
 
 /// Reads one operator override for a node port off this supervisor's env —
@@ -1046,14 +1117,57 @@ fn node_port_override(name: &'static str) -> Result<Option<u16>> {
     }
 }
 
+/// How long [`loopback_answers`] waits before deciding no listener is
+/// answering. A loopback connect settles at once — a refusal when nothing
+/// listens, or the kernel's own handshake when something does — so this is
+/// only the bound that keeps a pathological host from stalling a boot on the
+/// probe.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const LOOPBACK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether a listener accepts a connection on the loopback address at `port`.
+///
+/// A completed connection is a live listener: the kernel completes the
+/// handshake for a listening socket before the process behind it ever
+/// accepts, so the probe needs the connection and nothing more. It is closed
+/// as soon as it is made, so the listener sees a closing client and nothing
+/// else. Anything else the connect returns — a refusal, most often, or the
+/// timeout — means nothing is answering there.
+///
+/// This is the second probe a TCP node port must pass, and the one that
+/// decides on macOS: std's listener sets `SO_REUSEADDR`, which on that host
+/// lets the wildcard bind succeed over a listener another VM's hostname
+/// surface already holds on the loopback address (minimald's proxy binds
+/// `127.0.0.1:<port>`), so the bind alone reports that port free. See
+/// [`assign_node_port`].
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn loopback_answers(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+        LOOPBACK_PROBE_TIMEOUT,
+    )
+    .is_ok()
+}
+
 /// Assigns one node port by probing: bind the preferred port to check the
 /// host has it free, release the probe again, and let the OS pick when the
 /// preferred port is already held. The probe releases its socket, so between
 /// the assignment and the guest's bind inside the VM the port could still be
 /// taken by another process — a lost race the guest's own log tail shows
 /// (a handed port never silently moves, NET-024).
+///
+/// For a TCP port, free is a two-probe answer, because the bind probe is not
+/// the same question on every host: on Linux a bind on the wildcard conflicts
+/// with a listener on any address of the port, while on macOS std's
+/// `SO_REUSEADDR` lets it succeed over another VM's listener on the loopback
+/// address — the one address the hostname surface is published on. So a TCP
+/// port is free only when the wildcard bind succeeds *and* no listener
+/// answers a connection on `127.0.0.1` at that port
+/// ([`loopback_answers`]), and the skip reason names which probe refused it.
+/// The answerer's UDP probe is unchanged: a UDP socket never accepts a
+/// connection, so the bind is the whole question there.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn assign_node_port(preferred: u16, udp: bool) -> Result<u16> {
+fn assign_node_port(preferred: u16, udp: bool) -> Result<NodePortAssignment> {
     use anyhow::Context as _;
     let probe = |port: u16| -> std::io::Result<u16> {
         if udp {
@@ -1064,13 +1178,32 @@ fn assign_node_port(preferred: u16, udp: bool) -> Result<u16> {
             Ok(listener.local_addr()?.port())
         }
     };
-    match probe(preferred) {
-        Ok(assigned) => Ok(assigned),
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
-            probe(0).context("the node's default port is held and no OS-assigned port is available")
-        }
-        Err(error) => Err(error).context("probing the node's default port"),
-    }
+    // Which probe refused the preferred port, when one did. The bind asks the
+    // first half; for TCP, the probe's own socket is released the moment the
+    // probe closure returns — held, it would answer the connect below itself —
+    // so what answers on the loopback is a listener this host did not just
+    // bind.
+    let refused = match probe(preferred) {
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => Some(SKIP_BIND_REFUSED),
+        Err(error) => return Err(error).context("probing the node's default port"),
+        Ok(_) if udp => None,
+        Ok(_) if loopback_answers(preferred) => Some(SKIP_LOOPBACK_ANSWERING),
+        Ok(_) => None,
+    };
+    let Some(skipped) = refused else {
+        return Ok(NodePortAssignment {
+            port: preferred,
+            preferred,
+            skipped: None,
+        });
+    };
+    let port =
+        probe(0).context("the node's default port is held and no OS-assigned port is available")?;
+    Ok(NodePortAssignment {
+        port,
+        preferred,
+        skipped: Some(skipped),
+    })
 }
 
 #[cfg(test)]
@@ -1220,6 +1353,81 @@ mod tests {
     }
 
     #[test]
+    fn node_port_probe_skips_a_port_served_on_loopback() {
+        // The hostname surface a VM holds on the host is the loopback address
+        // (minimald's proxy binds `127.0.0.1:<port>`), so the port one VM is
+        // serving on is exactly the port the next VM wants: the assignment has
+        // to skip it. Hold it the way the holder really does — on the loopback
+        // address alone, not the wildcard — because that is the one shape the
+        // two probes disagree about: on Linux the wildcard bind refuses it
+        // (reason `bind refused`), while on macOS std's SO_REUSEADDR lets the
+        // same bind succeed over it and the connect probe is what sees the
+        // listener (reason `a listener is already answering on loopback`).
+        // Either way one VM keeps its surface and the other is handed a port
+        // that is nobody else's, and the assignment's log line says which
+        // probe refused it.
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let served = held.local_addr().unwrap().port();
+        assert!(
+            super::loopback_answers(served),
+            "the loopback probe sees the listener on 127.0.0.1:{served}"
+        );
+        let assigned = super::assign_node_port(served, false).unwrap();
+        assert_ne!(
+            assigned.port, served,
+            "a port another VM is serving on loopback is not handed as-is"
+        );
+        assert!(
+            matches!(
+                assigned.skipped,
+                Some(super::SKIP_BIND_REFUSED) | Some(super::SKIP_LOOPBACK_ANSWERING)
+            ),
+            "the skip names the probe that refused it, got: {:?}",
+            assigned.skipped
+        );
+    }
+
+    #[test]
+    fn node_port_probe_keeps_a_free_preferred_port() {
+        // A port with nothing on it is handed as asked: the loopback half of
+        // the TCP probe refuses nothing that is actually free, so a lone VM
+        // still lands on the default proxy port — the case the session e2e's
+        // hardcoded 7654 depends on.
+        let freed = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let free = freed.local_addr().unwrap().port();
+        drop(freed);
+        assert!(
+            !super::loopback_answers(free),
+            "the loopback probe leaves a free port alone"
+        );
+        let assigned = super::assign_node_port(free, false).unwrap();
+        assert_eq!(
+            assigned.port, free,
+            "a free preferred port is handed unchanged"
+        );
+        assert_eq!(
+            assigned.preferred, free,
+            "the preferred port is the one the assignment was asked for"
+        );
+        assert_eq!(
+            assigned.skipped, None,
+            "a free port is not skipped, and says so"
+        );
+
+        // The answerer's UDP probe is unchanged by the TCP probe's second
+        // check: a free UDP port is handed as asked, as the held one below is
+        // refused.
+        let freed_udp = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+        let free_udp = freed_udp.local_addr().unwrap().port();
+        drop(freed_udp);
+        let assigned_udp = super::assign_node_port(free_udp, true).unwrap();
+        assert_eq!(
+            assigned_udp.port, free_udp,
+            "a free UDP preferred port is handed unchanged"
+        );
+    }
+
+    #[test]
     fn node_port_assigned_on_host_and_handed_to_daemon() {
         // A port the test holds is busy: the assignment falls through to an
         // OS-assigned port rather than failing the boot over a shared-host
@@ -1227,11 +1435,13 @@ mod tests {
         // hold is on the wildcard address the assigner itself probes, so the
         // collision is one every host agrees on: a specific-address hold
         // collides with a wildcard probe on Linux and not everywhere else.
+        // The loopback-address hold — the shape a second VM's own hostname
+        // surface has — is the two tests above.
         let held = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
         let busy = held.local_addr().unwrap().port();
         let assigned = super::assign_node_port(busy, false).unwrap();
-        assert_ne!(assigned, busy, "a held port is not assigned as-is");
-        assert!(assigned != 0, "the fallback is a real port");
+        assert_ne!(assigned.port, busy, "a held port is not assigned as-is");
+        assert!(assigned.port != 0, "the fallback is a real port");
 
         // A port the test just released is free again: the default-first
         // probe assigns it as asked — the case the session e2e's hardcoded
@@ -1241,7 +1451,7 @@ mod tests {
         let free = freed.local_addr().unwrap().port();
         drop(freed);
         assert_eq!(
-            super::assign_node_port(free, false).unwrap(),
+            super::assign_node_port(free, false).unwrap().port,
             free,
             "a free port is assigned as asked"
         );
@@ -1252,7 +1462,7 @@ mod tests {
         let busy_udp = held_udp.local_addr().unwrap().port();
         let assigned_udp = super::assign_node_port(busy_udp, true).unwrap();
         assert_ne!(
-            assigned_udp, busy_udp,
+            assigned_udp.port, busy_udp,
             "a held UDP port is not assigned as-is"
         );
 
