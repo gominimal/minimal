@@ -1,5 +1,6 @@
 [package]
 name = "diagnostics"
+description = "App-agnostic machinery for diagnostic support bundles."
 version = "0.0.1"
 rust-version.workspace = true
 license.workspace = true
