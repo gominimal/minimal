@@ -539,6 +539,19 @@ impl Env {
             .with_hostname(args.name.clone())
             .with_daemon_id(ctx.daemon_id().unwrap()) // Always set under minimald
             .with_username(args.username.unwrap_or_else(|| "user".to_string()));
+        // NET-080: the box's own id, for the fetch records its installs
+        // produce — the leaf's name, the same id the tree's rules match,
+        // when the host placed it in one; else the session's name. Read
+        // before the leaf is moved into the sandbox config below.
+        let box_id = args
+            .classifier_leaf
+            .as_ref()
+            .and_then(|leaf| {
+                leaf.dir()
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| args.name.clone());
         // NET-079: the leaf the launcher created before this build, so the
         // sandbox keeps the host's cgroup mounts out of a leaf-bearing box and
         // names the leaf it entered on its launch log line. `None` on a host
@@ -576,6 +589,7 @@ impl Env {
             working: args.cwd.clone(),
             home: args.home.clone(),
             has_packages: transitives.keys().copied().collect(),
+            box_id,
             ot: args.ot.clone(),
             session: args.session.clone(),
             ctx,
@@ -835,6 +849,11 @@ struct SessionChannel {
 
     /// Packages already materialized into the rootfs.
     has_packages: HashSet<BuildSpecRef>,
+    /// NET-080: the box this channel's installs are made for, named the way
+    /// the classifier tree names it — the box's leaf when the host placed it
+    /// in one, else the session's name — so the daemon's own fetches are
+    /// recorded with the box that asked for them.
+    box_id: String,
     ot: Option<OpTracker>,
     /// Weak handle to the owning session actor, used by session-scoped commands
     /// (e.g. `min build`) to drive side-ops.
@@ -995,11 +1014,16 @@ impl SessionChannel {
         // fully-cached add emits neither and stays quiet.
         //
         // Built before the two futures: `build` needs `&mut self.ctx` and
-        // `render` must not borrow it as well.
+        // `render` must not borrow it as well. NET-080: the scope is the
+        // record's as much as the meter's — every package this install may
+        // fetch is recorded as the daemon's own node-plane fetch, made for
+        // the box that asked — so the one walk feeds both.
+        let scope = install_scope(&new_graph, pkgs);
         let progress = crate::sandbox_progress::SandboxProgress::new(
             self.ctx.op_tracker(),
-            Some(install_scope(&new_graph, pkgs)),
-        );
+            Some(scope.clone()),
+        )
+        .with_fetch_record(self.fetch_record(&new_graph, &scope));
         let (log_tx, log_rx) = futures::channel::mpsc::unbounded();
         let build = async {
             // Reduce the `!Send` error (`mctx::Error` holds nickel `Rc`s) to a
@@ -1095,6 +1119,43 @@ impl SessionChannel {
             pkgs.iter().map(|t| t.0).collect::<Vec<_>>().join(", ")
         );
         self.graph = new_graph;
+    }
+
+    /// NET-080: the context this install's fetches are recorded under — the
+    /// box the install was made for, the leaf this daemon's own fetches
+    /// leave from (where it stands in one), the host the daemon fetches the
+    /// configured remote cache from, and each package in the install's scope
+    /// spelled the way `min search` spells it, with its upstream version
+    /// when the graph knows one.
+    fn fetch_record(
+        &self,
+        graph: &Graph,
+        scope: &HashSet<String>,
+    ) -> crate::sandbox_progress::FetchRecord {
+        let objects = scope
+            .iter()
+            .map(|name| {
+                let spelled = graph
+                    .by_name(name)
+                    .and_then(|bsr| graph.get(bsr))
+                    .and_then(|build| build.upstream_version())
+                    .map_or_else(
+                        || name.clone(),
+                        |version| format!("{name} (version {version})"),
+                    );
+                (name.clone(), spelled)
+            })
+            .collect();
+        crate::sandbox_progress::FetchRecord {
+            box_id: self.box_id.clone(),
+            leaf: crate::net::classifier::daemon_fetch_leaf(Path::new(
+                sandbox2::classifier::TREE_ROOT,
+            )),
+            cache_host: crate::net::classifier::cache_host(
+                &self.ctx.daemon_context().config().remote_cache_url(),
+            ),
+            objects,
+        }
     }
 
     /// Implements `min search <term>`.
@@ -2198,6 +2259,7 @@ mod tests {
             home: DaemonAbsPath::try_new(Utf8PathBuf::try_from(home.path().to_path_buf()).unwrap())
                 .unwrap(),
             has_packages: HashSet::new(),
+            box_id: "a session in a test".to_string(),
             ot: None,
             session: crate::session::WeakSessionHandle::dangling(),
             runtime_env: RuntimeEnv::default(),
