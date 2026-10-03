@@ -27,7 +27,14 @@
 //! The gate is not a second TCP/IP stack. It parses nothing above the
 //! Ethernet header, and that only to summarize a frame for the shared verdict
 //! (`sessions::core::egress` — the same pure decision the in-guest relay
-//! applies, made here where nothing inside the VM can change it). It forwards
+//! applies, made here where nothing inside the VM can change it), with one
+//! addition this module owns: the shared refusal classifier
+//! (`switch::refusal`) reads a first packet's L4 addressing so the gate can
+//! *answer* it — a bare SYN or UDP datagram toward a registered box address
+//! at a port that row does not publish is refused with the shared reset or
+//! port-unreachable (NET-014's connection-refused, made here), never a stack
+//! of the gate's own: the reply is the shared builder's bytes and the line
+//! the shared emitter's format, the third of its four callers. It forwards
 //! the gvproxy upgrade head verbatim, then relays both ways: guest → switch
 //! through the verdict, per source address; switch → guest applied to nothing
 //! — ingress policy is the *target* box's and is decided in the guest, so
@@ -96,6 +103,21 @@
 //! flooding distinct spoofed addresses cannot turn the throttling into
 //! host-memory growth.
 //!
+//! The one thing the gate writes back toward the guest is a refusal, and it
+//! is the target's fact, not the sender's: a *first packet* — a bare SYN, or
+//! any UDP datagram — toward a registered box address at a port that row's
+//! publication does not name is answered with the shared reset or
+//! port-unreachable, and consumed by its answer (NET-014: the sender learns
+//! *refused* instead of timing out against a switch that has nothing to
+//! say). It is decided only after the frame's own egress was admitted, so
+//! the two silence classes keep their silence — a source no namespace holds
+//! and a frame a box's rules deny are drops, not refusals, whatever the
+//! destination they name — and it is bounded twice: per source, by the
+//! shared emitter's window, and per relay, by the channel the replies ride
+//! ([`REFUSAL_CHANNEL_CAPACITY`]), dropped at the edge so a guest that
+//! floods first packets while reading nothing can never wedge the egress
+//! leg that answered it.
+//!
 //! Two destinations are refused before any row's rules are read, for every
 //! row and in every phase: the switch's own address, a control surface and
 //! not a destination a box's rules decide (`egress-switch-control-surface`,
@@ -138,10 +160,13 @@ use sessions::core::switch_request::{
     self, Applied, MAX_REQUEST_RECORDS, Record, Refusal, SwitchRequest, SwitchRow, SwitchTable,
     SwitchVerb,
 };
+use switch::refusal;
 use switch::{DEFAULT_MTU, RESERVED_LOCAL_RANGE, SwitchSubnet};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::box_registry::{BoxRecord, BoxTable};
@@ -318,6 +343,22 @@ const DROP_WARN_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// before the fallback is taken, so a flood that has ended restores
 /// per-source lines within one interval.
 const DROP_WARN_MAX_TRACKED_PAIRS: usize = 1024;
+
+/// How many refusal replies one relay's writer will hold queued toward the
+/// guest: the bound that keeps a refusal from ever stalling the egress leg
+/// that decided it. A reply is written back to the same guest connection the
+/// refused frame arrived on, and the guest is the side this gate exists to
+/// contain — a process inside the VM that floods first packets at unpublished
+/// ports and never reads its socket would otherwise wedge the relay's own
+/// egress on the reply it had just been handed, holding every honest frame
+/// behind it. Past the bound a reply is dropped, never queued: the writer
+/// drains at the guest's own pace, the per-source quota of the shared audit
+/// ([`refusal::RefusalEmitter`]) is what keeps a well-behaved source's
+/// refusals inside it, and a flooder degrades to the timeout the reply
+/// replaced while nobody else does. The daemon's own relay legs carry the
+/// same bound under the same name
+/// (`RESET_CHANNEL_CAPACITY`, `crates/minimald/src/net/switch.rs`).
+const REFUSAL_CHANNEL_CAPACITY: usize = 256;
 
 /// The rule name for NET-081's failure case: a frame whose source address no
 /// published namespace holds and the phase leaves nothing to admit — an
@@ -831,6 +872,14 @@ impl EgressGate {
         // One limiter for the whole gate: a guest that reconnects must not
         // reset the rate window its drops are counted in.
         let limiter = Arc::new(DropLimiter::new());
+        // One shared refusal audit for the whole gate, beside the limiter,
+        // for the same reason: the per-source windows a connection's
+        // refusals are charged against are the gate's facts, not the
+        // connection's — a guest that reconnects must not get its quota
+        // back. This is the third of the four callers the shared builder
+        // serves (`crates/switch/src/refusal.rs`): every refusal this gate
+        // writes — and the line it says — comes from it.
+        let refusals = Arc::new(refusal::RefusalEmitter::default());
         // One publish ledger for the whole gate, beside the limiter: the
         // address a listener's publish was applied at is a fact of the gate,
         // not of the connection that carried it — the publish and the
@@ -844,6 +893,7 @@ impl EgressGate {
                 pins,
                 baseline,
                 limiter,
+                refusals,
                 forwards,
                 HANDSHAKE_TIMEOUT,
                 phase,
@@ -954,9 +1004,9 @@ impl AcceptFailure {
 #[expect(
     clippy::too_many_arguments,
     reason = "the source, the switch socket, the table, the DNS admission table, the \
-              baseline, the limiter, the publish ledger, the bound and the phase are \
-              each a distinct input to every relay the loop spawns; grouping them \
-              would name the bundle without naming the members"
+              baseline, the limiter, the refusals, the publish ledger, the bound and \
+              the phase are each a distinct input to every relay the loop spawns; \
+              grouping them would name the bundle without naming the members"
 )]
 async fn accept_loop<A: GuestSource>(
     mut source: A,
@@ -965,6 +1015,7 @@ async fn accept_loop<A: GuestSource>(
     pins: dns_pins::DnsPins,
     baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
+    refusals: Arc<refusal::RefusalEmitter>,
     forwards: Arc<PublishedForwards>,
     handshake_timeout: Duration,
     phase: UnregisteredSourcePhase,
@@ -1031,6 +1082,7 @@ async fn accept_loop<A: GuestSource>(
             pins.clone(),
             baseline.clone(),
             Arc::clone(&limiter),
+            Arc::clone(&refusals),
             Arc::clone(&forwards),
             handshake_timeout,
             phase,
@@ -1056,9 +1108,9 @@ async fn accept_loop<A: GuestSource>(
 #[expect(
     clippy::too_many_arguments,
     reason = "the two sockets, the table, the DNS admission table, the baseline, the \
-              limiter, the publish ledger, the drain bound and the phase are each a \
-              distinct input to what one connection does; grouping them would name \
-              the bundle without naming the members"
+              limiter, the refusals, the publish ledger, the drain bound and the phase \
+              are each a distinct input to what one connection does; grouping them \
+              would name the bundle without naming the members"
 )]
 async fn serve_connection(
     mut guest: UnixStream,
@@ -1067,6 +1119,7 @@ async fn serve_connection(
     pins: dns_pins::DnsPins,
     baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
+    refusals: Arc<refusal::RefusalEmitter>,
     forwards: Arc<PublishedForwards>,
     handshake_timeout: Duration,
     phase: UnregisteredSourcePhase,
@@ -1153,6 +1206,7 @@ async fn serve_connection(
                 pins,
                 baseline,
                 limiter,
+                refusals,
                 phase,
             )
             .await;
@@ -1200,11 +1254,28 @@ fn refuse_head(limiter: &DropLimiter, refused: &RefusedHead) {
 /// class the host's own decision is made from: the DNS replies the switch
 /// returns toward a box, which [`crate::net::dns_pins`] pins from
 /// ([`relay_switch_frames_to_guest`]).
+///
+/// The one thing written back toward the guest on the frame stream is a
+/// refusal: a first packet toward a registered box address at a port that
+/// row does not publish, answered by the host — with the shared reset for a
+/// SYN, the shared port-unreachable for a datagram, and the shared audit
+/// line ([`refuse_unpublished_port`], NET-014 outside the VM) — so a box
+/// whose sibling publishes nothing at a port learns *refused* at the gate
+/// instead of timing out against the switch. The reply travels by a
+/// **bounded** channel ([`REFUSAL_CHANNEL_CAPACITY`]) that the egress leg
+/// feeds and the relay's own writer task drains: the guest is the side this
+/// gate exists to contain, so the leg that decides frames must never be
+/// held up on writing back to a guest that will not read. The channel is
+/// the daemon's own reset channel's shape
+/// (`spawn_relay`, `crates/minimald/src/net/switch.rs`): dropped at the
+/// bound, never queued, with the per-source quota of the shared audit
+/// keeping a well-behaved source's refusals inside it.
 #[expect(
     clippy::too_many_arguments,
     reason = "the relay's full state in one place: both directions' halves, the \
               deciding table, the DNS admission table and the node-plane baseline \
-              set, the limiter, and the phase — splitting it would hide one of them"
+              set, the limiter, the shared refusal audit, and the phase — \
+              splitting it would hide one of them"
 )]
 async fn relay_frames(
     guest: Prefixed<OwnedReadHalf>,
@@ -1215,16 +1286,27 @@ async fn relay_frames(
     pins: dns_pins::DnsPins,
     baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
+    refusals: Arc<refusal::RefusalEmitter>,
     phase: UnregisteredSourcePhase,
 ) {
+    // The guest's write half is shared by the two tasks that write to it:
+    // the ingress leg, delivering the switch's frames, and the relay's own
+    // refusal writer, delivering the replies the egress leg's refusals
+    // handed it. One brief lock per write, exactly the share the daemon's
+    // relay legs give their reset writer.
+    let guest_tx = Arc::new(AsyncMutex::new(guest_tx));
+    let (replies, replies_rx) = mpsc::channel(REFUSAL_CHANNEL_CAPACITY);
+    let writer = tokio::spawn(write_refusals(replies_rx, Arc::clone(&guest_tx)));
     let mut ingress = tokio::spawn(relay_switch_frames_to_guest(
         switch_rx,
-        guest_tx,
+        Arc::clone(&guest_tx),
         table.clone(),
         pins.clone(),
         Arc::clone(&limiter),
     ));
-    let egress = relay_guest_to_switch(guest, switch_tx, table, pins, baseline, limiter, phase);
+    let egress = relay_guest_to_switch(
+        guest, switch_tx, table, pins, baseline, limiter, refusals, replies, phase,
+    );
     tokio::pin!(egress);
     // The two legs race, because neither can see the other's end. The egress
     // leg blocks on the guest, which has no reason to speak while it is idle,
@@ -1263,8 +1345,37 @@ async fn relay_frames(
         },
     }
     // The leg that lost the race is torn down with the relay, not left to
-    // hold what the guest or the switch end of it was holding.
+    // hold what the guest or the switch end of it was holding — and the
+    // refusal writer with them: its channel's senders all went when the
+    // egress leg did, but a writer still parked on a write the guest will
+    // never read holds the write half, and the relay is what ends.
     ingress.abort();
+    writer.abort();
+}
+
+/// Writes the relay's refusal replies to the guest, framed the way every
+/// frame leaves a relay: 2-byte little-endian length, then the frame —
+/// one combined write, so the prefix and the reply stay together even if
+/// the guest closes between two writes. Ends when the egress leg that feeds
+/// the channel ends, or on the first write the guest's end refuses: the
+/// relay's teardown is the legs' to drive, and a writer that cannot write
+/// only ever meant the refusals were not being delivered — the per-source
+/// quota had bounded what any source was owed anyway.
+///
+/// The channel is bounded ([`REFUSAL_CHANNEL_CAPACITY`]): the writer drains
+/// it at the guest's own pace, and the gate — never this task — decides
+/// what a full bound costs (a dropped reply, never a queued one).
+async fn write_refusals(
+    mut replies: mpsc::Receiver<Vec<u8>>,
+    guest: Arc<AsyncMutex<OwnedWriteHalf>>,
+) -> io::Result<()> {
+    while let Some(frame) = replies.recv().await {
+        let mut framed = Vec::with_capacity(2 + frame.len());
+        framed.extend_from_slice(&(frame.len() as u16).to_le_bytes());
+        framed.extend_from_slice(&frame);
+        guest.lock().await.write_all(&framed).await?;
+    }
+    Ok(())
 }
 
 /// One control request on a connection, decided before any of it is written
@@ -2255,7 +2366,7 @@ async fn copy_switch_to_guest(
 )]
 async fn relay_switch_frames_to_guest(
     mut switch: OwnedReadHalf,
-    mut guest: OwnedWriteHalf,
+    guest: Arc<AsyncMutex<OwnedWriteHalf>>,
     table: BoxTable,
     pins: dns_pins::DnsPins,
     limiter: Arc<DropLimiter>,
@@ -2292,11 +2403,12 @@ async fn relay_switch_frames_to_guest(
             pins.observe_reply(&table, &pkt, datagram, &limiter, Instant::now());
         }
         // One combined write keeps the length prefix and the frame together
-        // even if the guest closes between two writes.
+        // even if the guest closes between two writes — through the lock the
+        // relay's refusal writer shares this half by.
         let mut framed = Vec::with_capacity(2 + n);
         framed.extend_from_slice(&(n as u16).to_le_bytes());
         framed.extend_from_slice(&frame[..n]);
-        guest.write_all(&framed).await?;
+        guest.lock().await.write_all(&framed).await?;
     }
 }
 
@@ -2307,6 +2419,13 @@ async fn relay_switch_frames_to_guest(
 /// addresses it carried go to the table as a withdrawal report **and** to
 /// the DNS admission table as a retire, and the relay's outcome is passed
 /// through.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the two socket halves, the table, the DNS admission table, the baseline, \
+              the limiter, the shared refusal audit, the relay's reply channel and \
+              the phase are each a distinct input to the relay this owns the exit \
+              of; grouping them would name the bundle without naming the members"
+)]
 async fn relay_guest_to_switch(
     mut guest: Prefixed<OwnedReadHalf>,
     mut switch: OwnedWriteHalf,
@@ -2314,6 +2433,8 @@ async fn relay_guest_to_switch(
     pins: dns_pins::DnsPins,
     baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
+    refusals: Arc<refusal::RefusalEmitter>,
+    replies: mpsc::Sender<Vec<u8>>,
     phase: UnregisteredSourcePhase,
 ) -> io::Result<()> {
     // Every admitted frame's source, deduplicated: the attribution this
@@ -2328,6 +2449,8 @@ async fn relay_guest_to_switch(
         &pins,
         &baseline,
         &limiter,
+        &refusals,
+        &replies,
         phase,
         &mut attributed,
     )
@@ -2361,16 +2484,26 @@ async fn relay_guest_to_switch(
 /// says so once per source address per rule per interval, so a flood inside
 /// the VM produces a steady, readable account of what the host is dropping
 /// rather than a log flood.
+///
+/// The one admitted frame that is not written on is the refused one: a
+/// first packet toward a registered box address at a port that row does not
+/// publish ([`refuse_unpublished_port`]), answered back to the guest with
+/// the shared reset or port-unreachable instead of travelling — the
+/// connection-refused a sender otherwise times out waiting for (NET-014),
+/// decided by the host's own table where nothing inside the VM can change
+/// it. The frame is consumed by its answer: it does not pass, it is not
+/// attributed, and the interim has nothing to warn about, because nothing
+/// was admitted past the gate.
 #[expect(
     clippy::indexing_slicing,
     reason = "every `frame[..n]` is bounded by the `n > frame.len()` rejection above"
 )]
 #[expect(
     clippy::too_many_arguments,
-    reason = "the two socket halves, the table, the DNS admission table, the baseline, the \
-              limiter, the phase and the attribution are each a distinct input to every \
-              frame the loop decides; grouping them would name the bundle without naming \
-              the members"
+    reason = "the two socket halves, the table, the DNS admission table, the baseline, \
+              the limiter, the shared refusal audit, the reply channel, the phase and \
+              the attribution are each a distinct input to every frame the loop \
+              decides; grouping them would name the bundle without naming the members"
 )]
 async fn relay_frames_to_switch(
     guest: &mut Prefixed<OwnedReadHalf>,
@@ -2379,6 +2512,8 @@ async fn relay_frames_to_switch(
     pins: &dns_pins::DnsPins,
     baseline: &NodePlaneBaseline,
     limiter: &DropLimiter,
+    refusals: &refusal::RefusalEmitter,
+    replies: &mpsc::Sender<Vec<u8>>,
     phase: UnregisteredSourcePhase,
     attributed: &mut Vec<[u8; 4]>,
 ) -> io::Result<()> {
@@ -2433,6 +2568,20 @@ async fn relay_frames_to_switch(
                 continue;
             }
         };
+        // The one admitted frame that does not travel: a first packet
+        // toward a registered box address at a port that row does not
+        // publish is answered here, by the host, with the shared reset or
+        // port-unreachable — and the frame is consumed by its answer, so
+        // the check sits before the interim's line and the attribution
+        // below, both of which speak of traffic that passed.
+        if let Some(reply) = refuse_unpublished_port(&frame[..n], table, refusals) {
+            // Bounded, and dropped at the edge rather than queued: the
+            // relay's writer drains it at the guest's own pace, and a
+            // guest that floods first packets while reading nothing
+            // degrades to the timeout the reply replaced.
+            let _ = replies.try_send(reply);
+            continue;
+        }
         // The interim's admit is the one admission that owes a line: no row
         // bounded this frame, and the host must be able to see that it passed.
         if let GateAdmit::Unregistered { src } = admitted {
@@ -2821,6 +2970,75 @@ impl GateDrop {
             Self::Infrastructure { .. } => INFRASTRUCTURE_RULE,
             Self::UnknownSource { .. } => UNKNOWN_SOURCE_RULE,
             Self::SwitchControlSurface { .. } => SWITCH_CONTROL_RULE,
+        }
+    }
+}
+
+/// The reply one **admitted** frame is refused with at the host gate: a
+/// first packet — a bare SYN, or any UDP datagram — toward a registered box
+/// address at a port that row's publication does not name
+/// ([`BoxRecord::admitted_ports`]), answered with the shared reset for the
+/// SYN and the shared port-unreachable for the datagram (NET-014, the
+/// connection-refused a sender otherwise times out waiting for — decided
+/// here, against the host's own table, where nothing inside the VM can
+/// change it). `None` — the frame travels, decided by nothing here — for
+/// every frame that is not that shape: a segment the shared classifier
+/// cannot read, a segment that is not a first packet (a reset, established
+/// traffic, teardown: all traffic a stateless gate holds no state to refuse
+/// with, and answering which is how a reset loop starts), a destination no
+/// published namespace holds — the switch's own address included, the
+/// resolver's and the box egress proxy's with it — and a port the target's
+/// row does publish.
+///
+/// The third of the shared builder's four callers
+/// (`crates/switch/src/refusal.rs`): the reply is the shared crate's own
+/// bytes, and the line is the shared emitter's own format — the same
+/// builder, per-source bound and one-line-per-window cadence the daemon's
+/// two legs and the stack peer answer by, so a diagnostic bundle's log tail
+/// reads one voice whichever side refused the connection.
+///
+/// Build before charging, the discipline the daemon's own refusal keeps: a
+/// frame the gate can build no reply for is answered with nothing, and a
+/// refusal that writes no reply spends no quota and says no line — a
+/// source's window is spent only on the refusals it was actually answered.
+fn refuse_unpublished_port(
+    frame: &[u8],
+    table: &BoxTable,
+    refusals: &refusal::RefusalEmitter,
+) -> Option<Vec<u8>> {
+    let segment = refusal::classify(frame)?;
+    if !segment.is_first_packet() {
+        return None;
+    }
+    // The destination's own publication decides: only a registered box
+    // address is refused here, and only at a port its row does not name —
+    // the frame was the source's to send (the verdict admitted it), and
+    // the refusal is the target's to make.
+    let row = table.by_source(segment.dst.ip().octets())?;
+    if row.admitted_ports().contains(&segment.dst.port()) {
+        return None;
+    }
+    // Build before charging: a frame too short for the builder to answer is
+    // the source's malformed traffic, not a refusal it is owed.
+    let reply = if segment.is_tcp() {
+        refusal::refused_tcp_reset(frame, &segment)?
+    } else {
+        refusal::refused_udp_port_unreachable(frame, &segment)?
+    };
+    match refusals.refuse(
+        &refusal::Refusal {
+            class: refusal::UNPUBLISHED_PORT,
+            source: *segment.src.ip(),
+            address: *segment.dst.ip(),
+            about: refusal::About::Port(segment.dst.port()),
+        },
+        Instant::now(),
+    ) {
+        refusal::Outcome::Suppressed => None,
+        refusal::Outcome::Quiet => Some(reply),
+        refusal::Outcome::Emit(line) => {
+            tracing::warn!("{line}");
+            Some(reply)
         }
     }
 }
@@ -3744,13 +3962,14 @@ mod tests {
     use sessions::EgressPolicy;
     use sessions::core::egress::{DropReason, FrameFamily, FrameVerdict, Ipv4Cidr};
     use switch::SwitchSubnet;
+    use switch::refusal;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::mpsc;
 
     use super::test_support::{
-        CaptureWriter, DEADLINE, arp_frame, capture_log, connect_control, connect_over,
+        CaptureWriter, DEADLINE, QUIET, arp_frame, capture_log, connect_control, connect_over,
         expect_frame, expect_silence, expect_teardown, gate_connected, gate_connected_with_phase,
         gate_over, gate_over_control, gate_over_with, gate_over_with_node_baseline,
         gate_over_with_phase, ipv4_frame, ipv6_frame, read_within, send_frame, wait_for_log,
@@ -3773,6 +3992,12 @@ mod tests {
     /// The lease of the one published box below: the one source its frames
     /// may carry.
     const LEASE: [u8; 4] = [100, 64, 0, 9];
+
+    /// Two sibling boxes beside the target, and one whose own rules deny it
+    /// the reach the siblings have — the senders of the refusal test below.
+    const PEER: [u8; 4] = [100, 64, 0, 10];
+    const OTHER: [u8; 4] = [100, 64, 0, 11];
+    const STRICT: [u8; 4] = [100, 64, 0, 12];
 
     /// A box that may reach `10.0.0.0/8` over TCP and nothing else — the
     /// declaration the host-side rules below are compiled from.
@@ -3855,6 +4080,268 @@ mod tests {
             "one drop line per source address per rule per interval, got: {}",
             h.log.contents()
         );
+    }
+
+    /// An Ethernet II + IPv4 + TCP segment from `src`:`sport` to `dst`:`dport`
+    /// carrying `flags` and `seq` — the frame the shared classifier reads and
+    /// the shared reset builder answers. Checksums are zeroed: nothing on the
+    /// refusal path reads them; the builders answer the frame's own
+    /// addressing, numbers and flags alone.
+    fn tcp_segment(
+        src: [u8; 4],
+        sport: u16,
+        dst: [u8; 4],
+        dport: u16,
+        flags: u8,
+        seq: u32,
+    ) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(14 + 20 + 20);
+        frame.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x01]); // dst MAC
+        frame.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x02]); // src MAC
+        frame.extend_from_slice(&0x0800u16.to_be_bytes()); // EtherType: IPv4
+        frame.extend_from_slice(&[0x45, 0, 0, 0]); // version 4, IHL 5
+        frame.extend_from_slice(&[0; 4]); // id, flags+offset
+        frame.push(64); // TTL
+        frame.push(6); // protocol: TCP
+        frame.extend_from_slice(&[0; 2]); // checksum (unchecked)
+        frame.extend_from_slice(&src);
+        frame.extend_from_slice(&dst);
+        frame.extend_from_slice(&sport.to_be_bytes());
+        frame.extend_from_slice(&dport.to_be_bytes());
+        frame.extend_from_slice(&seq.to_be_bytes()); // sequence
+        frame.extend_from_slice(&0u32.to_be_bytes()); // acknowledgement
+        frame.push(0x50); // data offset 5, reserved
+        frame.push(flags);
+        frame.extend_from_slice(&[0; 2]); // window
+        frame.extend_from_slice(&[0; 2]); // checksum (unchecked)
+        frame.extend_from_slice(&[0; 2]); // urgent pointer
+        frame
+    }
+
+    /// An Ethernet II + IPv4 + UDP datagram from `src`:`sport` to `dst`:`dport`
+    /// carrying its whole 8-byte header — the shape the shared classifier
+    /// reads a datagram as, and the one the port-unreachable quotes.
+    fn udp_datagram(src: [u8; 4], sport: u16, dst: [u8; 4], dport: u16) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(14 + 20 + 8);
+        frame.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x01]); // dst MAC
+        frame.extend_from_slice(&[0x52, 0x54, 0x00, 0x00, 0x00, 0x02]); // src MAC
+        frame.extend_from_slice(&0x0800u16.to_be_bytes()); // EtherType: IPv4
+        frame.extend_from_slice(&[0x45, 0, 0, 0]); // version 4, IHL 5
+        frame.extend_from_slice(&[0; 4]); // id, flags+offset
+        frame.push(64); // TTL
+        frame.push(17); // protocol: UDP
+        frame.extend_from_slice(&[0; 2]); // checksum (unchecked)
+        frame.extend_from_slice(&src);
+        frame.extend_from_slice(&dst);
+        frame.extend_from_slice(&sport.to_be_bytes());
+        frame.extend_from_slice(&dport.to_be_bytes());
+        frame.extend_from_slice(&8u16.to_be_bytes()); // length: the header alone
+        frame.extend_from_slice(&[0; 2]); // checksum (unchecked)
+        frame
+    }
+
+    /// Reads one length-framed frame from the guest end within [`DEADLINE`] —
+    /// the shape a refusal's reply arrives in, written by the relay's own
+    /// writer task, failing the test when the timeout passes first.
+    async fn expect_reply(guest: &mut UnixStream) -> Vec<u8> {
+        let mut len_buf = [0u8; 2];
+        read_within(guest, &mut len_buf).await;
+        let n = u16::from_le_bytes(len_buf) as usize;
+        assert!(n > 0, "a zero-length reply claim is not a frame");
+        let mut frame = vec![0u8; n];
+        read_within(guest, &mut frame).await;
+        frame
+    }
+
+    /// After a marker frame has proved the gate decided everything before it,
+    /// asserts nothing came back to the guest: the frames this gate drops are
+    /// answered with nothing (NET-062), and so are the ones it merely relays.
+    async fn expect_no_reply(guest: &mut UnixStream) {
+        let mut buf = [0u8; 1];
+        match tokio::time::timeout(QUIET, guest.read(&mut buf)).await {
+            Ok(Ok(0)) => panic!("the guest end closed; the gate's relay is down"),
+            Ok(Ok(n)) => panic!(
+                "{n} byte(s) came back to the guest after the marker: a frame \
+                 the gate does not answer was answered"
+            ),
+            Ok(Err(e)) => panic!("reading the guest end failed: {e}"),
+            // Quiet for the window: nothing was written back.
+            Err(_) => {}
+        }
+    }
+
+    /// NET-014, outside the VM: a first packet toward a registered box
+    /// address at a port its row does not publish is answered by the host
+    /// gate itself — a SYN with the shared reset, a datagram with the shared
+    /// port-unreachable — so the sender learns *refused* instead of timing
+    /// out against the switch, and every refusal is the shared crate's:
+    /// byte for byte the shared builders' reply, and the shared emitter's
+    /// one line per source per window. The frames the gate answers with
+    /// nothing keep their silence: a source that belongs to no box, and a
+    /// frame a box's own egress rules deny, still drop where they stand — a
+    /// drop is not a reset (NET-062) — even when the destination they name is
+    /// the very port a registered sibling was just refused at.
+    #[tokio::test]
+    async fn host_gate_resets_syn_to_unadmitted_port() {
+        let registry = BoxRegistry::new(SUBNET);
+        // The target: a published box whose row names one port.
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
+        // A sibling with no declared egress — allow-all, the shipped default —
+        // whose frame the sibling's own publication refuses.
+        registry.register(BoxRegistration::new(
+            "peer",
+            Ipv4Addr::from(PEER),
+            Ipv4Addr::LOCALHOST,
+        ));
+        // A second sibling, for the datagram: the emitter's rows are per
+        // source, and a second sender is a second line.
+        registry.register(BoxRegistration::new(
+            "other",
+            Ipv4Addr::from(OTHER),
+            Ipv4Addr::LOCALHOST,
+        ));
+        // And one whose own rules deny the same destination — the frame the
+        // silent class below is made of.
+        registry.register(
+            BoxRegistration::new("strict", Ipv4Addr::from(STRICT), Ipv4Addr::LOCALHOST)
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                    allow_dns_hosts: None,
+                    deny_subnets: None,
+                }),
+        );
+        let mut h = gate_over(registry).await;
+
+        // A bare SYN to the box's address at a port its row does not publish:
+        // answered with the shared reset, byte for byte the shared builder's
+        // reply to the same frame.
+        let syn = tcp_segment(PEER, 40000, LEASE, 9999, refusal::TCP_SYN, 12345);
+        let segment = refusal::classify(&syn).expect("the test's SYN classifies");
+        send_frame(&mut h.guest, &syn).await;
+        let answered = expect_reply(&mut h.guest).await;
+        assert_eq!(
+            answered,
+            refusal::refused_tcp_reset(&syn, &segment).expect("the shared builder answers the SYN"),
+            "the reset the guest receives is the shared builder's, byte for byte"
+        );
+        // And the refused SYN never travels: the marker after it is the first
+        // thing the switch sees.
+        let marker = tcp_segment(PEER, 40001, [10, 1, 2, 3], 80, refusal::TCP_SYN, 7);
+        send_frame(&mut h.guest, &marker).await;
+        let seen = expect_frame(&mut h.switch).await;
+        assert_eq!(
+            seen, marker,
+            "the refused SYN never reached the switch; the marker after it did"
+        );
+        expect_silence(&mut h.switch).await;
+
+        // The refusal says the shared emitter's line: rule, address, port,
+        // reason, source and the count of replies this window — the one audit
+        // format every leg's log tail carries.
+        wait_for_log(&h.log, "no ingress mapping").await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains(
+                "rule_matched=\"no ingress mapping\" address=100.64.0.9 port=9999 \
+                 reason=\"no listener is published for the port\" source=100.64.0.10 \
+                 refusals=1"
+            ),
+            "the refusal line is the shared format, naming rule, address, port, reason, \
+             source and count, got: {logged}"
+        );
+
+        // A second SYN from the same source, inside the same window: answered,
+        // and silent — one line per window, never one per reset.
+        let second = tcp_segment(PEER, 40002, LEASE, 9999, refusal::TCP_SYN, 99);
+        send_frame(&mut h.guest, &second).await;
+        expect_reply(&mut h.guest).await;
+        assert_eq!(
+            h.log.contents().matches("no ingress mapping").count(),
+            1,
+            "the window says its line once, not once per reply, got: {}",
+            h.log.contents()
+        );
+
+        // A SYN at the port the row *does* publish travels, and nothing comes
+        // back for it: the target's published ingress is the target's to
+        // receive.
+        let published = tcp_segment(PEER, 40003, LEASE, 8080, refusal::TCP_SYN, 5);
+        send_frame(&mut h.guest, &published).await;
+        let seen = expect_frame(&mut h.switch).await;
+        assert_eq!(
+            seen, published,
+            "a SYN at a published port travels to the switch as it was sent"
+        );
+        expect_no_reply(&mut h.guest).await;
+
+        // A segment that is not a first packet travels too: a stateless gate
+        // refuses what it holds no state for and answers nothing else, so a
+        // connection's established traffic is the target's, never a reset
+        // loop of the host's making.
+        let established = tcp_segment(PEER, 40004, LEASE, 9999, refusal::TCP_ACK, 200);
+        send_frame(&mut h.guest, &established).await;
+        let seen = expect_frame(&mut h.switch).await;
+        assert_eq!(
+            seen, established,
+            "established traffic to the unpublished port is the target's to answer"
+        );
+        expect_no_reply(&mut h.guest).await;
+
+        // A UDP datagram at such a port: the shared port-unreachable, byte for
+        // byte, from a second source — and its own line, because the emitter's
+        // rows are per source.
+        let datagram = udp_datagram(OTHER, 40005, LEASE, 7777);
+        let datagram_segment =
+            refusal::classify(&datagram).expect("the test's datagram classifies");
+        send_frame(&mut h.guest, &datagram).await;
+        let answered = expect_reply(&mut h.guest).await;
+        assert_eq!(
+            answered,
+            refusal::refused_udp_port_unreachable(&datagram, &datagram_segment)
+                .expect("the shared builder answers the datagram"),
+            "the port-unreachable the guest receives is the shared builder's, byte for byte"
+        );
+        wait_for_log(&h.log, "source=100.64.0.11").await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains(
+                "rule_matched=\"no ingress mapping\" address=100.64.0.9 port=7777 \
+                 reason=\"no listener is published for the port\" source=100.64.0.11 \
+                 refusals=1"
+            ),
+            "the datagram's refusal line names its own source, got: {logged}"
+        );
+        expect_no_reply(&mut h.guest).await;
+
+        // A frame whose source belongs to no box: dropped where it stands,
+        // nothing written back — the gate's own drop, not a refusal, even
+        // though the destination is the same unpublished port the registered
+        // sibling was refused at.
+        let foreign = tcp_segment([203, 0, 113, 7], 40006, LEASE, 9999, refusal::TCP_SYN, 11);
+        send_frame(&mut h.guest, &foreign).await;
+        send_frame(&mut h.guest, &marker).await;
+        let seen = expect_frame(&mut h.switch).await;
+        assert_eq!(
+            seen, marker,
+            "the unknown-source SYN never reached the switch; the marker did"
+        );
+        expect_no_reply(&mut h.guest).await;
+
+        // And a frame a box's own egress rules deny: the same silence — the
+        // verdict's drop, not a reset, whatever the destination names.
+        let denied = tcp_segment(STRICT, 40007, LEASE, 9999, refusal::TCP_SYN, 13);
+        send_frame(&mut h.guest, &denied).await;
+        send_frame(&mut h.guest, &marker).await;
+        let seen = expect_frame(&mut h.switch).await;
+        assert_eq!(
+            seen, marker,
+            "the egress-denied SYN never reached the switch; the marker did"
+        );
+        expect_no_reply(&mut h.guest).await;
     }
 
     /// The switch's own address is a control surface, not a destination a
@@ -6067,6 +6554,7 @@ mod tests {
             dns_pins::DnsPins::new(SUBNET),
             NodePlaneBaseline::built_in(SUBNET),
             Arc::new(DropLimiter::new()),
+            Arc::new(refusal::RefusalEmitter::default()),
             Arc::new(PublishedForwards::new()),
             bound,
             UNREGISTERED_SOURCE_PHASE,
@@ -6152,6 +6640,7 @@ mod tests {
             dns_pins::DnsPins::new(SUBNET),
             NodePlaneBaseline::built_in(SUBNET),
             Arc::new(DropLimiter::new()),
+            Arc::new(refusal::RefusalEmitter::default()),
             Arc::new(PublishedForwards::new()),
             bound,
             UNREGISTERED_SOURCE_PHASE,
@@ -6236,6 +6725,7 @@ mod tests {
                 dns_pins::DnsPins::new(SUBNET),
                 NodePlaneBaseline::built_in(SUBNET),
                 Arc::new(DropLimiter::new()),
+                Arc::new(refusal::RefusalEmitter::default()),
                 Arc::new(PublishedForwards::new()),
                 bound,
                 UNREGISTERED_SOURCE_PHASE,
@@ -6315,6 +6805,7 @@ mod tests {
             dns_pins::DnsPins::new(SUBNET),
             NodePlaneBaseline::built_in(SUBNET),
             Arc::new(DropLimiter::new()),
+            Arc::new(refusal::RefusalEmitter::default()),
             Arc::new(PublishedForwards::new()),
             HANDSHAKE_TIMEOUT,
             UNREGISTERED_SOURCE_PHASE,
@@ -6567,6 +7058,7 @@ mod tests {
                 dns_pins::DnsPins::new(SUBNET),
                 NodePlaneBaseline::built_in(SUBNET),
                 Arc::new(DropLimiter::new()),
+                Arc::new(refusal::RefusalEmitter::default()),
                 Arc::new(PublishedForwards::new()),
                 bound,
                 UNREGISTERED_SOURCE_PHASE,
