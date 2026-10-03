@@ -76,6 +76,12 @@ fn load_or_create_daemon_identity(identity_dir: &DaemonAbsPath) -> std::io::Resu
         file.sync_all()?;
     }
     std::fs::rename(&tmp, &path)?;
+    // Sync the parent so the renamed entry itself survives a power loss.
+    // Best effort: the identity is already in place for this start, and a
+    // failure here only risks a new identity after a crash.
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+    }
     Ok(identity)
 }
 
