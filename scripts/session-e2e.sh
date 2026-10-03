@@ -6740,115 +6740,166 @@ proof_switch_steers_proxy_mac_frames_to_the_host_stack() {
   fi
 
   # When we can run, the test is identical in shape to the own-IP proof: boot an
-  # own-address box and, from inside it, send an Ethernet frame addressed to the
-  # proxy MAC. Because the box has no raw socket privileges (NET-083), we instead
-  # route to the proxy's address: the in-box stack emits the frame with the right
-  # destination MAC and source MAC derived from the box's lease. A TCP SYN to the
-  # proxy address on an unlistened port proves the frame reached the peer (it
-  # returns a TCP RST) and that the answer comes back to this box only (no other
-  # guest sees it). The RST is what the BepHost unit test already pins; here we
-  # prove the end-to-end path through the switch handles the proxy MAC correctly.
-  local bep_sid bep_ip proxy_ip proxy_mac
+  # own-address box and, from inside it, reach the proxy's address on the
+  # switch. Because the box has no raw socket privileges (NET-083), the frame is
+  # the in-box stack's own: the ARP exchange gives it the destination MAC, the
+  # lease the source MAC. What the case reads back is that the frame reached the
+  # host stack peer and its answer returned to this box only. NET-134 narrowed
+  # the credentialed lane to the peer's one listener — every other frame to the
+  # proxy's address is dropped at the gate by design, so no other port there can
+  # answer, let alone reset — and NET-132 left the listener's real acceptor to a
+  # later task: without MINVMD_BEP_STUB nothing binds the acceptor's socket and
+  # the pool resets the connection it just accepted, the acceptor-down answer, a
+  # race no case can read. So this case runs its daemon under the stand-in,
+  # whose one answer line names the source it was presented from, exactly as
+  # the proxy-source case below does, and reads two facts: the answer line —
+  # the frame reached the peer's pool and the delivery came back to this box —
+  # and the ARP entry the resolution left, which must name the peer's MAC, not
+  # the gateway's.
+  local bep_sid bep_ip proxy_ip proxy_mac proxy_port bep_sock sock_wait bep_mac_seen
   proxy_ip="100.64.255.252"
   proxy_mac="52:54:00:40:ff:fc"
+  proxy_port="8118"
+
+  # The stand-in is a daemon-side flag: the daemon this case's activation
+  # autospawns must inherit it, so stop whatever daemon an earlier case left
+  # on this host — both of the pair, the session daemon `mnl stop` reaches
+  # and, on a VM lane, the host daemon `minvmd stop`, the one whose
+  # environment the flag must reach — and let the activation below spawn one
+  # carrying it, the same discipline the proxy-source and credentialed-lane
+  # cases use. Every exit drops the flag again (bep_mac_fail below and the OK
+  # tail), so no later case's autospawn inherits it; the daemon this case
+  # leaves does carry it, and of the cases that reuse that daemon the ARP
+  # one probes this address on a port its missing lane drops at the gate,
+  # before the pool the stand-in stands behind, while the github-only case's
+  # fetches never touch the listener.
+  mnl stop --force >/dev/null 2>&1 || true
+  if [ -n "$E2E_VM" ]; then
+    minvmd stop >/dev/null 2>&1 || true
+  fi
+  export MINVMD_BEP_STUB=1
 
   BEP_SEED_DIR="$(hook_mktemp /tmp/mnlbep.XXXXXX)"
   hook_seed_preamble > "$BEP_SEED_DIR/minimal.toml"
   mkdir "$BEP_SEED_DIR/.git"
 
+  # Every failure path below: drop the flag this case exported, then the
+  # seed dir, then the global diagnostics.
+  bep_mac_fail() {
+    unset MINVMD_BEP_STUB
+    rm -rf "$BEP_SEED_DIR"
+    BEP_SEED_DIR=""
+    fail
+  }
+
   # The lane is the precondition, not the subject: NET-134 made the proxy's
   # address reachable only from a credentialed lane — a box that declares no
   # upstream has every frame to it dropped at the host-side gate — so this
-  # case's SYN would die at the gate and never reach the peer whose steering
-  # the case exists to prove. Declaring the upstream buys the frame its
-  # passage to the switch; the MAC the frame carries is what the case reads.
+  # case's connection would die at the gate and never reach the peer whose
+  # steering the case exists to prove. Declaring the upstream buys the frame
+  # its passage to the switch; the MAC the frame carries is what the case
+  # reads.
   bep_sid="$(cd "$BEP_SEED_DIR" && mnl session activate . --no-prompt \
     --name e2e-bep-mac --network own_ip --credentialed-upstream \
     2>"$WORK/bep-mac.err")" || {
     echo "::error::'min session activate --network own_ip --credentialed-upstream' failed for BEP MAC test"
     cat "$WORK/bep-mac.err" 2>/dev/null || true
-    rm -rf "$BEP_SEED_DIR"
-    BEP_SEED_DIR=""
-    fail
+    bep_mac_fail
   }
   bep_sid="$(printf '%s\n' "$bep_sid" | tail -n1 | tr -d '\r')"
 
   if ! mnl session exec "$bep_sid" sh -c 'cat /proc/net/dev' >"$WORK/bep-dev.out" 2>"$WORK/bep-dev.err"; then
     echo "::error::could not read /proc/net/dev from the own-IP box"
     cat "$WORK/bep-dev.err" 2>/dev/null || true
-    rm -rf "$BEP_SEED_DIR"
-    BEP_SEED_DIR=""
-    fail
+    bep_mac_fail
   fi
   if [ "$(grep -c ':' "$WORK/bep-dev.out")" -lt 2 ]; then
     echo "::error::own-IP box has no tap interface; the switch did not attach"
     cat "$WORK/bep-dev.out"
-    rm -rf "$BEP_SEED_DIR"
-    BEP_SEED_DIR=""
-    fail
+    bep_mac_fail
   fi
 
-  # The box's lease address — the source the SYN below carries. A session
-  # rootfs has no iproute2, so it is read from /proc/net/fib_trie (every
-  # local address sits on a `|-- A.B.C.D` line followed by `/32 host LOCAL`)
-  # and parsed here on the host, like the own-IP proof reads its facts.
+  # The box's lease address — the source the connection below carries. A
+  # session rootfs has no iproute2, so it is read from /proc/net/fib_trie
+  # (every local address sits on a `|-- A.B.C.D` line followed by
+  # `/32 host LOCAL`) and parsed here on the host, like the own-IP proof
+  # reads its facts.
   if ! mnl session exec "$bep_sid" sh -c 'cat /proc/net/fib_trie' >"$WORK/bep-fib.out" 2>"$WORK/bep-fib.err"; then
     echo "::error::could not read /proc/net/fib_trie from the own-IP box"
     cat "$WORK/bep-fib.err" 2>/dev/null || true
-    rm -rf "$BEP_SEED_DIR"
-    BEP_SEED_DIR=""
-    fail
+    bep_mac_fail
   fi
   bep_ip="$(awk '/\|--/ { addr = $2 }
                  /\/32 host LOCAL/ && addr !~ /^127\./ { print addr; exit }' "$WORK/bep-fib.out")"
   if [ -z "$bep_ip" ]; then
     echo "::error::could not determine the own-IP box's switch address from /proc/net/fib_trie"
     echo "--- fib_trie ---"; cat "$WORK/bep-fib.out" 2>/dev/null || true
-    rm -rf "$BEP_SEED_DIR"
-    BEP_SEED_DIR=""
-    fail
+    bep_mac_fail
   fi
 
-  # RST proves the peer received the frame and answered; a non-RST fast refusal
-  # would mean the switch dropped or mis-routed it. socat carries the probe: it
-  # is a launcher baseline package every box ships at /usr/bin, and a connect
-  # the peer resets fails at once with "Connection refused" on its stderr,
-  # while a dropped SYN runs into connect-timeout.
+  # socat carries the probe: it is a launcher baseline package every box ships
+  # at /usr/bin, and the one address the credentialed lane admits is the
+  # listener's, so the probe connects there — nowhere else at the proxy's
+  # address can answer under NET-134, and the lane's own case below pins that
+  # silence separately.
   mnl session exec "$bep_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 || {
     echo "::error::the session has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"
-    rm -rf "$BEP_SEED_DIR"
-    BEP_SEED_DIR=""
-    fail
+    bep_mac_fail
   }
-  # The reset alone does not prove the steer: a reset from the gateway's own
-  # stack would read the same. The ARP entry the SYN left behind names the MAC
-  # the frame went to, so the proof reads it from the same box after the probe
-  # and requires the peer's MAC, not the gateway's.
+
+  # The stand-in's socket, the flag's receipt on the filesystem: assert it
+  # before the probe, so a daemon that came up without the flag fails here
+  # naming the cause instead of in a blank probe answer below.
+  bep_sock="$XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-bep.sock"
+  sock_wait=0
+  until [ -S "$bep_sock" ]; do
+    sock_wait=$((sock_wait + 1))
+    if [ "$sock_wait" -gt 15 ]; then
+      echo "::error::the host daemon bound no stand-in socket at $bep_sock — this case's activation autospawned a daemon that did not carry MINVMD_BEP_STUB"
+      bep_mac_fail
+    fi
+    sleep 1
+  done
+
+  # The probe: the connection to the listener is accepted by the peer's pool,
+  # dialled through to the stand-in with this boot's token, and the acceptor's
+  # one answer line travels back to this box — so the probe must print that
+  # line on the box's stdout, where the greps below read it: socat's left
+  # address is an empty pipe and `-t 10` holds the connection open for the
+  # answer, the same shape the proxy-source case's probes use. The ARP entry
+  # the resolution left is read from the same box in the same exec, one more
+  # fact on the same stdout.
   mnl session exec "$bep_sid" \
-    "/usr/bin/socat /dev/null TCP:$proxy_ip:443,connect-timeout=5 2>/tmp/bep-mac-probe.err; cat /tmp/bep-mac-probe.err >&2; cat /proc/net/arp" \
-    >"$WORK/bep-mac-arp.out" 2>"$WORK/bep-mac-probe.err" || true
-  local bep_mac_seen
-  bep_mac_seen="$(awk -v ip="$proxy_ip" '$1 == ip { print $4; exit }' "$WORK/bep-mac-arp.out")"
-  if grep -q "Connection refused" "$WORK/bep-mac-probe.err" && [ "$bep_mac_seen" = "$proxy_mac" ]; then
-    echo "BEP MAC test OK: TCP SYN from $bep_ip to $proxy_ip went to $proxy_mac, reached the host stack peer and returned RST"
-  elif [ -n "$bep_mac_seen" ] && [ "$bep_mac_seen" != "$proxy_mac" ]; then
-    echo "::error::TCP SYN from $bep_ip to $proxy_ip went to $bep_mac_seen, not the peer's $proxy_mac; the switch did not steer the proxy-MAC frame"
-    cat "$WORK/bep-mac-probe.err" 2>/dev/null || true
-    rm -rf "$BEP_SEED_DIR"
-    BEP_SEED_DIR=""
-    fail
-  else
-    echo "::error::TCP SYN from $bep_ip to $proxy_ip did not produce a RST; proxy-MAC frame may not have reached the peer"
-    cat "$WORK/bep-mac-probe.err" 2>/dev/null || true
-    rm -rf "$BEP_SEED_DIR"
-    BEP_SEED_DIR=""
-    fail
+    "printf '' | /usr/bin/socat -t 10 - TCP:$proxy_ip:$proxy_port,connect-timeout=15; cat /proc/net/arp" \
+    >"$WORK/bep-mac-answer.out" 2>"$WORK/bep-mac-probe.err" || true
+  if ! grep -q -- "source=$bep_ip:" "$WORK/bep-mac-answer.out"; then
+    echo "::error::the peer's listener did not answer a line naming the box's own switch address ($bep_ip) — the proxy-MAC frame did not complete a delivered connection to the host stack peer"
+    echo "--- answer ---"; cat "$WORK/bep-mac-answer.out" 2>/dev/null || true
+    echo "--- stderr ---"; cat "$WORK/bep-mac-probe.err" 2>/dev/null || true
+    bep_mac_fail
+  fi
+  if ! grep -q -- "destination=$proxy_ip:$proxy_port" "$WORK/bep-mac-answer.out"; then
+    echo "::error::the answer does not name the proxy's address $proxy_ip:$proxy_port as the destination"
+    echo "--- answer ---"; cat "$WORK/bep-mac-answer.out" 2>/dev/null || true
+    bep_mac_fail
+  fi
+  # The answer alone does not prove the steer: an answer relayed from the
+  # gateway's own stack would read the same. The ARP entry the connection's
+  # resolution left names the MAC the frame went to, so the proof reads it
+  # from the same box after the probe and requires the peer's MAC, not the
+  # gateway's.
+  bep_mac_seen="$(awk -v ip="$proxy_ip" '$1 == ip { print $4; exit }' "$WORK/bep-mac-answer.out")"
+  if [ "$bep_mac_seen" != "$proxy_mac" ]; then
+    echo "::error::the proxy's address resolved to '${bep_mac_seen:-<no entry>}' not the peer's $proxy_mac; the frame went to another stack, or the switch answered resolution itself"
+    cat "$WORK/bep-mac-answer.out" 2>/dev/null || true
+    bep_mac_fail
   fi
 
   mnl session destroy --force "$bep_sid" >/dev/null 2>&1 || true
   rm -rf "$BEP_SEED_DIR"
   BEP_SEED_DIR=""
-  echo "switch steers proxy-MAC frames to the host stack peer OK"
+  unset MINVMD_BEP_STUB
+  echo "BEP MAC test OK: TCP from $bep_ip to $proxy_ip:$proxy_port resolved to $proxy_mac, reached the host stack peer and its answer came back"
   echo "::endgroup::"
 }
 
@@ -7845,10 +7896,11 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
   # carrying it. "Whatever daemon" is both, the pair teardown stops: the
   # session daemon `min stop` reaches — and, on a VM lane, the host daemon
   # `minvmd stop` does, which is the one whose environment the flag must
-  # reach. The MAC, ARP and github_only_allowlist cases above leave a
-  # minvmd running with no stub flag, an autospawn that finds it serves
-  # this case's boxes with no stand-in at the socket, and the case dies in
-  # a box's blank answer instead of naming the cause.
+  # reach. The MAC, ARP and github_only_allowlist cases above leave a minvmd
+  # running — the MAC case's carrying the stand-in flag its own probes read,
+  # the others carrying none — so an autospawn that finds whichever is there
+  # serves this case's boxes with a leftover's wiring; stop both, and the
+  # activation below spawns this case's own carrying the flag.
   mnl stop --force >/dev/null 2>&1 || true
   if [ -n "$E2E_VM" ]; then
     minvmd stop >/dev/null 2>&1 || true
@@ -8142,9 +8194,9 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
   # stdout, where the greps below read it: socat's left address is an empty
   # pipe and `-t 10` holds the connection open for the answer once that pipe
   # reaches EOF, the same shape the hostname-proxy case's bogus-head probe
-  # uses. A `/dev/null` left address — the shape the MAC and ARP cases use,
-  # which need only a RST and socat's stderr — would hand the answer to
-  # /dev/null and leave this case's greps with nothing to read.
+  # uses. A `/dev/null` left address — the shape the ARP case above uses,
+  # which reads only the ARP entry its connect leaves behind — would hand the
+  # answer to /dev/null and leave this case's greps with nothing to read.
   mnl session exec "$bepb_sid_a" 'test -x /usr/bin/socat' >/dev/null 2>&1 || {
     echo "::error::box A has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"
     bep_fail
