@@ -1238,12 +1238,15 @@ async fn host_hook() -> Hook {
 /// interim ends with (design §7.1: one command, one privilege elevation,
 /// for one host's configuration).
 ///
-/// The steps, in the order they run: `set -e;` first — the lines a heredoc
-/// ends are separate commands, no `&&` joins them to what follows, so a
-/// step that fails must stop the script itself: without it a write that
-/// does not land is skipped past, `launchctl bootstrap` loads a unit whose
-/// files are half written, and the command reports success. Then make the
-/// three directories the files live in (`mkdir -p` because a stock host
+/// The steps, in the order they run: `set -e;` first, and every step its own
+/// statement — separated by `;`, or by the newline a heredoc ends — never by
+/// `&&`: POSIX ignores `-e` for every command of an `&&` list except its
+/// last, so a `mkdir` or `printf` that failed inside one would short-circuit
+/// its list silently and the script would run on — the plist landing beside
+/// a resolver file that did not, `launchctl bootstrap` loading the stale
+/// program, and the command exiting 0 over a host it half-configured. As
+/// statements, the first step that fails stops the script itself. Then make
+/// the three directories the files live in (`mkdir -p` because a stock host
 /// has no `/etc/resolver` until the first hook and no [`RANGE_PROGRAM_DIR`]
 /// either, and a re-run must not die on `File exists`), write the resolver
 /// file, then write the unit's program and its plist **from the bytes this
@@ -1272,17 +1275,17 @@ pub(crate) fn macos_command(port: u16) -> String {
     let program = range_program();
     format!(
         "sudo sh -c 'set -e; mkdir -p /etc/resolver {RANGE_PROGRAM_DIR} {RANGE_PLIST_DIR} \
-         && printf \"nameserver 127.0.0.1\\nport {port}\\n\" > {RESOLVER_FILE} \
-         && cat > {RANGE_PROGRAM_PATH} <<\\{RANGE_PROGRAM_HEREDOC}\n\
+         ; printf \"nameserver 127.0.0.1\\nport {port}\\n\" > {RESOLVER_FILE} \
+         ; cat > {RANGE_PROGRAM_PATH} <<\\{RANGE_PROGRAM_HEREDOC}\n\
 {program}\
 {RANGE_PROGRAM_HEREDOC}\n\
 cat > {RANGE_PLIST_PATH} <<\\{RANGE_PLIST_HEREDOC}\n\
 {RANGE_UNIT_PLIST}\
 {RANGE_PLIST_HEREDOC}\n\
 chown root:wheel {RANGE_PROGRAM_PATH} {RANGE_PLIST_PATH} \
-         && chmod 0755 {RANGE_PROGRAM_PATH} && chmod 0644 {RANGE_PLIST_PATH} \
-         && (launchctl bootout system/{RANGE_UNIT_LABEL} 2>/dev/null || true) \
-         && launchctl bootstrap system {RANGE_PLIST_PATH}'"
+         ; chmod 0755 {RANGE_PROGRAM_PATH} ; chmod 0644 {RANGE_PLIST_PATH} \
+         ; (launchctl bootout system/{RANGE_UNIT_LABEL} 2>/dev/null || true) \
+         ; launchctl bootstrap system {RANGE_PLIST_PATH}'"
     )
 }
 
@@ -2479,14 +2482,28 @@ mod tests {
             sh_parses(payload),
             "the payload the root shell runs must parse: {payload}"
         );
-        // Fail closed inside the one command: the lines a heredoc ends are
-        // separate commands, nothing joins them to the steps after, so the
-        // payload opens with `set -e;` — a write that does not land stops the
-        // script before `launchctl bootstrap` loads a half-written unit, and
-        // the command reports failure rather than success.
+        // Fail closed inside the one command: the payload opens with
+        // `set -e;`, and every step is its own statement — separated by `;`
+        // or by the newline a heredoc ends — because POSIX ignores `-e` for
+        // every command of an `&&` list except its last: a `mkdir` or
+        // `printf` that failed inside one would short-circuit its list
+        // silently and the script would run on, the plist landing beside a
+        // resolver file that did not, `launchctl bootstrap` loading the
+        // stale program, and the command exiting 0 over a host it
+        // half-configured. As statements, the first failure stops the
+        // script before any later step runs. The one compound statement is
+        // the guarded boot-out, whose `|| true` is what makes it guarded —
+        // and that is an OR-list, never an `&&`.
         assert!(
             payload.starts_with("set -e;"),
             "the inner script fails closed — its first step is set -e: {payload}"
+        );
+        let bootout = format!("(launchctl bootout system/{RANGE_UNIT_LABEL} 2>/dev/null || true)");
+        assert!(
+            !payload.replace(&bootout, "").contains("&&"),
+            "no step hides inside an && list, where set -e reaches only the \
+             last command — the payload separates its steps, so the first \
+             failure stops the script: {payload}"
         );
         // The steps outside the two bodies substitute nothing — no `$`, no
         // backtick — and the bodies themselves are quoted-delimiter
@@ -2523,7 +2540,6 @@ mod tests {
         // the label collision — then the new one is bootstrapped into the
         // system domain, which runs the program now and registers
         // RunAtLoad to re-apply the range at every boot after.
-        let bootout = format!("(launchctl bootout system/{RANGE_UNIT_LABEL} 2>/dev/null || true)");
         let bootout_at = command.find(&bootout).expect("the boot-out step is named");
         let bootstrap = format!("launchctl bootstrap system {RANGE_PLIST_PATH}");
         let bootstrap_at = command
