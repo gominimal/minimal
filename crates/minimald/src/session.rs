@@ -2409,9 +2409,10 @@ impl Session {
             Some(session_host::AskAnswer::Allowed) => {
                 self.publish_exposed_port(&ask.record, ask.port).await
             }
-            // The human said deny — or left the dialog any of the ways that
-            // mean deny (cancel, EOF, a client that walked away): the box's
-            // own deny answer, now in the human's hand.
+            // The human said deny — or keyed a cancel (Ctrl-C, `q`, Escape),
+            // which means the same thing: the box's own deny answer, now in
+            // the human's hand. An input EOF is not this — a client that
+            // went away did not answer — so it lands on the `None` below.
             Some(session_host::AskAnswer::Refused) => {
                 Err(crate::net::policy::ExposeFailure::Refused(
                     crate::net::policy::ExposeRefusal::DeniedByPolicy,
@@ -2420,8 +2421,10 @@ impl Session {
             // Nobody was attached to answer (NET-045's unwanted branch) — no
             // binding to render the dialog, or one that ended mid-dialog
             // without the human choosing, its reply sender dropped unsent: a
-            // shed, a teardown, the host going away. The typed refusal,
-            // decided by the daemon, because there was no human deciding.
+            // shed, a teardown, the host going away, an input EOF (the
+            // client's channel going away with the dialog standing). The
+            // typed refusal, decided by the daemon, because there was no
+            // human deciding.
             None => Err(crate::net::policy::ExposeFailure::Refused(
                 crate::net::policy::ExposeRefusal::AskNeedsAnswer,
             )),

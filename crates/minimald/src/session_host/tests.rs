@@ -4183,6 +4183,129 @@ async fn expose_ask_superseded_mid_dialog_is_the_daemons_refusal() {
     );
 }
 
+/// A client that goes away mid-dialog is the daemon's refusal, not the
+/// human's deny (the review thread on `ask_prompt`): `async-dialog` reports
+/// an input EOF as the same `Selection::Cancelled` a keyed Ctrl-C produces,
+/// and the arm that read both as the human's own deny recorded a denial no
+/// human made. Under a raw `ssh -tt` tty no keystroke produces channel EOF,
+/// so EOF means the connection or client went away — a terminal that can no
+/// longer carry the dialog. Here the dialog is up and the client's channel
+/// reaches EOF under it: the ask ends with the typed nobody-is-attached
+/// refusal, the switch is asked nothing, and the decision is audited as the
+/// daemon's, exactly one record for it — because no human answered. A keyed
+/// cancel stays the human's own deny; [`expose_ask_human_deny_refused`]
+/// proves that half.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_ask_client_eof_mid_dialog_is_the_daemons_refusal() {
+    let capture = captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (web, handle) = dynamic_ingress_box(
+        &server,
+        &mut client,
+        "web",
+        Some(sessions::DynamicIngress::Ask),
+        Some((3000, 3999)),
+    )
+    .await;
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    // Attach the human the ask will be routed to, and prove the binding is
+    // live before asking: the mock shell's echo round-trips through it.
+    let mut channel = client.open_shell(web).await;
+    channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+    let mut live = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Data { data }) => {
+                    live.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&live).contains("got:hello") {
+                        return;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("the channel closed before the shell came up"),
+            }
+        }
+    })
+    .await
+    .expect("the attached shell should echo within the bound");
+
+    // Ask off the test's own task: the reply waits on the human.
+    let asked = tokio::spawn(async move { handle.expose_dynamic(3000).await });
+
+    // The dialog has to be up before the client goes away, so the EOF lands
+    // inside it.
+    let rendered = await_ask_prompt(&mut channel).await;
+    let rendered = String::from_utf8_lossy(&rendered);
+    assert!(
+        rendered.contains("web asks to publish port 3000"),
+        "the dialog's lead-in names the box and the port: {rendered}"
+    );
+
+    // The client's channel reaches EOF with the dialog standing — what a
+    // connection or client that went away looks like from the binding's side.
+    channel.eof().await.unwrap();
+
+    // The ask ends with the daemon's typed nobody-is-attached refusal — not
+    // the human's deny an input EOF used to be answered with.
+    let refused = tokio::time::timeout(Duration::from_secs(30), asked)
+        .await
+        .expect("a dialog whose client went away must end the ask, not park it")
+        .expect("the spawned request should not panic")
+        .expect_err("an input EOF mid-dialog fails the ask closed");
+    match refused {
+        crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::AskNeedsAnswer,
+        ) => {}
+        other => panic!("the EOF's refusal is the typed nobody-is-attached error: {other:?}"),
+    }
+    forwarder.abort();
+    assert!(
+        served.lock().expect("served lock").is_empty(),
+        "an ask nobody answered asks the switch nothing"
+    );
+
+    // The prompt says its line, and the refusal is logged as the daemon's
+    // fail-closed decision — not the human's, which is what an input EOF used
+    // to be recorded as.
+    let log = capture.contents();
+    assert!(
+        log.contains("asking the attached client to allow a runtime port publish"),
+        "the prompt the human saw says its line: {log}"
+    );
+    assert!(
+        log.contains("outcome=\"refused\"") && log.contains("decided_by=daemon"),
+        "the refusal is logged as the daemon's fail-closed decision: {log}"
+    );
+
+    // And exactly one audit record (NET-046) for the decision, naming the
+    // daemon as the decider — because the human the dialog was for never
+    // answered.
+    let records = audit_records(&server.state.minimal_state_dir().await).await;
+    assert_eq!(records.len(), 1, "one ask is one decision: {records:?}");
+    assert_eq!(records[0]["box"], "web");
+    assert_eq!(records[0]["port"], 3000);
+    assert_eq!(records[0]["decision"], "ask");
+    assert_eq!(
+        records[0]["decided_by"], "daemon",
+        "a dialog whose client went away is the daemon's decision: {records:?}"
+    );
+    assert_eq!(records[0]["outcome"], "refused");
+    assert_eq!(
+        records[0]["reason"], "dynamic ingress is set to ask and nobody is attached to answer",
+        "the audit record carries the typed error the caller read: {records:?}"
+    );
+}
+
 /// NET-045's no-client case against a live host: the box is up and detached
 /// (NET-015), so the refusal has to come from the host that has nobody
 /// attached rather than the no-host shortcut. Attaches, detaches, asks — the

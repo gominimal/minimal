@@ -13,6 +13,8 @@ use std::future::Future;
 use std::io;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::SystemTime;
 use tokio::io::AsyncWriteExt;
 use tokio::io::unix::AsyncFd;
@@ -78,18 +80,66 @@ const ASK_HELD_OUTPUT: usize = 4 * 1024 * 1024;
 /// this host's channel.
 ///
 /// Every answer short of an explicit allow is
-/// [`Refused`](Self::Refused) — a picked deny, a cancel, a client that went
-/// away mid-prompt: an ask never publishes unconfirmed. A dialog that ended
-/// with no answer to give — nobody was attached to give one — carries no
-/// `AskAnswer` at all: the `None` around it is the daemon's fail-closed
-/// refusal, not the human's, and the audit says so.
+/// [`Refused`](Self::Refused) — a picked deny, or a keyed cancel: an ask
+/// never publishes unconfirmed. A client that went away mid-prompt is not an
+/// answer at all: the dialog ends carrying no `AskAnswer`, and the `None`
+/// around it is the daemon's fail-closed refusal, not the human's, and the
+/// audit says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AskAnswer {
     /// The human picked allow: the request proceeds to the publish it came
     /// for.
     Allowed,
-    /// The human picked deny, cancelled, or left: the request fails closed.
+    /// The human picked deny or keyed a cancel: the request fails closed.
     Refused,
+}
+
+/// The ask dialog's input, wrapped so [`Binding::ask_prompt`] can tell an
+/// input EOF from a keyed cancel: `Selection::Cancelled` reports both, and
+/// the two mean different deciders. A keyed cancel — Ctrl-C, `q`, Escape —
+/// is the human's own deny, and stays one. An input EOF is the client's
+/// channel or connection going away with the dialog standing — under a raw
+/// `ssh -tt` tty no keystroke produces it — so it is a terminal that can no
+/// longer carry the dialog, an un-asked ask rather than an answered one. The
+/// wrapper changes nothing about the bytes and records only that: the dialog
+/// reads through it as through the bare channel, and the asking code consults
+/// the flag once the dialog has ended.
+struct AskDialogInput<R> {
+    inner: R,
+    eof: bool,
+}
+
+impl<R> AskDialogInput<R> {
+    /// Wraps the dialog's reader.
+    fn new(inner: R) -> Self {
+        Self { inner, eof: false }
+    }
+
+    /// Whether the wrapped input reached EOF.
+    fn input_eof(&self) -> bool {
+        self.eof
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for AskDialogInput<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let filled = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            // A ready read that moved nothing forward is the reader's EOF —
+            // the `AsyncRead` contract allows a zero only at the end — which
+            // is the one thing this wrapper exists to remember.
+            Poll::Ready(Ok(())) if buf.filled().len() == filled => {
+                this.eof = true;
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
 }
 
 /// How many changed-file rows the shell-exit prompt lists before folding the
@@ -1043,12 +1093,13 @@ impl Binding {
     /// channel halves, offering deny first so that a reflexive Enter — or any
     /// way the dialog can end without an explicit choice — fails the request
     /// closed. Answers with the answer the human gave; `None` when the
-    /// dialog could not be carried — a render or read that failed on I/O —
-    /// which is no answer rather than a deny, so the daemon owns the
-    /// refusal it becomes. An associated fn taking the facts piecewise,
+    /// dialog could not be carried — a render or read that failed on I/O, or
+    /// an input EOF, the client's channel going away with the dialog
+    /// standing — which is no answer rather than a deny, so the daemon owns
+    /// the refusal it becomes. An associated fn taking the facts piecewise,
     /// exactly like [`Self::shell_exit_prompt`], because [`Self::run`]
     /// holds the channel halves as locals.
-    async fn ask_prompt<R, W>(name: &str, port: u16, mut r: R, mut w: W) -> Option<AskAnswer>
+    async fn ask_prompt<R, W>(name: &str, port: u16, r: R, mut w: W) -> Option<AskAnswer>
     where
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
@@ -1070,19 +1121,27 @@ impl Binding {
             // would have given, so nothing publishes because someone held
             // Enter.
             .default(0);
-        match select.interact(&mut r, &mut w).await {
+        // The dialog reads through the EOF-telling wrapper, because
+        // `Selection::Cancelled` says both a keyed cancel and an input EOF,
+        // and the two mean different deciders.
+        let mut r = AskDialogInput::new(r);
+        let keyed = select.interact(&mut r, &mut w).await;
+        match keyed {
             Ok(async_dialog::Selection::At(1)) => Some(AskAnswer::Allowed),
-            // An explicit deny, a cancel (Ctrl-C, `q`, Escape), an EOF from a
-            // client that left mid-prompt: the human's own deny — the
+            // An explicit deny — Enter on the highlighted deny — or a keyed
+            // cancel (Ctrl-C, `q`, Escape): the human's own deny — the
             // fail-closed answer, now in their hand, of an ask that never
             // publishes unconfirmed.
-            Ok(_) => Some(AskAnswer::Refused),
-            // A dialog that could not be carried to the terminal and back —
-            // a render or read that failed on I/O — answered nobody. That
-            // is the daemon's refusal, not the human's deny, so it comes
-            // back as no answer: the dropped reply makes `resume_ask`
-            // record the daemon as the decider.
-            Err(_) => None,
+            Ok(_) if !r.input_eof() => Some(AskAnswer::Refused),
+            // An input EOF is not any of that: under a raw `ssh -tt` tty no
+            // keystroke produces channel EOF, so it means the connection
+            // or the client went away with the dialog standing — a terminal
+            // that can no longer carry it. That, like a render or read that
+            // failed on I/O (the other way this arm is reached), is the
+            // daemon's refusal, not the human's deny, so it comes back as
+            // no answer: the dropped reply makes `resume_ask` record the
+            // daemon as the decider.
+            _ => None,
         }
     }
 
