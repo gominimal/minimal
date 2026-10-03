@@ -498,7 +498,10 @@ impl fmt::Display for ExposeFailure {
                 write!(f, "publishing port {port} failed: {source}")
             }
             Self::RecordUnreadable { port, source } => {
-                write!(f, "reading the session record for port {port} failed: {source}")
+                write!(
+                    f,
+                    "reading the session record for port {port} failed: {source}"
+                )
             }
         }
     }

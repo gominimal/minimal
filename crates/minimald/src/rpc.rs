@@ -880,29 +880,21 @@ async fn serve_get_live_ingress(
                     error: "no session found".to_string(),
                 }),
                 Some(session) => {
-                    // The admitted set the gate is compiled from, by
-                    // transport — an unreadable record reads as "nothing
-                    // admitted", so its mappings all read pending: a row is
-                    // reachable only when the gate is known to admit it.
+                    // The admitted set the gate is compiled from, per
+                    // mapping's transport — an unreadable record reads as
+                    // "nothing admitted", so its mappings all read pending: a
+                    // row is reachable only when the gate is known to admit
+                    // it.
                     let record = session.record().await.ok();
                     let policy = record.as_ref().map(|record| &record.policy);
-                    let tcp_admitted = crate::net::switch::declared_ingress_ports(
-                        policy,
-                        crate::sessions::IpProto::Tcp,
-                    );
-                    let udp_admitted = crate::net::switch::declared_ingress_ports(
-                        policy,
-                        crate::sessions::IpProto::Udp,
-                    );
                     match session.live_ingress().await {
                         Ok(live) => Ok(Errorable::Ok(
-                            live
-                                .into_iter()
+                            live.into_iter()
                                 .map(|mut mapping| {
-                                    let admitted = match mapping.proto {
-                                        crate::sessions::IpProto::Tcp => &tcp_admitted,
-                                        crate::sessions::IpProto::Udp => &udp_admitted,
-                                    };
+                                    let admitted = crate::net::switch::declared_ingress_ports(
+                                        policy,
+                                        mapping.proto,
+                                    );
                                     mapping.pending = !admitted.contains(&mapping.internal_port);
                                     mapping
                                 })

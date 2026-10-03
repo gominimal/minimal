@@ -1536,7 +1536,9 @@ impl SessionChannel {
                     name = %self.name,
                     port = %port,
                     outcome = "refused",
-                    reason = "the session is gone",
+                    // `%format_args!` keeps the reason unquoted, the shape the
+                    // other expose lines print.
+                    reason = %format_args!("the session is gone"),
                     "dynamic ingress expose"
                 );
                 #[expect(
@@ -2414,7 +2416,9 @@ mod tests {
         let records: Vec<std::path::PathBuf> = std::fs::read_dir(&sessions_dir)
             .expect("the state root holds the sessions dir")
             .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
             .map(|entry| entry.path().join("record.json"))
+            .filter(|record| record.is_file())
             .collect();
         assert_eq!(records.len(), 1, "one session, one record: {records:?}");
         std::fs::write(&records[0], "not a record").expect("the record is made unreadable");
@@ -2452,14 +2456,16 @@ mod tests {
                 && expose[0].contains("port=http")
                 && expose[0].contains("outcome=\"refused\"")
                 && expose[0].contains("reason='http' is not a port number"),
-            "the non-numeric port's line names the port as given: {expose[0]}"
+            "the non-numeric port's line names the port as given: {}",
+            expose[0]
         );
         assert!(
             expose[1].contains("name=web")
                 && expose[1].contains("port=3000")
                 && expose[1].contains("outcome=\"refused\"")
                 && expose[1].contains("reason=the session is gone"),
-            "the gone session's line says so: {expose[1]}"
+            "the gone session's line says so: {}",
+            expose[1]
         );
         assert!(
             expose[2].contains("name=recweb")
@@ -2467,7 +2473,8 @@ mod tests {
                 && expose[2].contains("outcome=\"refused\"")
                 && expose[2].contains("reason=reading the session record for port 3000 failed"),
             "the record-read failure's line names the box, whose name the \
-             unreadable record could not: {expose[2]}"
+             unreadable record could not: {}",
+            expose[2]
         );
     }
 

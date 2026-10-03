@@ -2159,7 +2159,10 @@ impl Session {
         let record = match self.record.record().await {
             Ok(record) => record,
             Err(e) => {
-                return Err(crate::net::policy::ExposeFailure::RecordUnreadable { port, source: e })
+                return Err(crate::net::policy::ExposeFailure::RecordUnreadable {
+                    port,
+                    source: e,
+                });
             }
         };
         let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());

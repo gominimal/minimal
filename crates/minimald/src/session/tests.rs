@@ -6011,7 +6011,8 @@ async fn expose_without_published_address_is_not_a_policy_deny() {
             && line.contains("port=3000")
             && line.contains("decision=allow")
             && line.contains("outcome=\"refused\"")
-            && line.contains("reason=this box has no published address on file to expose a port at"),
+            && line
+                .contains("reason=this box has no published address on file to expose a port at"),
         "the line says the decision was allow and the refusal was the missing \
          publish: {line}"
     );
@@ -6097,7 +6098,9 @@ async fn expose_logs_every_path() {
     // also the proof the switch was never asked: a request that reached one
     // would fail with a connection error, not answer as a policy denial.
 
-    // A box whose switch refuses the bind: the publish that failed.
+    // A box whose switch refuses the bind: the publish that failed. The
+    // daemon's switch control socket is one shared path, so the 500 stand-in
+    // takes it over from the 200 one that served the publish above.
     let broken = finalize_dynamic_ingress_session(
         &mut client,
         "broken",
@@ -6116,22 +6119,20 @@ async fn expose_logs_every_path() {
         .ensure_host("tester".to_string())
         .await
         .expect("the broken box launches its host");
-    let (broken_forwarder, broken_served) = fake_forwarder(
-        broken_handle
-            .net_switch()
-            .await
-            .unwrap()
-            .lock()
-            .await
-            .control_socket(),
-        500,
-    )
-    .await;
+    web_forwarder.abort();
+    let broken_sock = broken_handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    std::fs::remove_file(&broken_sock).ok();
+    let (broken_forwarder, broken_served) = fake_forwarder(broken_sock, 500).await;
     match broken_handle.expose_dynamic(3000).await {
         Err(crate::net::policy::ExposeFailure::Publish { port: 3000, .. }) => {}
         other => panic!("a bind the switch refuses fails the publish: {other:?}"),
     }
-    web_forwarder.abort();
     broken_forwarder.abort();
     assert_eq!(
         web_served.lock().expect("served lock").len(),

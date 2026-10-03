@@ -1619,7 +1619,7 @@ mod tests {
         ];
         assert_eq!(
             round_trip(&Errorable::Ok(live.clone())),
-            Errorable::Ok(live)
+            Errorable::Ok(live.clone())
         );
 
         // The reachability half rides the wire by name: a pending publish
