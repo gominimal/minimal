@@ -2840,6 +2840,9 @@ fn gate_verdict(
     if let Some(dst) = summary.destination()
         && dst == table.subnet().box_egress_proxy_address().octets()
     {
+        // minvmd is the crate that sees both spellings of the listener's
+        // port: the switch's listener and the relay leg's triple are one port.
+        const _: () = assert!(egress::PROXY_LISTENER_PORT == switch::bep_host::PROXY_PORT);
         let listener = summary.protocol() == Some(egress::PROXY_LISTENER_PROTOCOL)
             && summary.destination_port() == switch::bep_host::PROXY_PORT;
         return match (record.as_ref(), listener) {
