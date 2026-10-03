@@ -1027,13 +1027,54 @@ fn subtrees_delegated(root: &Path) -> bool {
     })
 }
 
-/// Whether the loaded table's presence marker is there: the directory the
-/// step writes only after its `nft -f` transaction succeeded — the fact
-/// that says the installer ran, and the advisory's; the probe says whether
-/// the refusal it recorded is still in force.
+/// Whether the loaded table's presence marker is there, with the ct-mark
+/// mask it classifies with recorded beside it: the directory the step
+/// writes only after its `nft -f` transaction succeeded, and the record
+/// naming the two bits that transaction rendered — the facts that say the
+/// installer ran and say what it classifies with; the probe says whether
+/// the refusal it recorded is still in force. A marker without its record
+/// is a step that did not finish — the state a failed re-install leaves —
+/// and reads the same as no step at all.
 fn table_marker_present(root: &Path) -> bool {
     root.join(sandbox2::classifier::TABLE_MARKER).is_dir()
+        && recorded_ct_mark_mask(root).is_some()
 }
+
+/// The ct-mark mask the loaded table classifies cohort and node plane
+/// with, as the step recorded it beside the presence marker — the one fact
+/// of the table's classification half a probe with no `CAP_NET_ADMIN` can
+/// read, the way the marker itself is the one fact it can read of the
+/// table's presence. Only the record's prefix is this side's spelling
+/// (scripts/install-host-classifier.sh writes the same one): which two
+/// bits an install chose is the record's to say, never a default this
+/// probe assumes, and an install run with `--ct-mark-mask` is as
+/// installed as one run without. One well-formed value or nothing: a
+/// record that cannot be parsed, or two that disagree, is a step this
+/// probe cannot read the classification of, and an unreadable
+/// classification is no classification.
+fn recorded_ct_mark_mask(root: &Path) -> Option<u32> {
+    let recorded = std::fs::read_dir(root).ok()?;
+    let mut mask = None;
+    for entry in recorded.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(value) = name.strip_prefix(MASK_RECORD_PREFIX) else { continue };
+        let hex = value.strip_prefix("0x")?;
+        let bits = u32::from_str_radix(hex, 16).ok()?;
+        if mask.is_some_and(|other| other != bits) {
+            return None;
+        }
+        mask = Some(bits);
+    }
+    mask
+}
+
+/// The prefix of the ct-mark mask record the privileged step writes beside
+/// the presence marker: a cgroup named `ct-mark-mask-0x…`, its name
+/// carrying the two bits the loaded table classifies with. The step's own
+/// spelling of the same prefix is `MASK_RECORD_PREFIX` in
+/// scripts/install-host-classifier.sh.
+const MASK_RECORD_PREFIX: &str = "ct-mark-mask-";
 
 /// The two source identities the ruleset tests render the installer's
 /// table with: any two distinct addresses would do, and these are the
@@ -1236,8 +1277,17 @@ mod tests {
             .expect("the tree root is a slice below the cgroup2 mount root")
     }
 
+    /// The ct-mark mask the step's default install classifies with, and the
+    /// record name it writes beside the marker: `--print-ruleset` renders
+    /// these two bits, and the daemon's probe reads the record without
+    /// assuming them — a host may have installed with an override.
+    const TEST_CT_MARK_MASK: u32 = 0x3000_0000;
+    const TEST_CT_MARK_RECORD: &str = "ct-mark-mask-0x30000000";
+
     /// The cohort the step installs: both subtrees with their
-    /// delegation-contract files, and the table's marker.
+    /// delegation-contract files, the table's marker, and the ct-mark mask
+    /// recorded beside it — the probe reads both, and a marker without its
+    /// record is a step that did not finish.
     fn installed_cohort(root: &Path) {
         for verdict in [Verdict::Deny, Verdict::Allow] {
             let subtree = root
@@ -1248,6 +1298,8 @@ mod tests {
         }
         std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
             .expect("the step writes the table's marker");
+        std::fs::create_dir_all(root.join(TEST_CT_MARK_RECORD))
+            .expect("the step records the ct-mark mask beside the marker");
     }
 
     fn model_delegation_files(dir: &Path) {
@@ -1327,42 +1379,92 @@ mod tests {
             "the cohort holds the two subtrees and nothing else"
         );
 
-        // The rendered table's postrouting chain is that layout made
-        // real: the cohort's rule keys on `boxes/` — one match level over
-        // both subtrees, covering every box leaf and no node-plane leaf —
-        // with the cohort's identity, and the node plane's keys on the
-        // slice with its own, so the daemon's traffic leaves as the node
-        // plane and a box's leaves as the cohort. The cohort's rule comes
-        // first, because a slice-wide match would otherwise swallow it; the
-        // loopback guard keeps a packet to the answerer, which never
-        // leaves the host, from being rewritten on its own way there. The
-        // identities are the ones the step was told, not ones it guessed:
-        // it refuses to render the pair half-done.
+        // The rendered table's classify chain is that layout made real, at
+        // output's mangle priority — the last place the kernel admits a
+        // socket-cgroup match, which is why the classification lives
+        // there while the postrouting chain translates by its result: the
+        // kernel refuses a socket match at postrouting, so the two
+        // identities were never loadable as one chain. The cohort's rule
+        // keys on `boxes/` — one match level over both subtrees, covering
+        // every box leaf and no node-plane leaf — and marks a new
+        // connection's ct mark with the cohort bit; the node plane's keys
+        // on the slice with the node bit, guarded by the mask so a flow
+        // the boxes rule already classed is never re-decided, because
+        // every box leaf is inside the slice too. Both rules write the
+        // mask's two bits and nothing else (`and ~mask or bit`), so bits
+        // another component of the host classes with survive; the
+        // postrouting chain translates by the mark, never a socket, and
+        // its `lo` guard keeps a packet to the answerer, which never
+        // leaves the host, from being rewritten on its own way there.
+        // The identities and the bits are the ones the step was told and
+        // the ones its default mask chose, not ones it guessed: it
+        // refuses to render half a pair, and refuses a mask that is not
+        // two contiguous bits.
         let rel = tree_root_name();
         let cohort_path = format!("{}/{}", rel, sandbox2::classifier::BOXES_DIR);
         let ruleset = rendered_ruleset();
-        let postrouting = chain_rules(&ruleset, "postrouting");
+        assert!(
+            ruleset.contains("type filter hook output priority mangle"),
+            "the classify chain runs at output's mangle priority, ahead of \
+             the filter chain and of postrouting: the kernel admits a \
+             socket-cgroup match nowhere later: {ruleset}"
+        );
+        let clear = !TEST_CT_MARK_MASK;
+        let cohort_bit = TEST_CT_MARK_MASK & TEST_CT_MARK_MASK.wrapping_neg();
+        let node_bit = TEST_CT_MARK_MASK ^ cohort_bit;
+        let classify = chain_rules(&ruleset, "classify");
         let cohort_rule = format!(
-            "socket cgroupv2 level {} \"{}\" oifname != \"lo\" snat ip to {}",
+            "ct state new socket cgroupv2 level {} \"{}\" ct mark set ct mark and 0x{clear:08x} or 0x{cohort_bit:08x}",
             cohort_path.split('/').count(),
             cohort_path,
-            TEST_COHORT_ADDRESS
         );
         let node_plane_rule = format!(
-            "socket cgroupv2 level {} \"{}\" oifname != \"lo\" snat ip to {}",
+            "ct state new ct mark and 0x{:08x} == 0 socket cgroupv2 level {} \"{}\" \
+             ct mark set ct mark and 0x{clear:08x} or 0x{node_bit:08x}",
+            TEST_CT_MARK_MASK,
             rel.split('/').count(),
             rel,
-            TEST_NODE_PLANE_ADDRESS
+        );
+        assert_eq!(
+            classify.first(),
+            Some(&cohort_rule.as_str()),
+            "the cohort is classed first, on a new connection, by its \
+             subtree at its own level: {classify:?}"
+        );
+        assert_eq!(
+            classify.get(1),
+            Some(&node_plane_rule.as_str()),
+            "the node plane follows, guarded by the mask so the boxes \
+             rule's mark is final: {classify:?}"
+        );
+        assert_eq!(
+            classify.len(),
+            2,
+            "nothing else is classed: no per-box rule, no uid, no pid: {classify:?}"
+        );
+        let postrouting = chain_rules(&ruleset, "postrouting");
+        assert!(
+            !postrouting.iter().any(|rule| rule.contains("socket")),
+            "postrouting translates by the mark: a socket-cgroup match there \
+             is a rule the kernel has never loaded: {postrouting:?}"
+        );
+        let cohort_snat = format!(
+            "ct mark and 0x{:08x} == 0x{cohort_bit:08x} oifname != \"lo\" snat ip to {}",
+            TEST_CT_MARK_MASK, TEST_COHORT_ADDRESS
+        );
+        let node_plane_snat = format!(
+            "ct mark and 0x{:08x} == 0x{node_bit:08x} oifname != \"lo\" snat ip to {}",
+            TEST_CT_MARK_MASK, TEST_NODE_PLANE_ADDRESS
         );
         assert_eq!(
             postrouting.first(),
-            Some(&cohort_rule.as_str()),
-            "the cohort's rule is first, keyed on the cohort at its own level: {postrouting:?}"
+            Some(&cohort_snat.as_str()),
+            "the cohort leaves as its own identity, translated by its bit: {postrouting:?}"
         );
         assert_eq!(
             postrouting.get(1),
-            Some(&node_plane_rule.as_str()),
-            "the node plane's rule follows, keyed on the slice with its own identity: {postrouting:?}"
+            Some(&node_plane_snat.as_str()),
+            "the node plane leaves as its own, translated by its own bit: {postrouting:?}"
         );
         assert_eq!(
             postrouting.len(),
@@ -1590,7 +1692,7 @@ mod tests {
         // conntrack-direction admission, and the one route into the deny
         // chain is the jump the deny subtree's own match makes — an allow
         // box's replies never pass through a chain that could refuse them.
-        for chain in ["output", "dstnat", "postrouting"] {
+        for chain in ["output", "dstnat", "classify", "postrouting"] {
             let rules = chain_rules(&ruleset, chain);
             assert!(
                 rules.iter().all(|rule| !rule.contains("ct direction")),
@@ -1904,6 +2006,47 @@ mod tests {
             "and the guest's subtrees alone do not decide anything per box \
              in it either"
         );
+
+        // The marker's record is the other half of its own fact: the step
+        // writes the ct-mark mask it classifies with beside the marker, so
+        // a marker without its record is a step that did not finish — and
+        // a probe that cannot read the classification reads the step as
+        // not installed, never as installed on the strength of a marker
+        // whose table's bits it cannot name.
+        std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+            .expect("the step writes the table's marker");
+        assert_eq!(
+            decide(root, Some(&mountinfo(root, true)), false, refused_reading).cause(),
+            Some(Cause::StepNotInstalled),
+            "a marker without the recorded mask beside it decides nothing \
+             per box: the step did not finish"
+        );
+        std::fs::create_dir_all(root.join(TEST_CT_MARK_RECORD))
+            .expect("the step records the mask beside the marker");
+        // A record the probe cannot parse is no record: the classification
+        // it would name is unreadable, and an unreadable classification is
+        // not one a verdict can rest on.
+        std::fs::rename(root.join(TEST_CT_MARK_RECORD), root.join("ct-mark-mask-not-a-mask"))
+            .expect("malforming the recorded mask");
+        assert_eq!(
+            decide(root, Some(&mountinfo(root, true)), false, refused_reading).cause(),
+            Some(Cause::StepNotInstalled),
+            "a recorded mask the probe cannot parse is no classification"
+        );
+        std::fs::rename(root.join("ct-mark-mask-not-a-mask"), root.join(TEST_CT_MARK_RECORD))
+            .expect("restoring the recorded mask");
+        // Two records naming different bits are the state a half-finished
+        // re-install leaves, and the one value the table classifies by
+        // cannot be told from either: the step reads as not installed.
+        std::fs::create_dir_all(root.join("ct-mark-mask-0x0000c000"))
+            .expect("a second recorded mask");
+        assert_eq!(
+            decide(root, Some(&mountinfo(root, true)), false, refused_reading).cause(),
+            Some(Cause::StepNotInstalled),
+            "two recorded masks are no mask: the step did not finish"
+        );
+        std::fs::remove_dir_all(root.join("ct-mark-mask-0x0000c000"))
+            .expect("removing the second recorded mask");
 
         // A host with both halves and a table that is refusing decides per
         // box, guest or native: the probe read the effect the marker

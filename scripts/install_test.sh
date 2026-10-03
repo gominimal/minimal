@@ -1561,7 +1561,12 @@ STUB
     # after. The `-f` argument's file is captured whole: the case and the
     # daemon's own ruleset tests read the transaction the step rendered.
     # NFT_FAIL makes the load die, for the case that a failed re-load must
-    # leave no marker behind it.
+    # leave no marker behind it. `list ruleset` serves the listing NFT_RULESET
+    # names, because the step now reads the ruleset it is about to load over
+    # — the scan for a ct-mark user of its bits is a real call, and the
+    # fixture is how a conflict is staged. Any other `list` says absent: no
+    # stand-in kernel holds a table, so the uninstall probes once, skips its
+    # delete, and reports nothing removed.
     nft_calls="$root/nft.calls"; : >"$nft_calls"
     nft_input="$root/nft.input"; : >"$nft_input"
     cat >"$hcbin/nft" <<'STUB'
@@ -1571,8 +1576,10 @@ if [ "$1" = "-f" ] && [ -n "${2:-}" ]; then
     cat "$2" >>"$NFT_INPUT"
     exit "${NFT_FAIL:-0}"
 fi
-# No stand-in kernel holds a table, so `list` says absent: the uninstall
-# probes once, skips its delete, and reports nothing removed.
+if [ "$1" = "list" ] && [ "$2" = "ruleset" ]; then
+    cat "${NFT_RULESET:-/dev/null}"
+    exit 0
+fi
 [ "$1" = "list" ] && exit 1
 exit 0
 STUB
@@ -1589,6 +1596,7 @@ STUB
             NFT_CALLS="$nft_calls" \
             NFT_INPUT="$nft_input" \
             NFT_FAIL="${NFT_FAIL:-0}" \
+            NFT_RULESET="${NFT_RULESET:-}" \
             MINIMAL_OVERRIDE_CGROUP_MOUNTINFO="$mi" \
             bash "$hc" --root "$tree" "$@" </dev/null >"$OUT" 2>&1
         rc=$?
@@ -1746,10 +1754,37 @@ originates is refused" \
         grep -q 'type nat hook output priority dstnat' "$nft_input"
     want_ok "the deny rule refuses actively, never a silent drop" \
         grep -q 'reject with icmpx admin-prohibited' "$nft_input"
-    want_ok "the transaction gives the cohort and the node plane distinct sources, loopback excluded" \
-        grep -q 'level 2 "minimald.slice/boxes" oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
-    want_ok "the node-plane rule follows the cohort rule, loopback excluded too" \
-        grep -q 'level 1 "minimald.slice" oifname != "lo" snat ip to 100.72.0.1' "$nft_input"
+    # NET-078, translated: classification and translation are two chains,
+    # because the kernel admits a socket-cgroup match only before
+    # postrouting — a rule keyed on one there has never been loadable. The
+    # classify chain runs at output's mangle priority, classes only a
+    # connection that is new, and writes only the mask's two bits (the `and
+    # ~mask or bit` shape, so bits another component classes with survive);
+    # the slice's rule is guarded by the mask so it never re-decides a flow
+    # the boxes rule already classed. The postrouting chain reads the mark,
+    # never a socket, and gives the two planes their distinct sources.
+    want_ok "the classify chain runs at output's mangle priority, ahead of the filter" \
+        grep -q 'type filter hook output priority mangle' "$nft_input"
+    want_ok "the cohort is classed by its subtree on a new connection, its bit written" \
+        grep -q 'ct state new socket cgroupv2 level 2 "minimald.slice/boxes" ct mark set ct mark and 0xcfffffff or 0x10000000' "$nft_input"
+    want_ok "the slice's rule is guarded by the mask, so the boxes rule's mark is final" \
+        grep -q 'ct state new ct mark and 0x30000000 == 0 socket cgroupv2 level 1 "minimald.slice" ct mark set ct mark and 0xcfffffff or 0x20000000' "$nft_input"
+    want_err "no postrouting rule matches a socket: the kernel refuses one there" \
+        awk '/chain postrouting \{/ {p = 1; next}
+             p && /^\}/ {exit}
+             p && /socket/ {found = 1}
+             END {exit found ? 0 : 1}' "$nft_input"
+    want_ok "the cohort leaves as its own address, translated by its ct-mark bit, loopback excluded" \
+        grep -q 'ct mark and 0x30000000 == 0x10000000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
+    want_ok "the node plane leaves as its own address, translated by its own bit" \
+        grep -q 'ct mark and 0x30000000 == 0x20000000 oifname != "lo" snat ip to 100.72.0.1' "$nft_input"
+    # The scan is a real decision, not a decoration: the step read the
+    # ruleset it was about to load over, and recorded the two bits it chose
+    # beside the marker the daemon probes.
+    want_ok "the step read the ruleset it loads over, exactly once" \
+        [ "$(grep -c '^list ruleset' "$nft_calls")" -eq 1 ]
+    want_ok "the install records the ct-mark mask beside the marker" \
+        test -d "$tree/ct-mark-mask-0x30000000"
 
     # --- --print-ruleset prints the same transaction the install loaded:
     # the daemon's own ruleset tests read this mode, so the two spellings
@@ -1766,6 +1801,7 @@ originates is refused" \
     want_ok "check names the contract it verified" grep -q "cgroup.threads" "$OUT"
     want_ok "check says what stays root-owned" grep -q "stays root-owned" "$OUT"
     want_ok "check reports the table's marker" grep -q "classifier-table" "$OUT"
+    want_ok "check reports the recorded ct-mark mask" grep -q "ct-mark:  0x30000000" "$OUT"
 
     # --- A re-install whose transaction dies leaves no marker: the step
     # removes it before the load and writes it only after, so the daemon
@@ -1777,8 +1813,10 @@ originates is refused" \
         --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
     check 1 "$rc" "a re-install whose nft transaction dies exits 1"
     want_err "a failed re-load leaves no marker" test -e "$tree/classifier-table"
-    want_ok "the failure says no marker was written" \
-        grep -q "no marker was written" "$OUT"
+    want_err "a failed re-load leaves no ct-mark mask record either" \
+        test -e "$tree/ct-mark-mask-0x30000000"
+    want_ok "the failure says neither the marker nor its record was written" \
+        grep -q "neither the marker nor its ct-mark mask record was written" "$OUT"
     want_ok "the tree itself survives a failed re-load" test -d "$tree/boxes/deny"
     NFT_FAIL=0
     run_hc reloaded "$root/mi-on" --user "$me" \
@@ -1786,6 +1824,72 @@ originates is refused" \
     check 0 "$rc" "the next good re-install exits 0"
     want_ok "the next good re-install restores the marker" \
         test -d "$tree/classifier-table"
+    want_ok "the next good re-install restores the mask record beside it" \
+        test -d "$tree/ct-mark-mask-0x30000000"
+
+    # --- The ct-mark bits are a shared namespace: a component already
+    # classing with one of them would be silently overwritten by the
+    # classify chain (and would overwrite it back), so the step reads the
+    # ruleset it is about to load over and refuses, naming the rule and the
+    # override. The fixture's rule is the stand-in for that component; the
+    # escape is --ct-mark-mask naming bits nobody else classes with, and it
+    # must be recorded, not just rendered.
+    nft_ruleset_fixture="$root/nft-ruleset-conflict"
+    printf 'table inet other_component {\n    chain classify {\n        ct mark set ct mark or 0x10000000\n    }\n}\n' \
+        >"$nft_ruleset_fixture"
+    NFT_RULESET="$nft_ruleset_fixture"
+    run_hc conflict "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 1 "$rc" "the install refuses to load over a ct-mark user of its bits"
+    want_ok "the refusal names the conflicting rule itself" \
+        grep -q 'ct mark set ct mark or 0x10000000' "$OUT"
+    want_ok "the refusal names the override it would take instead" \
+        grep -q -- "--ct-mark-mask <two contiguous bits nothing else classes with>" "$OUT"
+    want_ok "the refusal dies before touching anything: the previous marker \
+still vouches for the table it loaded" \
+        test -d "$tree/classifier-table"
+    run_hc conflict_escaped "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
+        --ct-mark-mask 0x0000c000
+    check 0 "$rc" "an install with non-overlapping bits escapes the conflict"
+    want_ok "the escape renders its own bits, both identities on them" \
+        grep -q 'ct mark and 0x0000c000 == 0x00004000 oifname != "lo" snat ip to 100.72.0.9' "$nft_input"
+    want_ok "the escape records the bits it chose" \
+        test -d "$tree/ct-mark-mask-0x0000c000"
+    want_err "the escape left no record of the refused mask" \
+        test -e "$tree/ct-mark-mask-0x30000000"
+    run_hc conflict_back "$root/mi-on" --user "$me" \
+        --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1
+    check 1 "$rc" "the next default-mask install refuses again"
+    NFT_RULESET=
+
+    # --- --ct-mark-mask is validated before anything is made: exactly two
+    # contiguous set bits inside the 32 a connection mark holds, nothing
+    # else, each refused with the reason. A rule classing on one bit is no
+    # classification of two identities, three is a spelling mistake, two
+    # that are not adjacent is a mis-typed pair, and a bit the kernel cannot
+    # hold is not a mask this step can render. A value that is not
+    # hexadecimal at all is refused for that reason, its own.
+    for bad_mask in 0x10000000 0x70000000 0x50000000 0x100000000 0x0 0x3000000f; do
+        run_hc "bad_mask_$bad_mask" "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
+            --ct-mark-mask "$bad_mask"
+        check 1 "$rc" "--ct-mark-mask $bad_mask is refused"
+        want_ok "the refusal of $bad_mask says what a mask is" \
+            grep -q -- "--ct-mark-mask must name" "$OUT"
+        want_err "the refused mask $bad_mask made nothing" \
+            test -e "$tree/ct-mark-mask-$bad_mask"
+    done
+    for bad_mask in not-hex 30000000 0xzz; do
+        run_hc "bad_mask_$bad_mask" "$root/mi-on" --user "$me" \
+            --cohort-address 100.72.0.9 --node-plane-address 100.72.0.1 \
+            --ct-mark-mask "$bad_mask"
+        check 1 "$rc" "--ct-mark-mask $bad_mask is refused for its spelling"
+        want_ok "the refusal of $bad_mask names the spelling it needs" \
+            grep -q -- "--ct-mark-mask needs a" "$OUT"
+        want_err "the refused mask $bad_mask made nothing" \
+            test -e "$tree/ct-mark-mask-$bad_mask"
+    done
 
     # --- Uninstall: the tree comes away whole — the two subtrees and the
     # table's marker with it — but a leaf the script did not place (a live
@@ -1854,6 +1958,7 @@ originates is refused" \
     want_ok "usage shows the unprivileged --check" grep -q -- "--check" "$OUT"
     want_ok "usage shows the unprivileged --print-ruleset" grep -q -- "--print-ruleset" "$OUT"
     want_ok "usage shows the --pid step" grep -q -- "--pid PID" "$OUT"
+    want_ok "usage shows the ct-mark mask override" grep -q -- "--ct-mark-mask" "$OUT"
 
     # --- Without the rehearsal seam the script demands root, like the other
     # privileged loaders; nothing is created either way.
