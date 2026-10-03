@@ -5030,6 +5030,7 @@ pub(crate) mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
             }),
+            credentialed_upstream: None,
         }
     }
 
