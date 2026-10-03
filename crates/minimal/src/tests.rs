@@ -1154,6 +1154,18 @@ fn task_run_parses_task_keep_and_path() {
     assert_eq!(a.task, "build");
     assert_eq!(a.path.as_deref(), Some("sub/dir"));
 
+    // A declared task arg is a `--<name>` flag; it passes through as-is.
+    let a = run_args(&["min", "task", "run", "greet", "--name", "Alice"]);
+    assert_eq!(a.task, "greet");
+    assert_eq!(a.args, ["--name", "Alice"]);
+
+    // A task arg whose name collides with a `min task run` option (`path`,
+    // `keep`) goes after `--`, which ends `min`'s own options.
+    let a = run_args(&["min", "task", "run", "deploy", "--", "--path", "prod"]);
+    assert_eq!(a.task, "deploy");
+    assert!(a.path.is_none());
+    assert_eq!(a.args, ["--path", "prod"]);
+
     // The task name is required.
     assert!(Cli::try_parse_from(["min", "task", "run"]).is_err());
     assert!(Cli::try_parse_from(["min", "task"]).is_err());

@@ -252,12 +252,19 @@ async fn attach_or_reap<P: Reapable>(
 /// fills with the task's defaults. This mirrors the in-sandbox path in
 /// `mctx::env`, so a task using `%{arg}` resolves the same way whether it
 /// runs in-box or through the daemon.
-fn parse_task_args(task: &mfile::Task, argv: &[String]) -> Result<Option<args::ArgsSet>, String> {
+///
+/// `name` is the task's name, so a usage error shows the command the user
+/// can copy (`min task run <name> --arg <value>`), as `mip run` does.
+fn parse_task_args(
+    name: &str,
+    task: &mfile::Task,
+    argv: &[String],
+) -> Result<Option<args::ArgsSet>, String> {
     if task.args.is_empty() {
         return Ok(None);
     }
     task.args
-        .parse_argv_named("task", argv.iter().cloned())
+        .parse_argv_named(&format!("min task run {name}"), argv.iter().cloned())
         .map(Some)
         .map_err(|e| e.to_string())
 }
@@ -285,8 +292,8 @@ async fn task_producer(
         if let Some(task) = ctx.minimal_file().task(&exec.task)
             && task.action.as_echo().is_some()
         {
-            let parsed_args =
-                parse_task_args(&task, &exec.args).map_err(|e| io::Error::other(e.to_string()))?;
+            let parsed_args = parse_task_args(&exec.task, &task, &exec.args)
+                .map_err(|e| io::Error::other(e.to_string()))?;
             let task = mctx::interpolate_task_strings(&task, parsed_args.as_ref())
                 .map_err(|e| io::Error::other(e.to_string()))?;
             let text = task.action.as_echo().unwrap_or_default().to_string();
@@ -319,8 +326,8 @@ async fn task_producer(
         // is where the schema is first available: the dispatch arm only has
         // the raw argv off the wire. An empty argv still parses, applying
         // the task's defaults — the all-defaults case the issue reports.
-        let parsed_args =
-            parse_task_args(&task, &exec.args).map_err(|e| io::Error::other(e.to_string()))?;
+        let parsed_args = parse_task_args(&exec.task, &task, &exec.args)
+            .map_err(|e| io::Error::other(e.to_string()))?;
         // Values the client resolved against the invoking shell win over the
         // task's own declarations. That is what turns `{ inherit = true }`
         // into something the daemon can apply: resolving it here would read
@@ -3008,8 +3015,10 @@ mod tests {
         /// sequence a task run's client drives, shared by every test here
         /// that execs a task.
         ///
-        /// The mfile holds only `tasks.echo_ok`, whose entire output lives
-        /// in its declaration — no `[upstream]`, package graph, or sandbox:
+        /// The mfile holds only echo tasks — `tasks.echo_ok`, plus
+        /// `tasks.greet`, which declares one defaulted arg — whose entire
+        /// output lives in their declarations: no `[upstream]`, package
+        /// graph, or sandbox:
         /// the echo short-circuit never builds a graph, so nothing here
         /// reaches the (network-bound) package machinery. A task-only mfile
         /// gates nothing, so the loadout composes in one shot, and this
@@ -3037,7 +3046,10 @@ mod tests {
             server
                 .seed_workspace_mfile(
                     session_id,
-                    "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n",
+                    "[tasks.echo_ok]\necho = \"MINIMALD_SESSION_OK\"\n\n\
+                     [tasks.greet]\n\
+                     args.name = { type = \"string\", default = \"world\" }\n\
+                     echo = \"hi %{name}\"\n",
                 )
                 .await;
 
@@ -3104,6 +3116,66 @@ mod tests {
                 "echo task should produce no stderr: {:?}",
                 out.stderr,
             );
+        }
+
+        /// A task run's args reach the task: the daemon parses the argv off
+        /// the wire against the task's declared `args`, so `%{name}` binds
+        /// to the default when none is given, to the value when one is, and
+        /// an undeclared flag fails the run rather than being dropped.
+        #[tokio::test]
+        async fn exec_binds_task_args_and_defaults() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let session_id = active_session_with_echo_task(&server, &mut client, "args-test").await;
+            let session_str = session_id.to_string();
+
+            let run = |args: Vec<String>| {
+                ExecRequest::TaskRun {
+                    task: "greet".to_string(),
+                    owns_box: false,
+                    args,
+                }
+                .encode()
+            };
+
+            // No args: the declared default applies.
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &run(vec![]),
+                    &[],
+                )
+                .await
+                .expect("a task/run request should be accepted");
+            assert_eq!(out.stdout, b"hi world\n");
+            assert_eq!(out.exit_status, Some(0));
+
+            // An explicit value overrides the default.
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &run(vec!["--name".into(), "Alice".into()]),
+                    &[],
+                )
+                .await
+                .expect("a task/run request should be accepted");
+            assert_eq!(out.stdout, b"hi Alice\n");
+            assert_eq!(out.exit_status, Some(0));
+
+            // An undeclared flag fails the run instead of being ignored.
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &run(vec!["--nope".into(), "x".into()]),
+                    &[],
+                )
+                .await
+                .expect("a task/run request should be accepted");
+            assert!(out.stdout.is_empty(), "stdout: {:?}", out.stdout);
+            assert_ne!(out.exit_status, Some(0));
         }
 
         /// NET-131: a box created for a run ends when the run's command
