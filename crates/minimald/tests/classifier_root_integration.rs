@@ -8,16 +8,24 @@
 //!
 //! Two proofs, both `#[ignore]`d so the default suite and the surveyed
 //! nextest lines never run them. The native lane's
-//! `minimald-root-integration` job runs this binary under sudo, where every
-//! precondition below is the lane's own to hold; a host that cannot run one
-//! **fails** the proof rather than printing a reason and passing green — a
-//! proof that declines over a host that could run it proves nothing while
-//! looking like it ran. The one exception is a runner with no `nft`: the
-//! packet filter is the step's own dependency, the one thing no lane can
-//! promise a host, so each proof declines on it, with the reason printed.
-//! Locally: `just test-root-integration` (the lane's own recipe), or
+//! `minimald-root-integration` job runs this binary, and its recipe
+//! (`just test-root-integration`) runs it unprivileged — the same posture
+//! as that lane's netns harnesses, which sudo their own privileged
+//! commands — so the privileged steps here run through `sudo -n` the same
+//! way: the install, the step's `--pid` placement of this proof process
+//! into the tree, the table's listing and its removal. A binary run as
+//! root itself (a developer's `sudo just test-root-integration`) runs
+//! each of those directly; the two postures are one flow. Every other
+//! precondition — the root those steps need, a cgroup2 mounted with
+//! nsdelegate, IPv6 loopback, no existing host install or table —
+//! **fails** the proof rather than printing a reason and passing green:
+//! a proof that declines over a host that could run it proves nothing
+//! while looking like it ran. The one exception is a runner with no
+//! `nft`: the packet filter is the step's own dependency, the one thing
+//! no lane can promise a host, so each proof declines on it, with the
+//! reason printed. Locally: `just test-root-integration`, or
 //! `sudo cargo nextest run -p minimald --run-ignored all --no-tests=fail \
-//! -E 'binary(classifier_root_integration$)'`.
+//! -E 'binary(/classifier_root_integration$/)'`.
 //!
 //! Neither proof ever touches a host's own install: a tree at
 //! [`sandbox2::classifier::TREE_ROOT`], or an already-loaded
@@ -69,6 +77,36 @@ fn nft_present() -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
+/// Whether this binary itself runs as root — a developer's
+/// `sudo just test-root-integration`, where every privileged step below
+/// runs directly. The lane's own job does not: it is an unprivileged
+/// process whose netns harnesses sudo their own commands, so this
+/// binary's privileged steps sudo themselves the same way when this is
+/// false, through the same seam a person runs the installer by
+/// (`sudo scripts/install-host-classifier.sh`).
+fn running_as_root() -> bool {
+    // SAFETY: `geteuid(2)` has no failure modes or preconditions.
+    let euid = unsafe { libc::geteuid() };
+    euid == 0
+}
+
+/// A command that needs root — the install and the step's `--pid`
+/// placement, the table's listing and its removal, the cgroups' removal —
+/// run the way this binary got root: directly when the binary itself is
+/// root, or through `sudo -n` when it is the lane's unprivileged process.
+/// `-n` keeps a proof from sitting on a password prompt: a host that
+/// would ask for one fails the precondition loudly instead, with the
+/// recipe to run under sudo.
+fn privileged(program: &str) -> Command {
+    if running_as_root() {
+        Command::new(program)
+    } else {
+        let mut sudo = Command::new("sudo");
+        sudo.arg("-n").arg(program);
+        sudo
+    }
+}
+
 /// The host's live cgroup2 mount for the proofs below: the deepest mount
 /// in the daemon's own mount table that is the hierarchy itself (its
 /// namespace root is `/`, so it is not another cgroup namespace's view)
@@ -113,19 +151,61 @@ fn delegate_account() -> Option<String> {
     })
 }
 
+/// This process's own account, by uid — the account the scratch tree is
+/// delegated to when the proof runs unprivileged, which is the lane's
+/// posture: the install went through sudo, so the account that ran it is
+/// the one the tree is handed to, and every migration the proof then
+/// makes — the probe children's into their throwaway leaf, the backend's
+/// into its deny leaf — it makes as that account, the way the daemon it
+/// models does. Root itself is never the delegate: the step refuses it,
+/// because a tree delegated to root is no delegation at all.
+fn own_account() -> Option<String> {
+    // SAFETY: `getuid(2)` has no failure modes or preconditions.
+    let uid = unsafe { libc::getuid() };
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        let line_uid: u32 = fields.get(2)?.parse().ok()?;
+        let name = fields.first()?;
+        (line_uid == uid).then(|| name.to_string())
+    })
+}
+
+/// The account the scratch tree is delegated to: this proof's own when it
+/// runs unprivileged — the delegated account is the one whose migrations
+/// the proof must be able to make, and unprivileged they are all its own —
+/// or, when the whole binary was run as root (a developer's
+/// `sudo just test-root-integration`), the first human-range account, the
+/// account a development host's daemon runs as.
+fn the_delegated_account() -> String {
+    if running_as_root() {
+        delegate_account().expect(
+            "no non-root account to delegate the scratch tree to (the install \
+             refuses to delegate to root)",
+        )
+    } else {
+        own_account().expect("this proof's own account, by uid, in /etc/passwd")
+    }
+}
+
 /// The preconditions the root lane runs under, asserted rather than
 /// skipped: this binary's proofs load the installer's own table over this
 /// host's real cgroup2, so a host that cannot run one must fail loudly
-/// here rather than print a reason and pass green. Returns the cgroup2
-/// mountpoint the scratch tree goes under; `nft` itself is the caller's to
-/// decline on.
+/// here rather than print a reason and pass green. Root is the reach the
+/// install needs, not this binary's own uid — the lane runs its test
+/// processes unprivileged and sudoes the privileged commands for them, so
+/// either posture passes. Returns the cgroup2 mountpoint the scratch tree
+/// goes under; `nft` itself is the caller's to decline on.
 fn refuse_unless_the_root_lane_can_run() -> PathBuf {
-    // SAFETY: `geteuid(2)` has no failure modes or preconditions.
-    let euid = unsafe { libc::geteuid() };
     assert!(
-        euid == 0,
-        "the install these proofs run needs root to delegate the scratch \
-         tree and load the table (try: sudo just test-root-integration)"
+        running_as_root()
+            || privileged("true")
+                .status()
+                .is_ok_and(|status| status.success()),
+        "the install and the placement these proofs run need root: run the \
+         lane's recipe under sudo (sudo just test-root-integration), or \
+         give this account the passwordless sudo the lane's own harnesses \
+         assume"
     );
     assert!(
         !Path::new(classifier::TREE_ROOT).exists(),
@@ -134,26 +214,35 @@ fn refuse_unless_the_root_lane_can_run() -> PathBuf {
         classifier::TREE_ROOT
     );
     assert!(
-        !Command::new("nft")
+        !privileged("nft")
             .args(["list", "table", "inet", TABLE_NAME])
             .output()
             .is_ok_and(|out| out.status.success()),
         "a table named {TABLE_NAME} is already loaded — these proofs never \
          replace a host's own table"
     );
-    live_cgroup2_mount().expect(
+    let mountpoint = live_cgroup2_mount().expect(
         "no cgroup2 mounted with nsdelegate on this host — the \
          install's verify_mount would refuse the scratch tree, and \
          a tree on a mount without it confines nothing",
-    )
+    );
+    assert!(
+        TcpListener::bind("[::1]:0").is_ok(),
+        "no IPv6 loopback on this host, so the table's V6 leg cannot be \
+         read — the refusals these proofs read are family-wide, and \
+         their errnos are read per family"
+    );
+    mountpoint
 }
 
-/// The proof's install over `root`: the step's own rehearsal half, with
+/// The proof's install over `root`: the step's own install half, with
 /// `--root` naming the scratch tree, delegated to `account`, and the
 /// proof's two identities — one `nft -f` transaction that lays out the
-/// cohort's two subtrees and loads the table over them.
+/// cohort's two subtrees and loads the table over them. Run through the
+/// root-reach above, so the lane's unprivileged process installs the way
+/// a person does: through sudo, naming its own account.
 fn install_over_scratch(root: &Path, account: &str) {
-    let installed = Command::new("bash")
+    let installed = privileged("bash")
         .arg(installer())
         .arg("--root")
         .arg(root)
@@ -171,6 +260,79 @@ fn install_over_scratch(root: &Path, account: &str) {
         String::from_utf8_lossy(&installed.stdout),
         String::from_utf8_lossy(&installed.stderr),
     );
+}
+
+/// The step's `--pid` half, placing this proof process in the scratch
+/// tree's daemon leaf — the one migration the delegated account cannot
+/// make itself, because the common ancestor of any cgroup outside the
+/// slice and any leaf in it is the root-owned hierarchy root. The proofs
+/// migrate inside the tree — the probe's children into their throwaway
+/// leaf, the backend into its deny leaf — and v2 checks a migration's
+/// permission at the common ancestor of its ends, so a proof running
+/// unprivileged has to sit in the tree first, exactly as the daemon it
+/// models does. A proof running as root never needed the hop and takes it
+/// anyway, so both postures run one flow.
+fn place_this_process_in_the_tree(root: &Path) {
+    let placed = privileged("bash")
+        .arg(installer())
+        .arg("--root")
+        .arg(root)
+        .arg("--pid")
+        .arg(std::process::id().to_string())
+        .output()
+        .expect("running the step's placement half over the scratch tree");
+    assert!(
+        placed.status.success(),
+        "placing this proof process in the scratch tree's daemon leaf: {}{}",
+        String::from_utf8_lossy(&placed.stdout),
+        String::from_utf8_lossy(&placed.stderr),
+    );
+}
+
+/// Returns this proof process to the hierarchy root, the cgroup the
+/// placement above took it out of: the kernel refuses to remove a cgroup
+/// a process still sits in, so the proof leaves the tree before its drop
+/// removes the tree — through the same root-reach the placement went in
+/// by, because the common ancestor of the tree and anywhere outside it is
+/// the one place the delegated account cannot write, which is the barrier
+/// the install is.
+fn leave_the_tree(mountpoint: &Path) {
+    let procs = mountpoint.join("cgroup.procs");
+    let pid = format!("{}\n", std::process::id());
+    // Best effort, in kind with the drop that calls it: a proof that
+    // already failed must not lose its failure to a cleanup panic, and a
+    // host that cannot move this process back out is left holding the
+    // tree it refused to release — printed, and never a table.
+    let left =
+        if running_as_root() {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&procs)
+                .and_then(|mut file| file.write_all(pid.as_bytes()))
+        } else {
+            privileged("tee")
+                .arg("-a")
+                .arg(&procs)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut reached| {
+                    let mut stdin = reached
+                        .stdin
+                        .take()
+                        .ok_or_else(|| std::io::Error::other("the root-reached write's stdin"))?;
+                    stdin.write_all(pid.as_bytes())?;
+                    drop(stdin);
+                    reached.wait()?.success().then_some(()).ok_or_else(|| {
+                        std::io::Error::other("the root-reached write out of the tree")
+                    })
+                })
+        };
+    if let Err(cause) = left {
+        eprintln!(
+            "could not return this proof process to the hierarchy root \
+             ({cause}); the scratch tree it still holds is left in place"
+        );
+    }
 }
 
 /// Serializes this binary's two proofs against each other: each loads the
@@ -200,7 +362,9 @@ fn one_table_at_a_time() -> std::fs::File {
 /// The proof's own artifacts, removed on the way out however the proof
 /// ended: the backend child first, when one was forked (a live process
 /// pins its leaf and the tree under it), then the table (it outlives the
-/// cgroups it is keyed on), then the box leaf and the scratch tree with
+/// cgroups it is keyed on), then this proof process itself — the placement
+/// put it in the daemon leaf, and the kernel refuses to remove a cgroup a
+/// process still sits in — then the box leaf and the scratch tree with
 /// `rmdir`, never a remove-all — on a real cgroup2 these are cgroups, and
 /// the kernel's own refusal to remove one that still holds a process is
 /// the guard wanted here (the probe's child is reaped and its leaf gone
@@ -208,6 +372,10 @@ fn one_table_at_a_time() -> std::fs::File {
 struct ScratchInstall {
     /// The scratch tree, named by this proof, never the daemon's slice.
     root: PathBuf,
+    /// The cgroup2 mountpoint the scratch tree was laid out under, and the
+    /// tree's common ancestor with everywhere outside it — what the proof
+    /// writes itself back out through when it leaves.
+    mountpoint: PathBuf,
     /// The box leaf the proof made, when it made one.
     leaf: Option<PathBuf>,
     /// The forked backend, when one was placed.
@@ -226,9 +394,10 @@ impl Drop for ScratchInstall {
         if let Some(leaf) = self.leaf.take() {
             let _ = remove_box_leaf(&leaf);
         }
-        let _ = Command::new("nft")
+        let _ = privileged("nft")
             .args(["delete", "table", "inet", TABLE_NAME])
             .status();
+        leave_the_tree(&self.mountpoint);
         for dir in [
             self.root.join(classifier::TABLE_MARKER),
             self.root.join(classifier::BOXES_DIR).join(DENY_DIR),
@@ -237,7 +406,7 @@ impl Drop for ScratchInstall {
             daemon_leaf(&self.root),
             self.root.clone(),
         ] {
-            let _ = std::fs::remove_dir(&dir);
+            let _ = privileged("rmdir").arg(&dir).status();
         }
     }
 }
@@ -520,12 +689,12 @@ fn backend_connect_errno(response: &str) -> Option<i32> {
 /// was proved on.
 ///
 /// `#[ignore]`d so the default suite never runs it; the native lane's
-/// `minimald-root-integration` job runs this binary under sudo
-/// (`just test-root-integration`), where the preconditions it names are
-/// the lane's own to hold, and the one that is not — `nft` — declines
-/// with a printed reason. No lane but that one runs it.
+/// `minimald-root-integration` job runs this binary (`just
+/// test-root-integration`), where the preconditions it names are the
+/// lane's own to hold, and the one that is not — `nft` — declines with a
+/// printed reason. No lane but that one runs it.
 #[test]
-#[ignore = "loads the installer's own nftables table over this host's real cgroup2; run by the native lane's minimald-root-integration job under sudo (just test-root-integration)"]
+#[ignore = "loads the installer's own nftables table over this host's real cgroup2; run by the native lane's minimald-root-integration job (just test-root-integration)"]
 fn the_installers_table_refuses_the_probe_over_a_scratch_tree() {
     if !nft_present() {
         eprintln!(
@@ -538,19 +707,7 @@ fn the_installers_table_refuses_the_probe_over_a_scratch_tree() {
     // One table at a time: this binary's two proofs each load it.
     let _table = one_table_at_a_time();
     let mountpoint = refuse_unless_the_root_lane_can_run();
-    let account = delegate_account().expect(
-        "no non-root account to delegate the scratch tree to (the install \
-         refuses to delegate to root)",
-    );
-    // Both loopback families, because the proof reads one errno from
-    // each: a host with no IPv6 loopback would read its V4 leg alone, and
-    // that is the host's own state, not a failed refusal.
-    if let Err(cause) = TcpListener::bind("[::1]:0") {
-        panic!(
-            "no IPv6 loopback on this host ({cause}), so the V6 leg it \
-             reads EACCES from cannot be read"
-        );
-    }
+    let account = the_delegated_account();
 
     // The scratch tree, under the host's own cgroup2 so the loaded rules
     // are keyed on a path this host's probe can enter — named by this
@@ -558,10 +715,15 @@ fn the_installers_table_refuses_the_probe_over_a_scratch_tree() {
     let scratch = mountpoint.join(format!("minimald-proof-{}", std::process::id()));
     let _install = ScratchInstall {
         root: scratch.clone(),
+        mountpoint: mountpoint.clone(),
         leaf: None,
         child: None,
     };
     install_over_scratch(&scratch, &account);
+    // In the tree before anything migrates inside it: the probe's children
+    // self-place in its throwaway deny leaf, and a migration's permission
+    // is checked at the common ancestor of its ends.
+    place_this_process_in_the_tree(&scratch);
 
     // The reading: the table's refusal as the probe's legs met it, one
     // errno per family — the two loopbacks the decision's proofs name.
@@ -612,9 +774,10 @@ fn the_installers_table_refuses_the_probe_over_a_scratch_tree() {
 ///
 /// `#[ignore]`d for the lane's sake, and declined like the proof above on
 /// a runner with no `nft`; every other precondition it names is the
-/// lane's own to hold.
+/// lane's own to hold — the lane runs the binary unprivileged, its
+/// privileged steps going through sudo for it.
 #[test]
-#[ignore = "loads the installer's table and runs its backend in a real boxes/deny leaf; run by the native lane's minimald-root-integration job under sudo (just test-root-integration)"]
+#[ignore = "loads the installer's table and runs its backend in a real boxes/deny leaf; run by the native lane's minimald-root-integration job (just test-root-integration)"]
 fn deny_all_host_ip_box_answers_the_proxy_over_a_loaded_table() {
     if !nft_present() {
         eprintln!(
@@ -627,10 +790,7 @@ fn deny_all_host_ip_box_answers_the_proxy_over_a_loaded_table() {
     // One table at a time: this binary's two proofs each load it.
     let _table = one_table_at_a_time();
     let mountpoint = refuse_unless_the_root_lane_can_run();
-    let account = delegate_account().expect(
-        "no non-root account to delegate the scratch tree to (the install \
-         refuses to delegate to root)",
-    );
+    let account = the_delegated_account();
 
     // The scratch tree this proof installs over, and the backend's leaf in
     // the deny subtree — the subtree the deny-all declaration picks, the
@@ -639,10 +799,16 @@ fn deny_all_host_ip_box_answers_the_proxy_over_a_loaded_table() {
     let scratch = mountpoint.join(format!("minimald-proof-proxy-{}", std::process::id()));
     let mut install = ScratchInstall {
         root: scratch.clone(),
+        mountpoint: mountpoint.clone(),
         leaf: None,
         child: None,
     };
     install_over_scratch(&scratch, &account);
+    // In the tree before the backend is forked in it: the backend is born
+    // in this process's cgroup, and a migration's permission is checked
+    // at the common ancestor of its ends — inside the slice that is the
+    // delegated slice itself, outside it the root-owned hierarchy root.
+    place_this_process_in_the_tree(&scratch);
     let leaf = create_box_leaf(&scratch, "denybox", Verdict::Deny)
         .expect("the step's deny subtree takes a box leaf");
     install.leaf = Some(leaf.clone());
