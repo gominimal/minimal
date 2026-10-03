@@ -42,6 +42,15 @@ impl From<UpstreamReqwestUrl> for ReqwestUrl {
     }
 }
 
+impl ReqwestUrl {
+    /// The host the URL names, without its scheme or port: the host a fetch
+    /// of this URL leaves for, read from the parsed URL rather than from a
+    /// rendering of it.
+    pub fn host_str(&self) -> Option<&str> {
+        self.0.host_str()
+    }
+}
+
 /// The response to an RPC for some resource.
 pub trait FetchResponse: std::fmt::Debug + Sized {
     type Error: std::fmt::Debug;
