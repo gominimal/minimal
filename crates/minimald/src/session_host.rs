@@ -3307,8 +3307,11 @@ impl SessionLauncher for SandboxLauncher {
 
         // Step 1 (pre-spawn): the provider for this PTask's mode reserves what
         // the sandbox needs — for own-IP, a lease and a running gvproxy — and
-        // says what it is. `PlannedLaunch` owns the release from here: an early
-        // `Err` return or a cancelled launch gives the lease back.
+        // says what it is. The decision this launch itself read above goes in
+        // with them, carried rather than memoized, so the plan below follows
+        // this launch's verdict fact and never a concurrent launch's.
+        // `PlannedLaunch` owns the release from here: an early `Err` return
+        // or a cancelled launch gives the lease back.
         let planned = sandbox2::PlannedLaunch::begin(crate::net::provider::network_for(
             network_mode,
             &net_switch,
@@ -3316,6 +3319,7 @@ impl SessionLauncher for SandboxLauncher {
             Some(policy),
             own_address,
             box_addresses,
+            decision,
         ))
         .await
         .map_err(|e| io::Error::other(format!("planning the session network: {e}")))?;

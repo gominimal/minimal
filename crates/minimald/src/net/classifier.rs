@@ -1511,43 +1511,13 @@ pub(crate) fn decide_over(
 /// looking. The probe connects and waits, so an async caller runs it on
 /// the blocking pool.
 pub fn decide_now(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision {
-    let decision = decide(root, mountinfo, guest, || {
+    decide(root, mountinfo, guest, || {
         if guest {
             read_held_filter(root)
         } else {
             read_filter(root)
         }
-    });
-    note_decision(&decision);
-    decision
-}
-
-/// The freshest decision this daemon read — `decide_now`'s own record, held
-/// for the one reader that follows the decision but runs after it: the
-/// guest's network plan, which builds a deny-all box's resolver after the
-/// launch refused everything it must refuse. A guest that decides per box
-/// resolves such a box through its own answerer, the one carve-out its
-/// table admits; a guest that decides nothing keeps the node's DNS layer
-/// (NET-079, design §5.3). Held per launch rather than shared across them,
-/// because the decision is read fresh before each host-address launch — so
-/// what this carries is the launch's own decision, never another's.
-static READ_DECISION: std::sync::Mutex<Option<Decision>> = std::sync::Mutex::new(None);
-
-/// Records the decision the daemon just read, for the reader that follows it.
-pub(crate) fn note_decision(decision: &Decision) {
-    *READ_DECISION
-        .lock()
-        .expect("the decision memo is only written by this daemon") = Some(decision.clone());
-}
-
-/// The decision the current launch read, if it read one: `None` until the
-/// first `decide_now` runs — which every launch's own decision is, so a
-/// plan built before any decision ran is a plan that decides nothing.
-pub(crate) fn freshest_decision() -> Option<Decision> {
-    READ_DECISION
-        .lock()
-        .expect("the decision memo is only written by this daemon")
-        .clone()
+    })
 }
 
 /// Whether the cohort's two subtrees are there as the step delegates them:
@@ -3865,14 +3835,12 @@ mod tests {
             "the interim refuses the deny-all box rather than run it on nothing"
         );
 
-        // And the launch's own reader carries the same undecidable decision,
-        // so the plan that follows it resolves through the node's DNS layer.
-        note_decision(&decision);
-        assert!(
-            !freshest_decision().is_some_and(|read| read.can_decide_per_box()),
-            "the decision memo says nothing per box either, over a reading \
-             that would have decided per box had the facts held"
-        );
+        // The plan that follows this launch reads this same value by
+        // parameter — `network_for` carries the decision in, never through
+        // a memo another launch could overwrite — so the undecidable
+        // reading above is exactly what keeps the plan on the node's DNS
+        // layer. Proven in provider.rs's
+        // `guest_deny_all_box_resolves_through_answerer_once_decided`.
     }
 
     /// The guest's recheck (NET-079): a marker is the boot's claim, and the

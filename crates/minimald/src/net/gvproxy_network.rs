@@ -710,6 +710,7 @@ mod tests {
                 switch_address: handed_switch,
                 loopback_address: handed_loopback,
             }),
+            None,
         );
 
         // The plan's lease IS the handed address — the address the tap is
@@ -756,6 +757,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let _ = unregistered
             .plan()
@@ -793,6 +795,7 @@ mod tests {
                 switch_address: drawn.ip,
                 loopback_address: Ipv4Addr::LOCALHOST,
             }),
+            None,
         );
         let err = colliding_reserve
             .plan()
@@ -828,6 +831,7 @@ mod tests {
                 switch_address: handed_switch,
                 loopback_address: handed_loopback,
             }),
+            None,
         );
         let _ = reattached
             .plan()
@@ -867,6 +871,7 @@ mod tests {
                 switch_address: handed_switch,
                 loopback_address: Ipv4Addr::LOCALHOST,
             }),
+            None,
         );
         let err = colliding_live
             .plan()
