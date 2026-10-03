@@ -1799,6 +1799,72 @@ async fn an_attach_with_no_terminal_keeps_the_last_published_one() {
     );
 }
 
+/// Renaming a running session republishes the new `MINIMAL_SESSION_NAME`
+/// through the per-attach environment channel, so the already-running
+/// shell picks it up at its next prompt without a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rename_session_republishes_minimal_session_name() {
+    use minimald_rpc::{Errorable, RenameSession, RenameSessionRequest, RenameSessionResponse};
+
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_session(&mut client).await;
+
+    // Attach so the host is live and the attach-env files exist.
+    let mut channel = client.open_shell(session_id).await;
+    await_echo(&mut channel).await;
+
+    // Rename the session.
+    let resp = client
+        .call::<RenameSession>(&RenameSessionRequest {
+            id: session_id,
+            new_name: "renamed".to_string(),
+        })
+        .await;
+    assert_eq!(resp, Errorable::Ok(RenameSessionResponse));
+
+    // The republished attach-env now carries the new name. The RPC returns
+    // once the rename is queued to the host, which publishes afterwards, so
+    // poll for the write rather than reading once.
+    let mut renamed = String::new();
+    for _ in 0..50 {
+        renamed = published_attach_env(&server, session_id).await;
+        if renamed.contains("export MINIMAL_SESSION_NAME='renamed'") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        renamed.contains("export MINIMAL_SESSION_NAME='renamed'"),
+        "the attach-env should carry the new name after rename; got: {renamed:?}"
+    );
+
+    // The data form is published too, after the shell form, so poll it the
+    // same way.
+    let json_path = session_paths(&server, session_id)
+        .await
+        .home
+        .sub_path_unchecked(".local/state/minimal/attach-env.json");
+    let mut name = None;
+    for _ in 0..50 {
+        let body = tokio::fs::read_to_string(json_path.as_str())
+            .await
+            .unwrap_or_default();
+        name = serde_json_lenient::from_str::<serde_json_lenient::Value>(&body)
+            .ok()
+            .and_then(|v| v["MINIMAL_SESSION_NAME"].as_str().map(str::to_string));
+        if name.as_deref() == Some("renamed") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        name.as_deref(),
+        Some("renamed"),
+        "attach-env.json should carry the new name after rename"
+    );
+}
+
 /// Regression: a session shell minted headlessly — by the activation
 /// hooks, with no terminal anywhere in the picture — used to keep that
 /// terminal-less environment for the session's whole life, because

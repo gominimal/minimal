@@ -2157,7 +2157,7 @@ impl Session {
         #[cfg(target_os = "linux")]
         self.deregister_hostname(false).await;
         let mut new_record = record.clone();
-        new_record.name = Some(new_name);
+        new_record.name = Some(new_name.clone());
         let written = self.record.write(new_record.clone()).await;
 
         // Re-register whichever name stuck (the new one on success, the old
@@ -2172,6 +2172,19 @@ impl Session {
             false,
         )
         .await;
+
+        // Forward the new name to the running host so the shell's
+        // `$MINIMAL_SESSION_NAME` is republished through the per-attach
+        // environment channel. Best-effort: the record-side rename has
+        // already succeeded, and a dead host drops the message silently.
+        if written.is_ok()
+            && let SessionInner::Active {
+                host: Some((host, _)),
+                ..
+            } = &self.inner
+        {
+            host.rename(new_name).await;
+        }
 
         written
     }
