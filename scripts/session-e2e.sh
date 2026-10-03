@@ -5589,10 +5589,14 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
   # pins nothing, so a name's answer can never be the grant), the target's
   # half its published port set. Both directions complete, so the reach
   # holds under both boxes' rules; a port the target never published is
-  # refused by the target's half (the connect dies at the switch, nothing
-  # resets it); and a box allowed no plane entry at all is refused by the
-  # source's half — its own egress leg drops the SYN before the switch ever
-  # sees it, so the target's relay logs nothing. That last leg runs from a
+  # refused by the target's half with the kernel's own connection-refused
+  # shape — NET-014: the target's ingress gate answers the SYN with a
+  # reset, so the peer's connect fails at once rather than hanging to its
+  # timeout, the same refusal the proxy-parity case holds on its direct
+  # leg; and a box allowed no plane entry at all is refused by the source's
+  # half — its own egress leg drops the SYN without a reset (NET-062)
+  # before the switch ever sees it, so the target's relay logs nothing and
+  # the connect dies silently to its timeout. That last leg runs from a
   # FRESH box, not from the toolchain box: the violation line it reads is
   # rate-limited to one per source box and rule per minute (WARN_MIN_INTERVAL,
   # crates/minimald/src/net/policy.rs), and the toolchain box has been
@@ -5702,9 +5706,18 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
   # leg must see as false, by its name alone: the conjunction's halves are
   # each visible in the decision record, and a leg one half refused pins
   # that half there, so the refusal is read off the record that made it
-  # rather than inferred from the connect dying.
+  # rather than inferred from the connect dying. $7 (optional, a refused
+  # leg's own) = which refusal the leg must get, because the conjunction's
+  # two halves refuse differently: "refused" = the target's half, whose
+  # ingress gate answers the SYN with a reset — NET-014's
+  # connection-refused shape, the kernel's own, so the peer's connect fails
+  # at once (curl exit 7, fast, never the connect-timeout 28 a drop reads
+  # as; the parity case holds the same shape on its direct leg);
+  # "dropped"/absent = the source's half, whose own egress leg drops the
+  # SYN without a reset (NET-062), so nothing answers and the connect hangs
+  # to its --max-time.
   goa_zone_leg() {
-    local box="$1" label="$2" url="$3" marker="$4" want="$5" half="${6:-}"
+    local box="$1" label="$2" url="$3" marker="$4" want="$5" half="${6:-}" shape="${7:-}"
     local before start rc elapsed status err body records
     before="$(goa_log_lines)"
     start="$(now_ms)"
@@ -5748,17 +5761,38 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
         cat "$WORK/goa-$label.err" 2>/dev/null || true
         fail
       fi
-      if printf '%s' "$err" | grep -qi 'reset by peer'; then
-        echo "::error::zone leg $label was reset, not dropped — something answered a connect the conjunction refuses"
-        cat "$WORK/goa-$label.err" 2>/dev/null || true
-        fail
+      if [ "$shape" = refused ]; then
+        # The target's half: NET-014's refusal, the kernel's
+        # connection-refused shape — the gate answers the SYN with a reset,
+        # so the peer's connect fails at once (curl exit 7), never the
+        # connect-timeout 28 a silent drop reads as. The same gate, the
+        # same shape the proxy-parity case holds on its direct leg.
+        if [ "$rc" -ne 7 ]; then
+          echo "::error::zone leg $label did not end in a refused connection (curl exit $rc, expected 7) — the target's ingress gate did not answer the SYN its declaration refuses, and a silent drop would read as connect timeout 28, the shape NET-014 retires"
+          cat "$WORK/goa-$label.err" 2>/dev/null || true
+          fail
+        fi
+        if [ "$elapsed" -ge 6000 ]; then
+          echo "::error::zone leg $label took ${elapsed}ms to be refused — the target's gate answers a SYN it refuses at once, and a refusal that slow is a drop that read as the timeout, the shape NET-014 retires"
+          cat "$WORK/goa-$label.err" 2>/dev/null || true
+          fail
+        fi
+        echo "  -> refused with the kernel's connection-refused shape (curl exit 7), fast"
+      else
+        # The source's half: NET-062's drop — no reset, nothing answers, and
+        # the connect hangs to its --max-time.
+        if printf '%s' "$err" | grep -qi 'reset by peer'; then
+          echo "::error::zone leg $label was reset, not dropped — something answered a connect the conjunction refuses"
+          cat "$WORK/goa-$label.err" 2>/dev/null || true
+          fail
+        fi
+        if [ "$elapsed" -lt 6000 ]; then
+          echo "::error::zone leg $label failed in ${elapsed}ms — a fast refusal. The completing leg in this same run proved the fabric and both boxes' network paths, so the fast failure is the rules' own doing reported wrong, or a broken probe"
+          cat "$WORK/goa-$label.err" 2>/dev/null || true
+          fail
+        fi
+        echo "  -> refused, dropped silently to the timeout"
       fi
-      if [ "$elapsed" -lt 6000 ]; then
-        echo "::error::zone leg $label failed in ${elapsed}ms — a fast refusal. The completing leg in this same run proved the fabric and both boxes' network paths, so the fast failure is the rules' own doing reported wrong, or a broken probe"
-        cat "$WORK/goa-$label.err" 2>/dev/null || true
-        fail
-      fi
-      echo "  -> refused, dropped silently to the timeout"
     fi
   }
   goa_zone_leg "$goa_p1_sid" "peer1-to-peer2-published" \
@@ -5769,10 +5803,10 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
     "box-zone connection decided at connect"
   goa_zone_leg "$goa_p1_sid" "peer1-to-peer2-unpublished" \
     "http://$GOA_P2_NAME.min.internal:$GOA_CLOSED_PORT/" "" \
-    "box-zone connection decided at connect" target_pass
+    "box-zone connection decided at connect" target_pass refused
   goa_zone_leg "$goa_z_sid" "nofabric-to-peer2" \
     "http://$GOA_P2_NAME.min.internal:$GOA_P2_PORT/" "" \
-    "network policy violation"
+    "network policy violation" "" dropped
   # R2.7's `session_id`: the source-half leg's violation must be attributed to
   # the no-fabric box's own session — its switch lease — not to whichever box
   # dropped something in the same window. One box's drop being
@@ -5785,7 +5819,7 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
     fail
   fi
   echo "  -> the violation record names the source box's own session ($goa_z_ip)"
-  echo "NET-072/073 OK: boxes reached each other by name under both boxes' rules; the target's unpublished port and the plane-less box were refused"
+  echo "NET-072/073 OK: boxes reached each other by name under both boxes' rules; the target's unpublished port was refused fast with the kernel's connection-refused shape (NET-014) and the plane-less box's connect was dropped to its timeout (NET-062)"
 
   mnl session destroy --force "$goa_t_sid" >/dev/null 2>&1 || true
   mnl session destroy --force "$goa_d_sid" >/dev/null 2>&1 || true
