@@ -54,6 +54,7 @@
 //! the re-scope; an egress-proxy reachability check
 //! ([`super::proxy::bind_listener`]) replaces it.
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1074,11 +1075,16 @@ impl HostnameRegistry {
         let Registration { id, hostname } = self.by_session.remove(session_name)?;
         self.shared_published.remove(&id);
         // Remove the host route only when it still belongs to this session.
-        // A name that folds to the same hostname as another live session's
-        // (case-only collision) leaves the other session's route in place.
-        match self.by_host.get(&hostname) {
-            Some(route) if route.session() == session_name => {
-                let route = self.by_host.remove(&hostname).expect("route was present");
+        // Two live sessions can fold to the same hostname: a named session
+        // whose name differs from another's only in ASCII case (records that
+        // predate case-insensitive name uniqueness), and, still today, two
+        // unnamed sessions whose project directories' basenames fold
+        // together (`/x/App` and `/y/app`), since `registry_name` falls back
+        // to the basename. The later registration owns the route, so the
+        // other session's deregistration must leave it in place.
+        match self.by_host.entry(hostname.clone()) {
+            Entry::Occupied(entry) if entry.get().session() == session_name => {
+                let route = entry.remove();
                 tracing::info!(
                     session_id = %id,
                     session_name,
@@ -1088,17 +1094,17 @@ impl HostnameRegistry {
                     "deregistered PTask hostname"
                 );
             }
-            Some(route) => {
+            Entry::Occupied(entry) => {
                 tracing::warn!(
                     session_id = %id,
                     session_name,
                     hostname = %hostname,
-                    owner = route.session(),
+                    owner = entry.get().session(),
                     action = "deregister-kept-route",
                     "hostname route belongs to another session; leaving it in place"
                 );
             }
-            None => {
+            Entry::Vacant(_) => {
                 tracing::warn!(
                     session_id = %id,
                     session_name,

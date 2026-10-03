@@ -668,7 +668,7 @@ impl DiskLoader {
                 continue;
             }
             if let Some(name) = &record.name
-                && self.index.name_to_id.contains_key(name)
+                && self.index.find_by_name_folded(name).is_some()
             {
                 tracing::warn!(
                     short = %short,
@@ -803,10 +803,17 @@ impl Loader for DiskLoader {
     fn create(&mut self, mut record: Record) -> Result<Self::Key, std::io::Error> {
         if let Some(name) = &record.name {
             validate_session_name(name)?;
-            if self.index.find_by_name_folded(name).is_some() {
+            if let Some(existing_id) = self.index.find_by_name_folded(name) {
+                let existing = self
+                    .index
+                    .name_by_id(existing_id)
+                    .map_or(name.as_str(), String::as_str);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
-                    format!("a session with name `{name}` already exists"),
+                    format!(
+                        "a session named `{existing}` already exists \
+                         (session names are case-insensitive)"
+                    ),
                 ));
             }
         }
@@ -916,9 +923,16 @@ impl Loader for DiskLoader {
             && let Some(other_id) = self.index.find_by_name_folded(name).copied()
             && other_id != id
         {
+            let existing = self
+                .index
+                .name_by_id(&other_id)
+                .map_or(name.as_str(), String::as_str);
             return Err(std::io::Error::new(
                 AlreadyExists,
-                format!("a session with the name `{name}` already exists"),
+                format!(
+                    "a session named `{existing}` already exists \
+                     (session names are case-insensitive)"
+                ),
             ));
         }
 
@@ -1999,6 +2013,43 @@ mod tests {
         // not in the index.
         assert_eq!(loader.find_by_id(&a_id).unwrap(), Some(a_key));
         assert_eq!(loader.find_by_id(&orphan_record.id).unwrap(), None);
+        // The orphan dir is left on disk for manual triage.
+        assert!(
+            session_dir_path(&root, orphan_short).exists(),
+            "orphan dir should be preserved for triage",
+        );
+    }
+
+    #[test]
+    fn self_heal_skips_orphan_with_case_only_name_collision() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        // First session: created normally, claims "my-session".
+        let mut loader = DiskLoader::new(root.clone()).unwrap();
+        let a_key = loader.create(sample_record()).unwrap();
+        let a_id = *a_key.id();
+        drop(loader);
+
+        // Plant an orphan whose name differs from the live one only in
+        // ASCII case. The short is outside `create()`'s format so it can
+        // never collide with the real session's dir.
+        let orphan_short = "zzzzz";
+        let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
+        std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
+        let mut orphan_record = sample_record();
+        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.name = Some("MY-SESSION".to_string());
+        let record_file = orphan_dir.join("record.json");
+        let buf = serde_json_lenient::to_vec(&orphan_record).unwrap();
+        std::fs::write(record_file.as_std_path(), buf).unwrap();
+
+        let loader = DiskLoader::new(root.clone()).unwrap();
+        // The live session still resolves; the case-colliding orphan is not
+        // indexed.
+        assert_eq!(loader.find_by_id(&a_id).unwrap(), Some(a_key));
+        assert_eq!(loader.find_by_id(&orphan_record.id).unwrap(), None);
+        assert_eq!(loader.find_by_name("MY-SESSION").unwrap(), None);
         // The orphan dir is left on disk for manual triage.
         assert!(
             session_dir_path(&root, orphan_short).exists(),
