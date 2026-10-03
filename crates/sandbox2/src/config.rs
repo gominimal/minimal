@@ -742,8 +742,8 @@ impl Config {
         let base_len = base_dir.as_ref().as_os_str().len();
         let overhead = 1 + suffix.len(); // '/' separator + suffix
         let name_budget = SUN_PATH_MAX.saturating_sub(base_len + overhead);
-        let name = if name_budget == 0 {
-            return Err(Error::IO(
+        let name = fit_box_name(&self.name, name_budget).ok_or_else(|| {
+            Error::IO(
                 "create sandbox directory",
                 base_dir.as_ref().to_path_buf(),
                 std::io::Error::new(
@@ -754,37 +754,8 @@ impl Config {
                          AF_UNIX path limit"
                     ),
                 ),
-            ));
-        } else if self.name.len() > name_budget {
-            let mut hasher = Sha256::new();
-            hasher.update(self.name.as_bytes());
-            let hash_hex = hex::encode(hasher.finalize());
-            let hash_suffix = &hash_hex[..8];
-            // Reserve room for the hash suffix plus a '-' separator.
-            let keep = name_budget.saturating_sub(1 + hash_suffix.len());
-            if keep == 0 {
-                return Err(Error::IO(
-                    "create sandbox directory",
-                    base_dir.as_ref().to_path_buf(),
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "base directory path is {base_len} bytes, leaving \
-                             no room for a box name under the \
-                             {SUN_PATH_MAX}-byte AF_UNIX path limit"
-                        ),
-                    ),
-                ));
-            }
-            // Cut at a char boundary so the truncated name stays valid UTF-8.
-            let mut end = keep;
-            while end > 0 && !self.name.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!("{}-{}", &self.name[..end], hash_suffix)
-        } else {
-            self.name.clone()
-        };
+            )
+        })?;
 
         let build_base_dir = {
             let mut attempt = 0u32;
@@ -878,9 +849,71 @@ impl Config {
     }
 }
 
+/// Fits a box name into `budget` bytes. A name that fits is kept as is; a
+/// longer one is cut at a char boundary and suffixed with `-` and the first 8
+/// hex digits of the full name's SHA-256, so two long names sharing a prefix
+/// still differ and the same name always maps to the same result. `None` when
+/// the budget leaves no room for any name.
+fn fit_box_name(name: &str, budget: usize) -> Option<String> {
+    if budget == 0 {
+        return None;
+    }
+    if name.len() <= budget {
+        return Some(name.to_string());
+    }
+    let hash = hex::encode(Sha256::digest(name.as_bytes()));
+    let hash_suffix = &hash[..8];
+    // Reserve room for the hash suffix plus a '-' separator.
+    let keep = budget
+        .checked_sub(1 + hash_suffix.len())
+        .filter(|&k| k > 0)?;
+    let mut end = keep;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!("{}-{}", &name[..end], hash_suffix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_box_name_within_budget_is_kept() {
+        assert_eq!(fit_box_name("short", 5).as_deref(), Some("short"));
+    }
+
+    #[test]
+    fn a_long_box_name_is_cut_to_the_budget_with_a_hash_suffix() {
+        let name = "a".repeat(200);
+        let fitted = fit_box_name(&name, 40).unwrap();
+        assert_eq!(fitted.len(), 40);
+        assert!(fitted.starts_with(&"a".repeat(31)), "{fitted}");
+        // Deterministic: the same name always lands on the same directory name.
+        assert_eq!(fit_box_name(&name, 40).unwrap(), fitted);
+    }
+
+    #[test]
+    fn long_box_names_sharing_a_prefix_stay_distinct() {
+        let prefix = "a".repeat(100);
+        let a = fit_box_name(&format!("{prefix}-alpha"), 40).unwrap();
+        let b = fit_box_name(&format!("{prefix}-beta"), 40).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_long_box_name_is_cut_on_a_char_boundary() {
+        // 'é' is two bytes; a cut landing mid-char backs off to the boundary.
+        let fitted = fit_box_name(&"é".repeat(50), 20).unwrap();
+        assert!(fitted.len() <= 20, "{fitted}");
+        assert!(fitted.starts_with("éééé"), "{fitted}");
+    }
+
+    #[test]
+    fn a_budget_with_no_room_refuses_the_name() {
+        assert_eq!(fit_box_name("anything", 0), None);
+        assert_eq!(fit_box_name(&"a".repeat(20), 9), None);
+    }
 
     fn session_config() -> Config {
         let mut config = Config::new("test");
