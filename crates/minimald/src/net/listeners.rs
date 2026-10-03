@@ -35,10 +35,15 @@
 //! its bind can answer the dial a publication makes — to the box's lease —
 //! so a process bound to the box's loopback alone is not published at all
 //! ([`binds_for_the_lease`]); and nothing here is one-shot — a publication
-//! whose bind failed is retried on the next poll, a withdrawal whose
-//! unexpose failed is retried through the stop's passes, so a transient
+//! whose bind failed is retried on a per-port backoff that doubles off the
+//! poll interval, a withdrawal whose unexpose failed is retried on every
+//! poll the box still runs and through the stop's passes, so a transient
 //! refusal on the control channel never settles into a port that stays
-//! missing or a forward that stays bound.
+//! missing or a forward that stays bound. Neither half says its failure
+//! more than once while it keeps failing: the first refusal of a streak
+//! is the line, and the line that ends a streak is the publication's or
+//! the withdrawal's own — so a forwarder that is down for as long as the
+//! box lives is waited for, not written over and over.
 //!
 //! Polling, not a socket-diagnostic netlink socket or an inotify watch, is
 //! the honest read here: `/proc/<pid>/net/tcp` emits no change notification
@@ -82,6 +87,13 @@ const LISTEN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// the box's published address:port against a future session there, never
 /// enough that a control channel that is down outright hangs the stop.
 const WITHDRAW_PASSES: usize = 3;
+
+/// The longest a permitted port's publish waits between attempts: the
+/// backoff doubles off the poll interval once per refusal in the streak, so
+/// the first refusal costs exactly the one poll the one-shot retry paid and
+/// a refusal that persists is *waited for* — one attempt every half minute,
+/// never one per poll — while never being given up on.
+const PUBLISH_RETRY_CAP: Duration = Duration::from_secs(30);
 
 /// Everything a box's listener watcher needs, gathered by the launch that
 /// attached the box: its name (each publication's line names the box), its
@@ -140,9 +152,10 @@ impl ListenPlan {
 ///
 /// The take is destructive on purpose: a plan belongs to the one host that
 /// runs its box, and a reattach's launch stages a fresh one. A build that
-/// never takes its plan — a cancelled launch — leaves one entry behind,
-/// replaced the next time the same session launches, and holding no
-/// descriptor; the table is bounded by the sessions that exist.
+/// never takes its plan — a cancelled launch — leaves one entry behind for
+/// as long as one poll interval, until the next launch for the same session
+/// stages its own or clears the table's entry ([`clear_listen_plan`]); the
+/// table is bounded by the sessions that exist.
 static STAGED_PLANS: LazyLock<Mutex<HashMap<SessionId, ListenPlan>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -153,6 +166,21 @@ pub(crate) fn stage_listen_plan(session_id: SessionId, plan: ListenPlan) {
         .lock()
         .expect("staged listen-plan lock poisoned")
         .insert(session_id, plan);
+}
+
+/// Clears the table's entry for a launch that staged no plan — the box has
+/// no lease, no published address or no live gate, so none of its ports can
+/// be published by listening. The clear is the launch's own work, because
+/// what it removes is a *previous* launch's plan for the same session id: a
+/// cancelled launch staged one and never handed its box to a host, and the
+/// host the next launch does build must not take that orphan and start a
+/// watcher on a lease, an address and a gate the cancelled launch's attach
+/// already tore down.
+pub(crate) fn clear_listen_plan(session_id: SessionId) {
+    STAGED_PLANS
+        .lock()
+        .expect("staged listen-plan lock poisoned")
+        .remove(&session_id);
 }
 
 /// Takes the plan staged for `session_id` — once, so the host that runs the
@@ -236,6 +264,43 @@ struct WatchState {
     /// on the switch, including one whose unexpose failed and whose
     /// withdrawal is therefore still owed.
     forwards: HashMap<u16, ExposedMapping>,
+    /// One entry per permitted port whose publish the switch has refused
+    /// and not yet re-granted: when its next attempt may run, and how many
+    /// attempts the streak has refused. A port with an entry is one the
+    /// box is still listening on and the watcher still owes a publication,
+    /// which is exactly the set [`Self::listening`] is held down to.
+    backoff: HashMap<u16, PublishBackoff>,
+    /// The ports whose failed unexpose has been said once already: a
+    /// withdrawal that keeps failing is the *same* failure on every poll
+    /// and every stop pass, so its line is written once — the withdrawal's
+    /// own line, when the unexpose finally comes down, ends the streak.
+    reported_withdrawal_failures: HashSet<u16>,
+}
+
+/// One permitted port whose publish the switch refused: the book
+/// [`WatchState::poll`] keeps so a refusal that is not transient is waited
+/// out per port rather than re-asked on every poll.
+struct PublishBackoff {
+    /// When the next expose attempt may run — the backoff the streak's last
+    /// refusal chose.
+    retry_at: std::time::Instant,
+    /// How many attempts the streak has refused: the count the publication
+    /// that ends it carries, and the doubling's own counter.
+    refusals: u32,
+}
+
+/// The wait a refused publish's next attempt takes: the poll interval
+/// doubled once per refusal already in the streak, capped at
+/// [`PUBLISH_RETRY_CAP`]. The first refusal costs one poll — exactly the
+/// retry a single failure always paid — and each one after it doubles, so a
+/// forwarder that is down for as long as it takes is asked about once every
+/// half minute at most instead of four times a second.
+fn retry_after(refusals: u32) -> Duration {
+    let mut delay = LISTEN_POLL_INTERVAL;
+    for _ in 1..refusals {
+        delay = delay.saturating_mul(2).min(PUBLISH_RETRY_CAP);
+    }
+    delay
 }
 
 impl WatchState {
@@ -244,16 +309,18 @@ impl WatchState {
             plan,
             listening: HashSet::new(),
             forwards: HashMap::new(),
+            backoff: HashMap::new(),
+            reported_withdrawal_failures: HashSet::new(),
         }
     }
 
     /// One poll: read the box's listening sockets, publish what appeared,
-    /// withdraw what closed. A publication that failed to bind keeps its
-    /// port out of the book ([`Self::listening`]), so the next poll reads
-    /// the port as appeared again and retries it — the appearance is not
-    /// consumed by the failure, and a transient refusal on the control
-    /// channel never turns into a permitted port that stays unpublished
-    /// until its server restarts.
+    /// withdraw what closed, and ask again for what a refusal has left
+    /// owed. A publication that failed to bind keeps its port out of the
+    /// book ([`Self::listening`]), so the next poll reads the port as
+    /// appeared again — the appearance is not consumed by the failure, and
+    /// a transient refusal on the control channel never turns into a
+    /// permitted port that stays unpublished until its server restarts.
     async fn poll(&mut self, leader: u32) {
         let listening = match listening_ports(leader, self.plan.lease) {
             Ok(listening) => listening,
@@ -275,26 +342,82 @@ impl WatchState {
         // The diff is taken before anything mutates, so a publication made
         // here cannot be seen by the withdrawal beside it.
         let appeared: Vec<u16> = listening.difference(&self.listening).copied().collect();
-        let disappeared: Vec<u16> = self.listening.difference(&listening).copied().collect();
-        let mut unsettled = HashSet::new();
+        let disappeared: HashSet<u16> = self.listening.difference(&listening).copied().collect();
         for port in appeared {
-            if !self.open(port).await {
-                unsettled.insert(port);
-            }
+            self.publish(port).await;
         }
-        for port in disappeared {
-            self.close(port, "listener closed").await;
+        for port in &disappeared {
+            self.close(*port, "listener closed").await;
+        }
+        // The withdraw half of the nothing-is-one-shot promise: a forward
+        // whose unexpose failed is still standing on the switch —
+        // delivering to a lease:port nothing answers — for as long as the
+        // box runs, and the port left the listening book the poll its
+        // listener closed in, so the diff above never reads it as
+        // disappeared twice. Every port held in `forwards` that this
+        // poll's table does not name is a withdrawal the watcher still
+        // owes, and is asked for again here — bar one the diff above just
+        // tried, which this poll has already asked for and the next one
+        // will.
+        let owed: Vec<u16> = self
+            .forwards
+            .keys()
+            .copied()
+            .filter(|port| !listening.contains(port) && !disappeared.contains(port))
+            .collect();
+        for port in owed {
+            self.close(port, "the listener had closed and its unexpose failed")
+                .await;
         }
         self.listening = listening;
-        self.listening.retain(|port| !unsettled.contains(port));
+        // A port in the backoff book is one the box is listening on and
+        // the watcher has still not published, so it stays out of the
+        // book the diff reads: every poll that does not retry it sees it
+        // as appeared again, and the poll that does keeps it unsettled
+        // until the forward binds.
+        self.listening
+            .retain(|port| !self.backoff.contains_key(port));
+    }
+
+    /// NET-016: one listening port appeared, published unless the switch is
+    /// still refusing its publish. A port whose last attempt failed waits
+    /// its backoff out first — the appearance it still owes is kept while
+    /// it waits, never dropped and never re-asked on every poll.
+    async fn publish(&mut self, port: u16) {
+        let refusals = match self.backoff.get(&port) {
+            // The streak's backoff has not elapsed: this poll does not ask.
+            Some(wait) if wait.retry_at > std::time::Instant::now() => return,
+            Some(wait) => wait.refusals,
+            None => 0,
+        };
+        if self.open(port, refusals).await {
+            // The streak ends: the port is published, and the next failure
+            // — if the box's server ever makes one — is a streak of its own.
+            self.backoff.remove(&port);
+        } else {
+            let refusals = refusals + 1;
+            self.backoff.insert(
+                port,
+                PublishBackoff {
+                    retry_at: std::time::Instant::now() + retry_after(refusals),
+                    refusals,
+                },
+            );
+        }
     }
 
     /// NET-016: one listening port appeared. The shared verdict decides
     /// what the appearance is worth before anything is bound. Returns
     /// whether the appearance is settled — `false` only for a permitted
-    /// port whose forward failed to bind, the one appearance [`Self::poll`]
-    /// hands back to the next poll as appeared again.
-    async fn open(&mut self, port: u16) -> bool {
+    /// port whose forward failed to bind, the one appearance
+    /// [`Self::poll`] hands back to the next poll as appeared again, on
+    /// the backoff its refusals have earned.
+    ///
+    /// `refusals` counts the attempts this port's publish streak has
+    /// already been refused, so the failure is said once per streak — the
+    /// first refusal's line, never the retries' — and the publication that
+    /// ends a streak names what it took.
+    async fn open(&mut self, port: u16, refusals: u32) -> bool {
         match self.plan.gate.listen_verdict(port) {
             ListenVerdict::Publish => {
                 if self.forwards.contains_key(&port) {
@@ -305,6 +428,7 @@ impl WatchState {
                     // delivers to a port the rules permit. Re-admit it
                     // rather than ask the switch to bind a second forward
                     // onto the bind this one still holds.
+                    self.reported_withdrawal_failures.remove(&port);
                     self.plan.gate.admit_published(port);
                     tracing::info!(
                         session = %self.plan.box_name,
@@ -319,11 +443,11 @@ impl WatchState {
                 // The forward binds before the gate admits — the order the
                 // declaration's own apply holds (NET-121), so a port is
                 // never admitted while nothing answers for it, and a bind
-                // that fails admits nothing (the failure is already said,
-                // one warn at the bind): the poll keeps the port out of
-                // its book, so the next poll sees it still unpublished and
-                // tries again.
-                if let Ok(mapping) = expose_mapping(
+                // that fails admits nothing: the failure is said below,
+                // once per streak, and the poll keeps the port out of its
+                // book, so a later poll sees it still unpublished and asks
+                // again on the backoff the refusals have earned.
+                match expose_mapping(
                     &self.plan.control,
                     self.plan.published,
                     self.plan.lease,
@@ -331,18 +455,38 @@ impl WatchState {
                 )
                 .await
                 {
-                    self.plan.gate.admit_published(port);
-                    self.forwards.insert(port, mapping);
-                    tracing::info!(
-                        session = %self.plan.box_name,
-                        host = %self.plan.published,
-                        port,
-                        verdict = "permitted",
-                        "published a listening port on the box's address"
-                    );
-                    return true;
+                    Ok(mapping) => {
+                        self.plan.gate.admit_published(port);
+                        self.forwards.insert(port, mapping);
+                        tracing::info!(
+                            session = %self.plan.box_name,
+                            host = %self.plan.published,
+                            port,
+                            verdict = "permitted",
+                            refusals,
+                            "published a listening port on the box's address"
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        if refusals == 0 {
+                            // One line per streak: the refusals after this
+                            // one are the same failure, waited out rather
+                            // than repeated — the daemon log's tail is the
+                            // diagnostics bundle's.
+                            tracing::warn!(
+                                session = %self.plan.box_name,
+                                host = %self.plan.published,
+                                port,
+                                verdict = "permitted",
+                                retry_in = ?retry_after(refusals + 1),
+                                error = %e,
+                                "publishing a listening port on the switch failed"
+                            );
+                        }
+                        false
+                    }
                 }
-                false
             }
             // A declaration names the port: its forward was bound at
             // publish and is held until the box stops (NET-121), so there
@@ -368,6 +512,11 @@ impl WatchState {
     /// new connection crosses the gap between a listener already gone and a
     /// forward still bound; the forward comes down after. The order a
     /// revoked declared forwarder's own `revoke` holds (NET-121).
+    ///
+    /// `reason` names what ended the publication: the listener closing under
+    /// the box's own life, the box's stop taking every publication with it,
+    /// or a poll asking again for a forward whose unexpose failed while the
+    /// box still runs.
     async fn close(&mut self, port: u16, reason: &'static str) {
         let Some(mapping) = self.forwards.remove(&port) else {
             // Never published by the watcher: a declared port, whose
@@ -377,18 +526,40 @@ impl WatchState {
         };
         let terminated = self.plan.gate.withdraw_published(port);
         match unexpose_mapping(&self.plan.control, &mapping).await {
-            Ok(()) => tracing::info!(
-                session = %self.plan.box_name,
-                host = %self.plan.published,
-                port,
-                terminated,
-                reason,
-                "withdrew a listening port from the box's address"
-            ),
-            Err(_) => {
+            Ok(()) => {
+                // The withdrawal came down, so the streak of its failures —
+                // if it had one — is over and a later failure is its own.
+                self.reported_withdrawal_failures.remove(&port);
+                tracing::info!(
+                    session = %self.plan.box_name,
+                    host = %self.plan.published,
+                    port,
+                    verdict = "permitted",
+                    terminated,
+                    reason,
+                    "withdrew a listening port from the box's address"
+                );
+            }
+            Err(e) => {
+                // One line per streak, like the publish half: the retries
+                // the poll makes while the box runs and the stop's own
+                // passes are the same failure, and repeating it four times
+                // a second is what a forwarder that is down outright fills
+                // the daemon log with.
+                if self.reported_withdrawal_failures.insert(port) {
+                    tracing::warn!(
+                        session = %self.plan.box_name,
+                        host = %self.plan.published,
+                        port,
+                        verdict = "permitted",
+                        error = %e,
+                        "unpublishing a listening port on the switch failed"
+                    );
+                }
                 // The unexpose failed and said so. The gate already refuses
                 // the port, so nothing reaches the box through the forward
-                // left standing; keep it in the published set — the stop's
+                // left standing; keep it in the published set — the next
+                // poll asks for it again while the box runs, the stop's
                 // withdrawal passes retry it before the watcher ends, and a
                 // listener that comes back first re-admits the forward it
                 // still holds — rather than leaving it for the switch's
@@ -405,7 +576,9 @@ impl WatchState {
     /// past its box holding the box's published address:port — and the
     /// passes are bounded, so a control channel that is down outright ends
     /// the stop rather than hanging it. Whatever still stands when they are
-    /// spent is named, never left silent.
+    /// spent is named, never left silent — and nothing else is: a last pass
+    /// that brings everything down ends the stop with nothing to warn
+    /// about.
     async fn withdraw_all(&mut self) {
         for attempt in 0..WITHDRAW_PASSES {
             if self.forwards.is_empty() {
@@ -420,6 +593,13 @@ impl WatchState {
             for port in ports {
                 self.close(port, "box stopped").await;
             }
+        }
+        if self.forwards.is_empty() {
+            // The last pass brought the last forward down: every port the
+            // box's processes published is unpublished, and a warning that
+            // named none of them would only say the stop happened — which
+            // the stop itself already says.
+            return;
         }
         let still: Vec<&str> = self.forwards.values().map(ExposedMapping::local).collect();
         tracing::warn!(
@@ -539,7 +719,7 @@ fn v4_word(word: &str) -> Option<Ipv4Addr> {
 mod tests {
     use std::net::TcpListener;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1059,9 +1239,11 @@ mod tests {
     /// forward it never lost: the publication never came down, so it is
     /// re-admitted rather than re-bound — the switch still holds the first
     /// forward, and a second expose against that bind would fail every poll
-    /// the port's rules permit. The stop that ends the watcher still tries
-    /// the forward down, bounded, and never hangs on a channel that refuses
-    /// every unexpose.
+    /// the port's rules permit. The withdrawal it still owes is asked for
+    /// again while the box runs, and the stop that ends the watcher tries
+    /// the forward down too, bounded, never hanging on a channel that
+    /// refuses every unexpose — so how many unexposes were made is not a
+    /// number this proof can fix, only that they never stopped.
     #[tokio::test]
     async fn a_listener_back_before_its_failed_withdrawal_keeps_the_publication() {
         let listener = listening_socket();
@@ -1121,14 +1303,370 @@ mod tests {
             .iter()
             .filter(|served| served.path == "/services/forwarder/unexpose")
             .count();
-        assert_eq!(
-            withdrawals,
-            1 + WITHDRAW_PASSES,
-            "the refused withdrawal mid-life and every one of the stop's passes: {requests:?}"
+        assert!(
+            withdrawals > WITHDRAW_PASSES,
+            "the refused withdrawal is asked for again — once mid-life, then on every one \
+             of the stop's {} passes: {} requests, {requests:?}",
+            WITHDRAW_PASSES,
+            withdrawals
         );
         assert!(!gate.admits_tcp(port), "the publication ended with the box");
         drop(restarted);
         server.abort();
+    }
+
+    /// A withdrawal whose unexpose failed is retried while the box still
+    /// runs, not only at its stop: the forward left standing delivers to a
+    /// lease:port nothing answers, so every poll asks for it again until it
+    /// comes down — here the second unexpose, one poll later, with no stop
+    /// anywhere near it, and the stop that follows has nothing left to ask
+    /// of the switch.
+    #[tokio::test]
+    async fn a_failed_withdrawal_is_retried_while_the_box_runs() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("gvproxy.sock");
+        // The forwarder refuses the port's first unexpose — the shape of a
+        // forwarder mid-restart — and accepts every request after it.
+        let refused = AtomicBool::new(true);
+        let (server, mut served) = spawn_forwarder_deciding(sock.clone(), move |served| {
+            if served.path.ends_with("/unexpose") && refused.swap(false, Ordering::SeqCst) {
+                500
+            } else {
+                200
+            }
+        });
+        let (watcher, gate) = watcher_at(sock, &permit_policy(port));
+
+        let published = next_served(&mut served).await;
+        assert_eq!(published.path, "/services/forwarder/expose");
+        soon(|| gate.admits_tcp(port)).await;
+
+        // The listener closes and the unexpose is refused.
+        drop(listener);
+        let first = next_served(&mut served).await;
+        assert_eq!(first.path, "/services/forwarder/unexpose");
+        assert_eq!(first.local, format!("{PUBLISHED}:{port}"));
+        soon(|| !gate.admits_tcp(port)).await;
+
+        // The box is still running — no stop has been asked for — and the
+        // poll asks again for the withdrawal it owes, one poll later, for
+        // the same `local`.
+        let retried = next_served(&mut served).await;
+        assert_eq!(
+            retried,
+            Served {
+                path: "/services/forwarder/unexpose".into(),
+                local: format!("{PUBLISHED}:{port}"),
+                remote: String::new(),
+            },
+            "the failed withdrawal is retried while the box runs"
+        );
+
+        // So the stop has nothing left to withdraw: not one request.
+        watcher.stop().await;
+        let records = drained(&mut served);
+        assert!(
+            records.is_empty(),
+            "the withdrawal was already made while the box ran: {records:?}"
+        );
+        assert!(
+            !gate.admits_tcp(port),
+            "the publication ended with its listener"
+        );
+        server.abort();
+    }
+
+    /// A permitted port whose publish the switch refuses every time is
+    /// retried on a per-port backoff, not on every poll: the attempts space
+    /// out, doubling off the poll interval, so a forwarder that is down for
+    /// as long as it takes is waited for rather than hammered — and the
+    /// backoff never gives up on the port, which publishes the moment the
+    /// forwarder starts accepting.
+    #[tokio::test]
+    async fn a_persistently_refused_publish_backs_off() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("gvproxy.sock");
+        // The forwarder refuses the port's exposes while the test says so,
+        // and accepts them once the test clears the flag.
+        let refusing = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&refusing);
+        let (server, mut served) = spawn_forwarder_deciding(sock.clone(), move |served| {
+            if served.path.ends_with("/expose") && flag.load(Ordering::SeqCst) {
+                500
+            } else {
+                200
+            }
+        });
+        let (watcher, gate) = watcher_at(sock, &permit_policy(port));
+
+        // Three seconds of the switch refusing every publish: far fewer
+        // attempts than one per poll once the first few failures have the
+        // backoff doubling.
+        let started = std::time::Instant::now();
+        let mut attempts = 0;
+        while started.elapsed() < Duration::from_secs(3) {
+            match served.try_recv() {
+                Ok(attempt) => {
+                    assert_eq!(
+                        attempt.path, "/services/forwarder/expose",
+                        "only the port's publish is asked for: {attempt:?}"
+                    );
+                    assert_eq!(attempt.local, format!("{PUBLISHED}:{port}"));
+                    attempts += 1;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("the fake forwarder ended before the backoff was read")
+                }
+            }
+        }
+        assert!(
+            attempts <= 6,
+            "a forwarder that refuses every publish is waited for, not asked \
+             on every poll: {attempts} attempts in three seconds"
+        );
+        assert!(
+            !gate.admits_tcp(port),
+            "nothing is published while the switch refuses the bind"
+        );
+
+        // The moment the forwarder accepts, the next attempt lands: the
+        // port a box's process is listening on is published, late, never
+        // missing.
+        refusing.store(false, Ordering::SeqCst);
+        let published = next_served(&mut served).await;
+        assert_eq!(published.path, "/services/forwarder/expose");
+        assert_eq!(published.local, format!("{PUBLISHED}:{port}"));
+        soon(|| gate.admits_tcp(port)).await;
+
+        watcher.stop().await;
+        let withdrawn = next_served(&mut served).await;
+        assert_eq!(withdrawn.path, "/services/forwarder/unexpose");
+        assert_eq!(withdrawn.local, format!("{PUBLISHED}:{port}"));
+        assert!(!gate.admits_tcp(port));
+        server.abort();
+    }
+
+    /// Everything the watcher wrote on the thread it runs on, so a proof can
+    /// read the lines it left. The watcher's task shares a current-thread
+    /// runtime with the test, so `set_default` reaches it.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CaptureWriter {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Starts reading the watcher's own lines: the guard holds this thread's
+    /// default subscriber for as long as the proof does.
+    fn captured_lines() -> (CaptureWriter, tracing::subscriber::DefaultGuard) {
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (buf, guard)
+    }
+
+    /// The whole log lines carrying `what`, so a proof reads one event's
+    /// fields off the line that event landed on.
+    fn lines_saying<'a>(log: &'a str, what: &str) -> Vec<&'a str> {
+        log.lines().filter(|line| line.contains(what)).collect()
+    }
+
+    /// The publication's two endings carry the same facts its start does:
+    /// the withdrawal that ends it, and the failure of the unexpose that
+    /// cannot end it yet, each name the port, the box and the verdict — so
+    /// the daemon log's tail reads a publication's whole life whichever way
+    /// it ends. And the failure is said once per streak, not once per
+    /// attempt: the poll's retry is the same failure.
+    #[tokio::test]
+    async fn the_withdrawal_lines_carry_the_box_port_and_verdict() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("gvproxy.sock");
+        // The forwarder refuses the port's first unexpose and accepts every
+        // request after it, so the publication ends through one failed
+        // withdrawal and the retry that lands.
+        let refused = AtomicBool::new(true);
+        let (server, mut served) = spawn_forwarder_deciding(sock.clone(), move |served| {
+            if served.path.ends_with("/unexpose") && refused.swap(false, Ordering::SeqCst) {
+                500
+            } else {
+                200
+            }
+        });
+        let (lines, _guard) = captured_lines();
+        let (watcher, gate) = watcher_at(sock, &permit_policy(port));
+
+        let published = next_served(&mut served).await;
+        assert_eq!(published.path, "/services/forwarder/expose");
+        soon(|| gate.admits_tcp(port)).await;
+
+        drop(listener);
+        let first = next_served(&mut served).await;
+        assert_eq!(first.path, "/services/forwarder/unexpose");
+        let retried = next_served(&mut served).await;
+        assert_eq!(retried.path, "/services/forwarder/unexpose");
+        soon(|| !gate.admits_tcp(port)).await;
+        watcher.stop().await;
+        let log = lines.contents();
+
+        let withdrew = lines_saying(&log, "withdrew a listening port from the box's address");
+        assert_eq!(withdrew.len(), 1, "one withdrawal line, got: {log}");
+        assert!(
+            withdrew[0].contains("session=listen-box"),
+            "{}",
+            withdrew[0]
+        );
+        assert!(
+            withdrew[0].contains(&format!("port={port}")),
+            "{}",
+            withdrew[0]
+        );
+        assert!(
+            withdrew[0].contains("verdict=\"permitted\""),
+            "the withdrawal names its verdict as the publication does: {}",
+            withdrew[0]
+        );
+
+        let failed = lines_saying(&log, "unpublishing a listening port on the switch failed");
+        assert_eq!(
+            failed.len(),
+            1,
+            "the failed unexpose is said once, not once per attempt, got: {log}"
+        );
+        assert!(failed[0].contains("session=listen-box"), "{}", failed[0]);
+        assert!(failed[0].contains(&format!("port={port}")), "{}", failed[0]);
+        assert!(
+            failed[0].contains("verdict=\"permitted\""),
+            "the failure names its verdict as the publication does: {}",
+            failed[0]
+        );
+        server.abort();
+    }
+
+    /// The stop's "could not withdraw" warning names what it could not bring
+    /// down, and nothing else: a stop whose last pass succeeds — two refused
+    /// unexposes, then the third that comes down — warns of nothing, because
+    /// there is no forward left standing to name.
+    #[tokio::test]
+    async fn a_withdrawal_that_succeeds_on_the_last_pass_warns_of_nothing() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("gvproxy.sock");
+        // The forwarder refuses the stop's first two unexposes — its first
+        // two passes — and accepts the third, the last.
+        let refused = AtomicU32::new(2);
+        let (server, mut served) = spawn_forwarder_deciding(sock.clone(), move |served| {
+            if served.path.ends_with("/unexpose")
+                && refused.load(Ordering::SeqCst) > 0
+                && refused.fetch_sub(1, Ordering::SeqCst) > 0
+            {
+                500
+            } else {
+                200
+            }
+        });
+        let (lines, _guard) = captured_lines();
+        let (watcher, gate) = watcher_at(sock, &permit_policy(port));
+
+        let published = next_served(&mut served).await;
+        assert_eq!(published.path, "/services/forwarder/expose");
+        soon(|| gate.admits_tcp(port)).await;
+
+        // The listener still holds the port when the box stops, so the
+        // stop's own passes are the whole withdrawal: two refused, the
+        // third down.
+        watcher.stop().await;
+        let records = drained(&mut served);
+        let withdrawals = records
+            .iter()
+            .filter(|served| served.path == "/services/forwarder/unexpose")
+            .count();
+        assert_eq!(
+            withdrawals, 3,
+            "two refused passes and the one that came down: {records:?}"
+        );
+        assert!(!gate.admits_tcp(port), "the publication ended with the box");
+        let log = lines.contents();
+        assert!(
+            lines_saying(&log, "could not withdraw").is_empty(),
+            "a stop whose last pass withdrew everything warns of nothing: {log}"
+        );
+        assert_eq!(
+            lines_saying(&log, "unpublishing a listening port on the switch failed").len(),
+            1,
+            "the refusal is said once across the passes, got: {log}"
+        );
+        server.abort();
+    }
+
+    /// A launch that stages no plan still clears the table's entry for its
+    /// session, so the host a later launch builds never takes the plan a
+    /// cancelled launch left behind — one naming a lease, an address and a
+    /// gate that launch's attach already tore down.
+    #[test]
+    fn a_launch_that_stages_no_plan_clears_the_one_before_it() {
+        let cleared = SessionId::parse_str("00000000-0000-0000-0000-00000000a5c1").unwrap();
+        let kept = SessionId::parse_str("00000000-0000-0000-0000-00000000a5c2").unwrap();
+        let gate = Arc::new(SessionGate::for_session(
+            "listen-box".into(),
+            LEASE,
+            &permit_policy(8080),
+            SwitchSubnet::default(),
+        ));
+        let plan = || {
+            ListenPlan::new(
+                "listen-box".into(),
+                LEASE,
+                PUBLISHED,
+                ControlChannel::Unix(PathBuf::from("/nowhere")),
+                Arc::clone(&gate),
+            )
+        };
+        stage_listen_plan(cleared, plan());
+        stage_listen_plan(kept, plan());
+
+        // The new path: a launch that stages nothing removes what its
+        // session still holds.
+        clear_listen_plan(cleared);
+        assert!(
+            take_listen_plan(cleared).is_none(),
+            "the cancelled launch's plan is gone, so no later host takes it"
+        );
+        assert!(
+            take_listen_plan(kept).is_some(),
+            "the plan nobody cleared is still there to take"
+        );
     }
 
     /// The kernel socket table's rows read as the watcher reads them: a

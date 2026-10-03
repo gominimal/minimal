@@ -412,8 +412,9 @@ pub async fn remove_ingress(control: &ControlChannel, bound: &[PortForwarder]) {
 ///
 /// # Errors
 ///
-/// The expose error: the caller keeps the port unadmitted and retries on
-/// its next poll.
+/// The expose error, for the caller to say and decide about: the caller
+/// keeps the port unadmitted, says the failure once per streak, and retries
+/// on the per-port backoff its refusals have earned.
 pub async fn expose_mapping(
     control: &ControlChannel,
     published: Ipv4Addr,
@@ -426,21 +427,12 @@ pub async fn expose_mapping(
         proto: IpProto::Tcp,
     };
     let req = expose_request(&mapping, published, ptask_ip);
-    match post_json(control, "/services/forwarder/expose", &req).await {
-        Ok(()) => Ok(ExposedMapping {
+    post_json(control, "/services/forwarder/expose", &req)
+        .await
+        .map(|()| ExposedMapping {
             local: req.local,
             protocol: req.protocol,
-        }),
-        Err(e) => {
-            tracing::warn!(
-                port,
-                local = %req.local,
-                error = %e,
-                "publishing a listening port on the switch failed"
-            );
-            Err(e)
-        }
-    }
+        })
 }
 
 /// NET-017's withdraw: unexposes one mapping [`expose_mapping`] bound for a
@@ -457,10 +449,10 @@ pub async fn expose_mapping(
 ///
 /// The unexpose error, for the caller to say and decide about: a forward
 /// that fails to come down still stands at its `local`, so the caller keeps
-/// it in its published set — retrying the unexpose through the passes the
-/// stop that ends the watcher makes, and re-admitting the port if its
-/// listener returns before they run — never leaving it standing unowned for
-/// the switch's lifetime.
+/// it in its published set — retrying the unexpose on every poll the box
+/// still runs and through the passes the stop that ends the watcher makes,
+/// and re-admitting the port if its listener returns before they run —
+/// never leaving it standing unowned for the switch's lifetime.
 pub async fn unexpose_mapping(
     control: &ControlChannel,
     mapping: &ExposedMapping,
@@ -469,17 +461,7 @@ pub async fn unexpose_mapping(
         local: mapping.local.clone(),
         protocol: mapping.protocol.clone(),
     };
-    match post_json(control, "/services/forwarder/unexpose", &req).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            tracing::warn!(
-                local = %mapping.local(),
-                error = %e,
-                "unpublishing a listening port on the switch failed"
-            );
-            Err(e)
-        }
-    }
+    post_json(control, "/services/forwarder/unexpose", &req).await
 }
 
 /// NET-123's bind probe, conducted through the forwarder that will publish:

@@ -3368,7 +3368,11 @@ impl SessionLauncher for SandboxLauncher {
         // starts the watcher when it builds and stops it with the session,
         // so this is the one handoff: a box with no lease, no published
         // address or no live gate stages nothing, and its ports stay
-        // unpublishable by listening.
+        // unpublishable by listening — and it clears the table's entry for
+        // this session, so a plan a cancelled launch staged for it never
+        // reaches the host a later launch does build: that orphan names a
+        // lease, an address and a gate the cancelled launch's attach
+        // already tore down.
         let lease = plan.tap().map(|tap| tap.address);
         let published = own_address
             .as_ref()
@@ -3394,6 +3398,8 @@ impl SessionLauncher for SandboxLauncher {
                     gate,
                 ),
             );
+        } else {
+            crate::net::listeners::clear_listen_plan(session_id);
         }
 
         Ok(Launched {
