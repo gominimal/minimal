@@ -952,9 +952,9 @@ pub mod classifier {
         let account =
             own_account().unwrap_or_else(|| "<the account this daemon runs as>".to_string());
         format!(
-            "fetch install-host-classifier.sh from \
+            "run: curl -fsSLO \
              https://raw.githubusercontent.com/gominimal/minimal/main/scripts/install-host-classifier.sh \
-             and run: sudo bash ./install-host-classifier.sh --user {account} \
+             && sudo bash ./install-host-classifier.sh --user {account} \
              --cohort-address <cohort address> --node-plane-address <node-plane address>"
         )
     }
@@ -4476,7 +4476,10 @@ ff02::2\tip6-allrouters
         );
         assert!(!hint.contains("/blob/"), "{hint}");
         assert!(!hint.contains("sudo scripts/"), "{hint}");
-        // A downloaded file has no executable bit, so the hint runs it via bash.
+        // The fetch saves the file under its own name, so the run that
+        // follows finds it; a downloaded file has no executable bit, so the
+        // hint runs it via bash.
+        assert!(hint.contains("curl -fsSLO https://"), "{hint}");
         assert!(
             hint.contains("sudo bash ./install-host-classifier.sh"),
             "{hint}"
