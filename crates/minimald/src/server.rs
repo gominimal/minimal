@@ -1894,16 +1894,16 @@ pub(crate) async fn drive_proxy_until_serving(
 ///
 /// The serve loop starts as soon as the socket binds and stays up while the
 /// publish retries; the bind gate never runs again once it has passed, so a
-/// bound-and-served answerer is never dropped and rebound. On a VM boot the
-/// host port never moves at all: minvmd hands each VM its own distinct node
-/// ports on the boot line ([`crate::guest::handed_answerer_port`]) and the
-/// daemon binds them pinned, so each VM's answerer publishes at exactly the
-/// number it was handed and the walk below never runs (NET-059). The walk
-/// covers boots with no handed port — an older minvmd, a native run, a host
-/// that handed `0` — where a host port the host refuses is left for the
-/// next proposal, one rung further up ([`next_host_publish_port`]), while
-/// the socket keeps the port it bound: the same "publication walks, bind
-/// stays" rule the proxies follow.
+/// bound-and-served answerer is never dropped and rebound. The publish walk
+/// only ever covers boots with no handed port — a native run with the port
+/// unconfigured, or one that landed on `0` — where a host port the host
+/// refuses is left for the next proposal, one rung further up
+/// ([`next_host_publish_port`]), while the socket keeps the port it bound:
+/// the same "publication walks, bind stays" rule the proxies follow. A
+/// VM-hosted daemon never reaches this drive at all
+/// ([`start_host_proxies`] returns before it), so the walk's in-VM leg has
+/// no caller: the zone on a VM-backed host is the VM host daemon's host
+/// answerer's to serve (NET-138), never a guest's.
 #[cfg(target_os = "linux")]
 pub(crate) async fn drive_answerer_until_serving<T: crate::net::answerer::Zone>(
     state: ServerStateHandle,
@@ -2783,15 +2783,19 @@ mod tests {
         .expect("the hostname proxy must bind and report its port")
     }
 
-    /// T63 (NET-025, NET-138): a VM-hosted daemon binds the ports its host
+    /// T63 (NET-025, NET-138): a VM-hosted daemon binds the port its host
     /// handed it on the boot line, and selects none of its own. The handed
-    /// ports are read exactly the way pid-1 reads them — off the environment
+    /// port is read exactly the way pid-1 reads it — off the environment
     /// the kernel passes through — and the startup is driven the way a VM
     /// daemon's is: bind 0.0.0.0, publish behind the host-loopback gate, then
     /// record the bound port for the discovery reply to carry. With a handed
     /// port held busy, the startup keeps retrying that port and never
     /// re-picks: the host's box table names it, so a silent move would strand
     /// every client pointed at it.
+    ///
+    /// The handed port is the hostname proxy's alone: a VM-hosted daemon
+    /// starts no zone answerer (NET-138 — the VM host daemon's host answerer
+    /// owns the zone), so no answerer token exists to read or drive.
     ///
     /// The host-loopback publish is the `Fixed(None)` stand-in — the real
     /// gate's decisions are proven from the gate side (`minvmd`'s
@@ -2805,22 +2809,17 @@ mod tests {
 
         use crate::guest;
 
-        // Reserve free ports, then write them onto the boot line the way
-        // minvmd does: as tokens the kernel hands pid-1 as environment
-        // variables.
+        // Reserve a free port, then write it onto the boot line the way
+        // minvmd does: as a token the kernel hands pid-1 as an environment
+        // variable.
         let probe = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
         let proxy_port = probe.local_addr().unwrap().port();
         drop(probe);
-        let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
-        let answerer_port = probe.local_addr().unwrap().port();
-        drop(probe);
         unsafe {
             std::env::set_var(guest::HANDED_PROXY_PORT_TOKEN, proxy_port.to_string());
-            std::env::set_var(guest::HANDED_ANSWERER_PORT_TOKEN, answerer_port.to_string());
         }
-        // What pid-1's CLI is built with: the handed ports.
+        // What pid-1's CLI is built with: the handed port.
         assert_eq!(guest::handed_proxy_port().unwrap(), Some(proxy_port));
-        assert_eq!(guest::handed_answerer_port().unwrap(), Some(answerer_port));
 
         let dir = TempDir::new().unwrap();
         let state = ServerStateHandle::new(test_config(&dir), None)
@@ -2844,42 +2843,14 @@ mod tests {
             HostExpose::Fixed(None),
             retry,
         ));
-        let answerer = crate::net::answerer::ZoneAnswerer::new(
-            state.sessions_manager().await.hostnames(),
-            crate::net::answerer::AnswerScope::Microvm {
-                subnet: crate::net::DEFAULT_SUBNET,
-            },
-        );
-        tokio::spawn(drive_answerer_until_serving(
-            state.clone(),
-            answerer,
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            ProxyPort::from_config(
-                guest::handed_answerer_port().unwrap(),
-                crate::net::answerer::ANSWERER_PORT,
-            ),
-            true,
-            HostExpose::Fixed(None),
-            retry,
-        ));
 
-        // Bound as handed, both of them, and reported on the discovery path
-        // the RPC replies carry.
+        // Bound as handed, and reported on the discovery path the RPC
+        // replies carry.
         assert_eq!(
             wait_for_proxy_port(&state).await,
             proxy_port,
             "the handed proxy port is bound, not re-picked"
         );
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if state.zone_answerer_port().await == Some(answerer_port) {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the handed answerer port is bound, not re-picked");
 
         // And it really is a listener on the handed port: the proxy answers
         // (a name no live box owns gets its refusal).
@@ -3073,8 +3044,8 @@ mod tests {
         );
     }
 
-    /// T63 (NET-025): the pid-1 boot reads its handed ports fail-closed and
-    /// binds them before anything else answers. A token present but unusable
+    /// T63 (NET-025): the pid-1 boot reads its handed port fail-closed and
+    /// binds it before anything else answers. A token present but unusable
     /// is a surfaced boot error — the read is an `Err` naming the token and
     /// the value it carried, not a `None` the daemon would fall back from —
     /// and a handed port something already holds fails the probe bind, which
@@ -3103,12 +3074,9 @@ mod tests {
         let held_listener = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
         let held = held_listener.local_addr().unwrap().port();
         unsafe { std::env::set_var(guest::HANDED_PROXY_PORT_TOKEN, held.to_string()) };
-        unsafe { std::env::remove_var(guest::HANDED_ANSWERER_PORT_TOKEN) };
         let proxy = guest::handed_proxy_port().unwrap();
-        let answerer = guest::handed_answerer_port().unwrap();
         assert_eq!(proxy, Some(held));
-        assert_eq!(answerer, None);
-        let error = guest::probe_handed_node_ports(proxy, answerer)
+        let error = guest::probe_handed_node_port(proxy)
             .expect_err("a held handed port cannot bind for the probe");
         assert!(
             error.to_string().contains(&held.to_string()),
