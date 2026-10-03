@@ -1036,8 +1036,7 @@ fn subtrees_delegated(root: &Path) -> bool {
 /// is a step that did not finish — the state a failed re-install leaves —
 /// and reads the same as no step at all.
 fn table_marker_present(root: &Path) -> bool {
-    root.join(sandbox2::classifier::TABLE_MARKER).is_dir()
-        && recorded_ct_mark_mask(root).is_some()
+    root.join(sandbox2::classifier::TABLE_MARKER).is_dir() && recorded_ct_mark_mask(root).is_some()
 }
 
 /// The ct-mark mask the loaded table classifies cohort and node plane
@@ -1058,7 +1057,9 @@ fn recorded_ct_mark_mask(root: &Path) -> Option<u32> {
     for entry in recorded.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(value) = name.strip_prefix(MASK_RECORD_PREFIX) else { continue };
+        let Some(value) = name.strip_prefix(MASK_RECORD_PREFIX) else {
+            continue;
+        };
         let hex = value.strip_prefix("0x")?;
         let bits = u32::from_str_radix(hex, 16).ok()?;
         if mask.is_some_and(|other| other != bits) {
@@ -2026,15 +2027,21 @@ mod tests {
         // A record the probe cannot parse is no record: the classification
         // it would name is unreadable, and an unreadable classification is
         // not one a verdict can rest on.
-        std::fs::rename(root.join(TEST_CT_MARK_RECORD), root.join("ct-mark-mask-not-a-mask"))
-            .expect("malforming the recorded mask");
+        std::fs::rename(
+            root.join(TEST_CT_MARK_RECORD),
+            root.join("ct-mark-mask-not-a-mask"),
+        )
+        .expect("malforming the recorded mask");
         assert_eq!(
             decide(root, Some(&mountinfo(root, true)), false, refused_reading).cause(),
             Some(Cause::StepNotInstalled),
             "a recorded mask the probe cannot parse is no classification"
         );
-        std::fs::rename(root.join("ct-mark-mask-not-a-mask"), root.join(TEST_CT_MARK_RECORD))
-            .expect("restoring the recorded mask");
+        std::fs::rename(
+            root.join("ct-mark-mask-not-a-mask"),
+            root.join(TEST_CT_MARK_RECORD),
+        )
+        .expect("restoring the recorded mask");
         // Two records naming different bits are the state a half-finished
         // re-install leaves, and the one value the table classifies by
         // cannot be told from either: the step reads as not installed.
