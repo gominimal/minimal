@@ -925,6 +925,13 @@ impl SessionChannel {
                 self.run_materialize(stream, request).await;
                 None
             }
+            // `<port>`: the box's own `min net expose <port>` (NET-043) — the
+            // port a process inside the box asks to publish, decided and
+            // published by the session that owns it.
+            Some(("net-expose", port)) => {
+                self.expose_port(stream, port).await;
+                None
+            }
             _ => {
                 let _ = writeln!(stream, "error: unhandled input '{line}'");
                 None
@@ -1478,6 +1485,55 @@ impl SessionChannel {
         }
 
         let _ = writeln!(stream, "msg:{message} to {output}");
+    }
+
+    /// Handles the box's own `min net expose <port>` (NET-043): the request a
+    /// process inside the box sends to publish one of its ports. The session
+    /// that owns this channel decides it against the box's `dynamic_ingress`
+    /// setting and publishes when it allows (NET-044); the reply carries the
+    /// address the port was published on, or the typed refusal's own reason.
+    async fn expose_port(&self, stream: &mut UnixStream, port: &str) {
+        let Ok(port) = port.parse::<u16>() else {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the reply channel is best-effort: a peer that sent no port number \
+                          may be gone before the reply lands, and there is nowhere to report \
+                          that to"
+            )]
+            let _ = writeln!(stream, "error: '{port}' is not a port number");
+            return;
+        };
+        let Some(session) = self.session.upgrade() else {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the reply channel is best-effort: a peer may be gone before the \
+                          reply lands, and there is nowhere to report that to"
+            )]
+            let _ = writeln!(stream, "error: session is gone");
+            return;
+        };
+        match session.expose_dynamic(port).await {
+            Ok(mapping) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the reply channel is best-effort: a peer may be gone before the \
+                              reply lands, and there is nowhere to report that to"
+                )]
+                let _ = writeln!(
+                    stream,
+                    "msg:published port {} at {}",
+                    mapping.internal_port, mapping.local
+                );
+            }
+            Err(e) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the reply channel is best-effort: a peer may be gone before the \
+                              reply lands, and there is nowhere to report that to"
+                )]
+                let _ = writeln!(stream, "error: {e}");
+            }
+        }
     }
 
     /// Writes an [`mctx::Error`] to the client as `msg:` lines (preserving its
@@ -2168,6 +2224,47 @@ mod tests {
         assert!(
             lines[0].contains("error: unhandled input 'garbage-input'"),
             "unexpected output: {lines:?}"
+        );
+    }
+
+    /// The box's `min net expose <port>` reaches the channel as
+    /// `net-expose%<port>` (NET-043) — the request shape the helper sends —
+    /// and the channel answers it rather than treating it as unknown input:
+    /// a non-numeric port is refused as one, and a numeric one is routed to
+    /// the session that owns the channel (here a dangling handle, so the
+    /// routing is what the reply names). The decision itself — against the
+    /// box's `dynamic_ingress` — is the session actor's, proven where it
+    /// lives.
+    #[tokio::test]
+    async fn net_expose_reaches_the_session_channel() {
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%http", &mut ours).await;
+        drop(ours);
+        assert_eq!(
+            read_lines(&theirs),
+            vec!["error: 'http' is not a port number"],
+            "a non-numeric port is refused as one"
+        );
+
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%3000", &mut ours).await;
+        drop(ours);
+        assert_eq!(
+            read_lines(&theirs),
+            vec!["error: session is gone"],
+            "a numeric port is routed to the session that owns the channel"
         );
     }
 

@@ -205,6 +205,26 @@ min_materialize() {
     __min_rpc "materialize" "${PWD}%$*"
 }
 
+min_net() {
+    local subcmd="$1"
+    shift
+
+    case "$subcmd" in
+        expose)
+            local port="$1"
+            if [[ -z "$port" ]]; then
+                echo "Usage: min net expose <port>" >&2
+                return 1
+            fi
+            __min_rpc "net-expose" "$port"
+            ;;
+        *)
+            echo "error: unknown subcommand '$subcmd'. Expected 'expose'" >&2
+            return 1
+            ;;
+    esac
+}
+
 # If invoked directly as a script (not sourced), handle invocation
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     subcmd="$1"
@@ -231,6 +251,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         materialize)
             min_materialize "$@"
             ;;
+        net)
+            min_net "$@"
+            ;;
         *)
             echo "Usage: min <subcommand>" >&2
             echo "" >&2
@@ -241,6 +264,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             echo "Try building a package (with potentially-stale dependencies): min package patched-build <package name>" >&2
             echo "Check minimal configuration (bare, by exception): min check" >&2
             echo "Materialize an output into the workspace (bare, by exception): min materialize --output <path> [--arch <arch>] <output name>" >&2
+            echo "Publish a port from inside the box: min net expose <port>" >&2
             exit 1
             ;;
     esac
