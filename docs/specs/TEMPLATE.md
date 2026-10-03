@@ -3,14 +3,18 @@ id: XXX
 title: <feature name>
 owner: <github-handle>
 epic: <org/repo#N>
-arch: "<gominimal/arch link, or: none>"
+arch: <gominimal/arch link, or: none>
+# The commit of gominimal/arch the spec was written against. Every
+# github.com/gominimal/arch/blob/ link in the spec uses this sha in place of
+# main, so a bump is a visible diff.
+arch_sha: "<40-hex commit of gominimal/arch, or: none>"
 updated: <YYYY-MM-DD>
 ---
 
 # XXX — <feature name>
 
 <!--
-SOURCE  gominimal/foundry spec/template.md @ 84fa7182161886d0be29f2934e3417c9057c3515
+SOURCE  gominimal/foundry spec/template.md @ 485d77a148a14785347d76995b833510bbf04253
   This file is a copy. Edit it in foundry and open a PR here; a change made
   only in this repo is lost the next time the template is updated. The SOURCE
   line is what a drift check reads to tell whether this copy is behind.

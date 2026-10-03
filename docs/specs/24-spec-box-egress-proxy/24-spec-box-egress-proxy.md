@@ -3,7 +3,8 @@ id: BEP
 title: Local Box Egress Proxy — sealed GitHub credentials and host-store secrets without Gatehouse
 owner: norrietaylor
 epic: gominimal/inbox#625
-arch: https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md
+arch: https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/authn-authz/gatehouse-spec.md
+arch_sha: "5c1201517ba07347344fb9725efb06ee39d5c03e"
 updated: 2026-09-23
 ---
 
@@ -16,13 +17,13 @@ in, passing it through from the client environment, or running the Python
 reference broker. Each puts a bearer in the box, where a prompt-injected agent
 can read it and use it from anywhere for its full lifetime. The architecture
 ruled on 2026-09-06 that brokered secrets enter a box only as sealed values
-redeemed at a Box Egress Proxy ([architecture D6](https://github.com/gominimal/arch/blob/main/architecture.md),
-[Gatehouse §6.10](https://github.com/gominimal/arch/blob/main/specs/authn-authz/gatehouse-spec.md)),
+redeemed at a Box Egress Proxy ([architecture D6](https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/architecture.md),
+[Gatehouse §6.10](https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/authn-authz/gatehouse-spec.md)),
 and on 2026-09-17 that on a laptop the proxy runs node-local, on the host OS
 outside the VM, and that an un-enrolled client mints GitHub-module members from
 its own GitHub sign-in under a Minimal-published GitHub App (Gatehouse F19,
 §6.10 un-enrolled bullet; [networking design
-§7.1](https://github.com/gominimal/arch/blob/main/specs/networking/deployment-and-egress-gateway.md)).
+§7.1](https://github.com/gominimal/arch/blob/5c1201517ba07347344fb9725efb06ee39d5c03e/specs/networking/deployment-and-egress-gateway.md)).
 Gatehouse v1.23 made that member a reference to the sign-in, resolved and
 renewed at the proxy on each request, so a box's credentials work for its life
 within the credentialed lane's ceiling; v1.24

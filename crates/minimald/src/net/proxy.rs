@@ -73,6 +73,11 @@ const MAX_HEAD: usize = 8 * 1024;
 /// or stalled client cannot tie up a connection task indefinitely.
 const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the proxy waits for the upstream box to accept the TCP dial before
+/// answering `504`. A dead lease drops the SYN silently, so without this bound
+/// the client would wait out the kernel's SYN retries (about two minutes).
+const UPSTREAM_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The host-side lookup the proxy performs for each request: a `Host:`-header
 /// host (with any `:port` already stripped) to the route its requests forward
 /// on, or `None` if no live PTask owns it. The host resolver is never consulted.
@@ -491,9 +496,14 @@ where
         }
     };
 
-    let mut upstream = match TcpStream::connect(upstream_addr).await {
-        Ok(upstream) => upstream,
-        Err(error) => {
+    let mut upstream = match tokio::time::timeout(
+        UPSTREAM_DIAL_TIMEOUT,
+        TcpStream::connect(upstream_addr),
+    )
+    .await
+    {
+        Ok(Ok(upstream)) => upstream,
+        Ok(Err(error)) => {
             tracing::warn!(
                 component = "dns-proxy",
                 host = %host,
@@ -504,6 +514,18 @@ where
                 "refused a proxied request"
             );
             return write_status(&mut client, "502 Bad Gateway").await;
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                component = "dns-proxy",
+                host = %host,
+                session = route.session(),
+                upstream = %upstream_addr,
+                reason = "the upstream box did not answer within the dial timeout",
+                status = "504 Gateway Timeout",
+                "refused a proxied request"
+            );
+            return write_status(&mut client, "504 Gateway Timeout").await;
         }
     };
 
@@ -1211,6 +1233,76 @@ mod tests {
             logged.contains(r#"status="400 Bad Request""#),
             "expected the bad-request refusal to name the status, got: {logged}"
         );
+    }
+
+    /// An upstream that never completes the TCP handshake (a dead lease drops
+    /// the SYN silently) is answered with `504 Gateway Timeout` once
+    /// [`UPSTREAM_DIAL_TIMEOUT`] passes, instead of holding the client for the
+    /// kernel's SYN retries. The stalled upstream is a loopback listener whose
+    /// accept queue is already full, so Linux drops every further SYN.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn proxy_answers_504_when_the_upstream_dial_stalls() {
+        let stalled = TcpSocket::new_v4().unwrap();
+        stalled
+            .bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .unwrap();
+        let stalled = stalled.listen(0).unwrap();
+        let stalled_addr = stalled.local_addr().unwrap();
+
+        // Fill the accept queue (nothing accepts) until a dial stalls. These
+        // are blocking std dials on real time, untouched by the paused clock.
+        let mut held = Vec::new();
+        loop {
+            match std::net::TcpStream::connect_timeout(&stalled_addr, Duration::from_millis(250)) {
+                Ok(stream) => held.push(stream),
+                Err(error) => {
+                    assert_eq!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut,
+                        "expected a stalled dial once the accept queue is full"
+                    );
+                    break;
+                }
+            }
+            assert!(held.len() < 64, "the accept queue never filled");
+        }
+
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
+        reg.register_host_net(SessionId::nil(), "web");
+        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+
+        // An in-memory client, so the only real socket the proxy waits on is
+        // the stalled upstream dial.
+        let (mut client, proxy_side) = tokio::io::duplex(1024);
+        let request = format!(
+            "GET / HTTP/1.1\r\nHost: web.min.internal:{}\r\n\r\n",
+            stalled_addr.port()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            handle_connection_io(proxy_side, None, &router),
+        )
+        .await
+        .expect("the proxy must bound the upstream dial, not wait out the SYN retries")
+        .unwrap();
+        assert!(
+            started.elapsed() >= UPSTREAM_DIAL_TIMEOUT,
+            "the 504 must come from the dial timeout, after {:?}",
+            started.elapsed()
+        );
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.contains("504 Gateway Timeout"),
+            "expected a gateway timeout for a stalled dial, got: {response}"
+        );
+        drop(held);
     }
 
     /// Proof artifact 3 (R3.4 supersession): when the listen address cannot be
@@ -2186,6 +2278,16 @@ mod tests {
                     reg.report_own_address(target, "web", target_lease, applied);
                 }
                 TargetMode::OwnAddressNative => {
+                    // The creator's hand has published the box's address, as
+                    // `Session::register_hostname` records it; the attach
+                    // path's report and the session's own registration both
+                    // follow it, and neither is a source of the address.
+                    reg.publish_own_address(
+                        target,
+                        "web",
+                        target_lease,
+                        declared_request_ports(Some(&target_policy)),
+                    );
                     reg.report_own_address(target, "web", target_lease, applied);
                     // The session's own registration carries the declared
                     // set, as `Session::register_hostname` passes it.
@@ -2348,9 +2450,16 @@ mod tests {
                 .caller_at(CALLER_LEASE)
                 .expect("the reported lease names the registered caller");
 
-            // The attach path's report — an applied map with no mappings —
-            // and then the session actor's own registration, as a rename
-            // makes it: both must leave the route deny-all.
+            // The creator's hand published the box's address; the attach
+            // path's report — an applied map with no mappings — and then the
+            // session actor's own registration, as a rename makes it, both
+            // follow it: both must leave the route deny-all.
+            reg.publish_own_address(
+                target,
+                "web",
+                Ipv4Addr::LOCALHOST,
+                declared_request_ports(Some(&policy)),
+            );
             reg.report_own_address(target, "web", Ipv4Addr::LOCALHOST, BTreeMap::new());
             reg.register_own_ip(target, "web", declared_request_ports(Some(&policy)));
             let route = reg
