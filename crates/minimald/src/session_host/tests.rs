@@ -2428,6 +2428,14 @@ fn launcher_with(
 /// unit-test environment — which is exactly why the refusal's *absence* is
 /// the assertion, and a launched-and-dropped [`Launched`] is what its `Drop`
 /// promises it is.
+// `allow` rather than `expect` on purpose: this proof can skip, and on a host
+// whose tree can place a child it returns before its first await, where an
+// expectation the lint never meets would be its own warning.
+#[allow(
+    clippy::await_holding_lock,
+    reason = "the guard spans the launches because each host-address one \
+              re-reads the process-global classifier fact"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guest_launch_refuses_only_the_unplaced_host_address_box() {
     use sessions::NetworkMode;
@@ -2458,6 +2466,14 @@ async fn guest_launch_refuses_only_the_unplaced_host_address_box() {
         );
         return;
     }
+
+    // The window the launches write the daemon's process-global classifier
+    // fact in — every host-address launch re-reads it — taken for the whole
+    // proof, so under libtest no concurrent read answers over the state
+    // they write.
+    let _fact_window = super::PROBE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
 
     const REFUSAL: &str = "this guest has no classifier tree to place a host-address box in";
     for (guest, mode, refused, why) in [
@@ -2569,10 +2585,23 @@ fn a_none_mountinfo_knob_answers_over_the_daemons_own_mount_table() {
 /// and the placement probe is what reports the one thing the stand-in cannot
 /// model, the kernel that makes a placement placeable: the record the proof
 /// reads is the one that agreement produces.
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the guard spans the launches because each host-address one \
+              re-reads the process-global classifier fact"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unenforcing_native_host_runs_host_ip_box_unenforced() {
     use sandbox2::config::Verdict;
     use sessions::NetworkMode;
+
+    // The window the launches write the daemon's process-global classifier
+    // fact in — every host-address launch re-reads it, and the proof below
+    // reads the state they leave — taken for the whole proof, so under
+    // libtest no concurrent read answers over the state they write.
+    let _fact_window = super::PROBE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
 
     // The stand-in tree: the slice under a stand-in cgroup2 mount, named as
     // the production tree is named, with the step's subtrees delegated and
@@ -2767,6 +2796,25 @@ async fn unenforcing_native_host_runs_host_ip_box_unenforced() {
             "the record carries the decision in the machine spelling: {record}"
         );
     }
+
+    // And the launches' re-read is the read that keeps the daemon's one node
+    // fact current: the stand-in's own state — the step's half missing, so
+    // nothing decided per box — is what the launches left in the fact every
+    // read surface answers over, not a start-up reading that would outlive
+    // the tree it read.
+    let fact = super::host_ip_enforcement_fact();
+    assert_eq!(
+        fact.enforcement,
+        minimald_rpc::HostIpEnforcement::None,
+        "a launch over a tree missing the step's half leaves the fact's state \
+         `none` — the re-read's own answer"
+    );
+    assert_eq!(
+        fact.cause,
+        Some(crate::net::classifier::Cause::StepNotInstalled),
+        "the cause the re-read read is the fact's own, so the reads that \
+         derive from it name the ground they answer on"
+    );
 }
 
 /// The two probe causes, driven through the launch (A2's ruling): a native
@@ -2785,10 +2833,23 @@ async fn unenforcing_native_host_runs_host_ip_box_unenforced() {
 /// in `which_undecided_host_address_boxes_are_refused_and_with_what_words`,
 /// and the reading the refusal turns on is proved against a real loaded
 /// table by the root-gated proof in the classifier's module.
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the guard spans the launches because each host-address one \
+              re-reads the process-global classifier fact"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_native_launch_over_either_probe_cause_runs_records_none_and_advises() {
     use sandbox2::config::Verdict;
     use sessions::NetworkMode;
+
+    // The window the launches write the daemon's process-global classifier
+    // fact in — every host-address launch re-reads it — taken for the whole
+    // proof, so under libtest no concurrent read answers over the state
+    // they write.
+    let _fact_window = super::PROBE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
 
     // The step's half, installed: both subtrees with the kernel's own files,
     // and the marker that says the table loaded — everything the two probe
@@ -2941,6 +3002,14 @@ async fn a_native_launch_over_either_probe_cause_runs_records_none_and_advises()
 /// CLI's start output — and the banner is written onto the session's own pty,
 /// the in-session surface. Carrying the field out to a client over the
 /// session reply and `min doctor` is issue #1773, outside this task's layers.
+// `allow` rather than `expect` on purpose: this proof can skip, and on a host
+// whose tree can place a child it returns before its first await, where an
+// expectation the lint never meets would be its own warning.
+#[allow(
+    clippy::await_holding_lock,
+    reason = "the guard spans the launches because each host-address one \
+              re-reads the process-global classifier fact"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_unenforced_record_fires_on_every_launch_and_carries_the_field() {
     use sessions::NetworkMode;
@@ -2969,6 +3038,14 @@ async fn the_unenforced_record_fires_on_every_launch_and_carries_the_field() {
         );
         return;
     }
+
+    // The window the launches write the daemon's process-global classifier
+    // fact in — every host-address launch re-reads it — taken for the whole
+    // proof, so under libtest no concurrent read answers over the state
+    // they write.
+    let _fact_window = super::PROBE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
 
     let capture = crate::test_harness::captured_log();
     const NOTICE: &str = "this host places no classifier leaf for this session";
@@ -3038,6 +3115,14 @@ async fn the_unenforced_record_fires_on_every_launch_and_carries_the_field() {
 /// the env build, which fails on this box's unit-test graph before any pty is
 /// opened, so the banner is pinned to the same `advise` gate by construction
 /// and its suppression is proved at the record.
+// `allow` rather than `expect` on purpose: this proof can skip, and on a host
+// whose tree can place a child it returns before its first await, where an
+// expectation the lint never meets would be its own warning.
+#[allow(
+    clippy::await_holding_lock,
+    reason = "the guard spans the launches because each host-address one \
+              re-reads the process-global classifier fact"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hook_launch_does_not_advise_unenforced_placement() {
     use sessions::NetworkMode;
@@ -3064,6 +3149,14 @@ async fn a_hook_launch_does_not_advise_unenforced_placement() {
         );
         return;
     }
+
+    // The window the launches write the daemon's process-global classifier
+    // fact in — every host-address launch re-reads it — taken for the whole
+    // proof, so under libtest no concurrent read answers over the state
+    // they write.
+    let _fact_window = super::PROBE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
 
     let capture = crate::test_harness::captured_log();
     const RECORD: &str = "the session's host-address box runs unenforced on this host";
@@ -3241,6 +3334,14 @@ fn the_guests_unenforced_host_address_box_advises_with_the_interim() {
 /// on, for the two verdicts the guest can name — the deny-all box the
 /// interim refuses, and the box carrying an egress section, which the
 /// missing tree refuses for it here.
+// `allow` rather than `expect` on purpose: this proof can skip, and on a host
+// whose tree can place a child it returns before its first await, where an
+// expectation the lint never meets would be its own warning.
+#[allow(
+    clippy::await_holding_lock,
+    reason = "the guard spans the launches because each host-address one \
+              re-reads the process-global classifier fact"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_guests_refused_host_address_box_is_refused_and_not_advised() {
     use sessions::NetworkMode;
@@ -3265,6 +3366,14 @@ async fn a_guests_refused_host_address_box_is_refused_and_not_advised() {
         );
         return;
     }
+
+    // The window the launches write the daemon's process-global classifier
+    // fact in — every host-address launch re-reads it, refused or not —
+    // taken for the whole proof, so under libtest no concurrent read
+    // answers over the state they write.
+    let _fact_window = super::PROBE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
 
     let capture = crate::test_harness::captured_log();
     const REFUSALS: [&str; 2] = [

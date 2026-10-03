@@ -168,6 +168,39 @@ pub struct RunningSessionAttrs {
     pub visual_bell: Option<Bell>,
 }
 
+/// The per-box egress enforcement state a host-address session's verdict
+/// runs under (NET-079), as the daemon that owns the cgroup tree states it:
+/// `per_box` when the host can decide a host-address box's egress verdict on
+/// a classifier leaf of its own, `none` when it cannot and the box runs with
+/// the host's address and no verdict of its own.
+///
+/// The default is `none` — a daemon that has not read its host yet, or one
+/// whose host cannot decide, both spell the state the boxes on it run in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostIpEnforcement {
+    /// The host can decide per box: a host-address box's verdict is decided
+    /// on a classifier leaf of its own.
+    PerBox,
+    /// The host cannot decide per box: the box runs with the host's address
+    /// and no verdict of its own.
+    #[default]
+    None,
+}
+
+impl HostIpEnforcement {
+    /// The machine spelling the stringly surfaces carry — the create
+    /// response, the effective-policy reply, the daemon's log lines — so a
+    /// script that greps one surface for the state finds the same word on
+    /// every other.
+    pub fn machine_str(self) -> &'static str {
+        match self {
+            Self::PerBox => "per_box",
+            Self::None => "none",
+        }
+    }
+}
+
 /// An entry in the ListSessions response.
 ///
 /// `project_path` and `status` mirror the fields of the same name on the
@@ -199,25 +232,24 @@ pub struct ListSessionsEntry {
     #[serde(default)]
     pub git: Option<Box<GitInfo>>,
     pub attrs: Option<RunningSessionAttrs>,
-    /// The per-box egress enforcement this host's verdict gave the session
-    /// (NET-079): `per_box` when the host could decide a host-address box's
-    /// verdict on a classifier leaf of its own at create, `none` when it
-    /// could not and the box runs with the host's address and no verdict of
-    /// its own. Read off the record the create wrote it on, so a listing
-    /// shows the same state the create response and `min session policy`
-    /// show — no per-session follow-up round trip. `None` for a session
-    /// that is not host-address, for a record from a daemon that predates
-    /// the field, and when the record could not be read back; defaulted so
-    /// an entry from an older daemon still decodes, with the same silence
-    /// the other surfaces read as "not a host-address session".
-    ///
-    /// Boxed the way [`ListSessionsEntry::git`] is: the picker enums that
-    /// wrap an entry copy whole rows by value, and this field is one
-    /// machine word of state riding at the end of the row. On the wire it
-    /// is a plain string either way — the box is a client-side size
-    /// choice, invisible to the JSON.
+    /// The per-box egress enforcement this host's verdict gives the session
+    /// (NET-079): [`HostIpEnforcement::PerBox`] when this host can decide a
+    /// host-address box's verdict on a classifier leaf of its own,
+    /// [`HostIpEnforcement::None`] when it cannot and the box runs with the
+    /// host's address and no verdict of its own. Derived at read time from
+    /// the daemon's one classifier fact — seeded by its start-up read,
+    /// refreshed by each host-address launch's re-read — so a listing
+    /// always shows the state the host is in now, the same fact the create
+    /// response and `min session policy` answer over, with no per-session
+    /// follow-up round trip. `None` for a session that is not host-address
+    /// (its verdict is decided on address leases, never on the host's
+    /// cgroup tree), for a host-address box the classifier refused, whose
+    /// launch said the refusal, and when the record could not be read back
+    /// — defaulted so an entry from an older daemon still decodes, with the
+    /// same silence the other surfaces read as "not a host-address
+    /// session".
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_ip_enforcement: Option<Box<String>>,
+    pub host_ip_enforcement: Option<HostIpEnforcement>,
 }
 
 /// The git state of a session's project path, probed by the client on the
@@ -444,12 +476,13 @@ pub struct SessionConfig {
     #[serde(default = "default_hooks_enabled")]
     pub hooks_enabled: bool,
     /// Free-form attributes (typed by the caller), persisted onto the
-    /// session's record. The daemon adds one key of its own at create:
-    /// `host_ip_enforcement` (NET-079), the per-box egress enforcement this
-    /// host's verdict gives a host-address session, recorded so the state
-    /// outlives the create response that reported it and can be read back
-    /// by `GetEffectiveSessionPolicy` and the listing without re-probing
-    /// the host.
+    /// session's record. The daemon writes none of its own: NET-079's
+    /// per-box enforcement is a fact of the host reading the session, not of
+    /// the session's create, so it is derived at read time from the
+    /// daemon's own classifier fact and never recorded here. A client
+    /// supplying the daemon's own `host_ip_enforcement` key has it stripped
+    /// unconditionally, whatever the session's network mode — the state is
+    /// the host's verdict, never a caller's assertion.
     #[serde(default)]
     pub attrs: std::collections::BTreeMap<String, String>,
 }
@@ -678,8 +711,12 @@ pub struct CreateSessionResponse {
     #[serde(default)]
     pub answerer_bound: bool,
     /// The classifier advisory this host's verdict owes the session start
-    /// (NET-079): `Some` only while the box host cannot decide a
-    /// host-address box's egress verdict per box, naming the cause in
+    /// (NET-079): `Some` only when both halves it is about are true — the
+    /// daemon is not running inside a microVM, whose causes name its
+    /// image's builder rather than anything the person starting a session
+    /// could run, and the session is a host-address box, whose verdict is
+    /// the one the host's cgroup tree decides — and that host cannot
+    /// decide it per box, naming the cause in
     /// words, the state that leaves the box in — unenforced, except that
     /// a deny-all declaration is refused at placement while the probe
     /// that would decide it cannot be read — and the exact command that
@@ -704,18 +741,18 @@ pub struct CreateSessionResponse {
     /// host-address session (NET-079): `per_box` when this host can decide
     /// a box's verdict on a classifier leaf of its own, `none` when it
     /// cannot and the box runs with the host's address and no verdict of
-    /// its own. Spelled `host_ip_enforcement`, the machine spelling the
-    /// daemon's own record key and log line use, so a script reads the
-    /// state as data and not by parsing the prose around
-    /// it. `None` for a session that is not host-address: an own-address
-    /// or none box's verdict is decided on address leases, never on the
-    /// host's cgroup tree.
+    /// its own. Spelled in the machine spelling the daemon's log line and
+    /// the other replies use, so a script reads the state as data and not
+    /// by parsing the prose around it. `None` for a session that is not
+    /// host-address: an own-address or none box's verdict is decided on
+    /// address leases, never on the host's cgroup tree.
     ///
-    /// The daemon records the same fact onto the session's record at
-    /// create, so the state outlives this reply — the activation path's
-    /// one look at it. `None` from a daemon that predates the field is
-    /// that daemon's silence, never a decided `per_box`: a client that
-    /// reads nothing here claims nothing from it.
+    /// The state this create found on its host, read off the same daemon
+    /// fact the listing and the policy read answer over — never recorded,
+    /// because the fact is the host's and each host-address launch
+    /// re-reads it before placing a box. `None` from a daemon that
+    /// predates the field is that daemon's silence, never a decided
+    /// `per_box`: a client that reads nothing here claims nothing from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_ip_enforcement: Option<String>,
 }

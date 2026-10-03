@@ -345,14 +345,12 @@ pub enum EffectiveEgress {
 /// resolved into [`EffectiveEgress::DenyAll`] or [`EffectiveEgress::AllowAll`],
 /// so a reader cannot mistake "no declaration" for "no rules".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-// Unlike `SessionPolicy` this carries no `deny_unknown_fields`: its `egress`
-// is required, not an `Option`, so the daemon's `{"error": "..."}` reply
-// still falls through the `#[serde(untagged)]` `Errorable`'s `Ok` arm to
-// `Err` on its own and never masquerades as a valid policy. And a field this
-// shape can gain — the enforcement below arrived after the type was on the
-// wire — must stay ignorable, so an older client still decodes a newer
-// daemon's reply that carries a key it does not know rather than failing the
-// whole `min session policy` read.
+// Same reason as the attribute on `SessionPolicy`: the response rides an
+// `#[serde(untagged)]` `Errorable`, and the daemon's `{"error": "..."}` reply
+// must fall through to the `Err` arm rather than decode as a valid policy —
+// a silent false negative on a security-introspection command. Its `egress`
+// is required, not an `Option`, so the error reply falls through on its own.
+#[serde(deny_unknown_fields)]
 pub struct EffectiveSessionPolicy {
     /// The effective egress: the declaration, or the default the rollout
     /// phase and the daemon's opt-out leave in force.
@@ -372,8 +370,10 @@ pub struct EffectiveSessionPolicy {
     /// an enforcement of `none`, the state the box actually runs in, rather
     /// than a verdict that looks decided and is not.
     ///
-    /// Read off the record the create recorded the fact on, so the state
-    /// outlives the create response that first reported it.
+    /// Derived at read time, over the session's own declaration and network
+    /// mode, from the daemon's one classifier fact — the same fact the
+    /// listing answers over — so the reply always names the state the host
+    /// is in now, never one recorded earlier that a re-read has replaced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_ip_enforcement: Option<String>,
 }

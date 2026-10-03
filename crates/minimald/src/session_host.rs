@@ -2545,32 +2545,262 @@ fn launch_mountinfo(knob: Option<String>) -> Option<String> {
     knob.or_else(sandbox2::classifier::own_mountinfo)
 }
 
-/// The classifier fact every session-bearing path reads the host for,
+/// The daemon's one node fact about per-box egress enforcement (NET-079):
+/// whether this host can decide a host-address box's egress verdict per box,
+/// and — while it cannot — the cause it cannot. One fact for the whole node,
+/// because nothing it rests on is a session's: the decision reads the host's
+/// own cgroup tree, its mount table, and the loaded table's effect, and the
+/// cause names a state of the host, not of any box on it. The daemon's
+/// start-up read seeds it ([`set_host_ip_enforcement_fact`]'s caller in
+/// `main`) and every host-address launch's [`re_read_classifier_fact`]
+/// refreshes it, because the fact it rests on is the table's *effect*
+/// (design §7.4) — a marker survives whatever emptied the table and the
+/// refusal does not.
+///
+/// Held as a process-global rather than a field on the server's state for
+/// the same reason: the start-up read that seeds it runs before any server
+/// exists, and each surface that shows a session — the listing, the
+/// effective-policy reply, the create reply — derives its answer from it at
+/// read time, so all of them name the state the host is in now and none can
+/// show one a later re-read replaced.
+///
+/// `cause` rides beside the state because the two are one fact: the state a
+/// display shows and the advice the create reply carries both come from the
+/// one decision the probe read — the cause is `None` only while the host
+/// decides — and a fact that held the state alone could not say why.
+#[derive(Clone, Copy)]
+pub(crate) struct HostIpEnforcementFact {
+    /// The state itself, in the enum the listing's entries carry.
+    pub(crate) enforcement: minimald_rpc::HostIpEnforcement,
+    /// Why the host cannot decide per box; `None` while it can, and on a
+    /// fact no read has set yet (the cell's default, below), where the
+    /// cause is as unread as the state.
+    pub(crate) cause: Option<crate::net::classifier::Cause>,
+}
+
+impl HostIpEnforcementFact {
+    /// The fact as a [`classifier::Decision`], for the gate that refuses a
+    /// box over a cause. Lossless in the one direction that matters: a
+    /// `per_box` state is a decided verdict with no cause, and a cause
+    /// carries its own state — while a cause-less `none` state (the cell's
+    /// default, before any read has set it) is not a decision at all, so it
+    /// is `None`: a daemon that has not read its host refuses nothing over
+    /// it, and its displays show the state without claiming a cause.
+    fn decision(&self) -> Option<crate::net::classifier::Decision> {
+        match (self.enforcement, self.cause) {
+            (minimald_rpc::HostIpEnforcement::PerBox, _) => {
+                Some(crate::net::classifier::Decision::decided())
+            }
+            (_, Some(cause)) => Some(crate::net::classifier::Decision::undecidable(cause)),
+            (_, None) => None,
+        }
+    }
+}
+
+/// The fact itself: the cell every surface that shows a session reads, in
+/// the state the daemon's start-up read left it — `none`, with no cause, the
+/// state of a daemon that has not read its host yet. Const-initializable,
+/// so the one lock it sits behind is taken only by the reads and writes
+/// that swap or copy a fact two machine words wide.
+static HOST_IP_ENFORCEMENT_FACT: std::sync::Mutex<HostIpEnforcementFact> =
+    std::sync::Mutex::new(HostIpEnforcementFact {
+        enforcement: minimald_rpc::HostIpEnforcement::None,
+        cause: None,
+    });
+
+/// Sets the fact from a decision the classifier read — the one write path
+/// both its writers go through: the daemon's start-up read, which owns the
+/// host before any session exists, and each host-address launch's
+/// [`re_read_classifier_fact`], whose re-read keeps the fact current in the
+/// face of the table's own effect changing under it. `pub` because the
+/// start-up read is the daemon binary's (`main`), which owns the fact before
+/// any of this crate's servers exist.
+pub fn set_host_ip_enforcement_fact(decision: &crate::net::classifier::Decision) {
+    let mut fact = HOST_IP_ENFORCEMENT_FACT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fact.enforcement = if decision.can_decide_per_box() {
+        minimald_rpc::HostIpEnforcement::PerBox
+    } else {
+        minimald_rpc::HostIpEnforcement::None
+    };
+    fact.cause = decision.cause();
+}
+
+/// The fact as it stands, copied out for a surface that shows a session —
+/// the copy is two machine words, so the lock is held for the copy alone and
+/// never across a decision a re-read is making.
+pub(crate) fn host_ip_enforcement_fact() -> HostIpEnforcementFact {
+    *HOST_IP_ENFORCEMENT_FACT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Puts the fact back to its start-up default — no read, no cause — so a
+/// test that set a fact of its own leaves the daemon it shares a process
+/// with as it found it.
+#[cfg(test)]
+pub(crate) fn clear_host_ip_enforcement_fact() {
+    let mut fact = HOST_IP_ENFORCEMENT_FACT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fact.enforcement = minimald_rpc::HostIpEnforcement::None;
+    fact.cause = None;
+}
+
+/// The per-box egress enforcement a session's display surfaces show
+/// (NET-079): the daemon's one classifier fact, for a host-address box the
+/// classifier did not refuse, and nothing for any other box — an own-address
+/// or none box's verdict is decided on address leases, never on the host's
+/// cgroup tree, and a box the classifier refused at placement has no state
+/// to show, because the refusal is what its launch said.
+///
+/// The refusal half is the launch's own gate —
+/// [`refused_unenforced_host_address_box`] — so a display cannot disagree
+/// with a launch over which box is refused: the gate's `placed` fact, which a
+/// launch knows from its own placement, is inferred here from the fact's
+/// cause ([`fact_places_a_leaf`]), because the causes are what place or
+/// refuse the box natively and in the guest. A cause-less fact — the cell's
+/// default — places, and its gate refuses nothing, so the state shows as it
+/// stands.
+///
+/// Pure over its inputs, so the gate and its words are pinned where they are
+/// written.
+pub(crate) fn displayed_host_ip_enforcement(
+    guest: bool,
+    network_mode: NetworkMode,
+    verdict: sandbox2::config::Verdict,
+    fact: &HostIpEnforcementFact,
+) -> Option<minimald_rpc::HostIpEnforcement> {
+    if refused_unenforced_host_address_box(
+        guest,
+        network_mode,
+        verdict,
+        fact_places_a_leaf(fact.cause),
+        fact.decision().as_ref(),
+    )
+    .is_some()
+    {
+        return None;
+    }
+    match network_mode {
+        NetworkMode::HostNet => Some(fact.enforcement),
+        _ => None,
+    }
+}
+
+/// Whether a fact's cause says the step's tree is there to place a leaf in:
+/// the causes that imply a box nothing places are the step's absence and the
+/// mount that cannot confine, and every other cause — the two probe causes,
+/// the guest's unloaded table — arises only over a tree the step already
+/// installed (the marker and the delegated subtrees gate the probe), which is
+/// also where a decided fact's box goes. `None` — a decided fact, or the
+/// cell's default — places, so a display's refusal inference reads a decided
+/// host as the placement its launches make.
+fn fact_places_a_leaf(cause: Option<crate::net::classifier::Cause>) -> bool {
+    !matches!(
+        cause,
+        Some(
+            crate::net::classifier::Cause::StepNotInstalled
+                | crate::net::classifier::Cause::CannotConfine
+        )
+    )
+}
+
+/// Serializes the window in which a process-global test stand-in is
+/// installed, or the enforcement fact a test sets: a loopback-probe one
+/// (`net::loopback`), the classifier reading's (below), or the fact a launch
+/// or a test wrote — under libtest, where every test in this binary shares
+/// one process, a create, launch, or listing driven by another test would
+/// answer over it too. Nextest runs each test in its own process; the mutex
+/// keeps the in-process runner as safe.
+///
+/// Lives here — the module that owns the fact and the reading stand-in — so
+/// the launch tests that write the fact and the RPC tests that read it share
+/// one guard.
+#[cfg(test)]
+pub(crate) static PROBE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The test stand-in for the probe's reading: a `Reading` a test hands the
+/// decision in place of the live probe's, so the decision logic itself still
+/// runs over the facts a test laid out — the tree and mount table a test
+/// spells — and the one thing a stand-in tree cannot model, a table whose
+/// effect the probe reads, is the one thing a test injects. The same
+/// stand-in discipline the session-host knobs use: a fact in, never an
+/// answer.
+#[cfg(test)]
+static CLASSIFIER_READING_STANDIN: std::sync::Mutex<Option<crate::net::classifier::Reading>> =
+    std::sync::Mutex::new(None);
+
+/// Points the decision's probe at `reading` for the rest of this process —
+/// the stand-in state a test built. See [`CLASSIFIER_READING_STANDIN`].
+///
+/// The tests that use this take the probe-test mutex in this module for the
+/// whole install→read→assert→clear window: the stand-in is process-global,
+/// so under libtest — where the tests of one binary share a process — a
+/// launch driven by another test would read it too.
+#[cfg(test)]
+pub(crate) fn install_classifier_reading_standin(reading: crate::net::classifier::Reading) {
+    *CLASSIFIER_READING_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reading);
+}
+
+/// Withdraws the reading stand-in [`install_classifier_reading_standin`]
+/// installed, so later reads probe the table for real again.
+#[cfg(test)]
+pub(crate) fn clear_classifier_reading_standin() {
+    *CLASSIFIER_READING_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+/// The probe's reading the decision answers over: the live probe, except
+/// under test, where a stand-in reading may be installed over the same tree
+/// facts the test laid out.
+#[cfg(test)]
+fn classifier_reading(root: &std::path::Path) -> crate::net::classifier::Reading {
+    let standin = CLASSIFIER_READING_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    standin.unwrap_or_else(|| crate::net::classifier::read_filter(root))
+}
+
+/// The probe's reading the decision answers over: the live probe, always —
+/// the non-test twin of [`classifier_reading`], spelled separately so the
+/// test arm's lock is never compiled into a daemon that cannot install a
+/// stand-in.
+#[cfg(not(test))]
+fn classifier_reading(root: &std::path::Path) -> crate::net::classifier::Reading {
+    crate::net::classifier::read_filter(root)
+}
+
+/// The classifier fact every host-address launch reads the host for,
 /// freshly, on the blocking pool: the mount table the tree answers over —
 /// the knob's when one was set, the daemon's own, read live, when none was
 /// ([`launch_mountinfo`]) — and the decision over the tree and that one
 /// table (NET-079), returned together because the two are one fact: a
-/// caller that decides a box over a table and then answers over another has
-/// read nothing.
+/// launch that decides a box over a table and then places it over another
+/// has read nothing.
 ///
-/// Shared by every path that decides a host-address box on the host's own
-/// cgroup tree, so they cannot drift: the launch's read — the decision the
-/// placement, the recorded enforcement, and the refusal all answer over —
-/// and the create response's read, whose advisory and enforcement ride the
-/// reply to the start that is about to rely on the same host. Each caller
-/// reads fresh rather than keeping the start-time reading, because the
-/// fact the decision rests on is the table's *effect* (design §7.4): a
-/// marker survives whatever emptied the table and the refusal does not,
-/// and a kept reading would survive it the same way.
+/// The launch's read — the decision the placement, the recorded enforcement,
+/// and the refusal all answer over — and the write that keeps the daemon's
+/// one node fact ([`HOST_IP_ENFORCEMENT_FACT`]) current, in one move: the
+/// read is fresh rather than a kept start-time reading, because the fact
+/// the decision rests on is the table's *effect* (design §7.4) — a marker
+/// survives whatever emptied the table and the refusal does not, and a
+/// kept reading would survive it the same way — and the surfaces that show
+/// a session read the fact, so they show this read's state and not one a
+/// re-read has replaced.
 ///
 /// The mount table rides back out beside the decision because the launch
 /// answers its placement over the same one table the decision just read —
 /// one blocking hop, so the live mount-table read never runs on the async
 /// worker a session is being created on. `Err` says the read did not run
-/// at all — the blocking task was lost or panicked — which is each
-/// caller's own cause to name: a launch that cannot read the fact cannot
-/// place a box, while a create that cannot read reports the host as
-/// unable to decide per box, never as deciding.
+/// at all — the blocking task was lost or panicked — which is the launch's
+/// own cause to name: a launch that cannot read the fact cannot place a
+/// box.
 pub(crate) async fn re_read_classifier_fact(
     root: std::path::PathBuf,
     mountinfo_knob: Option<String>,
@@ -2578,7 +2808,10 @@ pub(crate) async fn re_read_classifier_fact(
 ) -> std::io::Result<(Option<String>, crate::net::classifier::Decision)> {
     tokio::task::spawn_blocking(move || {
         let mountinfo = launch_mountinfo(mountinfo_knob);
-        let decision = crate::net::classifier::decide_now(&root, mountinfo.as_deref(), guest);
+        let decision = crate::net::classifier::decide(&root, mountinfo.as_deref(), guest, || {
+            classifier_reading(&root)
+        });
+        set_host_ip_enforcement_fact(&decision);
         (mountinfo, decision)
     })
     .await
