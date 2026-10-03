@@ -35,8 +35,8 @@ pub async fn cmd_activate(global: &GlobalArgs, args: ActivateArgs) -> Result<(),
 const BOX_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One control-socket exchange with the VM host daemon (T66): one JSON
-/// line in — the verb's request — and one line out — the untagged reply
-/// the verb is answered with.
+/// line in — the verb's request, any request carrying the box-control verb
+/// tag — and one line out — the untagged reply the verb is answered with.
 ///
 /// The control socket lives beside the ssh socket in the minvmd
 /// provider-instance dir — the dir the daemon connection resolves through.
@@ -47,7 +47,7 @@ const BOX_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// destroy it rides on.
 async fn control_request_with_vm_host(
     sock_path: &std::path::Path,
-    request: minimald_rpc::BoxControlRequest,
+    request: impl serde::Serialize,
 ) -> anyhow::Result<minimald_rpc::BoxControlReply> {
     use tokio::io::AsyncBufReadExt as _;
     use tokio::io::AsyncWriteExt as _;
@@ -205,6 +205,140 @@ pub(crate) async fn withdraw_box_row(
                 box = %name,
                 "the VM host daemon did not answer the box row withdrawal in \
                  time; the row stays published"
+            );
+        }
+    }
+}
+
+/// One dynamic-ingress port the attached human answered yes to, recorded in
+/// the VM host daemon's box table (NET-138): a box's admitted port set is
+/// what its verdicts decide on, and a port published under `ask` (NET-045)
+/// is admitted by the human's own answer — a fact only the client that put
+/// the question to them holds, so it is the one that hands it to the host
+/// daemon before the publish it admits rides out.
+#[derive(Debug, serde::Serialize)]
+struct AdmitPortRequest {
+    /// The box whose row the port is admitted into — the name it registered
+    /// with (T66), which is the name its host row is filed under.
+    name: String,
+    /// The port the human allowed.
+    port: u16,
+    /// The row's pair, presented as the proof of being the row's creator —
+    /// the same proof the registration's withdrawal presents (T66), because
+    /// widening what a row admits is at least as much the creator's to ask
+    /// as unwinding the row is.
+    switch_address: std::net::Ipv4Addr,
+    loopback_address: std::net::Ipv4Addr,
+}
+
+/// The box-control line that carries [`AdmitPortRequest`] to the VM host
+/// daemon: `{"verb":"admit",...}`, framed exactly like every other box-control
+/// line (one JSON line, newline appended) so the daemon's per-verb dispatch
+/// reads it the same way.
+///
+/// Defined here rather than in `minimald-rpc` beside the other box-control
+/// requests because the wire side is the only half that exists yet: the host
+/// daemon's handler for it lands with the host half of NET-138, and when it
+/// does, the line moves to the shared wire crate so both sides spell it once.
+/// Until then a daemon that predates the verb refuses the tagged line, which
+/// is the designed answer of a version corner (a refusal, not a hang), and
+/// this side degrades that refusal to a warning.
+#[derive(serde::Serialize)]
+#[serde(tag = "verb", rename_all = "snake_case")]
+enum AdmitBoxControlLine {
+    Admit(AdmitPortRequest),
+}
+
+/// Records the port the attached human answered yes to in the VM host
+/// daemon's box table (NET-138), so the publish their answer admits is
+/// admitted by the host too: the row's admitted port set is what its egress
+/// verdicts decide on, and a port published under `ask` (NET-045) reaches it
+/// only by this recording — the declaration never opted in, and the human's
+/// yes is not a fact the host daemon can derive.
+///
+/// Called between the human's yes and the publish it admits. Always quiet
+/// when it owes nothing: a box with no name, no handed address pair, or no
+/// VM host to record with — a native host, an unresolved provider dir —
+/// records nothing and says nothing, exactly as its registration and
+/// withdrawal do. A recording that cannot be made — a daemon that predates
+/// the verb and refuses the line, the deadline — warns and lets the publish
+/// proceed: the host gate's own handling of an unadmitted port decides what
+/// happens then, and failing the human's own yes answer over bookkeeping
+/// would answer the question for them.
+#[allow(dead_code)] // No caller drives this yet: the box-naming expose verb
+// lands with the host half of NET-138, and the proof below drives it now.
+pub(crate) async fn record_ask_yes_in_host_table(
+    control_sock: Option<std::path::PathBuf>,
+    name: Option<&str>,
+    box_addresses: Option<sessions::BoxAddresses>,
+    port: u16,
+) {
+    let Some(name) = name else { return };
+    let Some(addresses) = box_addresses else {
+        return;
+    };
+    let Some(sock_path) = control_sock else {
+        tracing::warn!(
+            box = %name,
+            "cannot resolve the VM host daemon's control socket; the port the \
+             attached human allowed stays unadmitted by the host table"
+        );
+        return;
+    };
+    let request = AdmitPortRequest {
+        name: name.to_string(),
+        port,
+        switch_address: addresses.switch_address,
+        loopback_address: addresses.loopback_address,
+    };
+    let admitted = tokio::time::timeout(
+        BOX_CONTROL_TIMEOUT,
+        control_request_with_vm_host(&sock_path, AdmitBoxControlLine::Admit(request)),
+    )
+    .await;
+    match admitted {
+        Ok(Ok(reply)) => match reply {
+            // The daemon answers with the pair it went by, like every other
+            // verb that names a row: a pair back that is not the pair asked
+            // is a daemon speaking another protocol's answer — the row asked
+            // for is not the one widened.
+            minimald_rpc::BoxControlReply::Addresses(handed) if handed == addresses => {
+                tracing::debug!(box = %name, port, "recorded the allowed port in the box's host row");
+            }
+            minimald_rpc::BoxControlReply::Addresses(handed) => {
+                tracing::warn!(
+                    box = %name,
+                    port,
+                    switch_address = %handed.switch_address,
+                    "the VM host daemon answered the port admission with a \
+                     different address pair; the allowed port stays unadmitted"
+                );
+            }
+            minimald_rpc::BoxControlReply::Error { error } => {
+                tracing::warn!(
+                    box = %name,
+                    port,
+                    %error,
+                    "the VM host daemon refused the port admission; the \
+                     allowed port stays unadmitted"
+                );
+            }
+        },
+        Ok(Err(error)) => {
+            tracing::warn!(
+                box = %name,
+                port,
+                %error,
+                "recording the allowed port in the host table failed; it stays unadmitted"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                after = ?BOX_CONTROL_TIMEOUT,
+                box = %name,
+                port,
+                "the VM host daemon did not answer the port admission in time; \
+                 the allowed port stays unadmitted"
             );
         }
     }
@@ -2813,6 +2947,94 @@ mod tests {
         assert!(
             refused.to_string().contains("address plan is exhausted"),
             "the refusal surfaces with its reason: {refused}"
+        );
+    }
+
+    /// NET-138: the port the attached human answered yes to under `ask`
+    /// (NET-045) is recorded in the VM host daemon's box table over its
+    /// control socket — one box-control line naming the box, the port, and
+    /// the pair its registration handed back, presented the same proof of
+    /// being the row's creator the withdrawal presents (T66). The host
+    /// half that reads the line is not in the tree yet, so this drives the
+    /// client's half: the line a daemon would dispatch on.
+    #[tokio::test]
+    async fn ask_answer_recorded_in_host_table() {
+        // A stand-in daemon bound where a real minvmd's control socket
+        // would be, answering with the pair the registration handed back —
+        // the reply the recording goes by.
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let sock_path = provider_dir.join("control.sock");
+        let requests = fake_vm_host(
+            sock_path,
+            r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
+        )
+        .await;
+        let global = GlobalArgs {
+            provider: Some(Provider::LocalMinvmd),
+            minimal_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        // Driven the way the expose flow drives it: the socket resolved by
+        // the same rule the activation resolves it with, the pair the
+        // registration handed back, and the port the human allowed.
+        record_ask_yes_in_host_table(
+            vm_host_control_sock(&global),
+            Some("web"),
+            Some(sessions::BoxAddresses {
+                switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+                loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+            }),
+            3000,
+        )
+        .await;
+        {
+            // The lock is scoped: holding a std MutexGuard across the awaits
+            // below is exactly what the await-holding-lock lint names.
+            let seen = requests.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one admission, one request");
+            let request: serde_json_lenient::Value =
+                serde_json_lenient::from_str(&seen[0]).expect("the request is one JSON line");
+            assert_eq!(
+                request["verb"], "admit",
+                "the line carries the box-control admit verb: {request}"
+            );
+            assert_eq!(
+                request["name"], "web",
+                "the row widened is the box's own: {request}"
+            );
+            assert_eq!(
+                request["port"], 3000,
+                "the port recorded is the one allowed: {request}"
+            );
+            assert_eq!(
+                request["switch_address"], "100.64.0.2",
+                "the pair presented is the one the registration handed back: {request}"
+            );
+            assert_eq!(
+                request["loopback_address"], "127.0.64.0",
+                "the pair presented is the one the registration handed back: {request}"
+            );
+        }
+
+        // Nothing to record sends nothing: a box with no name, no handed
+        // pair, or no VM host to record with stays exactly as it was.
+        let silent_dir = tempfile::TempDir::new().unwrap();
+        let silent_sock = silent_dir.path().join("control.sock");
+        let silent = fake_vm_host(silent_sock, r#"{"error":"nothing"}"#.to_string()).await;
+        record_ask_yes_in_host_table(
+            Some(silent_dir.path().join("control.sock")),
+            None,
+            None,
+            3000,
+        )
+        .await;
+        record_ask_yes_in_host_table(None, Some("web"), None, 3000).await;
+        assert!(
+            silent.lock().unwrap().is_empty(),
+            "a recording that owes nothing sends nothing"
         );
     }
 
