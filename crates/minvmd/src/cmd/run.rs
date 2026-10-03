@@ -190,21 +190,56 @@ fn classify_detach_poll(
 /// A `__krun-vmm` child is reparented to init the moment its supervisor dies,
 /// so a live parent other than init means the VMM is still owned by a live
 /// supervisor — a competing supervisor's VMM, not a leak.
+///
+/// On macOS `/proc/<pid>/stat` does not exist; we read the parent pid via
+/// `proc_pidinfo(PROC_PIDTBSDINFO)` / `proc_bsdinfo` instead. When the parent
+/// pid cannot be determined, we conservatively treat the VMM as owned (return
+/// `true`) so the poll loop keeps waiting rather than misclassifying a healthy
+/// booting VMM as leaked.
 #[cfg(minvmd_libkrun)]
 fn vmm_owned_by_live_supervisor(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
+    let ppid = parent_pid(pid);
+    let Some(ppid) = ppid else {
+        // Cannot determine ownership: treat as owned so we keep waiting.
+        return true;
     };
+    // SAFETY: kill(pid, 0) probes for process existence without delivering a
+    // signal.
+    ppid != 1 && unsafe { libc::kill(ppid as libc::pid_t, 0) } == 0
+}
+
+/// Read the parent pid of `pid`. Returns `None` when the lookup fails.
+#[cfg(all(minvmd_libkrun, target_os = "macos"))]
+fn parent_pid(pid: u32) -> Option<u32> {
+    // SAFETY: the proc_bsdinfo buffer is stack-allocated and correctly sized;
+    // proc_pidinfo reads process info for the given pid into it.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
+        )
+    };
+    if ret <= 0 {
+        return None;
+    }
+    Some(info.pbi_ppid)
+}
+
+/// Read the parent pid of `pid` from `/proc/<pid>/stat`.
+#[cfg(all(minvmd_libkrun, not(target_os = "macos")))]
+fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // `comm` is the parenthesised process name and can itself contain spaces
     // and ')' — split on the last ')' so the fields after it are stable. The
     // first field after comm is `state`; the second is `ppid`.
     let after_comm = stat.rsplit_once(')').map(|(_, rest)| rest).unwrap_or("");
     let mut fields = after_comm.split_whitespace();
     let _state = fields.next();
-    let Some(ppid) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
-        return false;
-    };
-    ppid != 1 && unsafe { libc::kill(ppid as libc::pid_t, 0) } == 0
+    fields.next().and_then(|s| s.parse::<u32>().ok())
 }
 
 /// Spawn `minvmd run` as a detached background supervisor, then poll until
@@ -280,7 +315,7 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
             ),
             DetachPoll::LeakedVmm(pid) => bail!(
                 "the supervisor exited but a leaked __krun-vmm (pid {pid}) still holds the \
-                 alive lock; run `just reap` to kill stranded processes, then retry"
+                 alive lock; run `min stop` (or `kill -9 {pid}`), then retry"
             ),
             DetachPoll::Keep => {}
         }
@@ -1153,6 +1188,48 @@ mod tests {
             super::classify_detach_poll(false, Some(exited(1)), true, Some(i32::MAX as u32), false),
             super::DetachPoll::Keep
         ));
+    }
+
+    #[cfg(minvmd_libkrun)]
+    #[test]
+    fn detach_poll_cannot_determine_owner_keeps_waiting() {
+        // When `vmm_owned_by_live_supervisor` cannot determine ownership
+        // (e.g. macOS where /proc/<pid>/stat doesn't exist, or any OS where
+        // the lookup fails), it returns `true` — treat the VMM as owned and
+        // keep waiting rather than misclassifying a healthy booting VMM as
+        // leaked. This test uses a pid that doesn't exist, so the parent-pid
+        // lookup will fail, and the function should return `true`.
+        let nonexistent = i32::MAX as u32;
+        assert!(
+            super::vmm_owned_by_live_supervisor(nonexistent),
+            "cannot-determine-owner must return true (keep waiting)"
+        );
+    }
+
+    #[cfg(minvmd_libkrun)]
+    #[test]
+    fn vmm_with_live_non_init_parent_is_owned() {
+        // Our own process has a live parent (the test runner) that is not
+        // init, so it counts as owned on every platform — on macOS this
+        // needs the proc_pidinfo lookup, since /proc does not exist there.
+        // SAFETY: getppid() has no preconditions and cannot fail.
+        if unsafe { libc::getppid() } == 1 {
+            // Running as a direct child of init (e.g. a container pid-1
+            // runner): the premise does not hold.
+            return;
+        }
+        assert!(super::vmm_owned_by_live_supervisor(std::process::id()));
+    }
+
+    #[cfg(minvmd_libkrun)]
+    #[test]
+    fn parent_pid_of_own_process_is_consistent() {
+        // The lookup for our own pid must agree with getppid(). This
+        // exercises the platform's parent-pid path (proc_pidinfo on macOS,
+        // /proc/<pid>/stat on Linux).
+        // SAFETY: getppid() has no preconditions and cannot fail.
+        let expected = unsafe { libc::getppid() } as u32;
+        assert_eq!(super::parent_pid(std::process::id()), Some(expected));
     }
 
     #[test]
