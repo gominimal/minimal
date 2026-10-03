@@ -1125,8 +1125,8 @@ impl Binding {
         // `Selection::Cancelled` says both a keyed cancel and an input EOF,
         // and the two mean different deciders.
         let mut r = AskDialogInput::new(r);
-        let keyed = select.interact(&mut r, &mut w).await;
-        match keyed {
+        let outcome = select.interact(&mut r, &mut w).await;
+        match outcome {
             Ok(async_dialog::Selection::At(1)) => Some(AskAnswer::Allowed),
             // An explicit deny — Enter on the highlighted deny — or a keyed
             // cancel (Ctrl-C, `q`, Escape): the human's own deny — the
