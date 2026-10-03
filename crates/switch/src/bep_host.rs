@@ -972,6 +972,9 @@ impl BepStack {
 
     /// One full turn of the pool at `now`. The order is the choreography:
     ///
+    /// 0. the audit's expiry sweep, so a refusal window that ended between
+    ///    turns says the count it was still holding before any refusal this
+    ///    turn charges opens the next one (see the sweep's own comment below);
     /// 1. the partition reconciled against the box source — shares added
     ///    and withdrawn, a withdrawn row's live flows aborted and its
     ///    pin dropped. Reconciling before the screen is the same order as
@@ -1002,6 +1005,18 @@ impl BepStack {
     /// 8. the stack polled once more so everything the service queued
     ///    leaves inside the turn.
     pub fn poll(&mut self, now: Instant) {
+        // Windows that ended between turns say their final count here, before
+        // any refusal this turn charges opens the next one: a burst that stops
+        // leaves its window holding a count no line has said, and the silence
+        // that ended it never carries one — so the turn says it, at the window
+        // it belongs to. The audit keeps the real clock the pre-screen charges
+        // it at ([`BepStack::refuse_syn`]), not the stack's stepped `now`, so
+        // the sweep reads the same clock the windows were stamped with. `poll`
+        // runs at least every [`POLL_DELAY`], so an expired window is said on
+        // time and never waits for a further refusal to notice it.
+        for line in self.refusals.flush_expired(std::time::Instant::now()) {
+            tracing::warn!("{line}");
+        }
         self.reconcile();
         self.prescreen(now);
         self.host.poll(now);
@@ -1564,6 +1579,21 @@ impl BepStack {
             activated: None,
             flow: Flow::Listening,
         };
+    }
+}
+
+impl Drop for BepStack {
+    /// The stack's teardown flush, mirroring the relay's `SessionGate::Drop`
+    /// half: every count its audit still holds unsaid is said now, in the one
+    /// audit format, because nothing after the stack exists to carry one. The
+    /// peer's stack lives for the daemon's lifetime, so this is the whole
+    /// stack's own end — and a source that refused through its last window
+    /// and then fell silent still has that window's count said, rather than
+    /// dropped with the leg that counted it.
+    fn drop(&mut self) {
+        for line in self.refusals.flush_pending() {
+            tracing::warn!("{line}");
+        }
     }
 }
 
@@ -4178,6 +4208,79 @@ mod tests {
                 1
             ),
             "the sibling's refusal says its own line, on its own row"
+        );
+    }
+
+    /// T70: the peer drives the audit's own flushes, so a window's count is
+    /// never lost to the silence that ended it — the emitter's invariant, on
+    /// this leg as on the relay's, whose gate reports the same counts. A
+    /// burst that stops leaves its window holding a count no line has said;
+    /// the turn after the window passes says it, with the count that window
+    /// really saw. A stack that goes away says whatever its still-live
+    /// windows hold, at the leg's own end.
+    #[tokio::test]
+    async fn stack_peer_says_a_silent_windows_count() {
+        let (log, _guard) = capture_warn_lines();
+        let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let box_ip = Ipv4Addr::from(subnet.first_ptask());
+        let box_mac = EthernetAddress(MacAddr::for_switch_ip(box_ip).0);
+
+        // Ten refused SYNs in one burst: the window's one line at its first
+        // refusal, and nine refusals after it that no line has said.
+        for port in 40_200u16..40_210 {
+            h.lane.inject_frame(tcp_syn_from(box_mac, box_ip, proxy_ip, port, PROXY_PORT));
+        }
+        drive(&mut h.lane, 2).await;
+        let opening = shared_line(refusal::NO_REGISTERED_ROW, proxy_ip, PROXY_PORT, box_ip, 1);
+        assert_eq!(
+            log.lines(),
+            vec![opening.clone()],
+            "the burst's window says its one line, at its first refusal"
+        );
+
+        // The burst stops, and its window ends in that silence: nothing
+        // further from this source will ever carry the count it was holding,
+        // so the turn after the window passes says it — through the expiry
+        // sweep `poll` drives, in the one format every refusal leg uses.
+        tokio::time::sleep(refusal::REFUSAL_WINDOW + Duration::from_millis(100)).await;
+        drive(&mut h.lane, 1).await;
+        let owed = shared_line(refusal::NO_REGISTERED_ROW, proxy_ip, PROXY_PORT, box_ip, 10);
+        assert_eq!(
+            log.lines(),
+            vec![opening.clone(), owed.clone()],
+            "the silent window's count is said once the window has passed"
+        );
+
+        // A second burst opens a fresh window — the swept count is never
+        // said twice, and this window's line is its own opening one.
+        for port in 40_210u16..40_213 {
+            h.lane.inject_frame(tcp_syn_from(box_mac, box_ip, proxy_ip, port, PROXY_PORT));
+        }
+        drive(&mut h.lane, 2).await;
+        let second = shared_line(refusal::NO_REGISTERED_ROW, proxy_ip, PROXY_PORT, box_ip, 1);
+        assert_eq!(
+            log.lines(),
+            vec![opening.clone(), owed.clone(), second.clone()],
+            "the next window opens with its own count, never the swept one's"
+        );
+
+        // The stack goes away with that window still live, holding two
+        // refusals no line has said: its own end says them, in the one
+        // format — the teardown half of the flushes, the peer's twin of the
+        // relay gate's `Drop`.
+        drop(h);
+        let pending = shared_line(refusal::NO_REGISTERED_ROW, proxy_ip, PROXY_PORT, box_ip, 3);
+        let lines = log.lines();
+        assert_eq!(
+            lines[..3],
+            [opening, owed, second],
+            "the two windows' own lines, in the order they were said"
+        );
+        assert!(
+            lines.contains(&pending),
+            "the dropped stack says the count its live window still held: {lines:?}"
         );
     }
 

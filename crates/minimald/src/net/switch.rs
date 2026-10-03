@@ -1388,6 +1388,19 @@ impl SessionGate {
                 .filter(|(seen, _)| Instant::now().duration_since(*seen) < TERMINATED_FLOW_TTL)
                 .map(|(_, tail)| rst_from_flow(tail))
         };
+        // The sweep first, ahead of the charge: a window that ended between
+        // refusals — this source's or any other's — says the count it was
+        // still holding here, so a rolled window's own count is said at the
+        // window it belongs to and never folded into the next one's opening
+        // line. It runs on every refusal, whether or not that refusal builds
+        // a reset to write: a source that sends only spoofed segments to a
+        // revoked port refuses as much as one whose SYN is answered, and its
+        // closed windows must not wait for a reset the gate will never build.
+        // The stack peer's leg drives the same sweep on its own turn
+        // ([`switch::refusal::RefusalEmitter::flush_expired`]).
+        for line in self.refusals.flush_expired(Instant::now()) {
+            tracing::warn!("{line}");
+        }
         // The shared audit: bounded per source, its window's one line — said
         // whether or not there is a reply to write, while the reply itself is
         // written only when one was built and the source's quota owes it.
@@ -1404,28 +1417,23 @@ impl SessionGate {
         if let refusal::Outcome::Emit(line) = &outcome {
             tracing::warn!("{line}");
         }
-        let queued = match outcome {
+        // No early return past this point: the sweep above has already run,
+        // and a refusal that writes no reset returns through here like any
+        // other.
+        match outcome {
             // Past the quota: the source's refusals to lose are its own.
             refusal::Outcome::Suppressed => false,
-            refusal::Outcome::Quiet | refusal::Outcome::Emit(_) => {
-                let Some(reset) = reset else {
-                    return false;
-                };
-                self.send_reset(reset);
-                true
-            }
-        };
-        // Windows that ended between refusals say their final count here: a
-        // count the source's closed window was still holding, which no
-        // further refusal from it will ever carry on a next window's opening
-        // line, is said once — at the window it belongs to — instead of
-        // being lost to the silence that ended it. Any refusal drives the
-        // sweep, because only a refusal between windows can tell that a
-        // window ended; the lines that land are the same one format.
-        for line in self.refusals.flush_expired(Instant::now()) {
-            tracing::warn!("{line}");
+            // A refusal the gate built no reset for — a spoofed segment, or
+            // one of a flow it holds no tail for — is counted and said above,
+            // and writes nothing here.
+            refusal::Outcome::Quiet | refusal::Outcome::Emit(_) => match reset {
+                Some(reset) => {
+                    self.send_reset(reset);
+                    true
+                }
+                None => false,
+            },
         }
-        queued
     }
 
     /// Hands a synthesized reset to the leg that writes to the switch. The
@@ -3527,6 +3535,60 @@ pub(crate) mod tests {
             "a refusal that writes no reset is still the shared audit's — its \
              line is said: {logged}"
         );
+
+        // The sweep a no-reset refusal drives: four more spoofed segments
+        // count silently through the same window — five refusals it saw, one
+        // line said — and then the window ends in the silence of a source
+        // that stopped. The next refusal is a spoofed one too, so it writes
+        // no reset either: the sweep ahead of its charge is what says the
+        // closed window's count, and the path that never builds a reset must
+        // reach it as much as the one that does.
+        let spoofed = tcp_segment_with_numbers(ACK, OTHER_PEER, 80, 0xdead_beef, 0xfeed_face);
+        for _ in 0..4 {
+            let mut framed = Vec::with_capacity(2 + spoofed.len());
+            framed.extend_from_slice(&(spoofed.len() as u16).to_le_bytes());
+            framed.extend_from_slice(&spoofed);
+            harness.switch.write_all(&framed).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            capture
+                .contents()
+                .matches("source=100.64.0.6 refusals=")
+                .count(),
+            1,
+            "the window's refusals after its opening line say nothing yet: {}",
+            capture.contents()
+        );
+        tokio::time::sleep(refusal::REFUSAL_WINDOW + Duration::from_millis(100)).await;
+        let mut framed = Vec::with_capacity(2 + spoofed.len());
+        framed.extend_from_slice(&(spoofed.len() as u16).to_le_bytes());
+        framed.extend_from_slice(&spoofed);
+        harness.switch.write_all(&framed).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let logged = capture.contents();
+        assert!(
+            logged.contains(
+                "rule_matched=\"revoked ingress port\" address=100.64.0.9 port=80 \
+                 reason=\"the port's published ingress was revoked\" source=100.64.0.6 refusals=5"
+            ),
+            "the window that ended in a spoofed-only silence says its true \
+             count, at a refusal that writes no reset: {logged}"
+        );
+        assert_eq!(
+            logged.matches("source=100.64.0.6 refusals=").count(),
+            3,
+            "the closed window's count, the window's opening line, and the \
+             next window's own opening line — one per window, never per \
+             refusal: {logged}"
+        );
+        // And still no reset: the sweep and the line cost the wire nothing.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), read_framed(&mut harness.switch))
+                .await
+                .is_err(),
+            "no reset is built for a flow the gate holds nothing for"
+        );
     }
 
     /// The native relay leg answers through the shared builder: a refused SYN
@@ -4145,8 +4207,10 @@ pub(crate) mod tests {
         );
 
         // The window rolls and the flooder's quota returns with it — and the
-        // new window's opening line carries the count the spent one saw:
-        // four answered, four suppressed.
+        // sweep ahead of the new window's charge says the spent one's own
+        // count first: eight refusals, four answered and four suppressed,
+        // said at the window they belong to rather than folded into the next
+        // window's opening line.
         std::thread::sleep(Duration::from_millis(60));
         assert!(
             refused_syn(&gate, PEER),
@@ -4162,15 +4226,25 @@ pub(crate) mod tests {
             "the rolled window's line carries the refusals it saw: {}",
             capture.contents()
         );
-        // Two lines for the source across two windows — the second window's
-        // own count comes with its own roll — and not one per refusal
-        // anywhere.
+        assert_eq!(
+            capture
+                .contents()
+                .matches("source=100.64.0.5 refusals=1")
+                .count(),
+            2,
+            "each of the two windows opens with its own count, never the \
+             closed one's: {}",
+            capture.contents()
+        );
+        // Three lines for the source across two windows — the one each
+        // window says, plus the count the first one still held at its end —
+        // and not one per refusal anywhere.
         assert_eq!(
             capture
                 .contents()
                 .matches("source=100.64.0.5 refusals=")
                 .count(),
-            2,
+            3,
             "the flooder's lines are the window's, not the refusals': {}",
             capture.contents()
         );

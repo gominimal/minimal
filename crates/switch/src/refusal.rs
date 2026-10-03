@@ -872,9 +872,12 @@ impl RefusalEmitter {
     /// window's count from being lost to the silence that ended it — the
     /// count a further refusal would have carried on the next window's
     /// opening line, said once at the window it belongs to instead. The
-    /// caller drives it; the emitter says nothing itself. Any refusal is a
-    /// moment to call it, because only a refusal between windows can tell
-    /// that a window ended.
+    /// caller drives it; the emitter says nothing itself. A caller calls it
+    /// before every refusal, so a rolled window's own count is said rather
+    /// than folded into the next window's opening line, and a caller with a
+    /// cadence of its own — the stack peer's turn — calls it there too, so
+    /// a source that stops flooding does not need to send one more refusal
+    /// to have its last window's count said.
     pub fn flush_expired(&self, now: Instant) -> Vec<String> {
         let mut limiter = self.limiter();
         self.drain(&mut limiter, Some(now))
