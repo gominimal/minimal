@@ -4129,6 +4129,15 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         // The launcher consumes `name`; the bindings need it too, to name the
         // archives the shell-exit prompt's save-then-delete lane writes.
         let session_name = name.clone();
+        // The staged listen plan this launch may leave (NET-016, NET-017):
+        // this build is that plan's one taker, so it holds the plan's end
+        // too — a build that ends without taking it (a launch that
+        // errored, or an attach abandoned with its launch in flight)
+        // clears the entry as it ends, so an abandoned attach leaves
+        // nothing in the table holding the lease, the address and the
+        // gate its own attach registered. The take below disarms the
+        // guard; the drop clears.
+        let staged_plan = crate::net::listeners::StagedPlanGuard::armed_for(session_id);
         let Launched {
             master,
             process,
@@ -4171,6 +4180,10 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                 }
             }
         });
+        // The plan is the watcher's now — or there never was one — and the
+        // table's entry went with the take, so this build's own end has
+        // nothing left to clear.
+        staged_plan.taken();
 
         let (sender, receiver) = mpsc::channel(HOST_MAILBOX_CAPACITY);
         let handle = HostHandle { sender };

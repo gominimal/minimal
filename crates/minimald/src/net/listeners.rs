@@ -151,11 +151,15 @@ impl ListenPlan {
 /// and a mock launch that stages nothing starts no watcher at all.
 ///
 /// The take is destructive on purpose: a plan belongs to the one host that
-/// runs its box, and a reattach's launch stages a fresh one. A build that
-/// never takes its plan — a cancelled launch — leaves one entry behind for
-/// as long as one poll interval, until the next launch for the same session
-/// stages its own or clears the table's entry ([`clear_listen_plan`]); the
-/// table is bounded by the sessions that exist.
+/// runs its box, and a reattach's launch stages a fresh one. The build that
+/// could take a plan holds [`StagedPlanGuard`] across its launch and its
+/// take, so a build that ends without taking it — a launch that errored, or
+/// an attach abandoned with its launch in flight — clears the entry as it
+/// ends: a plan holds a lease, an address and the gate an attach registered,
+/// and none of them serves anything once that attach is gone. No entry
+/// outlives the build it was staged for, so the table is bounded by the
+/// host builds in flight — never grown one abandoned launch at a time over
+/// the daemon's life.
 static STAGED_PLANS: LazyLock<Mutex<HashMap<SessionId, ListenPlan>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -191,6 +195,49 @@ pub(crate) fn take_listen_plan(session_id: SessionId) -> Option<ListenPlan> {
         .lock()
         .expect("staged listen-plan lock poisoned")
         .remove(&session_id)
+}
+
+/// The hold the host build that could take a session's plan has on it: the
+/// build is a plan's one taker, so it owns the plan's end too. A build is a
+/// future, and the abandonment a cancelled attach leaves is a drop, not a
+/// return — a launch cancelled after it staged leaves no host behind, so
+/// nothing else ever comes for the plan — which is why the clear rides
+/// [`Drop`]: the build that ends without taking its plan takes the plan
+/// with it, and a plan's facts — a lease, an address, a gate an attach
+/// registered — never outlive the attach that gathered them.
+///
+/// [`Self::taken`] disarms the guard on the one ending a plan survives: the
+/// take, which is destructive and leaves the table with nothing for the
+/// drop to clear.
+pub(crate) struct StagedPlanGuard {
+    session_id: SessionId,
+    armed: bool,
+}
+
+impl StagedPlanGuard {
+    /// Takes the hold: the build about to launch is the one that could take
+    /// this session's plan.
+    #[must_use]
+    pub(crate) fn armed_for(session_id: SessionId) -> Self {
+        Self {
+            session_id,
+            armed: true,
+        }
+    }
+
+    /// The plan is taken — the watcher owns it now, and the table's entry
+    /// went with the take, so the guard's own end clears nothing.
+    pub(crate) fn taken(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StagedPlanGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            clear_listen_plan(self.session_id);
+        }
+    }
 }
 
 /// The running watcher: what a host holds for its box's lifetime, stopped by
@@ -1681,6 +1728,71 @@ mod tests {
         assert!(
             take_listen_plan(kept).is_some(),
             "the plan nobody cleared is still there to take"
+        );
+    }
+
+    /// No staged plan outlives the host build that could take it: a build
+    /// cancelled after its launch staged — the abandonment an attach that
+    /// gives up leaves, where no host ever comes for the plan — takes the
+    /// plan with it, and a build abandoned before its launch reached the
+    /// staging step clears the orphan an earlier cancelled launch left. The
+    /// build that does take its plan disarms the guard, and the plan is the
+    /// watcher's — a plan never holds its gate and its control channel
+    /// past the attach that gathered them.
+    #[test]
+    fn no_staged_plan_outlives_the_build_that_could_take_it() {
+        let cancelled = SessionId::parse_str("00000000-0000-0000-0000-00000000a5c3").unwrap();
+        let taken = SessionId::parse_str("00000000-0000-0000-0000-00000000a5c4").unwrap();
+        let gate = Arc::new(SessionGate::for_session(
+            "listen-box".into(),
+            LEASE,
+            &permit_policy(8080),
+            SwitchSubnet::default(),
+        ));
+        let plan = || {
+            ListenPlan::new(
+                "listen-box".into(),
+                LEASE,
+                PUBLISHED,
+                ControlChannel::Unix(PathBuf::from("/nowhere")),
+                Arc::clone(&gate),
+            )
+        };
+
+        // The launch cancelled after it staged: the plan is in the table,
+        // no host ever comes for it, and the build's own end clears it —
+        // not the next launch for the session, which may never come.
+        let guard = StagedPlanGuard::armed_for(cancelled);
+        stage_listen_plan(cancelled, plan());
+        drop(guard);
+        assert!(
+            take_listen_plan(cancelled).is_none(),
+            "a plan no build took leaves the table with the build that could have"
+        );
+
+        // A build abandoned before its launch reached the staging step
+        // clears the orphan an earlier cancelled launch left behind: a
+        // later host must never take a plan whose attach is already gone.
+        stage_listen_plan(cancelled, plan());
+        drop(StagedPlanGuard::armed_for(cancelled));
+        assert!(
+            take_listen_plan(cancelled).is_none(),
+            "the next build clears an earlier launch's orphan"
+        );
+
+        // The build that takes its plan: the guard disarms at the take,
+        // and the take's own destructiveness is what emptied the table —
+        // no second host takes what the first now runs its watcher on.
+        stage_listen_plan(taken, plan());
+        let guard = StagedPlanGuard::armed_for(taken);
+        assert!(
+            take_listen_plan(taken).is_some(),
+            "the plan a launch staged is there for its host build to take"
+        );
+        guard.taken();
+        assert!(
+            take_listen_plan(taken).is_none(),
+            "the take is destructive: the plan went with the host that took it"
         );
     }
 
