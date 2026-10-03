@@ -1103,14 +1103,28 @@ where
                         child_stdin = None;
                     }
                     Ok(n) => {
-                        if let Some(cs) = child_stdin.as_mut()
-                            && let Err(err) = cs.write_all(&stdin_buf[..n]).await
-                        {
-                            tracing::warn!(
-                                %channel_id, error = %err,
-                                "exec: failed to write stdin to child; closing child stdin",
-                            );
-                            child_stdin = None;
+                        // A child that stops reading stdin parks this
+                        // write; race it against client loss so the
+                        // disconnect still reaches the kill path below.
+                        if let Some(cs) = child_stdin.as_mut() {
+                            tokio::select! {
+                                res = cs.write_all(&stdin_buf[..n]) => {
+                                    if let Err(err) = res {
+                                        tracing::warn!(
+                                            %channel_id, error = %err,
+                                            "exec: failed to write stdin to child; closing child stdin",
+                                        );
+                                        child_stdin = None;
+                                    }
+                                }
+                                Ok(_) = client_lost.wait_for(|lost| *lost), if client_watch_open => {
+                                    tracing::warn!(
+                                        %channel_id,
+                                        "exec: ssh client disconnected; killing child",
+                                    );
+                                    ssh_write_failed = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -2894,6 +2908,63 @@ mod tests {
             !ctrl.was_killed(),
             "stdin EOF is a normal close, not a disconnect; the child must not be killed"
         );
+    }
+
+    /// A child that never reads stdin leaves the bridge parked writing
+    /// into a full stdin pipe. A disconnect arriving then must still
+    /// kill the child rather than wait on a write that never completes.
+    #[tokio::test]
+    async fn bridge_kills_child_blocked_on_stdin_when_client_disconnects() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                // Held but never read: the child's stdin pipe fills.
+                stdin_reader: _stdin_reader,
+                stdout_writer: _stdout_writer,
+                stderr_writer: _stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+
+        let (mut client_stdin, mut bridge_stdin) = duplex(64 * 1024);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+
+        // Far more than the child's stdin pipe holds; this writer blocks
+        // once both pipes are full, which is the point.
+        let feeder = tokio::spawn(async move {
+            let _ = client_stdin.write_all(&vec![b'x'; 512 * 1024]).await;
+        });
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost_rx,
+            )
+            .await
+        });
+
+        // Let the bridge fill the child's stdin pipe and park on it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!bridge_task.is_finished());
+
+        client_lost_tx.send(true).unwrap();
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a lost client must interrupt a blocked stdin write")
+            .unwrap();
+        assert_eq!(exit, 1);
+        assert!(ctrl.was_killed());
+        feeder.abort();
     }
 
     /// `min task run` from a terminal half-closes stdin before anything
