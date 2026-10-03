@@ -79,8 +79,12 @@ pub enum SocketSeal {
     /// keeps its inet sockets; `AF_PACKET` is admitted here and refused by
     /// the missing `CAP_NET_RAW` no box holds, as NET-083 binds.
     ConfinedFamilies,
-    /// Admits `AF_UNIX` alone and refuses every other family — the `none`
-    /// plan's promise of no reach outside the sandbox at all.
+    /// Admits the families the box's own network namespace confines — unix,
+    /// inet, inet6, netlink — so the box can use its own loopback, and
+    /// refuses every other family with `EAFNOSUPPORT`, the
+    /// namespace-bypass families (`AF_VSOCK`) included.  The `none` plan's
+    /// seal: the namespace already holds only `lo`, so admitting inet
+    /// blocks nothing the namespace does not already block.
     Full,
 }
 
@@ -166,10 +170,12 @@ impl NetPlan {
     }
 
     /// A none box: an unshared network namespace that will never get a tap,
-    /// with every socket family but `AF_UNIX` refused on top (`AF_VSOCK`
-    /// reaches the host regardless of the namespace). Unlike
+    /// with every socket family but the ones its own namespace confines
+    /// (`AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK`) refused on top
+    /// (`AF_VSOCK` reaches the host regardless of the namespace). Unlike
     /// [`NetPlan::isolated`], which an own-address box also starts from when
-    /// its tap is moved in after spawn, this plan is the promise of no reach.
+    /// its tap is moved in after spawn, this plan is the promise of no reach
+    /// outside the box — its own loopback stays usable.
     #[must_use]
     pub fn none() -> Self {
         Self {
