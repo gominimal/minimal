@@ -1669,6 +1669,16 @@ pub(crate) struct Host<P: SessionProcess, G: SessionGuard> {
     // net-guard-less tests.
     net_guard: Option<Box<dyn sandbox2::NetGuard>>,
 
+    /// The box's listen-publication watcher (NET-016, NET-017): publishes
+    /// the ports its processes listen on when the box's ingress rules
+    /// permit them, and withdraws each one whose listener closed. Started
+    /// in `build` from the plan the launch staged, stopped in `mainloop`
+    /// before the network attachment tears down — so every
+    /// runtime-published forward is gone before the switch's tap does.
+    /// `None` for boxes with nothing to publish on (tests, `HostNet`/`NoNet`,
+    /// and any launch that staged no plan).
+    listen_watcher: Option<crate::net::listeners::ListenWatcher>,
+
     /// The session's hostname-registry marker (NET-128): marked running when
     /// this host's `mainloop` starts and stopped when it returns, so a name
     /// the box shares with its node answers NODATA while no host is running.
@@ -3013,7 +3023,7 @@ impl SessionLauncher for SandboxLauncher {
             &net_switch,
             &session_name,
             Some(policy),
-            own_address,
+            own_address.clone(),
             box_addresses,
         ))
         .await
@@ -3319,6 +3329,44 @@ impl SessionLauncher for SandboxLauncher {
                 Err(e) => return Err(io::Error::other(e)),
             }
         };
+
+        // Step 4 (post-attach): stage the listen-publication plan (NET-016,
+        // NET-017) — everything the box's listener watcher needs, from what
+        // this launch alone holds: the box's lease on the switch, the gvproxy
+        // control channel its forwarder verbs ride (built the way the
+        // provider's own-IP plan builds it), the published address the
+        // switch granted this session (NET-010), and the ingress gate the
+        // attach just registered for the relay. The host that takes the box
+        // starts the watcher when it builds and stops it with the session,
+        // so this is the one handoff: a box with no lease, no published
+        // address or no live gate stages nothing, and its ports stay
+        // unpublishable by listening.
+        let lease = plan.tap().map(|tap| tap.address);
+        let published = own_address
+            .as_ref()
+            .and_then(|reporter| reporter.published_address());
+        let gate = lease.and_then(crate::net::switch::live_gate);
+        if let (Some(lease), Some(published), Some(gate)) = (lease, published, gate) {
+            let switch = net_switch.lock().await;
+            let control = match switch.transport() {
+                crate::net::SwitchTransport::LocalSpawn => {
+                    crate::net::policy::ControlChannel::Unix(switch.control_socket())
+                }
+                crate::net::SwitchTransport::HostShuttle { cid, port } => {
+                    crate::net::policy::ControlChannel::Vsock { cid, port }
+                }
+            };
+            crate::net::listeners::stage_listen_plan(
+                session_id,
+                crate::net::listeners::ListenPlan::new(
+                    session_label,
+                    lease,
+                    published,
+                    control,
+                    gate,
+                ),
+            );
+        }
 
         Ok(Launched {
             master,
@@ -3791,6 +3839,29 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             )
             .await?;
 
+        // The listen-publication watcher (NET-016, NET-017): the plan this
+        // launch staged is the box's whole publication surface — its lease,
+        // the switch's published address, the gvproxy control channel, and
+        // the ingress gate the attach registered. It polls the listening
+        // sockets of the process the launch names the box's leader (whose
+        // `/proc` entry reads the whole box's network namespace) and keeps
+        // the box's published ports in step with them until the session
+        // ends. A box that staged no plan — no lease, no published address —
+        // runs no watcher, and none of its ports is published by listening.
+        let listen_watcher = crate::net::listeners::take_listen_plan(session_id).and_then(|plan| {
+            match crate::nsenter::session_leader_pid(process.container_pid()) {
+                Ok(leader) => Some(crate::net::listeners::ListenWatcher::start(plan, leader)),
+                Err(e) => {
+                    tracing::warn!(
+                        session = %session_name,
+                        error = %e,
+                        "resolving the box's leader to start the listen-publication watcher",
+                    );
+                    None
+                }
+            }
+        });
+
         let (sender, receiver) = mpsc::channel(HOST_MAILBOX_CAPACITY);
         let handle = HostHandle { sender };
 
@@ -3833,6 +3904,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             stdout_buf: vec![0u8; 8 * 1024],
             stdin_buf: None,
             net_guard,
+            listen_watcher,
             #[cfg(target_os = "linux")]
             name_marker,
             tty_path,
@@ -3998,6 +4070,17 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         #[cfg(target_os = "linux")]
         if let Some(marker) = self.name_marker.take() {
             marker.mark_stopped();
+        }
+
+        // Stop the listen-publication watcher (NET-017's last half) before
+        // the network attachment tears down: the stop withdraws every port
+        // the box's processes published by listening — the gate refusing
+        // each first, the forward after — so no runtime-published forward
+        // outlives the tap it delivers through, and no session ends with a
+        // port published on its address. Declared forwards are not this
+        // call's: they come down with the attachment below (NET-121).
+        if let Some(watcher) = self.listen_watcher.take() {
+            watcher.stop().await;
         }
 
         // Tear down the per-sandbox network attachment explicitly (own-IP switch

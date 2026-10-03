@@ -18,6 +18,12 @@
 
 pub mod answerer;
 pub mod dns;
+// The listen-publication watcher (NET-016, NET-017): publishes the ports a
+// box's processes listen on, when its ingress rules permit them, and
+// withdraws them when the listeners close. `pub mod` (not `pub(crate)`)
+// because its unit tests live beside it and the launcher hands its plan to
+// the session host.
+pub mod listeners;
 pub mod loopback;
 pub mod policy;
 pub mod proxy;

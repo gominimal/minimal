@@ -395,6 +395,90 @@ pub async fn remove_ingress(control: &ControlChannel, bound: &[PortForwarder]) {
     }
 }
 
+/// NET-016's publish: exposes **one** mapping on the switch's forwarder —
+/// a port a process in the box is listening on, published at `published`
+/// (the box's own address, NET-010) at the port the process listens on,
+/// both sides the same number, exactly as a declaration's mapping publishes
+/// its external port. Returns the [`ExposedMapping`] that identifies the
+/// forward, for [`unexpose_mapping`] when the listener closes.
+///
+/// The single mapping of the listener watcher, not [`apply_ingress`]: a
+/// declaration's forwards are bound once at publish and held until the box
+/// stops (NET-121), while these come and go with the processes inside the
+/// box (NET-016, NET-017), one at a time, and only after the shared verdict
+/// permitted the port. The forward is bound *before* the caller admits the
+/// port at the box's gate — the same order the declaration's apply holds —
+/// so there is no window in which the gate admits a port nothing answers.
+///
+/// # Errors
+///
+/// The expose error: the caller keeps the port unadmitted and retries on
+/// its next poll.
+pub async fn expose_mapping(
+    control: &ControlChannel,
+    published: Ipv4Addr,
+    ptask_ip: Ipv4Addr,
+    port: u16,
+) -> io::Result<ExposedMapping> {
+    let mapping = PortMapping {
+        external_port: port,
+        internal_port: port,
+        proto: IpProto::Tcp,
+    };
+    let req = expose_request(&mapping, published, ptask_ip);
+    match post_json(control, "/services/forwarder/expose", &req).await {
+        Ok(()) => Ok(ExposedMapping {
+            local: req.local,
+            protocol: req.protocol,
+        }),
+        Err(e) => {
+            tracing::warn!(
+                port,
+                local = %req.local,
+                error = %e,
+                "publishing a listening port on the switch failed"
+            );
+            Err(e)
+        }
+    }
+}
+
+/// NET-017's withdraw: unexposes one mapping [`expose_mapping`] bound for a
+/// listener that has since closed, so the box's address stops answering at
+/// the port. The caller refuses the port at the box's gate *first* — the
+/// order [`PortForwarder::revoke`] holds for a declared forward — so no new
+/// connection crosses the gap between a listener already gone and a gate
+/// that still admits the port. A declared port's forward never comes down
+/// this path: it is not the watcher's (NET-081's sub-requirement — a
+/// withdrawal applies only to the runtime-published set), and nothing a
+/// process closing a listener does can withdraw what the declaration holds.
+///
+/// # Errors
+///
+/// The unexpose error, for the caller to say and decide about: a forward
+/// that fails to come down still stands at its `local`, so the withdrawal
+/// is retried while the watcher lives.
+pub async fn unexpose_mapping(
+    control: &ControlChannel,
+    mapping: &ExposedMapping,
+) -> io::Result<()> {
+    let req = UnexposeRequest {
+        local: mapping.local.clone(),
+        protocol: mapping.protocol.clone(),
+    };
+    match post_json(control, "/services/forwarder/unexpose", &req).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::warn!(
+                local = %mapping.local(),
+                error = %e,
+                "unpublishing a listening port on the switch failed"
+            );
+            Err(e)
+        }
+    }
+}
+
 /// NET-123's bind probe, conducted through the forwarder that will publish:
 /// the same whole-range walk as the local bind probe in `switch::loopback`,
 /// one [`ExposeRequest`] per address of the reserved local range, each
