@@ -321,25 +321,36 @@ async fn serve_create_session(
             // host-address launch's re-read, read here rather than re-probed,
             // because a create is not a place that decides a box: the launch
             // that follows reads the host again, over the same tree and the
-            // same table, before it places anything. The advisory the fact
-            // yields rides the reply to the start that is about to rely on
-            // the host's decision, and the enforcement is the same fact's
-            // state, said once here for the one message the activation path
-            // spends on it.
+            // same table, before it places anything, and records its own
+            // outcome on the session record this create is minting. The
+            // advisory the fact yields rides the reply to the start that is
+            // about to rely on the host's decision, and the enforcement is
+            // the same derivation every read surface answers through — over
+            // the declaration the config carries and with no launch record
+            // to show yet, so the fact is the best either half of the daemon
+            // knows about the box that is coming, and the launch's own
+            // refusal gate holds here too: a create under a probe cause
+            // refuses the box the same way its launch would, and carries
+            // no enforcement value anywhere.
             //
-            // Nothing is recorded: the state is the host's, not the
-            // session's, so a record could only freeze it at this create and
-            // the reads below would show a stale host. The one key a client
-            // might assert — the daemon's own `host_ip_enforcement` — is
-            // stripped here, unconditionally and for every network mode,
-            // because the listing and the policy read derive their answer
-            // from the fact and must not be handed one by whoever activated.
+            // Nothing is recorded at create: only a launch writes the
+            // outcome, on the daemon-owned record field. The one key a
+            // client might assert — the daemon's own `host_ip_enforcement`
+            // — is stripped here, unconditionally and for every network
+            // mode, because the reads answer over what the launch recorded
+            // and must not be handed one by whoever activated.
             let in_microvm = s.in_microvm().await;
             let fact = crate::session_host::host_ip_enforcement_fact();
             let classifier_cause = fact.cause;
             let classifier_advisory =
                 create_classifier_advisory(in_microvm, req.config.network, classifier_cause);
-            let host_ip_enforcement = create_host_ip_enforcement(req.config.network, &fact);
+            let host_ip_enforcement = crate::session_host::displayed_host_ip_enforcement(
+                in_microvm,
+                req.config.network,
+                classifier::verdict_of(req.config.policy.egress.as_ref()),
+                &fact,
+                None,
+            );
             req.config.attrs.remove(HOST_IP_ENFORCEMENT_ATTR);
 
             Ok(match mngr.create_session(req.config, ssh_username).await {
@@ -375,7 +386,8 @@ async fn serve_create_session(
                                 .map_or_else(|| "", classifier::Cause::detail),
                             classifier_install = ?classifier_cause
                                 .and_then(classifier::Cause::install_command),
-                            host_ip_enforcement = ?host_ip_enforcement,
+                            host_ip_enforcement =
+                                ?host_ip_enforcement.map(|enforcement| enforcement.machine_str()),
                             advisory = ?advisory,
                             "session create carried the classifier advisory"
                         );
@@ -405,10 +417,13 @@ async fn serve_create_session(
                         deny_all_opt_out: Some(s.deny_all_opt_out().await),
                         answerer_bound: zone_answerer_port.is_some(),
                         // NET-079's half: the advisory the start prints, and
-                        // the enforcement the daemon's fact states — the one
-                        // message the activation path spends on it.
+                        // the enforcement the same derivation the reads
+                        // answer through states over this create's
+                        // declaration — the one message the activation path
+                        // spends on it.
                         classifier_advisory,
-                        host_ip_enforcement: host_ip_enforcement.map(str::to_string),
+                        host_ip_enforcement: host_ip_enforcement
+                            .map(|enforcement| enforcement.machine_str().to_string()),
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
@@ -483,27 +498,6 @@ fn classifier_advisory_text(cause: classifier::Cause, guest: bool) -> String {
         advisory.push('.');
     }
     advisory
-}
-
-/// The per-box egress enforcement this host's verdict gives a session
-/// (NET-079), in the machine spelling the daemon's log line and the
-/// effective-policy reply use: a host-address session is the one whose
-/// verdict is decided on the host's cgroup tree, so it is the one the fact
-/// says something about — `per_box` when this host can decide a box's
-/// verdict on a classifier leaf of its own, `none` when it cannot and the
-/// box runs with the host's address and no verdict of its own. Every other
-/// mode carries nothing: an own-address or none box's verdict is decided on
-/// address leases, never on the host's cgroup tree, so `None` — not `none`
-/// — is what their replies say, the same nothing a daemon that predates
-/// the field says.
-fn create_host_ip_enforcement(
-    network: minimald_rpc::NetworkMode,
-    fact: &crate::session_host::HostIpEnforcementFact,
-) -> Option<&'static str> {
-    if network != minimald_rpc::NetworkMode::HostNet {
-        return None;
-    }
-    Some(fact.enforcement.machine_str())
 }
 
 /// The advisory a create owes the start it answers (NET-079): only when both
@@ -971,8 +965,11 @@ async fn serve_get_session_policy(
 /// The `GetEffectiveSessionPolicy` reply for one record's policy and network
 /// mode: the egress half resolved to what the gate enforces, the ingress half
 /// verbatim, and NET-079's enforcement state for a host-address box — the
-/// same daemon fact the create reply reported and the listing answers over,
-/// so every surface that reads a session names the state the host is in now.
+/// box's own launch record lowered by the daemon's one classifier fact,
+/// never raised above it, the same derivation the listing answers over and
+/// the create reply gates on, so every surface that reads a session names
+/// the state the box's launch placed it under rather than the host's later
+/// state.
 /// `phase` is the rollout
 /// phase to resolve under — the handler serves
 /// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, while the
@@ -3293,9 +3290,10 @@ mod tests {
     /// address leases instead of the host's cgroup tree carries nothing:
     /// `None`, not `none`, on every surface — the same nothing a daemon
     /// that predates the field says. A box the classifier refuses — the
-    /// deny-all box over a probe cause — shows nothing on the read
-    /// surfaces either, exactly as its launch refuses it, while the
-    /// host-address boxes that are not refused keep showing the fact.
+    /// deny-all box over a probe cause — shows nothing on the create
+    /// reply or the read surfaces, exactly as its launch refuses it,
+    /// while the host-address boxes that are not refused keep showing
+    /// the fact.
     // The guard is taken before the server is even built and held across
     // the awaited creates on purpose: the fact is process-global, so under
     // libtest another test's read in the window would answer over it too.
@@ -3432,14 +3430,15 @@ mod tests {
             own_policy.host_ip_enforcement
         );
 
-        // A box the classifier refuses shows nothing on the read surfaces:
-        // the same fact, over the probe cause that refuses a placed
-        // deny-all box natively, and the same launch gate the derivation
-        // shares — the deny-all box's launch is refused on this ground, so
-        // its listing entry and its policy reply say nothing rather than
-        // `none`. The host-address boxes that are not refused keep showing
-        // the fact: the one carrying an egress section still runs
-        // unenforced and still says so.
+        // A box the classifier refuses shows nothing on any surface: the
+        // same fact, over the probe cause that refuses a placed deny-all
+        // box natively, and the same launch gate the derivation shares —
+        // the deny-all box's launch is refused on this ground, so the
+        // create that mints it says no enforcement value, and its listing
+        // entry and its policy reply say nothing rather than `none`. The
+        // host-address boxes that are not refused keep showing the fact:
+        // the one carrying an egress section still runs unenforced and
+        // still says so, at its create and after.
         let mut sectioned = req("sectioned", "/uwu");
         sectioned.config.policy = SessionPolicy::new(
             Some(EgressPolicy {
@@ -3452,6 +3451,35 @@ mod tests {
         crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
             classifier::Cause::TableNotEffective,
         ));
+        let mut refused_create = req("refused-create", "/uwu");
+        refused_create.config.policy = SessionPolicy::new(Some(EgressPolicy::deny_all()), None);
+        let refused_create = client.call::<CreateSession>(&refused_create).await.unwrap();
+        assert!(
+            refused_create.host_ip_enforcement.is_none(),
+            "a create over the probe cause that refuses the deny-all box \
+             carries no enforcement value on its reply either — the box's \
+             own launch would refuse it, got: {:?}",
+            refused_create.host_ip_enforcement
+        );
+        let mut unrefused_create = req("unrefused-create", "/uwu");
+        unrefused_create.config.policy = SessionPolicy::new(
+            Some(EgressPolicy {
+                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                ..EgressPolicy::deny_all()
+            }),
+            None,
+        );
+        let unrefused_create = client
+            .call::<CreateSession>(&unrefused_create)
+            .await
+            .unwrap();
+        assert_eq!(
+            unrefused_create.host_ip_enforcement.as_deref(),
+            Some("none"),
+            "the sectioned box the fact does not refuse keeps getting the \
+             state it runs in on its create reply too, got: {:?}",
+            unrefused_create.host_ip_enforcement
+        );
         let listed = client.call::<ListSessions>(&()).await;
         let refused = listed
             .sessions
@@ -3844,14 +3872,12 @@ mod tests {
         // Box A's host reads undecided: the marker stands over a table whose
         // refusal is gone, so this host cannot decide per box and A's own
         // launch places it in no deciding state.
-        crate::session_host::install_classifier_reading_standin(
-            classifier::Reading::NotRefused {
-                because: "the injected reading stands in for a probe whose \
+        crate::session_host::install_classifier_reading_standin(classifier::Reading::NotRefused {
+            because: "the injected reading stands in for a probe whose \
                           every leg completed"
-                    .to_string(),
-                families: Vec::new(),
-            },
-        );
+                .to_string(),
+            families: Vec::new(),
+        });
         let (_, decision) = crate::session_host::re_read_classifier_fact(
             root.clone(),
             Some(mountinfo.clone()),
@@ -3995,14 +4021,12 @@ mod tests {
         // box, so every box on it shows the state its own record is lowered
         // to — B falls from `per_box` to `none`, and A stays where its
         // launch left it.
-        crate::session_host::install_classifier_reading_standin(
-            classifier::Reading::NotRefused {
-                because: "the injected reading stands in for a probe whose \
+        crate::session_host::install_classifier_reading_standin(classifier::Reading::NotRefused {
+            because: "the injected reading stands in for a probe whose \
                           every leg completed"
-                    .to_string(),
-                families: Vec::new(),
-            },
-        );
+                .to_string(),
+            families: Vec::new(),
+        });
         let (_, decision) = crate::session_host::re_read_classifier_fact(
             root.clone(),
             Some(mountinfo.clone()),

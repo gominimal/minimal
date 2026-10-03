@@ -728,10 +728,14 @@ pub struct CreateSessionResponse {
     /// host-address: an own-address or none box's verdict is decided on
     /// address leases, never on the host's cgroup tree.
     ///
-    /// The state this create found on its host, read off the same daemon
-    /// fact the listing and the policy read answer over — never recorded,
-    /// because the fact is the host's and each host-address launch
-    /// re-reads it before placing a box. `None` from a daemon that
+    /// The same derivation the listing and the policy read answer through,
+    /// with the same refusal gate: the session this create is minting has
+    /// no launch record yet, so the daemon's one classifier fact is the
+    /// best either half of it knows, and the box the gate refuses — a
+    /// deny-all host-address box the host cannot enforce, the one its own
+    /// launch would refuse — carries no enforcement value anywhere.
+    /// Never recorded at create: only a launch writes the box's own
+    /// outcome. `None` from a daemon that
     /// predates the field is that daemon's silence, never a decided
     /// `per_box`: a client that reads nothing here claims nothing from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]

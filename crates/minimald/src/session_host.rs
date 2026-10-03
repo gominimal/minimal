@@ -2689,9 +2689,7 @@ pub(crate) fn displayed_host_ip_enforcement(
             // can still decide per box, lowered to the undecidable state the
             // host is in when it cannot — never raised above either.
             Some(recorded) => match (recorded, fact.enforcement) {
-                (HostIpEnforcement::PerBox, HostIpEnforcement::PerBox) => {
-                    HostIpEnforcement::PerBox
-                }
+                (HostIpEnforcement::PerBox, HostIpEnforcement::PerBox) => HostIpEnforcement::PerBox,
                 _ => HostIpEnforcement::None,
             },
             // No box of this session has launched yet, so there is no
