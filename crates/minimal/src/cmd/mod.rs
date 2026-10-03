@@ -25,8 +25,8 @@ mod session;
 
 // The Ctrl-C cleanup (`arm_activation_interrupt`) withdraws the row the
 // activation registered with the VM host daemon; the withdrawal lives with
-// the session commands.
-use session::{vm_host_control_sock, withdraw_box_row};
+// the session commands, as does the provider-kind rule its gate keys on.
+use session::{daemon_provider_kind, vm_host_control_sock, withdraw_box_row};
 
 pub use admin::*;
 pub use list::*;
@@ -669,8 +669,14 @@ pub(crate) fn arm_activation_interrupt(
 ) -> ActivationInterrupt {
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
     // Resolved here, not inside the task: the withdrawal's socket is the
-    // same provider dir's, and the borrow must not cross the spawn.
-    let control_sock = vm_host_control_sock(global);
+    // same provider dir's, and the borrow must not cross the spawn. Keyed
+    // on the provider kind — the rule the socket resolution itself and the
+    // fabric display turn on — not on `use_minvmd()`, which is true only
+    // under an explicit `--provider local-minvmd`: on macOS every invocation
+    // is minvmd-backed with no flag at all, and a Ctrl-C that keyed on the
+    // flag would leave exactly that host's box row published.
+    let control_sock =
+        vm_host_control_sock(daemon_provider_kind(global), global.minimal_dir.as_deref());
     let task = tokio::spawn(async move {
         // Only the first Ctrl-C is intercepted; a second falls through to
         // the default disposition so a wedged cleanup can still be killed.
