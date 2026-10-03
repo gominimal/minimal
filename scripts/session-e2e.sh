@@ -116,8 +116,12 @@
 #                                    custody, the probe reading present, the
 #                                    job enabled for boot, the command re-run
 #                                    clean over the aliases it already applied,
-#                                    and the re-apply a boot performs (no Linux
-#                                    lane runs it — Linux takes no range step)
+#                                    and the re-apply a boot performs — no
+#                                    Linux lane runs it (Linux takes no range
+#                                    step), and it is operator-run: no CI lane
+#                                    is given the passwordless sudo it needs, so
+#                                    it self-skips unless
+#                                    MINIMAL_E2E_PRIVILEGED=1 is set
 #   hostnames_recover_and_two_daemons_route NET-020..027 warning, recovery,
 #                                   two daemons on one machine routing
 #   retired_surfaces_gone            NET-109/110: the retired surfaces are gone,
@@ -3821,10 +3825,24 @@ fi
 # aliases are removed. A real reboot stays a manual check, recorded in the
 # PR body; this is everything short of it.
 #
-# This case is the macOS lane's alone: Linux needs no range step — the whole
-# 127/8 binds on `lo` — so no Linux lane runs it, and when it cannot install
-# a LaunchDaemon it fails rather than self-skips, so the pin is never silent.
+# This case is operator-run, on an explicit opt-in: it installs a root
+# LaunchDaemon, and the macOS lane's runner is a persistent shared host that
+# is not given passwordless sudo — so unless MINIMAL_E2E_PRIVILEGED=1 is set
+# the case self-skips (see the gate at its top) and a whole-lane run
+# continues past it; with it set, a missing precondition fails rather than
+# skips, so the pin is never silent where it was asked for. Linux needs no
+# range step — the whole 127/8 binds on `lo` — so no Linux lane runs it.
 proof_local_range_reserved_by_privileged_step() {
+  # The opt-in gate, before any host check: the case installs a root
+  # LaunchDaemon, so it runs only where an operator said so — a macOS host
+  # with passwordless sudo. Without the opt-in it self-skips, so a
+  # whole-lane run continues past it; with it set, every missing
+  # precondition below fails rather than skips, so an opted-in run is never
+  # told OK by a host that could not install the unit.
+  if [ "${MINIMAL_E2E_PRIVILEGED:-}" != 1 ]; then
+    echo "SKIPPED (privileged: set MINIMAL_E2E_PRIVILEGED=1 on a macOS host with passwordless sudo)"
+    return 0
+  fi
   echo "::group::local range reserved by the advisory's privileged step (NET-123, macOS)"
   if [ "$(uname -s)" != Darwin ]; then
     echo "::error::the local-range case is the macOS lane's — Linux takes no range step (the whole 127/8 binds on lo), and a run that cannot install a LaunchDaemon fails rather than self-skips, so the pin is never silent"
@@ -4075,12 +4093,17 @@ proof_local_range_reserved_by_privileged_step() {
     echo "--- output ---"; cat "$WORK/range-cmd2.out" "$WORK/range-cmd2.err" 2>/dev/null || true
     fail
   fi
+  # launchd prints `last exit code = (never exited)` until the re-loaded job
+  # has actually run, so a non-empty value is not yet an answer: the poll
+  # waits for a numeric one, and only then is it required to be 0.
   range_last_exit=""
   for _ in $(seq 1 40); do
     range_last_exit="$(launchctl print "system/$RANGE_LABEL" 2>/dev/null \
       | sed -n 's/^[[:space:]]*last exit code = //p' | head -n1)"
-    [ -n "$range_last_exit" ] && break
-    sleep 0.25
+    case "$range_last_exit" in
+      "" | *[!0-9]*) sleep 0.25 ;;
+      *) break ;;
+    esac
   done
   if [ "$range_last_exit" != 0 ]; then
     echo "::error::the re-run's job did not exit 0 (last exit code: '$range_last_exit') — the program must skip the aliases it finds, not fail on them"
@@ -7448,10 +7471,12 @@ case "${1:-}" in
     proof_fresh_linux_kvm_activate_local_minvmd
     proof_fresh_arm64_kvm_activate_local_minvmd
     proof_linux_stock_install_runs_vm_boxes
-    # The local-range proof is the macOS lane's alone — Linux takes no range
-    # step (the whole 127/8 binds on lo), so a Linux lane does not run it from
-    # the whole-lane order; named by name it fails rather than self-skips, so
-    # the pin is never silent (see its own head for what it proves).
+    # The local-range proof is operator-run — it installs a root LaunchDaemon,
+    # and no CI lane is given the passwordless sudo it needs — so on the
+    # macOS lane it self-skips under the opt-in gate at its top and the run
+    # continues past it; Linux takes no range step (the whole 127/8 binds on
+    # lo), so a Linux lane does not call it from the whole-lane order either
+    # (see its own head for what it proves and how to opt in).
     if [ "$(uname -s)" = Darwin ]; then
       proof_local_range_reserved_by_privileged_step
     else
