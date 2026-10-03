@@ -89,10 +89,16 @@ async fn debugfs_program() -> PathBuf {
 // (proc tables, JSON, logs — all highly compressible text) expands ~15×, so a
 // literal 4× budget rejects every legitimate nested bundle. The ratio still
 // earns its keep for genuinely large blobs, but below `NESTED_MIN_BUDGET` it is
-// meaningless (a few hundred MiB decoded to check is free), so the budget is
-// `clamp(4×compressed, MIN_BUDGET, MAX_DECOMPRESSED)`. The two hard caps the
-// bomb guard actually rests on — the 1 GiB ceiling and the 10k-entry cap — are
-// exactly as specified.
+// meaningless (decoding up to that much into a sink is cheap and bounded), so
+// the budget is `clamp(4×compressed, MIN_BUDGET, MAX_DECOMPRESSED)`. The two
+// hard caps the bomb guard actually rests on — the 1 GiB ceiling and the
+// 10k-entry cap — are exactly as specified.
+//
+// Known limit: at ~15× expansion a bundle outgrows the 256 MiB floor at about
+// 17 MiB compressed, and a 4× ratio never catches up with 15× growth, so any
+// legitimate bundle past that size fails the size check and is stored
+// unverified. Lifting the limit means revisiting the ratio against R7.3, not
+// just the floor.
 
 /// Entry-count ceiling for the nested bundle (R7.3). Bounds the header
 /// dimension of a bomb, which the byte budget does not charge for.
