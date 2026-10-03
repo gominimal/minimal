@@ -1509,9 +1509,15 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
     // Published on the node's shared loopback address — the shared-address
     // lane this proof has always exercised — so the host connect below, to
     // 127.0.0.1:EXTERNAL, is the address the forward is bound on.
-    let exposed = apply_ingress(&control, std::net::Ipv4Addr::LOCALHOST, lease.ip, &ingress)
-        .await
-        .expect("apply ingress");
+    let exposed = apply_ingress(
+        &control,
+        std::net::Ipv4Addr::LOCALHOST,
+        lease.ip,
+        &ingress,
+        None,
+    )
+    .await
+    .expect("apply ingress");
 
     // From the host, connect to 127.0.0.1:EXTERNAL; gvproxy forwards the
     // connection into the PTask's listener over the switch. Retry until the
@@ -1633,9 +1639,15 @@ impl Ptask {
         }
 
         let gate = SessionGate::for_session(lease.ip.to_string(), lease.ip, policy, subnet);
-        let relay = attach_to_switch(fd, api_sock, Some(gate), lease.ip, subnet)
-            .await
-            .expect("attach tap to switch");
+        let relay = attach_to_switch(
+            fd,
+            api_sock,
+            Some(std::sync::Arc::new(gate)),
+            lease.ip,
+            subnet,
+        )
+        .await
+        .expect("attach tap to switch");
 
         Self {
             netns_pid,
