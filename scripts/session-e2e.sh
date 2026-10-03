@@ -7844,11 +7844,11 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
 #     only be the unpublished port's own.
 #
 #   * the host address leg — the host connects to the box's PUBLISHED
-#     ADDRESS, the loopback one the VM host daemon allocated it, on a port
-#     nothing published. Host-side forwarders bind only admitted ports, so
-#     a host SYN to an unpublished port is refused by the host kernel and
-#     never reaches the VM: the leg proves the published address refuses
-#     fast — the same connection-refused shape (curl exit 7) within the 5 s
+#     ADDRESS, the one its declaration publishes at, on a port nothing
+#     publishes. Host-side forwarders bind only admitted ports, so a host
+#     SYN to an unpublished port is refused by the host kernel and never
+#     reaches the VM: the leg proves the published address refuses fast —
+#     the same connection-refused shape (curl exit 7) within the 5 s
 #     NET-014 asks for, never the connect timeout a silent drop reads as
 #     (exit 28). The control is the condition, the peer leg's own doctrine:
 #     the host reaches the same address's PUBLISHED port and the marker
@@ -7856,16 +7856,25 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
 #     something on this host answers at that address proves nothing about
 #     the address, and under the macOS 127.0.0.1 interim the published
 #     address IS the shared host loopback, where anything may be listening.
-#     The address itself comes from the VM host daemon's registration
-#     record: neither `min session policy` (which prints a declared mapping
-#     without the address it publishes on) nor the session-start line
-#     (which names only the switch address) carries it, and the daemon's
-#     record — the same one the box-register proof reads its address pair
-#     from — is the one in-tree word for the pair it allocated. The record
-#     is INFO and a daemon's log filter is fixed at spawn, so the case
-#     stops the daemon pair first and lets its own activation autospawn a
-#     host daemon pinned command-locally one step wider than the lane's
-#     `warn,minimald::exec=info`, which drops it.
+#     The address itself is the host's own word for where the box is
+#     published: the zone answerer's A record for the box's name
+#     (NET-010/NET-127), the address the host-side forwarders bind, asked
+#     for straight at the answerer's own port — the one `min ls` reports as
+#     `ZONE ANSWERER`, which the guest daemon binds and the VM host's
+#     forwarders publish on the host loopback — with no OS resolver hook in
+#     the way. The box-registry record's `loopback_address` is a different
+#     allocation the forwarders do not bind at (#1908), so the leg does not
+#     connect by it; the case still reads and prints the record, as the
+#     registry's half of the pair beside the answerer's address, which is
+#     why it keeps the stop-and-respawn dance: the record is INFO and a
+#     daemon's log filter is fixed at spawn, so the case stops the daemon
+#     pair first and lets its own activation autospawn a host daemon pinned
+#     command-locally one step wider than the lane's
+#     `warn,minimald::exec=info`, which drops it. And the whole leg is
+#     WHERE-gated like the name leg: no answerer line, no address for the
+#     name, or a published port that does not answer at it, and the leg
+#     says what it could not assert and asserts nothing — the control alone
+#     never fails the case.
 #
 #   * the host name leg — WHERE a published name reaches the box from the
 #     host. The control IS the condition: the host connects through
@@ -7874,10 +7883,11 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
 #     Where that holds, the host's own connect through the same name to the
 #     UNPUBLISHED port must get the same refusal — the leg that shows the
 #     host gate passing a host-originated SYN through to the relay that
-#     resets it. Where it does not (today's KVM lane runs no host-side
-#     answerer, so no box name resolves there), the leg prints the observed
-#     fact and asserts nothing: the WHERE clause is the requirement's own,
-#     and a skip that says what it could not assert is the honest reading.
+#     resets it. Where it does not (no lane points this host's own resolver
+#     at the answerer, so no box name resolves from the host's curl), the
+#     leg prints the observed fact and asserts nothing: the WHERE clause is
+#     the requirement's own, and a skip that says what it could not assert
+#     is the honest reading.
 #
 # Every refusal's audit line — the one shared format every leg's log tail
 # carries — rides the guest's serial console into the host-side boot log on
