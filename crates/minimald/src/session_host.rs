@@ -3230,9 +3230,12 @@ impl SessionLauncher for SandboxLauncher {
         // blocking hop, and the same one table is what the placement below
         // answers over too.
         let (leaf, decision) = if matches!(network_mode, NetworkMode::HostNet) {
-            let (mountinfo, decision) =
-                re_read_classifier_fact(classifier_root.clone(), classifier_mountinfo.clone(), guest)
-                    .await?;
+            let (mountinfo, decision) = re_read_classifier_fact(
+                classifier_root.clone(),
+                classifier_mountinfo.clone(),
+                guest,
+            )
+            .await?;
             let leaf = create_session_leaf(
                 &classifier_root,
                 mountinfo.as_deref(),

@@ -143,8 +143,7 @@ async fn serve_list_sessions(
             // silence the other surfaces read as "not a host-address
             // session", so one unreadable record fails no listing.
             let enforcement = futures::future::join_all(infos.iter().map(|i| async {
-                mngr
-                    .get_record(SessionKeyPredicate::Id(i.id))
+                mngr.get_record(SessionKeyPredicate::Id(i.id))
                     .await
                     .ok()
                     .flatten()
@@ -323,9 +322,10 @@ async fn serve_create_session(
                 classifier_cause.map(|cause| classifier_advisory_text(cause, in_microvm));
             let host_ip_enforcement = create_host_ip_enforcement(req.config.network, &decision);
             if let Some(enforcement) = host_ip_enforcement {
-                req.config
-                    .attrs
-                    .insert(HOST_IP_ENFORCEMENT_ATTR.to_string(), enforcement.to_string());
+                req.config.attrs.insert(
+                    HOST_IP_ENFORCEMENT_ATTR.to_string(),
+                    enforcement.to_string(),
+                );
             }
 
             Ok(match mngr.create_session(req.config, ssh_username).await {
@@ -475,7 +475,10 @@ fn create_classifier_tree() -> (std::path::PathBuf, Option<String>) {
     {
         return pair;
     }
-    (std::path::PathBuf::from(sandbox2::classifier::TREE_ROOT), None)
+    (
+        std::path::PathBuf::from(sandbox2::classifier::TREE_ROOT),
+        None,
+    )
 }
 
 /// The create-time classifier read (NET-079): the one shared fact
@@ -1082,8 +1085,7 @@ async fn serve_get_effective_session_policy(
                     // create wrote it on — never re-probed here, because the
                     // state that answers is the one the box runs under, and
                     // the record is where the create left it.
-                    let host_ip_enforcement =
-                        record.attrs.get(HOST_IP_ENFORCEMENT_ATTR).cloned();
+                    let host_ip_enforcement = record.attrs.get(HOST_IP_ENFORCEMENT_ATTR).cloned();
                     Ok(Errorable::Ok(effective_policy_reply(
                         &record.policy,
                         record.network,
@@ -3506,8 +3508,7 @@ mod tests {
             "the advisory names what a person may run; it never asks: {not_effective}"
         );
 
-        let unreadable =
-            super::classifier_advisory_text(classifier::Cause::ProbeUnreadable, false);
+        let unreadable = super::classifier_advisory_text(classifier::Cause::ProbeUnreadable, false);
         assert!(
             unreadable.contains(
                 "its deny-all host-address boxes are refused and its other \
@@ -3526,8 +3527,7 @@ mod tests {
              got: {unreadable}"
         );
 
-        let guest =
-            super::classifier_advisory_text(classifier::Cause::StepNotInstalled, true);
+        let guest = super::classifier_advisory_text(classifier::Cause::StepNotInstalled, true);
         assert!(
             !guest.contains("whatever the boxes' declarations say"),
             "a guest refuses a deny-all box on every cause, so its advisory \
