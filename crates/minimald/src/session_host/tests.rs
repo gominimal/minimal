@@ -2285,6 +2285,11 @@ fn a_failed_closure_line_settles_the_boxs_fate_a_cover_line_does_not() {
         "the recorded fallback is as non-terminal as the design's cover"
     );
     assert!(
+        !super::say_closure_line("devpts max=1024 errno 22", "a session"),
+        "a devpts remount refusal is recorded but non-terminal: the box still \
+         runs on the shared PTY pool"
+    );
+    assert!(
         super::say_closure_line(
             "failed covering the bound classifier tree errno 1",
             "a session"

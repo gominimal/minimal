@@ -2886,6 +2886,15 @@ fn say_closure_line(line: &str, session: &str) -> bool {
             "the box's classifier cover was forced onto its recorded \
              fallback — a launch in a test posture, never a production one",
         );
+    } else if let Some(rest) = line.strip_prefix("devpts max=") {
+        let (max, errno) = rest.rsplit_once(" errno ").unwrap_or((rest, "unreported"));
+        tracing::warn!(
+            session = %session,
+            max,
+            errno,
+            "remounting the box's /dev/pts with a per-instance max failed; \
+             the box runs on the shared PTY pool",
+        );
     } else if let Some(failed) = line.strip_prefix("failed ") {
         let (step, errno) = failed
             .rsplit_once(" errno ")

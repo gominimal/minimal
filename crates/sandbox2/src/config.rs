@@ -24,6 +24,17 @@ pub const BOX_UID: u32 = 1000;
 /// synthesized `group` entry is held to it by the same test.
 pub const BOX_GID: u32 = 1000;
 
+/// The most PTYs one box may hold at once. PTYs are a machine-wide pool: a
+/// devpts instance mounted without a per-instance `max=` draws from the one
+/// kernel-wide counter (`kernel.pty.max` minus `kernel.pty.reserve`), so a
+/// single box that opens PTYs until the kernel refuses starves every other
+/// box and the session host's own shells. The launch path remounts the box's
+/// `/dev/pts` with `max=<BOX_PTY_MAX>` (see `exec_box_program`), so each box
+/// is bounded by its own instance rather than the shared pool. 1024 is a
+/// working value: it leaves room for the PTYs a real session needs while
+/// keeping one box from exhausting the host.
+pub const BOX_PTY_MAX: u32 = 1024;
+
 /// A capability no box may hold: its kernel number (these are ABI, assigned
 /// once and never reused) and its name, for the launch log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
