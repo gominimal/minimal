@@ -851,30 +851,13 @@ impl<S: Exec> ExecTask<S> {
         // `ChannelMsg::Eof`; a lost client then looks like a normal stdin
         // EOF, and a silent child (sleep, quiet build) keeps running
         // indefinitely (gominimal/inbox#813).
-        let (mut stdin_tx, mut stdin_rx) = pipe::pipe().expect("exec stdin pipe");
+        let (stdin_tx, mut stdin_rx) = pipe::pipe().expect("exec stdin pipe");
         let (client_lost_tx, client_lost_rx) = watch::channel(false);
 
-        let pump = spawn(async move {
-            loop {
-                match rs.wait().await {
-                    Some(russh::ChannelMsg::Data { data }) => {
-                        if stdin_tx.write_all(&data).await.is_err() {
-                            break;
-                        }
-                    }
-                    // Normal stdin EOF: close the pipe so the bridge sees
-                    // EOF, but do NOT signal client loss.
-                    Some(russh::ChannelMsg::Eof) => break,
-                    // Channel closed or sender dropped: the SSH client is
-                    // gone — signal the bridge to kill the child.
-                    Some(russh::ChannelMsg::Close) | None => {
-                        let _ = client_lost_tx.send(true);
-                        break;
-                    }
-                    Some(_) => {}
-                }
-            }
-        });
+        let msgs = Box::pin(stream::unfold(rs, |mut rs| async move {
+            rs.wait().await.map(|msg| (msg, rs))
+        }));
+        let pump = spawn(pump_channel_input(msgs, stdin_tx, client_lost_tx));
 
         let stream = self.exec.exec(self.session.clone());
         let exit_status = bridge(
@@ -896,6 +879,42 @@ impl<S: Exec> ExecTask<S> {
         let _ = ws.exit_status(exit_status).await; // otherwise considered -1
         let _ = ws.close().await; // needed to release the remote
         exit_status
+    }
+}
+
+/// Forwards the SSH channel's read half into the exec's stdin pipe and
+/// reports when the client is gone.
+///
+/// `Data` is written to `stdin`. `Eof` closes `stdin` (the child sees
+/// EOF) but keeps watching the channel: `min task run` from a terminal
+/// half-closes stdin straight away, so a disconnect almost always
+/// arrives *after* EOF and must still be seen. `Close`, or the end of
+/// `msgs` (the channel's sender dropped with the connection), sets
+/// `client_lost` to `true` and returns.
+async fn pump_channel_input<M, W>(mut msgs: M, stdin: W, client_lost: watch::Sender<bool>)
+where
+    M: Stream<Item = russh::ChannelMsg> + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut stdin = Some(stdin);
+    loop {
+        match msgs.next().await {
+            Some(russh::ChannelMsg::Data { data }) => {
+                // A failed write means the pipe's read end is gone; drop
+                // the data but keep watching for a disconnect.
+                if let Some(w) = stdin.as_mut()
+                    && w.write_all(&data).await.is_err()
+                {
+                    stdin = None;
+                }
+            }
+            Some(russh::ChannelMsg::Eof) => stdin = None,
+            Some(russh::ChannelMsg::Close) | None => {
+                let _ = client_lost.send(true);
+                return;
+            }
+            Some(_) => {}
+        }
     }
 }
 
@@ -1056,6 +1075,9 @@ where
     // signal, since anything still holding the pipes open past this
     // point is a grandchild we do not wait for.
     let mut child_exit: Option<io::Result<Option<i32>>> = None;
+    // Cleared once the client-loss sender is dropped without signalling:
+    // `changed()` would then resolve `Err` on every poll and spin the loop.
+    let mut client_watch_open = true;
 
     while (stdout_open || stderr_open) && !ssh_write_failed && child_exit.is_none() {
         tokio::select! {
@@ -1145,8 +1167,10 @@ where
             // The SSH client disconnected (channel close or sender
             // drop). Kill the child and stop — same path as a failed
             // SSH write (gominimal/inbox#813).
-            res = client_lost.changed() => {
-                if res.is_ok() && *client_lost.borrow() {
+            res = client_lost.changed(), if client_watch_open => {
+                if res.is_err() {
+                    client_watch_open = false;
+                } else if *client_lost.borrow() {
                     tracing::warn!(
                         %channel_id,
                         "exec: ssh client disconnected; killing child",
@@ -2870,6 +2894,72 @@ mod tests {
             !ctrl.was_killed(),
             "stdin EOF is a normal close, not a disconnect; the child must not be killed"
         );
+    }
+
+    /// `min task run` from a terminal half-closes stdin before anything
+    /// else, so a disconnect arrives *after* EOF. The pump must close the
+    /// child's stdin on EOF yet keep watching, and still signal client
+    /// loss when the channel then closes.
+    #[tokio::test]
+    async fn pump_signals_client_loss_after_stdin_eof() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel();
+        let msgs = Box::pin(futures::stream::unfold(msg_rx, |mut rx| async move {
+            rx.recv().await.map(|m| (m, rx))
+        }));
+        let (stdin_w, mut stdin_r) = duplex(64);
+        let (lost_tx, mut lost_rx) = tokio::sync::watch::channel(false);
+        let pump = tokio::spawn(super::pump_channel_input(msgs, stdin_w, lost_tx));
+
+        msg_tx
+            .send(russh::ChannelMsg::Data {
+                data: b"hi".as_slice().into(),
+            })
+            .unwrap();
+        msg_tx.send(russh::ChannelMsg::Eof).unwrap();
+
+        let mut got = Vec::new();
+        timeout(Duration::from_secs(10), stdin_r.read_to_end(&mut got))
+            .await
+            .expect("stdin EOF must close the child's stdin")
+            .unwrap();
+        assert_eq!(got, b"hi");
+        assert!(!*lost_rx.borrow(), "stdin EOF is not a disconnect");
+        assert!(!pump.is_finished(), "the pump must outlive stdin EOF");
+
+        msg_tx.send(russh::ChannelMsg::Close).unwrap();
+        timeout(Duration::from_secs(10), lost_rx.changed())
+            .await
+            .expect("a close after EOF must still signal client loss")
+            .unwrap();
+        assert!(*lost_rx.borrow());
+        pump.await.unwrap();
+    }
+
+    /// The channel's sender dropping (the connection died without a
+    /// `Close`) ends the message stream; that is a disconnect too.
+    #[tokio::test]
+    async fn pump_signals_client_loss_when_channel_sender_drops() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel::<russh::ChannelMsg>();
+        let msgs = Box::pin(futures::stream::unfold(msg_rx, |mut rx| async move {
+            rx.recv().await.map(|m| (m, rx))
+        }));
+        let (stdin_w, _stdin_r) = duplex(64);
+        let (lost_tx, mut lost_rx) = tokio::sync::watch::channel(false);
+        let pump = tokio::spawn(super::pump_channel_input(msgs, stdin_w, lost_tx));
+
+        drop(msg_tx);
+        timeout(Duration::from_secs(10), lost_rx.changed())
+            .await
+            .expect("a dropped channel must signal client loss")
+            .unwrap();
+        assert!(*lost_rx.borrow());
+        pump.await.unwrap();
     }
 
     /// A grandchild that inherited the child's stdout keeps the pipe
