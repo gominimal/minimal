@@ -4200,53 +4200,74 @@ proof_box_name_resolves_natively_without_proxy() {
   # $MINIMAL_BIN first) looks for it — exactly where an install would have
   # put it. The host's own prefix wins when it named one.
   bn_switch_reason=""
-  # The $MINIMAL_BIN read below (SC2031) is meant to see the LANE's prefix:
-  # the fresh-install proofs' swaps of it are subshell-local BY DESIGN (each
-  # runs inside its own `if ( ... )`, and the swap dying with the subshell is
-  # the point), so no earlier proof's change can be lost here — this case
-  # reads the env the caller exported, or nothing.
+  # The read below must see the LANE's prefix — every earlier swap of
+  # MINIMAL_BIN in this file is subshell-local by design, the very loss
+  # SC2031 warns about.
   # shellcheck disable=SC2031
-  if [ -z "$bn_tun" ] && [ -z "${MINIMAL_BIN:-}" ]; then
+  bn_prefix="${MINIMAL_BIN:-}"
+  # The prefix this case's daemon is given when it had to stage its own
+  # switch (set below, once the staged binary is verified) — empty until
+  # then, so an unfetchable switch leaves the daemon's probe the host's own
+  # prefixes to fall back through, exactly as before.
+  bn_switch_dir=""
+  if [ -z "$bn_tun" ] && [ -z "$bn_prefix" ]; then
     bn_bin="$WORK/bn-bin"
     mkdir -p "$bn_bin"
     if [ -n "${MINVMD_GVPROXY_BIN:-}" ] && [ -x "$MINVMD_GVPROXY_BIN" ]; then
       cp "$MINVMD_GVPROXY_BIN" "$bn_bin/gvproxy-min"
     elif [ -x "$ROOT/.scratch/gvproxy" ]; then
       cp "$ROOT/.scratch/gvproxy" "$bn_bin/gvproxy-min"
+    elif [ -x "$WORK/fresh-install/gvproxy" ]; then
+      # An earlier case in this same run already fetched the same pinned
+      # switch (the fresh-install proof's fetch, same lock) — the fetch is
+      # once per run, not once per case.
+      cp "$WORK/fresh-install/gvproxy" "$bn_bin/gvproxy-min"
     elif ! "$ROOT/scripts/fetch-gvproxy.sh" "$bn_bin/gvproxy-min" \
         >"$WORK/bn-fetch.out" 2>&1; then
       bn_switch_reason="the pinned gvproxy the box's session program spawns could not be fetched, so no box could attach its tap (a bare checkout ships none)"
     fi
     if [ -x "$bn_bin/gvproxy-min" ]; then
-      # This case runs in the MAIN shell (the dispatch calls its proof
-      # function directly), so this export is not lost: it is what carries
-      # the switch's location to the daemon this case autospawns below. The
-      # SC2031 shellcheck worries about is the fresh-install proofs'
-      # subshell-local swaps above — dead by the time this case runs, and
-      # never this export's business.
-      # shellcheck disable=SC2031
-      export MINIMAL_BIN="$bn_bin"
+      bn_switch_dir="$bn_bin"
     fi
   fi
 
-  # Restart with the daemon records this case reads at INFO — the loopback
-  # lease and release (minimald::session), the name registrations
-  # (minimald::net::dns), the publish exposes
-  # (minimald::net::gvproxy_network) — and the zone answerer at DEBUG, so
+  # The daemon's log filter for the restart below — INFO for the records
+  # this case reads (the loopback lease and release, minimald::session; the
+  # name registrations, minimald::net::dns; the publish exposes,
+  # minimald::net::gvproxy_network) and DEBUG for the zone answerer, so
   # every lookup this case makes leaves its own line. The exec records the
-  # harness's default keeps, for the `min bug` tail. The switch's location,
-  # MINIMAL_BIN above, rides the same autospawn.
+  # harness's default keeps, for the `min bug` tail.
+  bn_rust_log="warn,minimald::exec=info,minimald::session=info,minimald::net::dns=info,minimald::net::gvproxy_network=info,minimald::net::answerer=debug"
+  # Restart with it — a standalone run has no daemon yet; `min ls` below
+  # autospawns it. No restart and no new filter when this run cannot read
+  # the daemon's log: the daemon already up keeps the one it came with.
   if hook_log_readable; then
-    mnl stop >/dev/null 2>&1 || true # a standalone run has no daemon yet
-    export RUST_LOG="warn,minimald::exec=info,minimald::session=info,minimald::net::dns=info,minimald::net::gvproxy_network=info,minimald::net::answerer=debug"
+    mnl stop >/dev/null 2>&1 || true
+  else
+    bn_rust_log="${RUST_LOG:-warn,minimald::exec=info}"
   fi
+  # The spawn env that restart must see — the filter above, plus the switch
+  # prefix ($bn_switch_dir when this case staged its own, else the lane's)
+  # — rides the warm-up calls below ALONE, env-prefixed and never exported:
+  # the autospawned daemon inherits both and is detached, so it keeps them
+  # for the whole case, while the shell running the case — and every case
+  # after it, on every exit path of this one, `fail` included — keeps the
+  # env it came in with (drive_installed_vm_pair documents the same
+  # one-call pattern for its filter). Nothing after the warm-up can spawn
+  # the daemon: every call below it requires the answerer to have answered,
+  # which only a live daemon does.
+  bn_warm() {
+    # shellcheck disable=SC2086
+    env RUST_LOG="$bn_rust_log" MINIMAL_BIN="${bn_switch_dir:-${bn_prefix:-}}" \
+      min ${E2E_MINIMAL_ARGS:-} "$@"
+  }
 
   # Warm the daemon and wait until its answerer is on record — the
   # advisory's trigger is the create response carrying the answerer port, so
   # it cannot race the listener the daemon spawns beside it.
   bn_port=""
   for _ in $(seq 1 40); do
-    bn_port="$(mnl ls 2>/dev/null \
+    bn_port="$(bn_warm ls 2>/dev/null \
       | sed -n 's/^ZONE ANSWERER: *listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
       | head -n1)"
     [ -n "$bn_port" ] && break
@@ -4457,11 +4478,25 @@ proof_box_name_resolves_natively_without_proxy() {
   }
 
   # ---- the gates, and what each owes --------------------------------------
+  # The box half's two gates fail a lane outright: a CI native lane exists
+  # to run these assertions, so a host there without the tap or the switch
+  # is a red lane, never a green pass with the box half silently skipped —
+  # the degraded arms below stay for developer hosts only.
   if [ -n "$bn_tun" ]; then
+    if [ -n "${CI:-}" ]; then
+      echo "::error::a CI native lane must have the tap device this case's boxes open — $bn_tun"
+      fail
+    fi
     bn_degrade "$bn_tun"
     return 0
   fi
   if [ -n "$bn_switch_reason" ]; then
+    if [ -n "${CI:-}" ]; then
+      echo "::error::a CI native lane must be able to provide the switch the boxes' session programs spawn — $bn_switch_reason"
+      echo "--- fetch-gvproxy output ---"
+      cat "$WORK/bn-fetch.out" 2>/dev/null || true
+      fail
+    fi
     bn_degrade "$bn_switch_reason"
     return 0
   fi
@@ -4472,7 +4507,7 @@ proof_box_name_resolves_natively_without_proxy() {
   # lane; a dev host's way out is the degraded arm.
   if ! mnl session exec "$bn_sid" sh -c 'true' >/dev/null 2>"$WORK/bn-exec.err"; then
     if [ -n "${CI:-}" ]; then
-      echo "::error::the own-IP box never ran — its session program failed to spawn (switch found at ${MINIMAL_BIN:-<none>})"
+      echo "::error::the own-IP box never ran — its session program failed to spawn (switch prefix: ${bn_switch_dir:-${bn_prefix:-<none>}})"
       echo "--- exec stderr ---"; cat "$WORK/bn-exec.err" 2>/dev/null || true
       fail
     fi
