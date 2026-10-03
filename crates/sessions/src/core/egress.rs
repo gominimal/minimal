@@ -1381,6 +1381,14 @@ impl ReplyFlows {
         self.flows.is_empty()
     }
 
+    /// The per-box cap the table refuses new inbound flows at — the number a
+    /// status surface or a filled line names, read from the table so a
+    /// harness-shrunk cap says the cap the table actually holds.
+    #[must_use]
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
     /// The record a client's five-tuple is held under, when one is live —
     /// the shape a status surface or a proof reads of the table without
     /// driving a reply.
