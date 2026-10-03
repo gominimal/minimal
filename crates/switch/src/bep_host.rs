@@ -815,6 +815,21 @@ mod tests {
             event.record(&mut MessageField(&mut line));
             self.0.lock().expect("the test owns the log").push(line);
         }
+
+        // The stack's own work is span-free — a refusal is one WARN event —
+        // so the span half of the trait is a no-op: no span is ever created,
+        // and none of these can be reached before `new_span` would be.
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
     }
 
     /// Capture every WARN line the current thread emits while the guard
@@ -1117,6 +1132,166 @@ mod tests {
         let expected_dst_port = 53u16.to_be_bytes();
         assert_eq!(&returned[20..22], &expected_src_port);
         assert_eq!(&returned[22..24], &expected_dst_port);
+    }
+
+    /// The fourth caller's refusal audit: the stack peer's reset and
+    /// port-unreachable paths charge the shared emitter ([`crate::refusal`])
+    /// under the same per-source bound the other three legs charge — one line
+    /// when a source's window opens and one when its quota is spent, in the one
+    /// line format every leg's log tail carries, never one per reply — and the
+    /// reset's numbers are the shared builder's for the same segment, not a
+    /// shape of the peer's own. A box hammering the proxy address degrades
+    /// alone: past its window's quota it is answered with nothing, while a
+    /// sibling's SYN and a third box's datagram in the same window are answered
+    /// and each say their own line.
+    #[test]
+    fn stack_peer_refusals_use_the_shared_emitter() {
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let (device, mut ends) = BepDevice::pair();
+        let mut host = BepHost::new(device, subnet, proxy_ip);
+        // The shared emitter, with a small quota and a window short enough to
+        // watch roll inside a test: the same audit, tightened for the proof.
+        host.refusals =
+            refusal::RefusalEmitter::new(refusal::REFUSAL_ROWS, 4, Duration::from_millis(50));
+        let (log, _guard) = capture_warn_lines();
+
+        let box_ip = Ipv4Addr::from(subnet.first_ptask());
+        let sibling_ip = Ipv4Addr::from(subnet.first_ptask() + 1);
+        let third_ip = Ipv4Addr::from(subnet.first_ptask() + 2);
+        let port = 443_u16;
+
+        // The window's opening line — the one format, naming the rule, the
+        // address that refused, the port, the reason, the source, and the
+        // count of replies written to that source this window — and the reset
+        // it answered with carries the shared builder's numbers for the same
+        // SYN. Ethernet (14 bytes) then IPv4 (20) put the TCP header at 34;
+        // the fields below are ports, sequence+acknowledgement, and the flags
+        // byte — the numbers RFC 793 §3.4 gives a refused bare SYN, as the
+        // one builder computes them.
+        let syn = tcp_syn(box_ip, proxy_ip, 1234, port);
+        ends.inbound.send(syn.clone()).expect("send TCP SYN");
+        host.poll(Instant::from_millis(0));
+        let reset = ends.outbound.try_recv().expect("the first SYN is answered");
+        let segment = refusal::classify(&syn).expect("the SYN classifies");
+        let shared_reset =
+            refusal::refused_tcp_reset(&syn, &segment).expect("the shared builder answers the SYN");
+        let answered = &reset[34..54];
+        let builder = &shared_reset[34..54];
+        assert_eq!(
+            &answered[..4],
+            &builder[..4],
+            "the reset answers from the refused port to the refused source"
+        );
+        assert_eq!(
+            &answered[4..12],
+            &builder[4..12],
+            "the reset's sequence and acknowledgement are the shared builder's"
+        );
+        assert_eq!(
+            answered[13], builder[13],
+            "RST|ACK from sequence zero, acknowledging the SYN"
+        );
+        let window_opens = format!(
+            "rule_matched=\"unlistened proxy port\" address={proxy_ip} port={port} \
+             reason=\"no socket is listening on the port\" source={box_ip} refusals=1"
+        );
+        assert_eq!(
+            log.lines(),
+            vec![window_opens],
+            "one line when the source's window opens, in the one format"
+        );
+
+        // The middle of the window is answered and quiet: no line per reply,
+        // and the reply that spends the quota says the window's second line.
+        for _ in 1..4 {
+            ends.inbound
+                .send(tcp_syn(box_ip, proxy_ip, 1234, port))
+                .expect("send TCP SYN");
+            host.poll(Instant::from_millis(0));
+            assert!(
+                ends.outbound.try_recv().is_ok(),
+                "the window's quota is still open"
+            );
+        }
+        let quota_spent = format!(
+            "rule_matched=\"unlistened proxy port\" address={proxy_ip} port={port} \
+             reason=\"no socket is listening on the port\" source={box_ip} refusals=4"
+        );
+        assert_eq!(
+            log.lines(),
+            vec![
+                format!(
+                    "rule_matched=\"unlistened proxy port\" address={proxy_ip} port={port} \
+                     reason=\"no socket is listening on the port\" source={box_ip} refusals=1"
+                ),
+                quota_spent,
+            ],
+            "the window says two lines, not one per reply"
+        );
+
+        // Past the quota the flooder is answered with nothing — it degrades to
+        // the timeout the reset replaced, alone — and no third line is said.
+        for _ in 0..2 {
+            ends.inbound
+                .send(tcp_syn(box_ip, proxy_ip, 1234, port))
+                .expect("send TCP SYN");
+            host.poll(Instant::from_millis(0));
+            assert!(
+                matches!(
+                    ends.outbound.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+                "the flooder has spent its window's quota"
+            );
+        }
+        assert_eq!(
+            log.lines().len(),
+            2,
+            "a suppressed refusal writes nothing and says nothing"
+        );
+
+        // A sibling's SYN in the same window is still answered, and the
+        // flood spent its source's quota alone: the sibling's line is its
+        // own, its count its own.
+        ends.inbound
+            .send(tcp_syn(sibling_ip, proxy_ip, 4321, port))
+            .expect("send the sibling's SYN");
+        host.poll(Instant::from_millis(0));
+        assert!(ends.outbound.try_recv().is_ok(), "the sibling is answered");
+        assert!(
+            log.lines().contains(&format!(
+                "rule_matched=\"unlistened proxy port\" address={proxy_ip} port={port} \
+                 reason=\"no socket is listening on the port\" source={sibling_ip} refusals=1"
+            )),
+            "the sibling's line, in the same window: {:?}",
+            log.lines()
+        );
+
+        // The port-unreachable path charges the same audit: a third box's
+        // datagram is answered and says its own line under the same format —
+        // the fourth caller's two reply shapes, one emitter.
+        ends.inbound
+            .send(udp_datagram(third_ip, proxy_ip, 5353, port, b"x"))
+            .expect("send the third box's datagram");
+        host.poll(Instant::from_millis(0));
+        let reply = ends.outbound.try_recv().expect("the datagram is answered");
+        let frame = EthernetFrame::new_checked(&reply).unwrap();
+        let ip = Ipv4Packet::new_checked(frame.payload()).unwrap();
+        let icmp = Icmpv4Packet::new_checked(ip.payload()).unwrap();
+        assert_eq!(
+            icmp.msg_type(),
+            smoltcp::wire::Icmpv4Message::DstUnreachable
+        );
+        assert_eq!(icmp.msg_code(), 3);
+        assert!(
+            log.lines().contains(&format!(
+                "rule_matched=\"unlistened proxy port\" address={proxy_ip} port={port} \
+                 reason=\"no socket is listening on the port\" source={third_ip} refusals=1"
+            )),
+            "the datagram's line, under the same emitter and format: {:?}",
+            log.lines()
+        );
     }
 
     #[test]
