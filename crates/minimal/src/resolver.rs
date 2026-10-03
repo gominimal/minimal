@@ -487,18 +487,25 @@ async fn path_component_custody(paths: &[&str]) -> Vec<(String, FileCustody)> {
 
 /// The program path the loaded job under [`RANGE_UNIT_LABEL`] names, from
 /// `launchctl print`'s output: `None` when no job is loaded under the
-/// label, or the print could not be read. One read-only call of the
-/// system's own service manager; nothing it does can prompt.
+/// label, or the print could not be read within [`LAUNCHCTL_BOUND`]. One
+/// read-only call of the system's own service manager; nothing it does can
+/// prompt, and a wedged launchd reads as unread — custody unverified, so
+/// the advisory re-surfaces — rather than hanging the activate or `min ls`.
 async fn launchctl_print_program() -> Option<String> {
-    let output = tokio::process::Command::new("launchctl")
-        .arg("print")
-        .arg(format!("system/{RANGE_UNIT_LABEL}"))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
+    let output = tokio::time::timeout(
+        LAUNCHCTL_BOUND,
+        tokio::process::Command::new("launchctl")
+            .arg("print")
+            .arg(format!("system/{RANGE_UNIT_LABEL}"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1159,6 +1166,11 @@ pub(crate) async fn session_detection() -> (Hook, Option<String>, RangeStep) {
     host_detection(RESOLVECTL_BOUND).await
 }
 
+/// The deadline on the macOS range-unit read's one `launchctl print`: the
+/// list's second, on both verbs, since the call is the same and a wedged
+/// launchd must cost neither a wait.
+const LAUNCHCTL_BOUND: Duration = Duration::from_secs(1);
+
 /// [`session_detection`] at [`LIST_RESOLVECTL_BOUND`], the deadline the
 /// list's read carries: `min ls` is the most frequently-invoked verb, so
 /// the same host state it reads must not make it a wait — the verdict a
@@ -1173,8 +1185,9 @@ async fn ls_detection() -> (Hook, Option<String>, RangeStep) {
 #[cfg(target_os = "macos")]
 async fn host_detection(_bound: Duration) -> (Hook, Option<String>, RangeStep) {
     // macOS's resolver consults the resolver file directly — there is no
-    // stub for host lookups to bypass, so nothing can block the command,
-    // and the one read this makes carries no deadline to bound.
+    // stub for host lookups to bypass, so nothing can block the command;
+    // the range unit's one `launchctl print` carries its own
+    // [`LAUNCHCTL_BOUND`], so this read never waits on launchd.
     (
         host_hook().await,
         None,
