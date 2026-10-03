@@ -6961,8 +6961,10 @@ cred_box_ip() {
 }
 
 # The lane's half: a box that declared a credentialed upstream reaches the
-# proxy's acceptor under rules that deny everything — the one destination
-# its rules never decide — and no other host address or port answers it.
+# proxy's acceptor — the listener, the one destination and port its rules
+# never decide — under rules that deny everything, and no other host
+# address or port answers it, and nothing else at the proxy's own address
+# does either.
 # The demand crosses both legs a box's frame must clear to get there: its
 # own in-VM relay, which enforces the box's declared egress (NET-062)
 # before the frame ever reaches the shared switch, and the VM host's gate
@@ -7066,7 +7068,7 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
   # And no other host port: the same box, the same socat, at the host alias
   # — the host's exposure address on the switch, the one a configured host
   # exposure is reached through — on the proxy's port and on another. The
-  # lane's one address is the proxy's; everywhere else the box's own
+  # lane's one listener is the proxy's; everywhere else the box's own
   # 0.0.0.0/0 still decides, and it drops each of these frames in the
   # box's in-VM relay before the switch — exactly as it would without the
   # lane — so each connect runs out its window with no reset, and the
@@ -7076,7 +7078,7 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
     mnl session exec "$lane_sid" \
       "/usr/bin/socat /dev/null TCP:$host_alias:$refused_port,connect-timeout=8" \
       >/dev/null 2>"$WORK/cred-lane-refused-$refused_port.err" && {
-      echo "::error::the deny-all lane box reached the host alias at port $refused_port — the lane must add reach at the proxy's address and nowhere else"
+      echo "::error::the deny-all lane box reached the host alias at port $refused_port — the lane must add reach at the proxy's listener and nowhere else"
       cat "$WORK/cred-lane-refused-$refused_port.err" 2>/dev/null || true
       cred_fail
     }
@@ -7087,11 +7089,38 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
     fi
   done
 
+  # And no other port at the lane's own address: TCP to 443 at the proxy's
+  # address — a port the proxy's listener does not bind, so the declaration
+  # never admitted it — is the box's own 0.0.0.0/0's to refuse again, on
+  # both legs (the relay's lane arm and the gate's read the listener, not
+  # the address), so the connect runs out its window with no reset, exactly
+  # as the host alias did. The lane's narrowing, pinned end to end: what
+  # the declaration opened is the proxy's listener, not its address.
+  mnl session exec "$lane_sid" \
+    "/usr/bin/socat /dev/null TCP:$proxy_ip:443,connect-timeout=8" \
+    >/dev/null 2>"$WORK/cred-lane-other-port.err" && {
+    echo "::error::the deny-all lane box reached the proxy's address at port 443 — the lane opens the proxy's listener, never its address"
+    cat "$WORK/cred-lane-other-port.err" 2>/dev/null || true
+    cred_fail
+  }
+  if grep -q 'Connection refused' "$WORK/cred-lane-other-port.err" 2>/dev/null; then
+    echo "::error::the deny-all lane box's connection to the proxy's address at port 443 was reset, not dropped — a port the lane never opened is the box's own rules' to decide, on both legs"
+    cat "$WORK/cred-lane-other-port.err" 2>/dev/null || true
+    cred_fail
+  fi
+  # No UDP leg here, on purpose: a UDP datagram to the proxy's address is
+  # dropped silently today on both legs, but BEP-018's re-plan has the
+  # proxy answer a UDP datagram with an ICMP port-unreachable reject, and
+  # this case must not pin today's silence against that flip. The unit
+  # tests hold the datagram's posture meanwhile (the relay and the gate
+  # both drop it under the lane rule), so the listener's narrowing is
+  # pinned without freezing the wire behaviour.
+
   mnl session destroy --force "$lane_sid" >/dev/null 2>&1 || true
   rm -rf "$CRED_LANE_SEED_DIR"
   CRED_LANE_SEED_DIR=""
   cred_restore
-  echo "a deny-all box on a credentialed lane reaches the proxy and no other host port OK (from $lane_ip to $proxy_ip:$proxy_port)"
+  echo "a deny-all box on a credentialed lane reaches the proxy and no other host port OK (from $lane_ip to $proxy_ip:$proxy_port; silence at the address's other ports)"
   echo "::endgroup::"
 }
 
@@ -7217,6 +7246,15 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
   if ! cred_case_log | grep -- "egress-uncredentialed-proxy-destination" \
     | grep -qF -- "\"source\":\"$nolane_ip\""; then
     echo "::error::the proxy-lane drop line does not name the no-lane box's own address ($nolane_ip) as the source"
+    cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | tail -n5 | sed 's/^/  /'
+    cred_fail
+  fi
+  # The box beside the source — the plan's diagnostics line wants the refused
+  # frame logged "with the box and the reason", and the box is the row's own
+  # name, read from the same flat-JSON shape the source field above is.
+  if ! cred_case_log | grep -- "egress-uncredentialed-proxy-destination" \
+    | grep -qF -- "\"box\":\"e2e-cred-nolane\""; then
+    echo "::error::the proxy-lane drop line does not name the no-lane box by its row's name (e2e-cred-nolane)"
     cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | tail -n5 | sed 's/^/  /'
     cred_fail
   fi
