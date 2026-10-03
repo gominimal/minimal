@@ -1,6 +1,6 @@
 //! `clap` argument definitions for the `min` CLI.
 
-use clap::{ArgGroup, Args, Subcommand};
+use clap::{ArgGroup, Args, Subcommand, ValueEnum};
 // Re-exported so the crate-root glob (`pub use cli::*`) keeps `Parser` in scope
 // for tests that call `Cli::try_parse_from`, exactly as the old single-module
 // layout did.
@@ -176,7 +176,8 @@ pub enum SessionCommand {
     Destroy(DestroyArgs),
     /// Rename an existing session
     Rename(RenameArgs),
-    /// Print the effective networking policy for a session as JSON
+    /// Print the effective networking policy for a session, as text or as
+    /// one JSON document (`-o json`)
     Policy(PolicyArgs),
     /// Register a session as an SSH remote in Zed's settings
     ///
@@ -257,6 +258,20 @@ pub struct PolicyArgs {
     /// Session identifier (UUID or session name)
     #[arg(add = completion::session_completer())]
     pub session: String,
+    /// Write one JSON document instead of text (the default)
+    #[arg(short = 'o', long = "output", value_enum)]
+    pub output: Option<PolicyOutputFormat>,
+}
+
+/// The rendering `min session policy` writes. One value today — `json`, the
+/// machine-readable shape — beside the text default; an `output` enum rather
+/// than a bare `--json` flag so a second format lands beside the first
+/// instead of accreting flags.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum PolicyOutputFormat {
+    /// One JSON document, `min/v1/session-policy`, with each live mapping's
+    /// `pending` state carried
+    Json,
 }
 
 #[derive(Debug, Args)]

@@ -1574,6 +1574,16 @@ pub async fn cmd_session_policy(
     global: &GlobalArgs,
     args: PolicyArgs,
 ) -> Result<(), anyhow::Error> {
+    // `-o json` is the machine-readable rendering: one document on stdout,
+    // one error object on stderr when the walk fails. A separate walk with
+    // typed failures (below) rather than a flag threaded through the text
+    // one, because *which* failure it was is part of what a script reads —
+    // the text walk answers with a message only — and because the text
+    // rendering is not touched at all.
+    if args.output == Some(PolicyOutputFormat::Json) {
+        return session_policy_as_json(global, &args.session).await;
+    }
+
     ensure_daemon(global)?;
 
     let mut client = connect_daemon(global).await?;
@@ -1601,32 +1611,9 @@ pub async fn cmd_session_policy(
 
     // The ports the box published at runtime, listed beside the declaration
     // (NET-044) — the rows that make a `min net expose` visible rather than
-    // only permitted. Built here rather than through a `SessionLookup`
-    // conversion for the same reason the effective lookup above is: the
-    // request types stay the rpc crate's, where the wire contract lives. A
-    // view of live state, not a fact the listing stands on, so it degrades
-    // rather than fails: against a daemon that cannot serve it — an older
-    // build without the subsystem, a session mid-teardown — the declaration
-    // still prints, with a warning that the live rows are unavailable rather
-    // than a claim that nothing is published.
-    let live_lookup = match SessionLookup::parse(&args.session) {
-        SessionLookup::Id(id) => minimald_rpc::GetLiveIngressRequest::Id(id),
-        SessionLookup::Name(n) => minimald_rpc::GetLiveIngressRequest::Name(n),
-    };
-    let live = match client
-        .oneshot_rpc::<minimald_rpc::GetLiveIngress>(live_lookup)
-        .await
-    {
-        Ok(minimald_rpc::Errorable::Ok(live)) => live,
-        Ok(minimald_rpc::Errorable::Err { error }) => {
-            eprintln!("warning: live port mappings are unavailable: {error}");
-            Vec::new()
-        }
-        Err(error) => {
-            eprintln!("warning: live port mappings are unavailable: {error:#}");
-            Vec::new()
-        }
-    };
+    // only permitted. Fetched through the shared helper, which degrades the
+    // same way for the JSON rendering below.
+    let live = fetch_live_ingress_degrading(&mut client, &args.session).await;
 
     match resp {
         minimald_rpc::Errorable::Ok(policy) => {
@@ -1851,6 +1838,353 @@ pub fn write_live_ingress(
             mapping.proto, mapping.local, mapping.internal_port, reachability
         )?;
     }
+    Ok(())
+}
+
+/// The schema string of the document `min session policy -o json` writes:
+/// the stamp a client checks before it reads anything else, held as a
+/// constant so the renderer and the tests that pin the document cite one
+/// spelling.
+pub const POLICY_JSON_SCHEMA: &str = "min/v1/session-policy";
+
+/// The schema string of the object a `-o json` failure writes to stderr —
+/// the same kind of stamp on a different document, so a client reads a
+/// failure the same way it reads the policy.
+const POLICY_ERROR_JSON_SCHEMA: &str = "min/v1/error";
+
+/// The ingress block as the document carries it: the declared policy, or
+/// `deny_all` where the text rendering writes that reading — the same
+/// decision its "deny all" line makes, so the document never claims rules
+/// the box never declared. Tagged by `kind` so a client branches on one
+/// field, with the declared policy's own keys flattened beside it.
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PolicyIngressJson<'a> {
+    /// Nothing is set, and the switch's default state is the deny: a claim
+    /// about the switch, not about declared rules.
+    DenyAll,
+    /// The declared policy, carried as the wire's own shape.
+    Declared(&'a sessions::IngressPolicy),
+}
+
+impl<'a> PolicyIngressJson<'a> {
+    /// The document's form of the block [`format_policy`] prints: the same
+    /// empty→deny-all reading, so a box that declared nothing does not read
+    /// as carrying an empty declaration beside a box that denied everything
+    /// on purpose.
+    fn from_effective(policy: Option<&'a sessions::IngressPolicy>) -> Self {
+        match policy {
+            None => Self::DenyAll,
+            Some(ingress)
+                if ingress.port_mappings.is_empty()
+                    && ingress.dynamic_allowed_range.is_none()
+                    && ingress.dynamic_ingress.is_none() =>
+            {
+                Self::DenyAll
+            }
+            Some(ingress) => Self::Declared(ingress),
+        }
+    }
+}
+
+/// The node-plane baseline set the helper enumerates (NET-130), as the
+/// document carries it: owned rows, because the enumeration is built inside
+/// the render and the wire has no shape for it. The text rendering prints
+/// the same rows, so the two list the same set.
+#[derive(serde::Serialize)]
+struct PolicyBaselineJson {
+    phase: &'static str,
+    entries: Vec<PolicyBaselineEntryJson>,
+}
+
+/// One category row of the baseline set.
+#[derive(serde::Serialize)]
+struct PolicyBaselineEntryJson {
+    category: &'static str,
+    endpoints: Vec<String>,
+}
+
+/// One `min/v1/session-policy` document: the effective policy's parts, each
+/// named as a parser reads them. The blocks the text rendering prints carry
+/// over as keys, and the ones it suppresses are left out entirely rather
+/// than nulled, so a key's absence is itself the claim (a host-address box
+/// shares its host's namespace and has no per-session ingress; a none box
+/// has no policy at all) — [`format_policy`]'s shape decisions restated for
+/// a machine.
+///
+/// The live mappings ride as the wire's own rows, `pending` included, since
+/// carrying that state is half of what the mode is for: a published port
+/// the relay gate has not admitted yet must not read as reachable to
+/// something parsing this.
+#[derive(serde::Serialize)]
+struct PolicyJson<'a> {
+    schema: &'static str,
+    network: sessions::NetworkMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    egress: Option<&'a sessions::EffectiveEgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingress: Option<PolicyIngressJson<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_plane_baseline: Option<PolicyBaselineJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    live_ingress: Option<&'a [minimald_rpc::LiveMapping]>,
+}
+
+/// The document renderer `min session policy -o json` goes through — the
+/// JSON-side counterpart of [`format_policy`], taking the same inputs the
+/// command walks for so the two renderings describe the same policy. Shared
+/// with the tests that pin the document, the way [`format_policy`] is.
+pub fn write_policy_json(
+    out: &mut impl std::io::Write,
+    effective: &sessions::EffectiveSessionPolicy,
+    network: sessions::NetworkMode,
+    fabric: Option<switch::SwitchSubnet>,
+    live: &[minimald_rpc::LiveMapping],
+) -> Result<(), anyhow::Error> {
+    // A none box has no policy to describe; the text rendering's one-line
+    // note is prose for a person, so the document carries the schema and
+    // the mode alone, and every other key's absence says why.
+    let document = if network == sessions::NetworkMode::NoNet {
+        PolicyJson {
+            schema: POLICY_JSON_SCHEMA,
+            network,
+            egress: None,
+            ingress: None,
+            node_plane_baseline: None,
+            live_ingress: None,
+        }
+    } else {
+        // The baseline set is a switch-fabric surface, held to the same
+        // gate as the text rendering's block: own-address modes, and a
+        // fabric the helper gates named (NET-130).
+        let node_plane_baseline = if network == sessions::NetworkMode::OwnIp
+            && let Some(fabric) = fabric
+        {
+            let baseline = minvmd::net::NodePlaneBaseline::built_in(fabric);
+            Some(PolicyBaselineJson {
+                phase: baseline.phase().as_str(),
+                entries: baseline
+                    .entries()
+                    .iter()
+                    .map(|entry| PolicyBaselineEntryJson {
+                        category: entry.category().as_str(),
+                        endpoints: entry.endpoints().to_vec(),
+                    })
+                    .collect(),
+            })
+        } else {
+            None
+        };
+        PolicyJson {
+            schema: POLICY_JSON_SCHEMA,
+            network,
+            egress: Some(&effective.egress),
+            // Ingress is an own-address surface — the text rendering's gate:
+            // a host-address box shares its host's namespace, so a key there
+            // would claim a per-session policy that does not exist.
+            ingress: (network != sessions::NetworkMode::HostNet)
+                .then(|| PolicyIngressJson::from_effective(effective.ingress.as_ref())),
+            node_plane_baseline,
+            // The wire's own rows, `pending` included — an empty list is a
+            // claim about the box (it published nothing), which is what the
+            // key is for; the modes without a surface leave it out instead.
+            live_ingress: Some(live),
+        }
+    };
+    let encoded =
+        serde_json_lenient::to_string(&document).context("encoding the session-policy document")?;
+    writeln!(out, "{encoded}").context("writing the session-policy document")?;
+    Ok(())
+}
+
+/// Why a `-o json` walk failed, tagged where the kinds can be told apart —
+/// each tag is the `code` the error document writes, a name a script can
+/// branch on rather than a message to parse.
+enum PolicyJsonFailure {
+    /// No daemon to ask: the autospawn, the connection, or an RPC the daemon
+    /// never answered.
+    DaemonUnreachable(String),
+    /// The daemon answered, but nothing matches the selector.
+    SessionNotFound(String),
+    /// The session resolved, but its effective policy could not be read.
+    PolicyUnavailable(String),
+}
+
+impl PolicyJsonFailure {
+    /// The `code` of the error document this failure writes.
+    fn code(&self) -> &'static str {
+        match self {
+            Self::DaemonUnreachable(_) => "daemon_unreachable",
+            Self::SessionNotFound(_) => "session_not_found",
+            Self::PolicyUnavailable(_) => "policy_unavailable",
+        }
+    }
+
+    /// The `message` beside it: the whole error chain, read the way the text
+    /// mode's error line reads it.
+    fn message(&self) -> &str {
+        match self {
+            Self::DaemonUnreachable(message)
+            | Self::SessionNotFound(message)
+            | Self::PolicyUnavailable(message) => message,
+        }
+    }
+}
+
+/// The shape of the `min/v1/error` document.
+#[derive(serde::Serialize)]
+struct PolicyJsonErrorDoc<'a> {
+    schema: &'static str,
+    code: &'a str,
+    message: &'a str,
+}
+
+/// Writes one `min/v1/error` document to `err`: the only thing this mode
+/// puts on stderr, on any failure, so a client parses a failure the same way
+/// it parses the policy. Shared with the tests that pin the contract.
+pub fn write_policy_error(
+    err: &mut impl std::io::Write,
+    code: &str,
+    message: &str,
+) -> Result<(), anyhow::Error> {
+    let document = PolicyJsonErrorDoc {
+        schema: POLICY_ERROR_JSON_SCHEMA,
+        code,
+        message,
+    };
+    let encoded =
+        serde_json_lenient::to_string(&document).context("encoding the policy error document")?;
+    writeln!(err, "{encoded}").context("writing the policy error document")?;
+    Ok(())
+}
+
+/// A `-o json` failure that has already written its one `min/v1/error`
+/// document to stderr: carried as a typed error so the CLI's `main` can end
+/// the run non-zero without printing a second line for the same failure —
+/// [`crate::task::TaskExit`]'s precedent. The document is the contract; the
+/// exit code is the status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyJsonExit;
+
+impl std::fmt::Display for PolicyJsonExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the policy document could not be rendered; the JSON error on stderr says why"
+        )
+    }
+}
+
+impl std::error::Error for PolicyJsonExit {}
+
+/// The live-ingress half of either rendering's walk: the ports the box
+/// published at runtime, listed beside the declaration (NET-044) — the rows
+/// that make a `min net expose` visible rather than only permitted. Built
+/// through `SessionLookup::parse` rather than a conversion so the request
+/// types stay the rpc crate's, where the wire contract lives. A view of live
+/// state, not a fact the listing stands on, so it degrades rather than
+/// fails: against a daemon that cannot serve it — an older build without
+/// the subsystem, a session mid-teardown — the declaration still renders,
+/// with a warning that the live rows are unavailable rather than a claim
+/// that nothing is published.
+async fn fetch_live_ingress_degrading(
+    client: &mut client::Client,
+    session: &str,
+) -> Vec<minimald_rpc::LiveMapping> {
+    let live_lookup = match SessionLookup::parse(session) {
+        SessionLookup::Id(id) => minimald_rpc::GetLiveIngressRequest::Id(id),
+        SessionLookup::Name(n) => minimald_rpc::GetLiveIngressRequest::Name(n),
+    };
+    match client
+        .oneshot_rpc::<minimald_rpc::GetLiveIngress>(live_lookup)
+        .await
+    {
+        Ok(minimald_rpc::Errorable::Ok(live)) => live,
+        Ok(minimald_rpc::Errorable::Err { error }) => {
+            eprintln!("warning: live port mappings are unavailable: {error}");
+            Vec::new()
+        }
+        Err(error) => {
+            eprintln!("warning: live port mappings are unavailable: {error:#}");
+            Vec::new()
+        }
+    }
+}
+
+/// The walk behind the JSON rendering: the same three steps as the text
+/// walk — resolve the record, read the effective policy, list the live
+/// mappings — with each failure tagged where the kinds can be told apart,
+/// since the error document's `code` is a contract, and with the same
+/// degrade-or-warn live fetch.
+async fn session_policy_json_inputs(
+    global: &GlobalArgs,
+    session: &str,
+) -> Result<
+    (
+        sessions::Record,
+        sessions::EffectiveSessionPolicy,
+        Vec<minimald_rpc::LiveMapping>,
+    ),
+    PolicyJsonFailure,
+> {
+    ensure_daemon(global)
+        .map_err(|error| PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")))?;
+    let mut client = connect_daemon(global)
+        .await
+        .map_err(|error| PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")))?;
+
+    // The record the ingress key is gated on, resolved through the same
+    // lookup the text walk uses, with the failure kinds told apart where
+    // they can be: an RPC the daemon never answered is no daemon to ask;
+    // a lookup that answered with nothing is the not-found itself.
+    let resp = get_session_record(&mut client, session)
+        .await
+        .map_err(|error| PolicyJsonFailure::DaemonUnreachable(format!("{error:#}")))?;
+    let record = named_record(resp.record, session)
+        .map_err(|error| PolicyJsonFailure::SessionNotFound(error.to_string()))?;
+
+    use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
+    let lookup = match SessionLookup::parse(session) {
+        SessionLookup::Id(id) => GetEffectiveSessionPolicyRequest::Id(id),
+        SessionLookup::Name(n) => GetEffectiveSessionPolicyRequest::Name(n),
+    };
+    let resp = client
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(lookup)
+        .await
+        .map_err(|error| PolicyJsonFailure::PolicyUnavailable(format!("{error:#}")))?;
+
+    let live = fetch_live_ingress_degrading(&mut client, session).await;
+
+    match resp {
+        minimald_rpc::Errorable::Ok(policy) => Ok((record, policy, live)),
+        minimald_rpc::Errorable::Err { error } => {
+            Err(PolicyJsonFailure::PolicyUnavailable(error.to_string()))
+        }
+    }
+}
+
+/// The `-o json` rendering: the walk's inputs as one `min/v1/session-policy`
+/// document on stdout, or the failure's one `min/v1/error` object on stderr
+/// and a non-zero exit — never a document beside a plain-text error line,
+/// so a client parses exactly one thing.
+async fn session_policy_as_json(global: &GlobalArgs, session: &str) -> Result<(), anyhow::Error> {
+    let (record, policy, live) = match session_policy_json_inputs(global, session).await {
+        Ok(inputs) => inputs,
+        Err(failure) => {
+            let mut err = std::io::stderr();
+            write_policy_error(&mut err, failure.code(), failure.message())?;
+            return Err(PolicyJsonExit.into());
+        }
+    };
+    // The fabric the baseline set builds from — keyed the same way the text
+    // rendering keys it (see the comment in [`cmd_session_policy`]): the
+    // backend this command actually talks to, with no fabric named for the
+    // native daemon's per-daemon switch.
+    let fabric = (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
+        .then_some(switch::SwitchSubnet::default());
+    let mut out = std::io::stdout();
+    write_policy_json(&mut out, &policy, record.network, fabric, &live)?;
+    out.flush().context("Failed to write policy")?;
     Ok(())
 }
 
@@ -2785,6 +3119,45 @@ mod tests {
         assert!(
             admitted_json.contains("\"pending\":false"),
             "the admitted mapping's JSON says so: {admitted_json}"
+        );
+    }
+
+    /// The document a `-o json` failure writes to stderr: one `min/v1/error`
+    /// object, its `code` a name a script can branch on and its `message`
+    /// the same chain the text mode's error line carries — so a client
+    /// parses a failure the same way it parses the policy, with no second,
+    /// plain-text line to also handle.
+    #[test]
+    fn policy_json_error_document_is_one_object() {
+        let mut err = Vec::new();
+        write_policy_error(
+            &mut err,
+            "session_not_found",
+            "No session found matching 'gone'",
+        )
+        .unwrap();
+        let rendered = String::from_utf8(err).unwrap();
+        let document: serde_json_lenient::Value =
+            serde_json_lenient::from_str(rendered.trim_end()).unwrap();
+        assert_eq!(
+            document["schema"].as_str(),
+            Some("min/v1/error"),
+            "the failure object carries its own schema stamp: {rendered}"
+        );
+        assert_eq!(
+            document["code"].as_str(),
+            Some("session_not_found"),
+            "the failure's kind is a name, not a message to parse: {rendered}"
+        );
+        assert_eq!(
+            document["message"].as_str(),
+            Some("No session found matching 'gone'"),
+            "the message beside it: {rendered}"
+        );
+        assert_eq!(
+            rendered.lines().count(),
+            1,
+            "one object, one line, nothing else: {rendered}"
         );
     }
 

@@ -4,7 +4,7 @@ use std::io::IsTerminal as _;
 use std::process::ExitCode;
 
 use clap::{CommandFactory as _, Parser};
-use minimal::ExecArgs;
+use minimal::{ExecArgs, PolicyArgs, PolicyOutputFormat};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 /// Custom main: handle shell completion requests before launching the async world.
@@ -111,6 +111,13 @@ async fn run() -> ExitCode {
         if let Some(&minimal::task::TaskExit(code)) = e.downcast_ref::<minimal::task::TaskExit>() {
             return ExitCode::from(code);
         }
+        // A `-o json` policy run that failed has already written its one
+        // `min/v1/error` object to stderr — the document is the contract, so
+        // there is no second, plain-text line to print for the same failure,
+        // only the non-zero status.
+        if e.downcast_ref::<minimal::PolicyJsonExit>().is_some() {
+            return ExitCode::FAILURE;
+        }
         eprintln!("error: {e:#}");
         return ExitCode::FAILURE;
     }
@@ -137,7 +144,8 @@ impl std::io::Write for DashLog {
 /// command's output, and `task run` / `session run` stream the task's stdout —
 /// a log line in any of them would be read as content. A bare `min` (no subcommand) is
 /// one too: its non-TTY twin promises an empty stdout to pipelines, and its
-/// interactive activate path prints only the session id there.
+/// interactive activate path prints only the session id there. So is
+/// `session policy -o json`, whose stdout is one document a script parses.
 fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
     matches!(
         command,
@@ -146,7 +154,11 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
                 | minimal::Command::Completions(_)
                 | minimal::Command::Session(minimal::SessionArgs {
                     command: minimal::SessionCommand::Exec(ExecArgs { .. })
-                        | minimal::SessionCommand::Run(_),
+                        | minimal::SessionCommand::Run(_)
+                        | minimal::SessionCommand::Policy(PolicyArgs {
+                            output: Some(PolicyOutputFormat::Json),
+                            ..
+                        }),
                 })
                 | minimal::Command::Task(minimal::TaskArgs {
                     command: minimal::TaskCommand::Run(_),
@@ -193,5 +205,26 @@ mod tests {
             }),
         }));
         assert!(stdout_is_data_contract(&cmd));
+    }
+
+    /// `min session policy -o json` writes one document a script parses, so
+    /// its tracing must route to stderr — and the text rendering, whose
+    /// stdout is for a person, must not be caught by the same gate.
+    #[test]
+    fn session_policy_json_is_a_stdout_contract() {
+        let cmd = Some(Command::Session(minimal::SessionArgs {
+            command: minimal::SessionCommand::Policy(PolicyArgs {
+                session: "web".to_string(),
+                output: Some(PolicyOutputFormat::Json),
+            }),
+        }));
+        assert!(stdout_is_data_contract(&cmd));
+        let cmd = Some(Command::Session(minimal::SessionArgs {
+            command: minimal::SessionCommand::Policy(PolicyArgs {
+                session: "web".to_string(),
+                output: None,
+            }),
+        }));
+        assert!(!stdout_is_data_contract(&cmd));
     }
 }

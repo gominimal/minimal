@@ -821,10 +821,153 @@ async fn session_policy_succeeds() {
         &args,
         PolicyArgs {
             session: session_id.to_string(),
+            output: None,
         },
     )
     .await
     .unwrap();
+}
+
+/// `min session policy -o json` writes one `min/v1/session-policy` document:
+/// the schema stamp a client checks before anything else, the policy's
+/// blocks as keys, and the live mappings as the wire's own rows with each
+/// one's `pending` state carried (NET-044) — a port published at runtime
+/// that the relay gate has not admitted must not read as reachable to
+/// something parsing the document, and the port the declaration named must
+/// read as the admitted forward it is. Driven through `write_policy_json`,
+/// the renderer the command goes through, with the effective policy fetched
+/// the way the command fetches it (the effective-policy RPC, NET-074) from
+/// a real session that really declares the port that reads `pending:
+/// false` — so the two rows are grounded in a declaration, not in a
+/// hand-built pair.
+#[tokio::test]
+async fn policy_json_carries_schema_and_pending() {
+    let (daemon, args) = setup().await;
+    let session_id = create_session_with_policy(
+        &daemon,
+        "policy-json",
+        sessions::NetworkMode::OwnIp,
+        sessions::SessionPolicy::new(
+            None,
+            Some(sessions::IngressPolicy {
+                port_mappings: vec![sessions::PortMapping {
+                    external_port: 3000,
+                    internal_port: 3000,
+                    proto: sessions::IpProto::Tcp,
+                }],
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+        ),
+    )
+    .await;
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
+    let resp = client
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(session_id))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
+    };
+    assert!(
+        policy
+            .ingress
+            .as_ref()
+            .is_some_and(|ingress| ingress.port_mappings.len() == 1),
+        "the stored declaration must survive the record round trip"
+    );
+
+    // The live rows the way the daemon serves them: a runtime-only port the
+    // declaration never named, beside the declared one.
+    let live = vec![
+        minimald_rpc::LiveMapping {
+            local: "127.0.0.1:3200".to_string(),
+            internal_port: 3200,
+            proto: sessions::IpProto::Tcp,
+            pending: true,
+        },
+        minimald_rpc::LiveMapping {
+            local: "127.0.0.1:3000".to_string(),
+            internal_port: 3000,
+            proto: sessions::IpProto::Tcp,
+            pending: false,
+        },
+    ];
+
+    let mut out = Vec::new();
+    write_policy_json(&mut out, &policy, sessions::NetworkMode::OwnIp, None, &live).unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        document["schema"], "min/v1/session-policy",
+        "the document must open with the schema stamp:\n{document}"
+    );
+    assert_eq!(
+        document["network"], "own_ip",
+        "the mode names which surface the policy describes:\n{document}"
+    );
+    assert_eq!(
+        document["ingress"]["kind"], "declared",
+        "the declared block is carried as the declaration:\n{document}"
+    );
+    let declared = document["ingress"]["port_mappings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the declared mappings ride as an array: {document}"));
+    assert_eq!(
+        declared[0]["internal_port"].as_u64(),
+        Some(3000),
+        "the declaration the pending rows are measured against:\n{document}"
+    );
+
+    let live_rows = document["live_ingress"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the live mappings ride as an array: {document}"));
+    assert_eq!(live_rows.len(), 2, "every mapping carried: {document}");
+    let pending_of = |port: u16| {
+        live_rows
+            .iter()
+            .find(|row| row["internal_port"].as_u64() == Some(u64::from(port)))
+            .unwrap_or_else(|| panic!("no live row for port {port}: {document}"))["pending"]
+            .clone()
+    };
+    assert_eq!(
+        pending_of(3200).as_bool(),
+        Some(true),
+        "a port the declaration never named is carried as pending:\n{document}"
+    );
+    assert_eq!(
+        pending_of(3000).as_bool(),
+        Some(false),
+        "the port the declaration named is carried as admitted:\n{document}"
+    );
+}
+
+/// A `-o json` run that fails answers with the mode's error contract, not a
+/// plain-text line: the error that crosses to `main` is the typed
+/// `PolicyJsonExit` — what makes `main` end the run non-zero without
+/// printing a second line for the same failure, the `min/v1/error` object
+/// on stderr (whose one-object shape `write_policy_error`'s unit test pins)
+/// being the answer a client parses.
+#[tokio::test]
+async fn policy_json_failure_answers_with_the_error_contract() {
+    let (_daemon, args) = setup().await;
+    let err = cmd_session_policy(
+        &args,
+        PolicyArgs {
+            session: "no-such-session".to_string(),
+            output: Some(PolicyOutputFormat::Json),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.downcast_ref::<PolicyJsonExit>().is_some(),
+        "the failure crosses as the sentinel `main` downcasts, not a message: {err:#}"
+    );
 }
 
 /// `min session policy` shows the effective egress rules (NET-061): the four
