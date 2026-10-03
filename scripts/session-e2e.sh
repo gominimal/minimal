@@ -149,6 +149,13 @@
 #                                    its own box's switch address — two boxes
 #                                    live at once, and each answer names its
 #                                    own box, never the other's
+#   published_proxy_routes_from_host
+#                                    NET-059/081: a HOST request through the
+#                                    VM's published loopback proxy port
+#                                    reaches a box by its min.internal name
+#                                    and gets its answer — the forwarder's
+#                                    dial across the host egress gate, and
+#                                    the box's reply back through it
 #
 # Usage: scripts/session-e2e.sh [case]
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
@@ -231,6 +238,7 @@ BOXREG_CTRLC_SEED_DIR="" # its Ctrl-C seed (carries bulk data); removed on teard
 BOXREG_CTRLC_PID="" # its interrupted activate; INT then KILL on teardown
 BEPB_SEED_DIR_A="" # seeded by the proxy-source proof below; removed on teardown
 BEPB_SEED_DIR_B="" # its second box's seed; removed on teardown
+PUBP_SEED_DIR="" # seeded by the published-proxy proof below; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -575,6 +583,8 @@ teardown() {
   # trap is the one place that always sees them.
   [ -n "$BEPB_SEED_DIR_A" ] && rm -rf "$BEPB_SEED_DIR_A"
   [ -n "$BEPB_SEED_DIR_B" ] && rm -rf "$BEPB_SEED_DIR_B"
+  # The published-proxy proof's box: the same arrangement, for the same reason.
+  [ -n "$PUBP_SEED_DIR" ] && rm -rf "$PUBP_SEED_DIR"
   # The forward holds the laptop-side listener; INT is the documented stop,
   # KILL the backstop so a hung relay cannot outlive the run.
   if [ -n "$RETIRED_FWD_PID" ]; then
@@ -8184,6 +8194,163 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
   echo "::endgroup::"
 }
 
+# A HOST request through the VM's published hostname-proxy port — the
+# listener the VM host daemon asks the switch to expose on the host's
+# loopback, the one `min ls` points a PAC file at — must reach a box by its
+# min.internal name and get its answer (NET-059, NET-081). The path, leg by
+# leg: host curl → the forwarder's published listener → the switch dials the
+# guest's node proxy from the GATEWAY address at a port the node row admits
+# → the in-guest proxy resolves the box's name and dials it → the box
+# answers → the answer travels back out through the host egress gate. That
+# last leg is the one this proof exists for: the proxy's reply is addressed
+# to the gateway, which the gate's control-surface rule refuses on sight,
+# so the verdict can admit it only because the dial's SYN recorded a
+# forwarder flow — matched by the exact reverse tuple, never by the port
+# alone (the unit tests beside the gate in crates/minvmd pin the refusals;
+# this case pins the delivery).
+#
+# Runs where the CLI is VM-backed and a switch exists — the same two gates
+# the box-registration proof takes: a native host has no VM host daemon to
+# publish a port, and a minvmd with no gvproxy has no switch to publish on.
+# Late in the whole-lane order on purpose, like the proxy-source proof it
+# follows: it stops and respawns both daemons for its own run, and nothing
+# after it depends on the one before.
+proof_published_proxy_routes_from_host() {
+  local pubp_sid="" pubp_ls="" pubp_line="" pubp_port="" pubp_ready=""
+  # The names, ports and markers. Fixed on purpose — they must agree across
+  # the execs that start and probe the responder — high enough to need no
+  # privilege, and clear of the ports every earlier proof in this script
+  # fixed first.
+  PUBP_BOX_PORT=18084                  # the box's responder, dialed by name
+  PUBP_BOX_MARKER="PUBLISHED_PROXY_OK" # what the box's responder answers with
+
+  echo "::group::a host request through the published proxy port reaches a box (NET-059/081)"
+
+  if [ "$min_daemon" != minvmd ]; then
+    echo "published proxy proof SKIPPED (this run's daemon is minimald: a native host has no published VM proxy port — the proof runs where the CLI is VM-backed, which macOS is with no flag at all)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "published proxy proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so the VM's proxy port is never published)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # One host-address box (the default network) is the request's target —
+  # the shape the min.internal proof's origin box already showed the
+  # in-guest proxy can dial by name. Seeded like every other fixture, plus
+  # the bare `.git` marker that makes the headless upload gate ship it.
+  PUBP_SEED_DIR="$(hook_mktemp /tmp/mnlpp.XXXXXX)"
+  hook_seed_preamble > "$PUBP_SEED_DIR/minimal.toml"
+  mkdir "$PUBP_SEED_DIR/.git"
+
+  # Stop whatever daemon the earlier cases left on this host — both halves
+  # of the pair teardown stops, for the same reason the proxy-source proof
+  # does: the activation below must autospawn its own pair, against a VM
+  # whose published port `min ls` reports for this box alone.
+  mnl stop --force >/dev/null 2>&1 || true
+  if [ -n "$E2E_VM" ]; then
+    minvmd stop >/dev/null 2>&1 || true
+  fi
+
+  pubp_sid="$(cd "$PUBP_SEED_DIR" && mnl session activate . \
+    --no-prompt --name e2e-pub-proxy 2>"$WORK/pubp-activate.err")" || {
+    echo "::error::'min session activate' for the published-proxy proof's box failed"
+    echo "--- stderr ---"; cat "$WORK/pubp-activate.err" 2>/dev/null || true
+    fail
+  }
+  pubp_sid="$(printf '%s\n' "$pubp_sid" | tail -n1 | tr -d '\r')"
+  if ! printf '%s' "$pubp_sid" | grep -Eqx \
+    '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+    echo "::error::activate's last stdout line is not a session id: '$pubp_sid'"
+    cat "$WORK/pubp-activate.err" 2>/dev/null || true
+    fail
+  fi
+  echo "target box: $pubp_sid (default network)"
+
+  # The box's responder: socat (a launcher baseline package every box ships
+  # at /usr/bin) serving one fixed 200 whose body is the marker, written by
+  # the SESSION's shell so the Content-Length can never drift from the body
+  # it frames — the same responder shape the min.internal proof's boxes
+  # serve. `nohup ... >/dev/null 2>&1 &` is the documented detach form: the
+  # listener has to outlive the exec that starts it, and every probe below
+  # is its own exec.
+  mnl session exec "$pubp_sid" \
+    "body=$PUBP_BOX_MARKER; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200" \
+    >/dev/null 2>"$WORK/pubp-responder.err" \
+    || { echo "::error::could not write the box's response"; cat "$WORK/pubp-responder.err" 2>/dev/null || true; fail; }
+  mnl session exec "$pubp_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:$PUBP_BOX_PORT,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &" \
+    >/dev/null 2>"$WORK/pubp-responder.err" \
+    || { echo "::error::could not start the box's responder"; cat "$WORK/pubp-responder.err" 2>/dev/null || true; fail; }
+  for _ in $(seq 1 40); do
+    if [ "$(mnl session exec "$pubp_sid" \
+      "curl -sS --max-time 5 -o /home/ready.body -w '%{http_code}' http://127.0.0.1:$PUBP_BOX_PORT/" \
+      2>/dev/null || true)" = "200" ]; then
+      pubp_ready=1; break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$pubp_ready" ]; then
+    echo "::error::the box's responder never answered a direct curl — the published port is not in the picture yet"
+    echo "--- socat exec stderr ---"; cat "$WORK/pubp-responder.err" 2>/dev/null || true
+    fail
+  fi
+
+  # The port the VM's node proxy is published on, on the HOST's loopback —
+  # the one line `min ls` prints for exactly this purpose. On the VM backend
+  # the line names the VM whose port it is (`VM <vm> listening on ...`); the
+  # native spelling has no VM to name, so the parse takes either, `-E`
+  # because a BRE `\?` is not portable to the macOS lane's BSD sed.
+  pubp_line=""
+  for _ in $(seq 1 40); do
+    pubp_ls="$(mnl ls 2>&1)"
+    pubp_line="$(printf '%s\n' "$pubp_ls" | grep -F 'HOSTNAME PROXY:' | tail -n1)"
+    [ -n "$pubp_line" ] && break
+    sleep 0.25
+  done
+  if [ -z "$pubp_line" ]; then
+    echo "::error::'min ls' printed no HOSTNAME PROXY line, so no published proxy port exists to route this host's requests through"
+    echo "--- min ls ---"; printf '%s\n' "$pubp_ls"
+    fail
+  fi
+  echo "published proxy: $pubp_line"
+  pubp_port="$(printf '%s\n' "$pubp_line" \
+    | sed -En 's/^HOSTNAME PROXY:  (VM [^ ]* )?listening on 127\.0\.0\.1:([0-9]+) .*/\2/p')"
+  if [ -z "$pubp_port" ]; then
+    echo "::error::the HOSTNAME PROXY line names no loopback port: '$pubp_line'"
+    fail
+  fi
+
+  # The proof itself: one HOST curl, through the published proxy port, to
+  # the box's two-label name — the request a PAC-file'd browser on this host
+  # would make. Every leg named above has to hold at once for it to come
+  # back, so a failure here is only named by the leg prints above it. curl
+  # reports the status on stdout via -w; the body lands in the file -o names.
+  pubp_code="$(curl -sS --max-time 20 -o "$WORK/pubp-body.out" -w '%{http_code}' \
+    -x "http://127.0.0.1:$pubp_port" "http://e2e-pub-proxy.min.internal:$PUBP_BOX_PORT/" \
+    2>"$WORK/pubp-curl.err")"
+  if [ "$pubp_code" != "200" ]; then
+    echo "::error::the host request through the published proxy port came back '$pubp_code', not 200"
+    echo "--- curl stderr ---"; cat "$WORK/pubp-curl.err" 2>/dev/null || true
+    echo "--- body ---"; cat "$WORK/pubp-body.out" 2>/dev/null || true
+    fail
+  fi
+  if ! grep -q -- "$PUBP_BOX_MARKER" "$WORK/pubp-body.out" 2>/dev/null; then
+    echo "::error::the host request's answer is not the box's marker '$PUBP_BOX_MARKER'"
+    echo "--- body ---"; cat "$WORK/pubp-body.out" 2>/dev/null || true
+    fail
+  fi
+  echo "host request through the published proxy port: 200, body '$PUBP_BOX_MARKER'"
+
+  mnl session destroy --force "$pubp_sid" >/dev/null 2>&1 || true
+  rm -rf "$PUBP_SEED_DIR"
+  PUBP_SEED_DIR=""
+  echo "published proxy routes from host OK (port $pubp_port)"
+  echo "::endgroup::"
+}
+
 # Ordered late in the whole-lane run on purpose: it restarts the daemon (see
 # the RUST_LOG note inside) and nothing after it depends on the one before.
 # The github_only_allowlist case, which the dispatch runs after this one,
@@ -10320,6 +10487,7 @@ case "${1:-}" in
     proof_switch_answers_no_arp_for_the_proxy_address
     proof_github_only_allowlist
     proof_proxy_sees_each_vm_box_by_its_switch_address
+    proof_published_proxy_routes_from_host
     ;;
   lifecycle | session_exec | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
@@ -10332,7 +10500,8 @@ case "${1:-}" in
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes \
     | switch_steers_proxy_mac_frames_to_the_host_stack | switch_answers_no_arp_for_the_proxy_address \
-    | github_only_allowlist | proxy_sees_each_vm_box_by_its_switch_address)
+    | github_only_allowlist | proxy_sees_each_vm_box_by_its_switch_address \
+    | published_proxy_routes_from_host)
     "proof_$1"
     ;;
   *)
@@ -10350,6 +10519,7 @@ case "${1:-}" in
     echo "         min_internal_names_through_proxy proxy_refuses_like_direct retired_surfaces_gone"
     echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
     echo "         github_only_allowlist proxy_sees_each_vm_box_by_its_switch_address"
+    echo "         published_proxy_routes_from_host"
     exit 2
     ;;
 esac
