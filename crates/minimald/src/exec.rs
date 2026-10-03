@@ -32,6 +32,8 @@ use tokio::{
 };
 use tracing::Instrument as _;
 
+use diagnostics::redact::scrub_secrets;
+
 use crate::{
     ChannelConfig, MINIMAL_SESSION_ID_ENV,
     connection::{ConnectionError, ConnectionHandle},
@@ -1405,8 +1407,9 @@ pub(crate) async fn handle_exec(
     // Logged for every accepted form, before the dispatch that decides which
     // one it is: an operator reading the log should see what a client asked to
     // run, whether it was serviced by the daemon, handed to the session, or
-    // refused below.
-    tracing::info!(%session_id, command = %argv, "exec request");
+    // refused below. The command is scrubbed so a credential passed as an
+    // argument never lands in the log verbatim.
+    tracing::info!(%session_id, command = %scrub_secrets(&argv), "exec request");
 
     // Parsed, never sniffed. The vocabulary in `minimald_rpc::exec` is the only
     // way to ask for one of the daemon's own forms, so a session command can no
@@ -1561,7 +1564,7 @@ fn exec_span(config: &ChannelConfig, session_id: SessionId, argv: &str) -> traci
     let span = tracing::info_span!(
         "exec",
         %session_id,
-        command = %argv,
+        command = %scrub_secrets(argv),
         trace_id = %ctx.trace_id_hex(),
         span_id = %ctx.span_id_hex(),
         parent_span_id = tracing::field::Empty,
@@ -3553,6 +3556,62 @@ mod tests {
                 "got {:?}",
                 String::from_utf8_lossy(&out.stderr),
             );
+        }
+
+        /// An argv exec carrying a credential-shaped token emits an `exec
+        /// request` line without the token and with the rest of the command
+        /// intact.
+        #[tokio::test]
+        async fn exec_request_scrubs_credentials_from_log() {
+            let server = TestServer::new().await;
+            let mut client = server.connect().await;
+            let session_id = fresh_session(&mut client).await;
+            let session_str = session_id.to_string();
+
+            let capture = crate::test_harness::captured_log();
+
+            let out = client
+                .exec(
+                    &[(MINIMAL_SESSION_ID_ENV, session_str.as_str())],
+                    false,
+                    &ExecRequest::Argv(vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "curl -H 'Authorization: Bearer ghp_FAKETOKEN' https://x/".to_string(),
+                    ])
+                    .encode(),
+                    &[],
+                )
+                .await
+                .expect("an argv request is serviced over the channel");
+
+            // The exec itself may fail (no sandbox), but the log line must
+            // be scrubbed.
+            let logged = capture.contents();
+            assert!(
+                logged.contains("exec request"),
+                "expected an exec request line, got: {logged}"
+            );
+            assert!(
+                !logged.contains("ghp_FAKETOKEN"),
+                "token must be scrubbed from the exec request line, got: {logged}"
+            );
+            assert!(
+                logged.contains("<redacted:len=13>"),
+                "token must be replaced with placeholder, got: {logged}"
+            );
+            // The rest of the command is intact.
+            assert!(
+                logged.contains("curl -H 'Authorization: Bearer"),
+                "non-credential parts of the command must survive, got: {logged}"
+            );
+            assert!(
+                logged.contains("https://x/"),
+                "URL must survive, got: {logged}"
+            );
+
+            // The exec outcome is not the point of this test.
+            let _ = out;
         }
     }
 }

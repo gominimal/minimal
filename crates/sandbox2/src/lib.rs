@@ -2000,7 +2000,7 @@ impl<C: Channel> Sandbox<C> {
         write_resolv_conf(&self.rootfs(), plan.resolver())?;
         // The plan's static hosts entries, written the same way — a name the
         // box's resolver does not know still answers from `/etc/hosts`.
-        write_hosts(&self.rootfs(), plan.hosts())?;
+        write_hosts(&self.rootfs(), plan.hosts(), ipv6_disabled())?;
 
         if let Some(s) = &self.config.cpu_weight
             && booted_with_systemd()
@@ -3059,9 +3059,17 @@ fn write_resolv_conf(rootfs: &Path, resolver: &network::Resolver) -> Result<(), 
 /// rootfs is a hardlink farm over the package cache, and an in-place append
 /// would write through the link into the cached package.
 ///
+/// With `strip_ipv6` set (no IPv6 address in the daemon's namespace, see
+/// [`ipv6_disabled`]), the shipped IPv6 entries are dropped first, even when
+/// the plan carries no entries of its own: a VM guest boots with
+/// `ipv6.disable=1`, but its base image's `/etc/hosts` still maps `localhost`
+/// to `::1`, and a program that binds what the resolver hands back then fails
+/// with `EAFNOSUPPORT`.
+///
 /// Idempotent: `new_container` runs once per task invocation over the same
 /// rootfs, so an entry a previous invocation already wrote is skipped instead
-/// of growing the file a line per exec.
+/// of growing the file a line per exec, and a file that needs no change is
+/// left alone.
 ///
 /// The rewrite is atomic: the body is written to a temp file in the same
 /// directory and renamed over the target, so a concurrent writer or reader
@@ -3069,11 +3077,11 @@ fn write_resolv_conf(rootfs: &Path, resolver: &network::Resolver) -> Result<(), 
 /// serialized across the whole read-merge-rename, and each call stages under
 /// its own temp name, so concurrent calls neither collide on the temp nor
 /// drop an entry another call merged in.
-fn write_hosts(rootfs: &Path, hosts: &[network::HostEntry]) -> Result<(), Error> {
+fn write_hosts(rootfs: &Path, hosts: &[network::HostEntry], strip_ipv6: bool) -> Result<(), Error> {
     static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    if hosts.is_empty() {
+    if hosts.is_empty() && !strip_ipv6 {
         return Ok(());
     }
     // A poisoned lock only means another writer panicked mid-call; the file
@@ -3082,14 +3090,15 @@ fn write_hosts(rootfs: &Path, hosts: &[network::HostEntry]) -> Result<(), Error>
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let etc_hosts = rootfs.join("etc").join("hosts");
-    fs::create_dir_all(rootfs.join("etc"))
-        .map_err(|e| Error::IO("creating /etc", rootfs.join("etc"), e))?;
     let shipped = match fs::read(&etc_hosts) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(Error::IO("reading /etc/hosts", etc_hosts.clone(), e)),
     };
     let mut body = String::from_utf8_lossy(&shipped).into_owned();
+    if strip_ipv6 {
+        body = strip_ipv6_hosts_entries(&body);
+    }
     if !body.is_empty() && !body.ends_with('\n') {
         body.push('\n');
     }
@@ -3099,6 +3108,11 @@ fn write_hosts(rootfs: &Path, hosts: &[network::HostEntry]) -> Result<(), Error>
         }
         body.push_str(&format!("{}\t{}\n", entry.address, entry.name));
     }
+    if body.as_bytes() == shipped.as_slice() {
+        return Ok(());
+    }
+    fs::create_dir_all(rootfs.join("etc"))
+        .map_err(|e| Error::IO("creating /etc", rootfs.join("etc"), e))?;
     let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temp = etc_hosts.with_file_name(format!("hosts.tmp{}.{seq}", std::process::id()));
     let written = fs::write(&temp, &body)
@@ -3111,6 +3125,74 @@ fn write_hosts(rootfs: &Path, hosts: &[network::HostEntry]) -> Result<(), Error>
         let _ = fs::remove_file(&temp);
     }
     written
+}
+
+/// Whether the daemon's own network namespace has no IPv6 address configured.
+/// On Linux this is read from `/proc/net/if_inet6`: the file is absent when the
+/// kernel booted with `ipv6.disable=1`, and empty when IPv6 is compiled in but
+/// turned off by sysctl (`net.ipv6.conf.all.disable_ipv6=1`). An unreadable
+/// `/proc` also counts as disabled on purpose, since stripping only drops the
+/// `::1` lines and keeps the IPv4 `localhost` mapping. On other platforms IPv6
+/// is always assumed available (the caller is Linux-only in practice).
+fn ipv6_disabled() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        match fs::read("/proc/net/if_inet6") {
+            Ok(data) => data.is_empty(),
+            Err(_) => true,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Strips the IPv6 entries from a hosts file `body`: a line whose address
+/// parses as IPv6 (`::1`, `ff02::1`, a zoned `fe80::1%eth0`) is dropped, and
+/// an `ip6-*` alias on an IPv4 line is removed while the line's other names
+/// are kept. Comments, blank lines, and every other IPv4 entry survive.
+fn strip_ipv6_hosts_entries(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        let (data, comment) = match line.find('#') {
+            Some(i) => (&line[..i], Some(&line[i..])),
+            None => (line, None),
+        };
+        let mut fields = data.split_whitespace();
+        let Some(address) = fields.next() else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        let bare = address.split_once('%').map_or(address, |(a, _)| a);
+        if bare.parse::<std::net::Ipv6Addr>().is_ok() {
+            continue;
+        }
+        let names: Vec<&str> = fields.collect();
+        let kept: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|name| !name.to_ascii_lowercase().starts_with("ip6-"))
+            .collect();
+        if kept.len() == names.len() {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if kept.is_empty() {
+            continue;
+        }
+        out.push_str(address);
+        out.push('\t');
+        out.push_str(&kept.join(" "));
+        if let Some(comment) = comment {
+            out.push(' ');
+            out.push_str(comment);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Whether `body` already answers `entry` — a line whose whitespace-separated
@@ -3423,7 +3505,7 @@ mod tests {
         fs::write(&cache, "127.0.0.1\tlocalhost\n").unwrap();
         fs::hard_link(&cache, &etc_hosts).unwrap();
 
-        write_hosts(rootfs, hosts).unwrap();
+        write_hosts(rootfs, hosts, false).unwrap();
         assert_eq!(
             fs::read_to_string(&etc_hosts).unwrap(),
             "127.0.0.1\tlocalhost\n127.0.0.1\thost.min.internal\n",
@@ -3431,7 +3513,7 @@ mod tests {
         );
         // `new_container` runs once per task invocation on the same rootfs, so
         // a second write over an already-present entry must not duplicate it.
-        write_hosts(rootfs, hosts).unwrap();
+        write_hosts(rootfs, hosts, false).unwrap();
         assert_eq!(
             fs::read_to_string(&etc_hosts).unwrap(),
             "127.0.0.1\tlocalhost\n127.0.0.1\thost.min.internal\n",
@@ -3441,6 +3523,91 @@ mod tests {
             fs::read_to_string(&cache).unwrap(),
             "127.0.0.1\tlocalhost\n",
             "the package cache file must be untouched"
+        );
+    }
+
+    /// A VM guest boots with `ipv6.disable=1`, but its base image's
+    /// `/etc/hosts` still ships IPv6 entries. Stripping them keeps resolvers
+    /// from handing out `::1` for `localhost`, which makes programs fail with
+    /// `EAFNOSUPPORT`. IPv4 entries, comments, and blank lines survive.
+    #[test]
+    fn strip_ipv6_hosts_entries_drops_only_ipv6() {
+        let shipped = "\
+127.0.0.1\tlocalhost
+::1\tlocalhost ip6-localhost ip6-loopback
+ff02::1\tip6-allnodes
+ff02::2\tip6-allrouters
+# a comment
+
+127.0.1.1\thostname
+";
+        let stripped = strip_ipv6_hosts_entries(shipped);
+        assert_eq!(
+            stripped, "127.0.0.1\tlocalhost\n# a comment\n\n127.0.1.1\thostname\n",
+            "IPv6 entries removed, IPv4 entries, blank lines and comments kept"
+        );
+    }
+
+    /// A bare `::1 localhost` line carries no `ip6-*` alias, so only parsing
+    /// the address as IPv6 catches it; zoned link-local addresses go too.
+    #[test]
+    fn strip_ipv6_hosts_entries_drops_bare_v6_addresses() {
+        let shipped = "127.0.0.1 localhost\n::1 localhost\nfe80::1%eth0 link\n";
+        assert_eq!(
+            strip_ipv6_hosts_entries(shipped),
+            "127.0.0.1 localhost\n",
+            "every IPv6-addressed line is dropped"
+        );
+    }
+
+    /// An `ip6-*` alias on an IPv4 line goes, but the line's other names stay:
+    /// dropping the whole line would lose the IPv4 `localhost` mapping.
+    #[test]
+    fn strip_ipv6_hosts_entries_keeps_ipv4_names_beside_ip6_aliases() {
+        let shipped = "127.0.0.1 localhost ip6-localhost # loopback\n127.0.0.2 ip6-only\n";
+        assert_eq!(
+            strip_ipv6_hosts_entries(shipped),
+            "127.0.0.1\tlocalhost # loopback\n",
+            "only the ip6-* alias is removed; a line left without names goes"
+        );
+    }
+
+    /// A plan with no entries of its own still has the shipped IPv6 entries
+    /// stripped, and an unchanged file is not rewritten.
+    #[test]
+    fn write_hosts_strips_ipv6_without_plan_entries() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rootfs = tmp.path();
+        let etc_hosts = rootfs.join("etc").join("hosts");
+        fs::create_dir_all(rootfs.join("etc")).unwrap();
+        let cache = tmp.path().join("package-etc-hosts");
+        fs::write(&cache, "127.0.0.1\tlocalhost\n::1\tlocalhost\n").unwrap();
+        fs::hard_link(&cache, &etc_hosts).unwrap();
+
+        write_hosts(rootfs, &[], false).unwrap();
+        assert_eq!(
+            fs::read_to_string(&etc_hosts).unwrap(),
+            "127.0.0.1\tlocalhost\n::1\tlocalhost\n",
+            "with IPv6 available, an empty plan leaves the file alone"
+        );
+
+        write_hosts(rootfs, &[], true).unwrap();
+        assert_eq!(
+            fs::read_to_string(&etc_hosts).unwrap(),
+            "127.0.0.1\tlocalhost\n",
+            "with no IPv6 stack, the shipped ::1 entry is stripped"
+        );
+        assert_eq!(
+            fs::read_to_string(&cache).unwrap(),
+            "127.0.0.1\tlocalhost\n::1\tlocalhost\n",
+            "the package cache file must be untouched"
+        );
+
+        let empty = tempfile::TempDir::new().unwrap();
+        write_hosts(empty.path(), &[], true).unwrap();
+        assert!(
+            !empty.path().join("etc").join("hosts").exists(),
+            "an absent file with nothing to write stays absent"
         );
     }
 
@@ -3462,7 +3629,7 @@ mod tests {
                         name: format!("box{i}.min.internal"),
                         address: std::net::Ipv4Addr::new(10, 0, 0, i),
                     };
-                    write_hosts(&rootfs, &[entry])
+                    write_hosts(&rootfs, &[entry], false)
                 })
             })
             .collect();

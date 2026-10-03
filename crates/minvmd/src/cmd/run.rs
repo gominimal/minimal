@@ -444,7 +444,20 @@ fn run_foreground() -> Result<()> {
     // force. Every admit under the interim is rate-limited-warned, so a
     // diagnostic bundle's daemon log tail shows a host running it.
     // `UNREGISTERED_SOURCE_PHASE` (egress_gate) is the constant T66 flips.
-    let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
+    //
+    // The proxy's attachment table (NET-133): one attachment per box, held
+    // by this process for the VM's life. The registry is its one writer —
+    // every box row it publishes is an attachment issued ahead of the row,
+    // so the proxy holds the box before its first connection could arrive,
+    // and every retirement takes the attachment with it — and the stand-in
+    // acceptor below is handed the same table, so a delivered connection is
+    // attributed only to a live box it holds an attachment for. Issued and
+    // withdrawn for every boot, whatever binds at the proxy's socket: the
+    // table and its one line per attachment are the host's own state, ready
+    // for the acceptor that reads them.
+    let proxy_attachments = crate::bep_attach::Attachments::new();
+    let boxes = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET)
+        .feeding_proxy_attachments(proxy_attachments.clone());
     // The node's own ports are resolved once before the VM boots — the
     // operator's override (`MINVMD_NODE_*_PORT` in this supervisor's env) or
     // the default-first probe, so a VM sharing a host with a native daemon
@@ -553,6 +566,7 @@ fn run_foreground() -> Result<()> {
                         let _ = start_tx.send(crate::net::bep_stub::StubStart {
                             token,
                             daemon_pid: std::process::id(),
+                            attachments: proxy_attachments.clone(),
                         });
                         tracing::info!(
                             sock = %proxy_sock.display(),
