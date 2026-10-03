@@ -3828,6 +3828,115 @@ pub(crate) mod tests {
         );
     }
 
+    /// NET-134's refusal half, counted: the leg a native host runs alone,
+    /// with no minvmd gate beside it. An allow-all box that declared no
+    /// lane — the absent egress section's default, the posture that would
+    /// otherwise reach anything — sends TCP to the proxy's listener port,
+    /// and the frame never reaches the switch: it is the relay's own drop
+    /// under the lane's rule, named the way the host-side gate names it
+    /// (`egress-uncredentialed-proxy-destination`), and counted — one
+    /// rate-limited warn line per box per rule per interval (NET-062,
+    /// R2.7), so a probe's retransmits say one line, naming the box, the
+    /// direction, the destination the frame named and its protocol.
+    #[tokio::test]
+    async fn a_laneless_box_frame_to_the_proxy_listener_is_dropped_and_counted() {
+        let capture = crate::test_harness::captured_log();
+        let proxy = SwitchSubnet::default().box_egress_proxy_address();
+        let listener_port = egress::PROXY_LISTENER_PORT;
+        let allow_all = sessions::SessionPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let mut harness = spawn_test_relay(&allow_all);
+
+        // The frame a lane-less box would send to reach the proxy's
+        // acceptor: TCP to the listener's own port. The ARP sentinel behind
+        // it is the one thing that comes through.
+        let to_listener = egress_tcp_frame(LEASE, proxy, listener_port);
+        let sentinel = arp_frame(LEASE);
+        harness.box_end.write_all(&to_listener).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            first, sentinel,
+            "a lane-less box's frame to the proxy's listener never reaches the switch"
+        );
+
+        // The refusal is counted — one line, under the lane's own rule,
+        // naming the box, the direction, the listener's own (address, port)
+        // the frame named, and its protocol. On a VM host this is the same
+        // line the guest-side relay writes, so the host gate beyond the
+        // switch has nothing of the box's to log: the frame is refused once,
+        // at the first gate it meets.
+        let logged = capture.contents();
+        assert_eq!(
+            logged
+                .matches("rule_matched=\"egress-uncredentialed-proxy-destination\"")
+                .count(),
+            1,
+            "the lane-less listener drop says one line: {logged}"
+        );
+        for expected in [
+            "network policy violation",
+            "session_id=\"100.64.0.9\"",
+            "direction=egress",
+            &format!("remote_addr={proxy}:{listener_port}"),
+            "proto=tcp",
+        ] {
+            assert!(
+                logged.contains(expected),
+                "missing {expected:?} in: {logged}"
+            );
+        }
+
+        // And the drop is silent, not a reset (NET-062): nothing is
+        // written back toward the box.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        set_nonblocking(harness.box_end.as_raw_fd()).unwrap();
+        let mut probe = [0u8; 1];
+        let read = harness.box_end.read(&mut probe);
+        assert!(
+            matches!(read, Err(ref e) if e.kind() == io::ErrorKind::WouldBlock),
+            "a refused frame is dropped, not reset: got {read:?}"
+        );
+    }
+
+    /// The same frame from a box that declared the upstream is admitted:
+    /// the declaration is the one thing that opens the listener, and it
+    /// opens on this leg — the relay forwards the frame verbatim toward
+    /// the switch, where a VM host's gate decides it in turn, and nothing
+    /// is logged against it.
+    #[tokio::test]
+    async fn a_laned_box_frame_to_the_proxy_listener_passes() {
+        let capture = crate::test_harness::captured_log();
+        let proxy = SwitchSubnet::default().box_egress_proxy_address();
+        let laned = sessions::SessionPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: Some(sessions::CredentialedUpstream {}),
+        };
+        let mut harness = spawn_test_relay(&laned);
+
+        let to_listener = egress_tcp_frame(LEASE, proxy, egress::PROXY_LISTENER_PORT);
+        harness.box_end.write_all(&to_listener).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the lane's frame is forwarded")
+            .expect("the switch side stays open");
+        assert_eq!(
+            first, to_listener,
+            "a laned box's frame to the proxy's listener is forwarded verbatim"
+        );
+        assert!(
+            !capture.contents().contains("network policy violation"),
+            "the lane's own frame is not a violation"
+        );
+    }
+
     /// NET-062's warning: every drop is logged once per box per rule per
     /// minute — a flood of identical drops says one line, a different rule is
     /// still heard — and the line carries the box, the direction, the
