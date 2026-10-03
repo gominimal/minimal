@@ -1884,7 +1884,8 @@ mod kani_proofs {
     /// neither arm can silently become unreachable (the rcache harness
     /// pattern). The declared half is restated over the same summary and
     /// rules — the lease first (NET-084: the source is the lease), then the
-    /// resolver carve-out (NET-079), then the three declared dimensions
+    /// resolver carve-out (NET-079), then the credentialed lane's proxy
+    /// address (NET-134), then the three declared dimensions
     /// conjunctively — so a verdict that checks in a different order, or
     /// that reads `None` as deny-all, fails here.
     ///
@@ -1906,9 +1907,12 @@ mod kani_proofs {
         //
         // Symbolic: the fragment offset, the source, the protocol, the
         // destination and the L4 destination port — every value the
-        // decision reads — and the lease, beside the rules, that the source
+        // decision reads — the lease, beside the rules, that the source
         // is checked against (NET-084's property is over every frame and
-        // every lease).
+        // every lease), and the credentialed lane the rules may carry,
+        // so the proof's oracle holds over a lane-declaring box and a
+        // lane-less one alike (NET-134 admits the proxy's address for the
+        // first alone).
         //
         // Pinned to constants: the EtherType (IPv4, the one family the
         // rules decide; the families decided without rules each have their
@@ -1953,7 +1957,16 @@ mod kani_proofs {
 
         let resolver: [u8; 4] = kani::any();
         let lease: [u8; 4] = kani::any();
+        // The lane, spelled the way the compile produces it: a symbolic
+        // address a boolean chooses to declare or not, so the proof covers
+        // a lane-declaring box and a lane-less one alike (NET-134).
+        let lane_addr: [u8; 4] = kani::any();
+        let laned = kani::any::<bool>();
         let rules = EgressRules::new(two_protocols(), two_cidrs(), two_cidrs(), resolver, lease);
+        let rules = match laned {
+            true => rules.with_credentialed_upstream(lane_addr),
+            false => rules,
+        };
 
         let admitted = matches!(verdict(&summary, &rules), FrameVerdict::Admit);
 
@@ -1963,6 +1976,9 @@ mod kani_proofs {
                 let resolver = proto == IPPROTO_UDP
                     && dst == rules.resolver()
                     && summary.destination_port() == DNS_PORT;
+                let lane = rules
+                    .credentialed_upstream
+                    .is_some_and(|proxy| dst == proxy);
                 let protocols = rules
                     .allow_protocols
                     .as_ref()
@@ -1975,7 +1991,7 @@ mod kani_proofs {
                     .allow_subnets
                     .as_ref()
                     .is_none_or(|list| list.iter().any(|cidr| cidr.contains(dst)));
-                lease && (resolver || (protocols && !denied && allowed))
+                lease && (resolver || lane || (protocols && !denied && allowed))
             }
             // No readable IPv4 header is never a declared frame.
             _ => false,
