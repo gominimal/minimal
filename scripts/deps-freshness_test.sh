@@ -138,6 +138,8 @@ expect 0 "report shows pinned, latest, and status per pin" \
     '^alpine rootfs \(pkgs\) +3\.24\.1 +3\.24\.2 +behind$' \
     '^kani +0\.68\.0 +0\.68\.0 +current$' \
     '^protoc \(cross image\) +25\.1 +36\.2 +behind$' \
+    '^rust toolchain +1\.97\.0 +1\.99\.0 +behind$' \
+    '^shellcheck +0\.11\.0 +0\.11\.0 +current$' \
     '^vale ai-tells +1\.31\.0 +1\.37\.0 +behind$' \
     '^ok +libkrun vendored = pkgs +1\.19\.4$' \
     -- run
