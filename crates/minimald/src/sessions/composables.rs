@@ -184,34 +184,29 @@ fn attr_entries(v: &graph::AttrValue) -> Vec<&graph::AttrValue> {
 /// Outcome of resolving the client's project mfile + graph at
 /// `CreateSession` time.
 ///
-/// Three variants make the reachable states explicit: no mfile, a
-/// parsed mfile whose graph didn't resolve, or both. The
-/// unreachable `(None, Some)` shape is impossible by
-/// construction — hence an enum rather than a tuple.
+/// Two variants make the reachable states explicit: no mfile, or
+/// both mfile and graph. The unreachable `(None, Some)` shape is
+/// impossible by construction — hence an enum rather than a tuple.
 ///
-/// [`graph::Graph`] is boxed to keep the enum's size closer to the
-/// smaller variants — `graph::Graph` runs into the several-hundred-
-/// bytes range.
+/// [`mctx::Context`] and [`graph::Graph`] are boxed to keep the
+/// enum's size closer to the smaller variant — both run into the
+/// several-hundred-bytes range.
 pub(crate) enum ProjectResolution {
     /// No project `minimal.toml` visible (missing on disk, or on
     /// DM1 the daemon can't reach the host path). Project +
     /// package contributions are empty.
     NoMFile,
-    /// Mfile parsed but graph resolution failed (unreachable
-    /// upstream, stale layer cache, malformed nickel). Only
-    /// project-scoped contributions can land; package contributions
-    /// are empty.
-    MFileOnly(mctx::Context),
     /// Mfile parsed and graph resolved. Both project- and
     /// package-scoped contributions can land.
-    Full(mctx::Context, Box<graph::Graph>),
+    Full(Box<mctx::Context>, Box<graph::Graph>),
 }
 
 /// Parse the client's project `minimal.toml` and resolve its graph.
 /// A missing mfile yields [`ProjectResolution::NoMFile`]; a
-/// graph-resolve failure yields [`ProjectResolution::MFileOnly`]
-/// (transient failures shouldn't sink the whole compose). Other
-/// mfile errors are returned as `InvalidInput`.
+/// graph-resolve failure is returned as `InvalidInput` so the
+/// activation fails loudly rather than silently dropping every
+/// package contribution. Other mfile errors are returned as
+/// `InvalidInput`.
 pub(crate) fn resolve_project_ctx_and_graph(
     daemon_ctx: &Arc<mctx::DaemonContext>,
     project_path: &DaemonAbsPath,
@@ -250,25 +245,11 @@ pub(crate) fn resolve_project_ctx_and_graph(
     };
     let mut ctx = mctx::Context::from_daemon(Arc::clone(daemon_ctx), mfile);
     match ctx.graph_from_all_packages() {
-        Ok(graph) => Ok(ProjectResolution::Full(ctx, Box::new(graph))),
-        Err(e) => {
-            // `warn!` rather than `debug!`: when this fires, every
-            // package the project (or its stack) declared silently
-            // vanishes from the composition — no `env_state_wiring`
-            // vars, no `env_dir_mappings` / `env_file_mappings`
-            // patches reach the client. That's not something an
-            // operator wanting to know why claude-code's `~/.claude`
-            // isn't being prompted for can debug from a default-level
-            // daemon log; put it at `warn` so it lands in the
-            // ordinary log without a level bump.
-            tracing::warn!(
-                project_path = %project_path,
-                error = %e,
-                "graph resolution failed at CreateSession; \
-                 package contributions will be empty",
-            );
-            Ok(ProjectResolution::MFileOnly(ctx))
-        }
+        Ok(graph) => Ok(ProjectResolution::Full(Box::new(ctx), Box::new(graph))),
+        Err(e) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("resolving the package graph for {project_path}: {e}"),
+        )),
     }
 }
 
@@ -339,31 +320,20 @@ pub(crate) fn build_composables(
     ),
     std::io::Error,
 > {
-    // The project composable only needs the mfile; a missing graph
-    // doesn't stop it. The package composables need both the mfile
-    // (for the project's own package list) and the graph (for
-    // closure resolution).
+    // The project composable needs the mfile; the package
+    // composables need both the mfile (for the project's own
+    // package list) and the graph (for closure resolution).
     let (ctx, graph) = match resolution {
         ProjectResolution::NoMFile => return Ok((None, Vec::new())),
-        ProjectResolution::MFileOnly(ctx) => (ctx, None),
-        ProjectResolution::Full(ctx, graph) => (ctx, Some(graph.as_ref())),
+        ProjectResolution::Full(ctx, graph) => (ctx.as_ref(), graph.as_ref()),
     };
     let mfile = ctx.minimal_file();
 
     // The graph-level `Stack` this project references by name, if
-    // the mfile names one and the graph is available. Contributes
-    // its own `build_packages`, `runtime_packages`, and
-    // `build_env_vars` alongside the mfile-side session/stack
-    // material.
-    //
-    // `MFileOnly` (graph resolve failed) skips the graph-Stack
-    // lookup; the project still gets its explicit `[session]` and
-    // mfile `[stack]` extras, just not what the graph would have
-    // contributed on top.
-    let graph_stack = mfile
-        .stack
-        .as_ref()
-        .and_then(|s| graph.and_then(|g| g.stack(&s.name)));
+    // the mfile names one. Contributes its own `build_packages`,
+    // `runtime_packages`, and `build_env_vars` alongside the
+    // mfile-side session/stack material.
+    let graph_stack = mfile.stack.as_ref().and_then(|s| graph.stack(&s.name));
 
     // The complete set of packages this project asks to be in every
     // session it activates: explicit `[session] packages` unioned
@@ -446,23 +416,6 @@ pub(crate) fn build_composables(
         })
     };
 
-    let Some(graph) = graph else {
-        // Same silent-drop rationale as the two `warn!`s in
-        // `resolve_project_ctx_and_graph` and `as_bsrs` below: if
-        // `top_level_names` was non-empty (the mfile really did
-        // declare packages) but the graph was missing, the operator
-        // has no way to tell why claude-code isn't prompting.
-        if !top_level_names.is_empty() {
-            tracing::warn!(
-                project_path = %project_path,
-                packages = ?top_level_names,
-                "project declared packages but the graph is unavailable; \
-                 package composables will be empty (no env_state_wiring vars, \
-                 no env_dir/file_mappings patches)",
-            );
-        }
-        return Ok((project_composable, Vec::new()));
-    };
     tracing::info!(
         project_path = %project_path,
         top_level_names = ?top_level_names,
