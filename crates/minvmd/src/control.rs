@@ -24,11 +24,18 @@
 //! predating this module) still activates, handed no addresses, under the
 //! egress gate's announced interim.
 //!
-//! The v1 posture, stated: the trust is the socket itself — the same-uid
-//! 0600 the bind enforces, with no peer-credential check on a connection —
-//! and requests are served serially, one connection at a time, each read
-//! bounded by a 30-second timeout. That is what v1 ships, not a design
-//! endpoint.
+//! The v1 posture, stated: the trust is the uid. The bind tightens the
+//! provider dir to 0700 when the daemon owns it, refuses one it does not
+//! own, and sets the socket to 0600; every connection's peer uid is then
+//! checked against the daemon's own (`SO_PEERCRED` on Linux, `getpeereid`
+//! on macOS) and a foreign uid is dropped unanswered. Within the
+//! single-operator host profile any same-uid writer is accepted: a uid
+//! check cannot tell the activating client's registrations apart from
+//! another process running as the same user. If box rows ever have to
+//! come only from the host-side creator, a per-boot token minted by that
+//! creator is the pattern to use; this socket does not build one. Requests
+//! are served serially, one connection at a time, each read bounded by a
+//! 30-second timeout. That is what v1 ships, not a design endpoint.
 //!
 //! The interim is also where a box whose row is gone runs — never
 //! registered, or withdrawn at destroy — and putting the per-box default
@@ -86,6 +93,7 @@ pub fn spawn(sock_path: PathBuf, boxes: BoxRegistry) -> std::io::Result<JoinHand
     crate::sock::check_uds_path_len(&sock_path)?;
     crate::sock::prepare_socket_dir(&sock_path)?;
     if let Some(parent) = sock_path.parent() {
+        crate::sock::restrict_owned_dir(parent)?;
         crate::sock::verify_provider_dir_ownership(parent)?;
     }
     crate::sock::remove_stale_socket(&sock_path)?;
@@ -167,7 +175,13 @@ fn serve_request(
 /// The refusal is logged once per distinct foreign uid (per process
 /// lifetime) so a persistent misconfiguration does not flood the log.
 fn check_peer_credentials(stream: &UnixStream) -> std::io::Result<()> {
-    let peer_uid = peer_uid(stream)?;
+    check_peer_uid(peer_uid(stream)?)
+}
+
+/// Admit `peer_uid` only when it is the daemon's own effective uid; the
+/// decision half of [`check_peer_credentials`], apart from the socket.
+fn check_peer_uid(peer_uid: u32) -> std::io::Result<()> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
     let my_uid = unsafe { libc::geteuid() };
     if peer_uid == my_uid {
         return Ok(());
@@ -221,9 +235,11 @@ fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
 #[cfg(not(target_os = "linux"))]
 fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
     let mut euid: libc::uid_t = 0;
+    let mut egid: libc::gid_t = 0;
     // SAFETY: getpeereid reads the peer's effective uid and gid from the
-    // kernel; the kernel fills `euid` and `egid` on success.
-    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut euid, std::ptr::null_mut()) };
+    // kernel and writes both through the pointers unconditionally — a null
+    // gid pointer faults on macOS — so both point at live locals.
+    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut euid, &mut egid) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -428,8 +444,6 @@ mod tests {
     fn spawn_server(
         dir: &std::path::Path,
     ) -> std::io::Result<(PathBuf, JoinHandle<()>, BoxRegistry)> {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         let sock_path = dir.join(CONTROL_SOCK_FILE);
         let boxes = BoxRegistry::new(SUBNET);
         let handle = spawn(sock_path.clone(), boxes.clone())?;
@@ -925,50 +939,47 @@ mod tests {
         );
     }
 
-    /// The peer-credential check admits a connection from the same uid.
+    /// A connection from the daemon's own uid passes the peer-credential
+    /// check, read off a real socket (`SO_PEERCRED` / `getpeereid`).
     #[test]
-    fn peer_credential_check_admits_own_uid() {
-        let path = "/tmp/minvmd-test-peer-cred.sock";
-        let _ = std::fs::remove_file(path);
-        let listener = UnixListener::bind(path).unwrap();
-        let client = UnixStream::connect(path).unwrap();
-        let (_server, _) = listener.accept().unwrap();
-        check_peer_credentials(&client).expect("own uid is admitted");
-        let _ = std::fs::remove_file(path);
+    fn control_socket_admits_own_uid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("peer.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let _client = UnixStream::connect(&path).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        assert_eq!(peer_uid(&server).unwrap(), unsafe { libc::geteuid() });
+        check_peer_credentials(&server).expect("own uid is admitted");
     }
 
-    /// The peer-credential check refuses a connection from a different uid
-    /// when run as root (the only uid that can impersonate another).
+    /// A peer uid other than the daemon's is refused. The decision is
+    /// tested apart from the socket so it runs without root, which is the
+    /// only way to connect under a second uid.
     #[test]
-    fn peer_credential_check_refuses_foreign_uid() {
-        // This test can only verify the refusal path when run as root,
-        // because only root can change uid. When not root, the check
-        // always passes (same uid), which is the normal case.
-        if unsafe { libc::geteuid() } != 0 {
-            eprintln!("peer_credential_check_refuses_foreign_uid: not root, skipping");
-            return;
-        }
-        let path = "/tmp/minvmd-test-peer-cred-foreign.sock";
-        let _ = std::fs::remove_file(path);
-        let listener = UnixListener::bind(path).unwrap();
-        // Fork a child that drops to nobody and connects.
-        // SAFETY: fork creates a child process; the parent waits.
-        let pid = unsafe { libc::fork() };
-        if pid == 0 {
-            // Child: drop to nobody, connect, and exit.
-            unsafe {
-                libc::setuid(65534); // nobody
-            }
-            let _client = UnixStream::connect(path);
-            unsafe { libc::_exit(0) };
-        }
-        // Parent: accept and check.
-        let (stream, _) = listener.accept().unwrap();
-        let err = check_peer_credentials(&stream).unwrap_err();
+    fn control_socket_refuses_foreign_uid() {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let foreign = unsafe { libc::geteuid() }.wrapping_add(1);
+        let err = check_peer_uid(foreign).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-        // Reap the child.
-        let mut status = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
-        let _ = std::fs::remove_file(path);
+        // A repeat refusal (logged at debug, not warn) still refuses.
+        let err = check_peer_uid(foreign).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    /// The bind tightens a provider dir the daemon owns but `StateDir::new`
+    /// created under the umask (0755), rather than refusing every existing
+    /// install, and then serves on it.
+    #[test]
+    fn bind_tightens_an_owned_provider_dir_to_0700() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("local-minvmd0");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (sock_path, _handle, _boxes) = spawn_server(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        assert!(TestStream::connect(&sock_path).is_ok());
     }
 }
