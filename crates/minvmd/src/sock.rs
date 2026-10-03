@@ -127,8 +127,49 @@ pub fn enforce_socket_permissions(socket_path: &std::path::Path) -> io::Result<(
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
 }
 
+/// Verify that `dir` is owned by the calling process's uid and has mode
+/// 0700. Refuse to start otherwise, with an error that names the directory
+/// and its actual owner and mode.
+pub fn verify_provider_dir_ownership(dir: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let meta = std::fs::metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", dir.display()),
+        ));
+    }
+
+    let my_uid = unsafe { libc::geteuid() };
+    if meta.uid() != my_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "provider directory {} is owned by uid {}; expected uid {my_uid}",
+                dir.display(),
+                meta.uid(),
+            ),
+        ));
+    }
+
+    let mode = meta.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "provider directory {} has mode {mode:04o}; expected 0700",
+                dir.display(),
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::DirBuilderExt;
     use std::sync::Mutex;
 
     use super::*;
@@ -229,5 +270,35 @@ mod tests {
         let err = remove_stale_socket(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert!(path.exists(), "non-socket must be left in place");
+    }
+
+    #[test]
+    fn verify_provider_dir_ownership_passes_owned_0700() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("provider");
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        verify_provider_dir_ownership(&dir).unwrap();
+    }
+
+    #[test]
+    fn verify_provider_dir_ownership_rejects_wrong_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("provider");
+        std::fs::DirBuilder::new().mode(0o755).create(&dir).unwrap();
+        let err = verify_provider_dir_ownership(&dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("0755"), "{err}");
+        assert!(err.to_string().contains("expected 0700"), "{err}");
+    }
+
+    #[test]
+    fn verify_provider_dir_ownership_rejects_non_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("regular");
+        std::fs::File::create(&path).unwrap();
+        let err = verify_provider_dir_ownership(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotADirectory);
     }
 }
