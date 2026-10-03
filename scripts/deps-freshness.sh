@@ -137,11 +137,11 @@ latest() {
             gh api "repos/$repo/releases/latest" --jq .tag_name 2>/dev/null ;;
         kernel)
             series="$(printf '%s' "$2" | cut -d. -f1-2 | sed 's/\./\\./g')"
-            curl -fsSL https://www.kernel.org/releases.json 2>/dev/null \
+            curl -fsSL --max-time 30 https://www.kernel.org/releases.json 2>/dev/null \
                 | grep -oE "\"version\": *\"$series\\.[0-9]+\"" \
                 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 ;;
         alpine)
-            curl -fsSL https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml 2>/dev/null \
+            curl -fsSL --max-time 30 https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/latest-releases.yaml 2>/dev/null \
                 | sed -n 's/^ *version: *//p' | head -1 ;;
         pkgs-main)
             gh api "repos/$pkgs_repo/compare/$2...main" --jq .ahead_by 2>/dev/null ;;

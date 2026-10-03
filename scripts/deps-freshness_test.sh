@@ -50,6 +50,8 @@ EOF
 cat >"$tmp/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 url="${*: -1}"
+# A stalled upstream must time out into `unknown`, so every call is bounded.
+case " $* " in *" --max-time "*) ;; *) echo "curl stub: unbounded call $*" >&2; exit 2 ;; esac
 case "$url" in
     *kernel.org/releases.json)
         printf '{"releases":[\n{"version": "6.18.3"},\n{"version": "6.12.111"},\n{"version": "6.12.9"}\n]}\n' ;;
