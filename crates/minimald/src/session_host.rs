@@ -52,6 +52,31 @@ const CHORD_FLUSH_IDLE: std::time::Duration = std::time::Duration::from_millis(5
 /// [`SHELL_EXIT_PROMPT`].
 pub(crate) const SHELL_EXIT_NO_CHANGES: &str = "No files changed since activation.";
 
+/// Header of the dialog a runtime port-publish request decided `ask` renders
+/// over the channel (NET-045), asking the attached human whether the box may
+/// publish the port. Exposed so tests can await its appearance in the
+/// channel output before answering, for the same purpose as
+/// [`SHELL_EXIT_PROMPT`]. The lead-in line above it names the box and the
+/// port.
+pub(crate) const ASK_PROMPT: &str = "Allow the publish to the host?";
+
+/// What the attached human answered to the ask dialog (NET-045): the box's
+/// `dynamic_ingress` is `ask`, so the request belongs to whoever is bound to
+/// this host's channel.
+///
+/// Every way the dialog can end short of an explicit allow maps to
+/// [`Refused`](Self::Refused) — a picked deny, a cancel, a client that went
+/// away mid-prompt: an unanswered ask is a refusal, never a publish nobody
+/// confirmed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AskAnswer {
+    /// The human picked allow: the request proceeds to the publish it came
+    /// for.
+    Allowed,
+    /// The human picked deny, cancelled, or left: the request fails closed.
+    Refused,
+}
+
 /// How many changed-file rows the shell-exit prompt lists before folding the
 /// rest into an "and N more" line, keeping the prompt readable on a 24-row
 /// terminal.
@@ -164,6 +189,14 @@ fn log_session_contents(
 
 enum BindingMsg {
     Stdin(Vec<u8>),
+    /// Ask the attached human whether the box may publish `port` at runtime
+    /// (NET-045): the box's `dynamic_ingress` is `ask`, so this binding
+    /// renders the exit prompt's dialog on the bound client and replies with
+    /// the answer it brought. See [`Binding::ask_prompt`].
+    AskExpose {
+        port: u16,
+        reply: oneshot::Sender<AskAnswer>,
+    },
     /// The session was renamed while this binding is attached, so the archive
     /// the shell-exit prompt's save-then-delete lane writes carries the new
     /// name rather than the one cloned in at [`Binding::spawn`].
@@ -486,7 +519,34 @@ impl Binding {
         // Reading from the remote stops once it sends EOF;
         // the loop lives on to keep forwarding stdout.
         let mut remote_open = true;
+        // The ask the next iteration's head renders (NET-045), stashed by the
+        // select arm below because the dialog needs the channel halves the
+        // select's own futures are borrowing. One at a time: a second ask
+        // queues in this binding's mailbox and takes its turn.
+        let mut pending_ask: Option<(u16, oneshot::Sender<AskAnswer>)> = None;
         let exit_reason = loop {
+            if let Some((port, reply)) = pending_ask.take() {
+                tracing::info!(
+                    port,
+                    "asking the attached client to allow a runtime port publish"
+                );
+                // Raced against the shed: a client that stopped reading is
+                // not a client to wait on, and the host has already
+                // discarded this binding — so the ask fails closed here and
+                // the next iteration's shed arm closes the channel.
+                let answer = tokio::select! {
+                    answer = Self::ask_prompt(
+                        &self.name,
+                        port,
+                        rs.make_reader(),
+                        &mut w,
+                    ) => answer,
+                    () = self.shed.cancelled() => AskAnswer::Refused,
+                };
+                // The asker going away before the answer is not an error to
+                // relay: the reply's fate was always the asker's.
+                let _ = reply.send(answer);
+            }
             tokio::select! {
                 // Remote (ssh channel) => session stdin.
                 res = rs.wait(), if remote_open => match res {
@@ -557,6 +617,14 @@ impl Binding {
                                 _ = w.write_all(&b) => {},
                                 () = self.shed.cancelled() => break MainloopExitReason::Shed,
                             }
+                        },
+                        BindingMsg::AskExpose { port, reply } => {
+                            // Stashed rather than rendered here: the select's
+                            // own arms borrow the channel halves (`rs.wait()`
+                            // among them), and the dialog needs both — so the
+                            // ask suspends the relay for the next iteration's
+                            // head, where no arm's future is alive.
+                            pending_ask = Some((port, reply));
                         },
                         BindingMsg::Rename(name) => self.name = name,
                         BindingMsg::TeardownDueToProcessExit { cause, unwind_codes } => {
@@ -718,6 +786,39 @@ impl Binding {
             )
             .await;
         delta.archive_changed(files, dest.to_path_buf()).await
+    }
+
+    /// The ask a runtime port-publish request decided `ask` renders to the
+    /// attached human (NET-045): the exit prompt's own dialog, over the same
+    /// channel halves, offering deny first so that a reflexive Enter — or any
+    /// way the dialog can end without an explicit choice — fails the request
+    /// closed. An associated fn taking the facts piecewise, exactly like
+    /// [`Self::shell_exit_prompt`], because [`Self::run`] holds the channel
+    /// halves as locals.
+    async fn ask_prompt<R, W>(name: &str, port: u16, mut r: R, mut w: W) -> AskAnswer
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        // `\r\n`: the remote terminal is in raw mode, so a bare newline
+        // stair-steps off the right margin.
+        let _ = w
+            .write_all(format!("\r\n{name} asks to publish port {port}.\r\n").as_bytes())
+            .await;
+        let select = async_dialog::Select::new()
+            .with_prompt(ASK_PROMPT)
+            .items(["Deny", "Allow"])
+            // Deny stands highlighted: the answer the box's own posture
+            // would have given, so nothing publishes because someone held
+            // Enter.
+            .default(0);
+        match select.interact(&mut r, &mut w).await {
+            Ok(async_dialog::Selection::At(1)) => AskAnswer::Allowed,
+            // An explicit deny, a cancel (Ctrl-C, `q`, Escape), an EOF from a
+            // client that left mid-prompt, or a render/read failure: all of
+            // them are refusals — an unanswered ask never publishes.
+            _ => AskAnswer::Refused,
+        }
     }
 
     /// The shell-exit prompt, run after the session process ends: leads with
@@ -1177,6 +1278,16 @@ enum Message {
     /// Answered straight off the parser — no PTY resize, no I/O relay.
     GetScreen(oneshot::Sender<minimald_rpc::ScreenSnapshot>),
 
+    /// Ask the attached human whether the box may publish `port` at runtime
+    /// (NET-045): the box's `dynamic_ingress` is `ask`, so the bound client
+    /// decides. Answered with the answer the human gave, or `None` when
+    /// nobody is attached — a box outlives its client, and an unanswered ask
+    /// is a refusal, never a publish.
+    AskExpose {
+        port: u16,
+        reply: oneshot::Sender<Option<AskAnswer>>,
+    },
+
     SetTitleCallback(String),
     VisualBellCallback,
     AudibleBellCallback,
@@ -1549,6 +1660,32 @@ impl HostHandle {
         }
         recv.await
             .unwrap_or(minimald_rpc::SessionDeltaResponse::Unavailable)
+    }
+
+    /// Asks the attached human whether the box may publish `port` at runtime
+    /// (NET-045), and answers with what they said: the bound client renders
+    /// the exit prompt's own dialog and picks. `None` when nobody is
+    /// attached — no binding, a binding that cannot take the ask, or a host
+    /// that went away before answering — which is the caller's fail-closed
+    /// case, not an error to report: the typed refusal the request ends with
+    /// says nobody is attached to answer.
+    ///
+    /// Unbounded by design: the human's answer is the only bound an ask has,
+    /// so callers that must not park on it await this off the actor the
+    /// request belongs to (see how [`crate::session`] routes the ask).
+    pub(crate) async fn ask_expose(&self, port: u16) -> Option<AskAnswer> {
+        let (send, recv) = oneshot::channel();
+        if self
+            .sender
+            .send(Message::AskExpose { port, reply: send })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        // A dropped answer means the host tore its binding down mid-prompt:
+        // nobody is attached to answer any more.
+        recv.await.ok().flatten()
     }
 }
 
@@ -4503,6 +4640,52 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     Message::GetScreen(s) => {
                         let _ = s.send(self.screen_snapshot());
                     }
+                    // NET-045: forward the ask to the attached client, whose
+                    // binding renders the exit prompt's own dialog. Nobody
+                    // attached — no binding, or one whose mailbox is wedged —
+                    // answers `None` so the session refuses with the typed
+                    // nobody-is-attached error rather than hanging on a
+                    // dialog nobody can see.
+                    Message::AskExpose { port, reply } => match self.remote.as_ref() {
+                        None => {
+                            let _ = reply.send(None);
+                        }
+                        Some((tx, ..)) => {
+                            let (binding_reply, binding_recv) = oneshot::channel();
+                            match tx
+                                .send_timeout(
+                                    BindingMsg::AskExpose {
+                                        port,
+                                        reply: binding_reply,
+                                    },
+                                    crate::session::HOST_PROBE_TIMEOUT,
+                                )
+                                .await
+                            {
+                                // The binding answers on its own time: the
+                                // human may sit at the dialog for as long as
+                                // they like, so only the hand-off is bounded.
+                                Ok(()) => {
+                                    // The binding dropping mid-prompt is the
+                                    // nobody-attached case again.
+                                    let answer = binding_recv.await.ok();
+                                    tracing::info!(port, answer = ?answer, "the attached client answered the runtime port publish ask");
+                                    let _ = reply.send(answer);
+                                }
+                                Err(send_error) => {
+                                    // The ask never reached a human. On a
+                                    // timeout the message comes back here
+                                    // (binding-level reply and all) and drops
+                                    // with this arm; on a closed mailbox the
+                                    // binding is already gone. Either way the
+                                    // host-level answer below is what the
+                                    // asker sees: nobody is attached.
+                                    tracing::warn!(port, error = %send_error, "the ask could not reach the attached client");
+                                    let _ = reply.send(None);
+                                }
+                            }
+                        }
+                    },
                     Message::CommandInSession {
                         program,
                         args,
