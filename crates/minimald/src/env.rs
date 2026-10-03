@@ -546,7 +546,11 @@ impl Env {
         let box_id = args
             .classifier_leaf
             .as_ref()
-            .and_then(|leaf| leaf.dir().file_name().map(|n| n.to_string_lossy().into_owned()))
+            .and_then(|leaf| {
+                leaf.dir()
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
             .unwrap_or_else(|| args.name.clone());
         // NET-079: the leaf the launcher created before this build, so the
         // sandbox keeps the host's cgroup mounts out of a leaf-bearing box and
@@ -1122,7 +1126,11 @@ impl SessionChannel {
     /// configured remote cache from, and each package in the install's scope
     /// spelled the way `min search` spells it, with its upstream version
     /// when the graph knows one.
-    fn fetch_record(&self, graph: &Graph, scope: &HashSet<String>) -> crate::sandbox_progress::FetchRecord {
+    fn fetch_record(
+        &self,
+        graph: &Graph,
+        scope: &HashSet<String>,
+    ) -> crate::sandbox_progress::FetchRecord {
         let objects = scope
             .iter()
             .map(|name| {
@@ -1130,7 +1138,10 @@ impl SessionChannel {
                     .by_name(name)
                     .and_then(|bsr| graph.get(bsr))
                     .and_then(|build| build.upstream_version())
-                    .map_or_else(|| name.clone(), |version| format!("{name} (version {version})"));
+                    .map_or_else(
+                        || name.clone(),
+                        |version| format!("{name} (version {version})"),
+                    );
                 (name.clone(), spelled)
             })
             .collect();

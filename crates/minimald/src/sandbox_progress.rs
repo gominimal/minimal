@@ -191,7 +191,9 @@ impl SandboxProgress {
     /// index names no package to scope by and is attributed to whatever is
     /// building, the same caveat the meter's row carries.
     fn record_fetch(&self, op: &Operation) {
-        let Some(record) = &self.fetch_record else { return };
+        let Some(record) = &self.fetch_record else {
+            return;
+        };
         let (host, object) = match op {
             Operation::FetchPkg { name } => (
                 record.cache_host.clone(),
@@ -718,10 +720,7 @@ mod tests {
         FetchRecord {
             box_id: "a session".to_string(),
             cache_host: "cache.minimal.dev".to_string(),
-            objects: BTreeMap::from([(
-                "jq".to_string(),
-                "jq (version 1.7.1)".to_string(),
-            )]),
+            objects: BTreeMap::from([("jq".to_string(), "jq (version 1.7.1)".to_string())]),
         }
     }
 
@@ -824,9 +823,9 @@ mod tests {
     #[test]
     fn each_fetch_kind_is_recorded_with_its_own_host_and_object() {
         let root = OpTracker::new_root();
-        let _pkg = root
-            .new_child()
-            .with_op(Operation::FetchPkg { name: "jq".to_string() });
+        let _pkg = root.new_child().with_op(Operation::FetchPkg {
+            name: "jq".to_string(),
+        });
         let _source = root.new_child().with_op(Operation::FetchSource {
             url: "https://github.com/example/example/archive/v1.tar.gz".to_string(),
         });

@@ -1982,9 +1982,10 @@ mod tests {
         let registry = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .expect("a loopback listener standing in for the registry host");
         let fetched = registry.local_addr().expect("the registry host's address");
-        let fetch = TcpStream::connect(fetched)
-            .expect("the daemon opens the fetch's connection from its own leaf, \
-             which sits beside the cohort rather than inside it");
+        let fetch = TcpStream::connect(fetched).expect(
+            "the daemon opens the fetch's connection from its own leaf, \
+             which sits beside the cohort rather than inside it",
+        );
         drop(fetch);
 
         // The rendered spelling of a cgroup on this tree, relative to the
