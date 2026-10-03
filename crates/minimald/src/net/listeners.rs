@@ -2548,4 +2548,164 @@ mod tests {
             "a closed listener leaves the leader's table"
         );
     }
+
+    /// The listen-publication surface against the real gvproxy, not the
+    /// stand-in: the watcher's expose verbs land on a real forwarder, which
+    /// binds the box's published address at the port the process listens on
+    /// — and, when the listener closes, comes down with the port, so a
+    /// client after the close is refused at the box's own address, never
+    /// accepted by a forward delivering to nothing (NET-016's publish half
+    /// and NET-017's withdraw half, against the switch the daemon itself
+    /// spawns). The proof's client is the client a published box serves:
+    /// what it sees is the bind at the box's own address — the address it
+    /// connects to — appearing when the listener appears and refusing when
+    /// the listener closes. The bytes' other leg, through the switch to the
+    /// attached box's tap, is the netns and VM lanes' own proof — a
+    /// stand-in process has no tap on the switch's stack, so it is not
+    /// proven here.
+    ///
+    /// The stand-in box is this process: its listener is bound at its lease
+    /// — the host's own loopback, the address a dial into this namespace
+    /// reaches — and the watcher reads this process's `/proc` entry as the
+    /// box's leader, the way every proof in this module does. The bind at
+    /// the lease alone is what makes the proof's connect read the forward
+    /// rather than the listener: a wildcard bind answers at every local
+    /// address, the published one included, and the connect would reach
+    /// the listener without the forward at all. Gated on `GVPROXY_BIN`, the
+    /// way the netns proofs are gated on their own host facts:
+    /// `scripts/fetch-gvproxy.sh` fetches the pinned binary, so the proof is
+    /// run as
+    /// `GVPROXY_BIN=./gvproxy cargo nextest run -p minimald --run-ignored only a_published_listener_is_reachable_and_refused_on_the_real_switch`.
+    #[ignore = "needs the real gvproxy binary; gated on GVPROXY_BIN (scripts/fetch-gvproxy.sh fetches the pinned one)"]
+    #[tokio::test]
+    async fn a_published_listener_is_reachable_and_refused_on_the_real_switch() {
+        let Some(bin) = std::env::var_os("GVPROXY_BIN") else {
+            eprintln!(
+                "skipping real-switch listen proof: GVPROXY_BIN not set \
+                 (scripts/fetch-gvproxy.sh fetches the pinned binary)"
+            );
+            return;
+        };
+        // The stand-in box's lease: this process's own loopback, so a dial
+        // the real forwarder makes to the lease reaches the listener the
+        // test binds — the reachability a real box's own address is its
+        // published address for (NET-010).
+        const STANDIN_LEASE: Ipv4Addr = Ipv4Addr::LOCALHOST;
+        // The box's listener is bound at its lease, not the any address: in
+        // the stand-in's own namespace a wildcard bind answers at every
+        // local address, the published one included, so the proof's connect
+        // would reach the listener without the forward at all. A lease bind
+        // answers only the forward's dial — the shape a publication carries
+        // — and `binds_for_the_lease` reads it as the box's own.
+        let listener = TcpListener::bind((STANDIN_LEASE, 0))
+            .expect("the stand-in box's listener binds at its lease");
+        let port = port_of(&listener);
+        listener
+            .set_nonblocking(true)
+            .expect("the listener can go nonblocking");
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .expect("the listener joins the runtime that awaits it");
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("gvproxy.sock");
+
+        // The real switch, brought up the way the daemon brings it up: the
+        // rendered config, the control socket, the PID file, and no SSH
+        // forward. `kill_on_drop` takes it with the handle, so a proof that
+        // ends anywhere leaves no gvproxy behind.
+        let config = dir.path().join("switch.yml");
+        std::fs::write(
+            &config,
+            crate::net::render_gvproxy_config(SwitchSubnet::default(), &[]),
+        )
+        .expect("the switch config writes");
+        let gvproxy = tokio::process::Command::new(&bin)
+            .arg("-config")
+            .arg(&config)
+            .arg("-listen")
+            .arg(format!("unix://{}", sock.display()))
+            .arg("-pid-file")
+            .arg(dir.path().join("gvproxy.pid"))
+            .arg("-ssh-port")
+            .arg("-1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("GVPROXY_BIN spawns the real gvproxy");
+        // Waited for with a real connect, the way the daemon's own bring-up
+        // waits: the socket's file appears before its listen does.
+        soon(|| std::os::unix::net::UnixStream::connect(&sock).is_ok()).await;
+
+        let gate = Arc::new(SessionGate::for_session(
+            "listen-box".into(),
+            STANDIN_LEASE,
+            &permit_policy(port),
+            SwitchSubnet::default(),
+        ));
+        let watcher = ListenWatcher::start(
+            ListenPlan::new(
+                "listen-box".into(),
+                STANDIN_LEASE,
+                PUBLISHED,
+                ControlChannel::Unix(sock.clone()),
+                Arc::clone(&gate),
+            ),
+            Leader::Resolved(std::process::id()),
+        );
+
+        // The watcher publishes the listener's port on the real switch: a
+        // forward bound at the box's published address, at the process's own
+        // port number, delivering to the box's lease — the no-translation
+        // rule NET-010 holds of runtime publications too. Until the bind
+        // lands, a connect at the published address is refused, so the probe
+        // retries within the bound — and the bind it waits for is the
+        // forward's own: the stand-in's listener answers at its lease alone,
+        // so nothing but the published forward can answer at `PUBLISHED`.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut last_probe = String::new();
+        let published = loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the listener's port never published at the box's own \
+                 address (last probe: {last_probe})"
+            );
+            match tokio::net::TcpStream::connect((std::net::IpAddr::from(PUBLISHED), port)).await {
+                Ok(client) => break client,
+                Err(e) => last_probe = e.to_string(),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        drop(published);
+
+        // The box's server closes — the one fact NET-017 turns on — and the
+        // watcher withdraws the publication: the gate refuses the port
+        // first, the forward comes down after.
+        drop(listener);
+        soon(|| !gate.admits_tcp(port)).await;
+
+        // A fresh client is refused at the box's own address — a connection
+        // refused, the port bound by nothing, not a published forward
+        // accepting a connection to deliver to a listener that is gone. The
+        // refusal is waited for within the bound, because the unbind follows
+        // the gate's own withdrawal by a control round trip.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut last_probe = String::new();
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the port is still published after its listener closed \
+                 (last probe: {last_probe})"
+            );
+            match tokio::net::TcpStream::connect((std::net::IpAddr::from(PUBLISHED), port)).await {
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                Ok(_) => last_probe = "still connected".into(),
+                Err(e) => last_probe = e.to_string(),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        watcher.stop().await;
+        drop(gvproxy);
+    }
 }
