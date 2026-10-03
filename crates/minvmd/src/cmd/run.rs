@@ -1026,18 +1026,12 @@ mod tests {
     #[cfg(minvmd_libkrun)]
     #[test]
     fn parent_pid_of_own_process_is_consistent() {
-        // The parent pid of our own process should be a live process (the
-        // test runner). This exercises the parent-pid lookup on every
-        // platform.
-        let my_pid = std::process::id();
-        let ppid = super::parent_pid(my_pid);
-        assert!(ppid.is_some(), "parent pid of own process must be readable");
-        let ppid = ppid.unwrap();
-        assert!(ppid != 0, "parent pid must not be 0");
-        assert!(
-            ppid != 1 || cfg!(target_os = "macos"),
-            "parent pid is init only on macOS (launchd)"
-        );
+        // The lookup for our own pid must agree with getppid(). This
+        // exercises the platform's parent-pid path (proc_pidinfo on macOS,
+        // /proc/<pid>/stat on Linux).
+        // SAFETY: getppid() has no preconditions and cannot fail.
+        let expected = unsafe { libc::getppid() } as u32;
+        assert_eq!(super::parent_pid(std::process::id()), Some(expected));
     }
 
     #[test]
