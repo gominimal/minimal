@@ -1230,7 +1230,7 @@ fn upsert_toml_packages_list<T: TableLike>(
             ))
         })?;
 
-        let existing: Vec<String> = arr
+        let mut existing: Vec<String> = arr
             .iter()
             .map(|i| {
                 i.as_str().map(str::to_owned).ok_or_else(|| {
@@ -1247,8 +1247,7 @@ fn upsert_toml_packages_list<T: TableLike>(
             .get(arr.len().saturating_sub(1))
             .and_then(|v| v.decor().prefix())
             .and_then(|p| p.as_str())
-            .filter(|s| s.contains('\n'))
-            .map(str::to_owned);
+            .and_then(|s| s.rfind('\n').map(|i| s[i..].to_owned()));
 
         let mut did_edit = false;
         for p in upsert {
@@ -1258,6 +1257,7 @@ fn upsert_toml_packages_list<T: TableLike>(
                     value.decor_mut().set_prefix(prefix.as_str());
                 }
                 arr.push(value);
+                existing.push(p.clone());
                 did_edit = true;
             }
         }
