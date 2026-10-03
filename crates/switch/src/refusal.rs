@@ -1,18 +1,20 @@
 //! The one shape of a refused connection's answer (NET-014, NET-081).
 //!
-//! Four callers refuse connections — the daemon's switch relay, its
-//! per-session gate, the VM host's egress gate, and the box egress proxy's
-//! stack peer — and this module is the only place any of them builds the
-//! reply or says the audit line. Everything here is bytes and arithmetic on
-//! an arriving frame: the crate carries no runtime and no feature the rest
-//! of the workspace must match, so the in-guest daemon and the host daemon
-//! link the same definitions and a refusal shaped on one leg reads
-//! identically in a bundle's log tail whichever leg refused it.
+//! Three callers refuse connections — the daemon's switch relay, whose
+//! native and in-guest attach legs hold the same per-session gate, and the
+//! box egress proxy's stack peer — and this module is the only place any of
+//! them builds the reply or says the audit line. Everything here is bytes
+//! and arithmetic on an arriving frame: the crate carries no runtime and no
+//! feature the rest of the workspace must match, so the in-guest daemon and
+//! the host daemon link the same definitions and a refusal shaped on one leg
+//! reads identically in a bundle's log tail whichever leg refused it.
 //!
 //! - [`classify`] reads one frame into a [`Segment`] — the one parser, so
 //!   every leg agrees on what a frame *is* before any of them answers it.
-//! - [`refused_tcp_reset`] and [`refused_udp_port_unreachable`] build the
-//!   two replies a refusal writes (RFC 793 §3.4; RFC 792 type 3 code 3).
+//! - [`refused_tcp_reset`] builds the reply a refusal writes (RFC 793 §3.4):
+//!   the one shape, whether the refusing side is a relay leg answering a
+//!   port nothing is published on or the stack peer refusing a SYN its
+//!   pre-screen turned away.
 //! - [`RefusalEmitter`] bounds and rates every refusal per source, and
 //!   renders the one audit line ([`Outcome::Emit`]).
 
@@ -25,8 +27,6 @@ use std::time::{Duration, Instant};
 const ETH_HDR: usize = 14;
 /// The EtherType the classifier admits: IPv4 only.
 const ETHERTYPE_IPV4: u16 = 0x0800;
-/// IPv4 protocol number of ICMP.
-const IPPROTO_ICMP: u8 = 1;
 /// IPv4 protocol number of TCP.
 const IPPROTO_TCP: u8 = 6;
 /// IPv4 protocol number of UDP.
@@ -46,8 +46,11 @@ pub const TCP_ACK: u8 = 0x10;
 
 /// The L4 addressing and TCP control state of one IPv4 frame, as [`classify`]
 /// extracts it: the source and destination `ip:port`, the protocol, and —
-/// for TCP — the flags byte and the sequence/acknowledgement pair the reply
-/// builders need. `tcp_flags`, `seq` and `ack` are `0` for UDP.
+/// for TCP — the flags byte, the sequence/acknowledgement pair, and the
+/// payload length the reply's acknowledgement must count (RFC 793 §3.4: a
+/// reply acknowledges everything the segment carried, data included).
+/// `tcp_flags`, `seq`, `ack` and `payload_len` are `0` for UDP, which no
+/// reply here is built for yet.
 ///
 /// The one shape every leg reads a frame into, so a segment a gate parsed
 /// means the same thing on every leg that refuses it.
@@ -66,6 +69,11 @@ pub struct Segment {
     /// TCP acknowledgement number; `0` for UDP and for a segment with no
     /// ACK set, where the sender leaves the field unspecified.
     pub ack: u32,
+    /// The TCP payload's length in bytes: the IPv4 total length less both
+    /// headers, bounded by the bytes the frame actually carries, so a
+    /// length a hostile frame lies about buys no acknowledgement for bytes
+    /// it never sent. `0` for UDP.
+    pub payload_len: u16,
 }
 
 impl Segment {
@@ -154,6 +162,23 @@ pub fn classify(frame: &[u8]) -> Option<Segment> {
     } else {
         (0, 0)
     };
+    // The payload a reply must acknowledge: what the IPv4 total length
+    // vouches for less both headers, bounded by the bytes the frame
+    // actually carries past them — a total length that overstates its
+    // frame buys no acknowledgement for bytes that never arrived, and one
+    // that understates it loses the tail it did send.
+    let payload_len = if proto == IPPROTO_TCP {
+        // The TCP data offset (high nibble of byte 12) is the header's
+        // own length in 32-bit words.
+        let data_offset = ((l4[12] >> 4) as usize) * 4;
+        let claimed = (u16::from_be_bytes([ip[2], ip[3]]) as usize)
+            .saturating_sub(ihl)
+            .saturating_sub(data_offset);
+        let present = ip.len().saturating_sub(ihl).saturating_sub(data_offset);
+        claimed.min(present)
+    } else {
+        0
+    };
     Some(Segment {
         src: SocketAddrV4::new(
             Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]),
@@ -167,6 +192,7 @@ pub fn classify(frame: &[u8]) -> Option<Segment> {
         tcp_flags: if proto == IPPROTO_TCP { l4[13] } else { 0 },
         seq,
         ack,
+        payload_len: u16::try_from(payload_len).unwrap_or(u16::MAX),
     })
 }
 
@@ -235,10 +261,10 @@ pub fn seq_acknowledging(seq: u32, payload_len: u16, flags: u8) -> u32 {
 
 /// Assembles the Ethernet + IPv4 + TCP reset every caller writes: from
 /// `src` — the refusing address — back to `dst`, the refused connection's
-/// peer, with the observed frame's Ethernet addresses handed over swapped
-/// (`eth_dst` is the reset's destination MAC, the peer's). The only place
-/// reset bytes are laid out, so a reset's shape has one definition across
-/// the daemon's relay, its gate, and the VM host's gate.
+/// peer, with the reply's link addresses handed in directly (`eth_dst` is
+/// the reset's destination MAC, the peer's). The only place reset bytes are
+/// laid out, so a reset's shape has one definition across the daemon's
+/// relay legs and the box egress proxy's stack peer.
 ///
 /// `acknowledges` picks the flag byte RFC 793 §3.4 pairs with the numbers:
 /// a reply that acknowledges the refused segment carries RST|ACK; a reply
@@ -286,11 +312,18 @@ pub fn tcp_reset_frame(
     frame
 }
 
-/// The reset that refuses one TCP `segment` carried in `frame`
-/// (RFC 793 §3.4), addressed to the segment's source so a refusal can never
-/// be steered at a third party. `None` — nothing written — for a frame too
-/// short to carry both Ethernet addresses, and for a segment that is itself
-/// a reset, the one exchange RFC 793 forbids outright.
+/// The reset that refuses one TCP `segment` carried in `frame` (RFC 793
+/// §3.4), written from `leg_mac` — the refusing link's own MAC, never one
+/// read off the frame it refuses. A SYN a pre-screen rules on names the leg
+/// in its IP destination, but its Ethernet destination does not have to
+/// agree: a SYN sent to the broadcast reaches the leg too, and a reset
+/// whose *source* is the broadcast's MAC is a frame no switch would
+/// forward. The reset is still addressed to the segment's own source MAC,
+/// so a refusal can never be steered at a third party.
+///
+/// `None` — nothing written — for a frame too short to carry both Ethernet
+/// addresses, and for a segment that is itself a reset, the one exchange
+/// RFC 793 forbids outright.
 ///
 /// The two shapes, taken from the observed segment alone — never from
 /// numbers a gate holds nothing for:
@@ -301,30 +334,37 @@ pub fn tcp_reset_frame(
 ///   in-window for a connection that exists.
 /// - any other segment — a bare SYN in practice, the one shape a stateless
 ///   gate refuses — is answered from sequence zero with **RST|ACK**,
-///   acknowledging it: the segment's own sequence plus one. A connecting
-///   peer's half-open socket reads that pair as the connection-refused it
-///   is, the same answer a kernel gives a SYN nobody listens for.
-pub fn refused_tcp_reset(frame: &[u8], segment: &Segment) -> Option<Vec<u8>> {
+///   acknowledging it: the segment's own sequence, plus the data it
+///   carried, plus one (RFC 793 §3.4 counts both, and a client that opened
+///   with its whole question must not read the refusal as a hole in it). A
+///   connecting peer's half-open socket reads that pair as the
+///   connection-refused it is, the same answer a kernel gives a SYN nobody
+///   listens for.
+pub fn refused_tcp_reset_from(
+    leg_mac: [u8; 6],
+    frame: &[u8],
+    segment: &Segment,
+) -> Option<Vec<u8>> {
     if segment.carries_reset() {
         return None;
     }
-    let (eth_dst, rest) = frame.split_first_chunk::<6>()?;
-    let (eth_src, _) = rest.split_first_chunk::<6>()?;
+    let (_, rest) = frame.split_first_chunk::<6>()?;
+    let (peer_mac, _) = rest.split_first_chunk::<6>()?;
     let (seq, ack, acknowledges) = if segment.carries_ack() {
         (segment.ack, 0, false)
     } else {
-        // A bare SYN carries no payload worth counting: its one sequence
-        // number of weight is the flag's own, which
-        // [`seq_acknowledging`] adds.
+        // The data the segment carried counts in what its acknowledgement
+        // covers, alongside the SYN's own one sequence number of weight,
+        // which [`seq_acknowledging`] adds.
         (
             0,
-            seq_acknowledging(segment.seq, 0, segment.tcp_flags),
+            seq_acknowledging(segment.seq, segment.payload_len, segment.tcp_flags),
             true,
         )
     };
     Some(tcp_reset_frame(
-        *eth_src,
-        *eth_dst,
+        *peer_mac,
+        leg_mac,
         segment.dst,
         segment.src,
         seq,
@@ -333,53 +373,13 @@ pub fn refused_tcp_reset(frame: &[u8], segment: &Segment) -> Option<Vec<u8>> {
     ))
 }
 
-/// The ICMP port-unreachable that refuses one UDP `datagram` carried in
-/// `frame` (RFC 792 type 3, code 3): from the refusing `segment.dst` back to
-/// the datagram's source, quoting the datagram's own IPv4 header and the
-/// first eight bytes of what follows it — the UDP header, which is what
-/// tells the sender *which* datagram was refused. `None` — nothing written
-/// — for a segment that is not UDP, and for a frame too short to carry both
-/// Ethernet addresses.
-pub fn refused_udp_port_unreachable(frame: &[u8], segment: &Segment) -> Option<Vec<u8>> {
-    if !segment.is_udp() || frame.len() < ETH_HDR {
-        return None;
-    }
-    let (eth_dst, rest) = frame.split_first_chunk::<6>()?;
-    let (eth_src, _) = rest.split_first_chunk::<6>()?;
-    // The quote: the datagram's own IPv4 header plus the first eight bytes
-    // of its payload, bounded by what the frame actually carries — a
-    // kernel quoting a truncated datagram truncates the quote the same way.
-    let ihl = (frame[ETH_HDR] & 0x0f) as usize * 4;
-    let quote_end = (ETH_HDR + ihl + 8).min(frame.len());
-    let quote = &frame[ETH_HDR..quote_end];
-    const ICMP_HDR: usize = 8;
-    let mut icmp = vec![0u8; ICMP_HDR + quote.len()];
-    icmp[0] = 3; // destination unreachable
-    icmp[1] = 3; // port unreachable
-    icmp[8..].copy_from_slice(quote);
-    let checksum = ones_complement(ones_sum(&icmp));
-    icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
-    // IPv4, IHL 5: the refusing address as the source, the datagram's
-    // source as the destination.
-    let total_len = u16::try_from(20 + icmp.len()).unwrap_or(u16::MAX);
-    let mut header = [0u8; 20];
-    header[0] = 0x45;
-    header[2..4].copy_from_slice(&total_len.to_be_bytes());
-    header[8] = 64;
-    header[9] = IPPROTO_ICMP;
-    header[12..16].copy_from_slice(&segment.dst.ip().octets());
-    header[16..20].copy_from_slice(&segment.src.ip().octets());
-    let checksum = ipv4_checksum(&header);
-    header[10..12].copy_from_slice(&checksum.to_be_bytes());
-    let mut reply = Vec::with_capacity(ETH_HDR + 20 + icmp.len());
-    // Handed over swapped, like the reset's: the reply travels to the
-    // datagram's source MAC, from the MAC it was addressed to.
-    reply.extend_from_slice(eth_src);
-    reply.extend_from_slice(eth_dst);
-    reply.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
-    reply.extend_from_slice(&header);
-    reply.extend_from_slice(&icmp);
-    Some(reply)
+/// The relay legs' shape of [`refused_tcp_reset_from`]: the frame arrived
+/// addressed to the refusing box — the switch steers a segment to it by
+/// addressing it there — so the MAC the frame arrived at is the box's own,
+/// and the one the reset is written from.
+pub fn refused_tcp_reset(frame: &[u8], segment: &Segment) -> Option<Vec<u8>> {
+    let (leg_mac, _) = frame.split_first_chunk::<6>()?;
+    refused_tcp_reset_from(*leg_mac, frame, segment)
 }
 
 /// Rule text for a segment to a port the target's declaration does not
@@ -389,10 +389,6 @@ pub const NO_INGRESS_MAPPING_RULE: &str = "no ingress mapping";
 /// Rule text for a segment to a port whose published ingress was revoked
 /// (NET-121).
 pub const REVOKED_INGRESS_PORT_RULE: &str = "revoked ingress port";
-
-/// Rule text for a segment to the box egress proxy's address at a port no
-/// socket of the peer's listens on.
-pub const UNLISTENED_PROXY_PORT_RULE: &str = "unlistened proxy port";
 
 /// Rule text for the box egress proxy's pre-screen refusing a connection from
 /// a source no registered row holds (NET-134): no row, no share, no socket.
@@ -429,13 +425,6 @@ pub const UNPUBLISHED_PORT: Class = Class {
 pub const REVOKED_PORT: Class = Class {
     rule: REVOKED_INGRESS_PORT_RULE,
     reason: "the port's published ingress was revoked",
-};
-
-/// A connection to the box egress proxy's address at a port no socket of
-/// the peer's listens on.
-pub const UNLISTENED_PROXY_PORT: Class = Class {
-    rule: UNLISTENED_PROXY_PORT_RULE,
-    reason: "no socket is listening on the port",
 };
 
 /// A connection the box egress proxy's pre-screen refused because no
@@ -489,10 +478,12 @@ pub struct Refusal {
 /// say the audit line or not.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// Write the reply, and log `line`: the one audit line this window says
-    /// for the source — the first refusal of the window, and the one that
-    /// spends the source's quota — carrying the count of replies written to
-    /// that source this window.
+    /// Log `line`, and write the reply when the caller has one: the one
+    /// audit line this window says for the source, at the window's first
+    /// refusal — never one per reply. The count the line carries is the
+    /// refusals counted since the last line said for the source: one for a
+    /// source's first refusal, and at a window's roll the total the closed
+    /// window saw, answered and suppressed alike.
     Emit(String),
     /// Write the reply, and say nothing: the middle of a source's window,
     /// where a line per reply would be the flood the rate exists to
@@ -517,6 +508,22 @@ pub const REFUSALS_PER_WINDOW: u32 = 16;
 /// How long one window of the per-source quota lasts.
 pub const REFUSAL_WINDOW: Duration = Duration::from_secs(1);
 
+/// One window's counters — the state every row and every overflow bucket
+/// holds a copy of, so both are accounted identically.
+struct Window {
+    /// When this window started.
+    started: Instant,
+    /// Replies written through this window — the quota's counter.
+    written: u32,
+    /// Refusals counted since the last line said through this window: the
+    /// running total its line reports, kept across the roll so the next
+    /// window's opening line carries the closed one's real count.
+    since_line: u32,
+    /// Whether this window's line has been said: once, at the window's
+    /// first refusal, and never per reply.
+    said: bool,
+}
+
 /// One per-(source, rule) limiter row: the replies this window has been
 /// written to one source under one rule. A source that refuses under two
 /// rules holds two rows — a rule-specific flood spends neither rule's row
@@ -525,10 +532,8 @@ struct Row {
     /// The row's identity: the refused source and the rule it was refused
     /// under.
     key: (Ipv4Addr, &'static str),
-    /// When this window started; `resets` counts from it.
-    window_started: Instant,
-    /// Replies written to the source this window.
-    resets: u32,
+    /// The row's window.
+    window: Window,
     /// The row's recency, updated on every refusal — the eviction order
     /// among rows whose windows have expired.
     last: Instant,
@@ -539,10 +544,8 @@ struct Row {
 /// one quota shared by every source it holds, with each refusal's own
 /// source named in whatever line it says.
 struct Overflow {
-    /// When this window started; `resets` counts from it.
-    window_started: Instant,
-    /// Replies written through the bucket this window.
-    resets: u32,
+    /// The bucket's window.
+    window: Window,
 }
 
 /// The limiter's state under one lock: the rows and the overflow buckets.
@@ -555,7 +558,7 @@ struct Limiter {
 }
 
 /// The bounded, rate-limited refusal audit every refusal goes through —
-/// the fourth caller's as much as the first's.
+/// the stack peer's as much as the relay's.
 ///
 /// Two bounds, one per axis:
 ///
@@ -573,8 +576,9 @@ struct Limiter {
 ///   for anybody.
 ///
 /// The lines it says are the one audit format ([`Self::refuse`]'s
-/// [`Outcome::Emit`]): a rate-limited warn per refusal class per source,
-/// never one per reply.
+/// [`Outcome::Emit`]): one rate-limited warn per (source, rule) per window,
+/// said at the window's first refusal and carrying the refusals that window
+/// has seen from the source — never one per reply.
 pub struct RefusalEmitter {
     state: Mutex<Limiter>,
     rows: usize,
@@ -600,7 +604,15 @@ impl RefusalEmitter {
     /// Records one refusal at `now` and decides what the caller writes and
     /// says. Callers pass `Instant::now()`; tests pass what they like — the
     /// window is the emitter's arithmetic, not the clock's.
-    pub fn refuse(&self, refusal: &Refusal, now: Instant) -> Outcome {
+    ///
+    /// `answered` says whether the refusing side has a reply to write for
+    /// this one: a reset for a first packet, nothing for a segment no
+    /// honest builder answers — a spoofed ACK no held flow matches. An
+    /// unanswered refusal still counts toward its window and still says its
+    /// line, but spends none of the source's reply quota: no source can
+    /// spend another's refusals, and the log is never bought with resets a
+    /// lie manufactured.
+    pub fn refuse(&self, refusal: &Refusal, answered: bool, now: Instant) -> Outcome {
         let mut limiter = self.state.lock().expect("refusal emitter lock poisoned");
         let rule = refusal.class.rule;
         // The row this source holds under this rule.
@@ -610,7 +622,7 @@ impl RefusalEmitter {
             .find(|row| row.key == (refusal.source, rule))
         {
             row.last = now;
-            return self.account(&mut row.window_started, &mut row.resets, refusal, now);
+            return self.account(&mut row.window, refusal, answered, now);
         }
         // No row: a free slot first, then the least-recently-used row whose
         // window has already expired. A row whose window is still live is
@@ -618,16 +630,24 @@ impl RefusalEmitter {
         let slot = if limiter.rows.len() < self.rows {
             limiter.rows.push(Row {
                 key: (refusal.source, rule),
-                window_started: now,
-                resets: 0,
+                window: Window {
+                    started: now,
+                    written: 0,
+                    since_line: 0,
+                    said: false,
+                },
                 last: now,
             });
             limiter.rows.last_mut().expect("the row was just pushed")
         } else if let Some(index) = expired_lru_index(&limiter.rows, now, self.window) {
             limiter.rows[index] = Row {
                 key: (refusal.source, rule),
-                window_started: now,
-                resets: 0,
+                window: Window {
+                    started: now,
+                    written: 0,
+                    since_line: 0,
+                    said: false,
+                },
                 last: now,
             };
             &mut limiter.rows[index]
@@ -635,44 +655,69 @@ impl RefusalEmitter {
             // The table is full of live rows: collapse into the rule's
             // bucket, with this refusal's source in whatever line it says.
             let bucket = limiter.overflow.entry(rule).or_insert(Overflow {
-                window_started: now,
-                resets: 0,
+                window: Window {
+                    started: now,
+                    written: 0,
+                    since_line: 0,
+                    said: false,
+                },
             });
-            return self.account(&mut bucket.window_started, &mut bucket.resets, refusal, now);
+            return self.account(&mut bucket.window, refusal, answered, now);
         };
-        self.account(&mut slot.window_started, &mut slot.resets, refusal, now)
+        self.account(&mut slot.window, refusal, answered, now)
     }
 
     /// Charges one refusal against one window and decides what the caller
-    /// says: the first reply of a window says its line, the one that spends
-    /// the quota says its line, the middle says nothing, and past the quota
-    /// nothing is written at all.
+    /// says: the window's first refusal says its line — carrying the
+    /// refusals counted since the last line said through the window, the
+    /// closed window's total when it rolls — the rest of the window writes
+    /// quietly while the source's quota has room, and past the quota
+    /// nothing is written at all. An unanswered refusal counts and says,
+    /// but spends none of the quota.
     fn account(
         &self,
-        window_started: &mut Instant,
-        resets: &mut u32,
+        window: &mut Window,
         refusal: &Refusal,
+        answered: bool,
         now: Instant,
     ) -> Outcome {
-        if now.saturating_duration_since(*window_started) >= self.window {
-            *window_started = now;
-            *resets = 0;
+        if now.saturating_duration_since(window.started) >= self.window {
+            window.started = now;
+            window.written = 0;
+            window.said = false;
         }
-        if *resets >= self.per_window {
+        // The window's one line, at its first refusal. The count it carries
+        // is every refusal counted since the last line — which, because
+        // every window opens with one, is the closed window's total when
+        // the window has rolled, and one for a window that opens fresh.
+        if !window.said {
+            window.said = true;
+            let refusals = window.since_line + 1;
+            window.since_line = 0;
+            let line = self.line(refusal, refusals);
+            if answered && window.written < self.per_window {
+                window.written += 1;
+            }
+            return Outcome::Emit(line);
+        }
+        // The rest of the window counts toward the next line, and writes
+        // quietly while the quota has room.
+        window.since_line += 1;
+        if !answered {
+            return Outcome::Quiet;
+        }
+        if window.written >= self.per_window {
             return Outcome::Suppressed;
         }
-        *resets += 1;
-        if *resets == 1 || *resets == self.per_window {
-            return Outcome::Emit(self.line(refusal, *resets));
-        }
+        window.written += 1;
         Outcome::Quiet
     }
 
     /// Renders the one audit line every leg's log tail carries: the rule
     /// the verdict matched, the address that refused, what the connection
     /// reached for — its port, or the name it was for — the reason, the
-    /// refused source, and the count of replies written to that source this
-    /// window.
+    /// refused source, and the count of refusals that source's window has
+    /// seen.
     fn line(&self, refusal: &Refusal, refusals: u32) -> String {
         format!(
             "rule_matched=\"{rule}\" address={address} {about} reason=\"{reason}\" source={source} refusals={refusals}",
@@ -702,7 +747,7 @@ impl Default for RefusalEmitter {
 fn expired_lru_index(rows: &[Row], now: Instant, window: Duration) -> Option<usize> {
     rows.iter()
         .enumerate()
-        .filter(|(_, row)| now.saturating_duration_since(row.window_started) >= window)
+        .filter(|(_, row)| now.saturating_duration_since(row.window.started) >= window)
         .min_by_key(|(_, row)| row.last)
         .map(|(index, _)| index)
 }
@@ -769,22 +814,6 @@ mod tests {
         let checksum = tcp_checksum(&tcp, src, dst);
         tcp[16..18].copy_from_slice(&checksum.to_be_bytes());
         eth_ipv4(src, dst, IPPROTO_TCP, &tcp)
-    }
-
-    /// A UDP datagram with the ports the port-unreachable quotes.
-    fn udp_datagram(
-        src: Ipv4Addr,
-        dst: Ipv4Addr,
-        sport: u16,
-        dport: u16,
-        payload: &[u8],
-    ) -> Vec<u8> {
-        let mut udp = vec![0u8; 8 + payload.len()];
-        udp[0..2].copy_from_slice(&sport.to_be_bytes());
-        udp[2..4].copy_from_slice(&dport.to_be_bytes());
-        udp[4..6].copy_from_slice(&(8 + payload.len() as u16).to_be_bytes());
-        udp[8..].copy_from_slice(payload);
-        eth_ipv4(src, dst, IPPROTO_UDP, &udp)
     }
 
     /// The RFC 1071 checksum of `bytes`, written from the definition rather
@@ -899,63 +928,48 @@ mod tests {
     }
 
     #[test]
-    fn refusal_icmp_port_unreachable_quotes_the_datagram() {
-        let payload: &[u8] = &[0xab; 64];
-        let datagram = udp_datagram(PEER, LEASE, 40000, 9999, payload);
-        let segment = classify(&datagram).expect("a UDP frame classifies");
-        assert!(segment.is_udp());
-        assert!(segment.is_first_packet());
-        let reply =
-            refused_udp_port_unreachable(&datagram, &segment).expect("a datagram is answered");
-        // Addressed back to the datagram's source, from the address that
-        // refused it, with the observed addresses swapped.
-        assert_eq!(&reply[0..6], &datagram[6..12]);
-        assert_eq!(&reply[6..12], &datagram[0..6]);
-        assert_eq!(reply[ETH_HDR + 9], IPPROTO_ICMP);
-        assert_eq!(
-            &reply[ETH_HDR + 12..ETH_HDR + 16],
-            LEASE.octets().as_slice()
-        );
-        assert_eq!(&reply[ETH_HDR + 16..ETH_HDR + 20], PEER.octets().as_slice());
-        let icmp = &reply[ETH_HDR + 20..];
-        // Destination unreachable, port unreachable — the datagram itself
-        // says which listener was missing.
-        assert_eq!(icmp[0], 3);
-        assert_eq!(icmp[1], 3);
-        assert_eq!(
-            u16::from_be_bytes([reply[ETH_HDR + 2], reply[ETH_HDR + 3]]),
-            (20 + icmp.len()) as u16
-        );
-        // The quote is the datagram's own IPv4 header plus the first eight
-        // bytes of its payload — the UDP header, which names the refused
-        // datagram — and nothing past them.
-        let ihl = (datagram[ETH_HDR] & 0x0f) as usize * 4;
-        assert_eq!(icmp.len(), 8 + ihl + 8);
-        assert_eq!(&icmp[8..8 + ihl], &datagram[ETH_HDR..ETH_HDR + ihl]);
-        assert_eq!(
-            &icmp[8 + ihl..8 + ihl + 8],
-            &datagram[ETH_HDR + ihl..ETH_HDR + ihl + 8]
-        );
-        assert!(!icmp.contains(&0xab));
-        // The ICMP checksum covers the message the datagram's kernel
-        // verifies.
-        assert_eq!(
-            rfc1071(icmp),
-            0,
-            "the ICMP checksum must verify on the wire"
-        );
-        assert_eq!(
-            rfc1071(&reply[ETH_HDR..ETH_HDR + 20]),
-            0,
-            "the IPv4 header checksum must verify"
-        );
-
-        // A TCP segment is not answered with a port-unreachable, and a
-        // frame too short for the quote's start is answered with nothing.
-        let syn = tcp_segment(PEER, LEASE, 40000, 9999, TCP_SYN, 0, 0, &[]);
+    fn refusal_rst_acks_a_syn_carrying_data() {
+        // A SYN that carries data is acknowledged past the data (RFC 793
+        // §3.4): a client that opened with its whole question must not read
+        // the refusal as a hole in it.
+        let syn = tcp_segment(PEER, LEASE, 40000, 9999, TCP_SYN, 1000, 0, b"0123456789");
         let segment = classify(&syn).expect("a TCP frame classifies");
-        assert_eq!(refused_udp_port_unreachable(&syn, &segment), None);
-        assert_eq!(refused_udp_port_unreachable(&[], &segment), None);
+        assert_eq!(segment.payload_len, 10);
+        let reset = refused_tcp_reset(&syn, &segment).expect("a SYN is answered");
+        let tcp = tcp_of(&reset);
+        assert_eq!(tcp[13], TCP_RST | TCP_ACK);
+        // The sequence plus the ten data bytes plus the SYN's own weight.
+        assert_eq!(tcp[8..12], 1011u32.to_be_bytes());
+        assert_checksums_verify_on_the_wire(&reset);
+
+        // A total length that overstates its frame cannot buy a bigger
+        // acknowledgement: the count is bounded by the bytes the frame
+        // actually carries.
+        let mut lie = tcp_segment(PEER, LEASE, 40000, 9999, TCP_SYN, 7000, 0, b"abcd");
+        lie[ETH_HDR + 2..ETH_HDR + 4].copy_from_slice(&80u16.to_be_bytes());
+        let segment = classify(&lie).expect("a TCP frame classifies");
+        assert_eq!(segment.payload_len, 4);
+        let reset = refused_tcp_reset(&lie, &segment).expect("a SYN is answered");
+        assert_eq!(tcp_of(&reset)[8..12], 7005u32.to_be_bytes());
+        assert_checksums_verify_on_the_wire(&reset);
+
+        // A leg other than the link the frame was addressed to writes its
+        // own MAC as the reset's source — the shape a pre-screen needs,
+        // where the SYN may have been sent to the broadcast.
+        let mut to_broadcast = tcp_segment(PEER, LEASE, 40000, 9999, TCP_SYN, 42, 0, b"");
+        to_broadcast[0..6].copy_from_slice(&[0xff; 6]);
+        let leg_mac = mac_of(LEASE);
+        let segment = classify(&to_broadcast).expect("a TCP frame classifies");
+        let reset =
+            refused_tcp_reset_from(leg_mac, &to_broadcast, &segment).expect("a SYN is answered");
+        assert_eq!(&reset[0..6], &to_broadcast[6..12]);
+        assert_eq!(reset[6..12], leg_mac);
+        assert_eq!(tcp_of(&reset)[8..12], 43u32.to_be_bytes());
+        assert_checksums_verify_on_the_wire(&reset);
+        // The relay legs' shape of the same builder writes from the MAC the
+        // frame arrived addressed to — the box's own.
+        let reset = refused_tcp_reset(&to_broadcast, &segment).expect("a SYN is answered");
+        assert_eq!(&reset[6..12], &[0xff; 6]);
     }
 
     /// One refused SYN, for the emitter tests.
@@ -975,7 +989,7 @@ mod tests {
         let emitter = RefusalEmitter::new(8, 4, Duration::from_millis(50));
         let t0 = Instant::now();
         // The first refusal of a window says the line, with its count.
-        match emitter.refuse(&refusal_from(PEER), t0) {
+        match emitter.refuse(&refusal_from(PEER), true, t0) {
             Outcome::Emit(line) => {
                 assert!(line.contains("rule_matched=\"no ingress mapping\""));
                 assert!(line.contains("source=100.64.0.5"));
@@ -983,23 +997,30 @@ mod tests {
             }
             _ => panic!("the first refusal of a window says its line"),
         }
-        // The middle of the window writes and says nothing: no line per
-        // reply.
-        assert_eq!(emitter.refuse(&refusal_from(PEER), t0), Outcome::Quiet);
-        assert_eq!(emitter.refuse(&refusal_from(PEER), t0), Outcome::Quiet);
-        // The reply that spends the quota still writes, and says the count
-        // it spent.
-        match emitter.refuse(&refusal_from(PEER), t0) {
-            Outcome::Emit(line) => assert!(line.ends_with("refusals=4")),
-            _ => panic!("the refusal that spends the quota says its line"),
-        }
+        // The rest of the window writes and says nothing: no line per
+        // reply, not even for the reply that spends the quota.
+        assert_eq!(
+            emitter.refuse(&refusal_from(PEER), true, t0),
+            Outcome::Quiet
+        );
+        assert_eq!(
+            emitter.refuse(&refusal_from(PEER), true, t0),
+            Outcome::Quiet
+        );
+        assert_eq!(
+            emitter.refuse(&refusal_from(PEER), true, t0),
+            Outcome::Quiet
+        );
         // Past the quota: nothing written, nothing said — the flooder's own
         // refusals only.
         for _ in 0..10 {
-            assert_eq!(emitter.refuse(&refusal_from(PEER), t0), Outcome::Suppressed);
+            assert_eq!(
+                emitter.refuse(&refusal_from(PEER), true, t0),
+                Outcome::Suppressed
+            );
         }
         // A sibling is untouched: its own row, its own quota, its own line.
-        match emitter.refuse(&refusal_from(OTHER_PEER), t0) {
+        match emitter.refuse(&refusal_from(OTHER_PEER), true, t0) {
             Outcome::Emit(line) => {
                 assert!(line.contains("source=100.64.0.6"));
                 assert!(line.ends_with("refusals=1"));
@@ -1012,14 +1033,18 @@ mod tests {
             class: REVOKED_PORT,
             ..refusal_from(PEER)
         };
-        match emitter.refuse(&revoked, t0) {
-            Outcome::Emit(line) => assert!(line.contains("rule_matched=\"revoked ingress port\"")),
+        match emitter.refuse(&revoked, true, t0) {
+            Outcome::Emit(line) => {
+                assert!(line.contains("rule_matched=\"revoked ingress port\""))
+            }
             _ => panic!("a second rule is a second row"),
         }
-        // The window rolls and the spent source is answered again.
+        // The window rolls and the spent source is answered again — and the
+        // line the new window opens with reports what the closed one saw:
+        // fourteen refusals, of which four were answered.
         let t1 = t0 + Duration::from_millis(60);
-        match emitter.refuse(&refusal_from(PEER), t1) {
-            Outcome::Emit(line) => assert!(line.ends_with("refusals=1")),
+        match emitter.refuse(&refusal_from(PEER), true, t1) {
+            Outcome::Emit(line) => assert!(line.ends_with("refusals=14")),
             _ => panic!("a rolled window answers the source again"),
         }
     }
@@ -1034,31 +1059,35 @@ mod tests {
         let c = Ipv4Addr::new(100, 64, 0, 3);
         let d = Ipv4Addr::new(100, 64, 0, 4);
         assert!(matches!(
-            emitter.refuse(&refusal_from(a), t0),
+            emitter.refuse(&refusal_from(a), true, t0),
             Outcome::Emit(_)
         ));
         assert!(matches!(
-            emitter.refuse(&refusal_from(b), t0),
+            emitter.refuse(&refusal_from(b), true, t0),
             Outcome::Emit(_)
         ));
         // The table is full and both rows are live: a third source collapses
         // into the rule's bucket — still answered, its own source in its
         // line.
-        match emitter.refuse(&refusal_from(c), t0) {
+        match emitter.refuse(&refusal_from(c), true, t0) {
             Outcome::Emit(line) => assert!(line.contains("source=100.64.0.3")),
             _ => panic!("a source no row holds collapses into the rule's bucket"),
         }
         // The bucket is keyed by rule alone, so its quota is shared: D's
         // refusals are the bucket's, and past its quota nothing is written.
-        assert_eq!(emitter.refuse(&refusal_from(d), t0), Outcome::Quiet);
-        match emitter.refuse(&refusal_from(d), t0) {
-            Outcome::Emit(line) => assert!(line.ends_with("refusals=3")),
-            _ => panic!("the refusal that spends the bucket's quota says its line"),
-        }
-        assert_eq!(emitter.refuse(&refusal_from(c), t0), Outcome::Suppressed);
+        assert_eq!(emitter.refuse(&refusal_from(d), true, t0), Outcome::Quiet);
+        assert_eq!(emitter.refuse(&refusal_from(d), true, t0), Outcome::Quiet);
+        assert_eq!(
+            emitter.refuse(&refusal_from(d), true, t0),
+            Outcome::Suppressed
+        );
+        assert_eq!(
+            emitter.refuse(&refusal_from(c), true, t0),
+            Outcome::Suppressed
+        );
         // The rows are untouched: A and B answer within quotas of their own.
-        assert_eq!(emitter.refuse(&refusal_from(a), t0), Outcome::Quiet);
-        assert_eq!(emitter.refuse(&refusal_from(b), t0), Outcome::Quiet);
+        assert_eq!(emitter.refuse(&refusal_from(a), true, t0), Outcome::Quiet);
+        assert_eq!(emitter.refuse(&refusal_from(b), true, t0), Outcome::Quiet);
 
         // The rows' windows expire. A's refusal at t1 makes A the most
         // recently used row, so the LRU — B's — is the one evicted for a new
@@ -1066,21 +1095,18 @@ mod tests {
         // being its own, not the bucket's.
         let t1 = t0 + Duration::from_millis(60);
         assert!(matches!(
-            emitter.refuse(&refusal_from(a), t1),
+            emitter.refuse(&refusal_from(a), true, t1),
             Outcome::Emit(_)
         ));
         assert!(matches!(
-            emitter.refuse(&refusal_from(c), t1),
+            emitter.refuse(&refusal_from(c), true, t1),
             Outcome::Emit(_)
         ));
-        assert_eq!(emitter.refuse(&refusal_from(c), t1), Outcome::Quiet);
-        match emitter.refuse(&refusal_from(c), t1) {
-            Outcome::Emit(line) => assert!(line.ends_with("refusals=3")),
-            _ => panic!("a row of C's own spends a quota of C's own"),
-        }
+        assert_eq!(emitter.refuse(&refusal_from(c), true, t1), Outcome::Quiet);
+        assert_eq!(emitter.refuse(&refusal_from(c), true, t1), Outcome::Quiet);
         // B, evicted, collapses into the overflow bucket — whose window has
         // rolled too, so B is answered again, its own source in its line.
-        match emitter.refuse(&refusal_from(b), t1) {
+        match emitter.refuse(&refusal_from(b), true, t1) {
             Outcome::Emit(line) => assert!(line.contains("source=100.64.0.2")),
             _ => panic!("an evicted source is answered through the bucket"),
         }
@@ -1092,7 +1118,7 @@ mod tests {
         let mut answered = 0;
         let mut suppressed = 0;
         for last in 5u8..40 {
-            match flood.refuse(&refusal_from(Ipv4Addr::new(100, 64, 0, last)), t0) {
+            match flood.refuse(&refusal_from(Ipv4Addr::new(100, 64, 0, last)), true, t0) {
                 Outcome::Emit(_) | Outcome::Quiet => answered += 1,
                 Outcome::Suppressed => suppressed += 1,
             }
@@ -1104,7 +1130,7 @@ mod tests {
     #[test]
     fn refusal_audit_line_names_rule_address_port_and_reason() {
         let emitter = RefusalEmitter::default();
-        let line = match emitter.refuse(&refusal_from(PEER), Instant::now()) {
+        let line = match emitter.refuse(&refusal_from(PEER), true, Instant::now()) {
             Outcome::Emit(line) => line,
             _ => panic!("the first refusal of a window says its line"),
         };
@@ -1121,7 +1147,7 @@ mod tests {
             address: LEASE,
             about: About::Name("web".to_owned()),
         };
-        let line = match emitter.refuse(&named, Instant::now()) {
+        let line = match emitter.refuse(&named, true, Instant::now()) {
             Outcome::Emit(line) => line,
             _ => panic!("a new source's first refusal says its line"),
         };
@@ -1130,5 +1156,54 @@ mod tests {
             "rule_matched=\"revoked ingress port\" address=100.64.0.9 name=\"web\" \
              reason=\"the port's published ingress was revoked\" source=100.64.0.6 refusals=1"
         );
+    }
+
+    #[test]
+    fn refusal_line_carries_the_window_count() {
+        // A window sized for the production quota: the count the line
+        // carries must be the refusals the window saw, not the replies that
+        // were written.
+        let emitter = RefusalEmitter::new(8, REFUSALS_PER_WINDOW, Duration::from_millis(50));
+        let t0 = Instant::now();
+        // The window opens with one line, saying one.
+        match emitter.refuse(&refusal_from(PEER), true, t0) {
+            Outcome::Emit(line) => assert!(line.ends_with("refusals=1")),
+            _ => panic!("the first refusal of a window says its line"),
+        }
+        // Thirty refusals more, from the same source, inside the same
+        // window: the first fifteen are answered, the rest suppressed — and
+        // none of them says another line.
+        for _ in 0..30 {
+            assert!(matches!(
+                emitter.refuse(&refusal_from(PEER), true, t0),
+                Outcome::Quiet | Outcome::Suppressed
+            ));
+        }
+        // The next window opens with the real count: the thirty-one
+        // refusals the closed window saw, not the sixteen replies it wrote.
+        let t1 = t0 + Duration::from_millis(60);
+        match emitter.refuse(&refusal_from(PEER), true, t1) {
+            Outcome::Emit(line) => assert!(line.ends_with("refusals=31")),
+            _ => panic!("the next window opens with the closed one's count"),
+        }
+
+        // A source whose refusals are never answered still counts: the
+        // gate's spoofed-ACK refusals build no reset to write, and the line
+        // the next window opens with reports them anyway — said once, at
+        // the window's first refusal, suppressed never.
+        for _ in 0..7 {
+            assert!(matches!(
+                emitter.refuse(&refusal_from(OTHER_PEER), false, t0),
+                Outcome::Emit(_) | Outcome::Quiet
+            ));
+        }
+        match emitter.refuse(
+            &refusal_from(OTHER_PEER),
+            false,
+            t0 + Duration::from_millis(60),
+        ) {
+            Outcome::Emit(line) => assert!(line.ends_with("refusals=7")),
+            _ => panic!("an unanswered refusal still counts in its window's line"),
+        }
     }
 }
