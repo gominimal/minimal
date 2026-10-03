@@ -1122,7 +1122,8 @@ impl SessionChannel {
     }
 
     /// NET-080: the context this install's fetches are recorded under — the
-    /// box the install was made for, the host the daemon fetches the
+    /// box the install was made for, the leaf this daemon's own fetches
+    /// leave from (where it stands in one), the host the daemon fetches the
     /// configured remote cache from, and each package in the install's scope
     /// spelled the way `min search` spells it, with its upstream version
     /// when the graph knows one.
@@ -1147,6 +1148,9 @@ impl SessionChannel {
             .collect();
         crate::sandbox_progress::FetchRecord {
             box_id: self.box_id.clone(),
+            leaf: crate::net::classifier::daemon_fetch_leaf(Path::new(
+                sandbox2::classifier::TREE_ROOT,
+            )),
             cache_host: crate::net::classifier::cache_host(
                 &self.ctx.daemon_context().config().remote_cache_url(),
             ),

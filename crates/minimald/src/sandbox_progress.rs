@@ -209,23 +209,28 @@ impl SandboxProgress {
             Operation::FetchIndex => (record.cache_host.clone(), "index".to_owned()),
             _ => return,
         };
-        record_node_plane_fetch(&record.box_id, &host, &object);
+        record_node_plane_fetch(&record.box_id, record.leaf, &host, &object);
     }
 }
 
 /// NET-080: the context the daemon's own fetches are recorded under — the
 /// facts an install knows when it starts, spelled once so each fetch's
 /// record is only the fetch's own: the box the fetch was made for, the host
-/// the configured remote cache is fetched from, and the object each package
-/// in the install's scope is spelled as. The record is the daemon's evidence
-/// that a fetch a box's install triggered was the daemon's own node-plane
-/// traffic, never the box's, so it names the box — the way the classifier
-/// tree names it, by its leaf — that asked for the fetch it survived to
-/// make.
+/// the configured remote cache is fetched from, the object each package in
+/// the install's scope is spelled as, and the leaf the daemon's own fetches
+/// leave from. The record is the daemon's evidence that a fetch a box's
+/// install triggered was the daemon's own node-plane traffic, never the
+/// box's, so it names the box — the way the classifier tree names it, by
+/// its leaf — that asked for the fetch it survived to make.
 pub(crate) struct FetchRecord {
     /// The requesting box, named the way the tree names it: its leaf's own
     /// name when the host placed it in one, else the session's name.
     pub(crate) box_id: String,
+    /// The leaf the daemon's own fetches are recorded as leaving from, where
+    /// this daemon stands in one; `None` where it does not — the record's
+    /// one fact about the host rather than the fetch, read once here so the
+    /// line claims it only where it holds.
+    pub(crate) leaf: Option<&'static str>,
     /// The host the daemon's cache fetches — packages and the index — leave
     /// for, spelled from the configured remote cache.
     pub(crate) cache_host: String,
@@ -716,11 +721,14 @@ mod tests {
         }
     }
 
-    /// One install's [`FetchRecord`]: the box the install belongs to, the host
-    /// its cache fetches leave for, and the object its package is recorded as.
+    /// One install's [`FetchRecord`]: the box the install belongs to, the leaf
+    /// its daemon's fetches leave from — a daemon standing in its own leaf, so
+    /// the record names it — the host its cache fetches leave for, and the
+    /// object its package is recorded as.
     fn fetch_record() -> FetchRecord {
         FetchRecord {
             box_id: "a session".to_string(),
+            leaf: Some(sandbox2::classifier::DAEMON_LEAF),
             cache_host: "cache.minimal.dev".to_string(),
             objects: BTreeMap::from([("jq".to_string(), "jq (version 1.7.1)".to_string())]),
         }

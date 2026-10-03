@@ -1017,36 +1017,84 @@ pub fn decide_now(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision
     decide(root, mountinfo, guest, || read_filter(root))
 }
 
-/// NET-080: the node-plane record for the daemon's own leaf — one line per
-/// fetch the daemon itself makes, naming the box the fetch was made for,
-/// the host it left for, and the object it brought back, which is the line
-/// a diagnostics bundle's daemon-log tail reads each fetch from. One call
-/// per fetch, the caller naming the three.
+/// The leaf the daemon's own fetches are recorded as leaving from: its own,
+/// where this daemon stands in one — the leaf it entered at start, or the one
+/// the installer's `--pid` step placed a native daemon in — and `None` where
+/// it does not.
+///
+/// This is the one fact of [`record_node_plane_fetch`] that is about the
+/// *host* rather than about the fetch, so it is read, not assumed: a daemon
+/// that starts outside the tree never gets in, because its entry is a
+/// migration whose common ancestor this account cannot write to from outside
+/// (the reason the step's `--pid` half exists), and a host without the step
+/// has no tree to stand in at all — on both, the record must not claim a
+/// leaf. Read the way the placement is written ([`enter_daemon_leaf`] at
+/// start, `--pid` natively): this process's own pid among the members of its
+/// leaf's `cgroup.procs`, the one place a cgroup's membership is stated, so
+/// no path is derived here from a mount table a host may spell some other
+/// way. A leaf that is not there, or one this daemon is not in, reads as
+/// what it is: no leaf of the daemon's own.
+///
+/// [`enter_daemon_leaf`]: sandbox2::classifier::enter_daemon_leaf
+pub fn daemon_fetch_leaf(root: &Path) -> Option<&'static str> {
+    let members =
+        std::fs::read_to_string(sandbox2::classifier::daemon_leaf(root).join(PROCS_FILE)).ok()?;
+    members
+        .lines()
+        .any(|member| member.trim().parse::<u32>() == Ok(std::process::id()))
+        .then_some(sandbox2::classifier::DAEMON_LEAF)
+}
+
+/// NET-080: the node-plane record for the daemon's own fetches — one line
+/// per fetch the daemon itself makes, naming the box the fetch was made
+/// for, the host it left for, and the object it brought back, which is the
+/// line a diagnostics bundle's daemon-log tail reads each fetch from. One
+/// call per fetch, the caller naming the four.
 ///
 /// The fetch a `min add` inside a host-address box triggers is the
 /// *daemon's*, never the box's: the build runs in the daemon's own process,
-/// in the leaf it entered at start — a sibling of the cohort, never inside
-/// it — so the refusing rule that matches a deny-all box's subtree cannot
-/// reach it and the fetch completes on the same host while the box reaches
-/// nothing (the root lane's `snat_identity_is_seen_by_the_peer` reads the
-/// identity the node plane's own rule gives a real peer, under a loaded
-/// table). The fact is otherwise invisible: a fetch that completes says
-/// nothing about which identity carried it, and a person reading a bundle
-/// for why the box's install worked while the box's own connects are
-/// refused has this record to answer with. One line per fetch, at info,
-/// with the box, the host, the leaf it left from, and the object — a fetch
-/// is an event, not a meter, so no byte counts and no deduplication: each
-/// fetch is recorded, and nothing else is.
-pub fn record_node_plane_fetch(box_id: &str, host: &str, object: &str) {
-    tracing::info!(
-        host = %host,
-        leaf = %sandbox2::classifier::DAEMON_LEAF,
-        box_id = %box_id,
-        object = %object,
-        "the daemon's own fetch is node-plane traffic, from its own leaf \
-         beside the cohort: never the box's, so a deny-all host-address \
-         box's declaration refuses nothing of it"
-    );
+/// outside every box on every host, so a deny-all box's declaration refuses
+/// nothing of it and the fetch completes on the same host while the box
+/// reaches nothing (the root lane's `snat_identity_is_seen_by_the_peer`
+/// reads the identity the node plane's own rule gives a real peer, under a
+/// loaded table). The fact is otherwise invisible: a fetch that completes
+/// says nothing about whose it was, and a person reading a bundle for why
+/// the box's install worked while the box's own connects are refused has
+/// this record to answer with.
+///
+/// `leaf` is the one claim that is about the host rather than the fetch —
+/// that the daemon stands in a leaf of its own beside the cohort, so the
+/// loaded chain's refusing match cannot cover it. That holds where the
+/// step's tree is installed and this daemon was placed in it, and not on a
+/// host without the step or a daemon still outside the slice, so it is the
+/// caller's to pass ([`daemon_fetch_leaf`]) and the line makes it only
+/// where it holds: named as the leaf the fetch left from where the daemon
+/// is in one, and spelled out as absent where it is not — a reader on an
+/// unclassified host is told the fetch was the daemon's own process's, not
+/// that it left a leaf no tree there holds. One line per fetch, at info,
+/// with the box, the host, the leaf it left from where there is one, and
+/// the object — a fetch is an event, not a meter, so no byte counts and no
+/// deduplication: each fetch is recorded, and nothing else is.
+pub fn record_node_plane_fetch(box_id: &str, leaf: Option<&str>, host: &str, object: &str) {
+    match leaf {
+        Some(leaf) => tracing::info!(
+            host = %host,
+            leaf = %leaf,
+            box_id = %box_id,
+            object = %object,
+            "the daemon's own fetch is node-plane traffic, from its own leaf \
+             beside the cohort: never the box's, so a deny-all host-address \
+             box's declaration refuses nothing of it"
+        ),
+        None => tracing::info!(
+            host = %host,
+            box_id = %box_id,
+            object = %object,
+            "the daemon's own fetch is node-plane traffic, made in the daemon's \
+             own process and never the box's; this daemon stands in no \
+             classifier leaf of its own, so the record names no leaf"
+        ),
+    }
 }
 
 /// The host a fetch location is fetched from, spelled for the two forms the
@@ -2156,8 +2204,12 @@ mod tests {
 
         // The record, one line per fetch: the leg above is the fetch, made
         // for the resident box, and the daemon records it with the box, the
-        // host it fetched, and the object — here the address the leg went to
-        // and the package it brought back, then a second fetch, of the
+        // host it fetched, the object, and the leaf the fetch left from —
+        // read here the way the daemon reads it at install time, off the
+        // placement the entry above made of this very process, so the
+        // record's leaf claim is a fact the tree states and not a constant
+        // it asserts wherever it runs. Here the address the leg went to and
+        // the package it brought back, then a second fetch, of the
         // registry's index, to a named host, so the per-fetch half is pinned
         // and not only the spelling. The box is named the way the tree names
         // it, by its leaf. Read the way a bundle's daemon-log tail reads it:
@@ -2168,6 +2220,13 @@ mod tests {
             .and_then(|n| n.to_str())
             .expect("the box's leaf is named with its id")
             .to_owned();
+        let leaf = daemon_fetch_leaf(&root);
+        assert_eq!(
+            leaf,
+            Some(sandbox2::classifier::DAEMON_LEAF),
+            "the daemon that entered its own leaf above reads back as in it, \
+             which is the premise the record's leaf field is about to claim"
+        );
         let log = LogCapture::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(log.clone())
@@ -2177,8 +2236,8 @@ mod tests {
         let second = "pkgs.min.internal";
         let fetched_object = "jq";
         let second_object = "index";
-        record_node_plane_fetch(&box_id, &fetched.to_string(), fetched_object);
-        record_node_plane_fetch(&box_id, second, second_object);
+        record_node_plane_fetch(&box_id, leaf, &fetched.to_string(), fetched_object);
+        record_node_plane_fetch(&box_id, leaf, second, second_object);
         let recorded = log.contents();
         let lines: Vec<&str> = recorded
             .lines()
@@ -2218,6 +2277,140 @@ mod tests {
             lines[0].contains(&fetched.to_string()) && !lines[0].contains(second),
             "the first record is the first fetch, not a summary: {lines:?}"
         );
+    }
+
+    /// NET-080: the record's leaf field is the one claim in it about the
+    /// host rather than about the fetch, so it is made only where it holds.
+    /// A daemon standing in its own leaf is recorded as fetching from it;
+    /// one that is not — a host without the step's tree, or a daemon its
+    /// `--pid` step has not placed in one — is recorded as fetching in its
+    /// own process and naming no leaf, because that is what happened: a
+    /// person reading a bundle on such a host must not be told the fetch
+    /// left a leaf no tree there holds, and `daemon_fetch_leaf` is what
+    /// keeps the record from saying it.
+    #[test]
+    fn a_record_names_a_leaf_only_where_the_daemon_stands_in_one() {
+        // The tree as a host has it, and this process is placed in its own
+        // leaf the way the daemon is at start: the leaf the record then
+        // names, read off the placement rather than assumed of any host.
+        let mount = standin_mount();
+        let root = mount.root.clone();
+        installed_cohort(&root);
+        let daemon = sandbox2::classifier::daemon_leaf(&root);
+        std::fs::create_dir_all(&daemon).expect("the step makes the daemon's own leaf");
+        model_delegation_files(&daemon);
+
+        // The half every unclassified host runs on: the leaf is there and
+        // this daemon is not in it, so no leaf of the daemon's own exists
+        // and the record says so instead of naming one. The line still
+        // carries the fetch's own three — the box, the host, the object —
+        // and the claim that holds on every host: the fetch was the
+        // daemon's own process's, never the box's.
+        assert_eq!(
+            daemon_fetch_leaf(&root),
+            None,
+            "a daemon outside its own leaf has no leaf of its own to name, \
+             which is the fact the record below must spell rather than assume"
+        );
+        let (log, guard) = capture_node_plane_log();
+        record_node_plane_fetch(
+            "a session",
+            daemon_fetch_leaf(&root),
+            "cache.min.internal",
+            "jq",
+        );
+        let unplaced = the_one_record(&log);
+        assert!(
+            unplaced.contains("INFO"),
+            "the record is at the level a bundle's tail reads: {unplaced}"
+        );
+        assert!(
+            !unplaced.contains("leaf="),
+            "the record names no leaf where the daemon stands in none: {unplaced}"
+        );
+        assert!(
+            unplaced.contains("stands in no classifier leaf of its own"),
+            "the record says why it names no leaf, so the absence reads as a \
+             fact about the host and not as a field that went missing: {unplaced}"
+        );
+        assert!(
+            unplaced.contains("never the box's"),
+            "the claim that holds on every host is made on this one too: {unplaced}"
+        );
+        for needle in ["box_id=a session", "host=cache.min.internal", "object=jq"] {
+            assert!(
+                unplaced.contains(needle),
+                "the record still names the {needle} of the fetch: {unplaced}"
+            );
+        }
+        drop(guard);
+
+        // The entry the daemon performs at start, over the same tree: the
+        // leaf read turns, and the line with it — the fetch is now recorded
+        // as leaving from the leaf the tree holds for it, beside the cohort.
+        sandbox2::classifier::enter_daemon_leaf(&root)
+            .expect("the daemon enters its own leaf over the stand-in tree");
+        assert_eq!(
+            daemon_fetch_leaf(&root),
+            Some(sandbox2::classifier::DAEMON_LEAF),
+            "the daemon that entered its leaf reads back as in it"
+        );
+        let (log, guard) = capture_node_plane_log();
+        record_node_plane_fetch(
+            "a session",
+            daemon_fetch_leaf(&root),
+            "cache.min.internal",
+            "jq",
+        );
+        let placed = the_one_record(&log);
+        assert!(
+            placed.contains("leaf=daemon"),
+            "the record names the leaf the fetch left from, where the daemon \
+             stands in one: {placed}"
+        );
+        assert!(
+            placed.contains("from its own leaf beside the cohort"),
+            "the record claims the leaf-beside-the-cohort placement where \
+             there is a leaf to claim it from: {placed}"
+        );
+        drop(guard);
+
+        // The host without the step at all: no tree, so no leaf to read and
+        // none to name — the same line as the unplaced daemon's, read the
+        // same way by a bundle's tail on a host that never ran the install.
+        let bare = tempfile::tempdir().expect("a bare stand-in tree, nothing installed in it");
+        let slice = std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+            .file_name()
+            .expect("the tree root is a path with a name");
+        assert_eq!(
+            daemon_fetch_leaf(&bare.path().join(slice)),
+            None,
+            "a host without the step's tree has no leaf of the daemon's"
+        );
+    }
+
+    /// Captures this thread's log, the way the record's tests read the line
+    /// a bundle's daemon-log tail reads it.
+    fn capture_node_plane_log() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+        let log = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (log, guard)
+    }
+
+    /// The one node-plane record a captured log holds, or a panic naming
+    /// everything it holds instead.
+    fn the_one_record(log: &LogCapture) -> String {
+        let recorded = log.contents();
+        let lines: Vec<&str> = recorded
+            .lines()
+            .filter(|line| line.contains("node-plane traffic"))
+            .collect();
+        assert_eq!(lines.len(), 1, "one record for one fetch: {recorded}");
+        lines[0].to_owned()
     }
 
     /// NET-080: the host each fetch's record names, read from the location

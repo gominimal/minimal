@@ -1244,21 +1244,37 @@ fn daemon_fetch_survives_a_live_deny_leaf_over_a_loaded_table() {
     // and this is how a person reads that it was node-plane traffic —
     // captured through a tracing subscriber this proof installs, the way a
     // bundle's daemon-log tail reads the line, never off this process's
-    // stderr. One line, at the level the tail reads, naming the host
-    // fetched with the port it left for, the leaf the fetch left from, the
-    // box it was made for, and the object.
+    // stderr. The leaf the line names is read live, over this real cgroup2,
+    // from the placement the step's `--pid` half made of this process before
+    // the box child was forked — the record's leaf claim is a fact the tree
+    // states, not a constant it asserts on hosts that carry no tree. One
+    // line, at the level the tail reads, naming the host fetched with the
+    // port it left for, the leaf the fetch left from, the box it was made
+    // for, and the object.
     let box_id = leaf
         .file_name()
         .and_then(|name| name.to_str())
         .expect("the box's leaf is named with its id")
         .to_owned();
+    let fetched_from = minimald::net::classifier::daemon_fetch_leaf(&scratch);
+    assert_eq!(
+        fetched_from,
+        Some(THE_DAEMON_LEAF),
+        "the proof process the step placed in the scratch tree's daemon leaf \
+         reads back as in it, over this host's real cgroup2"
+    );
     let log = LogCapture::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(log.clone())
         .with_ansi(false)
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
-    record_node_plane_fetch(&box_id, &server_addr.to_string(), PACKAGE_OBJECT);
+    record_node_plane_fetch(
+        &box_id,
+        fetched_from,
+        &server_addr.to_string(),
+        PACKAGE_OBJECT,
+    );
     let recorded = log.contents();
     let lines: Vec<&str> = recorded
         .lines()
