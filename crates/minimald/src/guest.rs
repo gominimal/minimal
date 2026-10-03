@@ -746,13 +746,13 @@ pub fn mount_state_volume(device: &str, mountpoint: &str) -> std::io::Result<()>
 
 /// Quiesce the state volume before VMM teardown (spec R2.1): `syncfs(2)` the
 /// mount to flush all pending writes and the ext4 journal to the block device,
-/// then close the journal (plain unmount, else remount read-only), then
-/// best-effort trim the freed extents back to the host, then best-effort
-/// lazy-detach the mount. The journal-closing step runs before the trim so a
-/// slow trim cannot push it past the quiesce timeout and leave the journal
-/// dirty. A syncfs error propagates; a trim or unmount failure is logged and
-/// swallowed — the data is already synced, so the worst case is a journal
-/// replay on the next boot.
+/// then close the journal by remounting read-only, then (only if the journal
+/// closed) best-effort trim the freed extents back to the host, then unmount —
+/// plainly if nothing holds it, else lazily. The journal-closing remount runs
+/// before the trim so a slow trim cannot push it past the quiesce timeout and
+/// leave the journal dirty. A syncfs error propagates; a remount, trim or
+/// unmount failure is logged and swallowed — the data is already synced, so
+/// the worst case is a journal replay on the next boot.
 pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -766,25 +766,16 @@ pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
 
     let c_mountpoint = CString::new(mountpoint)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in mountpoint"))?;
-    // Try a plain unmount first: a full unmount closes the ext4 journal and
-    // marks the superblock clean. It fails EBUSY while anything holds an fd
-    // under the mount (e.g. the gvproxy switch socket in the state dir), so
-    // fall back to remounting read-only — ext4 marks recovery complete on
-    // the ro transition (clearing `INCOMPAT_RECOVER`) despite read-open fds
-    // and bound sockets. A *write*-open fd (e.g. a session-spawned process
-    // that outlived the drain, reparented to pid-1) defeats the remount too;
-    // then only the lazy detach runs and the journal stays dirty — logged
-    // with the holders below, bounded by the replay backstop. Every failure
-    // arm is logged and swallowed: the data is already synced, so the worst
-    // case is a journal replay on the next boot.
+    // Close the journal first, by remounting read-only: ext4 marks recovery
+    // complete on the ro transition (clearing `INCOMPAT_RECOVER`) despite
+    // read-open fds and bound sockets (e.g. the gvproxy switch socket in the
+    // state dir), and it succeeds whenever a plain unmount would. A *write*-open
+    // fd (e.g. a session-spawned process that outlived the drain, reparented to
+    // pid-1) defeats it; then the journal stays dirty — logged with the holders
+    // below, bounded by the replay backstop.
     //
-    // SAFETY: `umount2(2)`/`mount(2)` with valid, call-lifetime C strings;
-    // MS_REMOUNT|MS_RDONLY takes no source/fstype/data; MNT_DETACH is lazy
-    // (succeeds with busy fds; the fs finishes when they drop).
-    if unsafe { libc::umount2(c_mountpoint.as_ptr(), 0) } == 0 {
-        tracing::info!(mountpoint, "state volume quiesced and unmounted");
-        return Ok(());
-    }
+    // SAFETY: `mount(2)` with a valid, call-lifetime C string;
+    // MS_REMOUNT|MS_RDONLY takes no source/fstype/data.
     let remount_ro = unsafe {
         libc::mount(
             std::ptr::null(),
@@ -794,7 +785,25 @@ pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
             std::ptr::null(),
         )
     };
-    if remount_ro != 0 {
+    if remount_ro == 0 {
+        // Best-effort trim once the journal is closed: a clean stop is the one
+        // moment the guest can return every freed extent to the host, so it
+        // runs on every stop that closed the journal — but only after the
+        // remount, so a slow trim cannot push the journal-closing step past the
+        // quiesce timeout. FITRIM is the online-discard ioctl and works on a
+        // read-only mount. Skipped when the remount failed: the journal is
+        // dirty either way, and a trim contending with a live writer would only
+        // delay the detach. The error is logged and swallowed — the data is
+        // already synced, so a failed trim only strands extents for the
+        // maintenance sweep to reclaim.
+        if let Err(error) = trim_state_volume(mountpoint) {
+            tracing::warn!(
+                mountpoint,
+                %error,
+                "trimming state volume before teardown (best-effort; already synced)"
+            );
+        }
+    } else {
         tracing::warn!(
             mountpoint,
             error = %std::io::Error::last_os_error(),
@@ -803,23 +812,19 @@ pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
         );
     }
 
-    // Best-effort trim after the journal is closed: the unmount (or remount-ro)
-    // above is what clears `INCOMPAT_RECOVER`, and it must finish inside the
-    // quiesce timeout — a slow trim before it could push that step past the
-    // budget and leave the journal dirty. FITRIM is the online-discard ioctl
-    // and works on a read-only mount, so it still runs on the remount-ro path;
-    // on the clean-unmount path the volume is already gone and the trim is
-    // skipped, which the 6-hourly maintenance sweep makes up for. The error is
-    // logged and swallowed — the data is already synced, so a failed trim only
-    // strands extents for the next boot's sweep to reclaim.
-    if let Err(error) = trim_state_volume(mountpoint) {
-        tracing::warn!(
+    // Then unmount: plainly when nothing holds the mount, else lazily. A plain
+    // unmount fails EBUSY while anything holds an fd under the mount; the lazy
+    // detach succeeds with busy fds and the fs finishes when they drop.
+    //
+    // SAFETY: `umount2(2)` with a valid, call-lifetime C string.
+    if unsafe { libc::umount2(c_mountpoint.as_ptr(), 0) } == 0 {
+        tracing::info!(
             mountpoint,
-            %error,
-            "trimming state volume before teardown (best-effort; already synced)"
+            remounted_ro = remount_ro == 0,
+            "state volume quiesced and unmounted"
         );
+        return Ok(());
     }
-
     if unsafe { libc::umount2(c_mountpoint.as_ptr(), libc::MNT_DETACH) } != 0 {
         tracing::warn!(
             mountpoint,
