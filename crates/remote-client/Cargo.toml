@@ -1,5 +1,6 @@
 [package]
 name = "remote-client"
+description = "Client for the Remote Execution Service, driving remote builds against the graph."
 version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true

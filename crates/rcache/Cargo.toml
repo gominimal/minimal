@@ -1,5 +1,6 @@
 [package]
 name = "rcache"
+description = "Remote cache: fetch/upload build artifacts over the network."
 version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
