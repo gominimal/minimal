@@ -456,8 +456,11 @@ pub async fn expose_mapping(
 /// # Errors
 ///
 /// The unexpose error, for the caller to say and decide about: a forward
-/// that fails to come down still stands at its `local`, so the withdrawal
-/// is retried while the watcher lives.
+/// that fails to come down still stands at its `local`, so the caller keeps
+/// it in its published set — retrying the unexpose through the passes the
+/// stop that ends the watcher makes, and re-admitting the port if its
+/// listener returns before they run — never leaving it standing unowned for
+/// the switch's lifetime.
 pub async fn unexpose_mapping(
     control: &ControlChannel,
     mapping: &ExposedMapping,

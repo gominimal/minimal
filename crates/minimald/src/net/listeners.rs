@@ -30,6 +30,16 @@
 //! the runtime-published set (NET-081's sub-requirement), which is why the
 //! two halves are tracked apart all the way down to the gate.
 //!
+//! Two properties the story's shape rides on, beside the diff itself. The
+//! table is read as the forward reads the box: a listener counts only when
+//! its bind can answer the dial a publication makes — to the box's lease —
+//! so a process bound to the box's loopback alone is not published at all
+//! ([`binds_for_the_lease`]); and nothing here is one-shot — a publication
+//! whose bind failed is retried on the next poll, a withdrawal whose
+//! unexpose failed is retried through the stop's passes, so a transient
+//! refusal on the control channel never settles into a port that stays
+//! missing or a forward that stays bound.
+//!
 //! Polling, not a socket-diagnostic netlink socket or an inotify watch, is
 //! the honest read here: `/proc/<pid>/net/tcp` emits no change notification
 //! there is to subscribe to, and a process inside the box can bind without
@@ -64,6 +74,14 @@ use super::switch::SessionGate;
 /// enough that one box's watcher is not a load on the daemon — one small
 /// `/proc` read per box per quarter second.
 const LISTEN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How many passes the stop's withdrawal ([`WatchState::withdraw_all`])
+/// makes at the forwards still standing: the first, then a bounded number
+/// of retries for those a pass could not bring down — enough that a
+/// transient refusal does not leave a forward bound past its box, holding
+/// the box's published address:port against a future session there, never
+/// enough that a control channel that is down outright hangs the stop.
+const WITHDRAW_PASSES: usize = 3;
 
 /// Everything a box's listener watcher needs, gathered by the launch that
 /// attached the box: its name (each publication's line names the box), its
@@ -209,10 +227,14 @@ impl ListenWatcher {
 /// never enters it.
 struct WatchState {
     plan: ListenPlan,
-    /// The listening ports the last read named — published or not, so the
-    /// diff knows an appearance from a persistence.
+    /// The listening ports the last read settled — published, declined by
+    /// the rules, or a declaration's own. A port whose publication failed to
+    /// bind is held out until a poll binds it, so the diff reads it as
+    /// appeared again: the retry the bind failure's line promises.
     listening: HashSet<u16>,
-    /// The forwards standing for the ports the watcher published.
+    /// The forwards standing for the ports the watcher published — standing
+    /// on the switch, including one whose unexpose failed and whose
+    /// withdrawal is therefore still owed.
     forwards: HashMap<u16, ExposedMapping>,
 }
 
@@ -226,9 +248,14 @@ impl WatchState {
     }
 
     /// One poll: read the box's listening sockets, publish what appeared,
-    /// withdraw what closed.
+    /// withdraw what closed. A publication that failed to bind keeps its
+    /// port out of the book ([`Self::listening`]), so the next poll reads
+    /// the port as appeared again and retries it — the appearance is not
+    /// consumed by the failure, and a transient refusal on the control
+    /// channel never turns into a permitted port that stays unpublished
+    /// until its server restarts.
     async fn poll(&mut self, leader: u32) {
-        let listening = match listening_ports(leader) {
+        let listening = match listening_ports(leader, self.plan.lease) {
             Ok(listening) => listening,
             Err(e) => {
                 // The leader's entry is gone or unreadable — the box's
@@ -249,26 +276,53 @@ impl WatchState {
         // here cannot be seen by the withdrawal beside it.
         let appeared: Vec<u16> = listening.difference(&self.listening).copied().collect();
         let disappeared: Vec<u16> = self.listening.difference(&listening).copied().collect();
+        let mut unsettled = HashSet::new();
         for port in appeared {
-            self.open(port).await;
+            if !self.open(port).await {
+                unsettled.insert(port);
+            }
         }
         for port in disappeared {
             self.close(port, "listener closed").await;
         }
         self.listening = listening;
+        self.listening.retain(|port| !unsettled.contains(port));
     }
 
     /// NET-016: one listening port appeared. The shared verdict decides
-    /// what the appearance is worth before anything is bound.
-    async fn open(&mut self, port: u16) {
+    /// what the appearance is worth before anything is bound. Returns
+    /// whether the appearance is settled — `false` only for a permitted
+    /// port whose forward failed to bind, the one appearance [`Self::poll`]
+    /// hands back to the next poll as appeared again.
+    async fn open(&mut self, port: u16) -> bool {
         match self.plan.gate.listen_verdict(port) {
             ListenVerdict::Publish => {
+                if self.forwards.contains_key(&port) {
+                    // The port's listener closed, the withdrawal's unexpose
+                    // failed, and the listener is back before the stop
+                    // could retry the forward down: the forward never came
+                    // down, so the publication still stands and still
+                    // delivers to a port the rules permit. Re-admit it
+                    // rather than ask the switch to bind a second forward
+                    // onto the bind this one still holds.
+                    self.plan.gate.admit_published(port);
+                    tracing::info!(
+                        session = %self.plan.box_name,
+                        host = %self.plan.published,
+                        port,
+                        verdict = "permitted",
+                        reason = "the listener returned while its withdrawal had failed",
+                        "re-admitted a listening port on the box's address"
+                    );
+                    return true;
+                }
                 // The forward binds before the gate admits — the order the
                 // declaration's own apply holds (NET-121), so a port is
                 // never admitted while nothing answers for it, and a bind
                 // that fails admits nothing (the failure is already said,
-                // one warn at the bind): the next poll sees the port still
-                // unpublished and tries again.
+                // one warn at the bind): the poll keeps the port out of
+                // its book, so the next poll sees it still unpublished and
+                // tries again.
                 if let Ok(mapping) = expose_mapping(
                     &self.plan.control,
                     self.plan.published,
@@ -286,14 +340,16 @@ impl WatchState {
                         verdict = "permitted",
                         "published a listening port on the box's address"
                     );
+                    return true;
                 }
+                false
             }
             // A declaration names the port: its forward was bound at
             // publish and is held until the box stops (NET-121), so there
             // is nothing to publish — and when the listener closes, nothing
             // to withdraw (NET-081's sub-requirement). The declaration's
             // own bind lines already name the port.
-            ListenVerdict::Declared => {}
+            ListenVerdict::Declared => true,
             ListenVerdict::Deny => {
                 tracing::info!(
                     session = %self.plan.box_name,
@@ -301,6 +357,7 @@ impl WatchState {
                     verdict = "not permitted",
                     "left a listening port unpublished"
                 );
+                true
             }
         }
     }
@@ -331,60 +388,86 @@ impl WatchState {
             Err(_) => {
                 // The unexpose failed and said so. The gate already refuses
                 // the port, so nothing reaches the box through the forward
-                // left standing; keep it in the published set so this
-                // stop's last pass tries it again rather than leaving it
-                // for the switch's lifetime.
+                // left standing; keep it in the published set — the stop's
+                // withdrawal passes retry it before the watcher ends, and a
+                // listener that comes back first re-admits the forward it
+                // still holds — rather than leaving it for the switch's
+                // lifetime.
                 self.forwards.insert(port, mapping);
             }
         }
     }
 
     /// Stops the box's whole runtime-published surface: every forward still
-    /// standing, withdrawn in the same order a listener's closing takes.
+    /// standing, withdrawn in the same order a listener's closing takes. A
+    /// forward whose unexpose failed is retried on the next pass, one
+    /// poll-interval apart, so a transient refusal does not leave it bound
+    /// past its box holding the box's published address:port — and the
+    /// passes are bounded, so a control channel that is down outright ends
+    /// the stop rather than hanging it. Whatever still stands when they are
+    /// spent is named, never left silent.
     async fn withdraw_all(&mut self) {
-        let ports: Vec<u16> = self.forwards.keys().copied().collect();
-        for port in ports {
-            self.close(port, "box stopped").await;
+        for attempt in 0..WITHDRAW_PASSES {
+            if self.forwards.is_empty() {
+                return;
+            }
+            if attempt > 0 {
+                // A moment between passes, so a forwarder that was refusing
+                // while mid-restart can answer the retry.
+                tokio::time::sleep(LISTEN_POLL_INTERVAL).await;
+            }
+            let ports: Vec<u16> = self.forwards.keys().copied().collect();
+            for port in ports {
+                self.close(port, "box stopped").await;
+            }
         }
+        let still: Vec<&str> = self.forwards.values().map(ExposedMapping::local).collect();
+        tracing::warn!(
+            session = %self.plan.box_name,
+            still_published = ?still,
+            "the box stopped with listening ports its watcher could not withdraw"
+        );
     }
 }
 
-/// The TCP ports a listening socket holds in the network namespace `leader`'s
-/// `/proc` entry names — the box's, read through its leader: the kernel's
-/// socket tables are per-network-namespace, so one process's entry names
-/// every listening socket in the box, whichever of its processes holds it.
-/// Both tables are read — a server bound on the IPv6 any address accepts
-/// IPv4 connections, and its row lives in `tcp6`.
+/// The TCP ports the listening sockets of the network namespace `leader`'s
+/// `/proc` entry name hold at the box's `lease` — the box's own table, read
+/// through its leader: the kernel's socket tables are per-network-namespace,
+/// so one process's entry names every listening socket in the box, whichever
+/// of its processes holds it. Both tables are read — a server bound on the
+/// IPv6 any address accepts IPv4 connections, and its row lives in `tcp6` —
+/// and only the rows a publication's forward can deliver to are kept
+/// ([`binds_for_the_lease`]).
 ///
 /// # Errors
 ///
 /// Any read failure, so a caller decides what an unreadable table means
 /// rather than silently acting on half of one.
-fn listening_ports(leader: u32) -> io::Result<HashSet<u16>> {
+fn listening_ports(leader: u32, lease: Ipv4Addr) -> io::Result<HashSet<u16>> {
     let entry = Path::new("/proc").join(leader.to_string());
-    let mut ports = read_listening(&entry.join("net/tcp"), false)?;
-    ports.extend(read_listening(&entry.join("net/tcp6"), true)?);
+    let mut ports = read_listening(&entry.join("net/tcp"), false, lease)?;
+    ports.extend(read_listening(&entry.join("net/tcp6"), true, lease)?);
     Ok(ports)
 }
 
 /// One kernel socket table's listening ports: every row in state `0A`
-/// (`TCP_LISTEN`) whose local address an IPv4 forward can deliver to. The
-/// first line is the table's header.
-fn read_listening(table: &Path, v6: bool) -> io::Result<HashSet<u16>> {
+/// (`TCP_LISTEN`) whose local address a forward dialing the box's lease can
+/// deliver to. The first line is the table's header.
+fn read_listening(table: &Path, v6: bool, lease: Ipv4Addr) -> io::Result<HashSet<u16>> {
     let text = std::fs::read_to_string(table)?;
     Ok(text
         .lines()
         .skip(1)
-        .filter_map(|line| listen_port(line, v6))
+        .filter_map(|line| listen_port(line, v6, lease))
         .collect())
 }
 
 /// The port of one listening row of the kernel's socket table, or `None`
 /// for any other row: the header, a truncated row, a socket in any state
 /// but `TCP_LISTEN` — an established or time-wait socket is a connection,
-/// not a listener — or, in the v6 table, an address no IPv4 forward can
-/// deliver to.
-fn listen_port(line: &str, v6: bool) -> Option<u16> {
+/// not a listener — or a listener whose bind the forward's dial cannot
+/// reach, whichever table it is in.
+fn listen_port(line: &str, v6: bool, lease: Ipv4Addr) -> Option<u16> {
     let mut fields = line.split_whitespace();
     // `sl:` — the table's index column, always first.
     fields.next()?;
@@ -395,31 +478,68 @@ fn listen_port(line: &str, v6: bool) -> Option<u16> {
         return None;
     }
     let (address, port) = local.rsplit_once(':')?;
-    if v6 && !serves_v4(address) {
+    if !binds_for_the_lease(address, v6, lease) {
         return None;
     }
     u16::from_str_radix(port, 16).ok()
 }
 
-/// Whether a `tcp6` row's address can answer an IPv4 connection: the
-/// dual-stack any (`::`), which accepts IPv4 by mapping, or a mapped
-/// address (`::ffff:a.b.c.d`). A listener on any other v6 address cannot be
-/// reached at the box's IPv4 lease, so publishing it would bind a forward
-/// that dials a box with nothing listening for it — it is not a publication
-/// the story owes. The kernel prints each 32-bit word little-endian, so the
-/// marker reads `FFFF0000` and the mapped any reads as four zero words.
-fn serves_v4(address: &str) -> bool {
+/// Whether a listening row's local address can answer the connection a
+/// publication's forward makes. The forward dials `lease:port` — never
+/// another address in the box's namespace — so only a socket bound to the
+/// any address, which answers on every address the namespace holds, or to
+/// the lease itself ever hears it. A socket bound anywhere else — the
+/// box's loopback, the shape a dev server binds by default — would leave
+/// the publication a phantom: the box's address accepting a connection
+/// only for the dial to be refused at the lease, a reset in the place
+/// NET-014 owes a refusal. Such a row is left unpublished, so nothing is
+/// ever bound at the box's address for the port at all.
+///
+/// For a `tcp6` row the same rule reads the IPv4 address the v6 socket can
+/// serve: the dual-stack any (`::`), which accepts IPv4 by mapping, or a
+/// mapped address (`::ffff:a.b.c.d`) whose v4 part is the any or the lease.
+/// A listener on any other v6 address cannot be reached at the box's IPv4
+/// lease at all.
+fn binds_for_the_lease(address: &str, v6: bool, lease: Ipv4Addr) -> bool {
+    if !v6 {
+        return match v4_word(address) {
+            Some(bound) => bound.is_unspecified() || bound == lease,
+            None => false,
+        };
+    }
     if address.len() != 32 {
         return false;
     }
-    address.bytes().all(|b| b == b'0')
-        || (address.starts_with("0000000000000000") && &address[16..24] == "FFFF0000")
+    // The kernel prints each 32-bit word little-endian, so the mapped
+    // marker reads `FFFF0000` and the dual-stack any as four zero words.
+    if address.bytes().all(|b| b == b'0') {
+        return true;
+    }
+    address.starts_with("0000000000000000FFFF0000")
+        && match address.get(24..32).and_then(v4_word) {
+            Some(bound) => bound.is_unspecified() || bound == lease,
+            None => false,
+        }
+}
+
+/// One word of the kernel's address column as the IPv4 address it names:
+/// the table prints each 32-bit word little-endian — `127.0.0.1` reads
+/// `0100007F` — so the eight hex digits are byte-swapped back into network
+/// order. `None` for anything that is not exactly that.
+fn v4_word(word: &str) -> Option<Ipv4Addr> {
+    if word.len() != 8 || !word.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(word, 16)
+        .ok()
+        .map(|word| Ipv4Addr::from(word.swap_bytes()))
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -496,15 +616,19 @@ mod tests {
     }
 
     /// A gvproxy-shaped control channel at `path`: every request is read in
-    /// full, answered `200`, and recorded as its verb, `local` and
-    /// `remote`. The channel the real switch's forwarder verbs ride, with
-    /// its binds recorded instead of performed — what the proofs here read
-    /// is the request the watcher made, because the switch's behaviour is
-    /// `policy`'s own to prove. The server ends when the test drops its
-    /// receiver.
-    fn spawn_forwarder(path: PathBuf) -> (tokio::task::JoinHandle<()>, mpsc::Receiver<Served>) {
+    /// full, answered with the status `decide` picks for it, and recorded as
+    /// its verb, `local` and `remote`. The channel the real switch's
+    /// forwarder verbs ride, with its binds recorded instead of performed —
+    /// what the proofs here read is the request the watcher made, because
+    /// the switch's behaviour is `policy`'s own to prove. The server ends
+    /// when the test drops its receiver.
+    fn spawn_forwarder_deciding(
+        path: PathBuf,
+        decide: impl Fn(&Served) -> u16 + Send + Sync + 'static,
+    ) -> (tokio::task::JoinHandle<()>, mpsc::Receiver<Served>) {
         let listener = UnixListener::bind(&path).expect("the control socket binds");
         let (tx, rx) = mpsc::channel(64);
+        let decide = std::sync::Arc::new(decide);
         let handle = tokio::spawn(async move {
             // Sequential on purpose: the watcher publishes and withdraws one
             // port at a time, awaited, so one connection served at a time is
@@ -514,14 +638,22 @@ mod tests {
                     return;
                 };
                 let (path, body) = read_request(&mut sock).await;
-                sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                    .await
-                    .expect("the fake forwarder must answer");
                 let served = Served {
                     path,
                     local: field_of(&body, "local"),
                     remote: field_of(&body, "remote"),
                 };
+                let status = decide(&served);
+                let reason = if status == 200 {
+                    "OK"
+                } else {
+                    "Internal Server Error"
+                };
+                sock.write_all(
+                    format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                )
+                .await
+                .expect("the fake forwarder must answer");
                 if tx.send(served).await.is_err() {
                     return;
                 }
@@ -530,12 +662,22 @@ mod tests {
         (handle, rx)
     }
 
+    /// [`spawn_forwarder_deciding`] for a forwarder that accepts everything
+    /// — the shape every proof needs but the ones whose refusals are the
+    /// point.
+    fn spawn_forwarder(path: PathBuf) -> (tokio::task::JoinHandle<()>, mpsc::Receiver<Served>) {
+        spawn_forwarder_deciding(path, |_| 200)
+    }
+
     /// A bound, listening TCP socket in this process — the stand-in for the
     /// server a box's process runs: the watcher reads the kernel's socket
     /// table, and the test's own process is a leader whose table the port is
-    /// genuinely in.
+    /// genuinely in. Bound to the any address, the one bind a publication's
+    /// dial can always reach at the box's lease, so the row is one the
+    /// watcher publishes.
     fn listening_socket() -> TcpListener {
-        TcpListener::bind(("127.0.0.1", 0)).expect("an ephemeral loopback port binds")
+        TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .expect("an ephemeral port binds on the any address")
     }
 
     /// The port a bound listener holds.
@@ -565,6 +707,30 @@ mod tests {
         }
     }
 
+    /// The box's watcher against the fake forwarder bound at `sock`, with
+    /// its gate answering the given policy. This process is the leader: its
+    /// own `/proc` entry is the table the watcher reads, and the sockets the
+    /// test binds are in it.
+    fn watcher_at(
+        sock: PathBuf,
+        policy: &sessions::SessionPolicy,
+    ) -> (ListenWatcher, Arc<SessionGate>) {
+        let gate = Arc::new(SessionGate::for_session(
+            "listen-box".into(),
+            LEASE,
+            policy,
+            SwitchSubnet::default(),
+        ));
+        let plan = ListenPlan::new(
+            "listen-box".into(),
+            LEASE,
+            PUBLISHED,
+            ControlChannel::Unix(sock),
+            Arc::clone(&gate),
+        );
+        (ListenWatcher::start(plan, std::process::id()), gate)
+    }
+
     /// The box's watcher, started against a fake gvproxy control channel
     /// bound at a fresh socket, with its gate answering the given policy.
     /// Returns the watcher, the gate, and the fake's served-request
@@ -580,22 +746,7 @@ mod tests {
     ) {
         let sock = dir.path().join("gvproxy.sock");
         let (server, served) = spawn_forwarder(sock.clone());
-        let gate = Arc::new(SessionGate::for_session(
-            "listen-box".into(),
-            LEASE,
-            policy,
-            SwitchSubnet::default(),
-        ));
-        let plan = ListenPlan::new(
-            "listen-box".into(),
-            LEASE,
-            PUBLISHED,
-            ControlChannel::Unix(sock),
-            Arc::clone(&gate),
-        );
-        // This process is the leader: its own `/proc` entry is the table the
-        // watcher reads, and the sockets the test binds are in it.
-        let watcher = ListenWatcher::start(plan, std::process::id());
+        let (watcher, gate) = watcher_at(sock, policy);
         (watcher, gate, server, served)
     }
 
@@ -740,7 +891,7 @@ mod tests {
 
         // A fresh listener on the same port publishes it again: the
         // withdrawal held nothing back.
-        let restarted = std::net::TcpListener::bind(("127.0.0.1", port))
+        let restarted = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
             .expect("a closed listener leaves its port free to rebind");
         let republished = next_served(&mut served).await;
         assert_eq!(republished.path, "/services/forwarder/expose");
@@ -754,64 +905,322 @@ mod tests {
         server.abort();
     }
 
+    /// A publication whose bind failed is not consumed by the failure: the
+    /// next poll sees the port still unpublished — a transient refusal on
+    /// the control channel must not leave a permitted port unpublished
+    /// until its server restarts — and the retry that binds admits the
+    /// port, so the failure cost only the moment between the two requests.
+    #[tokio::test]
+    async fn a_failed_publish_is_retried_on_the_next_poll() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("gvproxy.sock");
+        // The forwarder refuses the port's first expose — the shape of a
+        // forwarder mid-restart, or a bind not free yet — and accepts every
+        // request after it.
+        let refused = AtomicBool::new(true);
+        let (server, mut served) = spawn_forwarder_deciding(sock.clone(), move |served| {
+            if served.path.ends_with("/expose") && refused.swap(false, Ordering::SeqCst) {
+                500
+            } else {
+                200
+            }
+        });
+        let (watcher, gate) = watcher_at(sock, &permit_policy(port));
+
+        // The first poll's expose is refused: nothing is published and
+        // nothing is admitted.
+        let first = next_served(&mut served).await;
+        assert_eq!(first.path, "/services/forwarder/expose");
+        assert_eq!(first.local, format!("{PUBLISHED}:{port}"));
+        assert!(!gate.admits_tcp(port));
+
+        // A later poll asks for the same port again — the appearance the
+        // failure could not settle — and the retry binds and admits.
+        let retried = next_served(&mut served).await;
+        assert_eq!(
+            retried,
+            Served {
+                path: "/services/forwarder/expose".into(),
+                local: format!("{PUBLISHED}:{port}"),
+                remote: format!("{LEASE}:{port}"),
+            },
+            "the retry is the same publication the refusal turned away"
+        );
+        soon(|| gate.admits_tcp(port)).await;
+
+        watcher.stop().await;
+        let withdrawn = next_served(&mut served).await;
+        assert_eq!(withdrawn.path, "/services/forwarder/unexpose");
+        server.abort();
+    }
+
+    /// A withdrawal whose unexpose failed is not abandoned by the stop: the
+    /// stop retries it before it returns, so no forward a box's processes
+    /// published by listening outlives the box — a stale forward would hold
+    /// the box's published address:port against a future session there.
+    #[tokio::test]
+    async fn a_failed_withdrawal_is_retried_before_the_stop_returns() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("gvproxy.sock");
+        // The forwarder refuses the port's first unexpose — the stop's first
+        // pass — and accepts every request after it, the retry included.
+        let refused = AtomicBool::new(true);
+        let (server, mut served) = spawn_forwarder_deciding(sock.clone(), move |served| {
+            if served.path.ends_with("/unexpose") && refused.swap(false, Ordering::SeqCst) {
+                500
+            } else {
+                200
+            }
+        });
+        let (watcher, gate) = watcher_at(sock, &permit_policy(port));
+
+        let published = next_served(&mut served).await;
+        assert_eq!(published.path, "/services/forwarder/expose");
+        soon(|| gate.admits_tcp(port)).await;
+
+        // The stop refuses to return with the forward still standing: the
+        // refused withdrawal is retried inside it and comes down.
+        watcher.stop().await;
+        let records = drained(&mut served);
+        let withdrawals: Vec<&Served> = records
+            .iter()
+            .filter(|served| served.path == "/services/forwarder/unexpose")
+            .collect();
+        assert_eq!(
+            withdrawals.len(),
+            2,
+            "the refused withdrawal was retried before the stop returned: {records:?}"
+        );
+        assert!(
+            withdrawals
+                .iter()
+                .all(|served| served.local == format!("{PUBLISHED}:{port}")),
+            "both passes named the same publication: {records:?}"
+        );
+        assert!(!gate.admits_tcp(port), "the publication ended with the box");
+        server.abort();
+    }
+
+    /// A listener bound to the box's loopback alone is never published,
+    /// whatever the rules permit: a publication's forward dials the box's
+    /// lease, which such a bind never answers, so publishing it would bind
+    /// a forward to nothing — the box's address accepting a connection only
+    /// to have it refused at the lease. The port the rules permit beside it
+    /// publishes, which is the control that the poll ran and read both
+    /// sockets and chose between them.
+    #[tokio::test]
+    async fn a_loopback_bound_listener_is_not_published() {
+        let loopback = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("an ephemeral port binds on the loopback alone");
+        let loop_port = port_of(&loopback);
+        let any = listening_socket();
+        let any_port = port_of(&any);
+        let dir = tempfile::tempdir().unwrap();
+        // The rules permit both ports: only the binds differ.
+        let policy = sessions::SessionPolicy {
+            ingress: Some(sessions::IngressPolicy {
+                port_mappings: Vec::new(),
+                dynamic_allowed_range: Some((loop_port.min(any_port), loop_port.max(any_port))),
+                dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+            }),
+            egress: None,
+        };
+        let (watcher, gate, server, mut served) = started_watcher(&dir, &policy);
+
+        // The any-bound listener publishes: the poll ran, read both rows,
+        // and it is the loopback bind alone that made the other unpublished.
+        let published = next_served(&mut served).await;
+        assert_eq!(published.local, format!("{PUBLISHED}:{any_port}"));
+        soon(|| gate.admits_tcp(any_port)).await;
+        assert!(
+            !gate.admits_tcp(loop_port),
+            "a bind the forward's dial cannot reach is never admitted"
+        );
+
+        // No request ever names the loopback port — across the stop's own
+        // withdrawal too, so the silence is the watcher's decision and not a
+        // record the test drained early.
+        watcher.stop().await;
+        let records = drained(&mut served);
+        assert!(
+            records
+                .iter()
+                .all(|served| served.local != format!("{PUBLISHED}:{loop_port}")),
+            "no request ever names the loopback-bound port: {records:?}"
+        );
+        server.abort();
+    }
+
+    /// A listener that returns while its withdrawal had failed finds the
+    /// forward it never lost: the publication never came down, so it is
+    /// re-admitted rather than re-bound — the switch still holds the first
+    /// forward, and a second expose against that bind would fail every poll
+    /// the port's rules permit. The stop that ends the watcher still tries
+    /// the forward down, bounded, and never hangs on a channel that refuses
+    /// every unexpose.
+    #[tokio::test]
+    async fn a_listener_back_before_its_failed_withdrawal_keeps_the_publication() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("gvproxy.sock");
+        // The forwarder accepts every expose and refuses every unexpose: a
+        // switch whose unbind verb is failing outright.
+        let (server, mut served) = spawn_forwarder_deciding(sock.clone(), |served| {
+            if served.path.ends_with("/unexpose") {
+                500
+            } else {
+                200
+            }
+        });
+        let (watcher, gate) = watcher_at(sock, &permit_policy(port));
+
+        // Every request the watcher made: the awaited ones kept beside the
+        // ones the stop's teardown leaves unread, so the counts below read
+        // the whole exchange and not a tail of it.
+        let mut requests = Vec::new();
+        let published = next_served(&mut served).await;
+        assert_eq!(published.path, "/services/forwarder/expose");
+        requests.push(published);
+        soon(|| gate.admits_tcp(port)).await;
+
+        // The listener closes and the withdrawal is refused: the record is
+        // awaited, not assumed, so the rebind below cannot race the poll
+        // that has to see the closure first.
+        drop(listener);
+        let refused = next_served(&mut served).await;
+        assert_eq!(refused.path, "/services/forwarder/unexpose");
+        requests.push(refused);
+        soon(|| !gate.admits_tcp(port)).await;
+
+        // The listener returns on the same port. The forward never came
+        // down, so the publication it still holds serves the port again —
+        // re-admitted, with no second bind asked of the switch.
+        let restarted = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
+            .expect("a closed listener leaves its port free to rebind");
+        soon(|| gate.admits_tcp(port)).await;
+
+        // The stop tries the never-withdrawn forward down across its
+        // bounded passes and returns without hanging on the channel that
+        // refuses them all.
+        watcher.stop().await;
+        requests.extend(drained(&mut served));
+        let exposes = requests
+            .iter()
+            .filter(|served| served.path == "/services/forwarder/expose")
+            .count();
+        assert_eq!(
+            exposes, 1,
+            "the returning listener was served by the forward still standing, never re-bound: {requests:?}"
+        );
+        let withdrawals = requests
+            .iter()
+            .filter(|served| served.path == "/services/forwarder/unexpose")
+            .count();
+        assert_eq!(
+            withdrawals,
+            1 + WITHDRAW_PASSES,
+            "the refused withdrawal mid-life and every one of the stop's passes: {requests:?}"
+        );
+        assert!(!gate.admits_tcp(port), "the publication ended with the box");
+        drop(restarted);
+        server.abort();
+    }
+
     /// The kernel socket table's rows read as the watcher reads them: a
     /// listener's port, and only a listener's — an established socket is a
-    /// connection, not a publication — from either table, and from the v6
-    /// table only where the address can answer an IPv4 connection.
+    /// connection, not a publication — from either table, and only where
+    /// the bind can answer a forward dialing the box's lease: the any
+    /// address and the lease itself, in either table's spelling.
     #[test]
     fn socket_rows_read_their_listening_port() {
-        // The v4 table: header, a listener on 127.0.0.1:8080
-        // (`0100007F:1F90`), an established socket at the same port, and a
-        // row too short to read.
+        // The v4 table: header, a listener on the any address
+        // (`00000000:1F90`), one on the box's lease (`09004064`, the
+        // little-endian word for 100.64.0.9), a loopback-bound listener
+        // (`0100007F:1F92`) no dial at the lease can reach, an established
+        // socket, and a row too short to read.
         let v4 = "  sl  local_address  rem_address   st\n\
-                  0: 0100007F:1F90 00000000:0000 0A 00000000:00000000\n\
-                  1: 0100007F:1F90 0100007F:9C4A 01 00000000:00000000\n\
-                  2: 0100007F";
+                  0: 00000000:1F90 00000000:0000 0A 00000000:00000000\n\
+                  1: 09004064:1F91 00000000:0000 0A 00000000:00000000\n\
+                  2: 0100007F:1F92 00000000:0000 0A 00000000:00000000\n\
+                  3: 0100007F:1F90 0100007F:9C4A 01 00000000:00000000\n\
+                  4: 0100007F";
         let ports: HashSet<u16> = v4
             .lines()
             .skip(1)
-            .filter_map(|line| listen_port(line, false))
+            .filter_map(|line| listen_port(line, false, LEASE))
             .collect();
-        assert_eq!(ports, HashSet::from([8080]));
+        assert_eq!(ports, HashSet::from([8080, 8081]));
 
-        // The v6 table: the dual-stack any (`::`), a v4-mapped listener,
-        // and a pure v6 address no IPv4 forward can deliver to.
+        // The v6 table: the dual-stack any (`::`), a v4-mapped bind on the
+        // lease, a v4-mapped loopback bind, and a pure v6 address — the
+        // last two answer no IPv4 dial at the lease.
         let v6 = "  sl  local_address  rem_address   st\n\
                   0: 00000000000000000000000000000000:1F90 00000000000000000000000000000000:0000 0A\n\
-                  1: 0000000000000000FFFF00000100007F:2328 00000000000000000000000000000000:0000 0A\n\
-                  2: 00000000000000000000000100000000:2329 00000000000000000000000000000000:0000 0A\n";
+                  1: 0000000000000000FFFF000009004064:2328 00000000000000000000000000000000:0000 0A\n\
+                  2: 0000000000000000FFFF00000100007F:2329 00000000000000000000000000000000:0000 0A\n\
+                  3: 00000000000000000000000100000000:2329 00000000000000000000000000000000:0000 0A\n";
         let ports: HashSet<u16> = v6
             .lines()
             .skip(1)
-            .filter_map(|line| listen_port(line, true))
+            .filter_map(|line| listen_port(line, true, LEASE))
             .collect();
         assert_eq!(ports, HashSet::from([8080, 9000]));
         assert!(
-            !serves_v4("00000000000000000000000100000000"),
-            "a pure v6 address"
+            binds_for_the_lease("00000000000000000000000000000000", true, LEASE),
+            "the dual-stack any"
         );
         assert!(
-            serves_v4("00000000000000000000000000000000"),
-            "the dual-stack any"
+            binds_for_the_lease("0000000000000000FFFF000009004064", true, LEASE),
+            "a mapped bind on the lease"
+        );
+        assert!(
+            !binds_for_the_lease("0000000000000000FFFF00000100007F", true, LEASE),
+            "a mapped loopback bind"
+        );
+        assert!(
+            !binds_for_the_lease("00000000000000000000000100000000", true, LEASE),
+            "a pure v6 address"
+        );
+        assert!(binds_for_the_lease("00000000", false, LEASE), "the v4 any");
+        assert!(binds_for_the_lease("09004064", false, LEASE), "the lease");
+        assert!(
+            !binds_for_the_lease("0100007F", false, LEASE),
+            "the box's loopback"
         );
     }
 
     /// The leader's process entry names its own listening sockets, and stops
     /// naming them when they close: the table the watcher's whole story
-    /// reads, proved against the real kernel rather than a fixture.
+    /// reads, proved against the real kernel rather than a fixture — with
+    /// the bind shape the watcher distinguishes: a loopback-bound listener
+    /// is in the kernel's table but is never one of the box's publications.
     #[test]
     fn the_leader_entry_names_its_own_listeners() {
-        let listener = listening_socket();
-        let port = port_of(&listener);
-        let ports = listening_ports(std::process::id()).expect("this process's entry is readable");
+        let reachable = listening_socket();
+        let reachable_port = port_of(&reachable);
+        let loopback = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("an ephemeral port binds on the loopback alone");
+        let loop_port = port_of(&loopback);
+        let ports =
+            listening_ports(std::process::id(), LEASE).expect("this process's entry is readable");
         assert!(
-            ports.contains(&port),
-            "a bound listener is in the leader's table"
+            ports.contains(&reachable_port),
+            "a listener bound to the any address is in the leader's table"
         );
-        drop(listener);
-        let ports = listening_ports(std::process::id()).expect("this process's entry is readable");
         assert!(
-            !ports.contains(&port),
+            !ports.contains(&loop_port),
+            "a loopback-bound listener is no publication: a forward dials the lease"
+        );
+        drop(reachable);
+        let ports =
+            listening_ports(std::process::id(), LEASE).expect("this process's entry is readable");
+        assert!(
+            !ports.contains(&reachable_port),
             "a closed listener leaves the leader's table"
         );
     }
