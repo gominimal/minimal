@@ -4667,3 +4667,165 @@ fn the_write_lock_promotion_moves_an_interim_to_a_vouched_hand_only() {
         None
     );
 }
+
+/// The call that helper was extracted from, driven through
+/// `register_hostname` itself rather than `promote_interim_to_hand` on its
+/// own ([`the_write_lock_promotion_moves_an_interim_to_a_vouched_hand_only`]
+/// pins the decision; this pins that the registration makes the call): a
+/// registration whose ask the unvouched verdict answered with the
+/// `127.0.0.1` interim publishes at its hand instead when the verdict
+/// lands present before the write lock — the window the re-read under the
+/// lock exists for, so a registration that skips the call leaves the box
+/// standing at the interim.
+///
+/// The window is driven deterministically, with no timer deciding
+/// anything: the box's first finalize is the one registration that waits
+/// for the verdict, and that wait — the one await between the ask and the
+/// publish — is where the test takes the registry's write lock. An
+/// **absent** landing wakes the ask, which answers the interim (one
+/// `loopback-hand-to-interim` line) and parks the registration on the
+/// held lock; the waiters count reaching zero is the proof the ask
+/// consumed the absent answer before the next landing is stored. A
+/// **present** landing then goes in through the raw verdict store — the
+/// half of a real landing that runs *before* its sweep takes this very
+/// lock, so the sweep cannot be what moves the box; the sweep's own move
+/// is [`an_interim_handed_publish_takes_its_hand_when_the_verdict_lands_late`]'s
+/// to pin. The whole window is one synchronous region — the registration
+/// is the task parked, on a worker, and the write lock is never held
+/// across an await. Releasing the lock lets the registration publish, and
+/// it must take its hand.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn register_hostname_promotes_an_interim_to_its_vouched_hand() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let manager = server.state.sessions_manager().await;
+    manager.hold_range_verdict_pending();
+    // Far out, so nothing here is decided by the deadline: the window's two
+    // ends are landings, not expiries.
+    manager.reset_hand_verdict_deadline(DEADLINE_HELD_OPEN_MS);
+    let mut client = server.connect().await;
+    let handed = std::net::Ipv4Addr::new(127, 0, 64, 9);
+    let web = create_handed_own_ip_session(
+        &mut client,
+        "web",
+        std::net::Ipv4Addr::new(100, 64, 128, 9),
+        handed,
+    )
+    .await;
+
+    // The finalize's registration parks on the pending verdict — past its
+    // read of the registry, ahead of its publish.
+    let mut finalize_client = server.connect().await;
+    let finalize = tokio::spawn(async move { finalize_session(&mut finalize_client, web).await });
+    await_verdict_waiter(&manager).await;
+
+    // The registry's write lock, held across both landings in one
+    // synchronous region — the registration is the task that parks here,
+    // with the interim answer in hand, so the lock is never held across an
+    // await: the parked registration has already read the registry, and
+    // this is exactly the spot its re-read under the lock exists for.
+    let registry = manager.hostnames();
+    {
+        let parked = registry.write().expect("registry lock");
+
+        // The ask answers the interim: an absent landing wakes the parked
+        // waiter with "not vouched", and the registration heads for
+        // `127.0.0.1`.
+        manager
+            .loopback_book()
+            .set_range_verdict(crate::net::dns::RangeVerdict::Absent);
+        // The ask has consumed the absent answer only once its waiter is
+        // gone — before that, a present landing could still be the one it
+        // reads. Waited out synchronously: the registration parks on this
+        // very lock while this thread waits, and the lock must not cross
+        // an await.
+        for _ in 0..12_000 {
+            if manager.verdict_waiters() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            manager.verdict_waiters(),
+            0,
+            "the registration left its wait on the absent landing"
+        );
+
+        // The verdict lands present through the raw store — not the
+        // landing's sweep, which would take this very lock — so the
+        // registration's own re-read is the only thing that can move the
+        // box.
+        manager
+            .loopback_book()
+            .set_range_verdict(crate::net::dns::RangeVerdict::Present);
+
+        // The registration, parked on this lock since its ask answered the
+        // interim, takes it now.
+        drop(parked);
+    }
+
+    finalize.await.expect("the finalize's task runs to its end");
+
+    // The hand is the published address — never the interim the ask
+    // answered with — and the name answers with it.
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .published_own_address(web),
+        Some(handed),
+        "a registration headed for the interim publishes at its own hand"
+    );
+    let (_, address) = zone_answer_for(&server, "web.min.internal")
+        .await
+        .expect("the name is held once the registration ends");
+    assert_eq!(
+        address, handed,
+        "the name answers at the hand, moved with the publish"
+    );
+    assert_eq!(
+        registry
+            .read()
+            .expect("registry lock")
+            .resolve("web.min.internal:18080")
+            .expect("the name routes at the hand")
+            .upstream(18080),
+        Some(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(handed),
+            18080
+        )),
+        "the box's declared port is published at its own hand, exactly where \
+         the attach path binds its forwards"
+    );
+
+    // The two lines the drive leaves: the interim answer it took under the
+    // unvouched verdict, and the promotion that moved it — the one line
+    // only the re-read emits, naming both addresses and the box.
+    let logged = capture.contents();
+    let interim_line = logged
+        .lines()
+        .find(|line| {
+            line.contains("action=\"loopback-hand-to-interim\"")
+                && line.contains("session_name=\"web\"")
+        })
+        .unwrap_or_else(|| panic!("the ask's interim answer must be logged, got: {logged}"));
+    assert!(
+        interim_line.contains(&format!("from={handed}")) && interim_line.contains("to=127.0.0.1"),
+        "the interim answer names the hand it refused and the interim it \
+         took: {interim_line}"
+    );
+    let promotion_line = logged
+        .lines()
+        .find(|line| {
+            line.contains("action=\"loopback-range-present-box\"")
+                && line.contains("session_name=\"web\"")
+        })
+        .unwrap_or_else(|| panic!("the promotion must be logged, got: {logged}"));
+    assert!(
+        promotion_line.contains("from=127.0.0.1")
+            && promotion_line.contains(&format!("to={handed}")),
+        "the promotion names the interim it moved off and the hand it moved \
+         to: {promotion_line}"
+    );
+}
