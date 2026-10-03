@@ -56,7 +56,10 @@ type Rows = BTreeMap<[u8; 4], Arc<BoxRecord>>;
 /// One published namespace's row in the host-side table. Of what it holds,
 /// two dimensions decide a frame from this namespace's address: its switch
 /// address, the lease the shared verdict checks every frame's source against
-/// (NET-084), and its compiled egress rules. The rest — its name
+/// (NET-084), and its compiled egress rules — beside which the one dimension
+/// the frame rules cannot carry travels in the row too: the DNS hosts its
+/// declaration named ([`Self::allow_dns_hosts`]), for the gate's DNS admission
+/// table to pin the row's destinations from. The rest — its name
 /// (diagnostics), its loopback address, the ports it admitted, the names it
 /// declared — is the declaration itself, carried for the host-side paths that
 /// attach and name the namespace, and for the publish half of the gate, which
@@ -72,6 +75,7 @@ pub struct BoxRecord {
     declared_names: Vec<String>,
     egress: EgressRules,
     resolves_names: bool,
+    dns_hosts: Vec<String>,
 }
 
 impl BoxRecord {
@@ -139,20 +143,33 @@ impl BoxRecord {
         &self.egress
     }
 
-    /// Whether the namespace's own relay can lift an undeclared-destination
-    /// drop by itself: `true` when its declaration named DNS hosts, because
-    /// the name-based admission (`allow_dns_hosts`, NET-066) lives in the
-    /// in-guest gate — resolution-time pins, held for their admission window
-    /// — and compiles to nothing in the frame rules. A row that named hosts
-    /// drops a frame outside its allowed subnets *in the guest* unless its
-    /// box's gate holds a pin for the destination, so the host-side verdict
-    /// for such a row defers exactly that one drop class to the guest's,
-    /// keeping the two decisions consistent for the frames a resolved name
-    /// admits. `false` — no names declared — means the guest lifts nothing
-    /// either, and the host-side drop is the whole story.
+    /// Whether the namespace's own declaration named DNS hosts: `true` when
+    /// [`Self::allow_dns_hosts`] is non-empty. Such a row has destinations
+    /// its compiled frame rules cannot carry — the addresses its declared
+    /// names resolve to — so its undeclared-destination drops are decided
+    /// by the host-side DNS admission table
+    /// ([`crate::net::dns_pins`], NET-081 deciding NET-066's admission
+    /// outside the VM) against the answers its own lookups received. `false`
+    /// — no names declared — means the frame rules are the whole decision,
+    /// and the table is never consulted for the row.
     #[must_use]
     pub fn resolves_names(&self) -> bool {
         self.resolves_names
+    }
+
+    /// The DNS hostnames the namespace's declaration named in
+    /// `egress.allow_dns_hosts`, as the client spelled them — the one egress
+    /// dimension that compiles to nothing in the frame rules, because a
+    /// name is not an address: NET-066 enforces it as the addresses the
+    /// box's own lookups resolved to, admitted for the shared admission
+    /// window. The host-side admission table reads this — it pins only
+    /// answers to a name the row declared here, so every pin it holds is an
+    /// answer the box's own query received. Empty for a row that declared
+    /// none: a name grant is earned by an entry, never by an absent field
+    /// (the dns-gate module doc records why `None` is not allow-all names).
+    #[must_use]
+    pub fn allow_dns_hosts(&self) -> &[String] {
+        &self.dns_hosts
     }
 }
 
@@ -424,36 +441,28 @@ impl BoxRegistry {
     /// boundary — only the host process holding this registry can publish at
     /// all, so nothing inside the VM can change a row behind the gate's back.
     ///
-    /// A row that declared DNS hosts is announced once, here, at `info`: its
-    /// undeclared-destination drop is the one class the host-side gate
-    /// defers to the guest's ([`BoxRecord::resolves_names`]), and the host's
-    /// log says so where the row enters the table rather than leaving it to
-    /// be inferred from a frame that reached the switch. The line goes away
-    /// with the deferral: moving that decision host-side is #1808's task.
+    /// A row that declared DNS hosts carries those names in the row itself
+    /// ([`BoxRecord::allow_dns_hosts`]), beside the rules: the name-based
+    /// admission is decided against them, on the host, by the gate's DNS
+    /// admission table ([`crate::net::dns_pins`]).
     ///
     /// # Panics
     ///
     /// Never: the row lock is only ever held across this map update, never
     /// across a panic.
     pub fn register(&self, registration: BoxRegistration) -> Arc<BoxRecord> {
-        // The name-based admission lives in the guest's gate, not in the
-        // frame rules: whether this row's host-side verdict may defer the
-        // undeclared-destination drop to the in-guest one is the
-        // declaration's own fact, read off the policy here and carried
-        // beside the rules for the verdict to consult.
-        let resolves_names = registration
+        // The name-based admission lives beside the frame rules, not in
+        // them: whether a row's undeclared destinations are the DNS
+        // admission table's to decide is the declaration's own fact, read
+        // off the policy here and carried in the row for the gate's table
+        // to pin from.
+        let dns_hosts = registration
             .egress
             .as_ref()
             .and_then(|policy| policy.allow_dns_hosts.as_ref())
-            .is_some_and(|hosts| !hosts.is_empty());
-        if resolves_names {
-            tracing::info!(
-                switch_addr = %registration.switch_addr,
-                name = %registration.name,
-                "the row declared DNS hosts: its undeclared-destination rule is deferred to \
-                 the guest's gate, because names resolve in-VM (#1808 moves it host-side)"
-            );
-        }
+            .cloned()
+            .unwrap_or_default();
+        let resolves_names = !dns_hosts.is_empty();
         let record = Arc::new(BoxRecord {
             name: registration.name,
             // The lease the compiled rules check is the row's own switch
@@ -466,6 +475,7 @@ impl BoxRegistry {
                 registration.switch_addr.octets(),
             ),
             resolves_names,
+            dns_hosts,
             switch_addr: registration.switch_addr,
             loopback_addr: registration.loopback_addr,
             admitted_ports: registration.admitted_ports,
