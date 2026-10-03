@@ -503,6 +503,56 @@ impl sandbox2::Channel for EnvChannel<'_> {
     }
 }
 
+/// How the sandbox's working directory is laid out.
+///
+/// The default mirrors host paths one-for-one ([`WdSetup::BoundDir`]): the
+/// working directory is the host directory named by [`EnvArgs::cwd`], and
+/// `~/`-rooted patch paths expand against [`EnvArgs::home`]. A session
+/// instead owns its layout outright ([`WdSetup::Session`]): the working
+/// directory is mounted at `/workbench` and the home at `/home`, so a task
+/// run by the daemon sees the same paths the interactive session does rather
+/// than the daemon's internal tree.
+///
+/// [`WdSetup`]: sandbox2::config::WdSetup
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum WdLayout {
+    /// Mirror host paths one-for-one; the working directory is [`EnvArgs::cwd`].
+    #[default]
+    BoundDir,
+    /// Use the session layout: `working` at `/workbench`, `home` at `/home`.
+    Session {
+        /// The host directory mounted at `/home`.
+        home: PathBuf,
+        /// The host directory mounted at `/workbench`.
+        working: PathBuf,
+    },
+}
+
+/// Applies the working-directory layout to a fresh sandbox config.
+///
+/// [`WdLayout::BoundDir`] mirrors host paths one-for-one: the working
+/// directory is `cwd` and `home` (when present) is the `$HOME` the sandbox
+/// reports. [`WdLayout::Session`] owns its layout outright, mounting `home`
+/// at `/home` and `working` at `/workbench`; the `fs_mappings` are only
+/// consumed by the bound-dir layout, matching how the session path already
+/// drops them.
+fn apply_wd_layout(
+    config: sandbox2::config::Config,
+    layout: &WdLayout,
+    cwd: &Path,
+    home: Option<&Path>,
+    fs_mappings: Vec<common::FsMapping>,
+) -> sandbox2::config::Config {
+    match layout {
+        WdLayout::BoundDir => config
+            .with_wd(cwd.to_path_buf(), false, fs_mappings)
+            .with_home(home.map(Path::to_path_buf)),
+        WdLayout::Session { home, working } => {
+            config.with_session_dirs(home.clone(), working.clone())
+        }
+    }
+}
+
 /// The arguments used to construct a runtime environment.
 pub struct EnvArgs<'a> {
     /// A symbolic name for the environment. For tasks, this is the task name.
@@ -514,6 +564,8 @@ pub struct EnvArgs<'a> {
     pub state_base_dir: PathBuf,
     /// The working directory to map.
     pub cwd: PathBuf,
+    /// How the working directory is laid out; see [`WdLayout`].
+    pub wd_layout: WdLayout,
     /// Any additional pinhole bind mounts / file mappings.
     pub patches: Option<&'a EnvPatches>,
     /// The home directory `~/`-rooted patch paths expand against, and that
@@ -793,9 +845,14 @@ impl<'a> Env<'a> {
                 declarations
             });
 
-        let mut config = sandbox2::config::Config::new(args.name)
-            .with_wd(args.cwd.clone(), false, fs_mappings)
-            .with_home(home.clone())
+        let mut config = apply_wd_layout(
+            sandbox2::config::Config::new(args.name),
+            &args.wd_layout,
+            &args.cwd,
+            home.as_deref(),
+            fs_mappings,
+        );
+        config = config
             .with_rootfs(
                 args.transitives
                     .keys()
@@ -1082,6 +1139,40 @@ mod tests {
             "task `test`",
             "a path no package declared came from the task's own patch table"
         );
+    }
+
+    /// The working-directory layout choice is what routes a task into the
+    /// session layout (`/workbench` + `/home`) instead of the bound-dir
+    /// layout that mirrors the daemon's internal tree path. `apply_wd_layout`
+    /// is the single branch both callers go through, so asserting its two
+    /// outcomes pins the fix without needing a full sandbox launch.
+    #[test]
+    fn wd_layout_selects_session_or_bound_dir() {
+        let session = apply_wd_layout(
+            sandbox2::config::Config::new("task"),
+            &WdLayout::Session {
+                home: PathBuf::from("/var/lib/minimal/sessions/s1/home"),
+                working: PathBuf::from("/var/lib/minimal/sessions/s1/tree"),
+            },
+            Path::new("/var/lib/minimal/sessions/s1/tree"),
+            None,
+            vec![],
+        );
+        assert_eq!(session.command_cwd().unwrap(), "/workbench");
+        assert_eq!(session.sandbox_home(), "/home");
+
+        let bound = apply_wd_layout(
+            sandbox2::config::Config::new("task"),
+            &WdLayout::BoundDir,
+            Path::new("/var/lib/minimal/sessions/s1/tree"),
+            Some(Path::new("/home/dev")),
+            vec![],
+        );
+        assert_eq!(
+            bound.command_cwd().unwrap(),
+            "/var/lib/minimal/sessions/s1/tree"
+        );
+        assert_eq!(bound.sandbox_home(), "/home/dev");
     }
 
     /// A missing read-only patch source surfaces as `"fs mapping"` and must

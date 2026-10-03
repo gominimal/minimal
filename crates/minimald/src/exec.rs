@@ -357,7 +357,7 @@ async fn task_producer(
         // directory the interactive session sees at `/home`. The daemon's own
         // ambient home is `/` inside the guest, and expanding against that
         // dropped package-declared files onto the read-only rootfs (#1204).
-        let session_home = session.paths().await?.home;
+        let session_paths = session.paths().await?;
         let mut env = ctx
             .make_env_with_network(
                 &exec.task,
@@ -368,7 +368,11 @@ async fn task_producer(
                 Some(&task.vars),
                 task.packages.clone(),
                 network,
-                mctx::PatchHome::Session(session_home),
+                mctx::PatchHome::Session(session_paths.home.clone()),
+                mctx::WdLayout::Session {
+                    home: session_paths.home.as_utf8_path().to_path_buf().into(),
+                    working: session_paths.working.as_utf8_path().to_path_buf().into(),
+                },
             )
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
