@@ -4230,7 +4230,8 @@ mod tests {
         // Ten refused SYNs in one burst: the window's one line at its first
         // refusal, and nine refusals after it that no line has said.
         for port in 40_200u16..40_210 {
-            h.lane.inject_frame(tcp_syn_from(box_mac, box_ip, proxy_ip, port, PROXY_PORT));
+            h.lane
+                .inject_frame(tcp_syn_from(box_mac, box_ip, proxy_ip, port, PROXY_PORT));
         }
         drive(&mut h.lane, 2).await;
         let opening = shared_line(refusal::NO_REGISTERED_ROW, proxy_ip, PROXY_PORT, box_ip, 1);
@@ -4256,7 +4257,8 @@ mod tests {
         // A second burst opens a fresh window — the swept count is never
         // said twice, and this window's line is its own opening one.
         for port in 40_210u16..40_213 {
-            h.lane.inject_frame(tcp_syn_from(box_mac, box_ip, proxy_ip, port, PROXY_PORT));
+            h.lane
+                .inject_frame(tcp_syn_from(box_mac, box_ip, proxy_ip, port, PROXY_PORT));
         }
         drive(&mut h.lane, 2).await;
         let second = shared_line(refusal::NO_REGISTERED_ROW, proxy_ip, PROXY_PORT, box_ip, 1);
