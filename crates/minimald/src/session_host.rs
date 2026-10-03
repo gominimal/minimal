@@ -29,7 +29,6 @@ use crate::sessions::SessionControl;
 use sessions::NetworkMode;
 use sessions::keys::{ChordMatcher, FeedOutcome, KeyAction, SessionKeys};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 mod pty;
 
@@ -2857,12 +2856,9 @@ fn refuses_unenforced_host_address_box(guest: bool, network_mode: NetworkMode) -
 ///
 /// The counterpart of [`refuses_unenforced_host_address_box`]: natively an
 /// unplaced host-address box is NET-079's advisory posture, never a refusal
-/// (design §7.4), so every *session* launch that ends without a leaf records
-/// so in the daemon log — once per launch, like the resolver advisory it is
-/// modelled on (design §7.1). The terminal banner carrying the same notice is
-/// gated further, to once per daemon lifetime ([`PTY_ADVISORY_PRINTED`]), as
-/// the state is the deployment's and repeating it on every session start is
-/// noise. A guest never advises: its unplaced box is
+/// (design §7.4), so every *session* launch that ends without a leaf says so
+/// — once per launch, like the resolver advisory it is modelled on (design
+/// §7.1), never once per daemon. A guest never advises: its unplaced box is
 /// refused, and a box that was placed needs no advice. What this predicate
 /// does not carry is the launch's audience — a launch minted for lifecycle
 /// hooks advises nobody (a hook run is not a session start), which the
@@ -2885,26 +2881,6 @@ fn unenforced_placement_notice() -> String {
          — {}",
         sandbox2::classifier::install_hint()
     )
-}
-
-/// Whether the pty advisory has already reached a terminal in this daemon
-/// run. The log record stays per-launch; only the terminal banner is gated
-/// to once per daemon lifetime so a later session start prints nothing.
-static PTY_ADVISORY_PRINTED: AtomicBool = AtomicBool::new(false);
-
-/// Whether the pty advisory is still owed a terminal under `printed`: it is
-/// until a write of it has succeeded. Checked before the write and marked
-/// only after one succeeds ([`mark_pty_advisory_printed`]), so a failed
-/// write leaves the banner owed to the next session rather than silencing
-/// it for the daemon's life. Two launches racing past the check may both
-/// print it; for an advisory that is acceptable.
-fn pty_advisory_due(printed: &AtomicBool) -> bool {
-    !printed.load(Ordering::Relaxed)
-}
-
-/// Records under `printed` that the pty advisory reached a terminal.
-fn mark_pty_advisory_printed(printed: &AtomicBool) {
-    printed.store(true, Ordering::Relaxed);
 }
 
 /// Moves the box's container supervisor into its classifier leaf, now that
@@ -3215,17 +3191,14 @@ impl SessionLauncher for SandboxLauncher {
             // in-session surface, the prose a person at the terminal reads;
             // the record for that same decision went to the daemon's log at
             // the placement decision, which no client reads (issue #1773
-            // tracks carrying it out). The state is the deployment's, not the
-            // session's, so the notice says what would change it — and only
-            // the first session in a daemon run to reach its terminal gets
-            // the banner ([`PTY_ADVISORY_PRINTED`]). Until #1773 lands, later
-            // sessions in the same daemon run are just as unenforced but get
-            // no notice a client can see; the daemon log still records each.
-            // Never in the guest: a guest's unplaced host-address box never
-            // gets this far, its launch being refused (design §7.1). And
-            // never on a hook launch: its pty is read by nobody, and a hook
-            // run is not a session start.
-            if advise && pty_advisory_due(&PTY_ADVISORY_PRINTED) {
+            // tracks carrying it out). The person about to type in this
+            // session is the one whose egress is not being decided, and the
+            // state is the deployment's, not the session's, so the notice
+            // says what would change it. Never in the guest: a guest's
+            // unplaced host-address box never gets this far, its launch
+            // being refused (design §7.1). And never on a hook launch: its
+            // pty is read by nobody, and a hook run is not a session start.
+            if advise {
                 let notice = unenforced_placement_notice();
                 // The same write the shell fallback notice uses, for the
                 // same reasons: onto the pty's slave, best-effort, CRLF —
@@ -3234,12 +3207,11 @@ impl SessionLauncher for SandboxLauncher {
                     use std::io::Write as _;
                     std::fs::File::from(fd).write_all(format!("minimal: {notice}\r\n").as_bytes())
                 });
-                match written {
-                    Ok(()) => mark_pty_advisory_printed(&PTY_ADVISORY_PRINTED),
-                    Err(e) => tracing::debug!(
+                if let Err(e) = written {
+                    tracing::debug!(
                         error = %e,
                         "could not print the placement notice to the terminal"
-                    ),
+                    );
                 }
             }
             // The shell, and the argv it needs to reach the daemon's
