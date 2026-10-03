@@ -5016,8 +5016,51 @@ for row in json.load(open(sys.argv[1])):
   done
   host_answerer_expect_a "$answerer_box" "$answerer_expected"
   # The row is this proof's to withdraw — destroying the session withdraws
-  # it (T66) — so the lane is left as it was found.
+  # it (T66) — so the lane is left as it was found. The withdrawal is also
+  # the live table's other half, so this proof reads it too: the row must
+  # leave the host-authored zone view within the same 20 s bound the
+  # create-side poll allowed, and the name must stop answering — NXDOMAIN, a
+  # destroyed box's answer (NET-012), never the stale A record the live row
+  # answered with.
   mnl session destroy --force "$answerer_session" >/dev/null 2>&1 || true
+  answerer_left=""
+  for _ in $(seq 1 40); do
+    answerer_left="$(python3 -c '
+import json, sys
+for row in json.load(open(sys.argv[1])):
+    if row.get("name") == sys.argv[2] and row.get("live"):
+        print(row.get("address") or "live")
+        break
+' "$zone_dump" "$answerer_box" 2>/dev/null || true)"
+    [ -z "$answerer_left" ] && break
+    sleep 0.5
+  done
+  if [ -n "$answerer_left" ]; then
+    echo "::error::$answerer_box still holds a live row ($answerer_left) in the zone table 20 s after its session was destroyed — the withdrawal never landed in the host-authored table"
+    echo "--- $zone_dump ---"; cat "$zone_dump" 2>/dev/null || echo "(absent)"
+    fail
+  fi
+  echo "$answerer_box's row left the zone table"
+  # The name follows the row off the answerer, and on a machine whose
+  # answerer is another daemon the negative can trail the dump by a poll —
+  # exactly the create side's trail — so wait for it, then assert it with the
+  # dig in hand: the row is gone from the table the answers come from, so
+  # anything but NXDOMAIN is a stale answer.
+  answerer_destroyed_nx=""
+  for _ in $(seq 1 40); do
+    answerer_destroyed_nx="$(dig +time=2 +tries=1 +noall +comments "@127.0.0.1" \
+      -p "$host_answerer_port" "$answerer_box" A 2>/dev/null || true)"
+    printf '%s\n' "$answerer_destroyed_nx" | grep -q 'status: NXDOMAIN' && break
+    sleep 0.5
+  done
+  if ! printf '%s\n' "$answerer_destroyed_nx" | grep -q 'status: NXDOMAIN'; then
+    echo "::error::$answerer_box did not answer NXDOMAIN at 127.0.0.1:$host_answerer_port after its session was destroyed"
+    echo "--- dig (comments) ---"; printf '%s\n' "$answerer_destroyed_nx"
+    echo "--- minvmd log (zone-answerer lines, tail) ---"
+    printf '%s\n' "$host_answerer_records" | grep -F -- 'zone-answerer' | tail -n5
+    fail
+  fi
+  echo "$answerer_box answers NXDOMAIN after destroy (the withdrawn row's name)"
 
   # An unknown name (NET-126): the zone's negatives say NXDOMAIN and carry
   # the SOA, not a silent drop, which a host resolver would read as a
@@ -5031,7 +5074,7 @@ for row in json.load(open(sys.argv[1])):
   fi
   echo "an unknown box name answers NXDOMAIN (the SOA-carrying negative)"
 
-  echo "native min.internal resolution from the VM host daemon's answerer OK (min ls names the VM host daemon, the host row and a live box answer at 127.0.0.1:$host_answerer_port, unknown names NXDOMAIN)"
+  echo "native min.internal resolution from the VM host daemon's answerer OK (min ls names the VM host daemon, the host row and a live box answer at 127.0.0.1:$host_answerer_port, the destroyed box's name withdraws to NXDOMAIN, unknown names NXDOMAIN)"
   echo "::endgroup::"
 }
 
