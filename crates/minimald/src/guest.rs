@@ -893,10 +893,12 @@ const FITRIM: u32 =
 /// journal commits, so trimming straight after a sweep otherwise reports far
 /// less than the sweep released.
 ///
-/// Safe to run on a live filesystem — `FITRIM` is the online-discard ioctl —
-/// but it takes ext4's block-group locks as it walks, so callers schedule it
-/// against idle time rather than contending with a build. The daemon's caller
-/// is the `maintenance` actor, which runs it behind the cache clean.
+/// Safe to run on a live filesystem — `FITRIM` is the online-discard ioctl.
+/// It takes ext4's block-group locks as it walks, but ext4 skips every group
+/// it has already trimmed and freed nothing in since, so a trim with nothing
+/// new to discard is cheap even alongside a build. The daemon's caller is the
+/// `maintenance` actor, which runs it behind every cache clean and also alone
+/// every `TRIM_INTERVAL`, whatever the guest is doing.
 ///
 /// Blocking, and unbounded: the walk is proportional to the filesystem, not to
 /// what the clean freed. Callers on an async runtime owe it a blocking thread.
