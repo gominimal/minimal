@@ -3194,7 +3194,13 @@ impl DropLimiter {
     /// was reaching for the proxy, the box named by the row that holds its
     /// source when one does, and the reason by the rule. Returns whether a
     /// line was written.
-    fn warn_proxy_lane(&self, src: [u8; 4], dst: [u8; 4], dst_port: u16, box_name: Option<&str>) -> bool {
+    fn warn_proxy_lane(
+        &self,
+        src: [u8; 4],
+        dst: [u8; 4],
+        dst_port: u16,
+        box_name: Option<&str>,
+    ) -> bool {
         match self.should_warn_at(Some(src), PROXY_LANE_RULE, Instant::now()) {
             WarnDecision::Silent => false,
             WarnDecision::Named => {
@@ -5285,7 +5291,7 @@ mod tests {
             ipv4_frame(LEASE, 17, proxy, 8118),
         ];
         for frame in &refused {
-            send_frame(&mut h.guest, &frame).await;
+            send_frame(&mut h.guest, frame).await;
         }
         let marker = ipv4_frame(LEASE, 6, proxy, 8118);
         send_frame(&mut h.guest, &marker).await;
@@ -5338,8 +5344,12 @@ mod tests {
                 .with_credentialed_upstream(sessions::CredentialedUpstream::default()),
         );
         registry.register(
-            BoxRegistration::new("bare", Ipv4Addr::from([100, 64, 0, 10]), Ipv4Addr::LOCALHOST)
-                .with_admitted_ports([8080]),
+            BoxRegistration::new(
+                "bare",
+                Ipv4Addr::from([100, 64, 0, 10]),
+                Ipv4Addr::LOCALHOST,
+            )
+            .with_admitted_ports([8080]),
         );
         let mut h = gate_over(registry).await;
         let proxy = SUBNET.box_egress_proxy_address().octets();
@@ -5372,7 +5382,7 @@ mod tests {
             ipv4_frame(stranger, 6, proxy, 8118),
         ];
         for frame in &refused {
-            send_frame(&mut h.guest, &frame).await;
+            send_frame(&mut h.guest, frame).await;
         }
         let marker = ipv4_frame(LEASE, 6, proxy, 8118);
         send_frame(&mut h.guest, &marker).await;

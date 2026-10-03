@@ -1383,12 +1383,7 @@ mod tests {
         // ever consulted — the lane is this box's, not the address's.
         assert!(
             !admits(
-                &ipv4_frame_from(
-                    [203, 0, 113, 7],
-                    IPPROTO_TCP,
-                    PROXY,
-                    PROXY_LISTENER_PORT
-                ),
+                &ipv4_frame_from([203, 0, 113, 7], IPPROTO_TCP, PROXY, PROXY_LISTENER_PORT),
                 &laned
             ),
             "a foreign source to the listener is the lease check's drop, never the lane's admit"
@@ -1406,7 +1401,10 @@ mod tests {
         // deny-all they drop the proxy's address the way they drop any
         // other.
         assert!(
-            !admits(&ipv4_frame(IPPROTO_TCP, PROXY, PROXY_LISTENER_PORT), &deny_all()),
+            !admits(
+                &ipv4_frame(IPPROTO_TCP, PROXY, PROXY_LISTENER_PORT),
+                &deny_all()
+            ),
             "the declaration is the one thing that opens the listener"
         );
     }
