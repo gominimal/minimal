@@ -3272,18 +3272,22 @@ mod tests {
     }
 
     /// NET-079: while the host cannot decide per box, a host-address box's
-    /// create reply and its record both say its egress is not enforced per
-    /// box — the reply so a client can say it at once, the record so the
-    /// state outlives the activate message (`GetSessionRecord` answers over
-    /// it, the bundle's sessions collector copies it, and the policy read
-    /// this state reserves for a later task rests on it). A deny-all box
-    /// running unenforced is the requirement's own case. A box whose verdict
-    /// is decided on address leases instead of the host's cgroup tree
-    /// carries nothing: `None`, not `none` — the same nothing a daemon that
-    /// predates the field says. And the state a decided host spells is
-    /// pinned pure, because no stand-in can make the probe read a refusal:
-    /// a tree the facts say is decided and a table that is still refusing
-    /// cannot both be built here.
+    /// create reply, its record, and every surface that reads the session
+    /// after the create all say its egress is not enforced per box — the
+    /// reply so a client can say it at once, the record so the state
+    /// outlives the create message (`GetSessionRecord` answers over it, the
+    /// bundle's sessions collector copies it), the listing a picker reads
+    /// without a round trip per session, and the effective-policy reply
+    /// `min session policy` renders, where the state rides beside the rules
+    /// it qualifies: a deny-all declaration with an enforcement of `none` is
+    /// the state the box actually runs in, not a verdict that looks decided
+    /// and is not. A deny-all box running unenforced is the requirement's
+    /// own case. A box whose verdict is decided on address leases instead of
+    /// the host's cgroup tree carries nothing: `None`, not `none`, on every
+    /// surface — the same nothing a daemon that predates the field says.
+    /// And the state a decided host spells is pinned pure, because no
+    /// stand-in can make the probe read a refusal: a tree the facts say is
+    /// decided and a table that is still refusing cannot both be built here.
     // The guard is taken before the server is even built and held across
     // the awaited creates on purpose: the stand-in is process-global, so
     // another test's create in the window would answer over it too.
@@ -3339,6 +3343,43 @@ mod tests {
              recorded, got: {attrs:?}"
         );
 
+        // The surfaces that read a session after the create answer over the
+        // same record, so they say the same thing: the listing a picker
+        // reads without a round trip per session, and the effective-policy
+        // reply `min session policy` renders. All three surfaces agree by
+        // construction here — they read one record the create wrote the
+        // fact on — which is the whole point of recording it.
+        let listed = client.call::<ListSessions>(&()).await;
+        let entry = listed
+            .sessions
+            .iter()
+            .find(|e| e.id == created.id)
+            .expect("the created session is in the listing");
+        assert_eq!(
+            entry.host_ip_enforcement.as_deref().map(String::as_str),
+            Some("none"),
+            "the listing must carry the same state the create reply did, \
+             got: {:?}",
+            entry.host_ip_enforcement
+        );
+        let policy = client
+            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(created.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            policy.egress,
+            EffectiveEgress::Declared(EgressPolicy::deny_all()),
+            "the policy reply keeps the declaration the box launched with"
+        );
+        assert_eq!(
+            policy.host_ip_enforcement.as_deref(),
+            Some("none"),
+            "the policy reply must carry the state beside the rules it \
+             qualifies: a deny-all declaration that is not decided per box \
+             is the state the box runs in, got: {:?}",
+            policy.host_ip_enforcement
+        );
+
         // A box whose verdict is decided on address leases carries nothing:
         // `None`, not `none`, over the same host that cannot decide.
         let own_address = own_ip_session(
@@ -3359,6 +3400,29 @@ mod tests {
             !attrs.contains_key(super::HOST_IP_ENFORCEMENT_ATTR),
             "an own-address box's verdict is decided on address leases, so \
              its record carries no per-box enforcement, got: {attrs:?}"
+        );
+        let listed = client.call::<ListSessions>(&()).await;
+        let own_entry = listed
+            .sessions
+            .iter()
+            .find(|e| e.id == own_address)
+            .expect("the own-address session is in the listing");
+        assert!(
+            own_entry.host_ip_enforcement.is_none(),
+            "an own-address box shows nothing on the listing either — its \
+             verdict was decided on address leases, got: {:?}",
+            own_entry.host_ip_enforcement
+        );
+        let own_policy = client
+            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(own_address))
+            .await
+            .unwrap();
+        assert!(
+            own_policy.host_ip_enforcement.is_none(),
+            "an own-address box shows nothing on the policy reply either — \
+             there is no per-box state to qualify rules that are decided on \
+             leases, got: {:?}",
+            own_policy.host_ip_enforcement
         );
 
         super::clear_create_classifier_standin();
