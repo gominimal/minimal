@@ -851,7 +851,9 @@ impl<S: Exec> ExecTask<S> {
         // `ChannelMsg::Eof`; a lost client then looks like a normal stdin
         // EOF, and a silent child (sleep, quiet build) keeps running
         // indefinitely (gominimal/inbox#813).
-        let (stdin_tx, mut stdin_rx) = pipe::pipe().expect("exec stdin pipe");
+        // An in-memory pipe: unlike pipe(2) it cannot fail (no fds to run
+        // out of), and dropping the pump's half still gives the bridge EOF.
+        let (stdin_tx, mut stdin_rx) = tokio::io::duplex(64 * 1024);
         let (client_lost_tx, client_lost_rx) = watch::channel(false);
 
         let msgs = Box::pin(stream::unfold(rs, |mut rs| async move {
