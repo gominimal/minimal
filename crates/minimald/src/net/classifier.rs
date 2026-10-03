@@ -1063,17 +1063,47 @@ pub(crate) fn cache_host(location: &AnyUrl) -> String {
     }
 }
 
+/// The host inside an authority: the authority minus any userinfo before
+/// the last `@`. A `FetchSource` URL may carry a credential in its userinfo
+/// (`https://<token>@github.com/…`), and the record is a log line a bundle
+/// keeps on disk, so no spelling it writes carries one; the host the fetch
+/// left for is the host, never the credential before it.
+fn authority_host(authority: &str) -> &str {
+    match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    }
+}
+
 /// The host a URL names — its authority, between the scheme and the first
-/// path, query, or fragment delimiter — which is where a `FetchSource`
-/// fetch leaves for. A spelling with no scheme (a local source tarball)
-/// names no host and crosses no network: the record's object still carries
-/// the whole spelling, so the fetch is read whole from the two fields.
+/// path, query, or fragment delimiter, with any userinfo dropped — which is
+/// where a `FetchSource` fetch leaves for. A spelling with no scheme (a
+/// local source tarball) names no host and crosses no network: the
+/// record's object still carries the whole spelling, so the fetch is read
+/// whole from the two fields.
 pub(crate) fn url_host(url: &str) -> &str {
     let Some((_, authority)) = url.split_once("://") else {
         return "";
     };
     let end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
-    &authority[..end]
+    authority_host(&authority[..end])
+}
+
+/// The object a `FetchSource` record names its fetch by: the URL's own
+/// spelling minus the parts that never belong in a log line — the userinfo
+/// before the last `@` (a credential), and the query and fragment after the
+/// path (a query is where a signed URL carries its signature). A spelling
+/// with no scheme (a local source tarball) names no host and crosses no
+/// network, and is the object whole: the way the record has always spelled
+/// a source it read off the operator's own disk.
+pub(crate) fn url_object(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let path_end = rest.find(['?', '#']).unwrap_or(rest.len());
+    let authority_end = rest[..path_end].find('/').unwrap_or(path_end);
+    let host = authority_host(&rest[..authority_end]);
+    format!("{scheme}://{host}{}", &rest[authority_end..path_end])
 }
 
 /// Whether the cohort's two subtrees are there as the step delegates them:
@@ -2176,6 +2206,63 @@ mod tests {
             cache_host(&bucket),
             "projects/_/buckets/minimal-cache",
             "a GCS location's host is the bucket it names"
+        );
+    }
+
+    /// NET-080: the two spellings a `FetchSource` URL's record carries — the
+    /// host it names and the object it is recorded as — never carry the
+    /// parts of the URL that must not reach a log line. The record is an
+    /// INFO line a bundle's daemon-log tail keeps on disk, and a source URL
+    /// can carry a credential in its userinfo (`https://<token>@github.com/…`)
+    /// and a signature in its query (`?X-Amz-Signature=…`), so the host is
+    /// the URL's authority minus its userinfo and the object is its spelling
+    /// minus the userinfo, the query, and the fragment. A source with no
+    /// scheme — a tarball off the operator's own disk — names no host and
+    /// crosses no network, and stays the object whole.
+    #[test]
+    fn url_host_and_object_carry_no_credentials() {
+        // A credential in the userinfo, before the host a GitHub source
+        // fetch actually leaves for.
+        let tokened = "https://ghp_deadbeef@github.com/example/example/archive/v1.tar.gz";
+        assert_eq!(
+            url_host(tokened),
+            "github.com",
+            "the host is the authority minus its userinfo, so the token never \
+             reaches the record: {}",
+            url_host(tokened)
+        );
+        assert_eq!(
+            url_object(tokened),
+            "https://github.com/example/example/archive/v1.tar.gz",
+            "the object is the URL minus its userinfo, so the token never \
+             reaches the record: {}",
+            url_object(tokened)
+        );
+        // A login pair, a port, a query, and a fragment: each is dropped or
+        // kept by what it is, not by where it sits.
+        let signed = "https://user:pass@mirror.example.com:8443/src/v2.tar.gz?X-Amz-Signature=deadbeef#fragment";
+        assert_eq!(
+            url_host(signed),
+            "mirror.example.com:8443",
+            "the host keeps the port and drops the login pair before it"
+        );
+        assert_eq!(
+            url_object(signed),
+            "https://mirror.example.com:8443/src/v2.tar.gz",
+            "the object keeps the host and port and drops the login pair, the \
+             query, and the fragment"
+        );
+        // A URL with nothing to drop is spelled whole in both fields.
+        let plain = "https://example.com/src/v3.tar.gz";
+        assert_eq!(url_host(plain), "example.com");
+        assert_eq!(url_object(plain), "https://example.com/src/v3.tar.gz");
+        // A local source names no host and is the object whole.
+        let local = "../tarballs/v4.tar.gz";
+        assert_eq!(url_host(local), "", "a local source names no host");
+        assert_eq!(
+            url_object(local),
+            "../tarballs/v4.tar.gz",
+            "a local source stays the object whole"
         );
     }
 

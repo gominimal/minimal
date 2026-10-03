@@ -12,7 +12,7 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use crate::net::classifier::{record_node_plane_fetch, url_host};
+use crate::net::classifier::{record_node_plane_fetch, url_host, url_object};
 use futures::{Stream, StreamExt as _};
 use ot::{OpId, OpSnapshot, OpTracker, Operation, Progress};
 
@@ -186,10 +186,12 @@ impl SandboxProgress {
     /// made for, and — per operation, the same division the meter shows —
     /// the host it leaves for and the object it brings back. A package or
     /// the index is fetched from the configured remote cache; a source from
-    /// the URL it names. Scoping is the meter's own: a package outside this
-    /// install's scope is not this install's fetch, while a source or the
-    /// index names no package to scope by and is attributed to whatever is
-    /// building, the same caveat the meter's row carries.
+    /// the URL it names, spelled as the record writes it — with neither the
+    /// URL's credentials nor its query, which never belong in a log line.
+    /// Scoping is the meter's own: a package outside this install's scope is
+    /// not this install's fetch, while a source or the index names no
+    /// package to scope by and is attributed to whatever is building, the
+    /// same caveat the meter's row carries.
     fn record_fetch(&self, op: &Operation) {
         let Some(record) = &self.fetch_record else {
             return;
@@ -203,7 +205,7 @@ impl SandboxProgress {
                     .cloned()
                     .unwrap_or_else(|| name.clone()),
             ),
-            Operation::FetchSource { url } => (url_host(url).to_owned(), url.clone()),
+            Operation::FetchSource { url } => (url_host(url).to_owned(), url_object(url)),
             Operation::FetchIndex => (record.cache_host.clone(), "index".to_owned()),
             _ => return,
         };
@@ -818,8 +820,8 @@ mod tests {
     /// NET-080: each kind of fetch the daemon makes on the install path is
     /// recorded with its own host and object — a package from the configured
     /// remote cache, named with its version; the index from the same cache;
-    /// a source from the URL it names, which is also its object. One line
-    /// each, spelled from the op that started.
+    /// a source from the host and the spelling its URL is recorded as. One
+    /// line each, spelled from the op that started.
     #[test]
     fn each_fetch_kind_is_recorded_with_its_own_host_and_object() {
         let root = OpTracker::new_root();
@@ -869,6 +871,43 @@ mod tests {
         assert!(
             !source.contains("cache.minimal.dev"),
             "a source's host is its URL's, not the cache's: {source}"
+        );
+    }
+
+    /// NET-080: a `FetchSource` URL that carries a credential — in its
+    /// userinfo, or in a signed query — is recorded by neither. The record
+    /// is an INFO line a bundle's daemon-log tail keeps on disk, so the host
+    /// it names is the URL's authority minus its userinfo and the object it
+    /// names is the URL's spelling minus the userinfo, the query, and the
+    /// fragment; the raw URL itself never reaches the log.
+    #[test]
+    fn a_source_fetch_record_carries_no_credentials() {
+        let root = OpTracker::new_root();
+        let url = "https://ghp_deadbeef@github.com/example/example/archive/v1.tar.gz?X-Amz-Signature=deadbeef";
+        let _source = root.new_child().with_op(Operation::FetchSource {
+            url: url.to_string(),
+        });
+        let (log, _guard) = capture_log();
+        let mut progress = SandboxProgress::new(None, None).with_fetch_record(fetch_record());
+        progress.line(&root.snapshot());
+
+        let recorded = log.contents();
+        let line = recorded
+            .lines()
+            .find(|line| line.contains("node-plane traffic"))
+            .unwrap_or_else(|| panic!("the fetch is recorded: {recorded}"));
+        assert!(
+            line.contains("host=github.com"),
+            "the record names the host the fetch left for: {line}"
+        );
+        assert!(
+            line.contains("object=https://github.com/example/example/archive/v1.tar.gz"),
+            "the record names the object as the URL minus what must not be \
+             logged: {line}"
+        );
+        assert!(
+            !line.contains("ghp_deadbeef") && !line.contains("X-Amz-Signature"),
+            "neither the token nor the signature reaches the log: {line}"
         );
     }
 }
