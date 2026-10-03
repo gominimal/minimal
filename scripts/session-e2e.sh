@@ -69,12 +69,13 @@
 # the order below; with a case name only that proof runs, standalone, against
 # the same fresh state dir and seeds the full lane gets. Most proofs mint (and
 # destroy) the sessions they need themselves; `session_exec`,
-# `session_outbound_request` and `sandbox` instead share the one `lifecycle`
-# activates first in a whole-lane run — and mint an equivalent session of their
-# own when they run alone (see proof_shared_session), so every case name below
-# is runnable by itself.
+# `session_rename`, `session_outbound_request` and `sandbox` instead share the
+# one `lifecycle` activates first in a whole-lane run — and mint an equivalent
+# session of their own when they run alone (see proof_shared_session), so every
+# case name below is runnable by itself.
 #   lifecycle                        cold activate → list → warm → destroy
 #   session_exec                     `min session exec` in the session's namespaces
+#   session_rename                   `min session rename`; rename-to-self refused
 #   session_outbound_request         an outbound request from inside the session (NET-107)
 #   own_ip                           `--network own_ip` tap + switch attach
 #   own_ip_egress_declared_and_enforced
@@ -741,6 +742,59 @@ if grep -q "unsupported command" "$lookalike_err"; then
   fail
 fi
 echo "session exec proof OK"
+echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# Session rename proof: `min session rename` against the live shared session.
+# The new name shows up in `ls --json`, the old name stops resolving, and
+# rename-to-self is an error rather than a silent no-op. The original name is
+# restored afterwards: the sandbox proof asserts the orientation banner
+# interpolates $SESSION_NAME, so the shared session must carry it again.
+proof_session_rename() {
+echo "::group::session rename proof (min session rename)"
+proof_shared_session
+
+RENAMED_NAME="e2e-renamed"
+mnl session rename "$sid" "$RENAMED_NAME" >/dev/null 2>"$WORK/rename.err" \
+  || { echo "::error::'min session rename $sid $RENAMED_NAME' failed"; cat "$WORK/rename.err" 2>/dev/null || true; fail; }
+
+ls_json="$(mnl ls --json 2>"$WORK/ls-json.err")" \
+  || { echo "::error::'min ls --json' failed"; cat "$WORK/ls-json.err" 2>/dev/null || true; fail; }
+# One python3 pass over the captured JSON — never `| grep -q`, whose early
+# exit SIGPIPEs the producer under pipefail and reads as "not found".
+if ! printf '%s' "$ls_json" | python3 -c '
+import json, sys
+names = [s.get("name") for s in json.load(sys.stdin)["sessions"]]
+want, old = sys.argv[1], sys.argv[2]
+if want not in names:
+    sys.exit("renamed name not listed")
+if old in names:
+    sys.exit("pre-rename name still listed")
+' "$RENAMED_NAME" "$SESSION_NAME"; then
+  echo "::error::'min ls --json' does not reflect the rename (want '$RENAMED_NAME', old '$SESSION_NAME' gone)"
+  echo "--- ls --json ---"; printf '%s\n' "$ls_json"
+  fail
+fi
+
+# The old name must no longer resolve to a session.
+if mnl session policy "$SESSION_NAME" >/dev/null 2>"$WORK/policy-old.err"; then
+  echo "::error::'min session policy $SESSION_NAME' still resolves after the rename"
+  fail
+fi
+
+# Rename-to-self must be an error, not a silent no-op.
+if mnl session rename "$sid" "$RENAMED_NAME" >/dev/null 2>"$WORK/rename-self.err"; then
+  echo "::error::'min session rename $sid $RENAMED_NAME' (rename-to-self) unexpectedly succeeded"
+  fail
+fi
+grep -q "session is already named" "$WORK/rename-self.err" \
+  || { echo "::error::rename-to-self error does not say 'session is already named'"; cat "$WORK/rename-self.err" 2>/dev/null || true; fail; }
+
+mnl session rename "$sid" "$SESSION_NAME" >/dev/null 2>"$WORK/rename-back.err" \
+  || { echo "::error::'min session rename $sid $SESSION_NAME' (restore) failed"; cat "$WORK/rename-back.err" 2>/dev/null || true; fail; }
+
+echo "session rename proof OK"
 echo "::endgroup::"
 }
 
@@ -7608,6 +7662,7 @@ case "${1:-}" in
   "")
     proof_lifecycle
     proof_session_exec
+    proof_session_rename
     proof_session_outbound_request
     proof_own_ip
     proof_own_ip_egress_declared_and_enforced
@@ -7630,7 +7685,7 @@ case "${1:-}" in
     proof_switch_answers_no_arp_for_the_proxy_address
     proof_two_named_vms_on_one_machine
     ;;
-  lifecycle | session_exec | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
+  lifecycle | session_exec | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
     | network_posture_from_stock_install | native_resolution_without_proxy_env \
     | hostnames_recover_and_two_daemons_route \
@@ -7643,7 +7698,7 @@ case "${1:-}" in
   *)
     echo "usage: $0 [case]"
     echo "  no argument: every proof, in the whole-lane order"
-    echo "  cases: lifecycle session_exec session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run hooks"
+    echo "  cases: lifecycle session_exec session_rename session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run hooks"
     echo "         skip_scaffold sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
     echo "         network_posture_from_stock_install native_resolution_without_proxy_env"
     echo "         fresh_linux_kvm_activate_local_minvmd fresh_arm64_kvm_activate_local_minvmd"
