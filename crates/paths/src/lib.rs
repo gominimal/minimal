@@ -191,6 +191,17 @@ pub fn provider_instance_name(kind: ProviderKind, instance: u32) -> String {
     format!("local-{}{instance}", kind.tag())
 }
 
+/// The SSH host alias a client connects with for a provider directory: the
+/// directory's basename. This is the single source of the `known_hosts` host
+/// identity — the daemon records the guest key under it and the ssh readers
+/// derive it from the socket's parent directory, so the two can never
+/// disagree. For the default VM the basename is the provider-instance name
+/// (`local-minvmd0`); for a named VM it is the VM name.
+#[must_use]
+pub fn ssh_host_alias(provider_dir: &Path) -> Option<&str> {
+    provider_dir.file_name().and_then(|n| n.to_str())
+}
+
 /// `<state_dir>/providers/local-<kind><instance>` — the directory holding the
 /// sockets, locks, and state files a client needs to reach one local daemon
 /// instance.
@@ -1954,6 +1965,21 @@ mod tests {
             provider_instance_dir(&state, ProviderKind::Minvmd, 0).as_str(),
             "/state/minimal/providers/local-minvmd0",
         );
+    }
+
+    /// The SSH host alias is the provider directory's basename: the
+    /// provider-instance name for the default VM, the VM name for a named VM.
+    #[test]
+    fn ssh_host_alias_is_the_provider_dir_basename() {
+        assert_eq!(
+            ssh_host_alias(Path::new("/state/minimal/providers/local-minvmd0")),
+            Some("local-minvmd0"),
+        );
+        assert_eq!(
+            ssh_host_alias(Path::new("/state/minimal/providers/local-minvmd0/alpha")),
+            Some("alpha"),
+        );
+        assert_eq!(ssh_host_alias(Path::new("/")), None);
     }
 
     /// A named VM's provider dir nests under a per-name subdirectory
