@@ -16,7 +16,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::time::SystemTime;
 use tokio::io::AsyncWriteExt;
 use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc::error::{SendError, SendTimeoutError};
+use tokio::sync::mpsc::error::{SendError, SendTimeoutError, TrySendError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -51,6 +51,23 @@ const CHORD_FLUSH_IDLE: std::time::Duration = std::time::Duration::from_millis(5
 /// changed since activation. Exposed for the same test-await purpose as
 /// [`SHELL_EXIT_PROMPT`].
 pub(crate) const SHELL_EXIT_NO_CHANGES: &str = "No files changed since activation.";
+
+/// What the attached human answered when the box's `ask` policy put a
+/// dynamic ingress request to them (NET-045). Carried back to the session
+/// actor, which publishes the port on a yes and refuses it on a no.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskAnswer {
+    /// Publish the port to the network.
+    Yes,
+    /// Keep the port private.
+    No,
+}
+
+/// Header of the prompt shown over the channel when a box's `ask` dynamic
+/// ingress policy asks the attached human to decide a request (NET-045).
+/// Rendered after the session's name, which the binding supplies. Exposed
+/// for the same test-await purpose as [`SHELL_EXIT_PROMPT`].
+pub(crate) const ASK_EXPOSE_PROMPT: &str = "asks to publish a port to the network - allow it?";
 
 /// How many changed-file rows the shell-exit prompt lists before folding the
 /// rest into an "and N more" line, keeping the prompt readable on a 24-row
@@ -168,6 +185,15 @@ enum BindingMsg {
     /// the shell-exit prompt's save-then-delete lane writes carries the new
     /// name rather than the one cloned in at [`Binding::spawn`].
     Rename(String),
+    /// A dynamic ingress request the box's `ask` policy puts to the attached
+    /// human (NET-045): render the prompt over this binding's channel, apply
+    /// the answer, and send it back on `reply`. The reply is `Option` so the
+    /// one other fact this ask can end in — nobody being attached — travels
+    /// through the same channel without a second message kind.
+    AskExpose {
+        port: u16,
+        reply: oneshot::Sender<Option<AskAnswer>>,
+    },
     /// The session process ended, so the binding should tear down and raise the
     /// shell-exit prompt. See [`TeardownCause`] for what the binding surfaces.
     ///
@@ -559,6 +585,31 @@ impl Binding {
                             }
                         },
                         BindingMsg::Rename(name) => self.name = name,
+                        BindingMsg::AskExpose { port, reply } => {
+                            // One line per prompt shown (NET-045): a request
+                            // that never reached a terminal has none, so this
+                            // line is the evidence an ask was put to somebody.
+                            tracing::info!(
+                                port,
+                                "asking the attached human to decide a dynamic ingress request"
+                            );
+                            // Raced against the shed, like every await that
+                            // parks on this client: a terminal that stopped
+                            // draining must not leave the ask wedged behind an
+                            // answer it will never give. The safe answer is no
+                            // either way, and the loop's next iteration leaves
+                            // via Shed with the channel closed.
+                            let answer = tokio::select! {
+                                answer = Self::ask_expose_prompt(
+                                    &self.name,
+                                    port,
+                                    rs.make_reader(),
+                                    &mut w,
+                                ) => answer,
+                                () = self.shed.cancelled() => AskAnswer::No,
+                            };
+                            let _ = reply.send(Some(answer));
+                        }
                         BindingMsg::TeardownDueToProcessExit { cause, unwind_codes } => {
                             // Before the notices below and before the
                             // shell-exit prompt further down: both render into
@@ -879,6 +930,38 @@ impl Binding {
         // failed delete, or a delete with nothing wired to carry it out.
         ExitDisposition::Kept
     }
+
+    /// The dynamic-ingress ask prompt (NET-045), shown to the human attached
+    /// at the terminal this binding serves: a request from inside the box to
+    /// publish one of its ports, answered yes or no. An associated fn taking
+    /// the reader and writer piecewise for the same reason as
+    /// [`Self::shell_exit_prompt`].
+    ///
+    /// `No` is the answer every failure mode maps to — a cancel, an EOF, a
+    /// channel that will not write — because the request was to publish, and
+    /// a question nobody answered must not leave the port open behind it. The
+    /// same choice is preselected, so a bare Enter refuses too.
+    async fn ask_expose_prompt<R, W>(name: &str, port: u16, mut r: R, mut w: W) -> AskAnswer
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let select = async_dialog::Select::new()
+            .with_prompt(format!("Session '{name}' {ASK_EXPOSE_PROMPT}"))
+            .items([
+                format!("Yes - publish port {port}"),
+                format!("No - keep port {port} private"),
+            ])
+            .default(1);
+        match select.interact(&mut r, &mut w).await {
+            Ok(Selection::At(0)) => AskAnswer::Yes,
+            Ok(Selection::At(_)) | Ok(Selection::Cancelled) => AskAnswer::No,
+            Err(e) => {
+                tracing::warn!(error = %e, "dynamic-ingress ask prompt failed");
+                AskAnswer::No
+            }
+        }
+    }
 }
 
 /// What the shell-exit prompt settled on, which decides whether the session
@@ -1171,6 +1254,14 @@ enum Message {
         /// environment verbatim.
         extra_env: std::collections::BTreeMap<String, String>,
         reply: oneshot::Sender<Result<std::process::Command, crate::nsenter::NsenterError>>,
+    },
+
+    /// Put a dynamic ingress request the box's `ask` policy must decide
+    /// (NET-045) to the human attached at this host's terminal, and answer
+    /// with what they said. `None` is the answer when there is nobody to ask.
+    AskExpose {
+        port: u16,
+        reply: oneshot::Sender<Option<AskAnswer>>,
     },
 
     /// Snapshot the terminal screen for a read-only preview (`min dash`).
@@ -1549,6 +1640,24 @@ impl HostHandle {
         }
         recv.await
             .unwrap_or(minimald_rpc::SessionDeltaResponse::Unavailable)
+    }
+
+    /// Puts a dynamic ingress request the box's `ask` policy must decide
+    /// (NET-045) to the human attached at this host's terminal, and answers
+    /// with what they said.
+    ///
+    /// `None` is the answer when the question was never put to anyone — no
+    /// client is attached, the attached binding cannot take it, or the host
+    /// is gone — and the caller reads it as the typed refusal it is: nobody
+    /// was there to answer.
+    pub async fn ask_expose(&self, port: u16) -> Option<AskAnswer> {
+        let (reply, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        match self.sender.send(Message::AskExpose { port, reply }).await {
+            Ok(()) => recv.await.ok().flatten(),
+            Err(SendError(Message::AskExpose { .. })) => None,
+            Err(e) => unreachable!("{:?}", e),
+        }
     }
 }
 
@@ -4521,6 +4630,49 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                         tokio::spawn(async move {
                             let _ = s.send(crate::session_delta::assess(root, delta).await);
                         });
+                    }
+                    Message::AskExpose { port, reply } => {
+                        match self.remote.as_ref() {
+                            // No binding: there is no terminal to put the
+                            // question on. Refused here, with the line that
+                            // says why, so the typed error the session actor
+                            // hands back — nobody attached to answer — has a
+                            // line behind it.
+                            None => {
+                                tracing::info!(
+                                    session = %self.session_name,
+                                    port,
+                                    "refusing the dynamic ingress ask: \
+                                     no client is attached to answer",
+                                );
+                                let _ = reply.send(None);
+                            }
+                            // Forwarded, never parked: this loop keeps
+                            // serving its mailbox while a human thinks, and
+                            // a binding mid-teardown — or one whose mailbox
+                            // is full — gets the refusal recovered from the
+                            // send rather than a send that waits on it.
+                            Some((tx, ..)) => {
+                                match tx.try_send(BindingMsg::AskExpose { port, reply }) {
+                                    Ok(()) => {}
+                                    Err(TrySendError::Full(BindingMsg::AskExpose {
+                                        reply, ..
+                                    }))
+                                    | Err(TrySendError::Closed(BindingMsg::AskExpose {
+                                        reply, ..
+                                    })) => {
+                                        tracing::warn!(
+                                            session = %self.session_name,
+                                            port,
+                                            "refusing the dynamic ingress ask: \
+                                             the attached binding cannot take it",
+                                        );
+                                        let _ = reply.send(None);
+                                    }
+                                    Err(e) => unreachable!("{:?}", e),
+                                }
+                            }
+                        }
                     }
                 }
             },

@@ -491,6 +491,18 @@ enum SessionMessage {
         reply:
             oneshot::Sender<Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>>,
     },
+    /// The publish half of an `ask` decision (NET-045), back from the human
+    /// the request was put to: their answer decides it — a yes publishes, a
+    /// no is refused by name as theirs — and a `None` is the nobody-attached
+    /// case the actor already refuses with its own typed reason. Answered like
+    /// [`SessionMessage::ExposeDynamic`], because it is the same request's
+    /// second half: the caller's reply channel rides along unchanged.
+    ApplyDynamicIngress {
+        port: u16,
+        answer: Option<session_host::AskAnswer>,
+        reply:
+            oneshot::Sender<Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>>,
+    },
     /// The live dynamic-ingress mappings this box published at runtime
     /// (NET-044) — what the `GetLiveIngress` RPC serves. Empty for a box that
     /// published none.
@@ -1595,11 +1607,22 @@ impl Session {
                 let _ = r.send(self.composition());
             }
             SessionMessage::ExposeDynamic { port, reply } => {
+                // The asker's reply channel is handed to the actor rather than
+                // awaited for here: an `ask` decision's answer comes back on a
+                // task (see [`Session::expose_dynamic`]), and must reach the
+                // asker even then.
+                self.expose_dynamic(port, reply).await;
+            }
+            SessionMessage::ApplyDynamicIngress {
+                port,
+                answer,
+                reply,
+            } => {
                 #[expect(
                     clippy::let_underscore_must_use,
                     reason = "the asker may already be gone; there is nothing to answer then"
                 )]
-                let _ = reply.send(self.expose_dynamic(port).await);
+                let _ = reply.send(self.apply_dynamic_ingress(port, answer).await);
             }
             SessionMessage::LiveIngress(r) => {
                 #[expect(
@@ -2164,17 +2187,40 @@ impl Session {
     /// bound on the switch and recorded as a live mapping (NET-044), which is
     /// what `min session policy` lists beside the declaration.
     ///
-    /// One info line per request, naming the box, the port, the decision its
-    /// `dynamic_ingress` setting made, and the outcome, so a diagnostics
-    /// bundle's daemon log tail carries every expose request with what became
-    /// of it.
+    /// Every decided request is observed exactly once — one info line and one
+    /// audit record (NET-046) — whatever decided it and however it ended; see
+    /// [`Session::observe_expose_decision`].
+    ///
+    /// `reply` is the asker's channel, taken by value because the `ask` case
+    /// (NET-045) is not decided here: the request is put to the attached
+    /// human, whose answer comes back on a task. A human-paced wait has no
+    /// place inside the actor — it would hold every message behind it,
+    /// destroy included, hostage to an unanswered prompt — so the task carries
+    /// the weak self (never a handle, so a session destroyed while the human
+    /// thinks lets its mailbox close and this actor end) and the reply, and
+    /// re-enters with [`SessionHandle::apply_dynamic_ingress`].
     async fn expose_dynamic(
         &mut self,
         port: u16,
-    ) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
+        reply: oneshot::Sender<
+            Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
+        >,
+    ) {
         let record = match self.record.record().await {
             Ok(record) => record,
-            Err(e) => return Err(crate::net::policy::ExposeFailure::Publish { port, source: e }),
+            Err(e) => {
+                // The request was never decided: the setting it would be
+                // decided against could not be read.
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
+                let _ = reply.send(Err(crate::net::policy::ExposeFailure::Publish {
+                    port,
+                    source: e,
+                }));
+                return;
+            }
         };
         let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
         // The setting the request is evaluated against (NET-043), spelled the
@@ -2186,8 +2232,140 @@ impl Session {
             .as_ref()
             .and_then(|ingress| ingress.dynamic_ingress)
             .unwrap_or(sessions::DynamicIngress::Deny);
-        let outcome = self.publish_exposed_port(&record, port).await;
-        match &outcome {
+        // `ask` is the attached human's decision to make (NET-045); every
+        // other setting is decided here, now.
+        if decision == sessions::DynamicIngress::Ask {
+            let host = match &self.inner {
+                SessionInner::Active {
+                    host: Some((host, _)),
+                    ..
+                } => Some(host.clone()),
+                _ => None,
+            };
+            match host {
+                Some(host) => {
+                    let weak = self.weak_self.clone();
+                    tokio::spawn(async move {
+                        let answer = host.ask_expose(port).await;
+                        match weak.upgrade() {
+                            Some(handle) => {
+                                handle.apply_dynamic_ingress(port, answer, reply).await;
+                            }
+                            // The session ended under the prompt. The asker
+                            // still gets its answer — the actor that would
+                            // have published is gone.
+                            None => {
+                                #[expect(
+                                    clippy::let_underscore_must_use,
+                                    reason = "the asker may already be gone; \
+                                              there is nothing to answer then"
+                                )]
+                                let _ =
+                                    reply.send(Err(crate::net::policy::ExposeFailure::Publish {
+                                        port,
+                                        source: std::io::Error::new(
+                                            std::io::ErrorKind::NotConnected,
+                                            "session actor is gone",
+                                        ),
+                                    }));
+                            }
+                        }
+                    });
+                }
+                None => {
+                    // No host means no terminal to put the question on: the
+                    // request fails closed with the typed no-one-attached
+                    // reason, recorded as nobody's decision — the setting
+                    // asked, and nobody answered.
+                    let outcome = Err(crate::net::policy::ExposeFailure::Refused(
+                        crate::net::policy::ExposeRefusal::AskNeedsAnswer,
+                    ));
+                    self.observe_expose_decision(
+                        &box_name,
+                        port,
+                        decision,
+                        crate::audit::DecidedBy::Nobody,
+                        &outcome,
+                    )
+                    .await;
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "the asker may already be gone; there is nothing to answer then"
+                    )]
+                    let _ = reply.send(outcome);
+                }
+            }
+            return;
+        }
+        let outcome = self.publish_exposed_port(&record, port, None).await;
+        self.observe_expose_decision(
+            &box_name,
+            port,
+            decision,
+            crate::audit::DecidedBy::Policy,
+            &outcome,
+        )
+        .await;
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the asker may already be gone; there is nothing to answer then"
+        )]
+        let _ = reply.send(outcome);
+    }
+
+    /// The publish half of an answered `ask` (NET-045), re-entering the actor
+    /// with what the attached human said: a yes publishes — their answer is
+    /// the decision — and a no is refused by name as theirs. `None` is the
+    /// no-one-attached case, refused with the typed reason that says so.
+    ///
+    /// Recorded like every decided request, with the human named as the
+    /// decider — or nobody, when there was nobody to ask.
+    async fn apply_dynamic_ingress(
+        &mut self,
+        port: u16,
+        answer: Option<session_host::AskAnswer>,
+    ) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
+        let record = match self.record.record().await {
+            Ok(record) => record,
+            Err(e) => return Err(crate::net::policy::ExposeFailure::Publish { port, source: e }),
+        };
+        let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
+        let decision = record
+            .policy
+            .ingress
+            .as_ref()
+            .and_then(|ingress| ingress.dynamic_ingress)
+            .unwrap_or(sessions::DynamicIngress::Deny);
+        let decided_by = if answer.is_some() {
+            crate::audit::DecidedBy::Human
+        } else {
+            crate::audit::DecidedBy::Nobody
+        };
+        let outcome = self.publish_exposed_port(&record, port, answer).await;
+        self.observe_expose_decision(&box_name, port, decision, decided_by, &outcome)
+            .await;
+        outcome
+    }
+
+    /// One observation per decided request: the info line the daemon log tail
+    /// carries — the box, the port, the setting, the outcome, and the outcome's
+    /// reason (NET-043's observability) — and, beside it, the audit record the
+    /// state dir keeps (NET-046), naming who decided so "who let this port
+    /// out" is answered from data.
+    ///
+    /// The audit is a side channel, never part of the publish: the decision
+    /// was made on the box's own setting, so a record that cannot be written
+    /// warns and stands down rather than failing the request over
+    /// evidence-gathering.
+    async fn observe_expose_decision(
+        &self,
+        box_name: &str,
+        port: u16,
+        decision: sessions::DynamicIngress,
+        decided_by: crate::audit::DecidedBy,
+        outcome: &Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
+    ) {
+        match outcome {
             Ok(mapping) => tracing::info!(
                 name = %box_name,
                 port,
@@ -2213,7 +2391,42 @@ impl Session {
                 "dynamic ingress expose"
             ),
         }
-        outcome
+        let (ended, reason, published_at) = match outcome {
+            Ok(mapping) => (
+                crate::audit::IngressOutcome::Published,
+                None,
+                Some(mapping.local.clone()),
+            ),
+            Err(crate::net::policy::ExposeFailure::Refused(refusal)) => (
+                crate::audit::IngressOutcome::Refused,
+                Some(refusal.to_string()),
+                None,
+            ),
+            Err(crate::net::policy::ExposeFailure::Publish { source, .. }) => (
+                crate::audit::IngressOutcome::PublishFailed,
+                Some(source.to_string()),
+                None,
+            ),
+        };
+        if let Err(e) = crate::audit::append(
+            self.minimal_state_dir.as_utf8_path().as_std_path(),
+            crate::audit::IngressDecision {
+                box_name: box_name.to_string(),
+                port,
+                decision,
+                decided_by,
+                outcome: ended,
+                reason,
+                published_at,
+            },
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %e,
+                "recording the dynamic ingress decision in the audit log failed"
+            );
+        }
     }
 
     /// The publish half of [`Session::expose_dynamic`], run once the request's
@@ -2223,21 +2436,38 @@ impl Session {
     /// refused request is refused with nothing bound and nothing asked
     /// (NET-047). Only then is the switch asked to bind, and the forwarder is
     /// recorded only once it accepted.
+    ///
+    /// `answer` is the attached human's answer an `ask` decision already put
+    /// to them (NET-045), or `None` when nobody was asked — the request's own
+    /// setting still decides then, `ask` included, failing closed with nobody
+    /// attached to answer.
     async fn publish_exposed_port(
         &mut self,
         record: &Record,
         port: u16,
+        answer: Option<session_host::AskAnswer>,
     ) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
         use crate::net::policy::{
             ExposeFailure, ExposeRefusal, dynamic_ingress_decision, expose_dynamic,
         };
 
         // The box's own setting decides first (NET-043), whatever asked: the
-        // deny-all default when nothing was declared, and `ask` failing
-        // closed with nobody attached to answer (NET-045's prompt is the
-        // sibling path).
-        dynamic_ingress_decision(record.policy.ingress.as_ref(), port)
-            .map_err(ExposeFailure::Refused)?;
+        // deny-all default when nothing was declared. An `ask` the attached
+        // human answered is decided already — a yes publishes, their answer
+        // being the decision, and a no is refused by name as theirs rather
+        // than as the policy's — and an `ask` nobody answered arrives as
+        // `None` and fails closed (NET-045's prompt path is the sibling that
+        // produces the answer).
+        match answer {
+            Some(session_host::AskAnswer::Yes) => {}
+            Some(session_host::AskAnswer::No) => {
+                return Err(ExposeFailure::Refused(ExposeRefusal::DeniedByHuman(port)));
+            }
+            None => {
+                dynamic_ingress_decision(record.policy.ingress.as_ref(), port)
+                    .map_err(ExposeFailure::Refused)?;
+            }
+        }
 
         // The port is published already, live, by this box: a second request
         // for it would double-bind the same address, so it is refused as the
@@ -3619,6 +3849,51 @@ impl SessionHandle {
                 ),
             }),
         }
+    }
+
+    /// Answers an `ask` decision's publish (NET-045) with what the attached
+    /// human said, on the session actor — the one place every decision is
+    /// made, audited and answered. `reply` is the original asker's channel,
+    /// carried through the ask so its answer reaches the caller unchanged; an
+    /// actor that ended under the prompt answers it with the actor-gone
+    /// publish failure instead.
+    pub(crate) async fn apply_dynamic_ingress(
+        &self,
+        port: u16,
+        answer: Option<session_host::AskAnswer>,
+        reply: oneshot::Sender<
+            Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
+        >,
+    ) {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the actor may already be gone; the recv below reports that"
+        )]
+        let _ = self
+            .0
+            .send(SessionMessage::ApplyDynamicIngress {
+                port,
+                answer,
+                reply: send,
+            })
+            .await;
+        let outcome = match recv.await {
+            Ok(answered) => answered,
+            Err(_) => Err(crate::net::policy::ExposeFailure::Publish {
+                port,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "session actor is gone",
+                ),
+            }),
+        };
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the asker may already be gone; there is nothing to answer then"
+        )]
+        let _ = reply.send(outcome);
     }
 
     /// The live dynamic-ingress mappings this box published at runtime

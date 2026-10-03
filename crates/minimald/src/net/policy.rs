@@ -408,6 +408,10 @@ pub enum ExposeRefusal {
     /// with nobody attached — or until that prompt path exists — the request
     /// fails closed rather than publishing unasked.
     AskNeedsAnswer,
+    /// The attached human an `ask` was put to answered no (NET-045). Carries
+    /// the port so the refusal is spelled as the human's own decision about
+    /// it, never as the box's — the setting asked, and the human answered.
+    DeniedByHuman(u16),
     /// `dynamic_ingress` allows, but the box declares no
     /// `dynamic_allowed_range`: no port was opted in.
     NoDynamicRange,
@@ -432,6 +436,9 @@ impl fmt::Display for ExposeRefusal {
                 f,
                 "dynamic ingress is set to ask and nobody is attached to answer"
             ),
+            Self::DeniedByHuman(port) => {
+                write!(f, "the attached human refused to publish port {port}")
+            }
             Self::NoDynamicRange => write!(
                 f,
                 "this box declares no dynamic port range, so no port can be allowed"

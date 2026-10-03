@@ -276,6 +276,15 @@ async fn build_bundle(
 
     collect_step!(w, "meta", meta(&mut w, s));
     collect_step!(w, "logs", logs(&mut w, &state_dir, log_tail_cap(req)));
+    // The local audit log's tail (NET-046): every dynamic ingress decision
+    // this daemon recorded, beside the daemon's own log and under the same
+    // caller cap — the who-decided record a wedge or a surprise publish is
+    // diagnosed from.
+    collect_step!(
+        w,
+        "audit",
+        audit_tail(&mut w, &state_dir, log_tail_cap(req))
+    );
     // The kernel's own log, beside the daemon's and under the same caller cap.
     // A guest bundle has no other kernel evidence: `console=hvc0` lands in the
     // *host's* `boot.log`, which is recreated per boot and tail-capped, so on a
@@ -516,6 +525,62 @@ async fn logs<W: BundleSink>(
         if let Err(e) = w.add_file_tail(&dest, &path, cap).await {
             w.skip(&dest, format!("unreadable: {e:#}"));
         }
+    }
+    Ok(())
+}
+
+/// The local audit log's tail (NET-046): the dynamic ingress decisions this
+/// daemon recorded, whatever they were decided by. The `logs` collector's
+/// symlink discipline applies unchanged — guest tasks can write this volume,
+/// so the audit directory is refused as a directory before the file in it is
+/// tailed, and `add_file_tail`'s O_NOFOLLOW refuses a swapped log file.
+async fn audit_tail<W: BundleSink>(
+    w: &mut BundleWriter<W>,
+    state_dir: &Path,
+    cap: u64,
+) -> Result<(), anyhow::Error> {
+    let log_path = crate::audit::audit_log_path(state_dir);
+    let Some(audit_dir) = log_path.parent() else {
+        w.skip("audit/", "the audit log has no parent directory");
+        return Ok(());
+    };
+    match tokio::fs::symlink_metadata(audit_dir).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            w.skip(
+                "audit/",
+                "no audit directory — no dynamic ingress decision recorded yet",
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            w.skip("audit/", format!("unreadable: {e}"));
+            return Ok(());
+        }
+        Ok(m) if !m.is_dir() => {
+            w.skip(
+                "audit/",
+                "not a directory — refusing to follow it out of the state dir",
+            );
+            return Ok(());
+        }
+        Ok(_) => {}
+    }
+    match tokio::fs::symlink_metadata(&log_path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            w.skip(
+                "audit/ingress.log",
+                "no decisions recorded — the log exists only after a first decision",
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            w.skip("audit/ingress.log", format!("unreadable: {e}"));
+            return Ok(());
+        }
+        Ok(_) => {}
+    }
+    if let Err(e) = w.add_file_tail("audit/ingress.log", &log_path, cap).await {
+        w.skip("audit/ingress.log", format!("unreadable: {e:#}"));
     }
     Ok(())
 }
@@ -1472,6 +1537,84 @@ mod tests {
         assert!(
             contents.contains("curl -H 'Authorization: Bearer"),
             "non-credential parts must survive, got: {contents}"
+        );
+    }
+
+    /// The bundle carries the local audit log's tail (NET-046's record of
+    /// every dynamic ingress decision), beside the daemon's own logs and
+    /// under the same caller cap — the who-decided record a diagnosis reads.
+    #[tokio::test]
+    async fn diag_bundle_carries_the_audit_log_tail() {
+        let server = TestServer::new().await;
+        let state_dir = server.state.minimal_state_dir().await;
+        crate::audit::append(
+            state_dir.as_utf8_path().as_std_path(),
+            crate::audit::IngressDecision {
+                box_name: "web".to_string(),
+                port: 3000,
+                decision: sessions::DynamicIngress::Ask,
+                decided_by: crate::audit::DecidedBy::Human,
+                outcome: crate::audit::IngressOutcome::Published,
+                reason: None,
+                published_at: Some("10.0.2.15:3000".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let files = fetch_bundle(&server).await;
+        let log = String::from_utf8_lossy(&files["audit/ingress.log"]);
+        assert!(
+            log.contains(r#""box":"web""#),
+            "the recorded decision travels in the bundle: {log}"
+        );
+        assert!(
+            log.contains(r#""decided_by":"human""#),
+            "who decided travels with it: {log}"
+        );
+
+        // And the entry is manifested as collected, not as an error.
+        let manifest = manifest(&files);
+        assert!(
+            manifest["errors"].as_array().unwrap().is_empty(),
+            "a healthy server with decisions to audit collects cleanly: {}",
+            manifest["errors"]
+        );
+        let collected: Vec<&str> = manifest["collected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
+        assert!(
+            collected.contains(&"audit/ingress.log"),
+            "the audit tail is a collected entry: {collected:?}"
+        );
+    }
+
+    /// A daemon that has never decided a port still collects cleanly: the
+    /// audit collector explains the absence in the manifest rather than
+    /// failing the bundle, so a fresh daemon's bundle is not an error report.
+    #[tokio::test]
+    async fn diag_bundle_explains_a_missing_audit_log() {
+        let server = TestServer::new().await;
+        let files = fetch_bundle(&server).await;
+
+        let manifest = manifest(&files);
+        assert!(
+            manifest["errors"].as_array().unwrap().is_empty(),
+            "a fresh daemon's bundle is healthy: {}",
+            manifest["errors"]
+        );
+        let skipped: Vec<&str> = manifest["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["what"].as_str().unwrap())
+            .collect();
+        assert!(
+            skipped.contains(&"audit/"),
+            "the absence of the audit directory is explained: {skipped:?}"
         );
     }
 }
