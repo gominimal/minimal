@@ -930,7 +930,8 @@ where
 ///
 /// `client_lost` is a watch receiver set to `true` when the SSH client
 /// disconnects (channel close or sender drop). The bridge kills the
-/// current child and stops the sequence when it fires.
+/// current child and stops the sequence when it fires, whatever exit
+/// code that child reports.
 ///
 /// On any non-zero exit the sequence stops and that code is returned —
 /// matching `set -e` shell semantics for chained task invocations. If
@@ -983,7 +984,10 @@ where
             &mut client_lost,
         )
         .await;
-        if last_exit != 0 {
+        // `changed()` fires once per transition, so a later step would
+        // never see a disconnect an earlier step already consumed: a child
+        // that exits 0 just as the client goes must still end the sequence.
+        if last_exit != 0 || *client_lost.borrow() {
             break;
         }
     }
@@ -3167,6 +3171,64 @@ mod tests {
         // The second process was never spawned, so its kill flag should
         // still be unset.
         assert!(!second.ctrl.was_killed());
+    }
+
+    /// A disconnect consumed by the first step must still stop the
+    /// sequence when that child reports exit 0 (it exited just before
+    /// the kill landed, or ignores kill like `EchoProcess`). The watch
+    /// transition is already spent, so a second, silent child would
+    /// never see it: the bridge must not start it. If it did, this test
+    /// times out, since nothing ever ends the second child.
+    #[tokio::test]
+    async fn bridge_stops_sequence_on_client_loss_after_zero_exit() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (iter, mut endpoints) = build_mock_seq(2);
+        // Silent and never exiting: stdio held open, ctrl never signalled.
+        let second = endpoints.pop().unwrap();
+        let MockEndpoints {
+            stdin_reader: _stdin_reader,
+            stdout_writer: first_stdout,
+            stderr_writer: first_stderr,
+            ctrl: first_ctrl,
+        } = endpoints.pop().unwrap();
+        drop(first_stdout);
+        drop(first_stderr);
+        first_ctrl.signal_exit(0).await;
+
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        // The client is gone and the transition is already observed, as
+        // the first step's `changed()` branch would have left it.
+        let (client_lost_tx, mut client_lost_rx) = tokio::sync::watch::channel(false);
+        client_lost_tx.send(true).unwrap();
+        client_lost_rx.borrow_and_update();
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                iter,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost_rx,
+            )
+            .await
+        });
+
+        timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a lost client must end the sequence, not start the next child")
+            .unwrap();
+        assert!(
+            !second.ctrl.was_killed(),
+            "the second child must never be started"
+        );
+        drop(client_lost_tx);
     }
 
     /// A two-process sequence where both children exit cleanly: the
