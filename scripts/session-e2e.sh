@@ -113,6 +113,13 @@
 #                                   two daemons on one machine routing
 #   retired_surfaces_gone            NET-109/110: the retired surfaces are gone,
 #                                    and a direct-tcpip forward relays for real
+#   github_only_allowlist            NET-066/067/072/073/136 + NET-068's e2e
+#                                    half: a hostname-only allowlist runs a
+#                                    real toolchain against github.com and
+#                                    friends, refuses and logs an answer into
+#                                    a denied range, answers AAAA/HTTPS/SVCB
+#                                    empty, and lets boxes reach each other by
+#                                    name under both boxes' rules
 #
 # Usage: scripts/session-e2e.sh [case]
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
@@ -182,6 +189,8 @@ RECOVER_SWITCH_HOLD="" # where beat C parks it mid-proof
 RETIRED_SEED_DIR="" # seeded by the retired-surfaces proof below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
+GOA_T_SEED_DIR="" # the github-only allowlist proof's toolchain-box seed; removed on teardown
+GOA_SEED_DIR="" # its shared shell-stack seed (the denied-range and peer boxes); removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -472,6 +481,8 @@ teardown() {
   [ -n "$SECOND_SEED_DIR" ] && rm -rf "$SECOND_SEED_DIR"
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
+  [ -n "$GOA_T_SEED_DIR" ] && rm -rf "$GOA_T_SEED_DIR"
+  [ -n "$GOA_SEED_DIR" ] && rm -rf "$GOA_SEED_DIR"
   # The forward holds the laptop-side listener; INT is the documented stop,
   # KILL the backstop so a hung relay cannot outlive the run.
   if [ -n "$RETIRED_FWD_PID" ]; then
@@ -4904,8 +4915,628 @@ proof_switch_answers_no_arp_for_the_proxy_address() {
   echo "::endgroup::"
 }
 
+# ---------------------------------------------------------------------------
+# A hostname-only allowlist, end to end (NET-066, NET-067, NET-136,
+# NET-072, NET-073, plus NET-068's end-to-end half): one own-address box
+# whose only reach is `--allow-dns-hosts` — its one `--allow-subnets` entry
+# is a documentation range no real destination ever sits inside, so nothing
+# but a DNS-pinned admission can ever carry a fetch — must still complete a
+# real toolchain against github.com and friends: git clone, npm install,
+# pip install and a container pull. (The composed base is not Debian and
+# ships no apt; the container pull is the leg that keeps the rotating-CDN
+# shape apt stood for — the same reconciliation the minvmd VM harness's
+# NET-068 test makes. The CLI has no spelling for an EMPTY allow-subnets
+# list — the harness spells one through the daemon's RPC — so a dead CIDR
+# is the e2e form of "hostname-only", the egress proof's own never-admits-
+# anything allow rule.)
+#
+# Everything the run shows is read back out of the daemon's log, per probe:
+# every admission the DNS gate made for the fetch, the relay's empty
+# answers for AAAA/HTTPS/SVCB lookups, the refused answer a denied range
+# produced (a second box allowed github.com but denying every subnet), and
+# the box-zone connects a sibling pair's declarations decided — boxes
+# reaching each other BY NAME, under both boxes' rules.
+#
 # Ordered LAST in the whole-lane run on purpose: it restarts the daemon (see
 # the RUST_LOG note inside) and nothing after it depends on the one before.
+proof_github_only_allowlist() {
+  echo "::group::github-only allowlist: toolchain fetches, one refused answer, empty lookups, box-zone reach"
+
+  # Own-address enforcement lives on the switch: the gate that admits a
+  # resolved name's answers is the box's own relay
+  # (crates/minimald/src/net/dns_gate.rs), so a target without one has
+  # nothing to prove here — the same gate as the two own-IP proofs above.
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "github-only allowlist proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The names, ports and markers. Ports are fixed on purpose — they must
+  # agree across the execs that start and probe each responder — and high
+  # enough to need no privilege, and clear of every port the proofs above
+  # publish.
+  GOA_T_NAME="e2e-goa-toolchain"  # the hostname-only box
+  GOA_D_NAME="e2e-goa-denied"     # the denied-range box
+  GOA_P1_NAME="e2e-goa-peer1"     # box-zone peer one
+  GOA_P2_NAME="e2e-goa-peer2"     # box-zone peer two
+  GOA_P1_PORT=18091               # P1's published responder
+  GOA_P2_PORT=18092               # P2's published responder (the reverse leg)
+  GOA_CLOSED_PORT=18093           # published by nothing: the conjunction's target half
+  GOA_P1_MARKER="GOA_PEER1_OK"    # what P1's responder answers with
+  GOA_P2_MARKER="GOA_PEER2_OK"    # what P2's responder answers with
+  # The dead allow entry that makes the declaration hostname-only:
+  # TEST-NET-3 (RFC 5737), the same range the own-IP egress proof uses as its
+  # can-never-admit-live-traffic allow rule.
+  GOA_DEAD_CIDR="203.0.113.0/24"
+  # The toolchain's hosts, verbatim from sessions::NET068_TOOLCHAIN_EGRESS_HOSTS
+  # (crates/sessions/src/lib.rs) — the one list the minimald unit fixture and
+  # the minvmd VM harness share; keep this copy in step with it. Docker Hub
+  # serves its image blobs through a 307 redirect that lands on either of
+  # its two CDNs, so a container pull needs both.
+  GOA_HOSTS="github.com codeload.github.com raw.githubusercontent.com registry.npmjs.org pypi.org files.pythonhosted.org registry-1.docker.io auth.docker.io production.cloudflare.docker.com production.cloudfront.docker.com"
+
+  # The daemon's log for THIS lane: natively the daily-rotated JSON file
+  # (newest last); on a VM lane the in-guest daemon's stdout rides the
+  # guest's serial console into the host-side boot log — the one host path
+  # that reaches its records (the same file `fail` dumps).
+  goa_log() {
+    if [ -n "$E2E_VM" ]; then
+      printf '%s\n' "${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-minvmd0/boot.log}"
+    else
+      find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null | sort | tail -n1
+    fi
+  }
+  # Its current line count (0 when it has not written one yet).
+  goa_log_lines() {
+    local f
+    f="$(goa_log)"
+    if [ -n "$f" ] && [ -f "$f" ]; then wc -l < "$f"; else printf '0\n'; fi
+  }
+  # The net-module records the log gained since its first $1 — one probe's
+  # evidence, and nothing else. Matched on the module path alone, which the
+  # native log carries as the JSON record's `target` and the VM console as
+  # the default layer's inline prefix, so the window reads the same on both
+  # shapes; the daemon logs plenty besides the probe while one is in flight
+  # (SSH-handshake warnings chief among them), which the filter keeps out.
+  goa_net_since() {
+    local f
+    f="$(goa_log)"
+    [ -n "$f" ] && [ -f "$f" ] || return 0
+    tail -n "+$(($1 + 1))" "$f" | grep -F -- 'minimald::net::' || true
+  }
+  # Polls (≤5 s) for the records since $1 to carry $2 ("" = any), prints
+  # them for the transcript, and leaves them in GOA_RECORDS: the file writer
+  # is asynchronous natively and the serial console is on a VM lane, so
+  # callers wait for the record their probe owes before asserting on it.
+  goa_print_net_since() {
+    local before="$1" want="${2:-}" i
+    GOA_RECORDS=""
+    for i in $(seq 1 20); do
+      GOA_RECORDS="$(goa_net_since "$before")"
+      if [ -z "$want" ] || [[ "$GOA_RECORDS" == *"$want"* ]]; then break; fi
+      sleep 0.25
+    done
+    if [ -n "$GOA_RECORDS" ]; then
+      printf '%s\n' "$GOA_RECORDS" | sed 's/^/daemon log: /'
+    else
+      echo "daemon log: (no minimald::net record in this window)"
+    fi
+  }
+  # Whether one of this proof's curl probes actually reached a server — the
+  # egress proof's rule: curl ALWAYS writes its -w line, and `HTTP:000` means
+  # nothing answered, so a completed exchange is a zero exit OR any real
+  # status back, whatever curl then thought of the certificate.
+  goa_curl_answered() {
+    [ "$1" -eq 0 ] && return 0
+    [ -n "$2" ] && [ "$2" != "HTTP:000" ] && return 0
+    return 1
+  }
+
+  # The daemon's filter comes from RUST_LOG at spawn, and this lane runs it
+  # at `warn` — which drops the DEBUG records half this case reads back: the
+  # DNS gate's admissions, the relay's empty-lookup answers, the switch's
+  # box-zone connect decisions. Restart with those two modules raised (the
+  # exec records stay at info, and the CLI's own modules stay at warn, so
+  # the session-id extraction every proof uses is untouched; the WARN
+  # refusal record needs no raise). No hook_log_readable gate here, unlike
+  # the proxy proofs above: on a VM lane the host's RUST_LOG rides the
+  # kernel command line into the guest (crates/minvmd/src/vm.rs,
+  # GUEST_LOG_ENV), so the raised filter reaches the in-guest daemon too,
+  # and its records ride the serial console into the host-side boot log this
+  # case reads. Sessions survive a daemon restart (the restart proof pins
+  # that), and this case is LAST in the whole-lane run, so nothing after it
+  # depends on the filter it leaves behind.
+  mnl stop >/dev/null 2>&1 || true # a standalone run has no daemon yet
+  export RUST_LOG="warn,minimald::exec=info,minimald::net::dns_gate=debug,minimald::net::switch=debug"
+
+  # ---- the seeds -----------------------------------------------------------
+  # The toolchain box gets its own seed: the shell stack (for bash, curl and
+  # socat — no package of the toolchain provides those) plus the toolchain
+  # packages the minvmd VM harness composes for NET-068, and the DNS probe.
+  # The other three boxes need only the shell stack, so they share one seed
+  # (a path that already has a session mints another with a warning — the
+  # duplicate check is advisory — and nothing of the boxes is shared).
+  GOA_T_SEED_DIR="$(hook_mktemp /tmp/mnlgoat.XXXXXX)"
+  {
+    hook_seed_preamble
+    printf '\n[session]\npackages = [\n'
+    printf '  "base",\n  "coreutils",\n  "git",\n  "python",\n  "node",\n'
+    printf '  "skopeo",\n  "ca-certificates",\n]\n'
+  } > "$GOA_T_SEED_DIR/minimal.toml"
+  mkdir "$GOA_T_SEED_DIR/.git"
+  # The in-box DNS probe (NET-136's observable): one question to the box's
+  # own resolver, answered by whatever the relay says. It rides the
+  # activation's project upload into the session — a box has no other
+  # channel in — and the probe-file check below asserts the upload carried
+  # it rather than letting a missing file read as a refused lookup. stdlib
+  # only. It prints QTYPE, RCODE, the answer count and the A records, so a
+  # caller can assert "empty" without caring which of the three qtypes it
+  # asked, and the A leg doubles as the live control for the empty ones.
+  # The heredoc's delimiter is quoted so nothing expands, and its body sits
+  # at column zero on purpose: `<<'EOF'` (not `<<-`) keeps every leading
+  # byte, so this function's indentation would end up inside the python
+  # file, where it is a syntax error.
+  cat > "$GOA_T_SEED_DIR/e2e-dns-probe.py" <<'GOA_PROBE_EOF'
+"""One DNS question, answered by the box's own resolver.
+
+Prints QTYPE, RCODE, the answer count and the A records so a caller can
+assert "empty" (NODATA) rather than trust any cache: the resolv.conf
+nameserver inside a box is the switch resolver, whose relay is the thing
+under test. stdlib only.
+"""
+import socket
+import struct
+import sys
+
+QTYPE = {"a": 1, "aaaa": 28, "https": 65, "svcb": 64}
+
+
+def resolver():
+    with open("/etc/resolv.conf") as handle:
+        for line in handle:
+            parts = line.split()
+            if parts and parts[0] == "nameserver":
+                return parts[1]
+    raise SystemExit("no nameserver in /etc/resolv.conf")
+
+
+def question(name, qtype):
+    labels = b"".join(
+        bytes([len(label)]) + label.encode() for label in name.rstrip(".").split(".")
+    )
+    return (
+        struct.pack("!HHHHHH", 0x4E47, 0x0100, 1, 0, 0, 0)
+        + labels
+        + b"\x00"
+        + struct.pack("!HH", qtype, 1)
+    )
+
+
+def skip_name(reply, offset):
+    while True:
+        length = reply[offset]
+        if length & 0xC0:
+            return offset + 2
+        if length == 0:
+            return offset + 1
+        offset += 1 + length
+
+
+def a_records(reply):
+    offset = skip_name(reply, 12) + 4
+    count = struct.unpack("!H", reply[6:8])[0]
+    records = []
+    for _ in range(count):
+        offset = skip_name(reply, offset)
+        rtype, _class, _ttl, rdlength = struct.unpack("!HHIH", reply[offset : offset + 10])
+        offset += 10
+        rdata = reply[offset : offset + rdlength]
+        offset += rdlength
+        if rtype == 1 and rdlength == 4:
+            records.append(socket.inet_ntoa(rdata))
+    return records
+
+
+def main():
+    if len(sys.argv) != 3 or sys.argv[2].lower() not in QTYPE:
+        raise SystemExit(f"usage: {sys.argv[0]} NAME a|aaaa|https|svcb")
+    name, kind = sys.argv[1], sys.argv[2].lower()
+    qtype = QTYPE[kind]
+    nameserver = resolver()
+    family = socket.AF_INET6 if ":" in nameserver else socket.AF_INET
+    with socket.socket(family, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(5)
+        sock.sendto(question(name, qtype), (nameserver, 53))
+        reply, _ = sock.recvfrom(4096)
+    rcode = struct.unpack("!H", reply[2:4])[0] & 0x0F
+    answers = struct.unpack("!H", reply[6:8])[0]
+    records = a_records(reply)
+    print(f"QTYPE={qtype} RCODE={rcode} ANSWERS={answers} A={','.join(records) or '-'}")
+
+
+main()
+GOA_PROBE_EOF
+  GOA_SEED_DIR="$(hook_mktemp /tmp/mnlgoa.XXXXXX)"
+  hook_seed_preamble > "$GOA_SEED_DIR/minimal.toml"
+  mkdir "$GOA_SEED_DIR/.git"
+
+  # The one variable the toolchain routes back for approval: the `node`
+  # package wires NPM_CONFIG_CACHE through its env_state_wiring attr
+  # (gominimal/pkgs packages/node/build.ncl), and --no-prompt aborts on
+  # anything the user policy cannot auto-decide. Pre-approve exactly it,
+  # mirroring the task proof's [vars] allow idiom, and remove the entry
+  # once the box is up so nothing later reads it as standing policy.
+  mkdir -p "$XDG_CONFIG_HOME/minimal"
+  printf '[vars]\nallow = ["NPM_CONFIG_CACHE"]\n' > "$XDG_CONFIG_HOME/minimal/user_policy.toml"
+
+  # ---- the hostname-only box ----------------------------------------------
+  goa_t_args=""
+  for goa_host in $GOA_HOSTS; do
+    goa_t_args="$goa_t_args --allow-dns-hosts $goa_host"
+  done
+  # shellcheck disable=SC2086 # the repeatable flags are built word-split on purpose
+  goa_t_sid="$(cd "$GOA_T_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$GOA_T_NAME" --network own_ip \
+    --allow-subnets "$GOA_DEAD_CIDR" --allow-protocols tcp $goa_t_args \
+    2>"$WORK/goa-activate-t.err")" || {
+    echo "::error::'min session activate' for the hostname-only box failed"
+    echo "--- stderr ---"; cat "$WORK/goa-activate-t.err" 2>/dev/null || true
+    fail
+  }
+  goa_t_sid="$(printf '%s\n' "$goa_t_sid" | tail -n1 | tr -d '\r')"
+  rm -f "$XDG_CONFIG_HOME/minimal/user_policy.toml"
+  echo "hostname-only box: $goa_t_sid ($GOA_T_NAME)"
+
+  # The box must be able to run a probe at all — a host that is itself a
+  # sandbox (the proxy proof's gate) denies the nested mount namespaces a
+  # box's rootfs needs, and every assertion below runs inside a box. A
+  # project that declares no hooks needs no [hooks] allow entry.
+  if ! mnl session exec "$goa_t_sid" 'true' >"$WORK/goa-execgate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$goa_t_sid" 'true' >"$WORK/goa-execgate.err" 2>&1; }; then
+    if [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; then
+      echo "::warning::github-only allowlist proof SKIPPED — this host cannot run a session sandbox"
+      echo "  (exec: $(head -n1 "$WORK/goa-execgate.err" 2>/dev/null || true))"
+      echo "  so none of the in-box probes can run; on CI or a VM lane this gate fails instead"
+      mnl session destroy --force "$goa_t_sid" >/dev/null 2>&1 || true
+      rm -rf "$GOA_T_SEED_DIR"; GOA_T_SEED_DIR=""
+      rm -rf "$GOA_SEED_DIR"; GOA_SEED_DIR=""
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::the hostname-only box cannot run an exec, so no in-box probe can run: nothing this case asserts can be asserted"
+    echo "  (exec: $(head -n1 "$WORK/goa-execgate.err" 2>/dev/null || true))"
+    echo "  on a VM lane the boxes live in the guest, so this is a lane-level fault"
+    fail
+  fi
+  # And the probe must have ridden the project upload into the workspace, so
+  # a missing file cannot masquerade as a refused lookup later.
+  if ! mnl session exec "$goa_t_sid" 'test -f /workbench/e2e-dns-probe.py' \
+     >"$WORK/goa-probegate.err" 2>&1; then
+    echo "::error::the DNS probe did not ride the project upload into the session workspace"
+    echo "  (exec: $(head -n1 "$WORK/goa-probegate.err" 2>/dev/null || true))"
+    fail
+  fi
+
+  # The effective rules, shown: the four-field rendering the egress proof
+  # pins has its own case; here it is the declaration's own receipt — the
+  # dead CIDR, every one of the ten hosts, and tcp alone.
+  goa_policy="$(mnl session policy "$goa_t_sid" 2>"$WORK/goa-policy.err")" || {
+    echo "::error::'min session policy' failed for the hostname-only box"
+    cat "$WORK/goa-policy.err" 2>/dev/null || true
+    fail
+  }
+  echo "effective policy of the hostname-only box:"
+  printf '%s\n' "$goa_policy" | sed 's/^/  /'
+  if ! grep -q -- "subnets  $GOA_DEAD_CIDR" <<<"$goa_policy" \
+     || ! grep -q -- "dns hosts  github.com" <<<"$goa_policy" \
+     || ! grep -q -- "production.cloudfront.docker.com" <<<"$goa_policy" \
+     || ! grep -q -- "protocols  tcp" <<<"$goa_policy"; then
+    echo "::error::the hostname-only declaration did not reach the effective policy"
+    echo "--- raw policy output ---"
+    printf '%s\n' "$goa_policy"
+    fail
+  fi
+
+  # ---- NET-068, the e2e half: the toolchain under the hostname-only box ----
+  # The four operations the minvmd VM harness drives, in the same shape:
+  # each must exit 0 with nothing but DNS-pinned reach behind it. DNS itself
+  # is UDP and the declaration allows tcp alone — the resolver carve-out
+  # (NET-079) carries it, and the fetches below completing is that proof's
+  # own evidence. Each leg prints the admissions the DNS gate made for it,
+  # which are the only grants it could have reached anything by.
+  goa_fetch() {
+    local label="$1" cmd="$2"
+    local before out rc
+    before="$(goa_log_lines)"
+    out="$(mnl session exec "$goa_t_sid" "$cmd" 2>"$WORK/goa-$label.err")"
+    rc=$?
+    echo "fetch $label: $cmd"
+    goa_print_net_since "$before" "admitted a resolved name"
+    echo "  -> exit $rc"
+    if [ "$rc" -ne 0 ]; then
+      echo "::error::$label did not complete (exit $rc) — a hostname-only allowlist must admit every host the tool touches; the window above names the hosts it did, so a host missing from it is the one to add to the declaration"
+      echo "--- stderr tail ---"; tail -20 "$WORK/goa-$label.err" 2>/dev/null || true
+      fail
+    fi
+    if [[ "$GOA_RECORDS" != *"admitted a resolved name"* ]]; then
+      echo "::error::the daemon log shows no DNS admission for the $label fetch — this case owes each fetch's admissions in the log (the box's one subnet rule can never admit a live destination, so a completed fetch without one is unexplained)"
+      fail
+    fi
+  }
+  goa_fetch "git" "/usr/bin/timeout 90 git clone --depth 1 https://github.com/octocat/Hello-World /tmp/hello-world"
+  goa_fetch "npm" "/usr/bin/timeout 90 sh -c 'mkdir -p /tmp/npm-stub && cd /tmp/npm-stub && npm install is-odd --prefix .'"
+  goa_fetch "pip" "/usr/bin/timeout 90 pip3 install --target /tmp/pip-stub requests"
+  goa_fetch "skopeo" "/usr/bin/timeout 90 skopeo --insecure-policy copy docker://docker.io/library/hello-world dir:/tmp/hw"
+
+  # ---- NET-136: AAAA, HTTPS and SVCB lookups get empty answers -------------
+  # The A control first, from the same box, the same name and the same
+  # resolver: answered, with a real address and an admission record naming
+  # the name. Without it, ANSWERS=0 below could be a dead resolver and the
+  # empty lookups would prove nothing.
+  goa_a_before="$(goa_log_lines)"
+  goa_a_out="$(mnl session exec "$goa_t_sid" \
+    "/usr/bin/timeout 20 python3 /workbench/e2e-dns-probe.py github.com a" \
+    2>"$WORK/goa-probe-a.err")"
+  goa_a_rc=$?
+  goa_print_net_since "$goa_a_before" "admitted a resolved name"
+  echo "probe a github.com -> ${goa_a_out:-<none>} (exit $goa_a_rc)"
+  if [ "$goa_a_rc" -ne 0 ]; then
+    echo "::error::the A-lookup control probe did not complete (exit $goa_a_rc)"
+    cat "$WORK/goa-probe-a.err" 2>/dev/null || true
+    fail
+  fi
+  if ! grep -Eq 'ANSWERS=[1-9]' <<<"$goa_a_out" || [[ "$goa_a_out" == *"A=-"* ]]; then
+    echo "::error::the A lookup for github.com came back empty or with no address — the control for the empty-lookup legs below is itself empty: '${goa_a_out:-<none>}'"
+    fail
+  fi
+  if [[ "$GOA_RECORDS" != *"admitted a resolved name"* ]] \
+     || [[ "$GOA_RECORDS" != *github.com* ]]; then
+    echo "::error::no admission record for github.com in the A-control probe's window — NET-066's admission is this case's evidence and it did not happen"
+    fail
+  fi
+  echo "NET-066 OK: an allowed name's A answer was admitted by the gate (the window above names it and its address)"
+
+  # One empty-records lookup: the probe asks the box's own resolver, and the
+  # assertion is on what the box's own resolver stack saw — RCODE 0 with
+  # zero answers — plus the relay's own record that the empty answer came
+  # from the relay, not from an empty upstream.
+  goa_nodata_leg() {
+    local qtype="$1" before out rc
+    before="$(goa_log_lines)"
+    out="$(mnl session exec "$goa_t_sid" \
+      "/usr/bin/timeout 20 python3 /workbench/e2e-dns-probe.py github.com $qtype" \
+      2>"$WORK/goa-probe-$qtype.err")"
+    rc=$?
+    goa_print_net_since "$before" "answered an empty-records lookup"
+    echo "probe $qtype github.com -> ${out:-<none>} (exit $rc)"
+    if [ "$rc" -ne 0 ]; then
+      echo "::error::the $qtype probe did not complete (exit $rc)"
+      cat "$WORK/goa-probe-$qtype.err" 2>/dev/null || true
+      fail
+    fi
+    if ! grep -q 'RCODE=0' <<<"$out" || ! grep -q 'ANSWERS=0' <<<"$out"; then
+      echo "::error::the $qtype lookup for github.com did not come back empty: got '${out:-<none>}' (NET-136 wants NOERROR with zero answers)"
+      fail
+    fi
+    if [[ "$GOA_RECORDS" != *"answered an empty-records lookup"* ]]; then
+      echo "::error::the daemon log does not record the relay answering the $qtype lookup — the evidence that the empty answer came from the relay rather than an empty upstream is missing"
+      fail
+    fi
+    echo "NET-136 OK: the $qtype lookup got an empty answer, and the relay's record says it answered"
+  }
+  goa_nodata_leg aaaa
+  goa_nodata_leg https
+  goa_nodata_leg svcb
+
+  # ---- NET-067: an answer into a denied range is refused and logged --------
+  # A second box, allowed the same name but denying every subnet: whatever
+  # github.com resolves to is refused into 0.0.0.0/0 — deterministic,
+  # because the deny matches every address the resolver could possibly
+  # answer, so the record is owed by resolution alone. The live control is
+  # this same run's toolchain legs and the A probe above: the resolver
+  # answers github.com on this lane, so a missing record is the gate's
+  # failure, not weather. The reply still passes through to the box
+  # (resolution is honest), so the connect has a real address to aim at and
+  # the deny is what drops it — a silent drop, no reset.
+  goa_d_sid="$(cd "$GOA_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$GOA_D_NAME" --network own_ip \
+    --allow-dns-hosts github.com --deny-subnets 0.0.0.0/0 \
+    2>"$WORK/goa-activate-d.err")" || {
+    echo "::error::'min session activate' for the denied-range box failed"
+    echo "--- stderr ---"; cat "$WORK/goa-activate-d.err" 2>/dev/null || true
+    fail
+  }
+  goa_d_sid="$(printf '%s\n' "$goa_d_sid" | tail -n1 | tr -d '\r')"
+  echo "denied-range box: $goa_d_sid ($GOA_D_NAME)"
+  goa_d_before="$(goa_log_lines)"
+  goa_d_start="$(now_ms)"
+  mnl session exec "$goa_d_sid" \
+    "curl -sS --max-time 10 -o /dev/null -w 'HTTP:%{http_code}' https://github.com/" \
+    >"$WORK/goa-denied.out" 2>"$WORK/goa-denied.err"
+  goa_d_rc=$?
+  goa_d_elapsed=$(( $(now_ms) - goa_d_start ))
+  goa_d_status="$(cat "$WORK/goa-denied.out" 2>/dev/null)"
+  goa_d_err="$(tr '\n' ' ' < "$WORK/goa-denied.err" 2>/dev/null)"
+  goa_print_net_since "$goa_d_before" "an allowed name resolved into a refused range"
+  echo "denied-range GET https://github.com/ -> rc=$goa_d_rc status=${goa_d_status:-<none>} elapsed=${goa_d_elapsed}ms curl: ${goa_d_err:-<none>}"
+  if goa_curl_answered "$goa_d_rc" "${goa_d_status:-}"; then
+    echo "::error::NET-067: the denied-range box completed a connection to github.com — its 0.0.0.0/0 deny admits nothing, so the connect escaping it is an enforcement hole"
+    cat "$WORK/goa-denied.err" 2>/dev/null || true
+    fail
+  fi
+  if printf '%s' "$goa_d_err" | grep -qi 'reset by peer'; then
+    echo "::error::NET-067: the denied-range box's connection was reset, not dropped silently — something answered a SYN the deny was supposed to drop"
+    cat "$WORK/goa-denied.err" 2>/dev/null || true
+    fail
+  fi
+  if [ "$goa_d_elapsed" -lt 6000 ]; then
+    echo "::error::NET-067: the denied-range box's connection failed in ${goa_d_elapsed}ms — a fast refusal. The controls above (this run's toolchain legs and the A probe) both resolved and reached github.com, so the resolver answers on this lane and the fast failure is the box's own doing, not weather"
+    cat "$WORK/goa-denied.err" 2>/dev/null || true
+    fail
+  fi
+  if [[ "$GOA_RECORDS" != *"an allowed name resolved into a refused range"* ]] \
+     || [[ "$GOA_RECORDS" != *github.com* ]]; then
+    echo "::error::NET-067: no refusal record for github.com in the denied-range box's window — the requirement is that the refusal is logged with the name and the answer, and the A control above proved the resolver answers"
+    fail
+  fi
+  echo "NET-067 OK: an allowed name's answer into a denied range was refused and logged (the window above names the name, the answer and the rule)"
+
+  # ---- NET-072/073: boxes reach each other by name, under both rules -------
+  # Two more boxes off the shared seed, both declaring the fabric plane as
+  # their one allow entry and each publishing one responder port: the
+  # source's half of the conjunction is the CIDR entry (a box-zone answer
+  # pins nothing, so a name's answer can never be the grant), the target's
+  # half its published port set. Both directions complete, so the reach
+  # holds under both boxes' rules; a port the target never published is
+  # refused by the target's half (the connect dies at the switch, nothing
+  # resets it); and the hostname-only box, allowed no plane entry, is
+  # refused by the source's half — its own egress leg drops the SYN before
+  # the switch ever sees it, so the target's relay logs nothing.
+  goa_p1_sid="$(cd "$GOA_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$GOA_P1_NAME" --network own_ip \
+    --allow-subnets 100.64.0.0/10 --allow-protocols tcp \
+    --ingress "$GOA_P1_PORT:$GOA_P1_PORT" \
+    2>"$WORK/goa-activate-p1.err")" || {
+    echo "::error::'min session activate' for peer box one failed"
+    echo "--- stderr ---"; cat "$WORK/goa-activate-p1.err" 2>/dev/null || true
+    fail
+  }
+  goa_p1_sid="$(printf '%s\n' "$goa_p1_sid" | tail -n1 | tr -d '\r')"
+  goa_p2_sid="$(cd "$GOA_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$GOA_P2_NAME" --network own_ip \
+    --allow-subnets 100.64.0.0/10 --allow-protocols tcp \
+    --ingress "$GOA_P2_PORT:$GOA_P2_PORT" \
+    2>"$WORK/goa-activate-p2.err")" || {
+    echo "::error::'min session activate' for peer box two failed"
+    echo "--- stderr ---"; cat "$WORK/goa-activate-p2.err" 2>/dev/null || true
+    fail
+  }
+  goa_p2_sid="$(printf '%s\n' "$goa_p2_sid" | tail -n1 | tr -d '\r')"
+  echo "box-zone peers: $goa_p1_sid ($GOA_P1_NAME) and $goa_p2_sid ($GOA_P2_NAME)"
+
+  # The responders (the proxy proof's socat form verbatim: socat is a
+  # launcher baseline package every box ships at /usr/bin), each serving a
+  # complete HTTP response, and each proven up before any cross-box leg
+  # runs — a leg failing against a listener that never started reads as a
+  # policy refusal, which is the one thing it must not be confused with.
+  for goa_peer in "$goa_p1_sid:$GOA_P1_PORT:$GOA_P1_MARKER" "$goa_p2_sid:$GOA_P2_PORT:$GOA_P2_MARKER"; do
+    IFS=: read -r goa_rb_sid goa_rb_port goa_rb_marker <<<"$goa_peer"
+    mnl session exec "$goa_rb_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 \
+      || { echo "::error::a peer box has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"; fail; }
+    mnl session exec "$goa_rb_sid" \
+      "body=$goa_rb_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200" \
+      >/dev/null 2>"$WORK/goa-responder.err" || {
+      echo "::error::could not write an in-box responder's response"
+      cat "$WORK/goa-responder.err" 2>/dev/null || true
+      fail
+    }
+    mnl session exec "$goa_rb_sid" \
+      "nohup /usr/bin/socat TCP-LISTEN:$goa_rb_port,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &" \
+      >/dev/null 2>"$WORK/goa-responder.err" || {
+      echo "::error::could not start an in-box responder"
+      cat "$WORK/goa-responder.err" 2>/dev/null || true
+      fail
+    }
+    goa_ready=""
+    for _ in $(seq 1 40); do
+      if [ "$(mnl session exec "$goa_rb_sid" \
+        "curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$goa_rb_port/" \
+        2>/dev/null || true)" = "200" ]; then
+        goa_ready=1
+        break
+      fi
+      sleep 0.25
+    done
+    [ -n "$goa_ready" ] || {
+      echo "::error::an in-box responder never answered its own box — the cross-box legs below must not run against a listener that never started"
+      fail
+    }
+  done
+
+  # One cross-box connect, reported: the status, then the window's box-zone
+  # records — the answer's validation (it pins nothing) and the connect
+  # decision (source_pass/target_pass, the conjunction) — then the
+  # assertion. $1 = source box, $2 = label, $3 = url, $4 = marker (a
+  # completing leg asserts it; "" = the leg must be refused), $5 = the
+  # record the leg owes the log.
+  goa_zone_leg() {
+    local box="$1" label="$2" url="$3" marker="$4" want="$5"
+    local before start rc elapsed status err body
+    before="$(goa_log_lines)"
+    start="$(now_ms)"
+    mnl session exec "$box" \
+      "curl -sS --max-time 8 -o /home/goa.body -w 'HTTP:%{http_code}' '$url'" \
+      >"$WORK/goa-$label.out" 2>"$WORK/goa-$label.err"
+    rc=$?
+    elapsed=$(( $(now_ms) - start ))
+    status="$(cat "$WORK/goa-$label.out" 2>/dev/null)"
+    err="$(tr '\n' ' ' < "$WORK/goa-$label.err" 2>/dev/null)"
+    goa_print_net_since "$before" "$want"
+    echo "zone leg $label: GET $url -> rc=$rc status=${status:-<none>} elapsed=${elapsed}ms curl: ${err:-<none>}"
+    if [[ "$GOA_RECORDS" != *"$want"* ]]; then
+      echo "::error::zone leg $label left no '$want' record in the daemon log — the connect decision this case owes the transcript did not happen"
+      fail
+    fi
+    if [ -n "$marker" ]; then
+      if ! goa_curl_answered "$rc" "${status:-}" || [ "$status" != "HTTP:200" ]; then
+        echo "::error::zone leg $label did not complete — a box-zone connect under both boxes' rules must reach the sibling it names"
+        cat "$WORK/goa-$label.err" 2>/dev/null || true
+        fail
+      fi
+      body="$(mnl session exec "$box" 'cat /home/goa.body' 2>/dev/null || true)"
+      if [[ "$body" != *"$marker"* ]]; then
+        echo "::error::zone leg $label connected but did not reach the sibling's responder (body: '$body')"
+        fail
+      fi
+      echo "  -> reached the sibling by name, marker $marker in the body"
+    else
+      if goa_curl_answered "$rc" "${status:-}"; then
+        echo "::error::zone leg $label completed — the conjunction was supposed to refuse it"
+        cat "$WORK/goa-$label.err" 2>/dev/null || true
+        fail
+      fi
+      if printf '%s' "$err" | grep -qi 'reset by peer'; then
+        echo "::error::zone leg $label was reset, not dropped — something answered a connect the conjunction refuses"
+        cat "$WORK/goa-$label.err" 2>/dev/null || true
+        fail
+      fi
+      if [ "$elapsed" -lt 6000 ]; then
+        echo "::error::zone leg $label failed in ${elapsed}ms — a fast refusal. The completing leg in this same run proved the fabric and both boxes' network paths, so the fast failure is the rules' own doing reported wrong, or a broken probe"
+        cat "$WORK/goa-$label.err" 2>/dev/null || true
+        fail
+      fi
+      echo "  -> refused, dropped silently to the timeout"
+    fi
+  }
+  goa_zone_leg "$goa_p1_sid" "peer1-to-peer2-published" \
+    "http://$GOA_P2_NAME.min.internal:$GOA_P2_PORT/" "$GOA_P2_MARKER" \
+    "box-zone connection decided at connect"
+  goa_zone_leg "$goa_p2_sid" "peer2-to-peer1-published" \
+    "http://$GOA_P1_NAME.min.internal:$GOA_P1_PORT/" "$GOA_P1_MARKER" \
+    "box-zone connection decided at connect"
+  goa_zone_leg "$goa_p1_sid" "peer1-to-peer2-unpublished" \
+    "http://$GOA_P2_NAME.min.internal:$GOA_CLOSED_PORT/" "" \
+    "box-zone connection decided at connect"
+  goa_zone_leg "$goa_t_sid" "toolchain-to-peer2" \
+    "http://$GOA_P2_NAME.min.internal:$GOA_P2_PORT/" "" \
+    "network policy violation"
+  echo "NET-072/073 OK: boxes reached each other by name under both boxes' rules; the target's unpublished port and the plane-less box were refused"
+
+  mnl session destroy --force "$goa_t_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$goa_d_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$goa_p1_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$goa_p2_sid" >/dev/null 2>&1 || true
+  rm -rf "$GOA_T_SEED_DIR"; GOA_T_SEED_DIR=""
+  rm -rf "$GOA_SEED_DIR"; GOA_SEED_DIR=""
+  echo "github-only allowlist OK (toolchain fetched, one refused answer logged, AAAA/HTTPS/SVCB answered empty, boxes reached each other by name)"
+  echo "::endgroup::"
+}
+
+# Ordered late in the whole-lane run on purpose: it restarts the daemon (see
+# the RUST_LOG note inside) and nothing after it depends on the one before.
+# The github_only_allowlist case, which the dispatch runs after this one,
+# last of all, restarts the daemon again for its own filter.
 proof_min_internal_names_through_proxy() {
   echo "::group::min.internal names through the hostname proxy (NET-001..NET-004)"
 
@@ -7015,6 +7646,7 @@ case "${1:-}" in
     proof_retired_surfaces_gone
     proof_switch_steers_proxy_mac_frames_to_the_host_stack
     proof_switch_answers_no_arp_for_the_proxy_address
+    proof_github_only_allowlist
     ;;
   lifecycle | session_exec | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
@@ -7023,7 +7655,8 @@ case "${1:-}" in
     | min_internal_names_through_proxy | proxy_refuses_like_direct | retired_surfaces_gone \
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes \
-    | switch_steers_proxy_mac_frames_to_the_host_stack | switch_answers_no_arp_for_the_proxy_address)
+    | switch_steers_proxy_mac_frames_to_the_host_stack | switch_answers_no_arp_for_the_proxy_address \
+    | github_only_allowlist)
     "proof_$1"
     ;;
   *)
@@ -7037,6 +7670,7 @@ case "${1:-}" in
     echo "         hostnames_recover_and_two_daemons_route"
     echo "         min_internal_names_through_proxy proxy_refuses_like_direct retired_surfaces_gone"
     echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
+    echo "         github_only_allowlist"
     exit 2
     ;;
 esac
