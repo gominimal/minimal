@@ -89,7 +89,14 @@ mod shuttle;
 pub use shuttle::{VSOCK_GVPROXY_SHUTTLE_PORT, resolve_gate_sock, resolve_switch_sock};
 mod baseline;
 pub use baseline::{NodeBaselinePhase, NodePlaneBaseline};
+pub use switch::bep_host::{BepBoxSource, BepWire};
 pub use switch::{BepDevice, BepDeviceEnds, BepHost, BepPeer};
+// The Box Egress Proxy's stand-in acceptor (NET-132): test and e2e only —
+// the supervisor binds it behind `MINVMD_BEP_STUB` and nothing on a
+// production boot ever listens at the proxy socket path. `pub` for the
+// same reachability reason `control` is: the stub build the `minimal` CLI
+// links must not see it as dead code.
+pub mod bep_stub;
 
 /// Default time to wait for gvproxy to exit on SIGTERM before escalating to
 /// SIGKILL.
@@ -712,6 +719,8 @@ impl HostGvproxy {
         switch_sock: PathBuf,
         datapath_check_interval: Duration,
         registry: &crate::box_registry::BoxRegistry,
+        wire: BepWire,
+        boxes: Arc<dyn BepBoxSource>,
     ) -> io::Result<Self> {
         let config = GvproxyConfig::new(binary, switch_sock)
             .with_datapath_check_interval(datapath_check_interval)
@@ -809,8 +818,11 @@ impl HostGvproxy {
                     // socket is known to accept connections: the peer owns the
                     // proxy's infrastructure address on the subnet, speaks the
                     // same length-framed Ethernet the switch socket carries, and
-                    // stops when this runtime drops at switch teardown.
-                    let _bep_peer = match BepPeer::spawn(&sock, subnet).await {
+                    // stops when this runtime drops at switch teardown. The wire
+                    // and the registered boxes arrive from the supervisor, which
+                    // mints the per-boot token and holds the rows the pool is
+                    // partitioned by (NET-132).
+                    let _bep_peer = match BepPeer::spawn(&sock, subnet, wire, boxes).await {
                         Ok(peer) => peer,
                         Err(e) => {
                             tracing::error!(error = %e, "failed to start box egress proxy peer");
@@ -1325,6 +1337,28 @@ mod tests {
         crate::box_registry::BoxRegistry::new(SwitchSubnet::default())
     }
 
+    /// The pool's box source for the supervision tests: no box rides the
+    /// stand-in switch, so no share of the pool is owed. The wiring beside
+    /// it names the same throwaway acceptor socket the peer would dial — no
+    /// acceptor listens there, which is the acceptor-down answer the peer
+    /// gives and nothing these tests observe either way.
+    struct NoBoxes;
+
+    impl BepBoxSource for NoBoxes {
+        fn box_switch_addresses(&self) -> Vec<Ipv4Addr> {
+            Vec::new()
+        }
+    }
+
+    /// The delivery wiring the supervision tests hand the switch runtime:
+    /// an acceptor path nothing listens at and a token nothing presents.
+    fn idle_bep_wire(dir: &std::path::Path) -> BepWire {
+        BepWire::new(
+            dir.join("gvproxy-bep.sock"),
+            [0u8; switch::bep_host::TOKEN_LEN],
+        )
+    }
+
     #[test]
     fn host_gvproxy_spawns_supervises_and_stops() {
         // A stay-alive script stands in for gvproxy: HostGvproxy::spawn only
@@ -1341,6 +1375,8 @@ mod tests {
             sock,
             DEFAULT_DATAPATH_CHECK_INTERVAL,
             &empty_box_registry(),
+            idle_bep_wire(dir.path()),
+            Arc::new(NoBoxes),
         )
         .expect("spawn host gvproxy");
         let pid = gvproxy.pid();
@@ -1368,6 +1404,8 @@ mod tests {
             sock,
             DEFAULT_DATAPATH_CHECK_INTERVAL,
             &empty_box_registry(),
+            idle_bep_wire(dir.path()),
+            Arc::new(NoBoxes),
         )
         .expect("spawn host gvproxy");
         let pid = gvproxy.pid();
@@ -1388,6 +1426,8 @@ mod tests {
             sock,
             DEFAULT_DATAPATH_CHECK_INTERVAL,
             &empty_box_registry(),
+            idle_bep_wire(dir.path()),
+            Arc::new(NoBoxes),
         )
         .expect_err("spawning a missing binary must fail");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
@@ -1408,6 +1448,8 @@ mod tests {
             sock.clone(),
             DEFAULT_DATAPATH_CHECK_INTERVAL,
             &empty_box_registry(),
+            idle_bep_wire(dir.path()),
+            Arc::new(NoBoxes),
         )
         .expect("spawn host gvproxy");
 
@@ -1451,6 +1493,8 @@ mod tests {
             sock,
             DEFAULT_DATAPATH_CHECK_INTERVAL,
             &registry,
+            idle_bep_wire(dir.path()),
+            Arc::new(NoBoxes),
         )
         .expect("spawn host gvproxy");
 
