@@ -1036,9 +1036,32 @@ pub fn load_guest_table(
     // The marker's discipline first, as the installer's re-install keeps it:
     // a marker or a stale mask record that cannot come away means the load
     // stops before touching the table, so nothing ever vouches for a table
-    // this boot did not render.
-    clear_marker_records(params.tree_root).map_err(GuestLoadFailure::Marker)?;
-    let ruleset = render_guest_ruleset(bash, params).map_err(GuestLoadFailure::Render)?;
+    // this boot did not render. The boot's caller drops this function's
+    // Result — the decision below is the fact's own reader, and nothing
+    // branches on the load — so the log is the one place a boot that never
+    // loaded a table says why, and every half that fails has its own line
+    // at error level, never a silent variant.
+    if let Err(cause) = clear_marker_records(params.tree_root) {
+        tracing::error!(
+            error = %cause,
+            "the guest's stale presence marker could not be cleared: no render, \
+             check, or load ran, so minimald reports no per-box verdict until \
+             a boot succeeds"
+        );
+        return Err(GuestLoadFailure::Marker(cause));
+    }
+    let ruleset = match render_guest_ruleset(bash, params) {
+        Ok(ruleset) => ruleset,
+        Err(cause) => {
+            tracing::error!(
+                error = %cause,
+                "the guest's classifier table could not be rendered: no check or \
+                 load ran and no marker was written, so minimald reports no \
+                 per-box verdict until a boot succeeds"
+            );
+            return Err(GuestLoadFailure::Render(cause));
+        }
+    };
     // The check is the render's own verdict on the guest's kernel — the one
     // expression the guest's image is being fixed to carry — and it is
     // logged as its own line, with nft's own error when it refuses, because
@@ -1068,7 +1091,16 @@ pub fn load_guest_table(
     // the commit point, never there without the record — and only after the
     // load succeeded, so the marker vouches for the table this boot rendered
     // and nothing else.
-    write_guest_marker(params.ct_mark_mask, params.tree_root).map_err(GuestLoadFailure::Marker)?;
+    if let Err(cause) = write_guest_marker(params.ct_mark_mask, params.tree_root) {
+        tracing::error!(
+            error = %cause,
+            "the guest's classifier table loaded but its presence marker \
+             could not be written: the table's refusal is in force and \
+             nothing vouches for it, so minimald reports no per-box verdict \
+             until a boot writes one"
+        );
+        return Err(GuestLoadFailure::Marker(cause));
+    }
     tracing::info!(
         sha256 = %digest,
         marker = %sandbox2::classifier::TABLE_MARKER,
@@ -3687,6 +3719,83 @@ mod tests {
             !root.join(TEST_CT_MARK_RECORD).is_dir(),
             "the record goes with the marker: only a load that succeeds \
              writes either again"
+        );
+    }
+
+    /// Every half of the guest's load that fails is a half the boot must
+    /// name at error level (NET-079's observability): the boot's own caller
+    /// drops the load's Result — nothing branches on it, the decision the
+    /// launch reads is the fact's own reader — so the daemon's log is the
+    /// only place a boot that never loaded a table says why. A render whose
+    /// bash does not exist is the proof: the failure is the render's own,
+    /// no check ran behind it, the tree is left without its marker — even
+    /// the one a previous load wrote, because the marker comes away before
+    /// anything renders — and the error line is on the log, naming the
+    /// render and its cause, so the silent variant this round removed is
+    /// gone.
+    #[test]
+    fn guest_render_failure_logs_its_own_error_and_leaves_no_marker() {
+        let mount = standin_mount();
+        let root = &mount.root;
+        let guest_ip = IpAddr::V4(crate::net::SwitchSubnet::default().daemon_ip());
+        let params = guest_params(&mount, Some(&mount.mountinfo), guest_ip, guest_ip);
+
+        // A marker a previous load wrote, over an nft stub that accepted the
+        // render's check and load: the render's failure below must leave the
+        // tree as markerless as a boot that never loaded a table at all.
+        let accepted = tempfile::tempdir().expect("a temp dir holding the recording nft");
+        let nft = recording_nft(accepted.path(), &[]);
+        load_guest_table(&guest_bash(), &nft, &params)
+            .expect("the load runs over an nft stub that accepts it");
+        assert!(
+            root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            "the previous load wrote its marker"
+        );
+
+        // The render through a bash path that does not exist. Its failure is
+        // the render's own — the bash it could not spawn, in the spawn's own
+        // words — and the fresh stub below proves no check ran behind it.
+        let capture = crate::test_harness::captured_log();
+        let untouched = tempfile::tempdir().expect("a temp dir holding the recording nft");
+        let nft = recording_nft(untouched.path(), &[]);
+        let no_bash = std::path::Path::new("/nonexistent-minimal-guest-bash");
+        match load_guest_table(no_bash, &nft, &params) {
+            Err(GuestLoadFailure::Render(cause)) => assert!(
+                cause.contains(&no_bash.display().to_string())
+                    && cause.contains("No such file or directory"),
+                "the render's own error names the bash it could not spawn: {cause}"
+            ),
+            other => {
+                panic!("a render that could not run is the render's own failure, not {other:?}")
+            }
+        }
+        assert!(
+            nft_calls(untouched.path()).is_empty(),
+            "no check ran behind a render that failed"
+        );
+        assert!(
+            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            "a failed render leaves no marker, and the one a previous load \
+             wrote does not survive a load that did not run"
+        );
+        assert!(
+            !root.join(TEST_CT_MARK_RECORD).is_dir(),
+            "the ct-mark record goes with the marker: a load that never \
+             rendered writes neither again"
+        );
+        // Presence only, never absence: under libtest every test in this
+        // binary shares the one capture subscriber (`just test-cross`), so
+        // the buffer can hold earlier tests' lines — and this test's own
+        // first load — beside this assertion's.
+        let log = capture.contents();
+        assert!(
+            log.contains("the guest's classifier table could not be rendered"),
+            "the render's failure is on the daemon's log at error level: {log}"
+        );
+        assert!(
+            log.contains(&no_bash.display().to_string()),
+            "the error line carries the render's own cause, the bash it could \
+             not spawn: {log}"
         );
     }
 
