@@ -837,13 +837,11 @@ pub(crate) async fn activate_session(
     // advisory names the cause, the state it leaves the box in, and, when
     // the missing privileged step is the cause, the exact command that
     // installs it; it is never a prompt (see
-    // [`classifier_advisory_start_line`]). Printed after the session exists
+    // [`write_classifier_advisory`]). Printed after the session exists
     // and before the work on it, like the notice below it, so a host that
     // cannot decide per box is named at the start that runs there and not
     // only in a log the person was not reading.
-    if let Some(advisory) = classifier_advisory_start_line(&created) {
-        eprintln!("{advisory}");
-    }
+    write_classifier_advisory(&mut std::io::stderr(), &created)?;
 
     // The coming-change notice (NET-076), printed while the deny-all egress
     // default is announced but not yet in force. Scoped to the box it would
@@ -1702,19 +1700,26 @@ pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'
 /// the exact command that installs it. The daemon spelled it, because the
 /// daemon is the side that read the host; the start prints it verbatim, so
 /// the terminal, the daemon's own log line for the same create, and the
-/// start all say the same thing. `None` from a host that decides per box
-/// and from a daemon that predates the field: nothing to print then, the
-/// way the other create-reply facts read.
+/// start all say the same thing. A reply that carries no advisory — from a
+/// host that decides per box, or from a daemon that predates the field —
+/// writes nothing: no line to print then, the way the other create-reply
+/// facts read.
 ///
-/// The advisory is never a prompt: it names what a person may run, and
-/// running it — and any privilege prompt it carries — is the person's act,
-/// never the session start's, so the activation prints it and goes on
-/// without waiting for an answer.
-#[must_use]
-pub fn classifier_advisory_start_line(
+/// A writer over the reply rather than a string out of it, so the render
+/// the start drives and the render a test drives are the same code — the
+/// test pins the bytes the terminal gets, not an accessor's echo of the
+/// field it read. The advisory is never a prompt: it names what a person
+/// may run, and running it — and any privilege prompt it carries — is the
+/// person's act, never the session start's, so the activation prints it
+/// and goes on without waiting for an answer.
+pub fn write_classifier_advisory(
+    out: &mut impl std::io::Write,
     created: &minimald_rpc::CreateSessionResponse,
-) -> Option<&str> {
-    created.classifier_advisory.as_deref()
+) -> std::io::Result<()> {
+    if let Some(advisory) = created.classifier_advisory.as_deref() {
+        writeln!(out, "{advisory}")?;
+    }
+    Ok(())
 }
 
 /// Render a session's effective policy as its rules: the egress the gate
@@ -2722,6 +2727,61 @@ mod tests {
         );
     }
 
+    /// NET-079's per-box enforcement row in the policy render: printed as
+    /// the egress block's closing row when the daemon reported a state, in
+    /// the machine spelling the record and the daemon's log line carry —
+    /// and printed from silence never, because a row made of nothing would
+    /// be the decided-looking one a daemon that predates the field never
+    /// sent. The requirement's own case is the first: a deny-all
+    /// declaration beside an enforcement of `none` is the state the box
+    /// actually runs in, not a verdict that looks decided and is not.
+    #[test]
+    fn policy_render_carries_the_enforcement_row_when_the_host_reported_it() {
+        let unenforced = EffectiveSessionPolicy {
+            egress: EffectiveEgress::DenyAll,
+            ingress: None,
+            host_ip_enforcement: Some("none".to_string()),
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &unenforced, NetworkMode::HostNet, None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("egress\n  deny all\n  per-box enforcement  none\n"),
+            "a deny-all declaration beside an enforcement of none is the \
+             state the box runs in, got: {rendered}"
+        );
+
+        // The decided host's own spelling rides the same row.
+        let enforced = EffectiveSessionPolicy {
+            egress: EffectiveEgress::AllowAll,
+            ingress: None,
+            host_ip_enforcement: Some("per_box".to_string()),
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &enforced, NetworkMode::HostNet, None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  per-box enforcement  per_box\n"),
+            "a host that decides per box says so in the machine spelling, \
+             got: {rendered}"
+        );
+
+        // No state reported, no row — the same silence an own-address box
+        // reads (its own render never carries the state at all).
+        let silent = EffectiveSessionPolicy {
+            egress: EffectiveEgress::DenyAll,
+            ingress: None,
+            host_ip_enforcement: None,
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &silent, NetworkMode::HostNet, None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            !rendered.contains("per-box enforcement"),
+            "no state reported means no row, got: {rendered}"
+        );
+    }
+
     /// The create reply the activation reads, with only the fields this
     /// test's lines depend on set: an id and a version to satisfy the skew
     /// gate, the classifier advisory, and the enforcement the same create
@@ -2752,6 +2812,13 @@ mod tests {
     /// the start to wait on. A cause no command ends still names the cause
     /// and never an install. A host that decides per box, or a daemon that
     /// predates the field, prints nothing at all.
+    ///
+    /// The render itself is driven here, with a buffer, the way
+    /// [`format_policy`]'s tests drive that render — the same writer the
+    /// start drives, so what this pins is the bytes the terminal gets, not
+    /// an accessor's echo of the field it read: the advisory the daemon
+    /// spelled, the newline that ends it, the command as the last line
+    /// with nothing after it.
     #[test]
     fn activate_prints_classifier_advisory() {
         // The reply a step-missing host sends: the daemon's own spelling,
@@ -2769,22 +2836,31 @@ mod tests {
             ),
             Some("none"),
         );
-        let line = classifier_advisory_start_line(&step_missing)
-            .expect("a step-missing host's create must print its advisory");
-        assert_eq!(
-            line,
-            step_missing.classifier_advisory.as_deref().unwrap(),
+        let mut out = Vec::new();
+        write_classifier_advisory(&mut out, &step_missing).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.starts_with(
+                "note: this host cannot decide a host-address box's egress verdict \
+                 per box: the classifier's privileged step is not installed on this \
+                 host. While it cannot, its host-address boxes run unenforced — \
+                 whatever the boxes' declarations say."
+            ),
             "the start prints the daemon's spelling verbatim, so the log, the \
-             reply, and the terminal cannot disagree"
+             reply, and the terminal cannot disagree, got: {rendered}"
         );
         assert!(
-            line.contains("sudo scripts/install-host-classifier.sh"),
-            "the missing privileged step is the cause, so the advisory must \
-             carry the exact command that installs it: {line}"
+            rendered.ends_with(
+                "  sudo scripts/install-host-classifier.sh --user runner \
+                 --cohort-address 10.0.0.0/16 --node-plane-address 10.0.1.0/24\n"
+            ),
+            "the missing privileged step is the cause, so the render carries \
+             the exact command that installs it, on the last line with \
+             nothing after it: {rendered}"
         );
         assert!(
-            !line.contains('?'),
-            "the advisory names what a person may run; it never asks: {line}"
+            !rendered.contains('?'),
+            "the advisory names what a person may run; it never asks: {rendered}"
         );
 
         // A host that cannot confine: the cause is still named, and no
@@ -2799,33 +2875,47 @@ mod tests {
             ),
             Some("none"),
         );
-        let line = classifier_advisory_start_line(&cannot_confine)
-            .expect("a host that cannot confine still gets its advisory");
+        let mut out = Vec::new();
+        write_classifier_advisory(&mut out, &cannot_confine).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
         assert!(
-            line.contains("no cgroup2 mount with nsdelegate covers the classifier tree"),
-            "the advisory must name this cause in words too: {line}"
+            rendered.contains("no cgroup2 mount with nsdelegate covers the classifier tree"),
+            "the advisory must name this cause in words too: {rendered}"
         );
         assert!(
-            !line.contains("install-host-classifier"),
-            "no command ends this cause, so the advisory must name none: {line}"
+            rendered.ends_with("declarations say.\n"),
+            "no command ends this cause, so the advisory must end with the \
+             state it named: {rendered}"
         );
         assert!(
-            !line.contains('?'),
-            "the advisory names what a person may run; it never asks: {line}"
+            !rendered.contains("install-host-classifier"),
+            "no command ends this cause, so the advisory must name none: {rendered}"
+        );
+        assert!(
+            !rendered.contains('?'),
+            "the advisory names what a person may run; it never asks: {rendered}"
         );
 
         // A host that decides per box, or a daemon that predates the field:
-        // nothing to print, the way the other create-reply facts read.
+        // nothing to print, the way the other create-reply facts read — the
+        // render writes not one byte.
         let decided = create_reply(None, Some("per_box"));
+        let mut out = Vec::new();
+        write_classifier_advisory(&mut out, &decided).unwrap();
         assert!(
-            classifier_advisory_start_line(&decided).is_none(),
-            "a decided host's create carries no advisory, so its start prints none"
+            out.is_empty(),
+            "a decided host's create carries no advisory, so its start prints \
+             none, got: {:?}",
+            String::from_utf8_lossy(&out)
         );
         let pre_field = create_reply(None, None);
+        let mut out = Vec::new();
+        write_classifier_advisory(&mut out, &pre_field).unwrap();
         assert!(
-            classifier_advisory_start_line(&pre_field).is_none(),
+            out.is_empty(),
             "a daemon that predates the field carries no advisory, so its \
-             start prints none"
+             start prints none, got: {:?}",
+            String::from_utf8_lossy(&out)
         );
     }
 
