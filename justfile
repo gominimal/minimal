@@ -484,6 +484,25 @@ test-installer case="":
 lint-shell:
     bash scripts/lint-shell.sh
 
+# Names and descriptions come from each member's Cargo.toml, so the list cannot
+# drift from the workspace. Fails if any member lacks a description, which keeps
+# AGENTS.md §Workspace crates honest. Stdlib-only python3 is already a
+# prerequisite (AGENTS.md §System dependencies), so this adds no tool to any host.
+#
+# List workspace crates with their descriptions.
+crates:
+    #!/usr/bin/env python3
+    import json, subprocess, sys
+    meta = subprocess.run(
+        ["cargo", "metadata", "--no-deps", "--offline", "--format-version", "1"],
+        capture_output=True, text=True, check=True)
+    packages = json.loads(meta.stdout)["packages"]
+    for pkg in sorted(packages, key=lambda p: p["name"]):
+        print(pkg["name"] + "\t" + (pkg.get("description") or "-"))
+    missing = sorted(p["name"] for p in packages if not p.get("description"))
+    if missing:
+        sys.exit("missing description: " + ", ".join(missing))
+
 # Not a CI gate. Default lints the markdown this branch touches (changed
 # against main, staged, unstaged, and untracked) so the common loop stays
 # short; pass files for specific ones, or --all for the whole tree. The
