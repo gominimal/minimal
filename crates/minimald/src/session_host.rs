@@ -2829,9 +2829,12 @@ fn refuses_unenforced_host_address_box(guest: bool, network_mode: NetworkMode) -
 ///
 /// The counterpart of [`refuses_unenforced_host_address_box`]: natively an
 /// unplaced host-address box is NET-079's advisory posture, never a refusal
-/// (design §7.4), so every *session* launch that ends without a leaf says so
-/// — once per launch, like the resolver advisory it is modelled on (design
-/// §7.1), never once per daemon. A guest never advises: its unplaced box is
+/// (design §7.4), so every *session* launch that ends without a leaf records
+/// so in the daemon log — once per launch, like the resolver advisory it is
+/// modelled on (design §7.1). The terminal banner carrying the same notice is
+/// gated further, to once per daemon lifetime ([`PTY_ADVISORY_PRINTED`]), as
+/// the state is the deployment's and repeating it on every session start is
+/// noise. A guest never advises: its unplaced box is
 /// refused, and a box that was placed needs no advice. What this predicate
 /// does not carry is the launch's audience — a launch minted for lifecycle
 /// hooks advises nobody (a hook run is not a session start), which the
