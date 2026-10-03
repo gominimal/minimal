@@ -7464,7 +7464,10 @@ print("yes" if any(s.get("vm") == sys.argv[1] for s in doc["sessions"]) else "no
   # finding e2e-two-vm-b is the CLI's own work: ask the selected VM first,
   # then every VM's socket, and say which one answered. Over a real pty (an
   # interactive attach's own requirement), answering the exit prompt with
-  # `keep` so the session survives for the destroy below.
+  # `keep` so the session survives: it must still be live when the case stops
+  # the named VM below — the stopped-VM beats need a box that WAS listed, or
+  # its absence from the after-stop listing would prove nothing about the
+  # stop.
   # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
   tw_attach_out="$(E2E_PTY_COMMANDS='cat /home/two-vm-b.mark
 exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
@@ -7554,11 +7557,33 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   echo "note: 'min net expose' has not landed — the cross-VM box-name resolution is the one the attach above proved; 'min net forward' is the shipping exposing verb"
 
   # ---- NET-055: stopping one VM leaves the other serving -------------------
-  # Box B goes first — a user's order — then the named VM itself, by the stop
-  # hint the CLI prints for a named VM. The default VM must not notice.
-  two_vm_mn session destroy --force "$tw_b_sid" >/dev/null 2>&1 \
-    || { echo "::error::could not destroy $tw_name's box"; fail; }
-  echo "destroy: box B on VM $tw_name — min --vm $tw_name session destroy --force"
+  # The named VM goes down WITH its box still live — the order that makes the
+  # listing beats below mean what they claim. Destroying box B first would
+  # leave the stopped VM with no box, and a box-less VM contributes nothing
+  # by definition, not by behavior — so B is left live, and the listing right
+  # before the stop is asserted to carry both of $tw_name's contributions
+  # (its box's row, its proxy's discovery line), so what vanishes after can
+  # be pinned on the stop alone. The stop is itself how a live box ends on
+  # this path — `minvmd stop` force-drains the guest before it signals the
+  # VMM (crates/minvmd/src/cmd/stop.rs → rpc_client.rs, force: true), so a
+  # user stopping a VM with work still in it is the normal case. The default
+  # VM must not notice.
+  tw_ls_pre="$(mnl ls 2>"$WORK/two-vm-ls-pre.err")" \
+    || { echo "::error::'min ls' failed with both VMs running — the pre-stop baseline the beats below compare against needs it"
+         echo "--- min ls stdout ---"; printf '%s\n' "$tw_ls_pre"
+         echo "--- min ls stderr ---"; cat "$WORK/two-vm-ls-pre.err" 2>/dev/null || true
+         fail; }
+  if ! printf '%s\n' "$tw_ls_pre" | awk -v vm="$tw_name" -v sid="$tw_b_sid" \
+       '$1 == vm && $2 == sid { found = 1 } END { exit !found }'; then
+    echo "::error::box B is not in the listing right before the stop — the stopped-VM beats below need a box that WAS listed, or its vanishing would prove nothing about the stop"
+    echo "--- min ls output ---"; printf '%s\n' "$tw_ls_pre"
+    fail
+  fi
+  [ -n "$(two_vm_ls_proxy_port "$tw_name" "$tw_ls_pre")" ] \
+    || { echo "::error::the named VM's proxy discovery line is missing right before the stop — the post-stop absence below needs it present to be pinned on the stop"
+         echo "--- min ls output ---"; printf '%s\n' "$tw_ls_pre"
+         fail; }
+  echo "pre-stop: $tw_name still contributes its box's row and its proxy's discovery line to the one listing"
   minvmd --vm "$tw_name" stop >"$WORK/two-vm-stop.out" 2>"$WORK/two-vm-stop.err" \
     || { echo "::error::'minvmd --vm $tw_name stop' failed"
          echo "--- stderr ---"; cat "$WORK/two-vm-stop.err" 2>/dev/null || true
@@ -7577,16 +7602,36 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     fail
   fi
   echo "stop: minvmd --vm $tw_name stop -> '$(minvmd --vm "$tw_name" status --json 2>/dev/null || true)'"
-  # The named VM is gone from the one listing — a stopped VM contributes
-  # nothing, silently, because a listing spanning every VM cannot error on
-  # one that is down. And the default VM did not move: its box is still
-  # listed, its daemon still running, its published port still routing its
-  # box's name. The table keeps its VM column whatever the count of VMs
-  # (every row prints it, crates/minimal/src/cmd/list.rs), so the default's
-  # row is asserted by its id alone — the identity no stop can move.
-  tw_ls_after="$(mnl ls 2>&1)"
+  # The stopped VM contributes nothing to the one listing, silently. Both of
+  # the contributions the pre-stop listing above asserted are now gone, and
+  # the stop is the only thing that ran between: the listing spans every VM
+  # on the host — it enumerates state directories, so the down VM is still
+  # walked and its stale socket probed — and one that is down answers "not
+  # running": exit 0, no warning, no row for the box that was live in it, no
+  # discovery line for its proxy (list_other_vm → ProbeRefusal::NotRunning,
+  # crates/minimal/src/cmd/list.rs). And the default VM did not move: its box
+  # is still listed, its daemon still running, its published port still
+  # routing its box's name. The table keeps its VM column whatever the count
+  # of VMs (every row prints it, crates/minimal/src/cmd/list.rs), so the
+  # default's row is asserted by its id alone — the identity no stop can move.
+  tw_ls_after="$(mnl ls 2>"$WORK/two-vm-ls-after.err")" \
+    || { echo "::error::'min ls' failed with $tw_name stopped — a listing spanning every VM cannot error on one that is down (NET-055)"
+         echo "--- min ls stdout ---"; printf '%s\n' "$tw_ls_after"
+         echo "--- min ls stderr ---"; cat "$WORK/two-vm-ls-after.err" 2>/dev/null || true
+         fail; }
+  tw_ls_err="$(cat "$WORK/two-vm-ls-after.err" 2>/dev/null || true)"
+  if printf '%s\n' "$tw_ls_err" | grep -Fq -- "warning: skipping VM $tw_name"; then
+    echo "::error::the listing warned about the stopped $tw_name — a stopped VM is an answer, not a fault; it must be skipped silently"
+    echo "--- min ls stderr ---"; printf '%s\n' "$tw_ls_err"
+    fail
+  fi
   if printf '%s\n' "$tw_ls_after" | grep -Fq -- "$tw_b_sid"; then
-    echo "::error::the stopped named VM's box is still in the listing — a stopped VM must contribute nothing"
+    echo "::error::the stopped named VM's box is still in the listing — the box was live at the stop; a stopped VM must contribute nothing"
+    echo "--- min ls output ---"; printf '%s\n' "$tw_ls_after"
+    fail
+  fi
+  if [ -n "$(two_vm_ls_proxy_port "$tw_name" "$tw_ls_after")" ]; then
+    echo "::error::the stopped named VM's proxy discovery line is still in the listing — a stopped VM must contribute nothing"
     echo "--- min ls output ---"; printf '%s\n' "$tw_ls_after"
     fail
   fi
