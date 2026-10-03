@@ -9250,16 +9250,18 @@ proof_own_ip_deny_all_box_answers_published_port() {
 #     is serving a port, reads the box's answer from inside the attached
 #     shell, leaves by the session detach chord, and demands the box still
 #     listed and still serving (NET-015): the box outlives the client that
-#     walked away from it. Every lane runs it — the server is on the shared
-#     loopback, so the harness's own curl is the outside client before and
-#     after the detach.
+#     walked away from it. Runs wherever a session sandbox can spawn — the
+#     server is on the shared loopback, so the harness's own curl is the
+#     outside client before and after the detach.
 #
 #   * the run half starts `min task run` of a task that prints a marker and
 #     sleeps, then SIGKILLs the client — the brutal form, because the claim
 #     is that a box created for a run does not depend on its client living —
 #     and demands the run's box delisted within a bound (NET-131: the destroy
 #     moved to the daemon side of the exec's exit, so a lost client strands
-#     no session). Every lane runs it.
+#     no session). Its box IS a session sandbox, so the earlier beats' gate
+#     verdict carries to it: a host that cannot spawn one skips it, a lane
+#     that exists to run it fails.
 proof_port_publishes_on_listen_and_box_outlives_client() {
   echo "::group::a permitted listen publishes and answers by name; the box outlives its client (NET-016, NET-121, NET-014, NET-015, NET-131)"
 
@@ -9275,6 +9277,12 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
   PO_OUTLIVE_MARKER="PO_OUTLIVE_OK"   # what the detach box answers with
   PO_RUN_MARKER="PO_RUN_BOX_LIVE"     # what the run task prints from inside its box
   PO_SAVED_RUST_LOG=""
+  # One verdict, read by the beats that need a session sandbox: the port and
+  # detach halves' exec gates set it to 0 when this host cannot spawn one, and
+  # the run half — whose box IS a session — skips on it rather than failing a
+  # host that was never the audience (the same split the deny-all answer
+  # proof's gates hold; on CI or a VM lane the gate fails instead).
+  PO_SANDBOX_OK=1
 
   # The daemon's newest log file, where this lane can read it at all (see
   # hook_log_readable for the lanes that cannot).
@@ -9343,6 +9351,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
         echo "::warning::port-publish half SKIPPED — this host cannot run a session sandbox"
         echo "  (exec: $(head -n1 "$WORK/po-execgate.err" 2>/dev/null || true))"
         echo "  on CI or a VM lane this gate fails instead"
+        PO_SANDBOX_OK=0
         mnl session destroy --force "$po_sid" >/dev/null 2>&1 || true
         rm -rf "$PO_OWNIP_SEED_DIR"; PO_OWNIP_SEED_DIR=""
         po_restore_log
@@ -9680,6 +9689,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       if [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; then
         echo "::warning::detach half SKIPPED — this host cannot run a session sandbox"
         echo "  (exec: $(head -n1 "$WORK/po-out-execgate.err" 2>/dev/null || true))"
+        PO_SANDBOX_OK=0
         mnl session destroy --force "$po_out_sid" >/dev/null 2>&1 || true
         rm -rf "$PO_OUTLIVE_SEED_DIR"; PO_OUTLIVE_SEED_DIR=""
         return 0
@@ -9776,91 +9786,104 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
   po_outlive_half
 
   # ---- beat 3: the run half — a box created for a run ends with the run --
-  PO_TASK_SEED_DIR="$(mktemp -d /tmp/mnlpors.XXXXXX)"
-  {
-    awk '
-      /^\[upstream\]/            { grab = 1; print; next }
-      grab && (/^$/ || /^\[/)    { exit }
-      grab                       { print }
-    ' "$ROOT/.minimal/minimal.toml"
-    printf '\n[stack]\nuse = "shell"\n'
-    printf '\n[tasks.e2e-port-run]\nbash = "echo %s; sleep 300"\n' "$PO_RUN_MARKER"
-  } > "$PO_TASK_SEED_DIR/minimal.toml"
-  mkdir "$PO_TASK_SEED_DIR/.git"
-  # `exec` inside the subshell makes $! the min client's own pid, so the KILL
-  # below reaches the client and not a shell that would leave it alive.
-  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
-  ( cd "$PO_TASK_SEED_DIR" && exec min ${E2E_MINIMAL_ARGS:-} task run e2e-port-run ) \
-    >"$WORK/po-task.out" 2>"$WORK/po-task.err" &
-  PO_TASK_PID=$!
-  po_run_started=""
-  for _ in $(seq 1 120); do
-    if grep -q -- "$PO_RUN_MARKER" "$WORK/po-task.out" 2>/dev/null; then
-      po_run_started=1
-      break
+  po_run_half() {
+    # A run's box IS a session sandbox, so a host the earlier beats found
+    # unable to spawn one has nothing for this beat to drive: skip on such a
+    # host, fail on a lane that exists to run it.
+    if [ "$PO_SANDBOX_OK" -ne 1 ]; then
+      echo "::warning::run half SKIPPED — this host cannot run a session sandbox, and a run's box is one"
+      echo "  (the same verdict the earlier beats' exec gates reached; on CI or a VM lane the gate fails instead)"
+      return 0
     fi
-    if ! kill -0 "$PO_TASK_PID" 2>/dev/null; then
-      break
-    fi
-    sleep 1
-  done
-  if [ -z "$po_run_started" ]; then
-    echo "::error::the run task never printed its marker — its box either never came up or the client died first"
-    echo "--- task stdout ---"; cat "$WORK/po-task.out" 2>/dev/null || true
-    echo "--- task stderr ---"; cat "$WORK/po-task.err" 2>/dev/null || true
-    fail
-  fi
-  echo "run: the task is inside its box and printed $PO_RUN_MARKER"
-  po_task_ls="$(mnl ls 2>/dev/null)"
-  po_task_box="$(printf '%s\n' "$po_task_ls" | grep -o 'task-e2e-port-run-[0-9a-f]\{4\}' | head -n1)"
-  if [ -z "$po_task_box" ]; then
-    echo "::error::the run's box was not listed while its task ran"
-    echo "--- min ls ---"; printf '%s\n' "$po_task_ls"
-    fail
-  fi
-  echo "run: box $po_task_box is listed — created for the run, serving it"
-  # The brutal form: the client vanishes mid-run. NET-131 moved the box's
-  # destroy to the daemon side of the exec's exit precisely so this ends the
-  # box rather than stranding it.
-  kill -9 "$PO_TASK_PID" 2>/dev/null || true
-  PO_TASK_PID=""
-  echo "run: SIGKILLed the client mid-run"
-  po_box_ended=""
-  for _ in $(seq 1 90); do
-    po_task_ls="$(mnl ls 2>/dev/null)"
-    if [[ "$po_task_ls" != *task-e2e-port-run-* ]]; then
-      po_box_ended=1
-      break
-    fi
-    sleep 1
-  done
-  if [ -z "$po_box_ended" ]; then
-    echo "::error::the run's box is STILL listed after its client was killed — a box created for a run must end with the run (NET-131)"
-    echo "--- min ls ---"; printf '%s\n' "$po_task_ls"
-    fail
-  fi
-  echo "run: the box ended with its run — no stranded session, client or no client (NET-131)"
-  # The daemon-side end's own record, where the lane can read it: one line
-  # naming the session, the run and the exit its box ended with. `minimald::exec`
-  # is at info in this lane's default filter, so no restart is owed for it.
-  if hook_log_readable; then
-    po_end_rec=""
-    for _ in $(seq 1 20); do
-      po_end_rec="$(grep -h -- 'run box ended' "$(po_daemon_log)" 2>/dev/null \
-        | grep -F -- '"task":"e2e-port-run"' | tail -n1 || true)"
-      [ -n "$po_end_rec" ] && break
-      sleep 0.25
+    PO_TASK_SEED_DIR="$(mktemp -d /tmp/mnlpors.XXXXXX)"
+    {
+      awk '
+        /^\[upstream\]/            { grab = 1; print; next }
+        grab && (/^$/ || /^\[/)    { exit }
+        grab                       { print }
+      ' "$ROOT/.minimal/minimal.toml"
+      printf '\n[stack]\nuse = "shell"\n'
+      printf '\n[tasks.e2e-port-run]\nbash = "echo %s; sleep 300"\n' "$PO_RUN_MARKER"
+    } > "$PO_TASK_SEED_DIR/minimal.toml"
+    mkdir "$PO_TASK_SEED_DIR/.git"
+    # `exec` inside the subshell makes $! the min client's own pid, so the KILL
+    # below reaches the client and not a shell that would leave it alive.
+    # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+    ( cd "$PO_TASK_SEED_DIR" && exec min ${E2E_MINIMAL_ARGS:-} task run e2e-port-run ) \
+      >"$WORK/po-task.out" 2>"$WORK/po-task.err" &
+    PO_TASK_PID=$!
+    po_run_started=""
+    for _ in $(seq 1 120); do
+      if grep -q -- "$PO_RUN_MARKER" "$WORK/po-task.out" 2>/dev/null; then
+        po_run_started=1
+        break
+      fi
+      if ! kill -0 "$PO_TASK_PID" 2>/dev/null; then
+        break
+      fi
+      sleep 1
     done
-    if [ -z "$po_end_rec" ]; then
-      echo "::error::no 'run box ended' record names the task's run — the daemon-side destroy NET-131 moved has no record of firing"
-      echo "--- daemon log (tail) ---"; tail -20 "$(po_daemon_log)" 2>/dev/null || true
+    if [ -z "$po_run_started" ]; then
+      echo "::error::the run task never printed its marker — its box either never came up or the client died first"
+      echo "--- task stdout ---"; cat "$WORK/po-task.out" 2>/dev/null || true
+      echo "--- task stderr ---"; cat "$WORK/po-task.err" 2>/dev/null || true
       fail
     fi
-    echo "daemon log: $po_end_rec"
-  else
-    echo "run-box-ended log check skipped (guest-side daemon log on VM lane)"
-  fi
-  rm -rf "$PO_TASK_SEED_DIR"; PO_TASK_SEED_DIR=""
+    echo "run: the task is inside its box and printed $PO_RUN_MARKER"
+    po_task_ls="$(mnl ls 2>/dev/null)"
+    po_task_box="$(printf '%s\n' "$po_task_ls" | grep -o 'task-e2e-port-run-[0-9a-f]\{4\}' | head -n1)"
+    if [ -z "$po_task_box" ]; then
+      echo "::error::the run's box was not listed while its task ran"
+      echo "--- min ls ---"; printf '%s\n' "$po_task_ls"
+      fail
+    fi
+    echo "run: box $po_task_box is listed — created for the run, serving it"
+    # The brutal form: the client vanishes mid-run. NET-131 moved the box's
+    # destroy to the daemon side of the exec's exit precisely so this ends the
+    # box rather than stranding it.
+    kill -9 "$PO_TASK_PID" 2>/dev/null || true
+    PO_TASK_PID=""
+    echo "run: SIGKILLed the client mid-run"
+    po_box_ended=""
+    for _ in $(seq 1 90); do
+      po_task_ls="$(mnl ls 2>/dev/null)"
+      if [[ "$po_task_ls" != *task-e2e-port-run-* ]]; then
+        po_box_ended=1
+        break
+      fi
+      sleep 1
+    done
+    if [ -z "$po_box_ended" ]; then
+      echo "::error::the run's box is STILL listed after its client was killed — a box created for a run must end with the run (NET-131)"
+      echo "--- min ls ---"; printf '%s\n' "$po_task_ls"
+      fail
+    fi
+    echo "run: the box ended with its run — no stranded session, client or no client (NET-131)"
+    # The daemon-side end's own record, where the lane can read it: one line
+    # naming the session, the run and the exit its box ended with.
+    # `minimald::exec` is at info in this lane's default filter, and the port
+    # half's restart keeps it there, so no restart is owed for it.
+    if hook_log_readable; then
+      po_end_rec=""
+      for _ in $(seq 1 20); do
+        po_end_rec="$(grep -h -- 'run box ended' "$(po_daemon_log)" 2>/dev/null \
+          | grep -F -- '"task":"e2e-port-run"' | tail -n1 || true)"
+        [ -n "$po_end_rec" ] && break
+        sleep 0.25
+      done
+      if [ -z "$po_end_rec" ]; then
+        echo "::error::no 'run box ended' record names the task's run — the daemon-side destroy NET-131 moved has no record of firing"
+        echo "--- daemon log (tail) ---"; tail -20 "$(po_daemon_log)" 2>/dev/null || true
+        fail
+      fi
+      echo "daemon log: $po_end_rec"
+    else
+      echo "run-box-ended log check skipped (guest-side daemon log on VM lane)"
+    fi
+    rm -rf "$PO_TASK_SEED_DIR"; PO_TASK_SEED_DIR=""
+    echo "run half OK (box created for the run, delisted when the run's client vanished)"
+  }
+  po_run_half
 
   echo "port publishes on listen and the box outlives its client OK"
   echo "::endgroup::"
