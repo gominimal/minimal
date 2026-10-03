@@ -1069,8 +1069,8 @@ pub(crate) fn cache_host(location: &AnyUrl) -> String {
 /// keeps on disk, so no spelling it writes carries one; the host the fetch
 /// left for is the host, never the credential before it.
 fn authority_host(authority: &str) -> &str {
-    match authority.rfind('@') {
-        Some(at) => &authority[at + 1..],
+    match authority.rsplit_once('@') {
+        Some((_, host)) => host,
         None => authority,
     }
 }
@@ -1085,8 +1085,7 @@ pub(crate) fn url_host(url: &str) -> &str {
     let Some((_, authority)) = url.split_once("://") else {
         return "";
     };
-    let end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
-    authority_host(&authority[..end])
+    authority_host(authority.split(['/', '?', '#']).next().unwrap_or_default())
 }
 
 /// The object a `FetchSource` record names its fetch by: the URL's own
@@ -1100,10 +1099,12 @@ pub(crate) fn url_object(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_owned();
     };
-    let path_end = rest.find(['?', '#']).unwrap_or(rest.len());
-    let authority_end = rest[..path_end].find('/').unwrap_or(path_end);
-    let host = authority_host(&rest[..authority_end]);
-    format!("{scheme}://{host}{}", &rest[authority_end..path_end])
+    let before_query = rest.split(['?', '#']).next().unwrap_or_default();
+    let (authority, path) = match before_query.split_once('/') {
+        Some((authority, path)) => (authority, format!("/{path}")),
+        None => (before_query, String::new()),
+    };
+    format!("{scheme}://{}{path}", authority_host(authority))
 }
 
 /// Whether the cohort's two subtrees are there as the step delegates them:
