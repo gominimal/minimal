@@ -332,7 +332,11 @@ async fn clean(
 /// over extents still undiscarded. It shares the shutdown hazard documented on
 /// [`clean`] — a trim in flight when the `Shutdown` RPC quiesces the volume is
 /// walking a filesystem being synced and unmounted — bounded the same way, by
-/// [`MaintenanceHandle::abort`] and the ext4 journal.
+/// [`MaintenanceHandle::abort`] and the ext4 journal. The standalone
+/// [`TRIM_INTERVAL`] cadence makes that overlap routine rather than rare, and
+/// `abort` does not stop a `FITRIM` already on the blocking pool: its open fd
+/// makes the quiesce's plain unmount fail `EBUSY`, and the quiesce's lazy
+/// detach covers that case, after the `syncfs` and read-only remount.
 #[cfg(target_os = "linux")]
 async fn trim_state_volume_if_mounted(state: &ServerStateHandle) {
     if !state.state_volume_mounted().await {
@@ -345,6 +349,9 @@ async fn trim_state_volume_if_mounted(state: &ServerStateHandle) {
         crate::guest::trim_state_volume(mountpoint.as_utf8_path().as_str())
     });
     match trim.await {
+        // Most standalone trims find nothing new (ext4 skips unchanged
+        // groups); an info line for those would repeat every TRIM_INTERVAL.
+        Ok(Ok(0)) => tracing::debug!("state volume trimmed; nothing to discard"),
         Ok(Ok(discarded)) => {
             tracing::info!(discarded_bytes = discarded, "state volume trimmed")
         }
