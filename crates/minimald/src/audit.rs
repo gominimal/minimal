@@ -21,6 +21,10 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use nix::fcntl::{OFlag, open, openat};
+#[cfg(unix)]
+use nix::sys::stat::Mode;
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
@@ -109,7 +113,10 @@ pub(crate) async fn append(state_dir: &Path, record: &DecisionRecord) {
     // Made on every append rather than once at daemon start: the log is the
     // state directory's child, and a daemon asked to audit its first-ever
     // decision on a fresh install should make the directory it was asked to
-    // write in, not fail on one it never owned.
+    // write in, not fail on one it never owned. It resolves a link planted
+    // where the directory should be — `create_dir_all` follows it — and so
+    // cannot be the guard itself; the open below is, because an open is the
+    // one step here that can refuse one.
     if let Some(parent) = path.parent()
         && let Err(e) = tokio::fs::create_dir_all(parent).await
     {
@@ -121,37 +128,6 @@ pub(crate) async fn append(state_dir: &Path, record: &DecisionRecord) {
              directory could not be made"
         );
         return;
-    }
-    // `symlink_metadata`, not `metadata`: the state volume is guest-writable
-    // on a VM host, so the directory itself is attacker-controlled — the same
-    // reason `crate::diag`'s audit collector refuses a symlinked file, and
-    // the write must hold the line the read already does. `create_dir_all`
-    // above follows links, so a planted `audit/` symlink to a directory
-    // passes it; unchecked, every append below would land through the link,
-    // in a target of someone else's choosing.
-    if let Some(parent) = path.parent() {
-        let refused = match tokio::fs::symlink_metadata(parent).await {
-            Ok(md) if md.is_dir() => None,
-            Ok(md) => Some(
-                if md.file_type().is_symlink() {
-                    "the audit directory is a symlink, not a real directory"
-                } else {
-                    "the audit directory is not a real directory"
-                }
-                .to_string(),
-            ),
-            Err(e) => Some(e.to_string()),
-        };
-        if let Some(reason) = refused {
-            tracing::warn!(
-                box = %record.box_name,
-                port = record.port,
-                error = %reason,
-                "the dynamic ingress decision could not be audited: the audit \
-                 directory could not be made"
-            );
-            return;
-        }
     }
     // Serialization of a plain derived struct cannot fail; the guard is for
     // the day the record grows a type that can.
@@ -165,16 +141,7 @@ pub(crate) async fn append(state_dir: &Path, record: &DecisionRecord) {
         return;
     };
     line.push('\n');
-    let mut options = tokio::fs::OpenOptions::new();
-    options.create(true).append(true);
-    // `O_NOFOLLOW`: the file the log's own path names must be the log, not a
-    // symlink planted in its place — the state volume is guest-writable, and
-    // an append through a link writes somewhere else with this daemon's
-    // privileges. Opened exactly the way `diagnostics::bundle::
-    // open_regular_nofollow` opens this same file for reading.
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW);
-    let mut file = match options.open(&path).await {
+    let mut file = match open_log(&path).await {
         Ok(file) => file,
         Err(e) => {
             tracing::warn!(
@@ -203,6 +170,78 @@ pub(crate) async fn append(state_dir: &Path, record: &DecisionRecord) {
             "the dynamic ingress decision could not be audited"
         );
     }
+}
+
+/// Opens the log for appending, refusing to follow a link at *any* component
+/// of the log's own path.
+///
+/// The state volume is guest-writable on a VM host, so the `audit/` directory
+/// is as attacker-controlled as the log file inside it — the same reason
+/// `crate::diag`'s audit collector refuses a symlinked file, and this write
+/// holds the line that read already does. But a check followed by an open
+/// cannot hold it: a guest that swaps `audit/` for a link to a directory
+/// elsewhere in the window between the two steers the daemon's append — with
+/// the daemon's privileges — through it, into a target of its own choosing,
+/// and no `O_NOFOLLOW` on the log's full path would notice, because it guards
+/// only the final component. So nothing is checked: the directory itself is
+/// opened `O_NOFOLLOW | O_DIRECTORY`, and the log is then opened *relative to
+/// that descriptor*, `openat` with `O_NOFOLLOW`. Both components are pinned
+/// at the moment they are opened, and there is no window at all; a link
+/// standing in either place is refused at open, exactly the way
+/// [`diagnostics::open_regular_nofollow`] refuses this same file for reading.
+#[cfg(unix)]
+async fn open_log(path: &Path) -> std::io::Result<tokio::fs::File> {
+    let (dir, file_name) = match (path.parent(), path.file_name()) {
+        (Some(dir), Some(file_name)) => (dir, file_name),
+        // `LOG_RELATIVE` always names a file inside a directory, so this is
+        // a `state_dir` that names no file at all.
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "`{}` does not name a file inside a directory",
+                    path.display()
+                ),
+            ));
+        }
+    };
+    let directory = open(
+        dir,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| open_refused("the audit directory", e))?;
+    let log = openat(
+        &directory,
+        file_name,
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_APPEND | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        // The daemon's own log, readable by nobody else: the only reader is
+        // the diagnostic collector, in this process.
+        Mode::S_IRUSR | Mode::S_IWUSR,
+    )
+    .map_err(|e| open_refused("the audit log", e))?;
+    Ok(tokio::fs::File::from(log))
+}
+
+/// Off unix there is no `openat` to open the log through, so it is opened by
+/// name; this crate's hosts are Linux, so the guard is unix's to keep.
+#[cfg(not(unix))]
+async fn open_log(path: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+}
+
+/// An open refusal as the warn that reports the loss should carry it: which
+/// half of the log's path refused, and the error behind it. `O_NOFOLLOW`
+/// refuses a link as `ELOOP` — "too many levels of symbolic links" — which
+/// names the link well enough once the half that refused is named beside it.
+#[cfg(unix)]
+fn open_refused(what: &'static str, error: nix::Error) -> std::io::Error {
+    let error = std::io::Error::from(error);
+    std::io::Error::new(error.kind(), format!("{what} could not be opened: {error}"))
 }
 
 #[cfg(test)]
@@ -274,11 +313,16 @@ mod tests {
     }
 
     /// The write side of the symlink guard the read side already had (the
-    /// review thread on `append`): the state volume is guest-writable on a
+    /// review threads on `append`): the state volume is guest-writable on a
     /// VM host, so a planted link — `decisions.log` itself, or the whole
-    /// `audit/` directory — must not steer the daemon's appends into a
-    /// target of someone else's choosing. Each case is refused, the warn
-    /// line says the loss, and the target the link named is untouched.
+    /// `audit/` directory — must not steer the daemon's appends into a target
+    /// of someone else's choosing. What a test can see is the link that stands
+    /// there when the append begins; the one that would be swapped in
+    /// mid-append is closed by construction instead, the open anchored to the
+    /// directory it opened and never re-resolving the path — which is why
+    /// there is no third case here. Each planted case is refused, the warn
+    /// line names which half of the log's own path refused, and the target the
+    /// link named is untouched.
     #[tokio::test]
     async fn audit_append_refuses_a_symlinked_log() {
         let capture = crate::test_harness::captured_log();
@@ -318,6 +362,10 @@ mod tests {
             );
             let log = capture.contents();
             assert!(
+                log.contains("the audit log could not be opened"),
+                "the refusal names the half of the path that refused: {log}"
+            );
+            assert!(
                 log.contains("the dynamic ingress decision could not be audited"),
                 "the symlinked file is a warned-about loss, not a silent one: {log}"
             );
@@ -340,15 +388,12 @@ mod tests {
             );
             let log = capture.contents();
             assert!(
-                log.contains("the audit directory is a symlink, not a real directory"),
-                "the symlinked directory names its reason: {log}"
+                log.contains("the audit directory could not be opened"),
+                "the refusal names the half of the path that refused: {log}"
             );
             assert!(
-                log.contains(
-                    "the dynamic ingress decision could not be audited: the audit \
-                     directory could not be made"
-                ),
-                "the symlinked directory is a warned-about loss: {log}"
+                log.contains("the dynamic ingress decision could not be audited"),
+                "the symlinked directory is a warned-about loss, not a silent one: {log}"
             );
         }
     }
