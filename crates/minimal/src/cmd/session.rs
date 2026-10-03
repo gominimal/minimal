@@ -750,7 +750,10 @@ pub(crate) async fn activate_session(
                 blocker = ?detection.1,
                 answerer_bound = created.answerer_bound,
                 range_present = ?verdict.range_present,
-                "session start decided the live name surface for this host"
+                range_unit_state = ?detection.2.state,
+                range_unit_check = ?detection.2.failed_check,
+                "session start decided the live name surface for this host, \
+                 with the range unit's state beside it"
             );
             eprintln!(
                 "{}",
