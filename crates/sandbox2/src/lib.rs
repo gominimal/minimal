@@ -739,11 +739,17 @@ pub mod classifier {
     /// one throwaway migration for the proof.
     #[cfg(target_os = "linux")]
     pub fn probe_child_placement(root: &Path) -> std::io::Result<()> {
-        // A throwaway leaf under the cohort, named by this daemon's pid so
-        // two daemons probing one tree never share one, and removed first so
-        // a probe that died before its own cleanup cannot wedge the next.
-        let leaf = box_leaf(root, &format!("placement-probe-{}", std::process::id()));
-        let _ = std::fs::remove_dir(&leaf);
+        // A throwaway leaf under the cohort, named by this daemon's pid and
+        // a per-process counter so two concurrent probes in one daemon never
+        // share one. The counter is a static atomic: the probe is called
+        // from a single daemon process, and the counter's only job is to
+        // make each probe's leaf unique within that process.
+        static PROBE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = PROBE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let leaf = box_leaf(
+            root,
+            &format!("placement-probe-{}-{}", std::process::id(), n),
+        );
         std::fs::create_dir(&leaf)?;
         let placed = place_child_in(&leaf.join("cgroup.procs"));
         // The throwaway leaf is owed its removal. The child is gone by now,
@@ -4545,12 +4551,16 @@ int main(int argc, char **argv) {
 
         // The leaf the probe made is not left behind by the failure either:
         // the probe owes the throwaway its removal whatever the answer was.
+        // The leaf is named by pid and a per-process counter, so the exact
+        // name is not knowable here; what is knowable is that no
+        // `placement-probe-` leaf survives the probe.
+        let leftover = std::fs::read_dir(tree.path().join(classifier::BOXES_DIR))
+            .expect("reading the cohort directory")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .any(|name| name.starts_with("placement-probe-"));
         assert!(
-            !classifier::box_leaf(
-                tree.path(),
-                &format!("placement-probe-{}", std::process::id())
-            )
-            .exists(),
+            !leftover,
             "the throwaway leaf the probe made is gone, failure or not"
         );
 
@@ -4562,6 +4572,57 @@ int main(int argc, char **argv) {
             bare.kind(),
             std::io::ErrorKind::NotFound,
             "a missing cohort is a missing tree, not a probe that passes"
+        );
+    }
+
+    /// Concurrent placement probes each get their own throwaway leaf, so
+    /// they never race on a shared name. N probes over a stand-in tree all
+    /// report the same answer (the tree has no cgroup.procs, so every probe
+    /// fails with `NotFound`), and no probe leaf is left behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_probes_each_get_their_own_leaf() {
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        std::fs::create_dir_all(tree.path().join(classifier::BOXES_DIR))
+            .expect("creating the cohort directory");
+
+        let n: usize = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .max(4);
+        let results: Vec<_> = (0..n)
+            .map(|_| {
+                let root = tree.path().to_path_buf();
+                std::thread::spawn(move || classifier::probe_child_placement(&root))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().expect("probe thread panicked"))
+            .collect();
+
+        // Every probe reports the same answer: the stand-in tree has no
+        // cgroup.procs, so every child's write fails with NotFound.
+        for result in &results {
+            let e = result
+                .as_ref()
+                .expect_err("over a stand-in tree every probe should fail");
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::NotFound,
+                "every probe's child opens the leaf's cgroup.procs without \
+                 creating it: a missing one is a missing leaf"
+            );
+        }
+
+        // No probe leaf is left behind.
+        let leftover = std::fs::read_dir(tree.path().join(classifier::BOXES_DIR))
+            .expect("reading the cohort directory")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .any(|name| name.starts_with("placement-probe-"));
+        assert!(
+            !leftover,
+            "no throwaway probe leaf is left behind after {n} concurrent probes"
         );
     }
 

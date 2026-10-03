@@ -2546,32 +2546,56 @@ async fn create_session_leaf(
         // that is there but refuses this daemon means the daemon is not
         // inside the delegated slice — the state the installer's `--pid`
         // step exists for, effective on the very next launch because the
-        // probe is per-launch.
-        let (what, hint) = match e.kind() {
-            std::io::ErrorKind::NotFound => (
-                "the classifier tree is not installed on this host — the \
-                 placement probe cannot even make its throwaway leaf in it",
-                "the installer has to install the tree",
-            ),
-            std::io::ErrorKind::PermissionDenied => (
-                "this daemon cannot place a process in the classifier tree",
-                "it is not inside the delegated slice, so the installer's \
-                 --pid step or a Delegate=yes unit has to place it",
-            ),
-            _ => (
-                "the placement probe of the classifier tree failed",
-                "the probe's error is where to start",
-            ),
-        };
-        tracing::info!(
-            session = session_name,
-            error = %e,
-            daemon_cgroup = ?sandbox2::classifier::own_cgroup_path(),
-            install = %sandbox2::classifier::install_hint(),
-            hint,
-            "{what}; {hint} — the session's box runs unenforced",
-        );
-        return Ok(None);
+        // probe is per-launch. These two are the genuine "cannot confine"
+        // results: the tree is absent or the daemon is outside the slice.
+        //
+        // Every other error is a transient I/O failure — a filesystem
+        // hiccup, a concurrent probe's race (fixed by unique leaf naming in
+        // `probe_child_placement`, but guarded here regardless), or a
+        // resource shortage — and is surfaced as an error the caller can
+        // retry, rather than silently mapped to "no leaf" which the guest
+        // then reads as a broken image.
+        match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                tracing::info!(
+                    session = session_name,
+                    error = %e,
+                    daemon_cgroup = ?sandbox2::classifier::own_cgroup_path(),
+                    install = %sandbox2::classifier::install_hint(),
+                    "the classifier tree is not installed on this host — the \
+                     placement probe cannot even make its throwaway leaf in \
+                     it; the installer has to install the tree — the \
+                     session's box runs unenforced",
+                );
+                return Ok(None);
+            }
+            std::io::ErrorKind::PermissionDenied => {
+                tracing::info!(
+                    session = session_name,
+                    error = %e,
+                    daemon_cgroup = ?sandbox2::classifier::own_cgroup_path(),
+                    install = %sandbox2::classifier::install_hint(),
+                    "this daemon cannot place a process in the classifier \
+                     tree; it is not inside the delegated slice, so the \
+                     installer's --pid step or a Delegate=yes unit has to \
+                     place it — the session's box runs unenforced",
+                );
+                return Ok(None);
+            }
+            _ => {
+                tracing::warn!(
+                    session = session_name,
+                    error = %e,
+                    daemon_cgroup = ?sandbox2::classifier::own_cgroup_path(),
+                    install = %sandbox2::classifier::install_hint(),
+                    "the placement probe of the classifier tree failed with \
+                     a transient I/O error — the session's box cannot be \
+                     placed and the launch is refused rather than run \
+                     unenforced",
+                );
+                return Err(e);
+            }
+        }
     }
     match create_or_reclaim_box_leaf(root, session_id) {
         Ok((leaf, reclaimed)) => {
