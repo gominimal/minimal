@@ -1916,6 +1916,29 @@ proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
     | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
   echo "declared box: $boxreg_declared_sid — VM host daemon record: $boxreg_record"
 
+  # Close the chain from the declaration to the row: the VM host daemon's
+  # record for this box must carry the switch address the CLI reported at
+  # session start AND the declared allow-list, field by field. The record's
+  # `egress` field is the declaration exactly as the row received it.
+  boxreg_start="$(grep -F 'BOX REGISTRATION:' "$WORK/boxreg-declared.err" | tail -n1)"
+  if [ -z "$boxreg_declared_switch" ] \
+    || ! printf '%s' "$boxreg_start" | grep -Fq "box 'e2e-box-declared'" \
+    || ! printf '%s' "$boxreg_start" | grep -Fq "switch address $boxreg_declared_switch"; then
+    echo "::error::the declared box's session-start line ('${boxreg_start:-<none>}') does not name the switch address the VM host daemon recorded ('${boxreg_declared_switch:-<none>}')"
+    fail
+  fi
+  for boxreg_try in '203.0.113.0/24' 'example.com' '\"tcp\"' '\"udp\"' '198.51.100.0/24'; do
+    if ! printf '%s' "$boxreg_record" | grep -Fq "$boxreg_try"; then
+      echo "::error::the VM host daemon's row for the declared box does not carry the declared egress entry $boxreg_try"
+      fail
+    fi
+  done
+  if ! printf '%s' "$boxreg_record" | grep -Fq '"egress":"{'; then
+    echo "::error::the VM host daemon's record for the declared box carries no egress declaration"
+    fail
+  fi
+  echo "declared row: the VM host daemon holds switch address $boxreg_declared_switch (as session start reported) and the declared allow-list"
+
   # The declared box's own allowed connection must complete first: it proves
   # both this lane's network and the allowed path, and on the SAME run it
   # separates a policy drop below from a dead network — which is what lets
