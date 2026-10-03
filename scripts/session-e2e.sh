@@ -104,6 +104,12 @@
 #                                    switch the install placed, with the VM
 #                                    host daemon's start record naming them
 #   min_internal_names_through_proxy NET-001..004 through the shipped proxy
+#   own_ip_deny_all_box_answers_published_port
+#                                    NET-040's answer half: a deny-all box
+#                                    with a published port answers a host
+#                                    client through the forwarder, the
+#                                    hostname proxy and a sibling box, while
+#                                    its own outbound connect still drops
 #   proxy_refuses_like_direct        the proxy refuses exactly as the switch
 #                                    does: paired direct/proxied attempts,
 #                                    h2 closed, h2c stripped (NET-069..071, 135)
