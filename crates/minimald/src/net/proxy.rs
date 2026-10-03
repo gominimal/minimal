@@ -72,6 +72,10 @@ const MAX_HEAD: usize = 8 * 1024;
 /// open the socket but never send the `\r\n\r\n` end-of-head marker, so a slow
 /// or stalled client cannot tie up a connection task indefinitely.
 const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the proxy waits for the upstream box to accept the TCP dial before
+/// answering `504`. A dead lease drops the SYN silently, so without this bound
+/// the client would wait out the kernel's SYN retries (about two minutes).
 const UPSTREAM_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The host-side lookup the proxy performs for each request: a `Host:`-header
@@ -1229,6 +1233,76 @@ mod tests {
             logged.contains(r#"status="400 Bad Request""#),
             "expected the bad-request refusal to name the status, got: {logged}"
         );
+    }
+
+    /// An upstream that never completes the TCP handshake (a dead lease drops
+    /// the SYN silently) is answered with `504 Gateway Timeout` once
+    /// [`UPSTREAM_DIAL_TIMEOUT`] passes, instead of holding the client for the
+    /// kernel's SYN retries. The stalled upstream is a loopback listener whose
+    /// accept queue is already full, so Linux drops every further SYN.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn proxy_answers_504_when_the_upstream_dial_stalls() {
+        let stalled = TcpSocket::new_v4().unwrap();
+        stalled
+            .bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .unwrap();
+        let stalled = stalled.listen(0).unwrap();
+        let stalled_addr = stalled.local_addr().unwrap();
+
+        // Fill the accept queue (nothing accepts) until a dial stalls. These
+        // are blocking std dials on real time, untouched by the paused clock.
+        let mut held = Vec::new();
+        loop {
+            match std::net::TcpStream::connect_timeout(&stalled_addr, Duration::from_millis(250)) {
+                Ok(stream) => held.push(stream),
+                Err(error) => {
+                    assert_eq!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut,
+                        "expected a stalled dial once the accept queue is full"
+                    );
+                    break;
+                }
+            }
+            assert!(held.len() < 64, "the accept queue never filled");
+        }
+
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
+        reg.register_host_net(SessionId::nil(), "web");
+        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+
+        // An in-memory client, so the only real socket the proxy waits on is
+        // the stalled upstream dial.
+        let (mut client, proxy_side) = tokio::io::duplex(1024);
+        let request = format!(
+            "GET / HTTP/1.1\r\nHost: web.min.internal:{}\r\n\r\n",
+            stalled_addr.port()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            handle_connection_io(proxy_side, None, &router),
+        )
+        .await
+        .expect("the proxy must bound the upstream dial, not wait out the SYN retries")
+        .unwrap();
+        assert!(
+            started.elapsed() >= UPSTREAM_DIAL_TIMEOUT,
+            "the 504 must come from the dial timeout, after {:?}",
+            started.elapsed()
+        );
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.contains("504 Gateway Timeout"),
+            "expected a gateway timeout for a stalled dial, got: {response}"
+        );
+        drop(held);
     }
 
     /// Proof artifact 3 (R3.4 supersession): when the listen address cannot be
