@@ -205,7 +205,7 @@ impl SandboxProgress {
                     .cloned()
                     .unwrap_or_else(|| name.clone()),
             ),
-            Operation::FetchSource { url } => (url_host(url).to_owned(), url_object(url)),
+            Operation::FetchSource { url } => (url_host(url), url_object(url)),
             Operation::FetchIndex => (record.cache_host.clone(), "index".to_owned()),
             _ => return,
         };

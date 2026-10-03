@@ -1052,13 +1052,19 @@ pub fn record_node_plane_fetch(box_id: &str, host: &str, object: &str) {
 /// The host a fetch location is fetched from, spelled for the two forms the
 /// configured remote cache takes: the mirror URL's own host, or the bucket
 /// a GCS location names. The mirror's host is read from the URL the
-/// newtype holds — its own `host_str`, the parsed host with no scheme and
-/// no port — never from a rendering of it: a `Debug` print is a formatting
+/// newtype holds — its own `host_str` for the host, its own `port` for the
+/// port — never from a rendering of it: a `Debug` print is a formatting
 /// choice of the newtype's, and a spelling that changes with it changes
-/// which host the record names while nothing else does.
+/// which host the record names while nothing else does. The port rides the
+/// one rule every fetch kind's host field carries: a mirror on a
+/// non-default port is named with it, one on https's own default without.
 pub(crate) fn cache_host(location: &AnyUrl) -> String {
     match location {
-        AnyUrl::Https(https) => https.host_str().unwrap_or_default().to_owned(),
+        // The mirror is an https location, so the one port rule reads its
+        // scheme as https: 443 is the default it drops.
+        AnyUrl::Https(https) => {
+            host_field(https.host_str().unwrap_or_default(), https.port(), "https")
+        }
         AnyUrl::Gcs(gcs) => gcs.bucket.clone(),
     }
 }
@@ -1075,17 +1081,55 @@ fn authority_host(authority: &str) -> &str {
     }
 }
 
+/// The port a fetch record's host field carries, one rule for both
+/// spellings a fetch's host is read from — the configured cache's
+/// location and a source URL: the port the fetch's URL spells, kept when
+/// it is not the scheme's own default and dropped when it is (443 for
+/// `https`, 80 for `http`). A non-default port is the one way two
+/// fetches of the same host differ, so the record keeps it the same way
+/// for every fetch kind; a default port is a fact the scheme already
+/// says, so the field never carries it.
+fn kept_port(scheme: &str, port: Option<u16>) -> Option<u16> {
+    match (scheme, port) {
+        ("https", Some(443)) | ("http", Some(80)) => None,
+        (_, port) => port,
+    }
+}
+
+/// The host a fetch's record names — `host` with the port [`kept_port`]
+/// keeps — one spelling for both spellings the host is read from, so the
+/// field reads the same way whatever the fetch left for.
+fn host_field(host: &str, port: Option<u16>, scheme: &str) -> String {
+    match kept_port(scheme, port) {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    }
+}
+
 /// The host a URL names — its authority, between the scheme and the first
-/// path, query, or fragment delimiter, with any userinfo dropped — which is
-/// where a `FetchSource` fetch leaves for. A spelling with no scheme (a
-/// local source tarball) names no host and crosses no network: the
-/// record's object still carries the whole spelling, so the fetch is read
-/// whole from the two fields.
-pub(crate) fn url_host(url: &str) -> &str {
-    let Some((_, authority)) = url.split_once("://") else {
-        return "";
+/// path, query, or fragment delimiter, with any userinfo dropped and the
+/// port carried only as the one rule every fetch kind's host field
+/// carries it — which is where a `FetchSource` fetch leaves for. A
+/// spelling with no scheme (a local source tarball) names no host and
+/// crosses no network: the record's object still carries the whole
+/// spelling, so the fetch is read whole from the two fields.
+pub(crate) fn url_host(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return String::new();
     };
-    authority_host(authority.split(['/', '?', '#']).next().unwrap_or_default())
+    let authority = authority_host(rest.split(['/', '?', '#']).next().unwrap_or_default());
+    // The port the authority spells after its last colon, when what
+    // follows that colon is one: the colons inside a bracketed IPv6
+    // literal are not a port, so an authority that spells none is the
+    // host whole.
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => match port.parse::<u16>() {
+            Ok(port) => (host, Some(port)),
+            Err(_) => (authority, None),
+        },
+        None => (authority, None),
+    };
+    host_field(host, port, scheme)
 }
 
 /// The object a `FetchSource` record names its fetch by: the URL's own
@@ -2178,15 +2222,20 @@ mod tests {
 
     /// NET-080: the host each fetch's record names, read from the location
     /// the configured remote cache takes. The mirror's is the URL's own
-    /// host — the parsed host, with neither the port nor the path nor the
-    /// scheme spelled beside it — and the GCS location's is the bucket it
-    /// names, the spelling `mctx` resolves `gs://…` and a bare bucket name
-    /// into. Both spellings are what a person reading a bundle's daemon-log
-    /// tail matches the fetch against, so a host read out of a rendering
-    /// of the URL rather than out of the URL itself is a host the record
-    /// can silently stop naming.
+    /// host — the parsed host, with neither the path nor the scheme spelled
+    /// beside it, and the port carried only when it is not https's own
+    /// default, the one rule every fetch kind's host field keeps — and the
+    /// GCS location's is the bucket it names, the spelling `mctx` resolves
+    /// `gs://…` and a bare bucket name into. Both spellings are what a
+    /// person reading a bundle's daemon-log tail matches the fetch
+    /// against, so a host read out of a rendering of the URL rather than
+    /// out of the URL itself is a host the record can silently stop
+    /// naming.
     #[test]
     fn cache_host_reads_https_host_and_gcs_bucket() {
+        // The mirror's own non-default port, kept: a fetch to port 8443
+        // and one to the default are two different fetches, and the
+        // record's one port rule names them apart.
         let mirror = AnyUrl::Https(
             common::fetchers::ReqwestUrl::try_from(
                 "https://cache.example.com:8443/prefix/index.shisha",
@@ -2195,9 +2244,33 @@ mod tests {
         );
         assert_eq!(
             cache_host(&mirror),
+            "cache.example.com:8443",
+            "the mirror's host keeps its own non-default port: the path is \
+             never part of the host a fetch leaves for, but a port is"
+        );
+        // The scheme's own default, dropped by the same one rule the
+        // source-URL spelling below is read by: a default port is a fact
+        // the scheme already says, so the field never carries it.
+        let default = AnyUrl::Https(
+            common::fetchers::ReqwestUrl::try_from(
+                "https://cache.example.com:443/prefix/index.shisha",
+            )
+            .expect("the default-port mirror URL parses"),
+        );
+        assert_eq!(
+            cache_host(&default),
             "cache.example.com",
-            "the mirror's host is the URL's own host: neither its port nor its \
-             path is part of the host a fetch leaves for"
+            "the mirror's host drops https's own default port: 443 is what \
+             the scheme already says"
+        );
+        let bare = AnyUrl::Https(
+            common::fetchers::ReqwestUrl::try_from("https://cache.example.com/prefix/index.shisha")
+                .expect("the portless mirror URL parses"),
+        );
+        assert_eq!(
+            cache_host(&bare),
+            "cache.example.com",
+            "a mirror that spells no port is named without one"
         );
         let bucket = AnyUrl::Gcs(common::fetchers::GcsUrl {
             bucket: "projects/_/buckets/minimal-cache".to_string(),
@@ -2217,7 +2290,11 @@ mod tests {
     /// can carry a credential in its userinfo (`https://<token>@github.com/…`)
     /// and a signature in its query (`?X-Amz-Signature=…`), so the host is
     /// the URL's authority minus its userinfo and the object is its spelling
-    /// minus the userinfo, the query, and the fragment. A source with no
+    /// minus the userinfo, the query, and the fragment. The port rides the
+    /// one rule every fetch kind's host field keeps — kept when it is not
+    /// the scheme's own default, dropped when it is, the same rule the
+    /// cache's host is spelled by — and that rule is the host field's
+    /// alone: the object keeps the URL's own spelling. A source with no
     /// scheme — a tarball off the operator's own disk — names no host and
     /// crosses no network, and stays the object whole.
     #[test]
@@ -2252,6 +2329,35 @@ mod tests {
             "https://mirror.example.com:8443/src/v2.tar.gz",
             "the object keeps the host and port and drops the login pair, the \
              query, and the fragment"
+        );
+        // Each scheme's own default port, dropped by the same one rule the
+        // cache's host is spelled by — while the object keeps the URL's
+        // whole spelling, because the port rule is the host field's.
+        let https_default = "https://mirror.example.com:443/src/v2.tar.gz";
+        assert_eq!(
+            url_host(https_default),
+            "mirror.example.com",
+            "the host drops https's own default port: 443 is what the scheme \
+             already says"
+        );
+        assert_eq!(
+            url_object(https_default),
+            "https://mirror.example.com:443/src/v2.tar.gz",
+            "the object keeps the URL's spelling whole minus what must not be \
+             logged: the port rule is the host field's alone"
+        );
+        let http_default = "http://mirror.example.com:80/src/v2.tar.gz";
+        assert_eq!(
+            url_host(http_default),
+            "mirror.example.com",
+            "the host drops http's own default port, the same one rule"
+        );
+        let http_kept = "http://mirror.example.com:8080/src/v2.tar.gz";
+        assert_eq!(
+            url_host(http_kept),
+            "mirror.example.com:8080",
+            "the host keeps http's non-default port the same way it keeps \
+             https's: one rule for every fetch kind"
         );
         // A URL with nothing to drop is spelled whole in both fields.
         let plain = "https://example.com/src/v3.tar.gz";
