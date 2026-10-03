@@ -38,10 +38,14 @@
 //!   infrastructure — the one destination a box reaches by declaring the
 //!   upstream, never by allowing its address; and every other frame to the
 //!   proxy's address is dropped ahead of the rules, for a laned box and a
-//!   lane-less one alike, under the same rule the host-side gate refuses
-//!   the address with — the address is the machine's infrastructure, no
-//!   egress rule of the box's opens it, and a node-local proxy can run on
-//!   a host where no gate stands beside the relay to refuse it.
+//!   lane-less one alike — a lane-less box's own listener triple included,
+//!   by the one lane predicate [`proxy_lane_admits`] both legs of a
+//!   frame's path out of a VM share, under the same rule the host-side
+//!   gate refuses the address with — the address is the machine's
+//!   infrastructure, no egress rule of the box's opens it, and the
+//!   listener's refusal a lane-less box is owed belongs to the box's own
+//!   path, which a native host runs with no gate beside this relay to
+//!   make it, so this leg makes it.
 //!
 //! The rules are compiled once per box at attach
 //! ([`EgressRules::from_policy`]); the per-frame work is [`summarize`] plus
@@ -105,11 +109,12 @@ const DNS_PORT: u16 = 53;
 pub const PROXY_LISTENER_PORT: u16 = 8118;
 
 /// The protocol the Box Egress Proxy's listener speaks: NET-134 admits the
-/// proxy's **listener** — TCP at [`PROXY_LISTENER_PORT`] — never its
-/// address, so a UDP datagram to the address and a TCP frame to another
-/// port are dropped ahead of the rules, and the one frame to the address
-/// the rules ever see is a lane-less box's own listener triple, which the
-/// host-side gate's default-deny and the proxy's acceptor refuse.
+/// proxy's **listener** — TCP at [`PROXY_LISTENER_PORT`] — for a box that
+/// declared a credentialed upstream and nothing else at its address, so a
+/// UDP datagram to the address, a TCP frame to another port, and a
+/// lane-less box's own listener triple are all dropped ahead of the
+/// rules, by the one lane predicate both legs of the frame's path share
+/// ([`proxy_lane_admits`]).
 pub const PROXY_LISTENER_PROTOCOL: u8 = 6;
 
 /// The Box Egress Proxy's listener on the switch this box attaches to —
@@ -117,9 +122,11 @@ pub const PROXY_LISTENER_PROTOCOL: u8 = 6;
 /// only one (NET-134): the listener, never the address, because what a
 /// lane buys is the listener its credentials are redeemed through, not a
 /// host address. Every other frame to the proxy's address — another port
-/// over TCP, any other protocol — is dropped ahead of the rules, laned or
-/// not, and the address is carried for a lane-less box exactly as for a
-/// laned one, because the drop at it is the relay's own.
+/// over TCP, any other protocol, and the listener's own triple from a box
+/// that declared no lane — is dropped ahead of the rules, and the address
+/// is carried for a lane-less box exactly as for a laned one, because the
+/// drop at it is the relay's own: a native host runs no minvmd gate beside
+/// the relay to make the refusal, so the relay makes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProxyListener {
     /// The proxy's address on the switch.
@@ -129,6 +136,22 @@ pub struct ProxyListener {
     /// The protocol the listener speaks ([`PROXY_LISTENER_PROTOCOL`]):
     /// TCP, the protocol of the proxy's acceptor.
     pub proto: u8,
+}
+
+impl ProxyListener {
+    /// The listener at `addr`: the one fixed listener every switch's Box
+    /// Egress Proxy answers on — TCP at [`PROXY_LISTENER_PORT`] over
+    /// [`PROXY_LISTENER_PROTOCOL`] — assembled one way, so the (address,
+    /// port, protocol) triple [`proxy_lane_admits`] matches against is the
+    /// same listener on the relay leg and on the VM host's gate.
+    #[must_use]
+    pub fn at(addr: [u8; 4]) -> Self {
+        Self {
+            addr,
+            port: PROXY_LISTENER_PORT,
+            proto: PROXY_LISTENER_PROTOCOL,
+        }
+    }
 }
 
 /// How long an address a DNS reply admitted stays admitted, from the
@@ -500,20 +523,22 @@ pub struct EgressRules {
     /// The Box Egress Proxy's listener on the switch this box attaches to
     /// (NET-134): the address it names is the machine's infrastructure,
     /// carried for a lane-less box exactly as for a laned one — the drop
-    /// at it is the relay's own, not the host-side gate's, because a
-    /// node-local proxy can run on a host where no gate stands beside the
-    /// relay — and the listener it names is the one destination admitted
-    /// beside the rules, whatever they say about it, the way the resolver
-    /// carve-out is: the proxy is that lane's infrastructure and the
-    /// credentials it redeems are the lane's own, so no egress rule of the
-    /// box's decides them. The admission is the listener's, never the
-    /// address's (design §5.3's port-scoped opening): [`ProxyListener`]
-    /// carries the address, the port and the protocol together, and a
-    /// frame to the proxy's address that is not TCP to
-    /// [`PROXY_LISTENER_PORT`] is dropped ahead of the rules below.
-    /// `None`, the shape [`EgressRules::new`] and [`EgressRules::from_policy`]
-    /// build, is a compile that knows no proxy on the switch: no address
-    /// is dropped and no listener admitted.
+    /// at it is the relay's own, not the host-side gate's alone, because a
+    /// native host runs no gate beside the relay — and the listener it
+    /// names is the one destination admitted beside the rules, whatever
+    /// they say about it, the way the resolver carve-out is: the proxy is
+    /// that lane's infrastructure and the credentials it redeems are the
+    /// lane's own, so no egress rule of the box's decides them. The
+    /// admission is the listener's, never the address's (design §5.3's
+    /// port-scoped opening): [`ProxyListener`] carries the address, the
+    /// port and the protocol together, and the whole address is decided
+    /// by the one lane predicate both legs of a frame's path share
+    /// ([`proxy_lane_admits`]) — a frame that is not the listener's own
+    /// triple from a box that declared the lane is dropped ahead of the
+    /// rules below. `None`, the shape [`EgressRules::new`] and
+    /// [`EgressRules::from_policy`] build, is a compile that knows no
+    /// proxy on the switch: no address is dropped and no listener
+    /// admitted.
     ///
     /// The declaration that opens the listener is
     /// [`Self::credentialed_upstream`]'s; the address is the relay's own
@@ -526,10 +551,10 @@ pub struct EgressRules {
     /// carry beside them. A lane is never an egress dimension: nothing a
     /// box says inside the VM grants one, and nothing an egress rule says
     /// stands in for one, so the frame to the listener a lane-less box
-    /// sends is not the rules' to admit — it reaches them only because the
-    /// listener is the proxy's own parser surface, whose refusal the
-    /// host-side gate's box-to-host default-deny and the proxy's acceptor
-    /// owe it, and the relay does not pre-empt either.
+    /// sends is not the rules' to admit either — the listener's refusal
+    /// belongs to the box's own path, and a native host runs no minvmd
+    /// gate and no shipped acceptor beside the relay to make it, so the
+    /// relay makes it: the frame is the address's own drop below.
     credentialed_upstream: bool,
     /// The box's lease on the switch — the one source address its frames
     /// may carry, which the verdict rejects any other of (NET-084). Known
@@ -608,16 +633,14 @@ impl EgressRules {
     /// Egress Proxy (NET-134): `proxy` is its address on the switch this
     /// box attaches to, an infrastructure address the relay knows by its
     /// own subnet — so the address is attached for a lane-less box exactly
-    /// as for a laned one, and every frame to it that is not the
-    /// listener's own (address, port, protocol) triple is the relay's
-    /// named drop, ahead of the box's rules, whatever they would say about
-    /// the address. The drop is the relay's own rather than the
-    /// host-side gate's because a node-local proxy can run on a host
-    /// where no gate stands beside it; a lane-less box's own listener
-    /// triple is the one frame to the address the rules still see, since
-    /// the listener is the proxy's parser surface and its refusal is the
-    /// gate's default-deny and the acceptor's, not a rule the box never
-    /// declared.
+    /// as for a laned one, and every frame to it the box's lane did not
+    /// admit is the relay's named drop, ahead of the box's rules, whatever
+    /// they would say about the address: another port over TCP, any other
+    /// protocol, and the listener's own triple from a box that declared no
+    /// lane. The drop is the relay's own rather than the host-side gate's
+    /// alone because a native host runs no gate beside it, and the
+    /// refusal a lane-less box is owed at the listener belongs to the
+    /// box's own path, not to the proxy's acceptor.
     ///
     /// The listener is one fixed listener — TCP at [`PROXY_LISTENER_PORT`],
     /// [`PROXY_LISTENER_PROTOCOL`] — so the compile hands the address alone
@@ -626,11 +649,7 @@ impl EgressRules {
     /// address.
     #[must_use]
     pub fn with_box_egress_proxy(mut self, proxy: [u8; 4]) -> Self {
-        self.proxy = Some(ProxyListener {
-            addr: proxy,
-            port: PROXY_LISTENER_PORT,
-            proto: PROXY_LISTENER_PROTOCOL,
-        });
+        self.proxy = Some(ProxyListener::at(proxy));
         self
     }
 
@@ -640,7 +659,8 @@ impl EgressRules {
     /// beside the rules — whatever they say about the address — because
     /// the proxy is that lane's infrastructure, the one destination a box
     /// reaches by declaring the upstream rather than by allowing its
-    /// address.
+    /// address, and the one frame at the address the declaration ever
+    /// admits.
     ///
     /// The caller is the compile of a whole session policy, the only place
     /// that holds both halves — the declaration ([`crate::CredentialedUpstream`],
@@ -649,11 +669,7 @@ impl EgressRules {
     /// the verdict reads one field.
     #[must_use]
     pub fn with_credentialed_upstream(mut self, proxy: [u8; 4]) -> Self {
-        self.proxy = Some(ProxyListener {
-            addr: proxy,
-            port: PROXY_LISTENER_PORT,
-            proto: PROXY_LISTENER_PROTOCOL,
-        });
+        self.proxy = Some(ProxyListener::at(proxy));
         self.credentialed_upstream = true;
         self
     }
@@ -736,12 +752,14 @@ pub enum DropReason {
         /// The frame's IPv4 protocol number.
         proto: u8,
     },
-    /// The destination is the Box Egress Proxy's address at anything but
-    /// its listener: the address is the machine's infrastructure and no
-    /// egress rule of the box's opens it (NET-134), so the frame is the
-    /// relay's own drop — ahead of the rules, for a laned box and a
-    /// lane-less one alike — under the same rule string the host-side
-    /// gate refuses the address with.
+    /// The destination is the Box Egress Proxy's address and the box's lane
+    /// did not admit the frame — another port, another protocol, or the
+    /// listener's own triple from a box that declared no upstream: the
+    /// address is the machine's infrastructure and no egress rule of the
+    /// box's opens it (NET-134), so the frame is the relay's own drop —
+    /// ahead of the rules, for a laned box and a lane-less one alike —
+    /// under the same rule string the host-side gate refuses the address
+    /// with.
     UncredentialedProxyDestination {
         /// The frame's IPv4 destination address: the proxy's.
         dst: [u8; 4],
@@ -822,6 +840,25 @@ pub fn foreign_source(summary: &FrameSummary, lease: [u8; 4]) -> Option<DropReas
     (src != lease).then_some(DropReason::ForeignSource { src, lease })
 }
 
+/// NET-134's one lane predicate, shared by the two gates a frame's path to
+/// the Box Egress Proxy can be refused at — the relay leg every daemon runs
+/// ([`verdict`], whose `verdict_ipv4` calls this) and the VM host's gate
+/// (`minvmd`'s `egress-uncredentialed-proxy-destination` arm), so the two
+/// admit the same frame or refuse it together by construction and can
+/// never drift. The listener is admitted only for a box that declared a
+/// credentialed upstream (`declared`), and only as the whole (address,
+/// port, protocol) triple the listener is — never the address alone
+/// (design §5.3's port-scoped opening): a frame to the address at any
+/// other port, over any other protocol, or from a box that declared no
+/// lane, is every other leg's refusal.
+#[must_use]
+pub fn proxy_lane_admits(declared: bool, listener: ProxyListener, summary: &FrameSummary) -> bool {
+    declared
+        && summary.dst == Some(listener.addr)
+        && summary.proto == Some(listener.proto)
+        && summary.dst_port == listener.port
+}
+
 /// The admit-or-drop decision for one frame summary against one box's rules
 /// — the pure function NET-062, NET-063, NET-064, and NET-084 all reduce
 /// to, and the one the Kani harness exhausts.
@@ -833,8 +870,9 @@ pub fn foreign_source(summary: &FrameSummary, lease: [u8; 4]) -> Option<DropReas
 /// resolves (NET-079); the credentialed lane's proxy listener comes with it,
 /// before every rule, so a box that declared the upstream reaches the
 /// listener whatever its rules say (NET-134); the proxy's address is then
-/// dropped at every other frame, ahead of the rules, laned or not, so no
-/// open dimension ever opens it; `deny_subnets` then carves
+/// dropped at every frame the lane did not admit, ahead of the rules,
+/// laned or not, so no open dimension ever opens it and a lane-less box
+/// reaches no listener either; `deny_subnets` then carves
 /// out of what the allows admit; and a drop never depends on the rule
 /// lists being sorted.
 #[must_use]
@@ -872,41 +910,40 @@ fn verdict_ipv4(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
         return FrameVerdict::Admit;
     }
     // NET-134: the Box Egress Proxy's listener for a box that declared a
-    // credentialed upstream — the lane's infrastructure, admitted beside the
-    // rules and by the whole (address, port, protocol) triple the listener
-    // is, exactly as the host-side gate admits it, so the two legs of a
-    // frame's path out of a VM never disagree about the one destination
-    // neither decides by the box's rules. The triple, never the address
-    // alone, is the contract (NET-062's port-scoped opening): a frame to
-    // the proxy's address at any other port, or over any other protocol,
-    // is not the listener and is the drop below's. A declaration the box
-    // never made admits nothing either.
-    if rules.credentialed_upstream
-        && let Some(listener) = rules.proxy
-        && proto == listener.proto
-        && dst == listener.addr
-        && summary.dst_port == listener.port
+    // credentialed upstream — the lane's infrastructure, admitted beside
+    // the rules and by the whole (address, port, protocol) triple the
+    // listener is, through the one lane predicate (`proxy_lane_admits`)
+    // the host-side gate decides the same destination by, so the two legs
+    // of a frame's path out of a VM never disagree about the one
+    // destination neither decides by the box's rules. The triple, never
+    // the address alone, is the contract (NET-062's port-scoped opening):
+    // a frame to the proxy's address at any other port, or over any other
+    // protocol, is not the listener and is the drop below's. A
+    // declaration the box never made admits nothing either — the
+    // listener's own triple included, which is the drop below's too.
+    if let Some(listener) = rules.proxy
+        && proxy_lane_admits(rules.credentialed_upstream, listener, summary)
     {
         return FrameVerdict::Admit;
     }
     // NET-134: and the proxy's address is infrastructure on this leg too —
     // the machine's, not the box's, so no egress rule of the box's opens
-    // it, and a node-local proxy can run on a host where no gate stands
-    // beside the relay to refuse it. Every frame to the address that is not
-    // the listener's own triple is the relay's named drop, ahead of the
-    // rules, for a laned box and a lane-less one alike, under the same
-    // rule string the host-side gate refuses the address with — so an
-    // allow-all box's open dimensions buy nothing at the address, and the
-    // two legs of a frame's path never disagree about it either. The one
-    // frame to the address the rules still see is a lane-less box's own
-    // listener triple, deliberately: the listener is the proxy's parser
-    // surface, whose refusal the host-side gate's box-to-host
-    // default-deny and the proxy's own acceptor owe a lane-less box, and
-    // this leg pre-empts neither by inventing a rule the box never
-    // declared.
+    // it, and the whole address is the lane's: decided by the same
+    // predicate the admit above reads and the host-side gate holds, and
+    // dropped ahead of the rules for every frame the lane did not admit —
+    // another port over TCP, any other protocol, and the listener's own
+    // triple from a box that declared no lane — under the same rule string
+    // the host-side gate refuses the address with, so an allow-all box's
+    // open dimensions buy nothing at the address and the two legs of a
+    // frame's path agree completely: the listener opens for a box that
+    // declared the lane alone, and nothing else at the address opens at
+    // all. The refusal a lane-less box is owed at the listener belongs to
+    // the box's own path, not to the proxy's acceptor: a native host runs
+    // no minvmd gate beside the relay to make it, so this leg makes it —
+    // and on a VM host this leg drops first, so the gate never sees the
+    // frame and the refusal is counted once, by whichever leg refused it.
     if let Some(listener) = rules.proxy
         && dst == listener.addr
-        && !(proto == listener.proto && summary.dst_port == listener.port)
     {
         return FrameVerdict::Drop(DropReason::UncredentialedProxyDestination { dst, proto });
     }
@@ -2166,18 +2203,16 @@ mod tests {
     /// granted by the system, and admitted as the whole (address, port,
     /// protocol) triple the listener is, never the address alone: a TCP
     /// frame to the listener's own port passes a deny-all. The address is
-    /// infrastructure on this leg too, so every other frame to it is the
-    /// relay's own named drop, ahead of the rules and under the same rule
-    /// string the host-side gate refuses the address with, for a laned box
-    /// and a lane-less one alike — an allow-all box's open dimensions buy
-    /// nothing at the address, on a native host where no gate stands beside
-    /// the relay as much as on a VM-backed one. The one frame to the
-    /// address the rules ever see is a lane-less box's own listener triple,
-    /// deliberately: the listener is the proxy's parser surface, whose
-    /// refusal the host-side gate's box-to-host default-deny and the
-    /// proxy's acceptor owe a lane-less box, and the relay pre-empts
-    /// neither by inventing a rule the box never declared. Without any
-    /// proxy compiled in, the rules alone decide, as they always did.
+    /// infrastructure on this leg too, so every frame to it the lane did
+    /// not admit is the relay's own named drop, ahead of the rules and
+    /// under the same rule string the host-side gate refuses the address
+    /// with, for a laned box and a lane-less one alike — an allow-all box's
+    /// open dimensions buy nothing at the address, and a lane-less box's
+    /// own listener triple is the drop's too: the lane alone opens the
+    /// listener, and the refusal a lane-less box is owed there belongs to
+    /// the box's own path, which a native host runs with no gate beside
+    /// the relay to make it, so the relay makes it. Without any proxy
+    /// compiled in, the rules alone decide, as they always did.
     #[test]
     fn proxy_lane_admits_only_the_listener() {
         // The Box Egress Proxy's address on the switch these tests' resolver
@@ -2280,35 +2315,34 @@ mod tests {
                 "{label}: a UDP datagram to the proxy's address is the address's drop too"
             );
         }
-        // The one frame to the address the rules ever see: a lane-less
-        // box's own listener triple, which the rules still decide — under
-        // allow-all they admit it, because the refusal a lane-less box is
-        // owed at the listener is the host-side gate's box-to-host
-        // default-deny and the proxy's own acceptor, never a rule the box
-        // declared, and under deny-all they drop it like any other
-        // destination.
-        assert!(
-            admits(
-                &ipv4_frame(IPPROTO_TCP, PROXY, PROXY_LISTENER_PORT),
-                &allow_all_unlaned
-            ),
-            "the lane-less box's listener triple is the gate's and the acceptor's to refuse, not the relay's"
+        // A lane-less box's own listener triple is the address's drop too:
+        // the lane is the one thing that opens the listener, so the rules
+        // never see the frame at all — an allow-all box's open dimensions
+        // buy nothing at it on a native host, where no gate stands beside
+        // the relay to make the refusal, as much as on a VM-backed one.
+        let listener_triple = ipv4_frame(IPPROTO_TCP, PROXY, PROXY_LISTENER_PORT);
+        let refused = FrameVerdict::Drop(DropReason::UncredentialedProxyDestination {
+            dst: PROXY,
+            proto: IPPROTO_TCP,
+        });
+        assert_eq!(
+            verdict(&summarize(&listener_triple), &allow_all_unlaned),
+            refused,
+            "a lane-less box's listener triple is the address's drop, not the rules'"
         );
-        assert!(
-            !admits(
-                &ipv4_frame(IPPROTO_TCP, PROXY, PROXY_LISTENER_PORT),
+        assert_eq!(
+            verdict(
+                &summarize(&listener_triple),
                 &deny_all().with_box_egress_proxy(PROXY)
             ),
+            refused,
             "a deny-all box that declared no lane still reaches no listener"
         );
         // No proxy compiled in at all: the rules alone decide, and under
         // deny-all they drop the proxy's address the way they drop any
         // other.
         assert!(
-            !admits(
-                &ipv4_frame(IPPROTO_TCP, PROXY, PROXY_LISTENER_PORT),
-                &deny_all()
-            ),
+            !admits(&listener_triple, &deny_all()),
             "the declaration is the one thing that opens the listener"
         );
     }
@@ -3454,14 +3488,13 @@ mod kani_proofs {
                             && summary.destination_port() == listener.port
                     });
                 // NET-134's other arm: every frame to the proxy's address
-                // that is not the listener's own triple, dropped ahead of
-                // the rules. A lane's own triple is the admit above, and a
-                // lane-less box's is the one frame to the address the rules
-                // still see, so it is not this drop's.
-                let non_listener = rules.proxy.is_some_and(|listener| {
-                    dst == listener.addr
-                        && !(proto == listener.proto && summary.destination_port() == listener.port)
-                });
+                // the lane did not admit, dropped ahead of the rules — the
+                // listener's own triple from a box that declared no lane
+                // included, by the one predicate both legs share: the
+                // listener opens for a laned box alone, and nothing else at
+                // the address opens at all, so no open dimension ever
+                // reaches it.
+                let at_the_address = rules.proxy.is_some_and(|listener| dst == listener.addr);
                 let protocols = rules
                     .allow_protocols
                     .as_ref()
@@ -3474,7 +3507,7 @@ mod kani_proofs {
                     .allow_subnets
                     .as_ref()
                     .is_none_or(|list| list.iter().any(|cidr| cidr.contains(dst)));
-                lease && (resolver || lane || (!non_listener && protocols && !denied && allowed))
+                lease && (resolver || lane || (!at_the_address && protocols && !denied && allowed))
             }
             // No readable IPv4 header is never a declared frame.
             _ => false,

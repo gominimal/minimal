@@ -3349,8 +3349,12 @@ fn gate_verdict(
     // `bep_host::PROXY_PORT`, the port the proxy's acceptor listens at read
     // from the stack that runs it, so the gate cannot drift from the
     // listener it guards, over the protocol of the acceptor the relay leg
-    // pins too (`egress::PROXY_LISTENER_PROTOCOL`), so the two legs admit
-    // the same frame or refuse it together. A row that declared the lane
+    // pins too (`egress::PROXY_LISTENER_PROTOCOL`) — and the predicate
+    // itself is the one function the relay leg decides the same
+    // destination by (`egress::proxy_lane_admits`, handed the listener as
+    // `egress::ProxyListener::at` builds it), so the two legs admit the
+    // same frame or refuse it together by construction rather than by
+    // parallel spellings of one triple. A row that declared the lane
     // is admitted here, whatever its rules would say about the address: a
     // deny-all row included, because the credentials the proxy redeems are
     // the lane's own and no egress rule of the box's says anything about
@@ -3371,10 +3375,17 @@ fn gate_verdict(
     {
         // minvmd is the one crate that sees both spellings of the listener's port.
         const _: () = assert!(egress::PROXY_LISTENER_PORT == switch::bep_host::PROXY_PORT);
-        let listener = summary.protocol() == Some(egress::PROXY_LISTENER_PROTOCOL)
-            && summary.destination_port() == switch::bep_host::PROXY_PORT;
-        return match (record.as_ref(), listener) {
-            (Some(row), true) if row.declares_credentialed_upstream() => Ok(GateAdmit::ProxyLane),
+        let listener = egress::ProxyListener::at(dst);
+        return match record.as_ref() {
+            Some(row)
+                if egress::proxy_lane_admits(
+                    row.declares_credentialed_upstream(),
+                    listener,
+                    summary,
+                ) =>
+            {
+                Ok(GateAdmit::ProxyLane)
+            }
             _ => Err(GateDrop::ProxyLane {
                 src,
                 dst,
