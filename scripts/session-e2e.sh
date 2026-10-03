@@ -8540,16 +8540,25 @@ proof_two_named_vms_on_one_machine() {
       # for the alias that socket's parent directory names — the provider
       # directory's basename for the default VM, the VM's own name for a named
       # one — while the record answers to whatever host the daemon keyed it
-      # on. A refusal at the key is a transport fact, not a box fact, so both
-      # aliases go in the error line and the record itself below.
+      # on (crates/minvmd/src/cmd/mod.rs, the provider instance name). The two
+      # rules agree only for the default VM, so a refusal splits into two
+      # stories the record itself tells apart: the aliases disagree — every
+      # named VM, until the record is keyed the alias the client derives — or
+      # they agree and the key the guest presented is not the key the record
+      # holds. Both are transport facts, not box facts, so the alias, the
+      # record's own host and the record itself go in the lines below.
       if printf '%s' "$tw_socat_err" | grep -Fiq "host key"; then
         if [ "$vm" = default ]; then tw_kh_dir="$tw_root"; else tw_kh_dir="$tw_root/$vm"; fi
         tw_kh_alias="$(basename "$tw_kh_dir")"
         tw_kh_rec="$(awk 'NR==1 { print $1; exit }' "$tw_kh_dir/known_hosts" 2>/dev/null || true)"
       fi
       if [ -n "$tw_socat_err" ]; then
-        if [ -n "$tw_kh_alias" ]; then
-          echo "::error::box $box on VM $vm: the exec was refused at the VM guest's host key before the box — ssh pinned host alias '$tw_kh_alias' against the record beside this VM's socket, which answers to '${tw_kh_rec:-<none>}' (the record is dumped below)"
+        if [ -n "$tw_kh_alias" ] && [ -n "$tw_kh_rec" ] && [ "$tw_kh_alias" != "$tw_kh_rec" ]; then
+          echo "::error::box $box on VM $vm: ssh asked for host alias '$tw_kh_alias' but the record beside this VM's socket answers to '$tw_kh_rec' — two rules that agree only for the default VM, so this VM's ssh channels are refused at the key (both rules and their files are named below)"
+        elif [ -n "$tw_kh_alias" ] && [ -n "$tw_kh_rec" ]; then
+          echo "::error::box $box on VM $vm: the exec was refused at the VM guest's host key though the record beside this VM's socket answers to the alias ssh asked for ('$tw_kh_alias') — the key the guest presented is not the key the record holds (the record is dumped below)"
+        elif [ -n "$tw_kh_alias" ]; then
+          echo "::error::box $box on VM $vm: the exec was refused at the VM guest's host key but no record sits beside this VM's socket — a missing record waives the pin rather than enforcing it, so this refusal is not the record's doing (see below)"
         else
           echo "::error::box $box on VM $vm: the exec itself failed — the box never answered: $(printf '%s' "$tw_socat_err" | head -n1 | cut -c1-160)"
         fi
@@ -8562,7 +8571,9 @@ proof_two_named_vms_on_one_machine() {
         echo "--- VM $vm's recorded guest host key ($tw_kh_dir/known_hosts) ---"
         if [ -f "$tw_kh_dir/known_hosts" ]; then
           cat "$tw_kh_dir/known_hosts"
-          echo "ssh was asked for host alias '$tw_kh_alias'; the record's own host is '${tw_kh_rec:-<empty>}'"
+          echo "ssh was asked for host alias '$tw_kh_alias' — the bridge socket's own directory's basename, the rule crates/minimal-client/src/attach.rs applies"
+          echo "the record's own host is '${tw_kh_rec:-<empty>}' — the provider instance name, the rule crates/minvmd/src/cmd/mod.rs applies"
+          echo "the two rules agree only for the default VM: a named VM's socket sits one directory deeper, so its alias is the VM's own name while its record is still keyed the instance name — until the record is keyed the alias the client derives (or the client asks for the record's key), every ssh channel into a named VM — exec, attach, forward — is refused at the key, and no retry window can change it"
         else
           echo "(absent — a missing record waives the pin rather than refusing it, so the refusal is not the record's doing)"
         fi
