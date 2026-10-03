@@ -205,6 +205,9 @@ impl SandboxProgress {
                     .cloned()
                     .unwrap_or_else(|| name.clone()),
             ),
+            // A source with no scheme is a tarball read off the operator's
+            // own disk: it crosses no network, so it is no node-plane fetch.
+            Operation::FetchSource { url } if !url.contains("://") => return,
             Operation::FetchSource { url } => (url_host(url), url_object(url)),
             Operation::FetchIndex => (record.cache_host.clone(), "index".to_owned()),
             _ => return,
@@ -879,6 +882,25 @@ mod tests {
         assert!(
             !source.contains("cache.minimal.dev"),
             "a source's host is its URL's, not the cache's: {source}"
+        );
+    }
+
+    /// NET-080: a local source tarball — a `FetchSource` with no scheme —
+    /// crosses no network, so it is never recorded as node-plane traffic.
+    #[test]
+    fn a_local_source_is_not_recorded_as_node_plane_traffic() {
+        let root = OpTracker::new_root();
+        let _source = root.new_child().with_op(Operation::FetchSource {
+            url: "../tarballs/v4.tar.gz".to_string(),
+        });
+        let (log, _guard) = capture_log();
+        let mut progress = SandboxProgress::new(None, None).with_fetch_record(fetch_record());
+        progress.line(&root.snapshot());
+
+        let recorded = log.contents();
+        assert!(
+            !recorded.contains("node-plane traffic"),
+            "a local source read is no network fetch: {recorded}"
         );
     }
 
