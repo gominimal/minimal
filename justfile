@@ -254,6 +254,14 @@ reap:
 kernel-review *args:
     scripts/kernel-bump-review.sh {{args}}
 
+# Not a CI gate: the report queries GitHub, kernel.org and Alpine. Lag never
+# fails; the duplicated-pin checks do (`--check`, or `--check --offline` for
+# the ones that read only local files, which `just test-shell` runs). The pin
+# inventory is the PINS table in scripts/deps-freshness.sh. Needs `gh`.
+# Report non-Rust dependency pins against upstream (`just deps-freshness [--check]`).
+deps-freshness *args:
+    scripts/deps-freshness.sh {{args}}
+
 # ── CI-parity gates ──────────────────────────────────────────────────────────
 
 # Fail fast with an install hint when a required tool is missing.
