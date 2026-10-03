@@ -17,11 +17,12 @@
 //! attempt from a source no row holds, from a MAC the switch would never
 //! lease to its address, or from a source already holding its share's cap —
 //! are charged to the shared refusal audit ([`crate::refusal`]) in the one
-//! line format the other refusal legs use: one line when a window opens and
-//! one when a source's quota is spent, bounded per source, so a box
-//! hammering the proxy address loses only its own replies. The reset those
-//! refusals answer with is the shared builder's
-//! ([`crate::refusal::refused_tcp_reset`]), not a shape of the peer's own.
+//! line format the other refusal legs use: one line per source per window,
+//! said at the window's first refusal and carrying the refusals that window
+//! saw, bounded per source, so a box hammering the proxy address loses only
+//! its own replies. The reset those refusals answer with is the shared
+//! builder's ([`crate::refusal::refused_tcp_reset_from`]), written from the
+//! leg's own MAC, not a shape of the peer's own.
 //!
 //! Those sockets are the proxy's listener pool, this task's work: a pool of
 //! listening TCP sockets at [`PROXY_PORT`] on the leg's address, partitioned
@@ -899,8 +900,9 @@ pub struct BepStack {
     neighbour_warns: WarnThrottle,
     /// The shared refusal audit ([`refusal::RefusalEmitter`]): every reset
     /// the pre-screen writes is charged to its source's quota, and the audit
-    /// says one line when a window opens and one when the quota is spent, in
-    /// the same line format every refusal leg uses.
+    /// says its window's one line — at the window's first refusal, carrying
+    /// the refusals that window saw — in the same line format every refusal
+    /// leg uses.
     refusals: refusal::RefusalEmitter,
 }
 
@@ -1031,15 +1033,16 @@ impl BepStack {
     /// of the same anti-spoof line the switch's static leases hold. A
     /// source that already holds [`BepWire::per_source_cap`] sockets keeps
     /// only the ones it has. Every refusal goes through the shared audit
-    /// ([`refusal::RefusalEmitter`], the fourth caller of it): one
-    /// rate-limited line per class per source in the format every refusal
-    /// leg uses, carrying the count of resets written to that source this
-    /// window, and a source that has spent its quota is answered with
-    /// nothing at all — so a box hammering the address loses only its own
-    /// replies and never a sibling's. The reset it is answered with is the
-    /// shared builder's, a shape the box's own stack accepts, addressed to
-    /// the MAC the SYN came from — a registered box's switch-derived one,
-    /// a spoofer's own tap MAC.
+    /// ([`refusal::RefusalEmitter`], a caller of it like the relay's): one
+    /// rate-limited line per (class, source) per window in the format every
+    /// refusal leg uses, said at the window's first refusal and carrying the
+    /// refusals that window saw, and a source that has spent its quota is
+    /// answered with nothing at all — so a box hammering the address loses
+    /// only its own replies and never a sibling's. The reset it is answered
+    /// with is the shared builder's, a shape the box's own stack accepts,
+    /// addressed to the MAC the SYN came from — a registered box's
+    /// switch-derived one, a spoofer's own tap MAC — and written from the
+    /// leg's own.
     ///
     /// A bare SYN whose `(source, port)` the pool already holds is
     /// dropped, not refused and not passed: smoltcp assigns an inbound
@@ -1162,9 +1165,8 @@ impl BepStack {
     }
 
     /// Answer one SYN the pre-screen refused: charge the refusal to the
-    /// shared audit — one line when a window opens and one when the source's
-    /// quota is spent, in the format every refusal leg uses — and write the
-    /// shared builder's reset when the audit still owes a reply.
+    /// shared audit — its window's one line, in the format every refusal leg
+    /// uses — and write the shared builder's reset when the audit owes one.
     ///
     /// [`refusal::Outcome::Suppressed`] means the source has spent this
     /// window's quota, and the segment is dropped with nothing written back:
@@ -1177,7 +1179,12 @@ impl BepStack {
             address: Ipv4Addr::from(u32::from_be_bytes(self.host.ip().octets())),
             about: refusal::About::Port(PROXY_PORT),
         };
-        match self.refusals.refuse(&refusal, std::time::Instant::now()) {
+        // The pre-screen refuses a SYN it has parsed, so a reset is always
+        // owed for this one.
+        match self
+            .refusals
+            .refuse(&refusal, true, std::time::Instant::now())
+        {
             refusal::Outcome::Suppressed => {}
             refusal::Outcome::Quiet => self.emit_reset(frame, syn),
             refusal::Outcome::Emit(line) => {
@@ -1187,12 +1194,13 @@ impl BepStack {
         }
     }
 
-    /// Write the reset the shared builder shapes for a refused SYN. A frame
-    /// the classifier cannot read is answered with nothing — the pre-screen
-    /// has already parsed it, so this is the builder's own guard, not a path
-    /// the pool expects to take.
+    /// Write the reset the shared builder shapes for a refused SYN, from the
+    /// leg's own MAC. A frame the classifier cannot read is answered with
+    /// nothing — the pre-screen has already parsed it, so this is the
+    /// builder's own guard, not a path the pool expects to take.
     fn emit_reset(&mut self, frame: &[u8], syn: &ScreenedSyn) {
-        if let Some(reset) = syn.refused_reset(frame) {
+        let leg_mac = self.host.mac().0;
+        if let Some(reset) = syn.refused_reset(leg_mac, frame) {
             self.host.emit_frame(reset);
         }
     }
@@ -1664,20 +1672,24 @@ impl ScreenedSyn {
     }
 
     /// Build the reset the refusal answers this SYN with: the shared
-    /// builder's ([`refusal::refused_tcp_reset`]), not a shape of the peer's
-    /// own — the same bytes every other refusal leg writes, so a refusal
-    /// reads identically on whichever leg refused it. The shared builder
-    /// answers a bare SYN the shape smoltcp's own `rst_reply` gives —
-    /// sequence zero, the SYN's sequence plus one acknowledged, no window —
-    /// so the box's stack accepts it and closes rather than retrying a
-    /// connection that will never be answered, and it addresses the reset to
-    /// the MAC the SYN came from — a registered box's switch-derived MAC,
-    /// and a spoofer's own tap MAC, so the refusal reaches whoever sent it —
-    /// never to a broadcast. `None` — nothing written — for a frame the
-    /// classifier cannot read, though the pre-screen already has.
-    fn refused_reset(&self, frame: &[u8]) -> Option<Vec<u8>> {
+    /// builder's ([`refusal::refused_tcp_reset_from`]), not a shape of the
+    /// peer's own — the same bytes every other refusal leg writes, so a
+    /// refusal reads identically on whichever leg refused it. The shared
+    /// builder answers a bare SYN the shape smoltcp's own `rst_reply` gives
+    /// — sequence zero, the SYN's sequence plus its data plus one
+    /// acknowledged, no window — so the box's stack accepts it and closes
+    /// rather than retrying a connection that will never be answered. It
+    /// addresses the reset to the MAC the SYN came from — a registered box's
+    /// switch-derived MAC, and a spoofer's own tap MAC, so the refusal
+    /// reaches whoever sent it — and writes it from `leg_mac`, the leg's own
+    /// MAC: never the frame's Ethernet destination, which names no one the
+    /// leg must answer as, and is the broadcast's when the SYN was sent to
+    /// the broadcast — a reset claiming that MAC is a frame no switch would
+    /// forward. `None` — nothing written — for a frame the classifier cannot
+    /// read, though the pre-screen already has.
+    fn refused_reset(&self, leg_mac: [u8; 6], frame: &[u8]) -> Option<Vec<u8>> {
         let segment = refusal::classify(frame)?;
-        refusal::refused_tcp_reset(frame, &segment)
+        refusal::refused_tcp_reset_from(leg_mac, frame, &segment)
     }
 }
 
@@ -4048,13 +4060,13 @@ mod tests {
         }
     }
 
-    /// NET-014/NET-081/T70: the stack peer is the fourth caller of the
-    /// shared refusal audit. A SYN its pre-screen refuses is answered with
-    /// the shared builder's reset — compared byte for byte against the
-    /// builder's, not against a shape of the peer's own — says the one line
-    /// format every other refusal leg says, and is bounded per source: a
-    /// box that floods the address spends its own window's quota and loses
-    /// only its own replies, while a sibling's are untouched.
+    /// NET-014/NET-081/T70: the stack peer is a caller of the shared refusal
+    /// audit. A SYN its pre-screen refuses is answered with the shared
+    /// builder's reset — compared byte for byte against the builder's, not
+    /// against a shape of the peer's own — says the one line format every
+    /// other refusal leg says, and is bounded per source: a box that floods
+    /// the address spends its own window's quota and loses only its own
+    /// replies, while a sibling's are untouched.
     #[tokio::test]
     async fn stack_peer_refusals_use_the_shared_emitter() {
         let (log, _guard) = capture_warn_lines();
@@ -4065,6 +4077,7 @@ mod tests {
         let box_mac = EthernetAddress(MacAddr::for_switch_ip(box_ip).0);
         let sibling_ip = Ipv4Addr::from(subnet.first_ptask() + 1);
         let sibling_mac = EthernetAddress(MacAddr::for_switch_ip(sibling_ip).0);
+        let leg_mac = MacAddr::for_switch_ip(proxy_ip).0;
 
         // No row is registered, so every SYN either source sends is the
         // pre-screen's to refuse under the no-row rule.
@@ -4072,7 +4085,8 @@ mod tests {
         h.lane.inject_frame(syn.clone());
         drive(&mut h.lane, 2).await;
 
-        // The refusal's answer is the shared builder's reset, byte for byte.
+        // The refusal's answer is the shared builder's reset, byte for byte,
+        // written from the leg's own MAC.
         let outbound = h.lane.stack_outbound();
         assert_eq!(
             outbound.len(),
@@ -4080,15 +4094,16 @@ mod tests {
             "the refused SYN is answered with one reset and nothing else"
         );
         let segment = refusal::classify(&syn).expect("the SYN classifies");
-        let shared = refusal::refused_tcp_reset(&syn, &segment).expect("a SYN is answered");
+        let shared =
+            refusal::refused_tcp_reset_from(leg_mac, &syn, &segment).expect("a SYN is answered");
         assert_eq!(
             outbound[0], shared,
             "the peer writes the shared builder's reset, not a shape of its own"
         );
 
         // ... and the line it says is the shared audit's: the rule, the
-        // address, the port and the reason, with the count of resets written
-        // to that source this window — one line, not one per reset.
+        // address, the port and the reason, with the refusals its window has
+        // seen — the window's one line, not one per reset.
         assert_eq!(
             log.lines(),
             vec![shared_line(
@@ -4101,8 +4116,9 @@ mod tests {
             "the refusal says the one shared line format"
         );
 
-        // The source's own quota: fifteen more refusals say nothing — the
-        // middle of its window — and the one that spends it says the line.
+        // The source's own quota: fifteen more refusals are answered and say
+        // nothing — the middle of its window, whose one line is already
+        // said.
         for port in 40_001u16..40_016 {
             h.lane
                 .inject_frame(tcp_syn_from(box_mac, box_ip, proxy_ip, port, PROXY_PORT));
@@ -4115,11 +4131,14 @@ mod tests {
         );
         assert_eq!(
             log.lines(),
-            vec![
-                shared_line(refusal::NO_REGISTERED_ROW, proxy_ip, PROXY_PORT, box_ip, 1),
-                shared_line(refusal::NO_REGISTERED_ROW, proxy_ip, PROXY_PORT, box_ip, 16),
-            ],
-            "one line when the window opened and one when the quota was spent"
+            vec![shared_line(
+                refusal::NO_REGISTERED_ROW,
+                proxy_ip,
+                PROXY_PORT,
+                box_ip,
+                1
+            )],
+            "the flood adds nothing to the window's one line"
         );
 
         // Past the quota the source is answered with nothing at all, and
@@ -4132,7 +4151,7 @@ mod tests {
             16,
             "a source that has spent its window is answered with nothing"
         );
-        assert_eq!(log.lines().len(), 2, "and nothing more is said");
+        assert_eq!(log.lines().len(), 1, "and nothing more is said");
 
         // A sibling's refusals are untouched: its own row, its own quota, its
         // own reset — one flooding box starves nobody else.
@@ -4150,7 +4169,7 @@ mod tests {
             "the sibling is still answered"
         );
         assert_eq!(
-            log.lines()[2],
+            log.lines()[1],
             shared_line(
                 refusal::NO_REGISTERED_ROW,
                 proxy_ip,
@@ -4159,6 +4178,62 @@ mod tests {
                 1
             ),
             "the sibling's refusal says its own line, on its own row"
+        );
+    }
+
+    /// T70: the pre-screen's reset is written from the leg's own MAC, never
+    /// from the MAC the refused frame was addressed to. A SYN may reach the
+    /// leg addressed to the broadcast — its IP destination names the leg,
+    /// its Ethernet destination does not have to — and a reset whose source
+    /// is the broadcast's MAC is a frame no switch would forward: the
+    /// refusal would never reach the box it refused.
+    #[tokio::test]
+    async fn stack_peer_reset_source_is_leg_mac() {
+        let (mut h, _proxy_sock, _token) = harness(1, Stall::None, true).await;
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let box_ip = Ipv4Addr::from(subnet.first_ptask());
+        let box_mac = EthernetAddress(MacAddr::for_switch_ip(box_ip).0);
+        let leg_mac = MacAddr::for_switch_ip(proxy_ip).0;
+
+        // A SYN sent to the broadcast: the frame every box on the lane sees,
+        // with only the leg's address in its IP header to name whose it is.
+        let mut syn = tcp_syn_from(box_mac, box_ip, proxy_ip, 40_000, PROXY_PORT);
+        syn[0..6].copy_from_slice(&EthernetAddress::BROADCAST.0);
+        h.lane.inject_frame(syn.clone());
+        drive(&mut h.lane, 2).await;
+
+        // The refusal answered it: one reset, at the sender's MAC, written
+        // from the leg's own — never claiming the broadcast's.
+        let outbound = h.lane.stack_outbound();
+        assert_eq!(
+            outbound.len(),
+            1,
+            "the refused SYN is answered with one reset and nothing else"
+        );
+        let eth = EthernetFrame::new_checked(&outbound[0]).expect("the peer sends ethernet");
+        assert_eq!(
+            eth.dst_addr(),
+            box_mac,
+            "the reset reaches the MAC that sent the SYN"
+        );
+        assert_eq!(
+            eth.src_addr(),
+            EthernetAddress(leg_mac),
+            "the reset is written from the leg's own MAC"
+        );
+        assert_ne!(
+            eth.src_addr(),
+            EthernetAddress::BROADCAST,
+            "the reset never claims the broadcast's MAC"
+        );
+        // And it is the shared builder's reset for this frame, byte for byte:
+        // the same shape every other refusal leg writes.
+        let segment = refusal::classify(&syn).expect("the SYN classifies");
+        assert_eq!(
+            outbound[0],
+            refusal::refused_tcp_reset_from(leg_mac, &syn, &segment).expect("a SYN is answered"),
+            "the leg writes the shared builder's reset, from its own MAC"
         );
     }
 
