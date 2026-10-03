@@ -210,6 +210,8 @@ RECOVER_SWITCH_HOLD="" # where beat C parks it mid-proof
 RETIRED_SEED_DIR="" # seeded by the retired-surfaces proof below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
+BEPB_SEED_DIR_A="" # seeded by the proxy-source proof below; removed on teardown
+BEPB_SEED_DIR_B="" # its second box's seed; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -334,11 +336,41 @@ fi
 # ON PATH, because the CLI autospawns its daemon by bare name
 # (crates/minimal/src/autospawn.rs) and the pair must come from one build.
 #
+# The provider args follow the same fact as the daemon name below: a
+# VM-backed run must drive the CLI with `--provider local-minvmd`, because
+# the flag is what makes the CLI treat minvmd as minvmd for its OWN
+# bookkeeping too. `GlobalArgs::use_minvmd()`
+# (crates/minimal/src/cli.rs) is a strict check of the flag, and it gates
+# the box registration with the VM host daemon and its withdrawal (T66,
+# crates/minimal/src/cmd/session.rs): an own_ip box that activates without
+# them runs UNREGISTERED — the guest self-allocates its switch address
+# from the reserve instead of running on the one the daemon handed it, the
+# box-egress pool has no row to partition a share from, and the pool's
+# prescreen resets the box's connection to the proxy's address
+# (crates/switch/src/bep_host.rs) with nothing on the CLI's stderr naming
+# the cause. The proxy-source case below is where that stops being a
+# silent posture difference and becomes a failed proof. macOS resolves
+# the minvmd backend either way (`client_provider_kind` gates on the OS,
+# crates/minimal-client/src/lib.rs), so a run there is VM-backed with or
+# without the flag — and both of its lanes arrive here with no
+# E2E_MINIMAL_ARGS at all (the macOS CI lane exports none; the justfile's
+# e2e-env adds the args on Linux only), so the script supplies the flag
+# for them itself. That default is what #1816 retires; until that fix
+# lands, this branch keeps supplying the flag exactly as it is.
+# An explicit E2E_MINIMAL_ARGS is kept verbatim, and
+# Linux is untouched: a Linux run without provider args is the native
+# lane and must stay exactly that.
+if [ "$(uname -s)" = Darwin ] && [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
+  E2E_MINIMAL_ARGS="--provider local-minvmd"
+fi
+#
 # The daemon that name resolves to on THIS run is `minimald` on a native
 # run and `minvmd` on a VM-backed one: macOS is always VM-backed (no native
 # minimald builds there), and a Linux run is VM-backed exactly when
-# E2E_MINIMAL_ARGS carries `--provider local-minvmd`, which every VM lane
-# passes (the justfile's e2e-env, the KVM lane, the VM smokes) — E2E_VM
+# E2E_MINIMAL_ARGS carries `--provider local-minvmd`, which the Linux VM
+# lanes pass up front (the justfile's e2e-env, the KVM lane, the VM
+# smokes) and the one that cannot — macOS, whose backend resolves with no
+# flag — is defaulted just above — E2E_VM
 # itself is deliberately not consulted: it marks teardown and log placement,
 # not the backend the CLI will spawn. Autospawn looks the daemon up on PATH
 # (a bare `Command::new`), never beside the CLI, so "findable" means ON
@@ -515,6 +547,11 @@ teardown() {
   [ -n "$SECOND_SEED_DIR" ] && rm -rf "$SECOND_SEED_DIR"
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
+  # The proxy-source proof's two boxes: their project dirs are removed on its
+  # success path, but every failure path in it goes straight to `fail`, so the
+  # trap is the one place that always sees them.
+  [ -n "$BEPB_SEED_DIR_A" ] && rm -rf "$BEPB_SEED_DIR_A"
+  [ -n "$BEPB_SEED_DIR_B" ] && rm -rf "$BEPB_SEED_DIR_B"
   # The forward holds the laptop-side listener; INT is the documented stop,
   # KILL the backstop so a hung relay cannot outlive the run.
   if [ -n "$RETIRED_FWD_PID" ]; then
@@ -6004,6 +6041,13 @@ while True:
 #     to any other box.
 #   * switch_answers_no_arp_for_the_proxy_address: the gvproxy switch itself does
 #     not answer ARP for 100.64.255.252; the host stack peer does.
+#
+# And the delivery those two cases set up, read back out of the box: the
+# proxy's own acceptor is a later task, so the case that reads a delivered
+# connection's identity runs against the stand-in acceptor the daemon binds
+# when its environment carries MINVMD_BEP_STUB — a test/e2e surface that
+# presents the token and credential refusals the proxy is promised and answers
+# one line naming the source it was presented from.
 proof_switch_steers_proxy_mac_frames_to_the_host_stack() {
   echo "::group::switch steers proxy-MAC frames to the host stack peer (NET-132)"
   if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
@@ -6182,6 +6226,397 @@ proof_switch_answers_no_arp_for_the_proxy_address() {
   rm -rf "$BEP_SEED_DIR"
   BEP_SEED_DIR=""
   echo "switch answers no ARP for the proxy address OK"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# The proxy sees each VM box by its own switch address (NET-132): a box's
+# connection to the proxy's address is delivered to the proxy's unix socket
+# carrying the box's own switch address in the delivery header, so the proxy
+# tells every box from every other — and from every host process. The real
+# proxy's acceptor is a later task, so this case reads the delivery's identity
+# from the stand-in acceptor the daemon binds when MINVMD_BEP_STUB is in its
+# environment: it takes this boot's token, refuses a connection that is not
+# the host daemon's own, and answers one line naming the source it was
+# presented from — the line this case reads back inside the box. Two boxes are
+# live at once, and each answer must name its own box's address, never the
+# other's. Gated on MINVMD_GVPROXY_BIN like the cases above: without a switch
+# there is no delivery to observe.
+#
+# Ordered LAST in the whole-lane run on purpose: it stops the daemon (so the
+# next activation autospawns one carrying the stand-in's flag) and nothing
+# after it depends on a daemon it did not spawn.
+proof_proxy_sees_each_vm_box_by_its_switch_address() {
+  echo "::group::proxy sees each VM box by its switch address (NET-132)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "proxy_sees_each_vm_box_by_its_switch_address SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The stand-in acceptor is a daemon-side flag: the daemon this case's
+  # activations autospawn must inherit it, so stop whatever daemon an
+  # earlier case left on this host and let the activation below spawn one
+  # carrying it. "Whatever daemon" is both, the pair teardown stops: the
+  # session daemon `min stop` reaches — and, on a VM lane, the host daemon
+  # `minvmd stop` does, which is the one whose environment the flag must
+  # reach. The MAC and ARP cases above leave a minvmd running with no
+  # stub flag, an autospawn that finds it serves this case's boxes with no
+  # stand-in at the socket, and the case dies in a box's blank answer
+  # instead of naming the cause.
+  mnl stop --force >/dev/null 2>&1 || true
+  if [ -n "$E2E_VM" ]; then
+    minvmd stop >/dev/null 2>&1 || true
+  fi
+  export MINVMD_BEP_STUB=1
+
+  # The filter the daemon this case autospawns will read its log at. The
+  # lane runs the whole script under `warn,minimald::exec=info`, and the
+  # daemon builds its own EnvFilter from that value — which drops every
+  # INFO record from minvmd's own modules, so the peer-up line the gate
+  # below waits for can never appear and the case fails every lane that
+  # runs it, and it drops the per-delivered-connection DEBUG record the
+  # box-egress pool writes, so the log tail a failure prints would be
+  # mute about the one surface this case exists to observe. Widen the
+  # filter for this case's daemon only — it is spawned after this point —
+  # keeping the CLI's modules at warn so the session-id extraction every
+  # proof uses is untouched, and restore it on every exit (bep_fail and
+  # the OK tail below) so no later case inherits it. The stand-in's
+  # refusals and the pool's cap resets are WARN and surface either way;
+  # it is the peer-up line and the delivered line that need this. The
+  # widened value rides the guest's kernel boot line too, where it only
+  # names host-side modules, so the guest daemon's records are unchanged.
+  bep_rust_log0="${RUST_LOG:-}"
+  export RUST_LOG="warn,minimald::exec=info,minvmd=info,switch::bep_host=debug"
+
+  # This case's failures must name the host daemon's own log, which the
+  # global fail() cannot: its tail pass matches `*.log`, and the
+  # autospawned minvmd — a detached supervisor — writes a daily-rotated
+  # `minvmd.log.<date>` whose dated name no `*.log` pattern reaches. The
+  # fresh-install proof names the same sink; newest first, the dated
+  # name sorts after the unsuffixed one, a later date after an earlier.
+  bep_host_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
+      | sort -r | head -n1
+  }
+  # ...but the whole run's daemons share that sink, so an unscoped grep
+  # reads the earlier cases' daemons too (each of them logged its own
+  # `host gvproxy switch up` long before this case began). This case's
+  # lines are the ones the newest log gained since the snapshot below.
+  bep_case_log() {
+    local f
+    f="$(bep_host_log)"
+    [ -n "$f" ] || return 0
+    if [ "$f" = "$bep_log0" ] && [ "${bep_log0_lines:-0}" -gt 0 ]; then
+      tail -n +"$((bep_log0_lines + 1))" "$f" 2>/dev/null
+    else
+      # A rotation mid-case: the newest file postdates the snapshot, so
+      # every line in it is this case's.
+      cat "$f" 2>/dev/null
+    fi
+  }
+  bep_host_log_tail() {
+    local f
+    f="$(bep_host_log)"
+    if [ -n "$f" ]; then
+      echo "--- minvmd log ($f) tail ---"
+      tail -60 "$f" 2>/dev/null || true
+    else
+      echo "--- minvmd log: none (no minvmd.log* under $XDG_STATE_HOME/minimal/logs) ---"
+    fi
+  }
+  # Every failure path below: drop the flag and the widened filter this
+  # case exported, name the daemon's log, then the global diagnostics.
+  bep_fail() {
+    unset MINVMD_BEP_STUB
+    if [ -n "${bep_rust_log0:-}" ]; then
+      export RUST_LOG="$bep_rust_log0"
+    else
+      unset RUST_LOG
+    fi
+    bep_host_log_tail
+    fail
+  }
+
+  # Snapshot the shared host log before this case's daemon exists — the
+  # activations below autospawn it — so bep_case_log can scope to the
+  # lines it gained from here on.
+  bep_log0="$(bep_host_log)"
+  bep_log0_lines=0
+  if [ -n "$bep_log0" ]; then
+    bep_log0_lines="$(wc -l <"$bep_log0" 2>/dev/null)" || bep_log0_lines=0
+  fi
+
+  # The probe's failure annotations: the facts that decide which leg of
+  # the chain failed, each on its own `::error::` line — plain-text
+  # blocks (the log tail below, a cat of stderr) never reach the run's
+  # annotation stream, and the lane's annotation is all this case's
+  # failure is read by from outside. socat's exit names what the box
+  # saw; the ARP entry says whether the switch's peer answered
+  # resolution at all; the cross-probe to an unlistened port isolates
+  # the box-to-peer path from the pool's listener (a RST there means the
+  # path is fine and the failure is at :8118's accept or the delivery's
+  # dial); the daemon's own lines name any refusal with its reason.
+  # One letter a/b per box: the files below key on the lowercase one.
+  bep_probe_diagnostics() {
+    local box="$1" sid="$2" label xerr arp cross peer
+    label="$(printf '%s' "$box" | tr '[:lower:]' '[:upper:]')"
+    peer="$(bep_case_log \
+      | grep -h -e 'host gvproxy switch up' -e 'failed to spawn host gvproxy switch' \
+        -e 'box egress proxy' 2>/dev/null | tail -n4 | tr '\n' ';' | tail -c 600)"
+    echo "::error::host daemon of this case said: ${peer:-<nothing about the box egress proxy>}"
+    xerr="$(tr '\n' ' ' <"$WORK/bep-box-$box-answer.err" 2>/dev/null | tail -c 400)"
+    echo "::error::box $label's probe stderr: ${xerr:-<empty — socat exited nonzero with nothing to say>}"
+    if arp="$(mnl session exec "$sid" sh -c 'cat /proc/net/arp' 2>/dev/null)"; then
+      arp="$(printf '%s\n' "$arp" | awk -v ip="$proxy_ip" '$1 == ip { print $4 }')"
+      if [ -n "$arp" ]; then
+        echo "::error::box $label's ARP entry for $proxy_ip is $arp — the peer answered resolution, so the SYN was framed to it"
+      else
+        echo "::error::box $label has no ARP entry for $proxy_ip — the proxy address never resolved, so the box cannot frame the SYN at all"
+      fi
+    else
+      echo "::error::box $label's ARP entry for $proxy_ip: unreadable (session exec failed)"
+    fi
+    if mnl session exec "$sid" "/usr/bin/socat /dev/null TCP:$proxy_ip:443,connect-timeout=5" \
+        >/dev/null 2>"$WORK/bep-box-$box-cross.err"; then
+      cross="$(tr '\n' ' ' <"$WORK/bep-box-$box-cross.err" 2>/dev/null | tail -c 300)"
+      echo "::error::box $label's cross-probe to $proxy_ip:443 (unlistened) completed instead of being reset — unexpected; stderr: ${cross:-<empty>}"
+    elif grep -q 'Connection refused' "$WORK/bep-box-$box-cross.err" 2>/dev/null; then
+      echo "::error::box $label's cross-probe to $proxy_ip:443 got the peer's RST — the box-to-peer path answers; the failure is at the pool's :$proxy_port listener or the delivery's dial to the stand-in"
+    else
+      cross="$(tr '\n' ' ' <"$WORK/bep-box-$box-cross.err" 2>/dev/null | tail -c 300)"
+      echo "::error::box $label's cross-probe to $proxy_ip:443 was not reset either — the box-to-peer path itself is down in this daemon; stderr: ${cross:-<empty>}"
+    fi
+  }
+
+  local proxy_ip proxy_port bepb_sid_a bepb_sid_b bepb_ip_a bepb_ip_b bep_sock bep_wait
+  proxy_ip="100.64.255.252"
+  proxy_port="8118"
+
+  BEPB_SEED_DIR_A="$(hook_mktemp /tmp/mnlbepa.XXXXXX)"
+  hook_seed_preamble > "$BEPB_SEED_DIR_A/minimal.toml"
+  mkdir "$BEPB_SEED_DIR_A/.git"
+  BEPB_SEED_DIR_B="$(hook_mktemp /tmp/mnlbepb.XXXXXX)"
+  hook_seed_preamble > "$BEPB_SEED_DIR_B/minimal.toml"
+  mkdir "$BEPB_SEED_DIR_B/.git"
+
+  bepb_sid_a="$(cd "$BEPB_SEED_DIR_A" && mnl session activate . --no-prompt \
+    --name e2e-bep-box-a --network own_ip 2>"$WORK/bep-box-a.err")" || {
+    echo "::error::'min session activate --network own_ip' failed for the proxy-source case's box A"
+    cat "$WORK/bep-box-a.err" 2>/dev/null || true
+    bep_fail
+  }
+  bepb_sid_a="$(printf '%s\n' "$bepb_sid_a" | tail -n1 | tr -d '\r')"
+  bepb_sid_b="$(cd "$BEPB_SEED_DIR_B" && mnl session activate . --no-prompt \
+    --name e2e-bep-box-b --network own_ip 2>"$WORK/bep-box-b.err")" || {
+    echo "::error::'min session activate --network own_ip' failed for the proxy-source case's box B"
+    cat "$WORK/bep-box-b.err" 2>/dev/null || true
+    bep_fail
+  }
+  bepb_sid_b="$(printf '%s\n' "$bepb_sid_b" | tail -n1 | tr -d '\r')"
+
+  # The stand-in's socket is the one host-side fact the flag buys: the
+  # daemon binds it at boot — only under MINVMD_BEP_STUB — at the path
+  # beside the switch socket. Assert it exists before any box probes the
+  # proxy's address: a daemon that came up without the flag binds none,
+  # and failing here names the cause and the daemon's own log, instead of
+  # a box's blank answer far below. Activation above waited out the
+  # daemon's boot, so the socket should be there at once; the wait bounds
+  # only a slow bind.
+  bep_sock="$XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-bep.sock"
+  bep_wait=0
+  until [ -S "$bep_sock" ]; do
+    bep_wait=$((bep_wait + 1))
+    if [ "$bep_wait" -gt 15 ]; then
+      echo "::error::the host daemon bound no stand-in socket at $bep_sock — the daemon this case's activation autospawned did not carry MINVMD_BEP_STUB, or died before the wiring that binds one"
+      bep_fail
+    fi
+    sleep 1
+  done
+
+  # The socket only says the daemon bound the stand-in — the stand-in is
+  # bound before the switch is even spawned, so a daemon whose switch
+  # never came up looks identical to a healthy one to the wait above, and
+  # every probe below would fail in terms of a peer that is not there.
+  # (A switch that will not come up under this case's flag fails the
+  # daemon's boot outright, and so does a stand-in that will not bind, so
+  # an activation that got this far means a daemon that started both —
+  # but assert it from the daemon's own log rather than trust the bind;
+  # if a line never appears, the tail below names the spawn that failed.
+  # A stand-in bind failure no longer boots on degraded — it fails the
+  # boot where the bind happens, so it never reaches this gate as a
+  # booted daemon at all: the activation above dies waiting on a daemon
+  # that never came up, its own words in the supervisor's run.log on the
+  # stderr the detached supervisor keeps.) Both lines the gate waits for are
+  # this case's daemon's own records: the stand-in's is written only under
+  # MINVMD_BEP_STUB — the flag's receipt in the daemon's voice, not just
+  # the socket file the wait above saw — and the switch's proves the peer
+  # came up behind it; bep_case_log scopes out every earlier daemon's
+  # identical lines.
+  bep_peer_seen=0
+  bep_wait=0
+  while [ "$bep_wait" -le 15 ]; do
+    if bep_case_log | grep -q 'box egress proxy stand-in acceptor up' \
+      && bep_case_log | grep -q 'host gvproxy switch up; box egress proxy peer started'; then
+      bep_peer_seen=1
+      break
+    fi
+    if bep_case_log | grep -q -e 'failed to spawn host gvproxy switch' \
+        -e 'gvproxy binary not found'; then
+      echo "::error::this case's daemon came up without the box egress proxy's peer — the switch never started, so the probes below would fail against a host that is not there. The daemon's log says:"
+      bep_case_log | grep -e 'failed to spawn host gvproxy switch' \
+        -e 'gvproxy binary not found' | tail -n5 | sed 's/^/  /'
+      bep_fail
+    fi
+    bep_wait=$((bep_wait + 1))
+    sleep 1
+  done
+  if [ "$bep_peer_seen" -ne 1 ]; then
+    echo "::error::the daemon's log never named its box egress proxy surface (waited ${bep_wait}s among this case's lines for 'box egress proxy stand-in acceptor up' and 'host gvproxy switch up; box egress proxy peer started')"
+    bep_fail
+  fi
+
+  # Both boxes must be registered with this case's daemon before any
+  # probe runs: the CLI registers each box with the VM host daemon as it
+  # activates (T66), and an own_ip box that is not registered has no row
+  # in the box-egress pool's partition — its connection to the proxy's
+  # address is reset with nothing on the CLI's stderr naming the cause,
+  # which is the exact posture difference this case exists to catch. The
+  # daemon's own registration line is the fact, one info line per box
+  # naming the box and both addresses; assert it from this case's lines
+  # (bep_case_log scopes out every earlier daemon's), waiting out the
+  # log writer's flush, and fail naming the box that never registered
+  # instead of a blank probe answer far below.
+  for bep_box_name in e2e-bep-box-a e2e-bep-box-b; do
+    bep_reg_seen=0
+    bep_wait=0
+    while [ "$bep_wait" -le 10 ]; do
+      if bep_case_log | grep 'registered box with the VM host daemon' \
+        | grep -q "$bep_box_name"; then
+        bep_reg_seen=1
+        break
+      fi
+      bep_wait=$((bep_wait + 1))
+      sleep 1
+    done
+    if [ "$bep_reg_seen" -ne 1 ]; then
+      echo "::error::$bep_box_name never registered with the VM host daemon — no row in the box-egress pool's partition, so its connection to the proxy's address is reset with nothing naming the cause. This case's daemon's registration lines say:"
+      bep_case_log | grep -e 'registered box with the VM host daemon' -e 'box registration' | tail -n5 | sed 's/^/  /'
+      bep_fail
+    fi
+  done
+
+  # Each box's lease address — the source its connection must be presented
+  # from — read from the box's own view, like the MAC case above reads its
+  # probe's source (a session rootfs has no iproute2; /proc/net/fib_trie
+  # carries every local address).
+  if ! mnl session exec "$bepb_sid_a" sh -c 'cat /proc/net/fib_trie' \
+    >"$WORK/bep-box-a-fib.out" 2>"$WORK/bep-box-a-fib.err"; then
+    echo "::error::could not read /proc/net/fib_trie from box A"
+    cat "$WORK/bep-box-a-fib.err" 2>/dev/null || true
+    bep_fail
+  fi
+  bepb_ip_a="$(awk '/\|--/ { addr = $2 }
+                    /\/32 host LOCAL/ && addr !~ /^127\./ { print addr; exit }' \
+    "$WORK/bep-box-a-fib.out")"
+  if [ -z "$bepb_ip_a" ]; then
+    echo "::error::could not determine box A's switch address from /proc/net/fib_trie"
+    echo "--- fib_trie ---"; cat "$WORK/bep-box-a-fib.out" 2>/dev/null || true
+    bep_fail
+  fi
+  if ! mnl session exec "$bepb_sid_b" sh -c 'cat /proc/net/fib_trie' \
+    >"$WORK/bep-box-b-fib.out" 2>"$WORK/bep-box-b-fib.err"; then
+    echo "::error::could not read /proc/net/fib_trie from box B"
+    cat "$WORK/bep-box-b-fib.err" 2>/dev/null || true
+    bep_fail
+  fi
+  bepb_ip_b="$(awk '/\|--/ { addr = $2 }
+                    /\/32 host LOCAL/ && addr !~ /^127\./ { print addr; exit }' \
+    "$WORK/bep-box-b-fib.out")"
+  if [ -z "$bepb_ip_b" ]; then
+    echo "::error::could not determine box B's switch address from /proc/net/fib_trie"
+    echo "--- fib_trie ---"; cat "$WORK/bep-box-b-fib.out" 2>/dev/null || true
+    bep_fail
+  fi
+
+  # socat carries the probe, as in the cases above (a launcher baseline
+  # package every box ships at /usr/bin). The connection to the proxy's
+  # address on its listener port is accepted by the delivery's pool, dialled
+  # through to the stand-in acceptor with this boot's token and the fixed
+  # header, and the acceptor's one answer line travels back through the
+  # delivery to this box — so the probe must print that line on the box's
+  # stdout, where the greps below read it: socat's left address is an empty
+  # pipe and `-t 10` holds the connection open for the answer once that pipe
+  # reaches EOF, the same shape the hostname-proxy case's bogus-head probe
+  # uses. A `/dev/null` left address — the shape the MAC and ARP cases use,
+  # which need only a RST and socat's stderr — would hand the answer to
+  # /dev/null and leave this case's greps with nothing to read.
+  mnl session exec "$bepb_sid_a" 'test -x /usr/bin/socat' >/dev/null 2>&1 || {
+    echo "::error::box A has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"
+    bep_fail
+  }
+  mnl session exec "$bepb_sid_a" \
+    "printf '' | /usr/bin/socat -t 10 - TCP:$proxy_ip:$proxy_port,connect-timeout=15" \
+    >"$WORK/bep-box-a-answer.out" 2>"$WORK/bep-box-a-answer.err" || {
+    echo "::error::box A's connection to the proxy's address did not complete"
+    cat "$WORK/bep-box-a-answer.err" 2>/dev/null || true
+    bep_probe_diagnostics a "$bepb_sid_a"
+    bep_fail
+  }
+  mnl session exec "$bepb_sid_b" \
+    "printf '' | /usr/bin/socat -t 10 - TCP:$proxy_ip:$proxy_port,connect-timeout=15" \
+    >"$WORK/bep-box-b-answer.out" 2>"$WORK/bep-box-b-answer.err" || {
+    echo "::error::box B's connection to the proxy's address did not complete"
+    cat "$WORK/bep-box-b-answer.err" 2>/dev/null || true
+    bep_probe_diagnostics b "$bepb_sid_b"
+    bep_fail
+  }
+
+  # Each answer names its own box's lease address as the source and the
+  # proxy's address as the destination — and never the other box's address,
+  # which is what makes the delivery's identity worth having.
+  for box in a b; do
+    ip_var="bepb_ip_$box"
+    box_ip="${!ip_var}"
+    if ! grep -q -- "source=$box_ip:" "$WORK/bep-box-$box-answer.out"; then
+      echo "::error::the proxy did not see box $box's connection from its own switch address ($box_ip)"
+      echo "--- answer ---"; cat "$WORK/bep-box-$box-answer.out" 2>/dev/null || true
+      echo "--- stderr ---"; cat "$WORK/bep-box-$box-answer.err" 2>/dev/null || true
+      sid_var="bepb_sid_$box"
+      bep_probe_diagnostics "$box" "${!sid_var}"
+      bep_fail
+    fi
+    if ! grep -q -- "destination=$proxy_ip:$proxy_port" "$WORK/bep-box-$box-answer.out"; then
+      echo "::error::box $box's answer does not name the proxy's address as the destination"
+      echo "--- answer ---"; cat "$WORK/bep-box-$box-answer.out" 2>/dev/null || true
+      sid_var="bepb_sid_$box"
+      bep_probe_diagnostics "$box" "${!sid_var}"
+      bep_fail
+    fi
+  done
+  if grep -q -- "source=$bepb_ip_b:" "$WORK/bep-box-a-answer.out"; then
+    echo "::error::box A's connection was presented from box B's address ($bepb_ip_b)"
+    cat "$WORK/bep-box-a-answer.out" 2>/dev/null || true
+    bep_fail
+  fi
+  if grep -q -- "source=$bepb_ip_a:" "$WORK/bep-box-b-answer.out"; then
+    echo "::error::box B's connection was presented from box A's address ($bepb_ip_a)"
+    cat "$WORK/bep-box-b-answer.out" 2>/dev/null || true
+    bep_fail
+  fi
+
+  mnl session destroy --force "$bepb_sid_a" >/dev/null 2>&1 || true
+  mnl session destroy --force "$bepb_sid_b" >/dev/null 2>&1 || true
+  rm -rf "$BEPB_SEED_DIR_A" "$BEPB_SEED_DIR_B"
+  BEPB_SEED_DIR_A=""
+  BEPB_SEED_DIR_B=""
+  unset MINVMD_BEP_STUB
+  if [ -n "${bep_rust_log0:-}" ]; then
+    export RUST_LOG="$bep_rust_log0"
+  else
+    unset RUST_LOG
+  fi
+  echo "proxy sees each VM box by its switch address OK (box A from $bepb_ip_a, box B from $bepb_ip_b)"
   echo "::endgroup::"
 }
 
@@ -8315,6 +8750,7 @@ case "${1:-}" in
     proof_retired_surfaces_gone
     proof_switch_steers_proxy_mac_frames_to_the_host_stack
     proof_switch_answers_no_arp_for_the_proxy_address
+    proof_proxy_sees_each_vm_box_by_its_switch_address
     ;;
   lifecycle | session_exec | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
@@ -8325,7 +8761,8 @@ case "${1:-}" in
     | min_internal_names_through_proxy | proxy_refuses_like_direct | retired_surfaces_gone \
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes \
-    | switch_steers_proxy_mac_frames_to_the_host_stack | switch_answers_no_arp_for_the_proxy_address)
+    | switch_steers_proxy_mac_frames_to_the_host_stack | switch_answers_no_arp_for_the_proxy_address \
+    | proxy_sees_each_vm_box_by_its_switch_address)
     "proof_$1"
     ;;
   *)
@@ -8341,6 +8778,7 @@ case "${1:-}" in
     echo "         hostnames_recover_and_two_daemons_route"
     echo "         min_internal_names_through_proxy proxy_refuses_like_direct retired_surfaces_gone"
     echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
+    echo "         proxy_sees_each_vm_box_by_its_switch_address"
     exit 2
     ;;
 esac
