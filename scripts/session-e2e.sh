@@ -8448,11 +8448,16 @@ proof_two_named_vms_on_one_machine() {
   # One request from the HOST through one VM's published proxy port — the
   # way a laptop enters: HTTP(S)_PROXY points at the published port, the
   # request lands in that VM's in-guest proxy, which resolves the name in
-  # its own registry and dials its own box. $1 = the published port, $2 =
-  # the URL, $3 = the label the transcript line carries.
+  # its own registry and dials its own box. The host's proxy env is
+  # stripped first: `-x` pins the proxy, but a NO_PROXY covering the name
+  # bypasses even a pinned one, and the probe would then measure the
+  # host's own path, not the VM's. $1 = the published port, $2 = the URL,
+  # $3 = the label the transcript line carries.
   two_vm_route() {
     TWO_VM_ROUTE_LABEL="$3"
-    TWO_VM_STATUS="$(curl -sS --max-time 20 -x "http://127.0.0.1:$1" \
+    TWO_VM_STATUS="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+      curl -sS --max-time 20 -x "http://127.0.0.1:$1" \
       -o "$WORK/two-vm-route.body" -w '%{http_code}' "$2" 2>"$WORK/two-vm-route.err" \
       | tail -n1 | tr -d '\r\n')"
     TWO_VM_BODY="$(cat "$WORK/two-vm-route.body" 2>/dev/null || true)"
@@ -8850,7 +8855,14 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     fail
   fi
   echo "forward banner: $(head -n1 "$WORK/two-vm-forward.err" 2>/dev/null || true)"
-  tw_fwd_status="$(curl -sS --max-time 20 -o "$WORK/two-vm-fwd.body" \
+  # The probe enters through the forward's own loopback listener, so the
+  # host's proxy env is stripped first: with an http_proxy set and no
+  # 127.0.0.1 exception, curl hands the request to that proxy instead of
+  # the just-bound forward, and the proof would fail on the host's
+  # settings, not the VM's.
+  tw_fwd_status="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+    -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+    curl -sS --max-time 20 -o "$WORK/two-vm-fwd.body" \
     -w '%{http_code}' "http://127.0.0.1:$TWO_VM_LOCAL_PORT/" 2>"$WORK/two-vm-fwd.err")"
   tw_fwd_rc=$?
   tw_fwd_body="$(cat "$WORK/two-vm-fwd.body" 2>/dev/null || true)"
