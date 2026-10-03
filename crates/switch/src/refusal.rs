@@ -15,12 +15,14 @@
 //!   the one shape, whether the refusing side is a relay leg answering a
 //!   port nothing is published on or the stack peer refusing a SYN its
 //!   pre-screen turned away.
-//! - [`RefusalEmitter`] bounds and rates every refusal per source, and
-//!   renders the one audit line ([`Outcome::Emit`]).
+//! - [`RefusalEmitter`] bounds and rates every refusal per source, renders
+//!   the one audit line ([`Outcome::Emit`]), and — driven by its caller —
+//!   says a window's final count at the window it belongs to when no
+//!   further refusal comes to carry it on the next window's opening line.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// Ethernet II header length in bytes.
@@ -517,11 +519,36 @@ struct Window {
     written: u32,
     /// Refusals counted since the last line said through this window: the
     /// running total its line reports, kept across the roll so the next
-    /// window's opening line carries the closed one's real count.
+    /// window's opening line carries the closed one's real count — and
+    /// cleared with it by the flushes ([`RefusalEmitter::flush_expired`],
+    /// [`RefusalEmitter::flush_pending`]), which say that same count at the
+    /// window it belongs to when no further refusal comes to carry it, so
+    /// no count is ever said twice.
     since_line: u32,
     /// Whether this window's line has been said: once, at the window's
     /// first refusal, and never per reply.
     said: bool,
+    /// What a line this window owes at its end is said about, kept from the
+    /// last refusal it counted. A window that ends holding a count no line
+    /// has said still says it — at its own end, not borrowed by the next
+    /// window's opening line — and this, with the count, is every field
+    /// that line names.
+    owed: Option<Owed>,
+}
+
+/// What a window's owed line is said about: every field the one audit line
+/// names but the count, kept from the last refusal the window counted so a
+/// line said at the window's end names a connection that actually reached
+/// it — never one a closed window inherited.
+struct Owed {
+    /// The rule the verdict matched, and why it refused.
+    class: Class,
+    /// The refused connection's source — the line's `source=`.
+    source: Ipv4Addr,
+    /// The address that refused the connection — the line's `address=`.
+    address: Ipv4Addr,
+    /// What the connection reached for: its port, or the name it was for.
+    about: About,
 }
 
 /// One per-(source, rule) limiter row: the replies this window has been
@@ -555,6 +582,12 @@ struct Limiter {
     rows: Vec<Row>,
     /// One bucket per rule for the sources no row holds.
     overflow: HashMap<&'static str, Overflow>,
+    /// Lines evicted rows owed before a new source took their place: counts
+    /// no line has said, held for the flushes to drain. Bounded by the
+    /// emitter's own `rows`, at which bound the newest line is the one
+    /// dropped — an emitter no caller flushes cannot grow it without end,
+    /// and one a caller does still writes the oldest first.
+    owed: Vec<String>,
 }
 
 /// The bounded, rate-limited refusal audit every refusal goes through —
@@ -578,7 +611,15 @@ struct Limiter {
 /// The lines it says are the one audit format ([`Self::refuse`]'s
 /// [`Outcome::Emit`]): one rate-limited warn per (source, rule) per window,
 /// said at the window's first refusal and carrying the refusals that window
-/// has seen from the source — never one per reply.
+/// has seen from the source — never one per reply. A window's count reaches
+/// its line one of two ways: the next window's opening line carries it when
+/// a further refusal comes, and when none does, [`Self::flush_expired`]
+/// says it at the window it belongs to — so a source that refuses through a
+/// window and then falls silent still has that window's count said, and the
+/// last window's count is never lost to the silence that ended it. The
+/// caller drives both flushes; the emitter is bytes and arithmetic, and
+/// says nothing itself ([`Self::flush_pending`] is the teardown half, for
+/// the emitter's own drop).
 pub struct RefusalEmitter {
     state: Mutex<Limiter>,
     rows: usize,
@@ -594,6 +635,7 @@ impl RefusalEmitter {
             state: Mutex::new(Limiter {
                 rows: Vec::new(),
                 overflow: HashMap::new(),
+                owed: Vec::new(),
             }),
             rows,
             per_window,
@@ -635,11 +677,18 @@ impl RefusalEmitter {
                     written: 0,
                     since_line: 0,
                     said: false,
+                    owed: None,
                 },
                 last: now,
             });
             limiter.rows.last_mut().expect("the row was just pushed")
         } else if let Some(index) = expired_lru_index(&limiter.rows, now, self.window) {
+            // The row this refusal takes may still owe a line — a count no
+            // line has said, stranded if the row simply goes. Hold it for
+            // the flushes to drain, bounded like the rows themselves.
+            if let Some(line) = self.take_owed(&mut limiter.rows[index].window) {
+                self.hold(&mut limiter, line);
+            }
             limiter.rows[index] = Row {
                 key: (refusal.source, rule),
                 window: Window {
@@ -647,6 +696,7 @@ impl RefusalEmitter {
                     written: 0,
                     since_line: 0,
                     said: false,
+                    owed: None,
                 },
                 last: now,
             };
@@ -660,6 +710,7 @@ impl RefusalEmitter {
                     written: 0,
                     since_line: 0,
                     said: false,
+                    owed: None,
                 },
             });
             return self.account(&mut bucket.window, refusal, answered, now);
@@ -685,7 +736,19 @@ impl RefusalEmitter {
             window.started = now;
             window.written = 0;
             window.said = false;
+            // The closed window's count rides the line this refusal says —
+            // rendered from this refusal, below — so what it was said about
+            // goes with it: the new window owes nothing yet.
+            window.owed = None;
         }
+        // What a line this window owes at its end is said about: this
+        // refusal, the last one counted through it.
+        window.owed = Some(Owed {
+            class: refusal.class,
+            source: refusal.source,
+            address: refusal.address,
+            about: refusal.about.clone(),
+        });
         // The window's one line, at its first refusal. The count it carries
         // is every refusal counted since the last line — which, because
         // every window opens with one, is the closed window's total when
@@ -730,6 +793,100 @@ impl RefusalEmitter {
             reason = refusal.class.reason,
             source = refusal.source,
         )
+    }
+
+    /// The limiter's state, poison-tolerated: a flush says a line, it never
+    /// refuses a connection, so a lock another thread's panic poisoned is
+    /// drained rather than propagated — a flush at teardown must not take
+    /// the teardown with it.
+    fn limiter(&self) -> MutexGuard<'_, Limiter> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Takes the line a window owes when it ends holding a count no line
+    /// has said — the count its next line would carry, said at the window it
+    /// belongs to, in the one audit format — clearing the count with the
+    /// line so it can never be said twice. `None` while the window holds
+    /// nothing unsaid, and for a window whose every refusal its opening line
+    /// already said.
+    fn take_owed(&self, window: &mut Window) -> Option<String> {
+        if window.since_line == 0 {
+            return None;
+        }
+        let count = window.since_line + 1;
+        window.since_line = 0;
+        let owed = window.owed.take()?;
+        let refusal = Refusal {
+            class: owed.class,
+            source: owed.source,
+            address: owed.address,
+            about: owed.about,
+        };
+        Some(self.line(&refusal, count))
+    }
+
+    /// Holds one line an evicted row owed, at the bound the rows themselves
+    /// carry: the newest is dropped at the cap, so the oldest — the line a
+    /// drain would write first — is the one that survives.
+    fn hold(&self, limiter: &mut Limiter, line: String) {
+        if limiter.owed.len() < self.rows {
+            limiter.owed.push(line);
+        }
+    }
+
+    /// Takes every line the limiter's windows owe: the eviction queue drained
+    /// first, so a count a row owed before its eviction is said before the
+    /// ones the still-standing rows hold. `expired_at` is [`Some`] for the
+    /// expiry flush, which says only a window whose time is out — the count
+    /// belongs to the window that ended, and a live one may still say its
+    /// own — and [`None`] for teardown, which says every count it holds,
+    /// live window or not, because nothing after it exists to carry one.
+    fn drain(&self, limiter: &mut Limiter, expired_at: Option<Instant>) -> Vec<String> {
+        let mut lines = std::mem::take(&mut limiter.owed);
+        let windows = limiter
+            .rows
+            .iter_mut()
+            .map(|row| &mut row.window)
+            .chain(limiter.overflow.values_mut().map(|bucket| &mut bucket.window));
+        for window in windows {
+            if expired_at.is_some_and(|now| {
+                now.saturating_duration_since(window.started) < self.window
+            }) {
+                continue;
+            }
+            if let Some(line) = self.take_owed(window) {
+                lines.push(line);
+            }
+        }
+        lines
+    }
+
+    /// The lines windows that ended holding a count no line has said now
+    /// owe, taken for the caller to write: every row and every overflow
+    /// bucket whose window has expired at `now`, plus whatever evictions
+    /// queued since the last flush. This is the one that keeps the last
+    /// window's count from being lost to the silence that ended it — the
+    /// count a further refusal would have carried on the next window's
+    /// opening line, said once at the window it belongs to instead. The
+    /// caller drives it; the emitter says nothing itself. Any refusal is a
+    /// moment to call it, because only a refusal between windows can tell
+    /// that a window ended.
+    pub fn flush_expired(&self, now: Instant) -> Vec<String> {
+        let mut limiter = self.limiter();
+        self.drain(&mut limiter, Some(now))
+    }
+
+    /// Every line any window still holds unsaid, live or ended: the teardown
+    /// flush. An emitter going away says every count it holds, because
+    /// nothing after it exists to carry one — the count a closed session's
+    /// gate was still holding would otherwise be the audit's one silent
+    /// loss, dropped with the gate that counted it.
+    pub fn flush_pending(&self) -> Vec<String> {
+        let mut limiter = self.limiter();
+        self.drain(&mut limiter, None)
     }
 }
 
@@ -1205,5 +1362,179 @@ mod tests {
             Outcome::Emit(line) => assert!(line.ends_with("refusals=7")),
             _ => panic!("an unanswered refusal still counts in its window's line"),
         }
+    }
+
+    /// The final window's count, said when no further refusal comes to
+    /// carry it ([`RefusalEmitter::flush_expired`]): a source refuses N
+    /// times through one window, then falls silent past it, and the count
+    /// the window holds — which a further refusal would have carried on the
+    /// next window's opening line — is said once, in the one audit format,
+    /// at the window it belongs to. The clock is the caller's, so the
+    /// expiry is forced with arithmetic, never a sleep.
+    #[test]
+    fn refusal_final_window_count_emitted_on_expiry() {
+        // Two rows and a 50ms window: small enough that the arithmetic is
+        // legible, and one row's count is the only thing any flush can say.
+        let emitter = RefusalEmitter::new(2, 4, Duration::from_millis(50));
+        let t0 = Instant::now();
+        // The window opens with its line, saying one...
+        match emitter.refuse(&refusal_from(PEER), true, t0) {
+            Outcome::Emit(line) => assert!(line.ends_with("refusals=1")),
+            _ => panic!("the window's first refusal says its line"),
+        }
+        // ...and eight more count silently through it: nine refusals the
+        // window saw, one line said — answered while the source's quota has
+        // room, suppressed past it, saying nothing either way.
+        for _ in 0..8 {
+            assert!(matches!(
+                emitter.refuse(&refusal_from(PEER), true, t0),
+                Outcome::Quiet | Outcome::Suppressed
+            ));
+        }
+        // Then silence, past the window — and the count is said: exactly
+        // one line, reading the nine refusals the window counted, in the
+        // one audit format every leg's log tail carries.
+        let t1 = t0 + Duration::from_millis(60);
+        let flushed = emitter.flush_expired(t1);
+        assert_eq!(
+            flushed.len(),
+            1,
+            "the one window that ended holding a count says its one line"
+        );
+        assert_eq!(
+            flushed[0],
+            "rule_matched=\"no ingress mapping\" address=100.64.0.9 port=9999 \
+             reason=\"no listener is published for the port\" source=100.64.0.5 refusals=9"
+        );
+        // And once only: the flush cleared the count, so a further refusal
+        // opens the next window with that window's own count, and no flush
+        // after it says the closed window's again.
+        assert!(
+            emitter.flush_expired(t1).is_empty(),
+            "the window's count is said once, never twice"
+        );
+        let t2 = t1 + Duration::from_millis(10);
+        match emitter.refuse(&refusal_from(PEER), true, t2) {
+            Outcome::Emit(line) => assert!(
+                line.ends_with("refusals=1"),
+                "the next window's opening line carries its own count: {line}"
+            ),
+            _ => panic!("a further refusal opens the next window with its own count"),
+        }
+        assert!(
+            emitter.flush_pending().is_empty(),
+            "and nothing after it still holds an unsaid count"
+        );
+    }
+
+    /// A count an evicted row still owed is not lost with the row
+    /// ([`RefusalEmitter::refuse`]'s eviction): the expired row a new source
+    /// takes may hold refusals no line has said, and the line for them is
+    /// held for the flush to drain — while a row that said everything it
+    /// counted owes nothing, and its eviction is silent. The queue the
+    /// evictions fill is bounded by the emitter's own rows, and the line
+    /// the bound drops is the newest's.
+    #[test]
+    fn refusal_pending_count_emitted_on_eviction() {
+        // Two rows — the limiter's whole key space — and a 50ms window.
+        let emitter = RefusalEmitter::new(2, 4, Duration::from_millis(50));
+        let t0 = Instant::now();
+        let a = Ipv4Addr::new(100, 64, 0, 1);
+        let b = Ipv4Addr::new(100, 64, 0, 2);
+        let c = Ipv4Addr::new(100, 64, 0, 3);
+        // A's window: its opening line, then four refusals no line has said
+        // — a count the row will owe at its eviction.
+        match emitter.refuse(&refusal_from(a), true, t0) {
+            Outcome::Emit(line) => assert!(line.ends_with("refusals=1")),
+            _ => panic!("A's window opens with its line"),
+        }
+        for _ in 0..4 {
+            assert!(matches!(
+                emitter.refuse(&refusal_from(a), true, t0),
+                Outcome::Quiet | Outcome::Suppressed
+            ));
+        }
+        // B's window, ten milliseconds later: one refusal, said by its
+        // opening line — a clean row that will owe its eviction nothing.
+        let t1 = t0 + Duration::from_millis(10);
+        assert!(matches!(
+            emitter.refuse(&refusal_from(b), true, t1),
+            Outcome::Emit(_)
+        ));
+        // Past both windows, a new source takes the least recently used of
+        // the two expired rows — A's, the older — and A's count is held for
+        // the flush, not lost with the row. C's own line opens C's window.
+        let t2 = t0 + Duration::from_millis(60);
+        match emitter.refuse(&refusal_from(c), true, t2) {
+            Outcome::Emit(line) => {
+                assert!(line.contains("source=100.64.0.3"));
+                assert!(line.ends_with("refusals=1"));
+            }
+            _ => panic!("the new source's refusal opens its own row's line"),
+        }
+        // The flush drains the eviction's line: A's five refusals, and
+        // nothing beside it — B's window said everything it counted, and
+        // B's and C's rows are still standing.
+        let flushed = emitter.flush_expired(t2);
+        assert_eq!(
+            flushed.len(),
+            1,
+            "the evicted row's owed count, and the clean rows' nothing: {flushed:?}"
+        );
+        assert_eq!(
+            flushed[0],
+            "rule_matched=\"no ingress mapping\" address=100.64.0.9 port=9999 \
+             reason=\"no listener is published for the port\" source=100.64.0.1 refusals=5"
+        );
+        assert!(
+            emitter.flush_pending().is_empty(),
+            "the owed count is said once, never twice"
+        );
+
+        // The queue evictions fill is bounded by the emitter's own rows,
+        // and the line the bound drops is the newest's. One row — the whole
+        // key space, so every new source past the window is an eviction.
+        let flood = RefusalEmitter::new(1, 4, Duration::from_millis(50));
+        let held = Ipv4Addr::new(100, 64, 0, 11);
+        let dropped = Ipv4Addr::new(100, 64, 0, 12);
+        let t = Instant::now();
+        // Held's window: its opening line, then a second refusal no line has
+        // said — the count its row will owe at its eviction.
+        assert!(matches!(
+            flood.refuse(&refusal_from(held), true, t),
+            Outcome::Emit(_)
+        ));
+        assert_eq!(flood.refuse(&refusal_from(held), true, t), Outcome::Quiet);
+        // Past held's window, dropped's refusal takes its row, and the
+        // count held's window held is queued — one line, the queue's whole
+        // bound.
+        let t1 = t + Duration::from_millis(60);
+        assert!(matches!(
+            flood.refuse(&refusal_from(dropped), true, t1),
+            Outcome::Emit(_)
+        ));
+        assert_eq!(flood.refuse(&refusal_from(dropped), true, t1), Outcome::Quiet);
+        // Past dropped's, held's refusal takes its row the same way — and
+        // the queue is full, so dropped's count is the one the bound drops:
+        // the oldest line is the one a drain writes first.
+        let t2 = t1 + Duration::from_millis(60);
+        assert!(matches!(
+            flood.refuse(&refusal_from(held), true, t2),
+            Outcome::Emit(_)
+        ));
+        let drained = flood.flush_expired(t2);
+        assert_eq!(
+            drained.len(),
+            1,
+            "the queue's one bound, and the expiry's nothing beside it: {drained:?}"
+        );
+        assert!(
+            drained[0].contains("source=100.64.0.11"),
+            "the oldest line is the one the drain writes: {drained:?}"
+        );
+        assert!(
+            drained.iter().all(|line| !line.contains("source=100.64.0.12")),
+            "the dropped row's count is the one the bound drops: {drained:?}"
+        );
     }
 }
