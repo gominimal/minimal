@@ -13,6 +13,13 @@ on:
         branches: ["main", "release/**"]
     pull_request:
         branches: ["main", "release/**"]
+    # A merge-queue build runs ONLY the ci-macos-success aggregator, which
+    # reports green with every gating job skipped. ci-macos-success is a
+    # required check, so the queue still needs this trigger to see it, but the
+    # lane's work happens on the PR run (path-filtered) and on the push to main
+    # after the merge, which runs the full lane. The single self-hosted runner
+    # is the queue's bottleneck, and queue builds have not caught a macOS
+    # failure the PR run missed.
     merge_group:
         branches: ["main", "release/**"]
     workflow_dispatch:
@@ -45,6 +52,8 @@ permissions:
 
 jobs:
     changes:
+        # Merge-queue builds run only the aggregator; see `merge_group` above.
+        if: github.event_name != 'merge_group'
         runs-on: ubuntu-latest
         timeout-minutes: 5
         outputs:
@@ -87,7 +96,7 @@ jobs:
 
     artifacts:
         needs: [changes]
-        if: github.event_name != 'pull_request' || needs.changes.outputs.macos == 'true'
+        if: github.event_name != 'merge_group' && (github.event_name != 'pull_request' || needs.changes.outputs.macos == 'true')
         # Build the `minimal` CLI from THIS repo's sources, then materialize the
         # guest kernel + rootfs against the repo's own .minimal/minimal.toml. Both
         # are cache pulls keyed by the pinned upstream commit (not compiles): the
@@ -245,6 +254,7 @@ jobs:
         # as pass, so this does not wedge the required check.
         if: >-
             ${{ vars.RUN_MACOS_CI != 'false'
+            && github.event_name != 'merge_group'
             && (github.event_name != 'pull_request'
                 || (needs.changes.outputs.macos == 'true'
                     && github.event.pull_request.head.repo.full_name == github.repository)) }}
@@ -449,7 +459,7 @@ jobs:
         # macOS-sensitive crates; widen to --workspace once the tree is
         # mac-buildable. Kept lean (private repo: macOS minutes bill at 10x).
         needs: [changes]
-        if: github.event_name != 'pull_request' || needs.changes.outputs.macos == 'true'
+        if: github.event_name != 'merge_group' && (github.event_name != 'pull_request' || needs.changes.outputs.macos == 'true')
         runs-on: macos-latest
         timeout-minutes: 45
         env:
