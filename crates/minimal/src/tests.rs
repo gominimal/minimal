@@ -2512,36 +2512,48 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
         no_input: true,
         vm: None,
     };
+    // Which backend `--provider local-minimald` selects is the platform's
+    // call: on Linux it is the native one, while macOS has no native backend
+    // at all, so `client_provider_kind` folds the flag's reading onto minvmd
+    // there — the same rule every VM-backed gate keys on, flag or no flag.
+    // The expectation is therefore the kind's, not a constant.
+    let native_names_a_vm = cfg!(target_os = "macos");
     assert_eq!(
         hostname_proxy_start_vm(&native),
-        None,
-        "the native backend hosts no VM to name"
+        native_names_a_vm.then_some(paths::DEFAULT_VM_NAME),
+        "the backend the flag selects names a VM exactly where that backend \
+         is the VM one"
     );
 
     // The native line is the single-VM routing line word for word — the same
-    // address in the same words, so the two surfaces read as one.
-    let native_start = hostname_proxy_start_line(hostname_proxy_start_vm(&native), NEXT_RUNG);
-    let mut single = Vec::new();
-    let mut native_resp = reply.clone();
-    native_resp.hostname_proxy_port = Some(NEXT_RUNG);
-    format_ls(
-        &mut single,
-        &LsArgs {
-            raw: false,
-            json: false,
-        },
-        &native_resp,
-        None,
-    )
-    .expect("rendering the single-VM listing");
-    let single = String::from_utf8(single).expect("the listing is UTF-8");
-    assert_eq!(
-        single
-            .lines()
-            .find(|l| l.starts_with("HOSTNAME PROXY:"))
-            .expect("the single-VM listing prints a routing line"),
-        native_start.as_str(),
-        "the native start line and `min ls`'s routing line must be the same \
-         line"
-    );
+    // address in the same words, so the two surfaces read as one. A fact
+    // about the native backend, so it is asserted only where that backend
+    // exists: a host whose every backend is minvmd renders its routing lines
+    // through the VM listing, which names the VM the start line names above.
+    if !native_names_a_vm {
+        let native_start = hostname_proxy_start_line(hostname_proxy_start_vm(&native), NEXT_RUNG);
+        let mut single = Vec::new();
+        let mut native_resp = reply.clone();
+        native_resp.hostname_proxy_port = Some(NEXT_RUNG);
+        format_ls(
+            &mut single,
+            &LsArgs {
+                raw: false,
+                json: false,
+            },
+            &native_resp,
+            None,
+        )
+        .expect("rendering the single-VM listing");
+        let single = String::from_utf8(single).expect("the listing is UTF-8");
+        assert_eq!(
+            single
+                .lines()
+                .find(|l| l.starts_with("HOSTNAME PROXY:"))
+                .expect("the single-VM listing prints a routing line"),
+            native_start.as_str(),
+            "the native start line and `min ls`'s routing line must be the same \
+             line"
+        );
+    }
 }

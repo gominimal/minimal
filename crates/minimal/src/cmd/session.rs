@@ -324,6 +324,39 @@ async fn register_box_for_activation(
     }
 }
 
+/// The session-start line for a box the activation registered with the VM
+/// host daemon (T66): the one line the start output owes the registration,
+/// naming the VM host daemon the row lives on and the switch address the box
+/// was handed — the facts a bundle's CLI transcript then answers without
+/// reaching for the daemon's log, and the one line the host that reaches the
+/// VM host daemon with no provider flag at all (NET-081's macOS half) has to
+/// show for its own boxes.
+///
+/// `vm` is the VM host the line names, by the same rule
+/// [`hostname_proxy_start_line`] names the proxy's: the selected VM on the VM
+/// backend, `None` on a backend that hosts no VMs. A registered box only ever
+/// exists on the former, so the `None` shape is the defensive one, mirroring
+/// the sibling start line's.
+#[must_use]
+pub fn box_registered_start_line(
+    vm: Option<&str>,
+    name: &str,
+    addresses: &sessions::BoxAddresses,
+) -> String {
+    match vm {
+        Some(vm) => format!(
+            "BOX REGISTRATION:  box '{name}' registered with the VM host daemon on VM '{vm}' · \
+             switch address {}",
+            addresses.switch_address
+        ),
+        None => format!(
+            "BOX REGISTRATION:  box '{name}' registered with the VM host daemon · \
+             switch address {}",
+            addresses.switch_address
+        ),
+    }
+}
+
 /// The activation flow shared by [`cmd_activate`] and the bare-`min` router.
 /// `offer_scaffold` gates the `minimal.toml` scaffold offer: `cmd_activate`
 /// keeps it (its long-standing behavior, unchanged), while bare `min`
@@ -665,6 +698,27 @@ pub(crate) async fn activate_session(
         )
         .await;
         return Err(error);
+    }
+    // The registration's own half of the session-start output (T66): one line
+    // naming the VM host daemon the box's row lives on and the switch address
+    // it was handed, beside the `tracing::info!` line the same registration
+    // writes. The line is the one a bundle reads off the CLI transcript to say
+    // whether this box has a host row — which is the question the host that
+    // reaches the VM host daemon with no provider flag at all (NET-081's macOS
+    // half) otherwise answers nowhere in its own output. A box that registered
+    // nothing — a native host, a host-ip box sharing the node's own row, a
+    // `none` box with no switch address — prints nothing: it has no row to
+    // name. Keyed on the provider kind the registration itself keyed on, never
+    // on `use_minvmd()`, so the flagless VM-backed host prints it too.
+    if let Some(addresses) = config.box_addresses.as_ref() {
+        eprintln!(
+            "{}",
+            box_registered_start_line(
+                hostname_proxy_vm(kind),
+                config.name.as_deref().unwrap_or("-"),
+                addresses,
+            )
+        );
     }
     warn_if_hostname_routing_down(
         created.hostname_routing_unavailable.as_deref(),
@@ -2809,21 +2863,50 @@ mod tests {
     /// which folds that platform in — and never on the flag's own reading:
     /// a flagless macOS activation would otherwise register no box, resolve
     /// no control socket to withdraw through, and name no VM on its start
-    /// line. Driven here by kind, the combination the flag cannot express.
+    /// line.
+    ///
+    /// The rule is stated as an expectation about the kinds, each gate is
+    /// then driven by kind — the combination the flag cannot express — and
+    /// the activation path itself is driven flagless, end to end, the way a
+    /// host with no native backend runs it: on such a host the registration,
+    /// the start line, and the create's carried addresses all happen with no
+    /// flag at all, which is exactly what a gate that read the flag would
+    /// skip.
     #[tokio::test]
     async fn vm_backed_gates_key_on_the_provider_kind_not_the_flag() {
-        // The premise, then the rule: a flagless invocation reads `use_minvmd`
-        // as false, and the kind — the same key the socket resolution and the
-        // fabric display turn on — is what the gates read.
+        // The premise, then the rule as an expectation about the kinds rather
+        // than about the rule's own implementation: a flagless invocation
+        // reads `use_minvmd` as false on every host, and the kind it resolves
+        // through is minvmd exactly on a host with no native backend to fall
+        // back to.
         let flagless = GlobalArgs::default();
         assert!(
             !flagless.use_minvmd(),
             "no provider flag, no flag reading: the premise of the macOS shape"
         );
+        let flagless_kind = if cfg!(target_os = "macos") {
+            paths::ProviderKind::Minvmd
+        } else {
+            paths::ProviderKind::Minimald
+        };
         assert_eq!(
             daemon_provider_kind(&flagless),
-            client::client_provider_kind(flagless.use_minvmd()),
-            "the gates' rule is the socket resolution's own rule, restated"
+            flagless_kind,
+            "a flagless invocation is VM-backed exactly where minvmd is the \
+             only backend"
+        );
+        let flagged = GlobalArgs {
+            provider: Some(Provider::LocalMinvmd),
+            ..Default::default()
+        };
+        assert!(
+            flagged.use_minvmd(),
+            "--provider local-minvmd is the flag's own reading"
+        );
+        assert_eq!(
+            daemon_provider_kind(&flagged),
+            paths::ProviderKind::Minvmd,
+            "--provider local-minvmd asks for the VM host by name"
         );
 
         // The registration gate, driven by kind on one provider dir: the
@@ -2891,6 +2974,91 @@ mod tests {
             hostname_proxy_vm(paths::ProviderKind::Minimald),
             None,
             "the native backend hosts no VMs to name"
+        );
+
+        // The activation path, driven flagless — no provider flag anywhere —
+        // against the same stand-ins the refused-registration test uses,
+        // resolved the way the invocation itself resolves
+        // them: a VM host daemon recorded as running behind the provider dir
+        // the flagless kind names, and a real daemon behind the ssh socket in
+        // the dir that same kind resolves the daemon connection through. On a
+        // host with no native backend the two are one dir, and the
+        // registration, the start line, and the create's carried addresses
+        // all happen with the flag unset; on a host with a native backend the
+        // same invocation asks the VM host for nothing, and any gate that
+        // reached for the VM host anyway would be seen here asking.
+        let state = tempfile::TempDir::new().unwrap();
+        let vm_provider_dir = client::resolve_provider_dir(Some(state.path()), true).unwrap();
+        std::fs::create_dir_all(&vm_provider_dir).unwrap();
+        let vm_state = minvmd::state::StateDir::new(vm_provider_dir.clone()).unwrap();
+        vm_state
+            .write_state(&minvmd::state::State {
+                lifecycle: minvmd::lifecycle::Lifecycle::Running,
+                ..minvmd::state::State::stopped()
+            })
+            .unwrap();
+        let _alive = vm_state.try_acquire_alive_lock().unwrap();
+        let handed = sessions::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+        };
+        let requests = fake_vm_host(
+            vm_provider_dir.join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
+        )
+        .await;
+        let server = minimald::test_harness::TestServer::new().await;
+        let ssh_sock =
+            client::resolve_socket_path(Some(state.path()), flagless.use_minvmd()).unwrap();
+        std::fs::create_dir_all(ssh_sock.parent().expect("the ssh socket has a parent")).unwrap();
+        server.listen_on_uds(&ssh_sock).await;
+
+        let project = tempfile::TempDir::new().unwrap();
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            no_input: true,
+            ..Default::default()
+        };
+        let args = ActivateArgs {
+            name: Some("gate-web".to_string()),
+            path: Some(project.path().to_str().unwrap().to_string()),
+            network: CliNetworkMode::OwnIp,
+            sync: Some(SyncMode::None),
+            no_loadouts: true,
+            no_prompt: true,
+            attach: false,
+            ..bare_activate_args()
+        };
+        activate_session(&global, args, false).await.expect(
+            "a flagless activation reaches a session on the backend its kind \
+             resolves to",
+        );
+
+        // The row: asked for on the VM host the flagless kind resolved to, or
+        // not asked for at all — the kind's own answer, never the flag's.
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            usize::from(flagless_kind == paths::ProviderKind::Minvmd),
+            "the flagless activation asked the VM host for a row exactly when \
+             its provider kind is minvmd"
+        );
+        // And the create's half: the pair a minvmd-backed registration handed
+        // back travels to the daemon on the create request, so the record the
+        // daemon holds names it; a native host's record carries no pair at
+        // all, because nothing was registered to hand it one.
+        let mut after = server.connect().await;
+        let record = after
+            .call::<minimald_rpc::GetSessionRecord>(&minimald_rpc::GetSessionRecordRequest::Name(
+                "gate-web".to_string(),
+            ))
+            .await
+            .record
+            .expect("the flagless activation created the session");
+        assert_eq!(
+            record.box_addresses,
+            (flagless_kind == paths::ProviderKind::Minvmd).then_some(handed),
+            "the create carried the addresses the registration handed back, \
+             or nothing when nothing was registered"
         );
     }
 
