@@ -1525,15 +1525,19 @@ impl SessionGate {
         self.allowed.contains(&port)
     }
 
-    /// The shared verdict for one port a process in the box is listening on
-    /// (NET-016): the pure decision `sessions::core::egress` holds for the
-    /// whole surface, asked of the rules this gate was compiled with at
-    /// attach, so the listener watcher and the relay can never grow two
-    /// derivations of the box's declaration that disagree. The watcher
-    /// calls this before it publishes anything.
+    /// The shared verdict for one port a process in the box is listening on,
+    /// on the transport it listens with (NET-016): the pure decision
+    /// `sessions::core::egress` holds for the whole surface, asked of the
+    /// rules this gate was compiled with at attach, so the listener watcher
+    /// and the relay can never grow two derivations of the box's
+    /// declaration that disagree. The transport is half of what the
+    /// declaration must name for a port to be published already — a
+    /// mapping's forward answers the one protocol it was exposed with
+    /// (NET-121) — so the watcher asks with the transport it publishes on.
+    /// The watcher calls this before it publishes anything.
     #[must_use]
-    pub fn listen_verdict(&self, port: u16) -> ListenVerdict {
-        self.ingress.listen_verdict(port)
+    pub fn listen_verdict(&self, proto: sessions::IpProto, port: u16) -> ListenVerdict {
+        self.ingress.listen_verdict(proto, port)
     }
 
     /// Admits one listen-published port (NET-016): the runtime-published
@@ -2745,10 +2749,16 @@ pub(crate) mod tests {
         assert!(!gate.admits_tcp(9999), "nothing is published yet");
         // The declared port is admitted by its declaration alone.
         assert!(gate.admits_tcp(80));
-        assert_eq!(gate.listen_verdict(9999), ListenVerdict::Deny);
-        assert_eq!(gate.listen_verdict(80), ListenVerdict::Declared);
         assert_eq!(
-            gate.listen_verdict(3005),
+            gate.listen_verdict(sessions::IpProto::Tcp, 9999),
+            ListenVerdict::Deny
+        );
+        assert_eq!(
+            gate.listen_verdict(sessions::IpProto::Tcp, 80),
+            ListenVerdict::Declared
+        );
+        assert_eq!(
+            gate.listen_verdict(sessions::IpProto::Tcp, 3005),
             ListenVerdict::Deny,
             "no stance: the range alone publishes nothing"
         );

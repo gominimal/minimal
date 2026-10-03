@@ -990,27 +990,39 @@ impl IngressRules {
             .map(|(_, port)| *port)
     }
 
-    /// Whether the declaration names `port` on any transport. The fact the
-    /// listen verdict reads: a declared port's forward is the
-    /// declaration's (NET-121) — bound before the box's name was even
-    /// registered and held until the box stops — so a listener on one is
-    /// never a listener the watcher has anything to publish, and never one
-    /// whose closing could withdraw what the declaration holds
+    /// Whether the declaration names `port` on `proto`. The fact the listen
+    /// verdict reads: a declared port's forward is the declaration's
+    /// (NET-121) — bound for the mapping's transport before the box's name
+    /// was even registered and held until the box stops — so a listener on
+    /// one is never a listener the watcher has anything to publish, and never
+    /// one whose closing could withdraw what the declaration holds
     /// (NET-081's sub-requirement: a withdrawal applies only to the
-    /// runtime-published set).
+    /// runtime-published set). The transport is half the fact, because a
+    /// mapping's forward answers the one protocol it was exposed with: a
+    /// port the declaration names on UDP alone is declared on UDP alone, and
+    /// a TCP listener on it is the watcher's to publish or decline — never
+    /// already-published under a forward its protocol would never reach.
     #[must_use]
-    pub fn declares(&self, port: u16) -> bool {
-        self.declared.iter().any(|(_, declared)| *declared == port)
+    pub fn declares(&self, proto: IpProto, port: u16) -> bool {
+        self.declared
+            .iter()
+            .any(|(declared, declared_port)| *declared == proto && *declared_port == port)
     }
 
-    /// The shared verdict for one port a process in the box is listening
-    /// on (NET-016): whether the listener watcher publishes it on the
-    /// box's address, and what holds the port back when it does not.
+    /// The shared verdict for one port a process in the box is listening on,
+    /// on the transport it listens with (NET-016): whether the listener
+    /// watcher publishes it on the box's address, and what holds the port
+    /// back when it does not.
     ///
     /// `Publish` needs every fact the declaration gives: the box's dynamic
     /// stance is `allow`, the port falls inside the permit range — the
     /// range is inclusive at both ends, and an absent one permits nothing
-    /// — and no declaration names the port. Every other listening port is
+    /// — and no declaration names the port on the listener's transport. A
+    /// declaration that names the port on the *other* transport alone is
+    /// not that: its forward answers the protocol it was exposed with and
+    /// never this listener's, so the port is not published already here —
+    /// the listener is published by these rules, or held back by them,
+    /// exactly as an undeclared one is. Every other listening port is
     /// `Deny`: it stays unpublished, and a connection to it is refused at
     /// the box's address, never published by a listener the rules do not
     /// permit (NET-016's sub-requirement).
@@ -1021,8 +1033,8 @@ impl IngressRules {
     /// answer is the attached human's to give, and no kernel socket table
     /// can give it.
     #[must_use]
-    pub fn listen_verdict(&self, port: u16) -> ListenVerdict {
-        if self.declares(port) {
+    pub fn listen_verdict(&self, proto: IpProto, port: u16) -> ListenVerdict {
+        if self.declares(proto, port) {
             return ListenVerdict::Declared;
         }
         let permitted = self
@@ -1044,9 +1056,10 @@ pub enum ListenVerdict {
     /// publishes it on the box's address and admits it at the gate, for as
     /// long as a process in the box keeps listening (NET-016, NET-017).
     Publish,
-    /// A declaration names the port: its forward was bound at publish and
-    /// is held until the box stops (NET-121), so the watcher neither
-    /// publishes nor withdraws it — the port is published already.
+    /// A declaration names the port on the listener's transport: its
+    /// forward was bound at publish for that transport and is held until
+    /// the box stops (NET-121), so the watcher neither publishes nor
+    /// withdraws it — the port is published already, on that transport.
     Declared,
     /// The rules do not permit the port: it stays unpublished, and a
     /// connection to it is refused at the box's address (NET-014) rather
@@ -1850,8 +1863,11 @@ mod tests {
     /// NET-016's decision, read off the dimensions it is stated over: a
     /// listening port is published exactly when the box's stance is
     /// `allow` and the port falls inside the permit range — inclusively at
-    /// both ends — and a port the declaration already names is never the
-    /// watcher's to publish or withdraw, whatever the range says about it.
+    /// both ends — and a port the declaration already names on the
+    /// listener's transport is never the watcher's to publish or withdraw,
+    /// whatever the range says about it. A port the declaration names on
+    /// the other transport alone is not that: its forward answers the one
+    /// protocol it was exposed with, so the listener falls to the rules.
     /// The exhaustive form of the same property is the ingress half of
     /// [`super::kani_proofs::kani_frame_verdict_admits_nothing_undeclared`].
     #[test]
@@ -1867,23 +1883,81 @@ mod tests {
         };
         let rules = IngressRules::from_policy(Some(&policy));
         // Inside the range, inclusive at both ends.
-        assert_eq!(rules.listen_verdict(3000), ListenVerdict::Publish);
-        assert_eq!(rules.listen_verdict(3005), ListenVerdict::Publish);
-        assert_eq!(rules.listen_verdict(3010), ListenVerdict::Publish);
+        assert_eq!(
+            rules.listen_verdict(IpProto::Tcp, 3000),
+            ListenVerdict::Publish
+        );
+        assert_eq!(
+            rules.listen_verdict(IpProto::Tcp, 3005),
+            ListenVerdict::Publish
+        );
+        assert_eq!(
+            rules.listen_verdict(IpProto::Tcp, 3010),
+            ListenVerdict::Publish
+        );
         // Outside it: unpublished, the refused-not-published posture.
-        assert_eq!(rules.listen_verdict(2999), ListenVerdict::Deny);
-        assert_eq!(rules.listen_verdict(3011), ListenVerdict::Deny);
+        assert_eq!(
+            rules.listen_verdict(IpProto::Tcp, 2999),
+            ListenVerdict::Deny
+        );
+        assert_eq!(
+            rules.listen_verdict(IpProto::Tcp, 3011),
+            ListenVerdict::Deny
+        );
         // The declaration's own internal port is published already
         // (NET-121): the watcher has nothing to publish and nothing to
         // withdraw, whatever the range says.
-        assert_eq!(rules.listen_verdict(8080), ListenVerdict::Declared);
+        assert_eq!(
+            rules.listen_verdict(IpProto::Tcp, 8080),
+            ListenVerdict::Declared
+        );
+        // A port the declaration names on UDP alone is declared on UDP
+        // alone: the mapping's forward answers UDP and never a TCP
+        // listener's, so the TCP listener is not published already — it is
+        // the watcher's, and these rules permit it, so it publishes.
+        let udp_declared = IngressRules::from_policy(Some(&IngressPolicy {
+            port_mappings: vec![crate::PortMapping {
+                external_port: 13005,
+                internal_port: 3005,
+                proto: IpProto::Udp,
+            }],
+            ..policy.clone()
+        }));
+        assert_eq!(
+            udp_declared.listen_verdict(IpProto::Udp, 3005),
+            ListenVerdict::Declared
+        );
+        assert_eq!(
+            udp_declared.listen_verdict(IpProto::Tcp, 3005),
+            ListenVerdict::Publish
+        );
+        // The same shape with nothing permitted holds the TCP listener
+        // back — a transport-blind `Declared` would not: the verdict must
+        // fall to the rules, which refuse it, not answer "published
+        // already" for a forward that would never answer its protocol.
+        let udp_declared_no_range = IngressRules::from_policy(Some(&IngressPolicy {
+            port_mappings: vec![crate::PortMapping {
+                external_port: 13005,
+                internal_port: 3005,
+                proto: IpProto::Udp,
+            }],
+            dynamic_allowed_range: None,
+            ..policy.clone()
+        }));
+        assert_eq!(
+            udp_declared_no_range.listen_verdict(IpProto::Tcp, 3005),
+            ListenVerdict::Deny
+        );
         // An absent stance — even with a range set — publishes nothing.
         let no_stance = IngressRules::from_policy(Some(&IngressPolicy {
             dynamic_allowed_range: Some((3000, 3010)),
             dynamic_ingress: None,
             ..policy.clone()
         }));
-        assert_eq!(no_stance.listen_verdict(3005), ListenVerdict::Deny);
+        assert_eq!(
+            no_stance.listen_verdict(IpProto::Tcp, 3005),
+            ListenVerdict::Deny
+        );
         // `ask` and `deny` both hold the port back: listening alone is
         // never the attached human's yes (NET-138).
         for stance in [Some(DynamicIngress::Ask), Some(DynamicIngress::Deny)] {
@@ -1891,18 +1965,27 @@ mod tests {
                 dynamic_ingress: stance,
                 ..policy.clone()
             }));
-            assert_eq!(held_back.listen_verdict(3005), ListenVerdict::Deny);
+            assert_eq!(
+                held_back.listen_verdict(IpProto::Tcp, 3005),
+                ListenVerdict::Deny
+            );
         }
         // An absent range permits no port at all.
         let no_range = IngressRules::from_policy(Some(&IngressPolicy {
             dynamic_allowed_range: None,
             ..policy
         }));
-        assert_eq!(no_range.listen_verdict(3005), ListenVerdict::Deny);
+        assert_eq!(
+            no_range.listen_verdict(IpProto::Tcp, 3005),
+            ListenVerdict::Deny
+        );
         // An absent policy is deny-all-external: nothing is declared on
         // either transport, and nothing a process listens on is published.
         let absent = IngressRules::from_policy(None);
-        assert_eq!(absent.listen_verdict(3005), ListenVerdict::Deny);
+        assert_eq!(
+            absent.listen_verdict(IpProto::Tcp, 3005),
+            ListenVerdict::Deny
+        );
         assert_eq!(
             absent.declared(IpProto::Tcp).collect::<Vec<u16>>(),
             Vec::<u16>::new()
@@ -1917,8 +2000,12 @@ mod tests {
             rules.declared(IpProto::Udp).collect::<Vec<u16>>(),
             Vec::<u16>::new()
         );
-        assert!(rules.declares(8080));
-        assert!(!rules.declares(3005));
+        assert!(rules.declares(IpProto::Tcp, 8080));
+        assert!(!rules.declares(IpProto::Tcp, 3005));
+        // `declares` reads the transport as half the fact: the UDP mapping
+        // names its port on UDP, never on TCP.
+        assert!(udp_declared.declares(IpProto::Udp, 3005));
+        assert!(!udp_declared.declares(IpProto::Tcp, 3005));
     }
 }
 
@@ -2145,13 +2232,26 @@ mod kani_proofs {
         };
         assert_eq!(admitted, declared);
 
-        // NET-016's half: a port a process in the box is listening on is
-        // published exactly when no declaration names it, the box's stance
-        // is `allow`, and the port falls inside the permit range — stated
-        // as an iff over the three verdicts, so neither the published nor
-        // the withheld arm can silently become unreachable, and a declared
-        // port can never be the listener watcher's to publish (NET-121)
-        // or to withdraw (NET-081's sub-requirement).
+        // NET-016's half: a port a process in the box is listening on, on
+        // the transport it listens with, is published exactly when no
+        // declaration names it on that transport, the box's stance is
+        // `allow`, and the port falls inside the permit range — stated as
+        // an iff over the three verdicts, so neither the published nor
+        // the withheld arm can silently become unreachable, and a port
+        // declared on the listener's transport can never be the listener
+        // watcher's to publish (NET-121) or to withdraw (NET-081's
+        // sub-requirement). A port declared on the *other* transport
+        // alone is in the proof beside it — the one-transport declaration
+        // against the both-transport listener — where the verdict must
+        // fall to the rules rather than answer `Declared` under a forward
+        // that would never answer the listener's protocol.
+        //
+        // The listened transport rides the same two concrete variants the
+        // declaration can name (`two_declared_ports`): TCP and UDP are the
+        // only transports a declaration carries, so they bound every
+        // already-published shape there is; any other transport declares
+        // nothing and reduces to the range-and-stance check the proof
+        // covers without it.
         //
         // The half's own loops — the two declared-port scans, one in the
         // decision and one in the oracle below — exit by their second
@@ -2159,8 +2259,16 @@ mod kani_proofs {
         // `memcmp` bound rationale above is still the longest this
         // function unwinds.
         let listen: u16 = kani::any();
+        let listen_proto = if kani::any::<bool>() {
+            IpProto::Tcp
+        } else {
+            IpProto::Udp
+        };
         let ingress = IngressRules::new(two_declared_ports(), a_range(), a_stance());
-        let declares = ingress.declared.iter().any(|(_, port)| *port == listen);
+        let declares = ingress
+            .declared
+            .iter()
+            .any(|(proto, port)| *proto == listen_proto && *port == listen);
         let permitted = ingress
             .permitted
             .is_some_and(|(low, high)| low <= listen && listen <= high);
@@ -2173,7 +2281,7 @@ mod kani_proofs {
         } else {
             ListenVerdict::Deny
         };
-        assert_eq!(ingress.listen_verdict(listen), expected);
+        assert_eq!(ingress.listen_verdict(listen_proto, listen), expected);
     }
 
     /// NET-067's property, the rebinding half: **for every resolved answer

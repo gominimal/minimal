@@ -68,8 +68,8 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use sessions::SessionId;
 use sessions::core::egress::ListenVerdict;
+use sessions::{IpProto, SessionId};
 
 use super::policy::{ControlChannel, ExposedMapping, expose_mapping, unexpose_mapping};
 use super::switch::SessionGate;
@@ -469,7 +469,14 @@ impl WatchState {
     /// first refusal's line, never the retries' — and the publication that
     /// ends a streak names what it took.
     async fn open(&mut self, port: u16, refusals: u32) -> bool {
-        match self.plan.gate.listen_verdict(port) {
+        // TCP is the transport the watcher knows a listener in: the kernel
+        // tables it reads name TCP listening sockets, and the forward it
+        // binds answers TCP — so TCP is the transport it asks the shared
+        // verdict for. A declaration that names the port on UDP alone is
+        // not a publication of this listener (its forward would never
+        // answer the protocol the watcher dials), so the verdict falls to
+        // the rules rather than answering `Declared` transport-blind.
+        match self.plan.gate.listen_verdict(IpProto::Tcp, port) {
             ListenVerdict::Publish => {
                 if self.forwards.contains_key(&port) {
                     // The port's listener closed, the withdrawal's unexpose
@@ -782,12 +789,13 @@ mod tests {
     use super::*;
 
     /// One request the fake forwarder served: the verb's path and the
-    /// `local`/`remote` pair its body carried.
+    /// `local`/`remote`/`protocol` fields its body carried.
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct Served {
         path: String,
         local: String,
         remote: String,
+        protocol: String,
     }
 
     /// The `name` field of a JSON request body, spelled as the serializer
@@ -873,6 +881,7 @@ mod tests {
                     path,
                     local: field_of(&body, "local"),
                     remote: field_of(&body, "remote"),
+                    protocol: field_of(&body, "protocol"),
                 };
                 let status = decide(&served);
                 let reason = if status == 200 {
@@ -1056,6 +1065,59 @@ mod tests {
         server.abort();
     }
 
+    /// NET-016, the declaration's transport: a mapping named for UDP answers
+    /// UDP alone, so a TCP listener on a port the declaration names on UDP
+    /// only is not published already — the verdict reads the transport
+    /// before it answers `Declared`, and a box whose rules permit the port
+    /// publishes the TCP listener, bound for the protocol the listener
+    /// holds. The shape a transport-blind `Declared` answered wrong: the
+    /// UDP mapping's forward never answers a TCP dial, so holding the
+    /// listener back would leave the server unreachable at the box's
+    /// address on TCP whatever the rules said.
+    #[tokio::test]
+    async fn listen_publishes_a_tcp_port_the_declaration_names_only_on_udp() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        // The declaration maps the port for UDP alone, while the range and
+        // the stance permit it: the TCP listener must fall to the rules and
+        // be published by them, not answered "published already" under a
+        // forward that would never answer its protocol.
+        let policy = sessions::SessionPolicy {
+            ingress: Some(sessions::IngressPolicy {
+                port_mappings: vec![sessions::PortMapping {
+                    external_port: port,
+                    internal_port: port,
+                    proto: sessions::IpProto::Udp,
+                }],
+                dynamic_allowed_range: Some((port, port)),
+                dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+            }),
+            egress: None,
+        };
+        let (watcher, gate, server, mut served) = started_watcher(&dir, &policy);
+
+        let published = next_served(&mut served).await;
+        assert_eq!(published.path, "/services/forwarder/expose");
+        assert_eq!(
+            published.protocol, "tcp",
+            "the publication is bound for the transport the listener holds"
+        );
+        assert_eq!(published.local, format!("{PUBLISHED}:{port}"));
+        assert_eq!(published.remote, format!("{LEASE}:{port}"));
+        soon(|| gate.admits_tcp(port)).await;
+
+        // The stop withdraws it like any runtime-published port: the
+        // declaration's UDP forward is not the watcher's and never comes
+        // down this path (NET-081's sub-requirement).
+        watcher.stop().await;
+        let withdrawn = next_served(&mut served).await;
+        assert_eq!(withdrawn.path, "/services/forwarder/unexpose");
+        assert_eq!(withdrawn.protocol, "tcp");
+        assert_eq!(withdrawn.local, format!("{PUBLISHED}:{port}"));
+        server.abort();
+    }
+
     /// NET-016's sub-requirement: a listener on a port the rules do not
     /// permit is never published — no forward, no admission — while a
     /// permitted listener beside it publishes, so the proof's silence is
@@ -1176,6 +1238,7 @@ mod tests {
                 path: "/services/forwarder/expose".into(),
                 local: format!("{PUBLISHED}:{port}"),
                 remote: format!("{LEASE}:{port}"),
+                protocol: "tcp".into(),
             },
             "the retry is the same publication the refusal turned away"
         );
@@ -1411,6 +1474,7 @@ mod tests {
                 path: "/services/forwarder/unexpose".into(),
                 local: format!("{PUBLISHED}:{port}"),
                 remote: String::new(),
+                protocol: "tcp".into(),
             },
             "the failed withdrawal is retried while the box runs"
         );
