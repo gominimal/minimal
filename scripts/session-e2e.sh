@@ -4200,6 +4200,12 @@ proof_box_name_resolves_natively_without_proxy() {
   # $MINIMAL_BIN first) looks for it — exactly where an install would have
   # put it. The host's own prefix wins when it named one.
   bn_switch_reason=""
+  # The $MINIMAL_BIN read below (SC2031) is meant to see the LANE's prefix:
+  # the fresh-install proofs' swaps of it are subshell-local BY DESIGN (each
+  # runs inside its own `if ( ... )`, and the swap dying with the subshell is
+  # the point), so no earlier proof's change can be lost here — this case
+  # reads the env the caller exported, or nothing.
+  # shellcheck disable=SC2031
   if [ -z "$bn_tun" ] && [ -z "${MINIMAL_BIN:-}" ]; then
     bn_bin="$WORK/bn-bin"
     mkdir -p "$bn_bin"
@@ -4212,6 +4218,13 @@ proof_box_name_resolves_natively_without_proxy() {
       bn_switch_reason="the pinned gvproxy the box's session program spawns could not be fetched, so no box could attach its tap (a bare checkout ships none)"
     fi
     if [ -x "$bn_bin/gvproxy-min" ]; then
+      # This case runs in the MAIN shell (the dispatch calls its proof
+      # function directly), so this export is not lost: it is what carries
+      # the switch's location to the daemon this case autospawns below. The
+      # SC2031 shellcheck worries about is the fresh-install proofs'
+      # subshell-local swaps above — dead by the time this case runs, and
+      # never this export's business.
+      # shellcheck disable=SC2031
       export MINIMAL_BIN="$bn_bin"
     fi
   fi
