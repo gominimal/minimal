@@ -312,6 +312,7 @@ fn register_and_reply(
         name: request.name.clone(),
         ingress_ports: request.ingress_ports,
         egress: request.egress,
+        credentialed_upstream: request.credentialed_upstream,
     };
     let reply = match boxes.register_client_box(spec) {
         Ok(record) => {
@@ -534,6 +535,7 @@ mod tests {
                         allow_dns_hosts: None,
                         deny_subnets: None,
                     }),
+                    credentialed_upstream: None,
                 },
             )
             .expect("first registration is answered"),
@@ -576,6 +578,7 @@ mod tests {
                     name: "db".to_string(),
                     ingress_ports: vec![5432],
                     egress: None,
+                    credentialed_upstream: None,
                 },
             )
             .expect("second registration is answered"),
@@ -619,6 +622,7 @@ mod tests {
                     name: "cache".to_string(),
                     ingress_ports: Vec::new(),
                     egress: None,
+                    credentialed_upstream: None,
                 },
             )
             .expect("server still serves after a refused request"),
@@ -643,6 +647,7 @@ mod tests {
                     allow_dns_hosts: None,
                     deny_subnets: None,
                 }),
+                credentialed_upstream: None,
             })
             .expect("the default plan has addresses to allocate");
 
@@ -696,6 +701,7 @@ mod tests {
                 name: "web".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
+                credentialed_upstream: None,
             })
             .expect_err("an unplanned subnet has no slice to allocate from");
         assert!(
@@ -739,6 +745,7 @@ mod tests {
                         allow_dns_hosts: None,
                         deny_subnets: None,
                     }),
+                    credentialed_upstream: None,
                 },
             )
             .expect("the registration is answered"),
@@ -808,6 +815,7 @@ mod tests {
                     name: "db".to_string(),
                     ingress_ports: Vec::new(),
                     egress: None,
+                    credentialed_upstream: None,
                 },
             )
             .expect("the marker box is registered"),

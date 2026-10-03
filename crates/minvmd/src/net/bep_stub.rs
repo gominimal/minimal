@@ -677,6 +677,7 @@ mod tests {
                 name: "box-a".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
+                credentialed_upstream: None,
             })
             .expect("the plan has a switch address to hand out");
         let box_b = registry
@@ -684,6 +685,7 @@ mod tests {
                 name: "box-b".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
+                credentialed_upstream: None,
             })
             .expect("the plan has a second switch address to hand out");
         drive(&mut lane, 2).await;
@@ -826,6 +828,7 @@ mod tests {
                 name: "web".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
+                credentialed_upstream: None,
             })
             .expect("the plan has a switch address to hand out");
 
@@ -910,6 +913,7 @@ mod tests {
                 name: "web".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
+                credentialed_upstream: None,
             })
             .expect("the plan has a switch address to hand out");
 

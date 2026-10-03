@@ -110,6 +110,18 @@
 //! before they can become pins, and the infrastructure drop is the host's
 //! own, whatever the row.
 //!
+//! The Box Egress Proxy's address is the third destination no row's rules
+//! decide (NET-134): the proxy is a **credentialed lane's** infrastructure —
+//! the one host-side listener a box reaches by declaring the upstream, not by
+//! allowing an address — so its address is admitted for a row that declared
+//! one and refused for everything else, a deny-all row included
+//! (`egress-uncredentialed-proxy-destination`, [`PROXY_LANE_RULE`]). The
+//! decision reads the row's own declaration, never its rules: a lane is not
+//! an egress dimension, and nothing a box says inside the VM can grant one —
+//! the declaration travelled the host's registration, reduced to a fact in
+//! the row ([`BoxRecord::declares_credentialed_upstream`]), and the node
+//! plane's baseline set admits the proxy's address for no category at all.
+//!
 //! Fail-closed faces the guest; the gate itself is what the host is left
 //! holding, so it stays up where it can. An accept failure the host can ride
 //! out — a momentary fd or memory shortage, a connection that died before it
@@ -445,6 +457,19 @@ fn infrastructure_destination(
     ranges.rfc1918.iter().any(|cidr| cidr.contains(dst))
         && !allow.is_none_or(|list| list.iter().any(|cidr| cidr.contains(dst)))
 }
+
+/// The rule name for a frame headed to the Box Egress Proxy's address from a
+/// box that declared no credentialed upstream (NET-134): the proxy's listener
+/// is a credentialed lane's infrastructure — the one host-side destination a
+/// box reaches by *declaring* the upstream, never by allowing its address —
+/// so the frame is refused for every source that carries no lane: a row whose
+/// declaration named none, whatever its rules would say about the address;
+/// an unregistered source the announced interim admits, which concedes a
+/// row's absence and never the fabric; and the node plane, whose baseline
+/// set admits the address for no category at all. A row that declares the
+/// upstream is the one exception, admitted at the address as infrastructure,
+/// beside its rules ([`GateAdmit::ProxyLane`]).
+const PROXY_LANE_RULE: &str = "egress-uncredentialed-proxy-destination";
 
 /// The rule name for the interim's admitted-unregistered source: a frame
 /// whose source is an address the plan could hand to a box but no published
@@ -2428,6 +2453,10 @@ async fn relay_frames_to_switch(
                 limiter.warn_infrastructure(src, dst, dst_port);
                 continue;
             }
+            Err(GateDrop::ProxyLane { src, dst, dst_port }) => {
+                limiter.warn_proxy_lane(src, dst, dst_port);
+                continue;
+            }
             Err(dropped) => {
                 limiter.emit(summary.source(), dropped.rule());
                 continue;
@@ -2452,7 +2481,7 @@ async fn relay_frames_to_switch(
         // the daemon frameless and unpublishable for the rest of the VM's
         // life, over a shuttle close its control path rode out.
         let src = match admitted {
-            GateAdmit::Baseline | GateAdmit::Row => summary.source(),
+            GateAdmit::Baseline | GateAdmit::Row | GateAdmit::ProxyLane => summary.source(),
             GateAdmit::Unregistered { src } => Some(src),
         };
         if let Some(src) = src
@@ -2585,11 +2614,12 @@ impl UnregisteredSourcePhase {
 pub(crate) const UNREGISTERED_SOURCE_PHASE: UnregisteredSourcePhase =
     UnregisteredSourcePhase::Announced;
 
-/// What the gate decided one frame's admission by: which of the three ways in —
-/// the node-plane baseline set, a published namespace's own rules, or the
-/// announced interim's default for a source the plan could have leased but no
-/// row holds. The relay that feeds on this distinguishes the interim's admit
-/// for the one thing only it needs: a line that says it happened.
+/// What the gate decided one frame's admission by: which of the four ways in —
+/// the node-plane baseline set, a published namespace's own rules, a row's
+/// declared credentialed lane, or the announced interim's default for a source
+/// the plan could have leased but no row holds. The relay that feeds on this
+/// distinguishes the interim's admit for the one thing only it needs: a line
+/// that says it happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateAdmit {
     /// The node-plane baseline's compiled set admitted the frame: its source
@@ -2614,6 +2644,14 @@ enum GateAdmit {
         /// The source address no row holds.
         src: [u8; 4],
     },
+    /// The frame named the Box Egress Proxy's address and the source's row
+    /// declared a credentialed upstream (NET-134): the one admission the
+    /// row's compiled rules never made, because the proxy's listener is the
+    /// lane's own infrastructure — reached by declaring the upstream, not by
+    /// allowing an address — so a deny-all row's frame to the proxy passes
+    /// where the same frame anywhere else on the host does not. The lane is
+    /// the row's own fact; nothing the guest says grants one.
+    ProxyLane,
 }
 
 /// The gate's admit-or-drop decision for one frame summary against the
@@ -2643,10 +2681,22 @@ enum GateAdmit {
 /// applies to every box-plane packet, CIDR-admitted direct-IP flows included,
 /// so a row's `allow_subnets` admits nothing in it — RFC 1918 under an
 /// explicit allowance excepted — and the pin arm a name-declaring row earns
-/// for its undeclared destinations never reaches it. The order is the
-/// contract: control surface, then the source (a baseline-decided node
-/// frame, a row, or the phase's unknown-source decision), then the
-/// infrastructure set, then the row's rules, then the pin arm.
+/// for its undeclared destinations never reaches it.
+///
+/// One destination is decided beside the rules instead of refused outright:
+/// the Box Egress Proxy's address (NET-134), the third thing the frame's
+/// destination is checked against after the source's routing. The proxy's
+/// listener is a credentialed lane's infrastructure — a box reaches it by
+/// declaring the upstream, not by allowing its address — so the address is
+/// admitted for the one row that declared the lane, whatever its compiled
+/// rules say about the frame ([`GateAdmit::ProxyLane`]), and refused for
+/// every other source under [`PROXY_LANE_RULE`]: a row that declared no
+/// upstream, an interim-admitted source with no row at all, and the node
+/// plane's baseline set, which holds the address for no category. The order
+/// is the contract: control surface, then the source (a baseline-decided
+/// node frame, a row, or the phase's unknown-source decision), then the
+/// infrastructure set, then the proxy lane, then the row's rules, then the
+/// pin arm.
 fn gate_verdict(
     summary: &FrameSummary,
     l4: Option<&dns_pins::L4Packet>,
@@ -2735,6 +2785,37 @@ fn gate_verdict(
             dst_port: summary.destination_port(),
         });
     }
+    // The Box Egress Proxy's address, decided beside every rule (NET-134):
+    // the proxy is a credentialed lane's infrastructure — the one host-side
+    // listener a box reaches by declaring the upstream, never by allowing
+    // its address — so this is the one destination whose admission the
+    // frame rules cannot carry, decided from the row's own declaration the
+    // way the DNS name dimension is. A row that declared the lane is
+    // admitted here, whatever its rules would say about the address: a
+    // deny-all row included, because the credentials the proxy redeems are
+    // the lane's own and no egress rule of the box's says anything about
+    // them. Every other source is refused under the box-to-host
+    // default-deny — a row that declared nothing (whatever its rules would
+    // have allowed at the address: a declared allowance is not a lane, the
+    // same way a `0.0.0.0/0` row admits no metadata service), an interim
+    // source the announced phase admits without a row, which concedes a
+    // row's absence, never the fabric, and the node row under the interim
+    // baseline, which is the allow-all the in-force enumeration replaces.
+    // The in-force baseline set needs no arm of its own: it never admits the
+    // address for any category, so its compiled rules refuse the frame
+    // where they refuse any undeclared destination.
+    if let Some(dst) = summary.destination()
+        && dst == table.subnet().box_egress_proxy_address().octets()
+    {
+        return match record.as_ref() {
+            Some(row) if row.declares_credentialed_upstream() => Ok(GateAdmit::ProxyLane),
+            _ => Err(GateDrop::ProxyLane {
+                src,
+                dst,
+                dst_port: summary.destination_port(),
+            }),
+        };
+    }
     let Some(record) = record else {
         return Ok(GateAdmit::Unregistered { src });
     };
@@ -2776,10 +2857,11 @@ fn gate_verdict(
 }
 
 /// Why the gate dropped a frame: the shared verdict's reason, or one of the
-/// three classes the host table adds — a source address no published
+/// four classes the host table adds — a source address no published
 /// namespace holds (NET-081's failure case), a frame the switch's own address
-/// would have received on a port nothing published answers, and a frame
-/// headed into the infrastructure deny set.
+/// would have received on a port nothing published answers, a frame headed
+/// into the infrastructure deny set, and a frame headed to the Box Egress
+/// Proxy's address from a source that carries no credentialed lane (NET-134).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateDrop {
     /// The shared frame verdict dropped it: the namespace's own rules, its
@@ -2810,6 +2892,19 @@ enum GateDrop {
         /// The port the frame named there, `0` when it carried none.
         dst_port: u16,
     },
+    /// The frame named the Box Egress Proxy's address and its source carries
+    /// no credentialed lane (NET-134): no row declares the upstream for the
+    /// address, and the proxy's listener is not a destination any rules —
+    /// rows', the interim's, or the baseline set's — admit without one
+    /// ([`PROXY_LANE_RULE`]).
+    ProxyLane {
+        /// The source address the frame wore.
+        src: [u8; 4],
+        /// The proxy's address on the switch, the destination refused.
+        dst: [u8; 4],
+        /// The port the frame named there, `0` when it carried none.
+        dst_port: u16,
+    },
 }
 
 impl GateDrop {
@@ -2821,6 +2916,7 @@ impl GateDrop {
             Self::Infrastructure { .. } => INFRASTRUCTURE_RULE,
             Self::UnknownSource { .. } => UNKNOWN_SOURCE_RULE,
             Self::SwitchControlSurface { .. } => SWITCH_CONTROL_RULE,
+            Self::ProxyLane { .. } => PROXY_LANE_RULE,
         }
     }
 }
@@ -3046,6 +3142,40 @@ impl DropLimiter {
                     "dropped frames to infrastructure destinations from more distinct \
                      source addresses than the gate keeps a window per source for; one \
                      line per rule covers the rest",
+                );
+                true
+            }
+        }
+    }
+
+    /// Emits the warning for one frame headed to the Box Egress Proxy's
+    /// address from a source that carries no credentialed lane (NET-134):
+    /// the same rate limit a drop's line answers to, keyed by the source and
+    /// the rule, and naming the destination and the port the frame gave it —
+    /// the line a host reads to learn which box was reaching for the proxy
+    /// without the lane that makes it its infrastructure, the box named by
+    /// the source address and the reason by the rule. Returns whether a line
+    /// was written.
+    fn warn_proxy_lane(&self, src: [u8; 4], dst: [u8; 4], dst_port: u16) -> bool {
+        match self.should_warn_at(Some(src), PROXY_LANE_RULE, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named => {
+                tracing::warn!(
+                    source = %Ipv4Addr::from(src),
+                    destination = %Ipv4Addr::from(dst),
+                    port = dst_port,
+                    rule_matched = PROXY_LANE_RULE,
+                    "dropped a frame to the box egress proxy's address; the proxy is a \
+                     credentialed lane's infrastructure, and this box declared no upstream",
+                );
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    rule_matched = PROXY_LANE_RULE,
+                    "dropped frames to the box egress proxy's address from more distinct \
+                     source addresses than the gate keeps a window per source for; one line \
+                     per rule covers the rest",
                 );
                 true
             }
@@ -3759,10 +3889,10 @@ mod tests {
         AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb, DROP_WARN_MAX_TRACKED_PAIRS,
         DROP_WARN_MIN_INTERVAL, DropLimiter, EgressGate, GateAdmit, GateDrop, GuestSource,
         GuestSpeak, HANDSHAKE_TIMEOUT, MALFORMED_PUBLISH_RULE, MAX_HEAD, MAX_LIVE_RELAYS,
-        MAX_NAMED_TARGET, PublishedForwards, Record, UNDECLARED_PUBLISH_RECORD_RULE,
-        UNDECLARED_RETRACT_RULE, UNREGISTERED_PUBLISH_RULE, UNREGISTERED_SOURCE_PHASE,
-        UNREGISTERED_SOURCE_RULE, UnregisteredSourcePhase, WarnDecision, accept_loop, dns_pins,
-        gate_verdict, max_frame, render_record, serve_connection,
+        MAX_NAMED_TARGET, PROXY_LANE_RULE, PublishedForwards, Record,
+        UNDECLARED_PUBLISH_RECORD_RULE, UNDECLARED_RETRACT_RULE, UNREGISTERED_PUBLISH_RULE,
+        UNREGISTERED_SOURCE_PHASE, UNREGISTERED_SOURCE_RULE, UnregisteredSourcePhase, WarnDecision,
+        accept_loop, dns_pins, gate_verdict, max_frame, render_record, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
     use crate::net::baseline::{BaselineCategory, NodeBaselinePhase, NodePlaneBaseline};
@@ -4896,6 +5026,257 @@ mod tests {
             !logged.contains("egress-undeclared-subnet"),
             "the name-declaring row's private destination is the infrastructure drop, not \
              a deferred one, got: {logged}"
+        );
+    }
+
+    /// NET-134: the Box Egress Proxy's listener is a credentialed lane's
+    /// infrastructure — the one host-side destination a box reaches by
+    /// declaring the upstream, never by allowing its address. A box whose
+    /// rules deny everything reaches the proxy's address at the proxy's own
+    /// port, admitted beside its rules, while the same rules hold the rest
+    /// of the host: no other host-side address answers the deny-all box,
+    /// and no outside destination does either. The lane adds reach at one
+    /// address and nowhere else.
+    #[tokio::test]
+    async fn credentialed_box_reaches_proxy_address_under_deny_all() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("laned", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_credentialed_upstream(sessions::CredentialedUpstream::default())
+                .with_egress_policy(EgressPolicy {
+                    // Deny-all: every IPv4 destination is denied, the
+                    // spelling the activating client's `--deny-subnets
+                    // 0.0.0.0/0` compiles to. The lane is admitted beside
+                    // these rules, so it must survive them.
+                    allow_protocols: None,
+                    allow_subnets: None,
+                    allow_dns_hosts: None,
+                    deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                }),
+        );
+        let mut h = gate_over(registry).await;
+
+        // The proxy's address, at the port its listener binds: admitted,
+        // whatever the deny-all rules say about it — the frame reaches the
+        // switch exactly as it was sent, because the credentials the proxy
+        // redeems are the lane's own and no egress rule of the box's says
+        // anything about them.
+        let proxy = SUBNET.box_egress_proxy_address().octets();
+        let to_proxy = ipv4_frame(LEASE, 6, proxy, 8118);
+        send_frame(&mut h.guest, &to_proxy).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            to_proxy,
+            "the laned box reaches the proxy's address under a deny-all row"
+        );
+
+        // No other host port and no other host address: the same box's
+        // frames to the host alias — at the proxy's port and at another —
+        // and to an outside destination are held by its own deny-all rules,
+        // exactly as they would be without the lane. The marker after them
+        // proves all were decided, and none passed: the proxy's address is
+        // the lane's whole reach.
+        let host_alias = SUBNET.host_alias().octets();
+        let refused = [
+            ipv4_frame(LEASE, 6, host_alias, 8118),
+            ipv4_frame(LEASE, 6, host_alias, 80),
+            ipv4_frame(LEASE, 6, [203, 0, 113, 7], 443),
+        ];
+        for frame in &refused {
+            send_frame(&mut h.guest, frame).await;
+        }
+        let marker = ipv4_frame(LEASE, 6, proxy, 8118);
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "only the proxy's address answers the laned box; the marker at it still does"
+        );
+        expect_silence(&mut h.switch).await;
+        assert!(
+            !h.log
+                .contents()
+                .contains("egress-uncredentialed-proxy-destination"),
+            "a laned box's frame to the proxy is not a proxy-lane drop, got: {}",
+            h.log.contents()
+        );
+    }
+
+    /// NET-134's refusal: a box without a credentialed lane has every frame
+    /// to the proxy's address dropped at the gate, whatever its rules would
+    /// say about the address — an allow-all box included, so the drop is the
+    /// lane's absence, never a rule's. The drop is not a reset (NET-062):
+    /// nothing answers, and the warn line says so — one rate-limited line
+    /// per source per rule per interval, naming the box, the proxy's
+    /// address, the port and the reason. A sibling box that declared the
+    /// lane reaches the same address at the same port under the same rules,
+    /// which is the proof the lane is the only thing that moved.
+    #[tokio::test]
+    async fn uncredentialed_box_dropped_at_proxy_address() {
+        let registry = BoxRegistry::new(SUBNET);
+        // The uncredentialed box: no policy at all, the allow-all default —
+        // the rules that would admit any address, so the proxy's address is
+        // refused by the lane's absence alone.
+        let bare = [100, 64, 0, 9];
+        // The sibling on a credentialed lane: the same allow-all rules, so
+        // the only difference between the two boxes is the declaration.
+        let laned = [100, 64, 0, 10];
+        registry.register(
+            BoxRegistration::new("bare", Ipv4Addr::from(bare), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
+        registry.register(
+            BoxRegistration::new("laned", Ipv4Addr::from(laned), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_credentialed_upstream(sessions::CredentialedUpstream::default()),
+        );
+        let mut h = gate_over(registry).await;
+        let proxy = SUBNET.box_egress_proxy_address().octets();
+
+        // The uncredentialed box's frames to the proxy's address — the
+        // proxy's own port, and another port at the same address, over TCP
+        // and UDP — never reach the switch. The marker after them proves
+        // all were decided before it, and none passed.
+        let refused = [
+            ipv4_frame(bare, 6, proxy, 8118),
+            ipv4_frame(bare, 6, proxy, 8080),
+            ipv4_frame(bare, 17, proxy, 8118),
+        ];
+        for frame in &refused {
+            send_frame(&mut h.guest, frame).await;
+        }
+        let marker = ipv4_frame(LEASE, 6, [203, 0, 113, 7], 80);
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "no frame of the uncredentialed box reached the proxy's address; the marker did"
+        );
+        expect_silence(&mut h.switch).await;
+
+        // The drop says so, one line per source per rule: the box's address,
+        // the proxy's address, the port and the reason — the line a
+        // diagnostic bundle's daemon log tail reads a refused frame to the
+        // proxy from.
+        wait_for_log(&h.log, "egress-uncredentialed-proxy-destination").await;
+        let logged = h.log.contents();
+        for needle in [
+            "source=100.64.0.9",
+            "destination=100.64.255.252",
+            "port=8118",
+            "rule_matched=\"egress-uncredentialed-proxy-destination\"",
+        ] {
+            assert!(
+                logged.contains(needle),
+                "the proxy-lane drop line carries {needle}, got: {logged}"
+            );
+        }
+        assert_eq!(
+            logged
+                .matches("egress-uncredentialed-proxy-destination")
+                .count(),
+            1,
+            "one warn line per source address per rule per interval, got: {logged}"
+        );
+
+        // The sibling on a lane reaches the same address at the same port
+        // under the same rules: the declaration is the whole difference.
+        let reach = ipv4_frame(laned, 6, proxy, 8118);
+        send_frame(&mut h.guest, &reach).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            reach,
+            "the laned sibling reaches the proxy's address at the same port under the same rules"
+        );
+    }
+
+    /// NET-134's third refusal: the node plane's own reach. The proxy's
+    /// address is a credentialed lane's infrastructure, and the node plane
+    /// is on no lane — its baseline set is the enumeration of the categories
+    /// NET-130 admits, and no category names the proxy. So the set never
+    /// admits the address: with the baseline in force a node frame to the
+    /// proxy is dropped by the compiled set like any other undeclared
+    /// destination, and while the interim allow-all node row still decides
+    /// the node plane, that row declares no lane either, so the proxy rule
+    /// drops it there too — the shipped arm and the flip hold one posture.
+    #[test]
+    fn baseline_set_never_admits_the_proxy_address() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654, 7656);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let proxy = SUBNET.box_egress_proxy_address().octets();
+        let node = baseline.node_addr();
+
+        // The set's own membership: no category of the enumeration names the
+        // proxy's address, so a later category that points at it fails here
+        // rather than silently buying the node plane a lane.
+        for entry in baseline.entries() {
+            for endpoint in entry.endpoints() {
+                let address = endpoint
+                    .split_once('/')
+                    .expect("an endpoint is spelled `a.b.c.d/n`")
+                    .0;
+                assert_ne!(
+                    address,
+                    Ipv4Addr::from(proxy).to_string(),
+                    "the {} category must not name the box egress proxy's address; it is \
+                     not a destination the node plane buys by enumeration",
+                    entry.category().as_str(),
+                );
+            }
+        }
+
+        // In force: the node's frame to the proxy is decided by the compiled
+        // set — and refused, at the proxy's port and over UDP too, because
+        // the address is inside no category's endpoints.
+        let in_force = baseline.clone().in_force();
+        for (proto, port) in [(6, 8118), (17, 8118)] {
+            let frame = sessions::core::egress::summarize(&ipv4_frame(node, proto, proxy, port));
+            match gate_verdict(
+                &frame,
+                None,
+                &table,
+                &in_force,
+                &pins,
+                UNREGISTERED_SOURCE_PHASE,
+            ) {
+                Ok(GateAdmit::Baseline) => panic!(
+                    "the baseline set admitted the proxy's address at proto {proto} port {port}"
+                ),
+                Ok(admitted) => panic!(
+                    "the in-force gate admitted a node frame to the proxy by another way: \
+                     {admitted:?}"
+                ),
+                Err(drop) => assert!(
+                    drop.rule() != PROXY_LANE_RULE,
+                    "the in-force set refuses the proxy's address as an undeclared \
+                     destination, not by the lane rule, got {}",
+                    drop.rule(),
+                ),
+            }
+        }
+
+        // Announced, the shipped interim: the node row — allow-all, and the
+        // row that decides the node plane until the flip — declares no lane,
+        // so the proxy rule drops the same frame. Either posture, no reach.
+        let frame = sessions::core::egress::summarize(&ipv4_frame(node, 6, proxy, 8118));
+        assert!(
+            matches!(
+                gate_verdict(
+                    &frame,
+                    None,
+                    &table,
+                    &baseline,
+                    &pins,
+                    UNREGISTERED_SOURCE_PHASE
+                ),
+                Err(GateDrop::ProxyLane { .. })
+            ),
+            "the interim node row carries no lane, so its frame to the proxy is the proxy \
+             rule's drop"
         );
     }
 
@@ -7036,6 +7417,9 @@ mod tests {
             /// The node-plane baseline set admitted the frame, decided
             /// beside the boxes' rows.
             AdmittedByBaseline,
+            /// The row's declared credentialed lane admitted the frame at
+            /// the proxy's address (NET-134): the admission no rules made.
+            AdmittedByProxyLane,
             /// The announced interim admitted the frame without consulting
             /// any rules: the shipped arm, until T66's flip (#1711).
             AdmittedByInterim,
@@ -7085,6 +7469,7 @@ mod tests {
                 Ok(GateAdmit::Baseline) => Verdict::AdmittedByBaseline,
                 Ok(GateAdmit::Row) if src == baseline.node_addr() => Verdict::AdmittedByNodeRow,
                 Ok(GateAdmit::Row) => Verdict::AdmittedByRow,
+                Ok(GateAdmit::ProxyLane) => Verdict::AdmittedByProxyLane,
                 Ok(GateAdmit::Unregistered { .. }) => Verdict::AdmittedByInterim,
                 Err(drop) => Verdict::Dropped(drop.rule()),
             };
@@ -7322,8 +7707,14 @@ mod tests {
                     attempt.port,
                 ),
                 // The shipped interim's admits are the gaps, each pinned to
-                // its in-force replacement by the verdict lookups below.
-                Verdict::AdmittedByNodeRow | Verdict::AdmittedByInterim | Verdict::Dropped(_) => {}
+                // its in-force replacement by the verdict lookups below. A
+                // proxy-lane admit is none of this test's attempts — no
+                // attempt names the proxy's address — and the arm keeps the
+                // match exhaustive for the ones that will.
+                Verdict::AdmittedByNodeRow
+                | Verdict::AdmittedByInterim
+                | Verdict::AdmittedByProxyLane
+                | Verdict::Dropped(_) => {}
             }
         }
 
