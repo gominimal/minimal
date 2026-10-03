@@ -1504,7 +1504,12 @@ pub(crate) async fn session_via_ssh(
             let _ = child.kill().await;
             std::process::exit(141);
         }
-        Err(e) => return Err(e).context("relaying ssh stdout"),
+        Err(e) => {
+            // Any other relay failure leaves ssh with nobody reading its
+            // output; stop it so the remote command does not outlive us.
+            let _ = child.kill().await;
+            return Err(e).context("relaying ssh stdout");
+        }
     };
     std::process::exit(exit_code_of(status));
 }
