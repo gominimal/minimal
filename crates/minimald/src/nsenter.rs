@@ -423,8 +423,9 @@ impl Injection {
     }
 
     /// Mark this injection as entering a none box, so the shim reinstalls the
-    /// none plan's full socket-family seal — every family but `AF_UNIX` —
-    /// after joining the namespaces.
+    /// none plan's full socket-family seal — every family but the ones the
+    /// box's own network namespace confines (`AF_UNIX`, `AF_INET`,
+    /// `AF_INET6`, `AF_NETLINK`) — after joining the namespaces.
     ///
     /// Every injection is sealed: without this marker the shim reinstalls the
     /// confined-families seal, the one every networked box launches under,

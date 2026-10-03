@@ -1280,6 +1280,67 @@ fn set_box_cover_marker(cover: &'static str) {
     }
 }
 
+/// Brings the loopback interface up in the current network namespace.
+///
+/// A fresh network namespace starts with `lo` down.  The networked path
+/// brings it up from outside the box (`switch.rs:207`), but a none box has
+/// no provider to do that — so the pre-exec closure does it here, before
+/// the socket-family filter is installed (the `AF_INET` socket the ioctl
+/// needs would be refused by the filter).  Best-effort: a none box whose
+/// `lo` stays down still runs, just without loopback.
+#[cfg(target_os = "linux")]
+fn bring_lo_up() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // SAFETY: socket(2) with valid arguments; async-signal-safe.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return;
+    }
+    // SAFETY: fd is a fresh, valid, owned socket fd.
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+    let fd = sock.as_raw_fd();
+
+    #[repr(C)]
+    struct IfReqFlags {
+        name: [libc::c_char; libc::IFNAMSIZ],
+        flags: libc::c_short,
+        _pad: [u8; 22],
+    }
+
+    let mut name_buf = [0 as libc::c_char; libc::IFNAMSIZ];
+    for (dst, b) in name_buf.iter_mut().zip(b"lo".iter()) {
+        *dst = *b as libc::c_char;
+    }
+
+    let mut flags = IfReqFlags {
+        name: name_buf,
+        flags: 0,
+        _pad: [0; 22],
+    };
+
+    // SAFETY: fd open; ifreq sized for the flags ioctls.
+    if unsafe {
+        libc::ioctl(
+            fd,
+            libc::SIOCGIFFLAGS as _,
+            std::ptr::from_mut(&mut flags).cast::<libc::c_void>(),
+        )
+    } < 0
+    {
+        return;
+    }
+    flags.flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+    // SAFETY: fd open; ifreq sized for the flags ioctls.
+    unsafe {
+        libc::ioctl(
+            fd,
+            libc::SIOCSIFFLAGS as _,
+            std::ptr::from_mut(&mut flags).cast::<libc::c_void>(),
+        );
+    }
+}
+
 /// The body of the launch closure in [`install_box_credentials`]: place the
 /// box in its classifier leaf, cover the tree the join went through, take
 /// the box's credentials, install the box's socket-family seal, then exec
@@ -1397,6 +1458,12 @@ fn exec_box_program(
             }
         }
     }
+    // Bring loopback up before taking the box credentials: the ioctl needs
+    // CAP_NET_ADMIN, which `assume_box_credentials` drops from the bounding
+    // set.  A none box has no provider to do this from outside; the networked
+    // path does it in `switch.rs:207`.  Best-effort: a box whose lo stays
+    // down still runs, just without loopback.
+    bring_lo_up();
     // SAFETY: `assume_box_credentials` is async-signal-safe; this is the
     // pre-exec moment it is for, with the namespace built and CAP_SETPCAP in
     // it still held.
@@ -1790,9 +1857,11 @@ impl<C: Channel> Sandbox<C> {
         // Socket-family seal for every plan. A fresh network namespace blocks
         // IP/UNIX flows, but AF_VSOCK is not subject to the network namespace,
         // so a process in any box could still reach the host over vsock.  The
-        // seal is an allowlist: the `none` plan's seal admits AF_UNIX alone,
-        // and every other plan's seal admits the families the box's own
-        // network namespace confines, so a family that reaches past the
+        // seal is an allowlist: the `none` plan's seal admits the families its
+        // own network namespace confines (unix, inet, inet6, netlink), so the
+        // box can use its own loopback, and every other plan's seal adds
+        // AF_PACKET (refused by the missing CAP_NET_RAW no box holds, per
+        // NET-083, not by this filter).  A family that reaches past the
         // namespace is refused in every box.  The filter is installed in the
         // child after hakoniwa has set up namespaces and credentials but
         // before exec, using `prctl` + `seccomp` via libc only.  A caller on
@@ -2761,13 +2830,12 @@ const SOCKETCALL_SOCKETPAIR: u32 = 8;
 /// Build the socket-family filter for a seal: a classic BPF seccomp program
 /// that admits the `socket()`/`socketpair()` calls whose address family the
 /// seal lists and refuses the rest with `EAFNOSUPPORT`.  Both seals are
-/// allowlists.  The `none` seal admits `AF_UNIX` alone, which stays working
-/// so the in-sandbox `min` helper and the minenv socket keep functioning;
-/// the confined-families seal admits the families the box's own network
-/// namespace confines — `AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK`,
-/// `AF_PACKET` — so no family that reaches past the namespace survives it.
-/// `AF_PACKET` sits on the admitted list because its refusal is the missing
-/// `CAP_NET_RAW` no box holds (NET-083), not this filter's.
+/// allowlists.  The `none` seal admits the families its own network
+/// namespace confines — `AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK` —
+/// so the box can use its own loopback; the confined-families seal adds
+/// `AF_PACKET` (refused by the missing `CAP_NET_RAW` no box holds, per
+/// NET-083, not by this filter).  No family that reaches past the namespace
+/// survives either seal.
 ///
 /// This program is the first instalment of the seccomp profile applied
 /// inside boxes (architecture.md AT9, open gap 2): the family list is
@@ -2794,10 +2862,17 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
     let kill_action = libc::SECCOMP_RET_KILL_PROCESS;
 
     // The families the seal admits, in the order the verdict tail compares
-    // them.  The `none` seal admits `AF_UNIX` alone; the confined-families
-    // seal admits the namespace-confined set.
+    // them.  The `none` seal admits the families its own network namespace
+    // confines — unix, inet, inet6, netlink — so the box can use its own
+    // loopback; the confined-families seal adds `AF_PACKET` (refused by the
+    // missing `CAP_NET_RAW` no box holds, per NET-083, not by this filter).
     let admitted: &[u32] = match seal {
-        network::SocketSeal::Full => &[libc::AF_UNIX as u32],
+        network::SocketSeal::Full => &[
+            libc::AF_UNIX as u32,
+            libc::AF_INET as u32,
+            libc::AF_INET6 as u32,
+            libc::AF_NETLINK as u32,
+        ],
         network::SocketSeal::ConfinedFamilies => &[
             libc::AF_UNIX as u32,
             libc::AF_INET as u32,
@@ -2935,7 +3010,7 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
         program: filter,
         seal,
         refused_families: match seal {
-            network::SocketSeal::Full => "every family but unix",
+            network::SocketSeal::Full => "every family but unix, inet, inet6, netlink",
             network::SocketSeal::ConfinedFamilies => {
                 "every family but unix, inet, inet6, netlink, packet"
             }
@@ -3955,7 +4030,8 @@ ff02::2\tip6-allrouters
 
     /// NET-038. The none-box filter refuses `AF_VSOCK` sockets (which bypass the
     /// network namespace) while still allowing the local `AF_UNIX` sockets the
-    /// sandbox's own minenv socket depends on, leaves every other syscall alone,
+    /// sandbox's own minenv socket depends on and the `AF_INET`/`AF_INET6`
+    /// sockets the box's own loopback needs, leaves every other syscall alone,
     /// admits the 32-bit compat ABI under the same family rules as the native
     /// ABI, and kills a caller on a truly foreign ABI rather than letting it
     /// through.  The production runtime effect is proved by
@@ -4047,7 +4123,7 @@ ff02::2\tip6-allrouters
         let filter = build_socket_family_filter(network::SocketSeal::Full);
         assert_eq!(filter.seal, network::SocketSeal::Full);
         assert_eq!(
-            filter.refused_families, "every family but unix",
+            filter.refused_families, "every family but unix, inet, inet6, netlink",
             "the launch log must name what the seal refuses"
         );
 
@@ -4066,8 +4142,8 @@ ff02::2\tip6-allrouters
         );
         assert_eq!(
             run(libc::SYS_socketpair, AUDIT_ARCH, libc::AF_INET as u32),
-            refuse,
-            "socketpair(AF_INET) must fail with EAFNOSUPPORT"
+            libc::SECCOMP_RET_ALLOW,
+            "socketpair(AF_INET) must stay allowed — the none seal admits inet"
         );
         assert_eq!(
             run(libc::SYS_socket, AUDIT_ARCH, libc::AF_UNIX as u32),
@@ -4090,8 +4166,8 @@ ff02::2\tip6-allrouters
         );
         assert_eq!(
             run(compat_socketpair, COMPAT_AUDIT_ARCH, libc::AF_INET as u32),
-            refuse,
-            "the compat ABI must refuse socketpair(AF_INET) with EAFNOSUPPORT"
+            libc::SECCOMP_RET_ALLOW,
+            "the compat ABI must keep socketpair(AF_INET) allowed"
         );
         assert_eq!(
             run(compat_socket, COMPAT_AUDIT_ARCH, libc::AF_UNIX as u32),
@@ -4163,14 +4239,12 @@ ff02::2\tip6-allrouters
             "the filter must keep AF_UNIX sockets working (errno {unix})"
         );
         assert_eq!(
-            inet,
-            libc::EAFNOSUPPORT as u8,
-            "the filter must refuse AF_INET with EAFNOSUPPORT"
+            inet, 0,
+            "the filter must keep AF_INET sockets working (errno {inet})"
         );
         assert_eq!(
-            inet6,
-            libc::EAFNOSUPPORT as u8,
-            "the filter must refuse AF_INET6 with EAFNOSUPPORT"
+            inet6, 0,
+            "the filter must keep AF_INET6 sockets working (errno {inet6})"
         );
         assert_eq!(
             vsock,
@@ -4197,20 +4271,21 @@ ff02::2\tip6-allrouters
     /// confine, whatever its network mode.  The plan picks the seal — the
     /// full `none` seal for [`NetPlan::none`], the confined-families seal for
     /// every other plan — and the seal picks the filter.  Both are
-    /// allowlists: the none seal admits `AF_UNIX` alone; the
-    /// confined-families seal admits the families the box's own network
-    /// namespace confines (`AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK`,
-    /// `AF_PACKET`), so it refuses `AF_VSOCK` — the family that reaches the
-    /// host whatever namespace the caller sits in — along with every other
-    /// family outside its list, without needing any of them named: the
-    /// simulated families below include `AF_BLUETOOTH` and `AF_ALG`, refused
-    /// because the allowlist does not carry them.  The confined seal's
-    /// program is what ships; these probes run the shipped filter against
-    /// the kernel this test executes on, exactly the way a host-address or
-    /// own-address box experiences it: install via `prctl` + `seccomp`, then
-    /// call `socket(2)` for real.  A control child runs unfiltered, so a
-    /// family the kernel itself cannot create (no AF_VSOCK driver, say) is
-    /// told apart from one the filter refused.
+    /// allowlists: the none seal admits the families its own network
+    /// namespace confines (`AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK`);
+    /// the confined-families seal adds `AF_PACKET` (refused by the missing
+    /// `CAP_NET_RAW` no box holds, per NET-083, not by this filter).  Both
+    /// refuse `AF_VSOCK` — the family that reaches the host whatever
+    /// namespace the caller sits in — along with every other family outside
+    /// their lists, without needing any of them named: the simulated
+    /// families below include `AF_BLUETOOTH` and `AF_ALG`, refused because
+    /// the allowlist does not carry them.  The confined seal's program is
+    /// what ships; these probes run the shipped filter against the kernel
+    /// this test executes on, exactly the way a host-address or own-address
+    /// box experiences it: install via `prctl` + `seccomp`, then call
+    /// `socket(2)` for real.  A control child runs unfiltered, so a family
+    /// the kernel itself cannot create (no AF_VSOCK driver, say) is told
+    /// apart from one the filter refused.
     #[cfg(target_os = "linux")]
     #[test]
     fn every_box_refuses_namespace_bypass_families() {
@@ -4220,34 +4295,26 @@ ff02::2\tip6-allrouters
             gateway: std::net::Ipv4Addr::new(10, 0, 0, 1),
             mtu: 1500,
         };
-        let plans: [(&str, network::NetPlan, network::SocketSeal, bool); 4] = [
+        let plans: [(&str, network::NetPlan, network::SocketSeal); 4] = [
             (
                 "host_ip",
                 network::NetPlan::host(),
                 network::SocketSeal::ConfinedFamilies,
-                true,
             ),
             (
                 "isolated",
                 network::NetPlan::isolated(),
                 network::SocketSeal::ConfinedFamilies,
-                true,
             ),
             (
                 "own_ip",
                 network::NetPlan::isolated_with_tap(tap),
                 network::SocketSeal::ConfinedFamilies,
-                true,
             ),
-            (
-                "none",
-                network::NetPlan::none(),
-                network::SocketSeal::Full,
-                false,
-            ),
+            ("none", network::NetPlan::none(), network::SocketSeal::Full),
         ];
         let refuse = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
-        for (name, plan, seal, admits_inet) in plans {
+        for (name, plan, seal) in plans {
             assert_eq!(plan.to_string(), name, "the plan under test");
             assert_eq!(plan.seal(), seal, "plan {name} must run under its seal");
             let filter = socket_family_filter_for_plan(&plan);
@@ -4291,27 +4358,16 @@ ff02::2\tip6-allrouters
             );
             let compat_inet = run(compat_socket, COMPAT_AUDIT_ARCH, libc::AF_INET as u32);
             let compat_inet6 = run(compat_socket, COMPAT_AUDIT_ARCH, libc::AF_INET6 as u32);
-            if admits_inet {
-                assert_eq!(
-                    compat_inet,
-                    libc::SECCOMP_RET_ALLOW,
-                    "{name}: a networked box must keep compat inet sockets"
-                );
-                assert_eq!(
-                    compat_inet6,
-                    libc::SECCOMP_RET_ALLOW,
-                    "{name}: a networked box must keep compat inet6 sockets"
-                );
-            } else {
-                assert_eq!(
-                    compat_inet, refuse,
-                    "{name}: the none seal must refuse compat AF_INET"
-                );
-                assert_eq!(
-                    compat_inet6, refuse,
-                    "{name}: the none seal must refuse compat AF_INET6"
-                );
-            }
+            assert_eq!(
+                compat_inet,
+                libc::SECCOMP_RET_ALLOW,
+                "{name}: a box must keep compat inet sockets"
+            );
+            assert_eq!(
+                compat_inet6,
+                libc::SECCOMP_RET_ALLOW,
+                "{name}: a box must keep compat inet6 sockets"
+            );
             // The allowlist is what meets "every family the namespace does
             // not confine" without enumerating it: a family outside the
             // list is refused whatever it is, the bypass families the old
@@ -4327,28 +4383,28 @@ ff02::2\tip6-allrouters
                      no family outside the seal's list may survive it"
                 );
             }
-            if admits_inet {
-                assert_eq!(
-                    run(libc::SYS_socket, AUDIT_ARCH, libc::AF_INET as u32),
-                    libc::SECCOMP_RET_ALLOW,
-                    "{name}: a networked box must keep its inet sockets"
-                );
-                assert_eq!(
-                    run(libc::SYS_socket, AUDIT_ARCH, libc::AF_INET6 as u32),
-                    libc::SECCOMP_RET_ALLOW,
-                    "{name}: a networked box must keep its inet6 sockets"
-                );
-                assert_eq!(
-                    run(libc::SYS_socket, AUDIT_ARCH, libc::AF_UNIX as u32),
-                    libc::SECCOMP_RET_ALLOW,
-                    "{name}: a networked box must keep its unix sockets"
-                );
-                assert_eq!(
-                    run(libc::SYS_socket, AUDIT_ARCH, libc::AF_NETLINK as u32),
-                    libc::SECCOMP_RET_ALLOW,
-                    "{name}: a networked box must keep its netlink sockets — \
-                     the namespace confines them"
-                );
+            assert_eq!(
+                run(libc::SYS_socket, AUDIT_ARCH, libc::AF_INET as u32),
+                libc::SECCOMP_RET_ALLOW,
+                "{name}: a box must keep its inet sockets"
+            );
+            assert_eq!(
+                run(libc::SYS_socket, AUDIT_ARCH, libc::AF_INET6 as u32),
+                libc::SECCOMP_RET_ALLOW,
+                "{name}: a box must keep its inet6 sockets"
+            );
+            assert_eq!(
+                run(libc::SYS_socket, AUDIT_ARCH, libc::AF_UNIX as u32),
+                libc::SECCOMP_RET_ALLOW,
+                "{name}: a box must keep its unix sockets"
+            );
+            assert_eq!(
+                run(libc::SYS_socket, AUDIT_ARCH, libc::AF_NETLINK as u32),
+                libc::SECCOMP_RET_ALLOW,
+                "{name}: a box must keep its netlink sockets — \
+                 the namespace confines them"
+            );
+            if seal == network::SocketSeal::ConfinedFamilies {
                 assert_eq!(
                     run(libc::SYS_socket, AUDIT_ARCH, libc::AF_PACKET as u32),
                     libc::SECCOMP_RET_ALLOW,
@@ -4358,9 +4414,9 @@ ff02::2\tip6-allrouters
                 );
             } else {
                 assert_eq!(
-                    run(libc::SYS_socket, AUDIT_ARCH, libc::AF_INET as u32),
+                    run(libc::SYS_socket, AUDIT_ARCH, libc::AF_PACKET as u32),
                     refuse,
-                    "{name}: the none seal must refuse AF_INET with EAFNOSUPPORT"
+                    "{name}: the none seal must refuse AF_PACKET with EAFNOSUPPORT"
                 );
             }
         }
