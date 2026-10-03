@@ -6586,6 +6586,10 @@ s.close()' "$1"
   # holding whatever port it selected, and the next run's pick (or the soak's
   # next rep) would inherit the confusion this case exists to explain.
   recover_two_daemon_cleanup() {
+    if [ -n "$RECOVER_HOLDER_PID" ]; then
+      kill "$RECOVER_HOLDER_PID" 2>/dev/null || true
+      RECOVER_HOLDER_PID=""
+    fi
     mnl session destroy --force "$recover_sid" >/dev/null 2>&1 || true
     if [ -n "${second_sid:-}" ]; then
       mnl2 session destroy --force "$second_sid" >/dev/null 2>&1 || true
@@ -6922,6 +6926,32 @@ while True:
 
   # ---- beat D: a second daemon on the same machine ------------------------
   echo "beat D: a second daemon under its own state dir"
+  # Beat A picked a spare pin when 7654 looked busy, but that holder may be
+  # gone by now (a daemon still shutting down from the stop above releases
+  # it a moment later). Re-assert the invariant rather than trust beat A's
+  # probe: if 7654 is free, hold it ourselves so the second daemon's
+  # default is busy and it must relocate.
+  if [ "$RECOVER_PIN" != 7654 ] && recover_port_free 7654; then
+    python3 -c 'import socket,sys,time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(("127.0.0.1", 7654))
+s.listen(1)
+while True:
+    time.sleep(3600)' \
+      >/dev/null 2>"$WORK/recover-default-holder.err" &
+    RECOVER_HOLDER_PID=$!
+    holder_bound=""
+    for _ in $(seq 1 40); do
+      if ! recover_port_free 7654; then holder_bound=1; break; fi
+      sleep 0.25
+    done
+    if [ -z "$holder_bound" ]; then
+      echo "::error::7654 was free at beat D and the stand-in holder never took it — the relocation cannot be staged"
+      echo "--- holder stderr ---"; cat "$WORK/recover-default-holder.err" 2>/dev/null || true
+      fail
+    fi
+    echo "default port: 7654 was free again, so python3 holds it (pid $RECOVER_HOLDER_PID) for the second daemon's start"
+  fi
   RECOVER_STATE2_DIR="$WORK/state2"
   mkdir -p "$RECOVER_STATE2_DIR"
   mnl2() { min --minimal-dir "$RECOVER_STATE2_DIR" "$@"; }
