@@ -500,7 +500,13 @@ enum SessionMessage {
     /// never by the actor itself, which must not park on a human. `None`
     /// means nobody was attached to answer, which is the ask's own
     /// fail-closed case rather than an error to report.
+    ///
+    /// Carries the ask's [`AskId`], not just its port: two asks can share a
+    /// port, and an answer that arrived keyed only by that would pop whichever
+    /// ask on it parked first — a late fail-closed answer would refuse the
+    /// wrong asker while its dialog was still on screen.
     AskAnswered {
+        id: AskId,
         port: u16,
         answer: Option<session_host::AskAnswer>,
     },
@@ -509,6 +515,13 @@ enum SessionMessage {
     /// assert composition contents without disturbing the lifecycle.
     #[cfg(test)]
     PeekComposition(oneshot::Sender<Option<Arc<Composition>>>),
+    /// Test-only inspection: the ids of the runtime port-publish asks still
+    /// parked on a human (NET-045), in route order, paired with their ports.
+    /// Lets tests name the asks they answer out of band — the interleaving a
+    /// racy hand-off failure can produce in production, reconstructed
+    /// deterministically here — without disturbing the lifecycle.
+    #[cfg(test)]
+    PeekPendingAsks(oneshot::Sender<Vec<(AskId, u16)>>),
 }
 
 /// One live dynamic-ingress publish (NET-044): the forwarder the switch
@@ -533,18 +546,29 @@ impl fmt::Debug for LiveIngressForward {
     }
 }
 
+/// The key an ask parks under (NET-045): minted per request the session
+/// routes, never derived from the port — two concurrent requests can share a
+/// port. The ask's continuation ([`SessionMessage::AskAnswered`]) carries it
+/// back, so an answer reaches the ask it answers even when another ask on the
+/// same port is parked ahead of it, and a late fail-closed answer for an ask
+/// that already ended does not pop its neighbour instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AskId(u64);
+
 /// One runtime port-publish request this box decided `ask`, parked until the
 /// attached human answers the dialog it was routed to (NET-045).
 ///
 /// The caller's reply travels with it because the actor never answers the
 /// request itself: it answers from [`Session::resume_ask`] once the human
 /// has, or fail-closed from [`Session::stop_running`] when the session is
-/// going away and nobody can. Keyed by port — the one fact the continuation
-/// message carries back — and answered first-in-first-out within a port, so
-/// two asks for the same port each reach their own asker.
+/// going away and nobody can. Keyed by [`AskId`] — the id the continuation
+/// message carries back — so two asks for the same port each reach their own
+/// asker however their answers arrive.
 #[derive(Debug)]
 struct PendingAsk {
-    /// The port the box asked to publish, and the ask's key.
+    /// The ask's key: the id its continuation carries back.
+    id: AskId,
+    /// The port the box asked to publish.
     port: u16,
     /// The box's record as it stood when the ask was routed: the publish an
     /// allow ends up running needs the address pair the box's registration
@@ -610,6 +634,11 @@ pub struct Session {
     /// nothing waiting on a human; drained fail-closed by
     /// [`Session::stop_running`].
     pending_asks: Vec<PendingAsk>,
+
+    /// The counter behind [`AskId`]: the actor mints one id per ask it parks,
+    /// so ids are unique within the session and monotonic in route order —
+    /// and carry no meaning beyond that.
+    next_ask_id: u64,
 
     /// The root of this session's operation tree - tracks long-running
     /// operations for display.
@@ -737,8 +766,10 @@ impl Session {
             // live until a `min net expose` inside it lands (NET-044).
             live_ingress: Vec::new(),
             // And for the asks routed to a human: nothing waits until a
-            // request decided `ask` lands (NET-045).
+            // request decided `ask` lands (NET-045), and the first of those
+            // takes the first id.
             pending_asks: Vec::new(),
+            next_ask_id: 0,
             #[cfg(target_os = "linux")]
             hostnames,
             #[cfg(target_os = "linux")]
@@ -1649,8 +1680,8 @@ impl Session {
                 )]
                 let _ = r.send(self.live_ingress_snapshot());
             }
-            SessionMessage::AskAnswered { port, answer } => {
-                self.resume_ask(port, answer).await;
+            SessionMessage::AskAnswered { id, port, answer } => {
+                self.resume_ask(id, port, answer).await;
             }
             SessionMessage::GetRecord(r) => {
                 let _ = r.send(self.record.record().await.unwrap());
@@ -1671,6 +1702,19 @@ impl Session {
                     SessionInner::Active { composition, .. } => composition.clone(),
                     SessionInner::Draft { .. } => None,
                 });
+            }
+            #[cfg(test)]
+            SessionMessage::PeekPendingAsks(r) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
+                let _ = r.send(
+                    self.pending_asks
+                        .iter()
+                        .map(|ask| (ask.id, ask.port))
+                        .collect(),
+                );
             }
         }
         ControlFlow::Continue(())
@@ -2326,7 +2370,13 @@ impl Session {
                 return;
             }
         };
+        // Minted before the park, not derived from the port: two asks can
+        // share a port, and the continuation below keys on this so each
+        // answer reaches the ask it answers however their answers arrive.
+        let id = AskId(self.next_ask_id);
+        self.next_ask_id += 1;
         self.pending_asks.push(PendingAsk {
+            id,
             port,
             record,
             box_name,
@@ -2339,24 +2389,30 @@ impl Session {
             // pending asks fail-closed (`stop_running`), so a handle that
             // will not promote is the normal end of a late answer.
             if let Some(handle) = weak.upgrade() {
-                handle.ask_answered(port, answer).await;
+                handle.ask_answered(id, port, answer).await;
             }
         });
     }
 
     /// Continues a parked runtime port-publish ask (NET-045) with the attached
     /// human's answer — or its absence, which is the ask's own fail-closed
-    /// refusal. The pending request's reply is answered here and its decision
-    /// audited (NET-046), whichever way it went: an allow runs the publish
-    /// half against the record the ask was routed with, a deny is the box's
-    /// own deny answer in the human's hand, and nobody attached is the typed
-    /// nobody-is-attached refusal the request ends with.
-    async fn resume_ask(&mut self, port: u16, answer: Option<session_host::AskAnswer>) {
-        let Some(position) = self.pending_asks.iter().position(|ask| ask.port == port) else {
+    /// refusal. The ask is found by its [`AskId`], not its port: two asks can
+    /// share a port, and the answer is whatever the task the *ask* routed
+    /// came back with. The pending request's reply is answered here and its
+    /// decision audited (NET-046), whichever way it went: an allow runs the
+    /// publish half against the record the ask was routed with, a deny is the
+    /// box's own deny answer in the human's hand, and nobody attached is the
+    /// typed nobody-is-attached refusal the request ends with.
+    async fn resume_ask(&mut self, id: AskId, port: u16, answer: Option<session_host::AskAnswer>) {
+        let Some(position) = self.pending_asks.iter().position(|ask| ask.id == id) else {
             // The ask already ended another way — the session answered it
             // fail-closed on its way down — or the asker went away. Nothing
-            // is waiting on this answer.
-            tracing::debug!(
+            // is waiting on this answer, and no decision changes: said at
+            // info like the answer it failed to be, because an answer the
+            // audit cannot account for is the line that explains the port
+            // that did not publish.
+            tracing::info!(
+                id = id.0,
                 port,
                 "a runtime port-publish answer arrived with no ask waiting for it"
             );
@@ -2370,7 +2426,7 @@ impl Session {
             // allowed ask can end refused, with the switch asked only now
             // (NET-047).
             Some(session_host::AskAnswer::Allowed) => {
-                self.publish_exposed_port(&ask.record, port).await
+                self.publish_exposed_port(&ask.record, ask.port).await
             }
             // The human said deny — or left the dialog any of the ways that
             // mean deny (cancel, EOF, a client that walked away): the box's
@@ -2392,7 +2448,7 @@ impl Session {
         };
         self.answer_expose(
             &ask.box_name,
-            port,
+            ask.port,
             sessions::DynamicIngress::Ask,
             decided_by,
             outcome,
@@ -3902,19 +3958,44 @@ impl SessionHandle {
 
     /// Continues a parked runtime port-publish ask (NET-045) with the attached
     /// human's answer, or its absence — sent by the task
-    /// [`Session::route_ask`] spawned, never by the actor itself. Best-effort
+    /// [`Session::route_ask`] spawned, never by the actor itself. Keyed by the
+    /// ask's [`AskId`] so the answer reaches the ask it answers. Best-effort
     /// by shape: a session that has already stopped has answered its asks
     /// fail-closed, so a message that does not land is the normal end of a
     /// late answer, not a loss.
-    pub(crate) async fn ask_answered(&self, port: u16, answer: Option<session_host::AskAnswer>) {
+    pub(crate) async fn ask_answered(
+        &self,
+        id: AskId,
+        port: u16,
+        answer: Option<session_host::AskAnswer>,
+    ) {
         #[expect(
             clippy::let_underscore_must_use,
             reason = "the session may already be gone; its asks were answered fail-closed then"
         )]
         let _ = self
             .0
-            .send(SessionMessage::AskAnswered { port, answer })
+            .send(SessionMessage::AskAnswered { id, port, answer })
             .await;
+    }
+
+    /// Test-only: the ids of the runtime port-publish asks still parked on a
+    /// human (NET-045), in route order, paired with their ports. Lets a test
+    /// answer a specific ask through [`Self::ask_answered`] — the same path
+    /// the routed task's answer takes — without guessing which park it
+    /// reached.
+    #[cfg(test)]
+    pub(crate) async fn pending_ask_ids(&self) -> Vec<(AskId, u16)> {
+        let (send, recv) = oneshot::channel();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the actor may already be gone; an empty peek is the honest answer then"
+        )]
+        let _ = self.0.send(SessionMessage::PeekPendingAsks(send)).await;
+        // A dead actor has no asks parked, and `Vec`'s default says exactly
+        // that — which is also the truth about a session that stopped, since
+        // `stop_running` answered them all fail-closed first.
+        recv.await.unwrap_or_default()
     }
 
     /// The live dynamic-ingress mappings this box published at runtime
