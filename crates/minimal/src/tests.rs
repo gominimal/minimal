@@ -30,6 +30,38 @@ fn ssh_status_becomes_the_clients_exit_code() {
     assert_eq!(exit_code_of(std::process::ExitStatus::from_raw(9)), 137);
 }
 
+/// The exec-path stdout relay copies data from a reader to a writer and
+/// returns `BrokenPipe` when the writer's far end closes (#815).
+#[tokio::test]
+async fn exec_stdout_relay_copies_and_detects_broken_pipe() {
+    use tokio::io::AsyncWriteExt as _;
+
+    // Clean EOF: write "hello\n" then drop the write half, so the read half
+    // yields the bytes and then EOF. The relay should copy and return Ok.
+    let (mut src, mut rx) = tokio::io::duplex(64);
+    src.write_all(b"hello\n").await.unwrap();
+    drop(src);
+    let mut sink = tokio::io::sink();
+    relay_exec_stdout(&mut rx, &mut sink)
+        .await
+        .expect("relay should succeed on clean EOF");
+
+    // BrokenPipe: the writer's far end is closed, so the first write fails.
+    let (mut src, mut rx) = tokio::io::duplex(64);
+    src.write_all(b"world\n").await.unwrap();
+    drop(src);
+    let (mut writer, reader) = tokio::io::duplex(64);
+    drop(reader); // close the read half of the duplex
+    let err = relay_exec_stdout(&mut rx, &mut writer)
+        .await
+        .expect_err("relay should fail when the writer's far end is closed");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::BrokenPipe,
+        "relay should return BrokenPipe when writer's far end closes"
+    );
+}
+
 /// A CLI upgraded past its daemon must be refused up front, naming both
 /// builds and the recovery. Before #1251 the skew surfaced only at
 /// `FinalizeSession`, by which point the activation's cleanup had already

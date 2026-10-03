@@ -1483,9 +1483,30 @@ pub(crate) async fn session_via_ssh(
         std::process::exit(code);
     }
 
-    let err = ssh.exec();
-    // exec() only returns on failure
-    bail!("failed to exec ssh: {err}");
+    // The exec path spawns ssh with stdout piped so this process can relay
+    // it. When the local reader closes (e.g. `head -1`), the write to
+    // stdout fails with BrokenPipe; we kill ssh and exit 141 (128+SIGPIPE)
+    // rather than leaving the remote process running indefinitely (#815).
+    ssh.stdout(std::process::Stdio::piped());
+    let mut child = tokio::process::Command::from(ssh)
+        .spawn()
+        .context("failed to spawn ssh")?;
+    let ssh_stdout = child.stdout.take().context("ssh stdout not piped")?;
+    let mut local_stdout = tokio::io::stdout();
+    let status = match relay_exec_stdout(ssh_stdout, &mut local_stdout).await {
+        Ok(()) => {
+            // ssh stdout closed cleanly; wait for the child and propagate
+            // its exit status.
+            child.wait().await.context("ssh exited")?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            // Local reader closed; kill ssh and exit 141.
+            let _ = child.kill().await;
+            std::process::exit(141);
+        }
+        Err(e) => return Err(e).context("relaying ssh stdout"),
+    };
+    std::process::exit(exit_code_of(status));
 }
 
 /// A child's exit status as this process's exit code, following the shell's
@@ -1497,6 +1518,25 @@ pub(crate) fn exit_code_of(status: std::process::ExitStatus) -> i32 {
         .code()
         .or_else(|| status.signal().map(|s| 128 + s))
         .unwrap_or(1)
+}
+
+/// Relay a reader's bytes to a writer until the reader reaches EOF. Returns
+/// `BrokenPipe` when the writer's far end closes first, so the caller can
+/// kill the child whose output it was relaying (#815).
+pub(crate) async fn relay_exec_stdout<R, W>(mut from: R, to: &mut W) -> Result<(), std::io::Error>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = from.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        to.write_all(&buf[..n]).await?;
+        to.flush().await?;
+    }
 }
 
 /// Print the effective networking rules for a session.
