@@ -6969,10 +6969,20 @@ proof_own_ip_deny_all_box_answers_published_port() {
   # from the host's own socket table: /proc/net/tcp spells an IPv4 socket's
   # local address as the address' four octets in little-endian order with the
   # port in big-endian hex — 127.64.0.14:18086 reads `0E00407F:46A6` — so
-  # the match pins the reserved range's trailing octets (00407F, the
-  # little-endian of 127.64.0) and the port, in the LISTEN state, and the
-  # decode flips the octets back. A macOS VM host has neither a readable
-  # record nor /proc, so that leg names itself skipped there.
+  # the match pins the port, the LISTEN state, and the loopback half of
+  # either spelling the publish surface can bind a box's port at: `127.64.0.x`,
+  # the reserved local range a granted publish answers on (NET-010), or
+  # `127.0.0.1`, the interim a publish stands at where the surface's range
+  # verdict read the range absent (NET-123). The KVM lane lands absent: the
+  # range walk rides the same shuttle the publishes do, and the host gate
+  # refuses every one of its probe rounds — the probe's `remote` is a
+  # placeholder, so no registered row holds the address its publish is keyed
+  # at — so the interim is that lane's own answer, not a broken publish.
+  # The reserved-range arm is tried first and stays for a lane whose verdict
+  # lands present, and the marker the dial below demands keeps either
+  # spelling honest: a stray host listener at the same port does not carry
+  # this box's answer. A macOS VM host has neither a readable record nor
+  # /proc, so that leg names itself skipped there.
   da_daemon_log() {
     find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null \
       | sort | tail -n1
@@ -7000,19 +7010,28 @@ proof_own_ip_deny_all_box_answers_published_port() {
       da_row="$(awk -v want="$(printf '%04X' "$DA_EXT")" \
         'substr($2, 7, 2) == "7F" && substr($2, 5, 2) == "40" && substr($2, 3, 2) == "00" \
          && $4 == "0A" && index($2, ":" want) == 9 { print $2 }' /proc/net/tcp 2>/dev/null | tail -n1)"
+      if [ -z "$da_row" ]; then
+        da_row="$(awk -v want="$(printf '%04X' "$DA_EXT")" \
+          'substr($2, 1, 8) == "0100007F" \
+           && $4 == "0A" && index($2, ":" want) == 9 { print $2 }' /proc/net/tcp 2>/dev/null | tail -n1)"
+      fi
       [ -n "$da_row" ] && break
       sleep 0.25
     done
     if [ -z "$da_row" ]; then
-      echo "::error::no listener in the host's socket table sits in the reserved local range at port $DA_EXT — the switch never bound the deny-all box's published port on this host's loopback"
-      echo "--- /proc/net/tcp (reserved-range listeners) ---"
-      awk 'substr($2, 7, 2) == "7F" && substr($2, 5, 2) == "40" && $4 == "0A" { print }' \
+      echo "::error::no listener in the host's socket table sits on this host's loopback at port $DA_EXT — neither an address of the reserved local range nor the 127.0.0.1 interim — so the switch never bound the deny-all box's published port"
+      echo "--- /proc/net/tcp (loopback listeners) ---"
+      awk 'substr($2, 7, 2) == "7F" && $4 == "0A" { print }' \
         /proc/net/tcp 2>/dev/null | head -20
       fail
     fi
     da_pub_addr="$(printf '%d.%d.%d.%d' \
       "0x${da_row:6:2}" "0x${da_row:4:2}" "0x${da_row:2:2}" "0x${da_row:0:2}")"
-    echo "host listener: $da_pub_addr:$DA_EXT (read from the host's own socket table — this lane's daemon log is the guest's)"
+    if [ "$da_pub_addr" = "127.0.0.1" ]; then
+      echo "host listener: $da_pub_addr:$DA_EXT (read from the host's own socket table — this lane's daemon log is the guest's; the publish stands at the 127.0.0.1 interim, this surface's absent range verdict)"
+    else
+      echo "host listener: $da_pub_addr:$DA_EXT (read from the host's own socket table — this lane's daemon log is the guest's; the reserved local range)"
+    fi
   else
     echo "forwarder leg SKIPPED on this lane: the daemon's expose record is the guest's and this host has no /proc to read its socket table from — the Linux KVM lane asserts this leg, and the host gate's unit tests pin the forwarder's dial recording the flow its answer reverses"
   fi
