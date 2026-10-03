@@ -789,6 +789,27 @@ async fn rename_by_name() {
     .unwrap();
 }
 
+#[tokio::test]
+async fn rename_to_self_is_an_error() {
+    let (daemon, args) = setup().await;
+    let session_id = create_session(&daemon, "same-name").await;
+
+    let err = cmd_rename(
+        &args,
+        RenameArgs {
+            session: session_id.to_string(),
+            new_name: "same-name".to_string(),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        err.to_string().contains("session is already named"),
+        "expected a rename-to-self error, got: {err}"
+    );
+}
+
 // --- session policy ---
 
 #[tokio::test]

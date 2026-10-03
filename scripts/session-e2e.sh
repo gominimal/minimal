@@ -69,12 +69,13 @@
 # the order below; with a case name only that proof runs, standalone, against
 # the same fresh state dir and seeds the full lane gets. Most proofs mint (and
 # destroy) the sessions they need themselves; `session_exec`,
-# `session_outbound_request` and `sandbox` instead share the one `lifecycle`
-# activates first in a whole-lane run — and mint an equivalent session of their
-# own when they run alone (see proof_shared_session), so every case name below
-# is runnable by itself.
+# `session_rename`, `session_outbound_request` and `sandbox` instead share the
+# one `lifecycle` activates first in a whole-lane run — and mint an equivalent
+# session of their own when they run alone (see proof_shared_session), so every
+# case name below is runnable by itself.
 #   lifecycle                        cold activate → list → warm → destroy
 #   session_exec                     `min session exec` in the session's namespaces
+#   session_rename                   `min session rename`; rename-to-self refused
 #   session_outbound_request         an outbound request from inside the session (NET-107)
 #   own_ip                           `--network own_ip` tap + switch attach
 #   own_ip_egress_declared_and_enforced
@@ -728,6 +729,59 @@ if grep -q "unsupported command" "$lookalike_err"; then
   fail
 fi
 echo "session exec proof OK"
+echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# Session rename proof: `min session rename` against the live shared session.
+# The new name shows up in `ls --json`, the old name stops resolving, and
+# rename-to-self is an error rather than a silent no-op. The original name is
+# restored afterwards: the sandbox proof asserts the orientation banner
+# interpolates $SESSION_NAME, so the shared session must carry it again.
+proof_session_rename() {
+echo "::group::session rename proof (min session rename)"
+proof_shared_session
+
+RENAMED_NAME="e2e-renamed"
+mnl session rename "$sid" "$RENAMED_NAME" >/dev/null 2>"$WORK/rename.err" \
+  || { echo "::error::'min session rename $sid $RENAMED_NAME' failed"; cat "$WORK/rename.err" 2>/dev/null || true; fail; }
+
+ls_json="$(mnl ls --json 2>"$WORK/ls-json.err")" \
+  || { echo "::error::'min ls --json' failed"; cat "$WORK/ls-json.err" 2>/dev/null || true; fail; }
+# One python3 pass over the captured JSON — never `| grep -q`, whose early
+# exit SIGPIPEs the producer under pipefail and reads as "not found".
+if ! printf '%s' "$ls_json" | python3 -c '
+import json, sys
+names = [s.get("name") for s in json.load(sys.stdin)["sessions"]]
+want, old = sys.argv[1], sys.argv[2]
+if want not in names:
+    sys.exit("renamed name not listed")
+if old in names:
+    sys.exit("pre-rename name still listed")
+' "$RENAMED_NAME" "$SESSION_NAME"; then
+  echo "::error::'min ls --json' does not reflect the rename (want '$RENAMED_NAME', old '$SESSION_NAME' gone)"
+  echo "--- ls --json ---"; printf '%s\n' "$ls_json"
+  fail
+fi
+
+# The old name must no longer resolve to a session.
+if mnl session policy "$SESSION_NAME" >/dev/null 2>"$WORK/policy-old.err"; then
+  echo "::error::'min session policy $SESSION_NAME' still resolves after the rename"
+  fail
+fi
+
+# Rename-to-self must be an error, not a silent no-op.
+if mnl session rename "$sid" "$RENAMED_NAME" >/dev/null 2>"$WORK/rename-self.err"; then
+  echo "::error::'min session rename $sid $RENAMED_NAME' (rename-to-self) unexpectedly succeeded"
+  fail
+fi
+grep -q "session is already named" "$WORK/rename-self.err" \
+  || { echo "::error::rename-to-self error does not say 'session is already named'"; cat "$WORK/rename-self.err" 2>/dev/null || true; fail; }
+
+mnl session rename "$sid" "$SESSION_NAME" >/dev/null 2>"$WORK/rename-back.err" \
+  || { echo "::error::'min session rename $sid $SESSION_NAME' (restore) failed"; cat "$WORK/rename-back.err" 2>/dev/null || true; fail; }
+
+echo "session rename proof OK"
 echo "::endgroup::"
 }
 
@@ -6304,7 +6358,8 @@ proof_min_internal_names_through_proxy() {
 #   * an undeclared port — refused by the OS on the direct leg (host-address
 #     box: nothing listens), refused by the proxy with that same refusal as
 #     its reason (502), and on a VM lane refused by the target's ingress
-#     declaration on BOTH legs (dropped SYN direct, 403 proxied);
+#     declaration on BOTH legs (connection-refused direct — the ingress
+#     gate answers the SYN with a reset, NET-014 — 403 proxied);
 #   * a caller whose egress rules deny the target — the caller's own gate
 #     drops its direct SYN, and the proxy refuses its request before dialing
 #     (403), against the same request routing from an ungated box;
@@ -6349,8 +6404,10 @@ proof_proxy_refuses_like_direct() {
   }
 
   # One DIRECT attempt from a box: curl's exit code and its stderr ARE the
-  # refusal a direct connection gets — an OS-refused connection is curl 7, a
-  # SYN a target's gate silently dropped is a connect timeout, curl 28.
+  # refusal a direct connection gets — a refused connection is curl 7 (the
+  # OS on a port nothing listens on, or a target's ingress gate answering a
+  # SYN to a port the box never declared with a reset, NET-014), a SYN an
+  # egress gate silently dropped is a connect timeout, curl 28.
   par_direct() { # $1 box, $2 url, $3 max-time
     mnl session exec "$1" "curl -sS --max-time $3 -o /dev/null '$2'" \
       2>"$WORK/par-direct.err"
@@ -6383,7 +6440,7 @@ proof_proxy_refuses_like_direct() {
   PAR_ECHO_PORT=18085               # the in-box echo responder (served + routed)
   PAR_DEAD_PORT=18086               # nothing listens: the OS refusal, both legs
   PAR_OWN_PORT=18087                # the target's published port (ext == int)
-  PAR_OWN_CLOSED_PORT=18088         # never published: dropped direct, 403 proxied
+  PAR_OWN_CLOSED_PORT=18088         # never published: refused direct, 403 proxied
   PAR_OWN_MARKER="PAR_OWN_ROUTED_OK"
 
   # The request origin: a host-address box, sharing its host's loopback —
@@ -6702,9 +6759,12 @@ PAR_EO
     # ---- pair 4: an undeclared port, own-address target --------------------
     # Both legs are refused by the ONE declaration: the proxy refuses the
     # request before dialing (403, where the host, the session and the port
-    # are all in hand), and the target's ingress gate drops the direct SYN —
-    # a drop is not a reset, so the direct leg is a connect timeout, which is
-    # itself the assertion that the gate sat between.
+    # are all in hand), and the target's ingress gate answers the direct SYN
+    # with a reset (NET-014) — the direct leg is connection-refused, fast,
+    # never a connect timeout; the unit proofs hold the gate itself to the
+    # reset (`unpublished_port_connection_refused`), and the pair here holds
+    # the end-to-end refusal against the proxy's, which is the parity the
+    # pair exists for.
     par_direct "$par_sid" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/" 5
     par_direct_rc="$PAR_RC"
     par_direct_line="GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/ -> curl exit $PAR_RC: $(head -n1 "$WORK/par-direct.err" 2>/dev/null || true)"
@@ -6712,8 +6772,8 @@ PAR_EO
     par_pair "an undeclared port, own-address box" \
       "$par_direct_line" \
       "GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/ via the proxy -> HTTP ${PAR_STATUS:-<none>} ($(head -n1 "$WORK/par-proxied.err" 2>/dev/null || true))"
-    [ "$par_direct_rc" -eq 28 ] || {
-      echo "::error::the direct attempt to the target's unpublished port did not end in a connect timeout (curl exit $par_direct_rc, expected 28) — the target's ingress gate did not drop it, or something answered"
+    [ "$par_direct_rc" -eq 7 ] || {
+      echo "::error::the direct attempt to the target's unpublished port did not end in a refused connection (curl exit $par_direct_rc, expected 7) — the target's ingress gate did not reset it (a drop reads as connect timeout 28, the shape NET-014 retires)"
       echo "--- curl stderr ---"; cat "$WORK/par-direct.err" 2>/dev/null || true
       fail
     }
@@ -7839,6 +7899,7 @@ case "${1:-}" in
   "")
     proof_lifecycle
     proof_session_exec
+    proof_session_rename
     proof_session_outbound_request
     proof_own_ip
     proof_own_ip_egress_declared_and_enforced
@@ -7861,7 +7922,7 @@ case "${1:-}" in
     proof_switch_answers_no_arp_for_the_proxy_address
     proof_github_only_allowlist
     ;;
-  lifecycle | session_exec | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
+  lifecycle | session_exec | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
     | network_posture_from_stock_install | native_resolution_without_proxy_env \
     | hostnames_recover_and_two_daemons_route \
@@ -7875,7 +7936,7 @@ case "${1:-}" in
   *)
     echo "usage: $0 [case]"
     echo "  no argument: every proof, in the whole-lane order"
-    echo "  cases: lifecycle session_exec session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run hooks"
+    echo "  cases: lifecycle session_exec session_rename session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run hooks"
     echo "         skip_scaffold sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
     echo "         network_posture_from_stock_install native_resolution_without_proxy_env"
     echo "         fresh_linux_kvm_activate_local_minvmd fresh_arm64_kvm_activate_local_minvmd"
