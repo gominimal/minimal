@@ -1886,27 +1886,74 @@ fn run_step(mount: &StandinMount, mode: &[&str], nft_dir: Option<&Path>) -> std:
         .expect("running the privileged step over the stand-in mount")
 }
 
+/// The account the install's tree is delegated to on the lane that runs
+/// it, named through the step's own sudo seam — the account that ran
+/// sudo, as an install a person runs names: this process's own account on
+/// a lane that is not root. A lane that runs as root has no such account,
+/// and root's own id is the one the step refuses to delegate to, so it
+/// names a non-root id the kernel has a mapping for instead: the
+/// delegation is the install's own fact either way, and what the lanes
+/// below pin is the bytes the step pipes, not the account that ends up
+/// owning the tree.
+#[cfg(test)]
+fn delegated_owner() -> (u32, u32) {
+    let uid = unsafe { libc::geteuid() };
+    if uid != 0 {
+        return (uid, unsafe { libc::getegid() });
+    }
+    // A numeric chown to an id no user namespace maps fails with EINVAL,
+    // so the namespace's own map decides the id, and nobody's is the
+    // stand-in when the map carries no non-root one at all.
+    let mapped = |file: &str| {
+        std::fs::read_to_string(file)
+            .ok()
+            .and_then(|map| mapped_non_root_id(&map))
+            .unwrap_or(65534)
+    };
+    (mapped("/proc/self/uid_map"), mapped("/proc/self/gid_map"))
+}
+
+/// The smallest non-root id one of a user namespace's maps carries: the
+/// map's columns are the inside id, the outside id it maps to, and how
+/// many ids the line covers, and a lane that runs this suite as root can
+/// still not chown to an id its kernel has no mapping for.
+#[cfg(test)]
+fn mapped_non_root_id(map: &str) -> Option<u32> {
+    for line in map.lines() {
+        let mut columns = line.split_whitespace();
+        let (Some(inside), Some(_outside), Some(count)) =
+            (columns.next(), columns.next(), columns.next())
+        else {
+            continue;
+        };
+        if let (Ok(inside), Ok(count)) = (inside.parse::<u32>(), count.parse::<u32>()) {
+            if inside > 0 {
+                return Some(inside);
+            }
+            if count > 1 {
+                return Some(1);
+            }
+        }
+    }
+    None
+}
+
 /// The install lane over a stand-in mount: the step lays out its tree,
 /// delegates it, and hands its one transaction to whatever `nft` a PATH
 /// with `nft_dir` prepended resolves to — a recording stub, so the bytes
 /// it pipes to the packet filter are captured whole. The account the tree
-/// is delegated to is this process's own, named through the step's sudo
-/// seam, because an install a person runs names the account that ran
-/// sudo. `None` when this process is root: the step refuses to delegate
-/// its tree to root, so there is no install to rehearse.
+/// is delegated to is named through the step's sudo seam whatever uid the
+/// lane runs as — see [`delegated_owner`] — so the lane asserts on root
+/// lanes too, not only where a person's account happens to be the one
+/// that ran sudo.
 #[cfg(test)]
-fn run_install(mount: &StandinMount, nft_dir: &Path) -> Option<std::process::Output> {
-    let uid = unsafe { libc::geteuid() };
-    if uid == 0 {
-        return None;
-    }
+fn run_install(mount: &StandinMount, nft_dir: &Path) -> std::process::Output {
     let mut step = step_command(mount, &[], Some(nft_dir));
+    let (uid, gid) = delegated_owner();
     step.env("SUDO_UID", uid.to_string())
-        .env("SUDO_GID", unsafe { libc::getegid() }.to_string());
-    Some(
-        step.output()
-            .expect("running the privileged step's install over the stand-in mount"),
-    )
+        .env("SUDO_GID", gid.to_string());
+    step.output()
+        .expect("running the privileged step's install over the stand-in mount")
 }
 
 /// The installer's rendered table, exactly as a host loads it, over a
@@ -2691,6 +2738,47 @@ mod tests {
     /// `nft -f` transaction — the bytes a native host's privileged step
     /// pipes to the packet filter — and the guest's boot load, which hands
     /// the same render to the guest's own `nft`, twice, as a check and then
+    /// The non-root account a root-run lane delegates its install to is
+    /// derived from the namespace's own map, never assumed: a numeric
+    /// chown to an id the kernel has no mapping for fails with EINVAL, so
+    /// a root lane inside a user namespace can only delegate to an id its
+    /// map carries, and the map is the one that says which. The shapes read
+    /// here are the ones this suite runs under — the full map of an initial
+    /// namespace or a plain container, the one-id map of a restricted user
+    /// namespace, a map that carries only root, and the unparseable — and
+    /// none of them ever reads as root.
+    #[test]
+    fn a_root_lane_delegates_to_an_id_its_map_carries() {
+        assert_eq!(
+            mapped_non_root_id("0          0          4294967295\n"),
+            Some(1),
+            "a full map carries every id, so the smallest non-root one is the \
+             answer, padded columns and all"
+        );
+        assert_eq!(
+            mapped_non_root_id("0 0 65536\n"),
+            Some(1),
+            "a container's default map carries the ids below its count"
+        );
+        assert_eq!(
+            mapped_non_root_id("1000 10001 1\n"),
+            Some(1000),
+            "a restricted map carries one id, and that one is the answer \
+             even though it is not small"
+        );
+        assert_eq!(
+            mapped_non_root_id("0 10001 1\n"),
+            None,
+            "a map that carries only root gives a root lane nothing to \
+             delegate to, and the fallback stands in"
+        );
+        assert_eq!(
+            mapped_non_root_id("not a map at all\n"),
+            None,
+            "an unparseable map reads as empty, never as root"
+        );
+    }
+
     /// as the load. Both come from `render_ruleset` and neither spells a
     /// rule the other does not, so a digest over each must be the same
     /// digest, and both digests must cover exactly the bytes the lane piped
@@ -2775,24 +2863,14 @@ mod tests {
         let mount = standin_mount();
         // The install lane: the step lays out its stand-in tree, renders its
         // one transaction, and hands it to `nft` — the recording one, so
-        // the bytes it was handed are this proof's own artifact. The step
-        // refuses to delegate its tree to root, so a test running as root
-        // cannot rehearse an install at all — the root check the rehearsal
-        // posture lifts is the only privilege it does. Say so: the guest
-        // lane above and the print lane already pin the one text, which
-        // needs none of this.
-        let installed = match run_install(&mount, stub.path()) {
-            Some(installed) => installed,
-            None => {
-                eprintln!(
-                    "skipping the install lane of \
-                     ruleset_digest_covers_bytes_piped_to_nft_in_both_lanes: \
-                     the install this lane rehearses refuses to delegate its tree \
-                     to root, and this test runs as root"
-                );
-                return;
-            }
-        };
+        // the bytes it was handed are this proof's own artifact. The tree
+        // is delegated to a non-root account even where the lane runs as
+        // root, named through the step's own sudo seam, because the step
+        // refuses to delegate to root — the root check the rehearsal
+        // posture lifts is the only privilege it does — so this lane
+        // asserts the one text on root lanes too, not only where a
+        // person's account happens to be the one that ran sudo.
+        let installed = run_install(&mount, stub.path());
         assert!(
             installed.status.success(),
             "the install lays out its tree and hands its one transaction to nft: {}{}",
