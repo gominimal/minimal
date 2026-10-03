@@ -106,16 +106,18 @@ const RANGE_PLIST_DIR: &str = "/Library/LaunchDaemons";
 
 /// The range program's template
 /// ([`reserve-local-range.sh`](resolver/reserve-local-range.sh)): a `/bin/sh`
-/// script whose [`RANGE_ALIAS_PLACEHOLDER`] line is replaced at command time
-/// with one absolute-path `ifconfig` alias per usable host address of
-/// [`RESERVED_LOCAL_RANGE`]. The rendered program reads no argument, no
-/// environment variable and no file.
+/// script whose [`RANGE_ADDRESS_PLACEHOLDER`] list is replaced at command
+/// time with every usable host address of [`RESERVED_LOCAL_RANGE`]. The
+/// rendered program reads no argument, no environment variable and no file,
+/// and neither template carries an apostrophe — the command that carries
+/// them wraps its whole payload in single quotes, and one inside a body
+/// would close them (see [`macos_command`]).
 #[cfg(any(test, target_os = "macos"))]
 const RANGE_PROGRAM_TEMPLATE: &str = include_str!("resolver/reserve-local-range.sh");
 
 /// The line of [`RANGE_PROGRAM_TEMPLATE`] the render replaces.
 #[cfg(any(test, target_os = "macos"))]
-const RANGE_ALIAS_PLACEHOLDER: &str = "@RANGE_ALIASES@";
+const RANGE_ADDRESS_PLACEHOLDER: &str = "@RANGE_ADDRESSES@";
 
 /// The unit's plist, as the command writes it: label [`RANGE_UNIT_LABEL`],
 /// ProgramArguments the root-owned program path alone, `RunAtLoad` true, no
@@ -150,21 +152,28 @@ const COMMAND_RESERVES_THE_RANGE: bool = true;
 #[cfg(not(target_os = "macos"))]
 const COMMAND_RESERVES_THE_RANGE: bool = false;
 
-/// The range program, rendered from [`RANGE_PROGRAM_TEMPLATE`] with one
-/// absolute-path `ifconfig` alias per usable host address of the reserved
-/// range ([`switch::loopback::range_hosts`], host parts 1 to 254 — the
-/// addresses the bind probe reads), filled in at render time. The rendered
-/// script reads no argument, no environment variable and no file, and
-/// applies exactly the reserved range and nothing else: the two-address
-/// alias form is the one the loopback-alias spike verified against lo0,
-/// each address a `/32`.
+/// The range program, rendered from [`RANGE_PROGRAM_TEMPLATE`] with every
+/// usable host address of the reserved range
+/// ([`switch::loopback::range_hosts`], host parts 1 to 254 — the addresses
+/// the bind probe reads) filled in at render time, one literal address per
+/// word of the list the program walks. The rendered script reads no
+/// argument, no environment variable and no file — its one read is the
+/// interface's own state, reported by the same absolute-path system tool
+/// the aliases are added with, so nothing user-writable can change what it
+/// applies — and it applies exactly the reserved range and nothing else:
+/// each address is one `/32` lo0 alias by the two-address `ifconfig` form
+/// the loopback-alias spike verified against lo0, and an address `lo0`
+/// already carries is skipped rather than re-added, so a re-run over a
+/// fully- or partially-applied range adds only what is missing (the spike
+/// never measured a re-add, so the program does not rely on one exiting
+/// zero).
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) fn range_program() -> String {
-    let aliases = switch::loopback::range_hosts()
-        .map(|addr| format!("/sbin/ifconfig lo0 alias {addr} 255.255.255.255"))
+    let addresses = switch::loopback::range_hosts()
+        .map(|addr| addr.to_string())
         .collect::<Vec<_>>()
-        .join("\n");
-    RANGE_PROGRAM_TEMPLATE.replace(RANGE_ALIAS_PLACEHOLDER, &aliases)
+        .join(" ");
+    RANGE_PROGRAM_TEMPLATE.replace(RANGE_ADDRESS_PLACEHOLDER, &addresses)
 }
 
 /// One path's custody facts, as the range unit's checks read them: the
@@ -1229,28 +1238,40 @@ async fn host_hook() -> Hook {
 /// interim ends with (design §7.1: one command, one privilege elevation,
 /// for one host's configuration).
 ///
-/// The steps, in the order they run: make the three directories the files
-/// live in (`mkdir -p` because a stock host has no `/etc/resolver` until
-/// the first hook and no [`RANGE_PROGRAM_DIR`] either, and a re-run must
-/// not die on `File exists`), write the resolver file, then write the
-/// unit's program and its plist **from the bytes this command itself
-/// carries** — the heredoc bodies are the rendered [`range_program`] and
-/// [`RANGE_UNIT_PLIST`], quoted delimiters (`<<\\…`) so nothing inside
-/// expands — so no staged copy, no `$PATH` lookup, no argument and no
-/// environment feeds either file. `chown root:wheel` and the `0755`/`0644`
-/// modes then converge both files to the exact state the custody checks
-/// ([`range_step_over`]) verify, whatever a previous attempt or a tampered
-/// host left there. The boot step loads last: `launchctl bootout` of the
-/// old unit first — guarded, because a first run has nothing to boot out —
-/// then `bootstrap` into the system domain, which runs the program now
-/// (the range is present on this boot) and registers [`RANGE_UNIT_PLIST`]'s
-/// `RunAtLoad` to re-apply it at every boot after. A re-run replaces the
-/// unit and re-runs the program rather than dying on a label collision.
+/// The steps, in the order they run: `set -e;` first — the lines a heredoc
+/// ends are separate commands, no `&&` joins them to what follows, so a
+/// step that fails must stop the script itself: without it a write that
+/// does not land is skipped past, `launchctl bootstrap` loads a unit whose
+/// files are half written, and the command reports success. Then make the
+/// three directories the files live in (`mkdir -p` because a stock host
+/// has no `/etc/resolver` until the first hook and no [`RANGE_PROGRAM_DIR`]
+/// either, and a re-run must not die on `File exists`), write the resolver
+/// file, then write the unit's program and its plist **from the bytes this
+/// command itself carries** — the heredoc bodies are the rendered
+/// [`range_program`] and [`RANGE_UNIT_PLIST`], quoted delimiters
+/// (`<<\\…`) so nothing inside expands — so no staged copy, no `$PATH`
+/// lookup, no argument and no environment feeds either file.
+/// `chown root:wheel` and the `0755`/`0644` modes then converge both files
+/// to the exact state the custody checks ([`range_step_over`]) verify,
+/// whatever a previous attempt or a tampered host left there. The boot step
+/// loads last: `launchctl bootout` of the old unit first — guarded, because
+/// a first run has nothing to boot out — then `bootstrap` into the system
+/// domain, which runs the program now (the range is present on this boot)
+/// and registers [`RANGE_UNIT_PLIST`]'s `RunAtLoad` to re-apply it at every
+/// boot after. A re-run replaces the unit and re-runs the program rather
+/// than dying on a label collision.
+///
+/// The whole payload rides inside the one pair of single quotes that
+/// `sh -c` takes it under, so neither body the heredocs write may carry an
+/// apostrophe of its own: one inside a body closes the quote, the paste
+/// hangs at a continuation prompt, and `sh -n` rejects the rendered line —
+/// which is why the suite parses both halves of the command and asserts
+/// the bodies carry none (see `advisory_command_reserves_the_range_on_macos`).
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) fn macos_command(port: u16) -> String {
     let program = range_program();
     format!(
-        "sudo sh -c 'mkdir -p /etc/resolver {RANGE_PROGRAM_DIR} {RANGE_PLIST_DIR} \
+        "sudo sh -c 'set -e; mkdir -p /etc/resolver {RANGE_PROGRAM_DIR} {RANGE_PLIST_DIR} \
          && printf \"nameserver 127.0.0.1\\nport {port}\\n\" > {RESOLVER_FILE} \
          && cat > {RANGE_PROGRAM_PATH} <<\\{RANGE_PROGRAM_HEREDOC}\n\
 {program}\
@@ -1872,6 +1893,21 @@ mod tests {
         ]
     }
 
+    /// Whether `/bin/sh` parses `script`: the shell a user pastes the whole
+    /// command into, and the shell `sudo sh -c` hands its payload to. Parse
+    /// only — nothing runs, so no privilege is ever asked for — and a shell
+    /// that could not be spawned reads as a command that does not parse,
+    /// never as one that does.
+    fn sh_parses(script: &str) -> bool {
+        std::process::Command::new("/bin/sh")
+            .args(["-n", "-c"])
+            .arg(script)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
     /// Root's custody facts, the state [`macos_command`] installs: every
     /// directory component of both the unit's paths root-owned with no
     /// group or other write, both files root-owned at their modes, and the
@@ -2415,6 +2451,43 @@ mod tests {
                 && command.contains(&format!("<<\\{RANGE_PLIST_HEREDOC}")),
             "the heredoc delimiters are quoted, so the bodies write byte for byte: {command}"
         );
+        // The command must parse — in the shell a user pastes it into and in
+        // the shell sudo hands its payload to. The whole payload rides inside
+        // the one pair of single quotes, so a single apostrophe in either
+        // body closes them: the paste then hangs at a continuation prompt
+        // and `sh -n` rejects the line, which is what the round found. So
+        // neither body may carry one, and both halves are parsed to prove it.
+        assert!(
+            !program.contains('\''),
+            "the program body carries no apostrophe — the command rides inside \
+             single quotes, and one inside a body closes them: {program}"
+        );
+        assert!(
+            !RANGE_UNIT_PLIST.contains('\''),
+            "the plist body carries no apostrophe — the command rides inside \
+             single quotes, and one inside a body closes them: {RANGE_UNIT_PLIST}"
+        );
+        assert!(
+            sh_parses(&command),
+            "the command must parse in the shell it is pasted into: {command}"
+        );
+        let payload = command
+            .strip_prefix("sudo sh -c '")
+            .and_then(|rest| rest.strip_suffix('\''))
+            .expect("the command is the one sudo sh -c, its payload quoted whole");
+        assert!(
+            sh_parses(payload),
+            "the payload the root shell runs must parse: {payload}"
+        );
+        // Fail closed inside the one command: the lines a heredoc ends are
+        // separate commands, nothing joins them to the steps after, so the
+        // payload opens with `set -e;` — a write that does not land stops the
+        // script before `launchctl bootstrap` loads a half-written unit, and
+        // the command reports failure rather than success.
+        assert!(
+            payload.starts_with("set -e;"),
+            "the inner script fails closed — its first step is set -e: {payload}"
+        );
         // The steps outside the two bodies substitute nothing — no `$`, no
         // backtick — and the bodies themselves are quoted-delimiter
         // (asserted above), so a backtick inside one (the program's comments
@@ -2478,12 +2551,15 @@ mod tests {
     }
 
     /// The rendered program applies exactly the reserved range and nothing
-    /// else (NET-123): every line that is not the shebang, a comment or
-    /// `set -e` is one absolute-path `ifconfig` aliasing one address of the
-    /// range as a `/32` — exactly the addresses the bind probe probes —
-    /// and the program reads no argument, no environment variable and no
-    /// file, so nothing user-writable can change what the boot step
-    /// applies.
+    /// else (NET-123): the addresses it walks are exactly the usable host
+    /// addresses of the /24 — the addresses the bind probe probes — each one
+    /// applied by a single absolute-path `ifconfig` alias as a `/32` on lo0,
+    /// and an address lo0 already carries is skipped rather than re-added,
+    /// so a re-run adds only the missing aliases and removes nothing. The
+    /// program reads no argument, no environment variable and no file — its
+    /// one read is the interface's own state, reported by the same
+    /// absolute-path tool — so nothing user-writable can change what the
+    /// boot step applies.
     #[test]
     fn range_program_applies_exactly_the_reserved_range() {
         let program = range_program();
@@ -2493,30 +2569,75 @@ mod tests {
             Some(&"#!/bin/sh"),
             "the unit's program is a /bin/sh script: {program}"
         );
-        let aliases: Vec<&str> = lines
+        // The walk: exactly the range's host addresses, in probe order, and
+        // no address outside the range.
+        let walk = lines
             .iter()
+            .find(|line| line.starts_with("for addr in ") && line.ends_with("; do"))
             .copied()
-            .filter(|line| !line.starts_with('#') && *line != "set -e")
+            .unwrap_or_else(|| panic!("the program walks the range's addresses: {program}"));
+        let walked: Vec<String> = walk["for addr in ".len()..walk.len() - "; do".len()]
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let expected: Vec<String> = switch::loopback::range_hosts()
+            .map(|addr| addr.to_string())
             .collect();
         assert_eq!(
-            aliases.len(),
-            254,
-            "one alias per usable host address of the /24, and nothing else: {program}"
+            walked, expected,
+            "the program walks exactly the addresses the bind probe probes — every \
+             usable host address of the /24 and no address outside it: {program}"
         );
-        let expected: std::collections::BTreeSet<String> = switch::loopback::range_hosts()
-            .map(|addr| format!("/sbin/ifconfig lo0 alias {addr} 255.255.255.255"))
-            .collect();
-        let applied: std::collections::BTreeSet<String> =
-            aliases.iter().map(|line| (*line).to_string()).collect();
-        assert_eq!(
-            applied, expected,
-            "the program applies exactly the addresses the bind probe probes, as \
-             /32 lo0 aliases, by absolute path: {program}"
-        );
+        // The one application form: an absolute-path `ifconfig` alias with
+        // the /32 mask, guarded by the skip over what lo0 already carries.
         assert!(
-            !program.contains('$'),
-            "the program substitutes nothing — no argument, no environment, no \
-             file can change what it applies: {program}"
+            program.contains(
+                "case \" $present \" in *\" $addr \"*) ;; *) /sbin/ifconfig lo0 alias \
+                 \"$addr\" 255.255.255.255 ;; esac"
+            ),
+            "each address is applied as one /32 lo0 alias by absolute path, skipped \
+             when lo0 already carries it: {program}"
+        );
+        assert_eq!(
+            program.matches("/sbin/ifconfig").count(),
+            2,
+            "ifconfig appears exactly twice — the read of the interface's own state \
+             and the alias — both by absolute path: {program}"
+        );
+        // No address outside the range is named anywhere the program acts:
+        // every IPv4-shaped literal on its working lines is one of the
+        // walked addresses or the /32 mask.
+        let addresses: std::collections::BTreeSet<String> = expected.iter().cloned().collect();
+        for line in lines.iter().filter(|line| !line.starts_with('#')) {
+            for word in line.split(|c: char| !c.is_ascii_alphanumeric() && c != '.') {
+                if word.parse::<Ipv4Addr>().is_ok() {
+                    assert!(
+                        addresses.contains(word) || word == "255.255.255.255",
+                        "the program names no address outside the reserved range \
+                         ({word}): {program}"
+                    );
+                }
+            }
+        }
+        // The program substitutes nothing but its own reads: no positional
+        // argument, no environment variable, no file read in — the only
+        // identifiers behind its `$` signs are its own two and the one
+        // command substitution.
+        for (at, _) in program.match_indices('$') {
+            let rest = &program[at + 1..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            assert!(
+                rest.starts_with('(') || name == "present" || name == "addr",
+                "the program substitutes nothing but its own reads (found {name:?}) — \
+                 no argument, no environment variable, no file: {program}"
+            );
+        }
+        assert!(
+            !program.contains('<'),
+            "the program reads no file — nothing redirects one in: {program}"
         );
         assert!(
             !program.contains("127.0.0.1"),
@@ -2880,12 +3001,15 @@ mod tests {
     /// a real lo0.
     #[test]
     fn bind_probe_reads_present_after_the_range_step() {
-        // The addresses the program applies, parsed from its own bytes.
+        // The addresses the program applies, parsed from its own bytes: the
+        // list its one walk carries.
         let program = range_program();
-        let applied: Vec<Ipv4Addr> = program
+        let walk = program
             .lines()
-            .filter(|line| line.starts_with("/sbin/ifconfig lo0 alias "))
-            .filter_map(|line| line.split_whitespace().nth(3))
+            .find(|line| line.starts_with("for addr in ") && line.ends_with("; do"))
+            .unwrap_or_else(|| panic!("the program walks the range's addresses: {program}"));
+        let applied: Vec<Ipv4Addr> = walk["for addr in ".len()..walk.len() - "; do".len()]
+            .split_whitespace()
             .filter_map(|address| address.parse().ok())
             .collect();
         assert_eq!(
