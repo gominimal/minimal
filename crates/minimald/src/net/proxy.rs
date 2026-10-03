@@ -534,6 +534,18 @@ where
         // `Connection: Upgrade`, and becomes a raw tunnel to the box it named
         // only when that box answers `101 Switching Protocols`.
         RequestKind::Forward => {
+            // A bare-LF line ending in the header block is refused: the proxy
+            // ends the head at the first `\r\n\r\n`, and an upstream that
+            // tolerates bare LF could end it earlier and read a second request
+            // out of what the proxy took for one head.
+            if has_bare_lf(head.get(..head_end(&head)).unwrap_or_default()) {
+                log_refusal(
+                    Some(host),
+                    "the request head has a bare-LF line ending",
+                    "400 Bad Request",
+                );
+                return write_status(&mut client, "400 Bad Request").await;
+            }
             let stripped = strip_h2c_upgrade(&head);
             let lines = head_lines(stripped.get(..head_end(&stripped)).unwrap_or_default());
             let is_upgrade = carries_upgrade(&lines);
@@ -740,11 +752,7 @@ fn carries_upgrade(lines: &[&[u8]]) -> bool {
 /// untouched. The head is borrowed when no rewrite is needed (the `Connection`
 /// header is already `close` alone).
 fn set_connection_close(head: &[u8]) -> Cow<'_, [u8]> {
-    let head_end = head
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map_or(head.len(), |at| at + 4);
-    let (headers, rest) = head.split_at(head_end);
+    let (headers, rest) = head.split_at(head_end(head));
     let lines = head_lines(headers);
 
     // Whether the head already carries `Connection: close` alone.
@@ -754,7 +762,7 @@ fn set_connection_close(head: &[u8]) -> Cow<'_, [u8]> {
             && is_header(name, b"connection")
         {
             let tokens: Vec<&[u8]> = value_tokens(value).collect();
-            if tokens.len() == 1 && is_token(tokens[0], b"close") {
+            if matches!(tokens.as_slice(), [only] if is_token(only, b"close")) {
                 already_close = true;
             }
             break;
@@ -783,12 +791,22 @@ fn set_connection_close(head: &[u8]) -> Cow<'_, [u8]> {
     if !connection_written {
         // Insert `Connection: close` before the end-of-head marker. The last
         // line is the `\r\n` that ends the head; insert before it.
-        let last = out.len() - lines.last().map_or(0, |l| l.len());
+        let last = out
+            .len()
+            .saturating_sub(lines.last().map_or(0, |l| l.len()));
         let inserted = b"Connection: close\r\n";
         out.splice(last..last, inserted.iter().copied());
     }
     out.extend_from_slice(rest);
     Cow::Owned(out)
+}
+
+/// Whether `headers` holds a `\n` not preceded by `\r` (a bare-LF line ending).
+fn has_bare_lf(headers: &[u8]) -> bool {
+    headers.first() == Some(&b'\n')
+        || headers
+            .windows(2)
+            .any(|w| matches!(w, [prev, b'\n'] if *prev != b'\r'))
 }
 
 /// Where a buffered head ends: just past its `\r\n\r\n`, or its whole length
@@ -864,6 +882,11 @@ fn request_body(lines: &[&[u8]]) -> Option<RequestBody> {
 /// upstream answers `101 Switching Protocols` do the client's later bytes go
 /// on to it, as the upgraded protocol's raw stream. The exchange ends when the
 /// upstream's side does, so nothing the client sends after that is read.
+///
+/// Until the response head arrives, the client is not read past its body, so a
+/// client that closes while the upstream is still working (a long-poll it gave
+/// up on) is noticed only once the upstream answers or closes; both sockets are
+/// held until then.
 async fn relay_exchange<C: AsyncRead + AsyncWrite + Unpin>(
     client: &mut C,
     upstream: &mut TcpStream,
@@ -916,8 +939,8 @@ async fn relay_exchange<C: AsyncRead + AsyncWrite + Unpin>(
 ///
 /// # Errors
 ///
-/// Errors if a head exceeds [`MAX_HEAD`], the upstream ends before a final
-/// head, or a write to the client fails.
+/// Errors if a head exceeds [`MAX_HEAD`], or a read or a write to the client
+/// fails.
 async fn relay_response_head<U, C>(
     upstream: &mut U,
     client: &mut C,
@@ -929,7 +952,16 @@ where
 {
     let mut buf = Vec::with_capacity(512);
     loop {
-        fill_head(upstream, &mut buf).await?;
+        // An upstream that ends before a whole `\r\n\r\n` head (one answering
+        // with bare-LF line endings, say) has its bytes passed on unchanged:
+        // the exchange ends with the upstream, so the client reuses nothing.
+        if let Err(error) = fill_head(upstream, &mut buf).await {
+            if error.kind() != io::ErrorKind::UnexpectedEof {
+                return Err(error);
+            }
+            client.write_all(&buf).await?;
+            return Ok(false);
+        }
         let (head, rest) = buf.split_at(head_end(&buf));
         match response_status(head) {
             Some(101) if upgrade => {
@@ -2196,11 +2228,11 @@ mod tests {
     /// Two requests for different hostnames on one client connection: the
     /// first gets its box's response with `Connection: close`, the connection
     /// ends, and the second request on a new connection reaches the other box.
-    /// Each backend echoes its identity so the test can tell which box
-    /// answered.
+    /// Each backend records the bytes it receives, so the test can tell which
+    /// box a request reached.
     #[tokio::test]
     async fn proxy_closes_after_one_request_so_next_request_routes_independently() {
-        // Two backends, each echoing its own name.
+        // Two backends, each recording what it receives.
         let (box_a_port, box_a_received) = spawn_recording_backend().await;
         let (box_b_port, box_b_received) = spawn_recording_backend().await;
 
@@ -2267,6 +2299,74 @@ mod tests {
             box_b_head.contains("Host: box-b.min.internal:"),
             "expected the second request to reach box-b, got: {box_b_head}"
         );
+    }
+
+    /// A request head with a bare-LF line ending is refused with 400 and
+    /// nothing reaches the box: an upstream that tolerates bare LF could end
+    /// the head at the `\n\n` and read the bytes after it as a second request
+    /// naming another host.
+    #[tokio::test]
+    async fn bare_lf_request_head_is_refused_before_the_upstream_sees_it() {
+        let (box_a_port, box_a_received) = spawn_recording_backend().await;
+
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
+        reg.register_host_net(SessionId::nil(), "box-a");
+        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve(proxy, router));
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let request = format!(
+            "GET /a HTTP/1.1\r\nHost: box-a.min.internal:{box_a_port}\r\nX: y\n\nGET /b HTTP/1.1\r\nHost: box-b.min.internal\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "expected a bare-LF head to be refused, got: {response}"
+        );
+        assert!(
+            box_a_received.lock().unwrap().is_empty(),
+            "the box must receive nothing of a refused head"
+        );
+
+        assert!(has_bare_lf(b"GET / HTTP/1.1\nHost: a\r\n\r\n"));
+        assert!(has_bare_lf(b"\nGET / HTTP/1.1\r\n\r\n"));
+        assert!(!has_bare_lf(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"));
+    }
+
+    /// An upstream that answers with bare-LF line endings never produces a
+    /// `\r\n\r\n` head; when it closes, its bytes reach the client unchanged
+    /// rather than the client getting an empty, reset connection.
+    #[tokio::test]
+    async fn bare_lf_response_is_passed_through_when_the_upstream_closes() {
+        let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = backend.accept().await.unwrap();
+            let mut scratch = [0u8; 1024];
+            let _ = sock.read(&mut scratch).await;
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\n\nhi").await;
+        });
+
+        let mut reg = HostnameRegistry::new(DEFAULT_HOST_ID, false);
+        reg.register_host_net(SessionId::nil(), "web");
+        let router = Router::new(Arc::new(reg), proxied_request_verdict);
+
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve(proxy, router));
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let request = format!("GET / HTTP/1.1\r\nHost: web.min.internal:{backend_port}\r\n\r\n");
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"HTTP/1.1 200 OK\n\nhi");
     }
 
     /// An upstream that answers without a `Connection` header still reaches
