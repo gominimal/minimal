@@ -40,10 +40,21 @@
 //! Beside the frame verdict sits its name-level counterpart, the DNS
 //! rebinding intersection (NET-066, NET-067): the pure decision of which
 //! addresses a name *resolved to* may ever be admitted for a box, once the
-//! box's denies and the infrastructure deny set are subtracted. The relay
-//! (not this module) holds the admission window; what lives here is the
+//! box's denies and the infrastructure deny set are subtracted. The
+//! admission table itself is not here — it is relay state, and there are
+//! two relays holding it, the host-side table that decides a box's
+//! destinations outside the VM (NET-081) and the in-VM precision copy —
+//! so the numbers both tables are bounded by live here, as constants,
+//! that neither leg can drift from the other: the window, the per-name
+//! address cap and the used-pin retention. The host table's own bounds —
+//! the outstanding-query cap and expiry its reply matching holds — live
+//! beside them, named where the cross-leg contract is, so a leg that adds
+//! a copy reads the same numbers rather than inventing its own. What else
+//! lives here is the
 //! arithmetic the window stores the results of, kept pure and free of
 //! resolver I/O so the NET-067 harness can exhaust it.
+
+use std::time::Duration;
 
 use crate::{EgressPolicy, IpProto};
 
@@ -59,6 +70,70 @@ const ETHERTYPE_IPV6: u16 = 0x86DD;
 const IPPROTO_UDP: u8 = 17;
 /// The port DNS is served on: the resolver carve-out's port (NET-079).
 const DNS_PORT: u16 = 53;
+
+/// How long an address a DNS reply admitted stays admitted, from the
+/// instant of the reply the box's own lookup received. The two admission
+/// tables — the host-side one that decides a DNS-resolving box's
+/// destinations outside the VM (NET-081) and the in-VM precision copy
+/// (NET-066) — both hold exactly this window, reading it here, so a pin
+/// can never outlive its window on one leg while it lives on in the other.
+///
+/// It is a *fixed* window where design §5.3's is TTL-bounded — floored at
+/// 600 s, capped at 24 h, a proposal in the design text — and the gates
+/// record that departure at the constant's use site; what the floor buys
+/// (covering the gap between resolution and use) is covered for
+/// established flows by [`DNS_FLOW_IDLE_CAP`] below.
+pub const DNS_ADMISSION_WINDOW: Duration = Duration::from_mins(5);
+
+/// Design §5.3's cap on one name's admitted addresses, at most this many
+/// at once, fail closed: a reply whose A records run past the cap has its
+/// tail refused, so a hostile or pathological answer cannot grow the box's
+/// grant one address at a time. The cap counts what a name *holds* — an
+/// admission whose window has passed is released before the cap is spent —
+/// so a name whose resolved address set rotates keeps its grant. Both
+/// admission tables hold the same cap, reading it here.
+pub const DNS_MAX_ADDRESSES_PER_NAME: usize = 32;
+
+/// How long a pin the box *used* keeps its admitted destination past the
+/// window: design §5.3's conntrack-aware retention, the one staleness
+/// bound on an established flow. The first frame a pin admits establishes
+/// the flow, and the flow keeps its destination until it ends — a FIN or
+/// RST, or this cap reclaiming a flow nothing has ridden for a day — so a
+/// long `git clone` or keep-alive to an allowed name is not severed at the
+/// window's edge. It is also the only release a UDP flow ever gets, UDP
+/// carrying no close signal to read. Both admission tables hold the same
+/// cap, reading it here.
+pub const DNS_FLOW_IDLE_CAP: Duration = Duration::from_hours(24);
+
+/// How many flows one box holds open through its pins at once, fail closed
+/// at the cap: a new flow that finds the table full is admitted by the
+/// window its first frame is inside and not retained — so its retention
+/// ends with the window rather than past it, and the flows already
+/// recorded keep refreshing as they do. Idle entries are swept before the
+/// cap is spent, so what it bounds is live flows. The bound is the
+/// host-side table's alone — its entries are the host daemon's memory,
+/// which a hostile relay holding one pin must not grow one flow at a time,
+/// where the in-VM precision copy's growth is contained by the VM an
+/// escapee already controls.
+pub const DNS_MAX_FLOWS_PER_BOX: usize = 4096;
+
+/// How many of one box's DNS queries the host-side admission table holds
+/// outstanding at once, fail closed: a query past the cap is not recorded,
+/// so no reply can ever match it, and no answer of the box's can pin. The
+/// bound is the table's own memory bound on the reply-matching state below
+/// — the same discipline the per-name cap keeps for admitted addresses —
+/// and it sits far past what a real resolver stack keeps in flight: one
+/// lookup's parallel pair, and a handful of concurrent lookups at most.
+pub const DNS_OUTSTANDING_QUERY_CAP: usize = 16;
+
+/// How long the host-side admission table holds one of a box's outstanding
+/// queries: a DNS exchange is seconds in practice, and a resolver stack's
+/// whole retransmission budget — 5 s an attempt, a few attempts — fits
+/// inside this with room to spare. The entry exists only to pair a reply
+/// with the question it answers, so it has nothing to outlive: past the
+/// expiry a reply is one the box never asked for, and it passes through
+/// unpinned, exactly as an unsolicited one does.
+pub const DNS_QUERY_EXPIRY: Duration = Duration::from_secs(30);
 
 /// Which L2 family a frame belongs to — the first fact the verdict needs,
 /// because three of the four families are decided without any rules.
@@ -582,7 +657,12 @@ fn verdict_ipv4(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
 ///   resolver the box's carve-out is keyed to, NET-079) and the helper's (the
 ///   deprecated host-alias literal, NET-004), each held as a `/32` so both
 ///   are named individually rather than only through the plane containing
-///   them. Refused under every declaration, for every name — a box-zone
+///   them; and the four ranges that complete the set — this-host space
+///   (`0.0.0.0/8`, where `0.0.0.0` names the host itself, so the range is
+///   loopback's neighbour), multicast (`224.0.0.0/4`), broadcast
+///   (`255.255.255.255/32`), and the reserved block the broadcast address
+///   ends in (`240.0.0.0/4`) — none of them a destination a name may name.
+///   Refused under every declaration, for every name — a box-zone
 ///   name included (NET-072): even a subverted zone answer must not become a
 ///   path to the metadata service or loopback, and `host.min.internal`
 ///   resolves for the box but is never pinned as reach.
@@ -634,6 +714,16 @@ impl InfrastructureDenySet {
                 cidr("169.254.0.0/16"),
                 // Loopback space.
                 cidr("127.0.0.0/8"),
+                // This-host space: `0.0.0.0` names the host itself, so the
+                // range is loopback's neighbour, refused for the same reason.
+                cidr("0.0.0.0/8"),
+                // Multicast: no destination a name may name.
+                cidr("224.0.0.0/4"),
+                // The reserved block, and the broadcast address ending it —
+                // named on its own so the set still refuses it if the
+                // reserved block is ever re-scoped.
+                cidr("240.0.0.0/4"),
+                cidr("255.255.255.255/32"),
                 Ipv4Cidr::exact(resolver),
                 Ipv4Cidr::exact(host_alias),
             ],
@@ -647,6 +737,25 @@ impl InfrastructureDenySet {
         }
     }
 }
+
+/// The IPv6 half of the infrastructure deny set, as a record for the IPv6
+/// epoch — kept beside the IPv4 set above so the two halves of one set
+/// cannot be spelled apart when the epoch comes.
+///
+/// It decides nothing in v1, on purpose: no IPv6 admission path exists
+/// anywhere (guest IPv6 is disabled, NET-082; AAAA is answered NODATA,
+/// NET-136), so no IPv6 address is ever admitted and the rebinding
+/// intersection above never sees one. It exists so the epoch that carries
+/// IPv6 answers finds the set's IPv6 half already spelled: the unspecified
+/// address (`::`, which names the host the way `0.0.0.0` does), loopback
+/// (`::1`), and the IPv4-mapped space (`::ffff:0:0/96`, the addresses a
+/// dual-stack host answers at — the one class a v6 epoch could reach v4
+/// infrastructure through). The entries are `a::/n` strings rather than a
+/// parsed type, because v1 has no IPv6 CIDR type to parse them into; the
+/// test at the bottom of this file is the record's own proof that every
+/// entry parses as an address and a prefix, so the epoch cannot inherit a
+/// typo.
+pub const IPV6_INFRASTRUCTURE_DENY_RANGES: &[&str] = &["::/128", "::1/128", "::ffff:0:0/96"];
 
 /// Why the rebinding intersection refused one resolved address, carrying the
 /// rule its rate-limited warning is keyed to (mirroring [`DropReason::rule`],
@@ -1352,11 +1461,18 @@ mod tests {
         );
 
         // The infrastructure ranges are refused under every declaration —
-        // link-local and the metadata services in it, loopback, the plane,
-        // and the gateway's own two addresses.
+        // link-local and the metadata services in it, loopback, the completed
+        // four (this host, multicast, broadcast, reserved), the plane, and
+        // the gateway's own two addresses.
         for refused in [
             [169, 254, 169, 254], // metadata, in link-local
             [127, 0, 0, 1],       // loopback
+            [0, 0, 0, 0],         // this host: 0.0.0.0 names the host itself
+            [0, 1, 2, 3],         // the rest of this-host space
+            [224, 0, 0, 1],       // multicast
+            [239, 255, 255, 254], // multicast's last address
+            [240, 0, 0, 1],       // reserved
+            [255, 255, 255, 255], // broadcast, reserved space's last address
             [100, 64, 0, 9],      // the plane (a box's lease)
             RESOLVER,             // the answerer's own address
             HOST_ALIAS,           // the helper's own address
@@ -1398,6 +1514,34 @@ mod tests {
             Err(RebindingRefusal::Infrastructure),
             "a different private range is not a covering"
         );
+    }
+
+    /// The IPv6 half of the deny set — the record the IPv6 epoch reads — is
+    /// spelled as ranges that parse: an IPv6 address and a prefix length,
+    /// every entry of it, so the epoch that builds a set from
+    /// [`IPV6_INFRASTRUCTURE_DENY_RANGES`] inherits a set and not a typo.
+    #[test]
+    fn ipv6_infrastructure_ranges_are_spelled_as_ranges() {
+        assert!(
+            !IPV6_INFRASTRUCTURE_DENY_RANGES.is_empty(),
+            "the record must name the ranges it exists to hold"
+        );
+        for range in IPV6_INFRASTRUCTURE_DENY_RANGES {
+            let (address, prefix) = range.split_once('/').unwrap_or_else(|| {
+                panic!("the IPv6 record's entry {range:?} must be spelled as `address/prefix`")
+            });
+            let prefix = prefix.parse::<u8>().unwrap_or_else(|_| {
+                panic!("the IPv6 record's entry {range:?} must carry a numeric prefix")
+            });
+            assert!(
+                prefix <= 128,
+                "the IPv6 record's entry {range:?} must carry an IPv6 prefix"
+            );
+            assert!(
+                address.parse::<std::net::Ipv6Addr>().is_ok(),
+                "the IPv6 record's entry {range:?} must carry an IPv6 address"
+            );
+        }
     }
 
     /// NET-072: a box-zone answer is carved out of the fabric plane — a

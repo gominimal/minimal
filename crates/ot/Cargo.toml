@@ -1,5 +1,6 @@
 [package]
 name = "ot"
+description = "Operation tracking for progress rendering (render-agnostic core + drivers)."
 version = "0.0.1"
 rust-version.workspace = true
 license.workspace = true
