@@ -113,9 +113,10 @@
 #                                    NET-123's macOS half: the advisory's one
 #                                    command installs the boot-time range unit;
 #                                    custody, the probe reading present, the
-#                                    job enabled for boot, and the re-apply a
-#                                    boot performs (no Linux lane runs it —
-#                                    Linux takes no range step)
+#                                    job enabled for boot, the command re-run
+#                                    clean over the aliases it already applied,
+#                                    and the re-apply a boot performs (no Linux
+#                                    lane runs it — Linux takes no range step)
 #   hostnames_recover_and_two_daemons_route NET-020..027 warning, recovery,
 #                                   two daemons on one machine routing
 #   retired_surfaces_gone            NET-109/110: the retired surfaces are gone,
@@ -3868,9 +3869,17 @@ proof_local_range_reserved_by_privileged_step() {
       ;;
   esac
   case "$range_cmd" in
-    *"launchctl bootout system/$RANGE_LABEL"* | *"launchctl bootstrap system $RANGE_PLIST_PATH"*) ;;
+    *"launchctl bootout system/$RANGE_LABEL"*) ;;
     *)
-      echo "::error::the advisory's command does not load the unit (bootout, then bootstrap)"
+      echo "::error::the advisory's command does not boot out a prior unit (launchctl bootout system/$RANGE_LABEL)"
+      echo "--- command ---"; printf '%s\n' "$range_cmd"
+      fail
+      ;;
+  esac
+  case "$range_cmd" in
+    *"launchctl bootstrap system $RANGE_PLIST_PATH"*) ;;
+    *)
+      echo "::error::the advisory's command does not bootstrap the unit (launchctl bootstrap system $RANGE_PLIST_PATH)"
       echo "--- command ---"; printf '%s\n' "$range_cmd"
       fail
       ;;
@@ -3976,25 +3985,60 @@ proof_local_range_reserved_by_privileged_step() {
     printf '%s\n' "$range_print" | head -40
     fail
   fi
-  if ! printf '%s' "$range_print" | grep -qi -- 'runatload = true'; then
+  # launchctl print reports RunAtLoad as a bare `runatload` token inside the
+  # job's `properties = …` line, never as `runatload = true`.
+  if ! printf '%s' "$range_print" | grep -qi -- 'properties = .*runatload'; then
     echo "::error::the loaded job is not RunAtLoad — the range would not re-apply at boot"
     printf '%s\n' "$range_print" | head -40
     fail
   fi
-  # The disabled table's rows read `label => bool`, so the boolean is the
-  # third field; a label with no row is enabled too. Read under sudo: the
-  # system domain's table is root's to list, and the gate above proved
-  # passwordless sudo.
+  # The disabled table's rows read `"label" => enabled|disabled`, label
+  # quoted, so the row's first field carries the quotes; a label with no row
+  # is enabled too. Read under sudo: the system domain's table is root's to
+  # list, and the gate above proved passwordless sudo.
   range_disabled="$(sudo launchctl print-disabled system 2>/dev/null \
-    | awk -v l="$RANGE_LABEL" '$1 == l { print $3 }')"
+    | awk -v l="\"$RANGE_LABEL\"" '$1 == l { print $3 }')"
   case "${range_disabled:-}" in
-    "" | false) ;;
+    "" | enabled) ;;
     *)
       echo "::error::the range unit is disabled for boot (launchctl print-disabled: $range_disabled)"
       fail
       ;;
   esac
   echo "the unit is loaded (RunAtLoad, program = the root-owned copy) and enabled for boot"
+
+  # The re-run a repeat install (or a user pasting the command twice) is: the
+  # same command, verbatim, with all 254 aliases still on lo0 and the unit
+  # still loaded. It must come back clean — exit 0 for the command, `last
+  # exit code = 0` for the re-loaded job — because the program skips the
+  # addresses lo0 already carries rather than re-adding them: a re-run adds
+  # only the missing aliases and removes nothing. (The command boots out
+  # the prior load first, its guarded half, then bootstraps the unit again.)
+  if ! sh -c "$range_cmd" >"$WORK/range-cmd2.out" 2>"$WORK/range-cmd2.err"; then
+    echo "::error::the advisory's command failed on its re-run over the aliases it had already applied"
+    echo "--- command (first and last lines) ---"
+    printf '%s\n' "$range_cmd" | sed -n '1p;$p'
+    echo "--- output ---"; cat "$WORK/range-cmd2.out" "$WORK/range-cmd2.err" 2>/dev/null || true
+    fail
+  fi
+  range_last_exit=""
+  for _ in $(seq 1 40); do
+    range_last_exit="$(launchctl print "system/$RANGE_LABEL" 2>/dev/null \
+      | sed -n 's/^[[:space:]]*last exit code = //p' | head -n1)"
+    [ -n "$range_last_exit" ] && break
+    sleep 0.25
+  done
+  if [ "$range_last_exit" != 0 ]; then
+    echo "::error::the re-run's job did not exit 0 (last exit code: '$range_last_exit') — the program must skip the aliases it finds, not fail on them"
+    launchctl print "system/$RANGE_LABEL" 2>&1 | head -40 || true
+    fail
+  fi
+  range_still="$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')"
+  if [ "$range_still" != 254 ]; then
+    echo "::error::the re-run left $range_still of 254 aliases on lo0 — a re-run must remove nothing"
+    fail
+  fi
+  echo "the command re-runs clean over the aliases it had already applied: last exit code = 0, all 254 still on lo0"
 
   # The re-apply a boot performs: the aliases removed, then the unit
   # kickstarted as a boot's load would run it — the range comes back with no
@@ -4029,7 +4073,7 @@ proof_local_range_reserved_by_privileged_step() {
   # removed when the command created it) — so the soak's next iteration finds
   # the host as this one did. The teardown repeats this wherever a proof dies.
   range_teardown_unit
-  echo "local range reserved by the privileged step OK (unit installed, custody held, probe present, boot re-apply shown, host restored)"
+  echo "local range reserved by the privileged step OK (unit installed, custody held, probe present, re-run clean, boot re-apply shown, host restored)"
   echo "::endgroup::"
 }
 
