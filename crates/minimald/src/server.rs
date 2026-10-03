@@ -51,23 +51,28 @@ fn load_or_create_daemon_identity(minimal_state_dir: &DaemonAbsPath) -> std::io:
         .as_std_path()
         .join(DAEMON_IDENTITY_FILE);
     match std::fs::read_to_string(&path) {
-        Ok(contents) => {
-            let trimmed = contents.trim().to_owned();
-            if trimmed.is_empty() {
-                return Err(std::io::Error::other("daemon-identity file is empty"));
-            }
-            Ok(trimmed)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let identity = common::random_alphanumeric(5);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&path, &identity)?;
-            Ok(identity)
-        }
-        Err(e) => Err(e),
+        Ok(contents) if !contents.trim().is_empty() => return Ok(contents.trim().to_owned()),
+        // An empty file (say, from a crash before the first write landed) is
+        // regenerated like a missing one, so it cannot pin every start to the
+        // per-start fallback.
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
+    let identity = common::random_alphanumeric(5);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Write a sibling temp file, sync it, and rename it into place, so a
+    // crash never leaves a truncated identity behind.
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut file, identity.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(identity)
 }
 
 /// Try to acquire an exclusive lock for `octet` under `lock_dir`, the
@@ -4208,6 +4213,26 @@ mod tests {
         assert!(
             (1..=254).contains(&first),
             "derived octet {first} is outside 1..=254"
+        );
+    }
+
+    /// An empty identity file is regenerated and persisted rather than
+    /// sending every start to the per-start fallback.
+    #[test]
+    fn empty_daemon_identity_file_is_regenerated() {
+        let dir = TempDir::new().unwrap();
+        let state_dir = DaemonAbsPath::try_new(
+            camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap(),
+        )
+        .unwrap();
+        let path = dir.path().join(DAEMON_IDENTITY_FILE);
+        std::fs::write(&path, "  \n").unwrap();
+        let identity = load_or_create_daemon_identity(&state_dir).unwrap();
+        assert!(!identity.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), identity);
+        assert_eq!(
+            load_or_create_daemon_identity(&state_dir).unwrap(),
+            identity
         );
     }
 
