@@ -1397,6 +1397,42 @@ fn exec_box_program(
             }
         }
     }
+    // Cap the box's PTY count before the credentials drop: PTYs are a
+    // machine-wide pool, and the box's devpts instance was mounted without a
+    // per-instance `max=`, so it draws from the one kernel-wide counter and a
+    // single box can starve every other box and the session host's own
+    // shells. The remount needs CAP_SYS_ADMIN over this mount namespace,
+    // which the box's user namespace still holds here — the same moment the
+    // classifier cover above is mounted. Best-effort: a box whose remount is
+    // refused still runs, on the shared pool as today, and the refusal is
+    // recorded for the daemon to warn.
+    let pts_target = std::ffi::CString::new("/dev/pts").expect("no NUL in /dev/pts path");
+    let pts_data = std::ffi::CString::new(format!("max={}", config::BOX_PTY_MAX))
+        .expect("no NUL in the devpts max option");
+    // SAFETY: `mount(2)` with valid C strings; `data` carries the devpts
+    // `max=` option and is read for the duration of the call.
+    if unsafe {
+        libc::mount(
+            c"devpts".as_ptr(),
+            pts_target.as_ptr(),
+            c"devpts".as_ptr(),
+            libc::MS_REMOUNT,
+            pts_data.as_ptr().cast(),
+        )
+    } == -1
+    {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        write_closure_report(
+            closure_report,
+            &format!("devpts max={} errno {errno}", config::BOX_PTY_MAX),
+        );
+        tracing::warn!(
+            errno,
+            max = config::BOX_PTY_MAX,
+            "remounting the box's /dev/pts with a per-instance max; the box \
+             runs on the shared PTY pool"
+        );
+    }
     // SAFETY: `assume_box_credentials` is async-signal-safe; this is the
     // pre-exec moment it is for, with the namespace built and CAP_SETPCAP in
     // it still held.
