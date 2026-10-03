@@ -397,10 +397,28 @@ fn expand_pattern(
         // `normalize_path` above, so a relative pattern like
         // `../escape` is already `PathTraversal` before we get here.
         if let Some(root) = anchors.project_root {
+            // The root is a substituted value, so its glob
+            // metacharacters must be escaped in the pattern the walker
+            // sees — a project directory literally named `a[b]` would
+            // otherwise truncate the walk root at the `[`. The
+            // unescaped form is kept for the plain-directory check,
+            // which consults the real filesystem path.
+            //
+            // The root must itself be absolute: a relative project
+            // path (possible on the wire) would otherwise let
+            // `finish_expand` emit a relative pattern, defeating the
+            // absoluteness guarantee this branch exists to uphold.
+            if !root.starts_with('/') {
+                return Err(ExpandError::NotAbsolute {
+                    pattern: root.to_owned(),
+                });
+            }
+            let mut escaped_root = String::with_capacity(root.len());
+            escape_glob_metas(root, &mut escaped_root);
             let joined = if root.ends_with('/') {
-                format!("{root}{normalized}")
+                format!("{escaped_root}{normalized}")
             } else {
-                format!("{root}/{normalized}")
+                format!("{escaped_root}/{normalized}")
             };
             let unescaped_joined = if root.ends_with('/') {
                 format!("{root}{unescaped_normalized}")
@@ -1338,6 +1356,33 @@ mod tests {
         .map(|fs| fs.pattern().to_owned())
         .unwrap();
         assert_eq!(pat, "/home/u/foo");
+    }
+
+    /// Glob metacharacters in the project root are escaped like any
+    /// other substituted value. A project directory literally named
+    /// `proj[1]` would otherwise truncate the walk root at the `[` and
+    /// match a far wider tree than the project asked for.
+    #[test]
+    fn project_root_escapes_glob_metas() {
+        let vars: [ResolvedVar; 0] = [];
+        assert_eq!(
+            expand_with_project_root("config/myrc", vars.as_slice(), "/home/u/proj[1]").unwrap(),
+            "/home/u/proj[[]1[]]/config/myrc",
+        );
+    }
+
+    /// A relative project root is rejected before the join: joining a
+    /// relative source onto it would still be relative, and
+    /// `finish_expand` would emit a pattern that defeats the
+    /// absoluteness guarantee this branch exists to uphold.
+    #[test]
+    fn project_root_relative_is_rejected() {
+        let vars: [ResolvedVar; 0] = [];
+        let err = expand_with_project_root("config/myrc", vars.as_slice(), "proj").unwrap_err();
+        assert!(
+            matches!(err, ExpandError::NotAbsolute { ref pattern } if pattern == "proj"),
+            "got: {err:?}",
+        );
     }
 
     // ---- plain-directory source ----
