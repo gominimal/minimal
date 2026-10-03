@@ -838,7 +838,7 @@ impl<S: Exec> ExecTask<S> {
     /// the channel is closed once this returns — the point at which a box
     /// created for the run can end (NET-131).
     pub async fn run(self, channel: Channel<Msg>) -> u32 {
-        let (mut rs, ws) = channel.split();
+        let (rs, ws) = channel.split();
         // SSH_EXTENDED_DATA_STDERR (RFC 4254 §5.2) — selects the stderr
         // stream on the same channel as a separate extended-data type.
         let mut w = ws.make_writer();
