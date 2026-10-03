@@ -1721,7 +1721,8 @@ async fn vm_escape_bounded_to_resident_union() {
                 );
                 format!(
                     "spoofed source {src} reached {alias}:{port} (the shipped \
-                         interim's admit; T66's flip makes it an unknown-source drop)"
+                         interim's admit; T66's flip makes it an unknown-source drop; \
+                         {marker_ack})"
                 )
             }
             Err(e) => {
