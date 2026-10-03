@@ -984,10 +984,10 @@ pub fn render_guest_ruleset(bash: &Path, params: &GuestRender<'_>) -> Result<Vec
     // The script is read from the child's stdin, so feed it and close the
     // pipe; a child that stops reading before the script ends makes the
     // write fail, and its own output says why.
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(cause) = stdin.write_all(INSTALLER_SCRIPT.as_bytes()) {
-            tracing::debug!("the installer stopped reading its script: {cause}");
-        }
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(cause) = stdin.write_all(INSTALLER_SCRIPT.as_bytes())
+    {
+        tracing::debug!("the installer stopped reading its script: {cause}");
     }
     let printed = child
         .wait_with_output()
@@ -1160,10 +1160,10 @@ fn run_guest_nft(nft: &Path, check: bool, ruleset: &[u8]) -> Result<(), String> 
     let mut child = load
         .spawn()
         .map_err(|cause| format!("spawning {}: {cause}", nft.display()))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(cause) = stdin.write_all(ruleset) {
-            tracing::debug!("the guest's nft stopped reading the ruleset: {cause}");
-        }
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(cause) = stdin.write_all(ruleset)
+    {
+        tracing::debug!("the guest's nft stopped reading the ruleset: {cause}");
     }
     let applied = child
         .wait_with_output()
@@ -1440,14 +1440,14 @@ pub(crate) fn decide_over(
     // its own cause, and the probe does not run over it: a reading taken
     // from a kernel that answers nothing would dress the absence up as the
     // table not refusing, when the fact is the table not being there.
-    if guest {
-        if let Listing::Gone(why) = list() {
-            tracing::warn!(
-                recheck = %why,
-                "the guest's marker stands over a table that is not there: the launch reads it back before deciding anything per box"
-            );
-            return Decision::undecidable(Cause::TableNotEffective);
-        }
+    if guest
+        && let Listing::Gone(why) = list()
+    {
+        tracing::warn!(
+            recheck = %why,
+            "the guest's marker stands over a table that is not there: the launch reads it back before deciding anything per box"
+        );
+        return Decision::undecidable(Cause::TableNotEffective);
     }
     // The table's half, the one the facts above cannot vouch for: the
     // marker says the install ran, not that the refusal it recorded is
@@ -2567,22 +2567,42 @@ mod tests {
         // A host with both halves and a table that is refusing decides per
         // box, guest or native: the probe read the effect the marker
         // vouches for, and the guest's own boot is the one step that can
-        // write it there.
+        // write it there. The guest's half has one more fact than the
+        // native host's — its recheck reads the table back out of its own
+        // kernel with `nft list`, which no test host can answer for it, so
+        // the listing is handed to the decision here as the fact a guest
+        // whose boot loaded its table reads (the recheck itself is pinned
+        // in `guest_decide_rechecks_table_not_only_marker`).
         std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
             .expect("the step writes the table's marker");
-        for (kind, guest) in [("native", false), ("guest", true)] {
-            let decided = decide(root, Some(&mountinfo(root, true)), guest, refused_reading);
-            assert!(
-                decided.can_decide_per_box(),
-                "a confining {kind} host with the step installed and its table \
-                 refusing decides per box"
-            );
-            assert_eq!(
-                decided.cause(),
-                None,
-                "a decided {kind} host names no cause"
-            );
-        }
+        let decided = decide(root, Some(&mountinfo(root, true)), false, refused_reading);
+        assert!(
+            decided.can_decide_per_box(),
+            "a confining native host with the step installed and its table \
+             refusing decides per box"
+        );
+        assert_eq!(
+            decided.cause(),
+            None,
+            "a decided native host names no cause"
+        );
+        let guest_decided = decide_over(
+            root,
+            Some(&mountinfo(root, true)),
+            true,
+            refused_reading,
+            || Listing::Listed,
+        );
+        assert!(
+            guest_decided.can_decide_per_box(),
+            "a confining guest with its table loaded, listed and refusing \
+             decides per box"
+        );
+        assert_eq!(
+            guest_decided.cause(),
+            None,
+            "a decided guest names no cause"
+        );
 
         // The same host, the same marker, a table whose refusal is not in
         // force: the probe's connection was not refused the chain's way, so
