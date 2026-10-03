@@ -59,6 +59,7 @@ fn ls_shows_shared_resource_pool() {
             project_path: Some(paths::HostAbsPath::try_new("/p").unwrap()),
             status: sessions::SessionStatus::Active,
             git: None,
+            host_ip_enforcement: None,
             attrs: None,
         }],
     };
@@ -96,6 +97,7 @@ fn ls_table_exposes_project_path_and_status() {
             project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
             status: sessions::SessionStatus::Active,
             git: None,
+            host_ip_enforcement: None,
             attrs: None,
         }],
     };
@@ -1012,6 +1014,7 @@ async fn policy_shows_deny_all_default() {
             false,
         ),
         ingress: None,
+        host_ip_enforcement: None,
     };
     assert_eq!(
         in_force.egress,
@@ -1106,6 +1109,7 @@ fn policy_shows_baseline_set() {
             false,
         ),
         ingress: None,
+        host_ip_enforcement: None,
     };
     let fabric = switch::SwitchSubnet::default();
     let mut out = Vec::new();

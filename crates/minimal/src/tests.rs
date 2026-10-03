@@ -475,6 +475,7 @@ fn twin_entry(
         project_path: path.map(|p| paths::HostAbsPath::try_new(p).unwrap()),
         status,
         git: None,
+        host_ip_enforcement: None,
         attrs: None,
     }
 }

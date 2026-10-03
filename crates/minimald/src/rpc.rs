@@ -24,6 +24,7 @@ use tokio::task::spawn;
 use crate::{
     ChannelConfig,
     connection::{ConnectionError, ConnectionHandle},
+    net::classifier,
     server::ServerStateHandle,
     sessions::SessionKeyPredicate,
 };
@@ -131,6 +132,29 @@ async fn serve_list_sessions(
             // has not come up pays nothing per list.
             let hostname_proxy_port = s.hostname_proxy_port().await;
             let zone_answerer_port = s.zone_answerer_port().await;
+            // NET-079: the per-box egress enforcement the create recorded on
+            // each session's record — `per_box` when this host could decide a
+            // host-address box's verdict on a classifier leaf of its own,
+            // `none` when it could not and the box runs unenforced — read
+            // back per entry, in parallel, so the listing shows the same
+            // state the create response and the effective-policy read show,
+            // without a follow-up round trip per session. A record that
+            // fails to read degrades to `None`: nothing said is the same
+            // silence the other surfaces read as "not a host-address
+            // session", so one unreadable record fails no listing.
+            let enforcement = futures::future::join_all(infos.iter().map(|i| async {
+                mngr.get_record(SessionKeyPredicate::Id(i.id))
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|record| {
+                        record
+                            .attrs
+                            .get(HOST_IP_ENFORCEMENT_ATTR)
+                            .map(|value| Box::new(value.clone()))
+                    })
+            }))
+            .await;
             Ok(ListSessionsResponse {
                 daemon_version: Some(OWN_VERSION.to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
@@ -144,12 +168,14 @@ async fn serve_list_sessions(
                 // client fills it host-side after the reply.
                 sessions: infos
                     .into_iter()
-                    .map(|i| ListSessionsEntry {
+                    .zip(enforcement)
+                    .map(|(i, host_ip_enforcement)| ListSessionsEntry {
                         id: i.id,
                         name: i.name,
                         project_path: Some(i.project_path),
                         status: i.status,
                         git: None,
+                        host_ip_enforcement,
                         attrs: i.attrs.map(|a| minimald_rpc::RunningSessionAttrs {
                             last_stdout: a.stdout_last.map(|i| i.into()),
                             last_stdin: a.stdin_last.map(|i| i.into()),
@@ -258,7 +284,7 @@ async fn serve_create_session(
     ssh_username: Option<String>,
 ) -> Result<(), ConnectionError> {
     CreateSession
-        .handle_channel(c, async |req| {
+        .handle_channel(c, async |mut req| {
             // The version gate, made by the RPC the activation path was
             // already sending rather than by a `GetVersion` ahead of it
             // (#1251). Checked here, before the manager allocates anything,
@@ -280,6 +306,27 @@ async fn serve_create_session(
             // the manager consumes it, and the stored record's egress is what
             // the counts below report beside the "session created" line.
             let egress_counts = EgressRuleCounts::of(&req.config.policy);
+            // NET-079: this host's verdict on whether it can decide a
+            // host-address box's egress per box — the fact the daemon read at
+            // start and each launch reads again before it places a box, read
+            // fresh here too, because the fact it rests on is the table's
+            // *effect*, which is the other thing that can change between a
+            // start and this create (design §7.4). The advisory it yields
+            // rides the reply to the start that is about to rely on the
+            // host's decision, and the enforcement it yields is recorded
+            // onto the record below, so the state outlives this reply.
+            let in_microvm = s.in_microvm().await;
+            let decision = create_classifier_decision(in_microvm).await;
+            let classifier_cause = decision.cause();
+            let classifier_advisory =
+                classifier_cause.map(|cause| classifier_advisory_text(cause, in_microvm));
+            let host_ip_enforcement = create_host_ip_enforcement(req.config.network, &decision);
+            if let Some(enforcement) = host_ip_enforcement {
+                req.config.attrs.insert(
+                    HOST_IP_ENFORCEMENT_ATTR.to_string(),
+                    enforcement.to_string(),
+                );
+            }
 
             Ok(match mngr.create_session(req.config, ssh_username).await {
                 Ok(id) => {
@@ -297,6 +344,28 @@ async fn serve_create_session(
                         egress_deny_subnets = egress_counts.deny_subnets,
                         "session created"
                     );
+                    // NET-079's observability: one info line per create
+                    // response that carries the advisory, naming the cause
+                    // it names and the enforcement attribute this create
+                    // recorded for a host-address box — so the daemon's log,
+                    // the bundle's tail, carries what this reply told the
+                    // person in the terminal, beside the start line and each
+                    // launch's own record. The advisory rides as a field,
+                    // Debug-escaped, because the line a person copies their
+                    // command from must stay one line: the terminal gets the
+                    // two-line spelling, the log gets the same text whole.
+                    if let Some(advisory) = &classifier_advisory {
+                        tracing::info!(
+                            session_id = %id,
+                            classifier_cause = classifier_cause
+                                .map_or_else(|| "", classifier::Cause::detail),
+                            classifier_install = ?classifier_cause
+                                .and_then(classifier::Cause::install_command),
+                            host_ip_enforcement = ?host_ip_enforcement,
+                            advisory = ?advisory,
+                            "session create carried the classifier advisory"
+                        );
+                    }
                     // NET-123: the session-start loopback probe, before any
                     // of this session's names publish. Its interim flag on
                     // the reply is what tells the client to surface the
@@ -321,6 +390,12 @@ async fn serve_create_session(
                         // already chosen to keep the shipped default.
                         deny_all_opt_out: Some(s.deny_all_opt_out().await),
                         answerer_bound: zone_answerer_port.is_some(),
+                        // NET-079's half: the advisory the start prints, and
+                        // the enforcement the record already carries — the
+                        // same fact the reply repeats for the one message the
+                        // activation path spends on it.
+                        classifier_advisory,
+                        host_ip_enforcement: host_ip_enforcement.map(str::to_string),
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
@@ -336,6 +411,177 @@ async fn serve_create_session(
             })
         })
         .await
+}
+
+/// The record-attr key the create writes NET-079's per-box egress
+/// enforcement under, for a host-address session: `per_box` when this host
+/// can decide the box's egress verdict on a classifier leaf of its own,
+/// `none` when it cannot and the box runs unenforced — the machine spelling
+/// the create reply, the listing entry, the effective-policy reply and the
+/// launch's own record share, so whatever reads the record reads the state
+/// as data. Recorded at create so the state outlives the create response
+/// that first reported it: the record is what a later command resolves and
+/// the bundle's sessions collector carries, long after this reply is spent.
+const HOST_IP_ENFORCEMENT_ATTR: &str = "host_ip_enforcement";
+
+/// The test stand-in for the create-time classifier read: the tree root and
+/// mount table a test wants the read to answer over, standing in for the
+/// production pair — the installer's tree and this daemon's own mount table.
+/// Installed as *state*, never as an answer, so the create path still reads
+/// the real [`classifier::decide`] over whatever facts the stand-in is, the
+/// way the launch's own tests drive it.
+#[cfg(any(test, feature = "test-support"))]
+static CREATE_CLASSIFIER_STANDIN: std::sync::Mutex<Option<(std::path::PathBuf, Option<String>)>> =
+    std::sync::Mutex::new(None);
+
+/// Points the create-time classifier read at `root` and `mountinfo` for the
+/// rest of this process — the stand-in state a test built. See
+/// [`CREATE_CLASSIFIER_STANDIN`].
+///
+/// The tests that use this take the probe-test mutex in this module's test
+/// module for the whole install→create→assert→clear window: the stand-in is
+/// process-global, so under libtest — where the tests of one binary share a
+/// process — a create driven by another test would answer over it too.
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_create_classifier_standin(root: std::path::PathBuf, mountinfo: Option<String>) {
+    *CREATE_CLASSIFIER_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((root, mountinfo));
+}
+
+/// Withdraws the stand-in [`install_create_classifier_standin`] installed, so
+/// later creates answer over the production tree and mount table again.
+#[cfg(any(test, feature = "test-support"))]
+pub fn clear_create_classifier_standin() {
+    *CREATE_CLASSIFIER_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+/// The classifier tree and mount table the create-time read answers over: the
+/// test stand-in's when one is installed, else the production pair — the
+/// tree the installer lays out at [`sandbox2::classifier::TREE_ROOT`] and
+/// this daemon's own mount table, the same facts the start-time read and
+/// each launch's read answer over. The mount table rides as the knob the
+/// shared read carries: the stand-in's stands in for the daemon's own live
+/// read, which [`crate::session_host::re_read_classifier_fact`] performs on
+/// the blocking pool.
+fn create_classifier_tree() -> (std::path::PathBuf, Option<String>) {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(pair) = CREATE_CLASSIFIER_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return pair;
+    }
+    (
+        std::path::PathBuf::from(sandbox2::classifier::TREE_ROOT),
+        None,
+    )
+}
+
+/// The create-time classifier read (NET-079): the one shared fact
+/// [`crate::session_host::re_read_classifier_fact`] every host-address
+/// path answers over — the same read each launch performs over the same
+/// pair of a tree and a mount table, so the create's advisory and the
+/// launch that follows it cannot disagree over what this host is. The
+/// probe it attaches when the facts are all in binds a listener, forks a
+/// child, and waits, so it runs on the blocking pool, and an async caller
+/// never runs it on the worker a session is being created on. A read that
+/// could not run at all is its own cause — an unreadable table is not a
+/// verdict, and the create must not report a host as deciding per box
+/// over evidence it never gathered.
+async fn create_classifier_decision(in_microvm: bool) -> classifier::Decision {
+    let (root, mountinfo) = create_classifier_tree();
+    match crate::session_host::re_read_classifier_fact(root, mountinfo, in_microvm).await {
+        Ok((_, decision)) => decision,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "the create-time classifier check did not run; treating this \
+                 host as unable to decide per box"
+            );
+            classifier::Decision::undecidable(classifier::Cause::ProbeUnreadable)
+        }
+    }
+}
+
+/// The advisory a cause yields for the reply (NET-079): the cause in words,
+/// the state it leaves the box in, and — only when the cause is one the
+/// command ends — the exact command that ends it. Spelled here, on the one
+/// side that read the host, so the daemon's log line, the reply a client
+/// prints verbatim, and the start that prints it agree by construction, and
+/// the advisory is never a prompt: it names what a person may run, and
+/// running it (and any privilege prompt it carries) is the person's act,
+/// never the session start's.
+///
+/// The state it names is the box outcome the cause leaves, with the
+/// "whatever the boxes' declarations say" clause carried only while that
+/// outcome names no refusals: natively the step's and the mount's causes
+/// leave even a deny-all box running unenforced, while the two probe causes
+/// refuse a deny-all box at placement — an advisory that said "whatever the
+/// declarations say" over a refusal would deny the refusal a person is about
+/// to hit — and in the guest every cause refuses.
+fn classifier_advisory_text(cause: classifier::Cause, guest: bool) -> String {
+    let mut advisory = format!(
+        "note: this host cannot decide a host-address box's egress verdict \
+         per box: {}. While it cannot, {}",
+        cause.detail(),
+        cause.host_ip_box_outcome(guest),
+    );
+    // The clause holds exactly while the outcome sentence names no
+    // refusals — the same causes [`classifier::Cause::host_ip_box_outcome`]
+    // spells "run unenforced" for on a native host, mirrored here so the
+    // clause and the outcome it qualifies cannot drift apart. `guest` is
+    // folded into the mirror: every guest outcome names refusals.
+    if !guest
+        && matches!(
+            cause,
+            classifier::Cause::StepNotInstalled
+                | classifier::Cause::CannotConfine
+                | classifier::Cause::GuestTableNotLoaded
+        )
+    {
+        advisory.push_str(" — whatever the boxes' declarations say");
+    }
+    if let Some(command) = cause.install_command() {
+        // The command ends the advisory with nothing after it, so the line
+        // a person copies from the terminal is the command, verbatim.
+        advisory.push_str(&format!(
+            ". Install the classifier's privileged step with:\n  {command}"
+        ));
+    } else {
+        advisory.push('.');
+    }
+    advisory
+}
+
+/// The per-box egress enforcement this host's verdict gives a session
+/// (NET-079), in the machine spelling the launch's own record uses: a
+/// host-address session is the one whose verdict is decided on the host's
+/// cgroup tree, so it is the one that carries the state — `per_box` when
+/// this host can decide a box's verdict on a classifier leaf of its own,
+/// `none` when it cannot and the box runs with the host's address and no
+/// verdict of its own. Every other mode carries nothing: an own-address or
+/// none box's verdict is decided on address leases, never on the host's
+/// cgroup tree, so `None` — not `none` — is what their replies say, the same
+/// nothing a daemon that predates the field says.
+fn create_host_ip_enforcement(
+    network: minimald_rpc::NetworkMode,
+    decision: &classifier::Decision,
+) -> Option<&'static str> {
+    if network != minimald_rpc::NetworkMode::HostNet {
+        return None;
+    }
+    Some(
+        if decision.can_decide_per_box() {
+            crate::session_host::HostIpEnforcement::Enforced
+        } else {
+            crate::session_host::HostIpEnforcement::Unenforced
+        }
+        .machine_str(),
+    )
 }
 
 /// The bind probe over the reserved local range, on the blocking pool —
@@ -779,20 +1025,26 @@ async fn serve_get_session_policy(
 
 /// The `GetEffectiveSessionPolicy` reply for one record's policy and network
 /// mode: the egress half resolved to what the gate enforces, the ingress half
-/// verbatim. `phase` is the rollout phase to resolve under — the handler
-/// serves [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships,
-/// while the tests pass [`sessions::EgressDefaultPhase::InForce`] so the
-/// deny-all posture the rollout ends at stays proven while the default is
-/// only announced (NET-076).
+/// verbatim, and NET-079's enforcement state for a host-address box — the
+/// same fact the create reply reported, read back off the record's
+/// [`HOST_IP_ENFORCEMENT_ATTR`] so the policy read and the create agree on
+/// what the declarations actually do on this host. `phase` is the rollout
+/// phase to resolve under — the handler serves
+/// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, while the
+/// tests pass [`sessions::EgressDefaultPhase::InForce`] so the deny-all
+/// posture the rollout ends at stays proven while the default is only
+/// announced (NET-076).
 pub(crate) fn effective_policy_reply(
     policy: &sessions::SessionPolicy,
     network: sessions::NetworkMode,
     phase: sessions::EgressDefaultPhase,
     opt_out: bool,
+    host_ip_enforcement: Option<String>,
 ) -> minimald_rpc::EffectiveSessionPolicy {
     minimald_rpc::EffectiveSessionPolicy {
         egress: sessions::effective_egress(policy.egress.as_ref(), network, phase, opt_out),
         ingress: policy.ingress.clone(),
+        host_ip_enforcement,
     }
 }
 
@@ -828,12 +1080,20 @@ async fn serve_get_effective_session_policy(
                 None => Ok(Errorable::Err {
                     error: "no session found".to_string(),
                 }),
-                Some(record) => Ok(Errorable::Ok(effective_policy_reply(
-                    &record.policy,
-                    record.network,
-                    sessions::EGRESS_DEFAULT_PHASE,
-                    opt_out,
-                ))),
+                Some(record) => {
+                    // NET-079's enforcement state, read off the record the
+                    // create wrote it on — never re-probed here, because the
+                    // state that answers is the one the box runs under, and
+                    // the record is where the create left it.
+                    let host_ip_enforcement = record.attrs.get(HOST_IP_ENFORCEMENT_ATTR).cloned();
+                    Ok(Errorable::Ok(effective_policy_reply(
+                        &record.policy,
+                        record.network,
+                        sessions::EGRESS_DEFAULT_PHASE,
+                        opt_out,
+                        host_ip_enforcement,
+                    )))
+                }
             }
         })
         .await
@@ -2798,11 +3058,11 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        let id = client
+        let created = client
             .call::<CreateSession>(&req("my session", "/uwu"))
             .await
-            .unwrap()
-            .id;
+            .unwrap();
+        let id = created.id;
         assert!(id != SessionId::nil());
 
         let get_session = client
@@ -2831,8 +3091,447 @@ mod tests {
                 status: sessions::SessionStatus::Pending,
                 // /uwu is not a git repository, so the probe yields nothing.
                 git: None,
+                // The same enforcement state the create response above
+                // carried (NET-079), read back off the record the create
+                // wrote it on — pinned to the create's own answer, not to a
+                // literal, because this create answers over the real host's
+                // classifier facts and the state is this host's verdict,
+                // whatever it is.
+                host_ip_enforcement: created.host_ip_enforcement.map(Box::new),
                 attrs: None,
             }]
+        );
+    }
+
+    /// The classifier facts a create answers over, as a test builds them:
+    /// the cohort the step installs — both subtrees with the
+    /// delegation-contract files — plus a mount table the test spells, handed
+    /// to [`install_create_classifier_standin`] so the real decision logic
+    /// runs over facts a test laid out. The same stand-in discipline the
+    /// session-host reads use for their knobs: a fact pair in, never an
+    /// answer. Returns the tree guard, which the caller keeps alive for as
+    /// long as the stand-in answers.
+    fn standin_tree() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the classifier tree");
+        let root = tree.path().to_path_buf();
+        for verdict in [
+            sandbox2::config::Verdict::Deny,
+            sandbox2::config::Verdict::Allow,
+        ] {
+            let subtree = root
+                .join(sandbox2::classifier::BOXES_DIR)
+                .join(verdict.dir_name());
+            std::fs::create_dir_all(&subtree).expect("the step makes the subtree");
+            for file in ["cgroup.procs", "cgroup.threads", "cgroup.subtree_control"] {
+                std::fs::write(subtree.join(file), "")
+                    .unwrap_or_else(|e| panic!("modeling {file} in {}: {e}", subtree.display()));
+            }
+        }
+        (tree, root)
+    }
+
+    /// The stand-in whose decision is the cause the install command ends:
+    /// the step's cohort is there, the loaded table's marker is not — a
+    /// native host whose privileged step never ran.
+    fn install_step_missing_standin() -> tempfile::TempDir {
+        let (tree, root) = standin_tree();
+        let mountinfo = format!(
+            "35 30 0:26 / {} rw,relatime shared:2 - cgroup2 cgroup2 rw,nsdelegate\n",
+            root.display()
+        );
+        super::install_create_classifier_standin(root, Some(mountinfo));
+        tree
+    }
+
+    /// The stand-in whose decision is the cause no command ends: the same
+    /// delegated cohort, on a cgroup2 mounted without `nsdelegate` — a host
+    /// that cannot confine a box however installed, so the advisory must
+    /// name the cause and never an install.
+    fn install_cannot_confine_standin() -> tempfile::TempDir {
+        let (tree, root) = standin_tree();
+        let mountinfo = format!(
+            "35 30 0:26 / {} rw,relatime shared:2 - cgroup2 cgroup2 rw\n",
+            root.display()
+        );
+        super::install_create_classifier_standin(root, Some(mountinfo));
+        tree
+    }
+
+    /// The classifier-advisory lines this session's create produced (the
+    /// NET-079 observability contract). Attributed by session id, because
+    /// under libtest the capture buffer is shared by every test in the
+    /// binary — assertions on it say `contains`, never `equals`.
+    fn classifier_lines(log: &str, session_id: &SessionId) -> Vec<String> {
+        let message = "session create carried the classifier advisory";
+        let id = format!("session_id={session_id}");
+        log.lines()
+            .filter(|line| line.contains(message) && line.contains(&id))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// NET-079: a native create on a host that cannot decide per box answers
+    /// with the advisory the requirement spells — the cause in words, the
+    /// state it leaves the box in, and, only when the cause is one the
+    /// command ends, the exact command that ends it. Both causes a stand-in
+    /// has to build, because the daemon's own host decides them for real:
+    /// the step never having run, and a mount that cannot confine a box at
+    /// all — so the advisory a person reads is never handed an install that
+    /// cannot help. The advisory is spelled without a question, because it
+    /// names what a person may run and never asks them to run it, and the
+    /// daemon logs one line per advisory-carrying create naming the cause,
+    /// the command when one applies, and the per-box enforcement the reply
+    /// and the record both carry — the bundle's tail then says what every
+    /// create said.
+    // The guard is taken before the server is even built and held across
+    // both awaited creates on purpose: the stand-in is process-global, so
+    // another test's create in the window would answer over it too.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the stand-in is process-global, so the guard must span the awaited \
+                  creates it is installed for"
+    )]
+    #[tokio::test]
+    async fn native_host_advises_classifier_install_without_prompt() {
+        let _standin_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let capture = crate::test_harness::captured_log();
+
+        let _tree = install_step_missing_standin();
+        let step_missing = client
+            .call::<CreateSession>(&req("step-missing", "/uwu"))
+            .await
+            .unwrap();
+        let advisory = step_missing
+            .classifier_advisory
+            .expect("a create on a step-missing host carries the advisory");
+        assert!(
+            advisory.contains("the classifier's privileged step is not installed on this host"),
+            "the advisory must name the cause in words, got: {advisory}"
+        );
+        assert!(
+            advisory.contains("its host-address boxes run unenforced"),
+            "the advisory must say the state it leaves the box in, got: {advisory}"
+        );
+        assert!(
+            advisory.contains("sudo scripts/install-host-classifier.sh"),
+            "a missing step is the cause the install command ends, so the \
+             advisory must carry it, got: {advisory}"
+        );
+        assert!(
+            !advisory.contains('?'),
+            "the advisory names what a person may run; it never asks: {advisory}"
+        );
+        super::clear_create_classifier_standin();
+
+        // The cannot-confine stand-in over the same box: the cause is the
+        // mount's, so the advisory names it and nothing to run.
+        let _tree = install_cannot_confine_standin();
+        let cannot_confine = client
+            .call::<CreateSession>(&req("cannot-confine", "/uwu"))
+            .await
+            .unwrap();
+        super::clear_create_classifier_standin();
+        let advisory = cannot_confine
+            .classifier_advisory
+            .expect("a host that cannot confine still gets the advisory");
+        assert!(
+            advisory.contains(
+                "no cgroup2 mount with nsdelegate covers the classifier tree, so a \
+                 box could migrate out of its leaf"
+            ),
+            "the advisory must name this cause in words too, got: {advisory}"
+        );
+        assert!(
+            !advisory.contains("install-host-classifier"),
+            "no command ends this cause, so the advisory must name none: {advisory}"
+        );
+        assert!(
+            !advisory.contains('?'),
+            "the advisory names what a person may run; it never asks: {advisory}"
+        );
+
+        // One line per advisory-carrying create, attributed by the session
+        // it carried — the cause, the command when one applies, and the
+        // enforcement the reply and the record both carry.
+        let tail = capture.contents();
+        let step_line = classifier_lines(&tail, &step_missing.id);
+        assert_eq!(
+            step_line.len(),
+            1,
+            "each advisory-carrying create must log exactly one line naming \
+             it, got: {tail}"
+        );
+        let step_line = &step_line[0];
+        assert!(
+            step_line.contains("advisory=\"note: this host cannot decide"),
+            "the logged line must carry the advisory's own text, not only \
+             its facts, got: {step_line}"
+        );
+        assert!(
+            step_line.contains("the classifier's privileged step is not installed"),
+            "the logged line must name the cause, got: {step_line}"
+        );
+        assert!(
+            step_line.contains("sudo scripts/install-host-classifier.sh"),
+            "the logged line must carry the command when one applies, got: {step_line}"
+        );
+        let confine_line = classifier_lines(&tail, &cannot_confine.id);
+        assert_eq!(
+            confine_line.len(),
+            1,
+            "each advisory-carrying create must log exactly one line naming \
+             it, got: {tail}"
+        );
+        let confine_line = &confine_line[0];
+        assert!(
+            confine_line.contains("no cgroup2 mount with nsdelegate covers the classifier tree"),
+            "the logged line must name this cause too, got: {confine_line}"
+        );
+        assert!(
+            confine_line.contains("host_ip_enforcement=Some(\"none\")"),
+            "the logged line must carry the enforcement recorded for the host-address box, got: {confine_line}"
+        );
+    }
+
+    /// NET-079: while the host cannot decide per box, a host-address box's
+    /// create reply, its record, and every surface that reads the session
+    /// after the create all say its egress is not enforced per box — the
+    /// reply so a client can say it at once, the record so the state
+    /// outlives the create message (`GetSessionRecord` answers over it, the
+    /// bundle's sessions collector copies it), the listing a picker reads
+    /// without a round trip per session, and the effective-policy reply
+    /// `min session policy` renders, where the state rides beside the rules
+    /// it qualifies: a deny-all declaration with an enforcement of `none` is
+    /// the state the box actually runs in, not a verdict that looks decided
+    /// and is not. A deny-all box running unenforced is the requirement's
+    /// own case. A box whose verdict is decided on address leases instead of
+    /// the host's cgroup tree carries nothing: `None`, not `none`, on every
+    /// surface — the same nothing a daemon that predates the field says.
+    /// And the state a decided host spells is pinned pure, because no
+    /// stand-in can make the probe read a refusal: a tree the facts say is
+    /// decided and a table that is still refusing cannot both be built here.
+    // The guard is taken before the server is even built and held across
+    // the awaited creates on purpose: the stand-in is process-global, so
+    // another test's create in the window would answer over it too.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the stand-in is process-global, so the guard must span the awaited \
+                  creates it is installed for"
+    )]
+    #[tokio::test]
+    async fn create_response_shows_enforcement_none_while_the_host_cannot_decide() {
+        let _standin_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        let _tree = install_step_missing_standin();
+        let mut deny_all = req("deny-all", "/uwu");
+        deny_all.config.policy = SessionPolicy::new(Some(EgressPolicy::deny_all()), None);
+        let created = client.call::<CreateSession>(&deny_all).await.unwrap();
+
+        assert_eq!(
+            created.host_ip_enforcement.as_deref(),
+            Some("none"),
+            "a deny-all box running unenforced on a host that cannot decide \
+             per box must show egress enforcement none, got: {:?}",
+            created.host_ip_enforcement
+        );
+        assert!(
+            created
+                .classifier_advisory
+                .as_deref()
+                .is_some_and(|advisory| advisory.contains("its host-address boxes run unenforced")),
+            "the reply must carry the advisory that says the same state in \
+             words, got: {:?}",
+            created.classifier_advisory
+        );
+
+        // The state outlives the activate message: the record carries the
+        // attribute the create recorded, exactly as the launch's record
+        // carries its own.
+        let record = client
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(created.id))
+            .await;
+        let attrs = &record
+            .record
+            .expect("the created session has a record")
+            .attrs;
+        assert_eq!(
+            attrs
+                .get(super::HOST_IP_ENFORCEMENT_ATTR)
+                .map(String::as_str),
+            Some("none"),
+            "the record must carry the per-box enforcement the create \
+             recorded, got: {attrs:?}"
+        );
+
+        // The surfaces that read a session after the create answer over the
+        // same record, so they say the same thing: the listing a picker
+        // reads without a round trip per session, and the effective-policy
+        // reply `min session policy` renders. All three surfaces agree by
+        // construction here — they read one record the create wrote the
+        // fact on — which is the whole point of recording it.
+        let listed = client.call::<ListSessions>(&()).await;
+        let entry = listed
+            .sessions
+            .iter()
+            .find(|e| e.id == created.id)
+            .expect("the created session is in the listing");
+        assert_eq!(
+            entry.host_ip_enforcement.as_deref().map(String::as_str),
+            Some("none"),
+            "the listing must carry the same state the create reply did, \
+             got: {:?}",
+            entry.host_ip_enforcement
+        );
+        let policy = client
+            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(created.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            policy.egress,
+            EffectiveEgress::Declared(EgressPolicy::deny_all()),
+            "the policy reply keeps the declaration the box launched with"
+        );
+        assert_eq!(
+            policy.host_ip_enforcement.as_deref(),
+            Some("none"),
+            "the policy reply must carry the state beside the rules it \
+             qualifies: a deny-all declaration that is not decided per box \
+             is the state the box runs in, got: {:?}",
+            policy.host_ip_enforcement
+        );
+
+        // A box whose verdict is decided on address leases carries nothing:
+        // `None`, not `none`, over the same host that cannot decide.
+        let own_address = own_ip_session(
+            &mut client,
+            "own-address",
+            SessionPolicy::new(Some(EgressPolicy::deny_all()), None),
+        )
+        .await;
+        assert!(own_address != SessionId::nil());
+        let reply = client
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(own_address))
+            .await;
+        let attrs = &reply
+            .record
+            .expect("the own-address session has a record")
+            .attrs;
+        assert!(
+            !attrs.contains_key(super::HOST_IP_ENFORCEMENT_ATTR),
+            "an own-address box's verdict is decided on address leases, so \
+             its record carries no per-box enforcement, got: {attrs:?}"
+        );
+        let listed = client.call::<ListSessions>(&()).await;
+        let own_entry = listed
+            .sessions
+            .iter()
+            .find(|e| e.id == own_address)
+            .expect("the own-address session is in the listing");
+        assert!(
+            own_entry.host_ip_enforcement.is_none(),
+            "an own-address box shows nothing on the listing either — its \
+             verdict was decided on address leases, got: {:?}",
+            own_entry.host_ip_enforcement
+        );
+        let own_policy = client
+            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(own_address))
+            .await
+            .unwrap();
+        assert!(
+            own_policy.host_ip_enforcement.is_none(),
+            "an own-address box shows nothing on the policy reply either — \
+             there is no per-box state to qualify rules that are decided on \
+             leases, got: {:?}",
+            own_policy.host_ip_enforcement
+        );
+
+        super::clear_create_classifier_standin();
+
+        // The decided host, pinned pure: no stand-in can carry this, so the
+        // reply's own pure half says it — the same machine spelling the
+        // launch's record uses.
+        assert_eq!(
+            super::create_host_ip_enforcement(
+                NetworkMode::HostNet,
+                &classifier::Decision::decided()
+            ),
+            Some("per_box"),
+            "a host that can decide per box must show a host-address box as \
+             enforced"
+        );
+        assert_eq!(
+            super::create_host_ip_enforcement(NetworkMode::OwnIp, &classifier::Decision::decided()),
+            None,
+            "a decided host still decides an own-address box's verdict on \
+             address leases, not on the cgroup tree"
+        );
+    }
+
+    /// The advisory over the two probe causes (NET-079), pinned pure: no
+    /// stand-in can carry either — a fake tree's probe child never places,
+    /// so the stand-ins answer a step or mount cause, and a stand-in that
+    /// carried a decided tree would need a table whose refusal the probe
+    /// could read. The two are the exception's one limit: natively the
+    /// outcome names the refusal — a deny-all host-address box is refused at
+    /// placement — so the advisory must not claim the boxes' declarations do
+    /// not matter over a refusal a person is about to hit. The table a
+    /// reload would fix still names the command; the probe no command can
+    /// make run names none. And in the guest every cause refuses, so the
+    /// clause never appears there either.
+    #[test]
+    fn advisory_over_a_probe_cause_names_the_refusal_not_a_blanket_unenforced() {
+        let not_effective =
+            super::classifier_advisory_text(classifier::Cause::TableNotEffective, false);
+        assert!(
+            not_effective.contains(
+                "its deny-all host-address boxes are refused and its other \
+                 host-address boxes run unenforced"
+            ),
+            "the probe cause's advisory names the refusal, got: {not_effective}"
+        );
+        assert!(
+            !not_effective.contains("whatever the boxes' declarations say"),
+            "the clause holds only while no box is refused, got: {not_effective}"
+        );
+        assert!(
+            not_effective.contains("sudo scripts/install-host-classifier.sh"),
+            "a table the marker vouches for but the probe does not is the one \
+             the step's install reloads, so the advisory still carries the \
+             command, got: {not_effective}"
+        );
+        assert!(
+            !not_effective.contains('?'),
+            "the advisory names what a person may run; it never asks: {not_effective}"
+        );
+
+        let unreadable = super::classifier_advisory_text(classifier::Cause::ProbeUnreadable, false);
+        assert!(
+            unreadable.contains(
+                "its deny-all host-address boxes are refused and its other \
+                 host-address boxes run unenforced"
+            ),
+            "an unreadable probe leaves the same refusal-naming outcome, \
+             got: {unreadable}"
+        );
+        assert!(
+            !unreadable.contains("whatever the boxes' declarations say"),
+            "the clause still does not apply, got: {unreadable}"
+        );
+        assert!(
+            !unreadable.contains("install-host-classifier"),
+            "no command is known to make a probe run, so none is named, \
+             got: {unreadable}"
+        );
+
+        let guest = super::classifier_advisory_text(classifier::Cause::StepNotInstalled, true);
+        assert!(
+            !guest.contains("whatever the boxes' declarations say"),
+            "a guest refuses a deny-all box on every cause, so its advisory \
+             must not claim the declarations do not matter, got: {guest}"
         );
     }
 
@@ -2921,10 +3620,11 @@ mod tests {
         );
     }
 
-    /// Serializes the window in which a loopback-probe stand-in is installed:
-    /// the stand-in is process-global (`net::loopback`), so under libtest —
-    /// where every test in this binary shares one process — a create driven
-    /// by another test would read it too. Nextest runs each test in its own
+    /// Serializes the window in which a process-global stand-in is installed
+    /// — a loopback-probe one (`net::loopback`) or a create-time classifier
+    /// one ([`install_create_classifier_standin`]): under libtest — where
+    /// every test in this binary shares one process — a create driven by
+    /// another test would read it too. Nextest runs each test in its own
     /// process; the mutex keeps the in-process runner as safe.
     static PROBE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -3357,10 +4057,12 @@ mod tests {
                 NetworkMode::OwnIp,
                 sessions::EgressDefaultPhase::InForce,
                 false,
+                None,
             ),
             EffectiveSessionPolicy {
                 egress: EffectiveEgress::DenyAll,
                 ingress: None,
+                host_ip_enforcement: None,
             },
             "an own-address box with no egress section must answer deny-all in force",
         );
@@ -3372,6 +4074,7 @@ mod tests {
         let deny_all = EffectiveSessionPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
+            host_ip_enforcement: None,
         };
         let wire = serde_json_lenient::to_string(&minimald_rpc::Errorable::Ok(deny_all.clone()))
             .expect("the deny-all reply must serialize");
@@ -3399,6 +4102,7 @@ mod tests {
                 NetworkMode::OwnIp,
                 sessions::EGRESS_DEFAULT_PHASE,
                 false,
+                None,
             ),
             "the wire must answer the shipped phase's resolution for a bare box",
         );
@@ -3457,6 +4161,7 @@ mod tests {
             EffectiveSessionPolicy {
                 egress: EffectiveEgress::AllowAll,
                 ingress: None,
+                host_ip_enforcement: None,
             },
             "behind the opt-out, an absent egress section keeps the shipped allow-all",
         );
