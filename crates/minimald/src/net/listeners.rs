@@ -521,6 +521,15 @@ impl WatchState {
             self.close(port, "the listener had closed and its unexpose failed")
                 .await;
         }
+        // A port whose listener closed takes its backoff streak with it: the
+        // book keeps a backed-off port out of the listening table (below), so
+        // the diff above never reads one as disappeared — without this, the
+        // entry outlives the listener it was refused for, and the next server
+        // the box binds on that port number inherits a wait it did not earn
+        // and a count whose first failure was never said. The fresh table is
+        // the fact that decides: an entry survives only while a process in
+        // the box is still listening on its port.
+        self.backoff.retain(|port, _| listening.contains(port));
         self.listening = listening;
         // A port in the backoff book is one the box is listening on and
         // the watcher has still not published, so it stays out of the
@@ -683,6 +692,14 @@ impl WatchState {
             // not permit, whose publication never existed.
             return;
         };
+        // The gate withdraws before the forward comes down, and the order is
+        // the point: between the two, the listener is already gone and the
+        // forward still bound, so a connection arriving in that gap would be
+        // accepted by the box's own address and delivered to nothing. With
+        // the gate first, that connection is refused at the address instead
+        // — the same order a revoked declared forwarder's `revoke` holds
+        // (NET-121), so both ingress surfaces end a publication the same
+        // way.
         let terminated = self.plan.gate.withdraw_published(port);
         match unexpose_mapping(&self.plan.control, &mapping).await {
             Ok(()) => {
@@ -1773,6 +1790,116 @@ mod tests {
         assert_eq!(published.local, format!("{PUBLISHED}:{port}"));
         soon(|| gate.admits_tcp(port)).await;
 
+        watcher.stop().await;
+        let withdrawn = next_served(&mut served).await;
+        assert_eq!(withdrawn.path, "/services/forwarder/unexpose");
+        assert_eq!(withdrawn.local, format!("{PUBLISHED}:{port}"));
+        assert!(!gate.admits_tcp(port));
+        server.abort();
+    }
+
+    /// A backoff streak belongs to one listener: a port whose listener closed
+    /// while its publish was waiting out a refusal starts a fresh streak when
+    /// the box's next server binds the same port number — not the wait and the
+    /// count the closed listener earned. The book keeps a backed-off port out
+    /// of the listening table, so the poll's diff never reads one as
+    /// disappeared, and the entry would otherwise outlive its listener: the
+    /// next server would inherit a wait it did not earn and a count whose
+    /// first failure was never said. The fresh server's first failure is its
+    /// own streak's first — said, at the poll's own cadence — and the streak
+    /// still ends the way every one does: the port publishes the moment the
+    /// forwarder accepts.
+    #[tokio::test]
+    async fn a_backed_off_port_that_closes_starts_a_fresh_streak() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("gvproxy.sock");
+        // The forwarder refuses every expose while the test says so, so both
+        // servers' publishes fail under it until the test clears the flag.
+        let refusing = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&refusing);
+        let (server, mut served) = spawn_forwarder_deciding(sock.clone(), move |served| {
+            if served.path.ends_with("/expose") && flag.load(Ordering::SeqCst) {
+                500
+            } else {
+                200
+            }
+        });
+        let (lines, _guard) = captured_lines();
+        let (watcher, gate) = watcher_at(sock, &permit_policy(port));
+
+        // The first server's publish is refused and said — one streak's first
+        // failure, at the poll's own cadence: the fresh wait is one poll
+        // (`retry_in` below).
+        let first_attempt = next_served(&mut served).await;
+        assert_eq!(first_attempt.path, "/services/forwarder/expose");
+        assert_eq!(first_attempt.local, format!("{PUBLISHED}:{port}"));
+        soon(|| {
+            !lines_saying(&lines.contents(), "publishing a listening port on the switch failed")
+                .is_empty()
+        })
+        .await;
+
+        // The first server closes, and a poll reads its port gone — two
+        // poll intervals leave no doubt the fresh table was read — so the
+        // streak it never finished goes with it.
+        drop(listener);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            lines_saying(&lines.contents(), "publishing a listening port on the switch failed")
+                .len(),
+            1,
+            "the closed listener's streak said its one failure and no more"
+        );
+
+        // The box's next server binds the same port number: a listener of its
+        // own, whose first failure must be said too — the count the old
+        // streak earned would swallow it — and at the poll's cadence, not
+        // made to wait the old streak's backoff out.
+        let second = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
+            .expect("the box's next server binds the port its old one held");
+        let second_attempt = next_served(&mut served).await;
+        assert_eq!(
+            second_attempt,
+            Served {
+                path: "/services/forwarder/expose".into(),
+                local: format!("{PUBLISHED}:{port}"),
+                remote: format!("{LEASE}:{port}"),
+                protocol: "tcp".into(),
+            },
+            "the new server's publish is asked for like any fresh appearance"
+        );
+        soon(|| {
+            lines_saying(&lines.contents(), "publishing a listening port on the switch failed")
+                .len()
+                == 2
+        })
+        .await;
+        let log = lines.contents();
+        let failed = lines_saying(&log, "publishing a listening port on the switch failed");
+        assert_eq!(failed.len(), 2, "two streaks, one line each: {failed:?}");
+        for line in failed {
+            assert!(
+                line.contains("retry_in=250ms"),
+                "each streak's first failure waits one poll, not the count \
+                 an earlier listener earned: {line}"
+            );
+        }
+        assert!(
+            !gate.admits_tcp(port),
+            "nothing is published while the switch refuses the binds"
+        );
+
+        // The fresh streak still ends the way every one does: the moment the
+        // forwarder accepts, the port the new server holds publishes.
+        refusing.store(false, Ordering::SeqCst);
+        let published = next_served(&mut served).await;
+        assert_eq!(published.path, "/services/forwarder/expose");
+        assert_eq!(published.local, format!("{PUBLISHED}:{port}"));
+        soon(|| gate.admits_tcp(port)).await;
+
+        drop(second);
         watcher.stop().await;
         let withdrawn = next_served(&mut served).await;
         assert_eq!(withdrawn.path, "/services/forwarder/unexpose");
