@@ -39,7 +39,11 @@
 //! poll interval, a withdrawal whose unexpose failed is retried on every
 //! poll the box still runs and through the stop's passes, so a transient
 //! refusal on the control channel never settles into a port that stays
-//! missing or a forward that stays bound. Neither half says its failure
+//! missing or a forward that stays bound, and a leader the box's host could
+//! not resolve when it built is asked for again on every poll ([`Leader`]),
+//! so a shell that was mid-spawn or a `/proc` that could not answer for the
+//! moment costs the moment between two polls and never the box's whole
+//! listen-published surface. Neither half says its failure
 //! more than once while it keeps failing: the first refusal of a streak
 //! is the line, and the line that ends a streak is the publication's or
 //! the withdrawal's own — so a forwarder that is down for as long as the
@@ -240,6 +244,38 @@ impl Drop for StagedPlanGuard {
     }
 }
 
+/// The box's leader as the watcher holds it: the PID whose `/proc` entry
+/// reads the box's whole network namespace — or, while that PID is still to
+/// be found, the container PID the resolution is owed from.
+///
+/// The leader is not a precondition of the watcher's existence. The
+/// resolution can be refused for reasons that pass — a shell that is
+/// mid-spawn, a `/proc` whose `children` file cannot answer for the moment —
+/// and a watcher that needed it to have succeeded would turn each of those
+/// into a box whose ports are never published by listening, for its whole
+/// life. So the watcher starts with what it has — a leader the box's host
+/// resolved, or the container PID to resolve one from — and asks again on
+/// every poll the leader is still owed ([`WatchState::resolve_leader`]):
+/// the nothing-is-one-shot contract the module's publish and withdraw halves
+/// hold, held of its start too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leader {
+    /// The session leader — the program the box runs, whose `/proc` entry
+    /// names every listening socket in the box. Pinned for the watcher's
+    /// life once resolved: the box's table is the box's, whichever of its
+    /// processes the entry belongs to, and a leader that has gone is the
+    /// box ending — the host's stop is what ends the watcher, not a fact
+    /// to re-resolve.
+    Resolved(u32),
+    /// The container PID [`crate::nsenter::session_leader_pid`] resolves the
+    /// leader from — `hakoniwa`'s supervisor, the daemon-side handle whose
+    /// sole child is the program the box runs.
+    Pending {
+        /// The container supervisor the leader is resolved from.
+        container_pid: u32,
+    },
+}
+
 /// The running watcher: what a host holds for its box's lifetime, stopped by
 /// [`Self::stop`] at session end. Stopping is the one other thing the
 /// watcher does — its loop polls, and everything it published comes down
@@ -255,18 +291,24 @@ pub struct ListenWatcher {
 
 impl ListenWatcher {
     /// Starts the box's watcher: a loop that reads the listening sockets of
-    /// the process tree `leader` leads — the box's leader, whose `/proc`
+    /// the process tree `leader` names — the box's leader, whose `/proc`
     /// entry names the whole box's network namespace — and keeps the
     /// box's publications in step with them. The first poll happens at
     /// once, so a listener that outlived a previous host is published
     /// before a person can look for it.
+    ///
+    /// `leader` may still be owed ([`Leader::Pending`]): the box's host
+    /// stages the container PID it holds and the watcher resolves the
+    /// program itself, so a box whose leader could not be found when its
+    /// host built — a shell mid-spawn, a `/proc` that could not answer —
+    /// publishes the moment the next poll finds it, rather than never.
     #[must_use]
-    pub fn start(plan: ListenPlan, leader: u32) -> Self {
+    pub fn start(plan: ListenPlan, leader: Leader) -> Self {
         let (stop, mut stop_rx) = watch::channel(false);
         let task = tokio::spawn(async move {
-            let mut state = WatchState::new(plan);
+            let mut state = WatchState::new(plan, leader);
             loop {
-                state.poll(leader).await;
+                state.poll().await;
                 tokio::select! {
                     _ = stop_rx.changed() => break,
                     _ = tokio::time::sleep(LISTEN_POLL_INTERVAL) => {}
@@ -306,6 +348,16 @@ impl ListenWatcher {
 /// never enters it.
 struct WatchState {
     plan: ListenPlan,
+    /// The box's leader — resolved, or the container PID it is still owed
+    /// from ([`Leader`]).
+    leader: Leader,
+    /// Whether the streak of resolutions that could not find the box's
+    /// leader has been said already: the first refusal is the line, and
+    /// the polls that retry it are the same failure waited out — the
+    /// publish half's own discipline, held of the leader. The line that
+    /// ends the streak is the resolution's own: the publications the leader
+    /// it found makes.
+    reported_leader_refusal: bool,
     /// The listening ports the last read settled — published, declined by
     /// the rules, or a declaration's own. A port whose publication failed to
     /// bind is held out until a poll binds it, so the diff reads it as
@@ -355,9 +407,11 @@ fn retry_after(refusals: u32) -> Duration {
 }
 
 impl WatchState {
-    fn new(plan: ListenPlan) -> Self {
+    fn new(plan: ListenPlan, leader: Leader) -> Self {
         Self {
             plan,
+            leader,
+            reported_leader_refusal: false,
             listening: HashSet::new(),
             forwards: HashMap::new(),
             backoff: HashMap::new(),
@@ -365,14 +419,61 @@ impl WatchState {
         }
     }
 
-    /// One poll: read the box's listening sockets, publish what appeared,
-    /// withdraw what closed, and ask again for what a refusal has left
-    /// owed. A publication that failed to bind keeps its port out of the
+    /// The PID this poll reads the box's table through, resolving the leader
+    /// first when it is still owed: the resolution is retried on every poll
+    /// that fails, so a refusal that passes costs the moment between two
+    /// polls — never the box's whole listen-published surface, which is
+    /// what a start that needed the resolution to have succeeded would
+    /// cost it. A resolved leader is pinned ([`Leader::Resolved`]).
+    ///
+    /// `None` while the leader is still owed, the refusal said once for its
+    /// streak the way a refused publish's is.
+    fn resolve_leader(&mut self) -> Option<u32> {
+        match self.leader {
+            Leader::Resolved(leader) => Some(leader),
+            Leader::Pending { container_pid } => {
+                match crate::nsenter::session_leader_pid(container_pid) {
+                    Ok(leader) => {
+                        // The streak of refused resolutions — if there was
+                        // one — is over, and a later refusal is a streak of
+                        // its own.
+                        self.reported_leader_refusal = false;
+                        self.leader = Leader::Resolved(leader);
+                        Some(leader)
+                    }
+                    Err(e) => {
+                        if !self.reported_leader_refusal {
+                            self.reported_leader_refusal = true;
+                            tracing::warn!(
+                                session = %self.plan.box_name,
+                                container_pid,
+                                error = %e,
+                                "resolving the box's leader to read its listening sockets, \
+                                 retrying on every poll"
+                            );
+                        }
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// One poll: resolve the box's leader when it is still owed, read the
+    /// box's listening sockets, publish what appeared, withdraw what
+    /// closed, and ask again for what a refusal has left owed. A poll that
+    /// has not found the leader publishes nothing and withdraws nothing —
+    /// it has no table to diff — and asks again on the next one. A
+    /// publication that failed to bind keeps its port out of the
     /// book ([`Self::listening`]), so the next poll reads the port as
     /// appeared again — the appearance is not consumed by the failure, and
     /// a transient refusal on the control channel never turns into a
     /// permitted port that stays unpublished until its server restarts.
-    async fn poll(&mut self, leader: u32) {
+    async fn poll(&mut self) {
+        // The leader first, when the box's host could not resolve it.
+        let Some(leader) = self.resolve_leader() else {
+            return;
+        };
         let listening = match listening_ports(leader, self.plan.lease) {
             Ok(listening) => listening,
             Err(e) => {
@@ -948,12 +1049,11 @@ mod tests {
     }
 
     /// The box's watcher against the fake forwarder bound at `sock`, with
-    /// its gate answering the given policy. This process is the leader: its
-    /// own `/proc` entry is the table the watcher reads, and the sockets the
-    /// test binds are in it.
-    fn watcher_at(
+    /// its gate answering the given policy and the leader the test names.
+    fn watcher_with(
         sock: PathBuf,
         policy: &sessions::SessionPolicy,
+        leader: Leader,
     ) -> (ListenWatcher, Arc<SessionGate>) {
         let gate = Arc::new(SessionGate::for_session(
             "listen-box".into(),
@@ -968,7 +1068,17 @@ mod tests {
             ControlChannel::Unix(sock),
             Arc::clone(&gate),
         );
-        (ListenWatcher::start(plan, std::process::id()), gate)
+        (ListenWatcher::start(plan, leader), gate)
+    }
+
+    /// The box's watcher, this process its leader: the watcher's own `/proc`
+    /// entry is the table it reads, and the sockets the test binds are in
+    /// it — the shape a box whose host resolved its leader starts with.
+    fn watcher_at(
+        sock: PathBuf,
+        policy: &sessions::SessionPolicy,
+    ) -> (ListenWatcher, Arc<SessionGate>) {
+        watcher_with(sock, policy, Leader::Resolved(std::process::id()))
     }
 
     /// The box's watcher, started against a fake gvproxy control channel
@@ -1195,6 +1305,101 @@ mod tests {
         watcher.stop().await;
         let last = next_served(&mut served).await;
         assert_eq!(last.path, "/services/forwarder/unexpose");
+        server.abort();
+    }
+
+    /// The leader is not a precondition of the watcher's start: a box whose
+    /// program was not there to be found when its host built — a shell
+    /// mid-spawn, or a `/proc` that could not answer for the moment — still
+    /// publishes, because the watcher starts with the container PID the
+    /// resolution is owed from and asks again on every poll. The refusal is
+    /// said once for its streak, and the moment the program is there the
+    /// box's port publishes: the same publication a build that resolved
+    /// would have had, late by the moment between two polls and never
+    /// missing.
+    #[tokio::test]
+    async fn a_watcher_whose_leader_was_not_yet_findable_publishes_when_it_is() {
+        use std::io::Write as _;
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Stdio;
+
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("gvproxy.sock");
+        let (server, mut served) = spawn_forwarder(sock.clone());
+        // The box's container supervisor: `/bin/sh` stands in for the
+        // supervisor hakoniwa hands its host — it holds no child while it
+        // waits on `read`, a shell builtin, so nothing is forked — and forks
+        // `sleep`, the program the box "runs", the moment its stdin is
+        // given a line. The `& wait` is load-bearing: bash exec-optimizes a
+        // `-c` script's last external command, which would replace the
+        // supervisor with its program instead of forking one for the
+        // resolution to find. The supervisor and the program it forks are
+        // their own process group, so the proof takes them both down
+        // together at its end and leaves neither behind.
+        let mut supervisor = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("read line; sleep 60 & wait")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawning the box's container supervisor");
+        let (lines, _guard) = captured_lines();
+        let (watcher, gate) = watcher_with(
+            sock,
+            &permit_policy(port),
+            Leader::Pending {
+                container_pid: supervisor.id(),
+            },
+        );
+
+        // A poll ran and its resolution was refused: the box's program is
+        // not there to be found, and nothing was published.
+        soon(|| !lines_saying(&lines.contents(), "resolving the box's leader").is_empty()).await;
+        assert!(
+            served.try_recv().is_err(),
+            "nothing is published while the box's leader is still to be found"
+        );
+        assert!(!gate.admits_tcp(port));
+
+        // The program appears — the sole child the resolution reads — and a
+        // later poll finds it, so the box's port publishes.
+        let mut stdin = supervisor
+            .stdin
+            .take()
+            .expect("the supervisor reads the line that forks its program");
+        writeln!(stdin, "go").expect("the supervisor takes the line it forks its program on");
+        drop(stdin);
+        let published = next_served(&mut served).await;
+        assert_eq!(published.path, "/services/forwarder/expose");
+        assert_eq!(published.local, format!("{PUBLISHED}:{port}"));
+        assert_eq!(
+            published.remote,
+            format!("{LEASE}:{port}"),
+            "the publication is the one the rules permit, at its own number"
+        );
+        soon(|| gate.admits_tcp(port)).await;
+
+        // The refusal was said once for its whole streak — the polls that
+        // retried it in between are the same failure — and the leader it
+        // found is pinned: no resolution is asked for again.
+        assert_eq!(
+            lines_saying(&lines.contents(), "resolving the box's leader").len(),
+            1,
+            "the refused resolution is said once, not once per poll"
+        );
+
+        // The publication is the watcher's to withdraw like any other.
+        watcher.stop().await;
+        let withdrawn = next_served(&mut served).await;
+        assert_eq!(withdrawn.path, "/services/forwarder/unexpose");
+        assert_eq!(withdrawn.local, format!("{PUBLISHED}:{port}"));
+        assert!(!gate.admits_tcp(port));
+        let _ = unsafe { libc::kill(-(supervisor.id() as libc::pid_t), libc::SIGKILL) };
+        let _ = supervisor.wait();
         server.abort();
     }
 

@@ -4167,18 +4167,22 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         // the box's published ports in step with them until the session
         // ends. A box that staged no plan — no lease, no published address —
         // runs no watcher, and none of its ports is published by listening.
-        let listen_watcher = crate::net::listeners::take_listen_plan(session_id).and_then(|plan| {
-            match crate::nsenter::session_leader_pid(process.container_pid()) {
-                Ok(leader) => Some(crate::net::listeners::ListenWatcher::start(plan, leader)),
-                Err(e) => {
-                    tracing::warn!(
-                        session = %session_name,
-                        error = %e,
-                        "resolving the box's leader to start the listen-publication watcher",
-                    );
-                    None
-                }
-            }
+        //
+        // The leader itself is the watcher's to resolve, not this build's to
+        // have resolved: a resolution that fails here — a shell that is
+        // mid-spawn, a `/proc` that cannot answer for the moment — would
+        // otherwise drop the plan with it and silently cost the box its
+        // whole listen-published surface, so the build hands the container
+        // PID it holds and the watcher asks on every poll until the box's
+        // program is there to be found (the module's nothing-is-one-shot
+        // contract, held of its start).
+        let listen_watcher = crate::net::listeners::take_listen_plan(session_id).map(|plan| {
+            crate::net::listeners::ListenWatcher::start(
+                plan,
+                crate::net::listeners::Leader::Pending {
+                    container_pid: process.container_pid(),
+                },
+            )
         });
         // The plan is the watcher's now — or there never was one — and the
         // table's entry went with the take, so this build's own end has
