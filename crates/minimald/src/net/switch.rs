@@ -65,7 +65,9 @@ use tokio::task::JoinHandle;
 use super::dns_gate::DnsGate;
 use super::policy::{Direction, PolicyWarnLimiter, Proto};
 use super::{DEFAULT_MTU, PtaskLease, SwitchSubnet};
-use sessions::core::egress::{self, DropReason, FrameSummary, FrameVerdict};
+use sessions::core::egress::{
+    self, DropReason, FrameSummary, FrameVerdict, IngressRules, ListenVerdict,
+};
 use switch::refusal;
 
 /// `ioctl` request number for `TUNSETIFF` (set the tap/tun interface a fd backs).
@@ -975,8 +977,10 @@ fn register_live_gate(lease: Ipv4Addr, gate: &Arc<SessionGate>) {
 }
 
 /// The live gate of the box `addr` belongs to, while its relay lives — `None`
-/// for every other source, whatever the table once held.
-fn live_gate(addr: Ipv4Addr) -> Option<Arc<SessionGate>> {
+/// for every other source, whatever the table once held. Read by the
+/// listener watcher's launch path, which hands the gate its box's
+/// publications through (NET-016).
+pub(crate) fn live_gate(addr: Ipv4Addr) -> Option<Arc<SessionGate>> {
     LIVE_GATES
         .lock()
         .expect("live gate table poisoned")
@@ -1022,6 +1026,16 @@ pub struct SessionGate {
     /// and what both a peer session and the host-publish forwarder dial). An empty
     /// set denies every inbound SYN (the own-IP default-block posture).
     allowed: HashSet<u16>,
+    /// TCP ports the box's *processes* published by listening on them
+    /// (NET-016): admitted beside the declared ones for as long as a
+    /// listener holds the port, withdrawn — connections and all — when it
+    /// closes (NET-017). Tracked apart from `allowed` because the two
+    /// halves have different owners: a declared port's admission is the
+    /// declaration's (held until the box stops, NET-121), and a withdrawal
+    /// never touches it (NET-081's sub-requirement), while this set is
+    /// the listener watcher's alone. Interior-mutable because the watcher
+    /// publishes while the gate is shared between both relay legs.
+    listen_published: Mutex<HashSet<u16>>,
     /// UDP destination ports the target accepts new inbound datagrams on (the
     /// internal ports of its UDP `port_mappings`). Inbound UDP to any other port
     /// passes only if it matches a live outbound flow in `conntrack`.
@@ -1091,6 +1105,12 @@ pub struct SessionGate {
     /// resolver the carve-out is keyed to, and its lease (NET-084) — decided
     /// by `sessions::core::egress`.
     egress: egress::EgressRules,
+    /// The box's compiled ingress rules — its declared internal ports, the
+    /// permit range and the dynamic stance — the shared decision a
+    /// listen-published port is published by ([`Self::listen_verdict`],
+    /// NET-016), kept here beside the egress compilation so both halves of
+    /// the box's policy decide on one form of each.
+    ingress: IngressRules,
     /// The DNS gate (NET-066, NET-067, NET-136): the per-box table of the
     /// addresses its allowed names resolved to, each holding for its
     /// admission window — the one thing that can lift an
@@ -1157,6 +1177,11 @@ impl SessionGate {
         let (box_resets, box_resets_rx) = mpsc::channel(RESET_CHANNEL_CAPACITY);
         Self {
             allowed: declared_ingress_ports(Some(policy), sessions::IpProto::Tcp),
+            // The runtime-published half starts empty: nothing a box's
+            // processes listen on is published until the watcher sees it
+            // (NET-016), and an own-IP box that starts no watcher — one whose
+            // launch attached no switch — publishes nothing at all.
+            listen_published: Mutex::new(HashSet::new()),
             udp_allowed: declared_ingress_ports(Some(policy), sessions::IpProto::Udp),
             revoked: Mutex::new(HashSet::new()),
             inbound_flows: Mutex::new(HashMap::new()),
@@ -1170,6 +1195,10 @@ impl SessionGate {
             label,
             limiter,
             egress: rules,
+            // The ingress half of the same compilation discipline: the
+            // listener watcher asks this gate, so both it and the inbound
+            // leg read the one decision the shared module holds (NET-016).
+            ingress: IngressRules::from_policy(policy.ingress.as_ref()),
             dns,
             flows: ReplyFlowGate::new(),
         }
@@ -1220,12 +1249,14 @@ impl SessionGate {
 
     /// Records the tail of an admitted inbound TCP flow: the packet's own
     /// addressing, sequence and acknowledgement pair, Ethernet addresses and
-    /// length — the state a later revocation of its port builds the flow's
-    /// terminating reset from. Only packets to declared ports are recorded: a
-    /// return segment of the box's own egress is no ingress flow. Swept past
+    /// length — the state a later withdrawal of its port builds the flow's
+    /// terminating reset from. Only packets to admitted ports are recorded
+    /// — a declared port's (NET-121) or a listen-published one's (NET-016),
+    /// both of which a forward dials through this relay: a return segment of
+    /// the box's own egress is no ingress flow. Swept past
     /// [`INBOUND_FLOW_SWEEP_AT`] entries, the conntrack's bound.
     fn record_inbound(&self, pkt: &L4Packet, frame: &[u8]) {
-        if !self.allowed.contains(&pkt.dst.port()) {
+        if !self.admits_tcp(pkt.dst.port()) {
             return;
         }
         let tail = InboundFlowTail {
@@ -1276,6 +1307,20 @@ impl SessionGate {
             // revocation terminates nothing.
             return 0;
         }
+        self.terminate_port(port)
+    }
+
+    /// Ends every connection the gate holds on `port`, at **both ends** — the
+    /// machinery a forward's disappearance runs whether the forward was a
+    /// declaration's, revoked through [`Self::revoke_port`] (NET-121), or a
+    /// listen-published one whose listener closed ([`Self::withdraw_published`],
+    /// NET-017): each recorded flow is answered with a reset built from the
+    /// last packet the gate saw of it, the box's half of the same flow is
+    /// ended by a reset written into the tap toward it, and every flow's tail
+    /// is kept for [`TERMINATED_FLOW_TTL`] so a segment the ended connection
+    /// still sends is answered from the state the gate **tracked**. Returns
+    /// the number of held connections terminated, for the caller's log line.
+    fn terminate_port(&self, port: u16) -> usize {
         let now = Instant::now();
         let drained: Vec<(InboundFlowKey, InboundFlowTail)> = {
             let mut flows = self
@@ -1455,8 +1500,20 @@ impl SessionGate {
     /// src))` when it must be dropped — a new TCP connection or an unsolicited UDP
     /// datagram to a port the target did not declare — else `None` (pass).
     fn inbound_drop(&self, frame: &[u8]) -> Option<(sessions::IpProto, u16, SocketAddrV4)> {
-        if let Some((dst_port, src)) = blocked_syn(frame, &self.allowed) {
-            return Some((sessions::IpProto::Tcp, dst_port, src));
+        {
+            // NET-016: the declared ports and the listen-published ones are
+            // one admission set for a new inbound connection. The
+            // runtime-published half is read under one lock per frame — the
+            // same interior-mutable shape the revoked check holds below it —
+            // rather than snapshotted, so a frame never decides on a set the
+            // watcher has already moved on from.
+            let listen_published = self
+                .listen_published
+                .lock()
+                .expect("gate listen-published lock poisoned");
+            if let Some((dst_port, src)) = blocked_syn(frame, &self.allowed, &listen_published) {
+                return Some((sessions::IpProto::Tcp, dst_port, src));
+            }
         }
         if let Some((dst_port, src)) = blocked_udp(frame, &self.udp_allowed, &self.conntrack) {
             return Some((sessions::IpProto::Udp, dst_port, src));
@@ -1532,8 +1589,10 @@ impl SessionGate {
             FrameVerdict::Drop(reason) => (Some(reason), false),
         };
         // The target's half, as `inbound_drop` will decide the same frame a
-        // breath later if the source's half passes.
-        let target_pass = self.allowed.contains(&dst_port);
+        // breath later if the source's half passes — the declared and
+        // listen-published ports together, the one admission set a new
+        // inbound connection is decided on (NET-016).
+        let target_pass = self.admits_tcp(dst_port);
         tracing::debug!(
             source = %peer.label,
             target = %self.label,
@@ -1574,6 +1633,73 @@ impl SessionGate {
     #[must_use]
     pub fn admits_direct_tcp(&self, port: u16) -> bool {
         self.allowed.contains(&port)
+    }
+
+    /// The shared verdict for one port a process in the box is listening on,
+    /// on the transport it listens with (NET-016): the pure decision
+    /// `sessions::core::egress` holds for the whole surface, asked of the
+    /// rules this gate was compiled with at attach, so the listener watcher
+    /// and the relay can never grow two derivations of the box's
+    /// declaration that disagree. The transport is half of what the
+    /// declaration must name for a port to be published already — a
+    /// mapping's forward answers the one protocol it was exposed with
+    /// (NET-121) — so the watcher asks with the transport it publishes on.
+    /// The watcher calls this before it publishes anything.
+    #[must_use]
+    pub fn listen_verdict(&self, proto: sessions::IpProto, port: u16) -> ListenVerdict {
+        self.ingress.listen_verdict(proto, port)
+    }
+
+    /// Admits one listen-published port (NET-016): the runtime-published
+    /// half of the inbound gate's TCP set, so the connections its forwarder
+    /// dials through the relay reach the box. The watcher calls this only
+    /// *after* [`super::policy::expose_mapping`] bound the forward — the
+    /// order the declaration's own apply holds (NET-121) — so a port is
+    /// never admitted while nothing answers for it.
+    pub(crate) fn admit_published(&self, port: u16) {
+        self.listen_published
+            .lock()
+            .expect("gate listen-published lock poisoned")
+            .insert(port);
+    }
+
+    /// Whether this gate admits a new inbound TCP connection to `port` —
+    /// the declared ports (NET-121) and the listen-published ones
+    /// (NET-016) together: the one predicate the inbound leg, the
+    /// connect-time debug line, and the watcher's own tests read.
+    pub(crate) fn admits_tcp(&self, port: u16) -> bool {
+        self.allowed.contains(&port)
+            || self
+                .listen_published
+                .lock()
+                .expect("gate listen-published lock poisoned")
+                .contains(&port)
+    }
+
+    /// Withdraws one listen-published port (NET-017): its admission goes,
+    /// and the connections it held are terminated at both ends — a forward
+    /// whose listener is gone must not leave connections hanging at it, the
+    /// same end a revoked declared forwarder's connections come to. The
+    /// declared set is never touched: a declaration's port is published
+    /// already and held until the box stops (NET-121), and a withdrawal
+    /// applies only to the runtime-published set (NET-081's
+    /// sub-requirement). Returns the number of held connections terminated,
+    /// for the withdrawal's log line.
+    pub(crate) fn withdraw_published(&self, port: u16) -> usize {
+        if !self
+            .listen_published
+            .lock()
+            .expect("gate listen-published lock poisoned")
+            .remove(&port)
+        {
+            // Never published through this gate: there is no admission to
+            // withdraw and no connection of this publication to end.
+            return 0;
+        }
+        // The publication's reply-flow records go with it: a reply on a
+        // withdrawn port is new traffic the box's own rules decide.
+        self.flows.end_tcp_port(port);
+        self.terminate_port(port)
     }
 
     /// NET-040's answer half, the egress leg's half: whether one frame the
@@ -1617,8 +1743,12 @@ impl SessionGate {
         // fact the ingress gate above decided the frame by, checked here so
         // the record's invariant holds by construction at the recording
         // call, not by the caller's position in the leg.
+        // TCP reads both halves of the admission set — declared (NET-121)
+        // and listen-published (NET-016) — so a deny-all box can answer a
+        // connection to a port its listener published, as it can one to a
+        // declared port.
         let published = match pkt.proto {
-            IPPROTO_TCP => self.allowed.contains(&pkt.dst.port()),
+            IPPROTO_TCP => self.admits_tcp(pkt.dst.port()),
             IPPROTO_UDP => self.udp_allowed.contains(&pkt.dst.port()),
             _ => false,
         };
@@ -1793,6 +1923,15 @@ impl ReplyFlowGate {
             .clear();
     }
 
+    /// Ends the recorded TCP flows of one withdrawn port
+    /// ([`SessionGate::withdraw_published`]).
+    fn end_tcp_port(&self, port: u16) {
+        self.flows
+            .lock()
+            .expect("the reply-flow lock is held only across one decision")
+            .end_port(IPPROTO_TCP, port);
+    }
+
     /// The per-box cap, read from the table so a harness-shrunk cap is the
     /// one the filled line names.
     fn cap(&self) -> usize {
@@ -1892,24 +2031,19 @@ pub use switch::refusal::REVOKED_INGRESS_PORT_RULE;
 /// The internal ports a target's ingress declaration admits on `proto` — the
 /// one derivation both ingress surfaces read: the relay's inbound gate
 /// ([`SessionGate::allowed`]/[`SessionGate::udp_allowed`]) and, through the
-/// registry's routes, the hostname proxy's own port gate. An absent ingress
-/// policy admits nothing (the own-IP default-block posture).
+/// registry's routes, the hostname proxy's own port gate. Compiled by the
+/// shared rules (`sessions::core::egress::IngressRules`), so the declared
+/// half and the listen-published half of a box's ingress answer the same
+/// form of the same declaration. An absent ingress policy admits nothing
+/// (the own-IP default-block posture).
 #[must_use]
 pub fn declared_ingress_ports(
     policy: Option<&sessions::SessionPolicy>,
     proto: sessions::IpProto,
 ) -> HashSet<u16> {
-    policy
-        .and_then(|policy| policy.ingress.as_ref())
-        .map(|ingress| {
-            ingress
-                .port_mappings
-                .iter()
-                .filter(|m| m.proto == proto)
-                .map(|m| m.internal_port)
-                .collect()
-        })
-        .unwrap_or_default()
+    IngressRules::from_policy(policy.and_then(|policy| policy.ingress.as_ref()))
+        .declared(proto)
+        .collect()
 }
 
 /// The external ports a request to an **own-address** target may name
@@ -2122,16 +2256,26 @@ fn parse_ipv4_l4(frame: &[u8]) -> Option<L4Packet> {
 }
 
 /// Returns `Some((dst_port, src))` iff `frame` is a bare TCP SYN (SYN set, ACK
-/// clear) to a port not in `allowed` — the one TCP case the ingress gate drops.
-/// `None` (pass) for non-TCP, declared ports, and any ACK-set segment (SYN-ACK,
-/// established, egress return).
-fn blocked_syn(frame: &[u8], allowed: &HashSet<u16>) -> Option<(u16, SocketAddrV4)> {
+/// clear) to a port neither half of the gate's admission set holds — not
+/// declared (`allowed`) and not published by a listener ([`listen_published`],
+/// NET-016) — the one TCP case the ingress gate drops. `None` (pass) for
+/// non-TCP, admitted ports, and any ACK-set segment (SYN-ACK, established,
+/// egress return).
+fn blocked_syn(
+    frame: &[u8],
+    allowed: &HashSet<u16>,
+    listen_published: &HashSet<u16>,
+) -> Option<(u16, SocketAddrV4)> {
     let pkt = parse_ipv4_l4(frame)?;
     if pkt.proto != IPPROTO_TCP {
         return None;
     }
     let (syn, ack) = (pkt.tcp_flags & 0x02 != 0, pkt.tcp_flags & 0x10 != 0);
-    if !syn || ack || allowed.contains(&pkt.dst.port()) {
+    if !syn
+        || ack
+        || allowed.contains(&pkt.dst.port())
+        || listen_published.contains(&pkt.dst.port())
+    {
         return None;
     }
     Some((pkt.dst.port(), pkt.src))
@@ -2682,7 +2826,8 @@ pub(crate) mod tests {
     fn gate_drops_syn_to_undeclared_port() {
         let allowed = HashSet::from([80]);
         let frame = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, SRC, 9999);
-        let hit = blocked_syn(&frame, &allowed).expect("a SYN to :9999 must be blocked");
+        let hit = blocked_syn(&frame, &allowed, &none_published())
+            .expect("a SYN to :9999 must be blocked");
         assert_eq!(hit.0, 9999);
         assert_eq!(*hit.1.ip(), SRC);
         assert_eq!(hit.1.port(), 40000);
@@ -2692,7 +2837,7 @@ pub(crate) mod tests {
     fn gate_passes_syn_to_declared_port() {
         let allowed = HashSet::from([80]);
         let frame = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, SRC, 80);
-        assert!(blocked_syn(&frame, &allowed).is_none());
+        assert!(blocked_syn(&frame, &allowed, &none_published()).is_none());
     }
 
     #[test]
@@ -2703,7 +2848,7 @@ pub(crate) mod tests {
         for flags in [SYN | ACK, ACK] {
             let frame = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, flags, SRC, 9999);
             assert!(
-                blocked_syn(&frame, &allowed).is_none(),
+                blocked_syn(&frame, &allowed, &none_published()).is_none(),
                 "flags {flags:#x} must pass"
             );
         }
@@ -2714,13 +2859,25 @@ pub(crate) mod tests {
         let allowed = HashSet::new();
         // ARP and IPv6 EtherTypes.
         for et in [0x0806u16, 0x86DD] {
-            assert!(blocked_syn(&tcp_frame(et, IPPROTO_TCP, SYN, SRC, 9999), &allowed).is_none());
+            assert!(
+                blocked_syn(
+                    &tcp_frame(et, IPPROTO_TCP, SYN, SRC, 9999),
+                    &allowed,
+                    &none_published()
+                )
+                .is_none()
+            );
         }
         // UDP (proto 17) and ICMP (proto 1) are not gated by the TCP-SYN check.
         for proto in [17u8, 1] {
             assert!(
-                blocked_syn(&tcp_frame(ETHERTYPE_IPV4, proto, SYN, SRC, 9999), &allowed).is_none()
-            );
+                blocked_syn(
+                    &tcp_frame(ETHERTYPE_IPV4, proto, SYN, SRC, 9999),
+                    &allowed,
+                    &none_published()
+                )
+                .is_none()
+            )
         }
     }
 
@@ -2731,11 +2888,131 @@ pub(crate) mod tests {
         // A prefix shorter than eth(14) + ip(20) + tcp-through-flags(14) = 48
         // bytes cannot yield the TCP flags/port and must pass rather than misread.
         for cut in [0, 14, 20, 33, 40, 47] {
-            assert!(blocked_syn(&full[..cut], &allowed).is_none(), "len {cut}");
+            assert!(
+                blocked_syn(&full[..cut], &allowed, &none_published()).is_none(),
+                "len {cut}"
+            );
         }
         // A one-byte-truncated frame (byte 53) still carries a full TCP header
         // through the flags/port, so it is correctly still classified.
-        assert!(blocked_syn(&full[..full.len() - 1], &allowed).is_some());
+        assert!(blocked_syn(&full[..full.len() - 1], &allowed, &none_published()).is_some());
+    }
+
+    /// The empty listen-published set: the shape of every gate before the
+    /// box's watcher publishes anything (NET-016).
+    fn none_published() -> HashSet<u16> {
+        HashSet::new()
+    }
+
+    /// NET-016/NET-017's gate half: a port a box's process published by
+    /// listening is admitted for its listener's lifetime and withdrawn —
+    /// connections and all — when the listener closes, while a declared
+    /// port's admission is the declaration's and never moves. The watcher's
+    /// own end-to-end proofs live in [`super::listeners`]; this is the
+    /// admission-set half they observe from outside.
+    #[test]
+    fn gate_admits_and_withdraws_a_listen_published_port() {
+        let policy = sessions::SessionPolicy {
+            ingress: Some(sessions::IngressPolicy {
+                port_mappings: vec![sessions::PortMapping {
+                    external_port: 18080,
+                    internal_port: 80,
+                    proto: sessions::IpProto::Tcp,
+                }],
+                // A permit range with no stance permits nothing, so this
+                // gate's own rules would refuse 9999 — publishing is the
+                // watcher's decision to apply, not the gate's to re-derive.
+                dynamic_allowed_range: Some((3000, 3010)),
+                dynamic_ingress: None,
+            }),
+            egress: None,
+        };
+        let gate = SessionGate::for_session(
+            "100.64.0.9".into(),
+            Ipv4Addr::new(100, 64, 0, 9),
+            &policy,
+            SwitchSubnet::default(),
+        );
+        assert!(!gate.admits_tcp(9999), "nothing is published yet");
+        // The declared port is admitted by its declaration alone.
+        assert!(gate.admits_tcp(80));
+        assert_eq!(
+            gate.listen_verdict(sessions::IpProto::Tcp, 9999),
+            ListenVerdict::Deny
+        );
+        assert_eq!(
+            gate.listen_verdict(sessions::IpProto::Tcp, 80),
+            ListenVerdict::Declared
+        );
+        assert_eq!(
+            gate.listen_verdict(sessions::IpProto::Tcp, 3005),
+            ListenVerdict::Deny,
+            "no stance: the range alone publishes nothing"
+        );
+
+        assert!(
+            gate.record_delivered_inbound(&tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, SRC, 9999))
+                .is_none(),
+            "no reply-flow record opens for an unpublished port"
+        );
+
+        // The watcher publishes 9999: the runtime-published half admits it,
+        // beside the declared set.
+        gate.admit_published(9999);
+        assert!(gate.admits_tcp(9999));
+        assert!(
+            matches!(
+                gate.record_delivered_inbound(&tcp_frame(
+                    ETHERTYPE_IPV4,
+                    IPPROTO_TCP,
+                    SYN,
+                    SRC,
+                    9999
+                )),
+                Some(egress::InboundFlow::Recorded { .. })
+            ),
+            "a connection to a listen-published port opens a reply-flow record, so the box can answer it"
+        );
+        assert_eq!(gate.inbound_flow_records(), 1);
+        assert!(
+            blocked_syn(
+                &tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, SRC, 9999),
+                &gate.allowed,
+                &gate.listen_published.lock().unwrap(),
+            )
+            .is_none(),
+            "a new inbound connection to a published port passes the SYN gate"
+        );
+        assert!(
+            !gate.admits_direct_tcp(9999),
+            "the proxy's declared-port gate is untouched by a publication"
+        );
+
+        // The listener closes: the admission goes with it, the declared
+        // port's stays.
+        let reply = egress_tcp_segment(Ipv4Addr::new(100, 64, 0, 9), 9999, SRC, 40000, SYN | ACK);
+        assert!(
+            gate.reply_admits_frame(&reply),
+            "the box's answer on the recorded flow passes"
+        );
+        assert_eq!(gate.withdraw_published(9999), 0, "no connection was held");
+        assert!(!gate.admits_tcp(9999));
+        assert_eq!(
+            gate.inbound_flow_records(),
+            0,
+            "the withdrawal ends the port's reply-flow records"
+        );
+        assert!(
+            !gate.reply_admits_frame(&reply),
+            "a reply on a withdrawn port is no longer admitted as one"
+        );
+        assert!(gate.admits_tcp(80), "the declaration's port is still held");
+        // Withdrawing something never published is a no-op, and withdrawing
+        // a declared port changes nothing: its admission is not the
+        // watcher's to take (NET-081's sub-requirement).
+        assert_eq!(gate.withdraw_published(1234), 0);
+        assert_eq!(gate.withdraw_published(80), 0);
+        assert!(gate.admits_tcp(80));
     }
 
     #[test]
