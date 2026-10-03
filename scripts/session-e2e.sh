@@ -5460,7 +5460,8 @@ proof_min_internal_names_through_proxy() {
 #   * an undeclared port — refused by the OS on the direct leg (host-address
 #     box: nothing listens), refused by the proxy with that same refusal as
 #     its reason (502), and on a VM lane refused by the target's ingress
-#     declaration on BOTH legs (dropped SYN direct, 403 proxied);
+#     declaration on BOTH legs (connection-refused direct — the ingress
+#     gate answers the SYN with a reset, NET-014 — 403 proxied);
 #   * a caller whose egress rules deny the target — the caller's own gate
 #     drops its direct SYN, and the proxy refuses its request before dialing
 #     (403), against the same request routing from an ungated box;
@@ -5505,8 +5506,10 @@ proof_proxy_refuses_like_direct() {
   }
 
   # One DIRECT attempt from a box: curl's exit code and its stderr ARE the
-  # refusal a direct connection gets — an OS-refused connection is curl 7, a
-  # SYN a target's gate silently dropped is a connect timeout, curl 28.
+  # refusal a direct connection gets — a refused connection is curl 7 (the
+  # OS on a port nothing listens on, or a target's ingress gate answering a
+  # SYN to a port the box never declared with a reset, NET-014), a SYN an
+  # egress gate silently dropped is a connect timeout, curl 28.
   par_direct() { # $1 box, $2 url, $3 max-time
     mnl session exec "$1" "curl -sS --max-time $3 -o /dev/null '$2'" \
       2>"$WORK/par-direct.err"
@@ -5539,7 +5542,7 @@ proof_proxy_refuses_like_direct() {
   PAR_ECHO_PORT=18085               # the in-box echo responder (served + routed)
   PAR_DEAD_PORT=18086               # nothing listens: the OS refusal, both legs
   PAR_OWN_PORT=18087                # the target's published port (ext == int)
-  PAR_OWN_CLOSED_PORT=18088         # never published: dropped direct, 403 proxied
+  PAR_OWN_CLOSED_PORT=18088         # never published: refused direct, 403 proxied
   PAR_OWN_MARKER="PAR_OWN_ROUTED_OK"
 
   # The request origin: a host-address box, sharing its host's loopback —
@@ -5858,9 +5861,12 @@ PAR_EO
     # ---- pair 4: an undeclared port, own-address target --------------------
     # Both legs are refused by the ONE declaration: the proxy refuses the
     # request before dialing (403, where the host, the session and the port
-    # are all in hand), and the target's ingress gate drops the direct SYN —
-    # a drop is not a reset, so the direct leg is a connect timeout, which is
-    # itself the assertion that the gate sat between.
+    # are all in hand), and the target's ingress gate answers the direct SYN
+    # with a reset (NET-014) — the direct leg is connection-refused, fast,
+    # never a connect timeout; the unit proofs hold the gate itself to the
+    # reset (`unpublished_port_connection_refused`), and the pair here holds
+    # the end-to-end refusal against the proxy's, which is the parity the
+    # pair exists for.
     par_direct "$par_sid" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/" 5
     par_direct_rc="$PAR_RC"
     par_direct_line="GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/ -> curl exit $PAR_RC: $(head -n1 "$WORK/par-direct.err" 2>/dev/null || true)"
@@ -5868,8 +5874,8 @@ PAR_EO
     par_pair "an undeclared port, own-address box" \
       "$par_direct_line" \
       "GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_CLOSED_PORT/ via the proxy -> HTTP ${PAR_STATUS:-<none>} ($(head -n1 "$WORK/par-proxied.err" 2>/dev/null || true))"
-    [ "$par_direct_rc" -eq 28 ] || {
-      echo "::error::the direct attempt to the target's unpublished port did not end in a connect timeout (curl exit $par_direct_rc, expected 28) — the target's ingress gate did not drop it, or something answered"
+    [ "$par_direct_rc" -eq 7 ] || {
+      echo "::error::the direct attempt to the target's unpublished port did not end in a refused connection (curl exit $par_direct_rc, expected 7) — the target's ingress gate did not reset it (a drop reads as connect timeout 28, the shape NET-014 retires)"
       echo "--- curl stderr ---"; cat "$WORK/par-direct.err" 2>/dev/null || true
       fail
     }
