@@ -69,10 +69,10 @@
 # the order below; with a case name only that proof runs, standalone, against
 # the same fresh state dir and seeds the full lane gets. Most proofs mint (and
 # destroy) the sessions they need themselves; `session_exec`,
-# `session_rename`, `session_outbound_request` and `sandbox` instead share the one `lifecycle`
-# activates first in a whole-lane run — and mint an equivalent session of their
-# own when they run alone (see proof_shared_session), so every case name below
-# is runnable by itself.
+# `session_rename`, `session_outbound_request` and `sandbox` instead share the
+# one `lifecycle` activates first in a whole-lane run — and mint an equivalent
+# session of their own when they run alone (see proof_shared_session), so every
+# case name below is runnable by itself.
 #   lifecycle                        cold activate → list → warm → destroy
 #   session_exec                     `min session exec` in the session's namespaces
 #   session_rename                   `min session rename`; rename-to-self refused
