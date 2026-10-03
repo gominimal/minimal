@@ -24,6 +24,36 @@ pub fn trace_context() -> &'static minimald_rpc::trace::TraceContext {
     CONTEXT.get_or_init(minimald_rpc::trace::TraceContext::mint)
 }
 
+// ── VM name ─────────────────────────────────────────────────────────────────
+
+static VM_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Set the process-wide VM name (`--vm <NAME>`) so every provider dir this
+/// process resolves names the same VM (NET-052). First call wins; must be
+/// called at command dispatch, before any path resolution. A name outside
+/// the allowlist is rejected here rather than resolved to a directory outside
+/// the provider dir.
+///
+/// # Errors
+///
+/// [`paths::Error::InvalidVmName`] when `vm` breaks the naming rule
+/// ([`paths::validate_vm_name`]).
+pub fn set_vm_name(vm: &str) -> Result<(), paths::Error> {
+    paths::validate_vm_name(vm)?;
+    let _ = VM_NAME.set(vm.to_owned());
+    Ok(())
+}
+
+/// The VM this process talks to: the `--vm` name when set, else the default VM
+/// ([`paths::DEFAULT_VM_NAME`], whose paths are unchanged — NET-053).
+#[must_use]
+pub fn vm_name() -> &'static str {
+    VM_NAME
+        .get()
+        .map(String::as_str)
+        .unwrap_or(paths::DEFAULT_VM_NAME)
+}
+
 /// Build a spinner bar on the process-global `MultiProgress` with the house
 /// animation and a caller-chosen `template`.
 ///
@@ -157,6 +187,42 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// forever. Generous — a healthy daemon answers in milliseconds, so this
 /// only bounds the pathological case.
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+/// The leash a caller is expected to run a [`Client::probe`] under: the
+/// probe's connect, its handshake, and the one RPC the caller makes on it,
+/// end to end. The retry ([`CONNECT_RETRIES`]), the handshake deadline and
+/// the RPC deadline each bound one wedge on their own; stacked, they hold a
+/// caller that spans every VM for about 72 s per wedged VM. A probe is of a
+/// VM the caller did not select — one answer among several, not the daemon
+/// the operator asked for — so it gets a short leash instead: the same 4 s
+/// the TUI allows a mid-run reconnect. The caller applies it, because the
+/// RPC it makes is the caller's.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Why [`Client::probe`] could not reach a daemon: the classification a
+/// caller of a VM it did not select needs, so "this VM is not running" is an
+/// answer it can act on rather than an error it must warn about.
+#[derive(Debug)]
+pub enum ProbeRefusal {
+    /// Nothing answers at the socket path — the stale `ssh.sock` of a VM
+    /// that is down, or a path that vanished since the caller looked. Not a
+    /// fault: a VM that is not running is a normal thing to find mid-list.
+    NotRunning,
+    /// The path is there and something is wrong beyond that: a wedged
+    /// handshake, an unexpected connect error, a refused auth. Worth a
+    /// warning, and worth the caller's attention.
+    Unreachable(anyhow::Error),
+}
+
+impl std::fmt::Display for ProbeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProbeRefusal::NotRunning => write!(f, "not running"),
+            ProbeRefusal::Unreachable(e) => write!(f, "unreachable: {e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for ProbeRefusal {}
 
 /// russh client handler that accepts any ephemeral host key.
 ///
@@ -191,7 +257,68 @@ impl Client {
     /// race on macOS where the libkrun bridge UDS appears slightly after the
     /// `vm-up` line, and bounds the handshake by [`HANDSHAKE_TIMEOUT`] so a
     /// wedged daemon behind an accepting socket fails instead of hanging.
+    /// That retry is for the VM this process *selected* — the one it just
+    /// ensured and is about to drive. A VM it did not select gets
+    /// [`Client::probe`] instead: waiting out the retry on a daemon nobody
+    /// promised would charge every stopped VM on the host to the caller.
     pub async fn connect(sock_path: &Path) -> Result<Self, anyhow::Error> {
+        Self::connect_as(sock_path, "minimal-cli").await
+    }
+
+    /// Connect scoped to one session: the SSH username is the session's
+    /// UUID.
+    ///
+    /// The daemon's `direct-tcpip` handler parses the SSH username as the
+    /// session a channel belongs to, so channels opened on this connection
+    /// dial from that session's box (its own network namespace, when it has
+    /// one) rather than from the daemon's. Everything else — retries,
+    /// handshake deadline, RPC vocabulary — is [`Client::connect`].
+    pub async fn connect_scoped(
+        sock_path: &Path,
+        session: sessions::SessionId,
+    ) -> Result<Self, anyhow::Error> {
+        Self::connect_as(sock_path, &session.to_string()).await
+    }
+
+    /// Connect for a probe of a VM this process did not select: one attempt,
+    /// no retry, with the refusal classified.
+    ///
+    /// A stopped VM leaves its `ssh.sock` behind, so a present path is not
+    /// proof of a running daemon — and a VM nobody selected is not one to
+    /// wait for. One connect attempt, and the caller reads
+    /// [`ProbeRefusal::NotRunning`] as the answer it is rather than a fault
+    /// to warn about. Everything else — the handshake deadline, the SSH
+    /// vocabulary — is [`Client::connect`]. The caller runs the probe under
+    /// [`PROBE_TIMEOUT`] so a wedged VM answers one probe quickly instead of
+    /// holding a listing or a resolution that spans every VM.
+    pub async fn probe(sock_path: &Path) -> Result<Self, ProbeRefusal> {
+        let stream = match tokio::net::UnixStream::connect(sock_path).await {
+            Ok(stream) => stream,
+            // Nothing answers at the path: the socket file a stopped VM
+            // left behind (`ConnectionRefused`), or one that vanished since
+            // the caller's existence check (`NotFound`) — both are "this VM
+            // is not running", not a fault.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ConnectionRefused
+                    || e.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Err(ProbeRefusal::NotRunning);
+            }
+            Err(e) => {
+                return Err(ProbeRefusal::Unreachable(anyhow::anyhow!(
+                    "connect to daemon at {}: {}",
+                    sock_path.display(),
+                    e
+                )));
+            }
+        };
+        let handle = Self::handshake(stream, "minimal-cli", sock_path)
+            .await
+            .map_err(ProbeRefusal::Unreachable)?;
+        Ok(Client { handle })
+    }
+
+    async fn connect_as(sock_path: &Path, username: &str) -> Result<Self, anyhow::Error> {
         let stream = {
             let mut conn = None;
             let mut last_err = None;
@@ -216,6 +343,18 @@ impl Client {
             })?
         };
 
+        let handle = Self::handshake(stream, username, sock_path).await?;
+        Ok(Client { handle })
+    }
+
+    /// The SSH handshake over an already-connected stream: version exchange
+    /// and `none` auth as `username`, bounded by [`HANDSHAKE_TIMEOUT`] — a
+    /// connect is not proof anyone is home (#730).
+    async fn handshake(
+        stream: tokio::net::UnixStream,
+        username: &str,
+        sock_path: &Path,
+    ) -> Result<russh::client::Handle<MinimalClientHandler>, anyhow::Error> {
         // The client deliberately runs without keepalives: a laptop closed
         // for an hour should reconnect transparently on wake rather than have
         // the link torn down mid-sleep. The server's long-interval keepalive
@@ -228,7 +367,7 @@ impl Client {
                 .context("ssh connect")?;
 
             let auth = handle
-                .authenticate_none("minimal-cli")
+                .authenticate_none(username)
                 .await
                 .context("authenticate")?;
 
@@ -238,16 +377,33 @@ impl Client {
             Ok(handle)
         };
 
-        let handle = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
                     "connect to {}: SSH handshake timed out after {HANDSHAKE_TIMEOUT:?}",
                     sock_path.display()
                 )
-            })??;
+            })?
+    }
 
-        Ok(Client { handle })
+    /// Open a `direct-tcpip` channel to `host:port`, as seen from the
+    /// session this connection is scoped to.
+    ///
+    /// On a [`Client::connect_scoped`] connection the daemon relays the
+    /// channel onto the address as dialed from the session's box, so
+    /// `127.0.0.1` is the box's own loopback — which is the point: a service
+    /// bound inside the box answers as if the request had come from there.
+    /// The caller owns both halves of the relay from here.
+    pub async fn open_direct_tcpip(
+        &mut self,
+        host: &str,
+        port: u16,
+    ) -> Result<russh::Channel<russh::client::Msg>, anyhow::Error> {
+        self.handle
+            .channel_open_direct_tcpip(host, u32::from(port), "127.0.0.1", 0)
+            .await
+            .with_context(|| format!("open direct-tcpip channel to {host}:{port}"))
     }
 
     /// Issue a oneshot RPC: open a channel, request the subsystem, write the
@@ -1081,27 +1237,159 @@ pub fn migrate_legacy_provider_dirs(minimal_dir_override: Option<&std::path::Pat
 /// Resolve the provider-instance dir (`<state dir>/providers/local-<kind>0`) the
 /// daemon and CLI agree on: `--minimal-dir` when set, else the default minimal
 /// state dir. `use_minvmd` selects the backend's dir (see [`client_provider_kind`]).
+///
+/// This is the default VM ([`paths::DEFAULT_VM_NAME`]); [`vm_name()`] selects the
+/// process's VM, so call [`set_vm_name`] first to talk to a named VM.
 pub fn resolve_provider_dir(
     minimal_dir_override: Option<&std::path::Path>,
     use_minvmd: bool,
 ) -> std::io::Result<std::path::PathBuf> {
+    resolve_provider_dir_named(minimal_dir_override, use_minvmd, vm_name())
+}
+
+/// [`resolve_provider_dir`] for an explicit VM. A named VM nests under its own
+/// subdirectory of the provider dir (NET-052/NET-054):
+/// `<state dir>/providers/local-minvmd0/<name>`; the default VM keeps the
+/// provider dir itself (NET-053). The native `minimald` backend hosts no VMs,
+/// so a named VM is an error there rather than a silent fall-back to the base
+/// provider dir — a `--vm` that resolves to the default daemon's directory
+/// would mean a different VM than the one asked for.
+///
+/// # Errors
+///
+/// [`std::io::Error`] with [`paths::Error::InvalidVmName`] when `vm` breaks
+/// the naming rule, with a "named VMs need the minvmd provider" message when
+/// the backend is native `minimald`, or when `minimal_dir_override` is not
+/// usable.
+pub fn resolve_provider_dir_named(
+    minimal_dir_override: Option<&std::path::Path>,
+    use_minvmd: bool,
+    vm: &str,
+) -> std::io::Result<std::path::PathBuf> {
     let base = resolve_state_base(minimal_dir_override)?;
-    Ok(
-        paths::provider_instance_dir(&base, client_provider_kind(use_minvmd), 0)
-            .as_utf8_path()
-            .as_std_path()
-            .to_path_buf(),
-    )
+    let kind = client_provider_kind(use_minvmd);
+    if kind != paths::ProviderKind::Minvmd && vm != paths::DEFAULT_VM_NAME {
+        return Err(std::io::Error::other(
+            "named VMs need the minvmd provider (`--provider local-minvmd`); \
+             the native local-minimald backend hosts no VMs",
+        ));
+    }
+    let dir = if kind == paths::ProviderKind::Minvmd {
+        paths::provider_instance_dir_named(&base, kind, 0, vm).map_err(std::io::Error::other)?
+    } else {
+        paths::provider_instance_dir(&base, kind, 0)
+    };
+    Ok(dir.as_utf8_path().as_std_path().to_path_buf())
 }
 
 /// Resolve the daemon socket path: `<provider dir>/ssh.sock`. Each backend
 /// serves this endpoint under its own provider dir, so `use_minvmd` must select
 /// the same backend the daemon was spawned as.
+///
+/// This is the default VM's socket; a named VM serves its own (see
+/// [`resolve_provider_dir_named`]).
 pub fn resolve_socket_path(
     minimal_dir_override: Option<&std::path::Path>,
     use_minvmd: bool,
 ) -> std::io::Result<std::path::PathBuf> {
-    Ok(resolve_provider_dir(minimal_dir_override, use_minvmd)?.join(paths::SSH_SOCK_FILE))
+    resolve_socket_path_named(minimal_dir_override, use_minvmd, vm_name())
+}
+
+/// [`resolve_socket_path`] for an explicit VM: `<named provider dir>/ssh.sock`.
+///
+/// # Errors
+///
+/// As [`resolve_provider_dir_named`].
+pub fn resolve_socket_path_named(
+    minimal_dir_override: Option<&std::path::Path>,
+    use_minvmd: bool,
+    vm: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    Ok(
+        resolve_provider_dir_named(minimal_dir_override, use_minvmd, vm)?
+            .join(paths::SSH_SOCK_FILE),
+    )
+}
+
+/// One VM's daemon socket with the name that selects it: the pair a client
+/// needs to reach one VM's daemon in particular — `--vm` selects it, and a
+/// listing (NET-057) or a box-name resolution (NET-058) spans every entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmSocket {
+    /// The VM's name: [`paths::DEFAULT_VM_NAME`] for the default VM, the
+    /// subdirectory's name for a named one.
+    pub vm: String,
+    /// The socket that VM's daemon serves.
+    pub sock: std::path::PathBuf,
+}
+
+/// Enumerate every VM's socket on this host, default VM first: the default
+/// VM's provider dir plus one entry per named VM that has a state dir
+/// (NET-052's layout). A VM that is not running is still enumerated — its
+/// daemon simply is not answering, which each caller reports its own way —
+/// so the set is the host's, not the running half of it.
+///
+/// The native `minimald` backend hosts no VMs, so it enumerates nothing:
+/// callers fall back to [`resolve_socket_path`], the one socket that backend
+/// serves (and the path that refuses a named `--vm` there, as it must).
+/// Directories whose name breaks the naming rule are skipped rather than
+/// reported: the provider dir also holds non-VM trappings — `ssh.sock`, the
+/// reserved `guest/` payload dir — and a stray must not fail a listing.
+///
+/// # Errors
+///
+/// [`std::io::Error`] when `minimal_dir_override` is not usable or the
+/// provider dir cannot be read. A provider dir that does not exist yet
+/// (no VM created, ever) is not an error: the default VM is still reported,
+/// with a socket nothing serves yet.
+pub fn enumerate_vm_sockets(
+    minimal_dir_override: Option<&std::path::Path>,
+    use_minvmd: bool,
+) -> std::io::Result<Vec<VmSocket>> {
+    let base = resolve_state_base(minimal_dir_override)?;
+    let kind = client_provider_kind(use_minvmd);
+    if kind != paths::ProviderKind::Minvmd {
+        return Ok(Vec::new());
+    }
+    let provider = paths::provider_instance_dir(&base, kind, 0);
+    let dir = provider.as_utf8_path().as_std_path();
+    let mut vms = vec![VmSocket {
+        vm: paths::DEFAULT_VM_NAME.to_string(),
+        sock: dir.join(paths::SSH_SOCK_FILE),
+    }];
+    // Deterministic order for the named half: alphabetical, after the
+    // default VM's entry, so a resolution that reports the VMs it looked at
+    // always reports them in the same order.
+    let mut named: Vec<String> = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // No provider dir yet: no VM has ever been created on this host.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vms),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // `default` is the unnamed VM, already first; a name that breaks the
+        // rule is not a VM (see the provider dir's other trappings).
+        if name != paths::DEFAULT_VM_NAME && paths::validate_vm_name(name).is_ok() {
+            named.push(name.to_string());
+        }
+    }
+    named.sort_unstable();
+    for vm in named {
+        vms.push(VmSocket {
+            sock: dir.join(&vm).join(paths::SSH_SOCK_FILE),
+            vm,
+        });
+    }
+    Ok(vms)
 }
 
 /// Sends the process trace context as a `TRACEPARENT` channel env request.
@@ -1206,7 +1494,7 @@ pub async fn fill_git_info(entries: &mut [minimald_rpc::ListSessionsEntry]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, resolve_socket_path};
+    use super::{Client, resolve_provider_dir, resolve_socket_path};
     use std::path::Path;
 
     /// The daemon-error accumulator is bounded: a daemon that sprays extended
@@ -1276,6 +1564,146 @@ mod tests {
         assert_eq!(
             sock,
             Path::new("/tmp/minimal-test/providers/local-minvmd0/ssh.sock")
+        );
+    }
+
+    /// A named VM must resolve to its own provider dir and socket under a
+    /// per-name subdirectory (NET-052/NET-054).
+    #[test]
+    fn named_vm_gets_its_own_dir_and_socket() {
+        let dir =
+            super::resolve_provider_dir_named(Some(Path::new("/tmp/minimal-test")), true, "alpha")
+                .unwrap();
+        assert_eq!(
+            dir,
+            Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha")
+        );
+
+        let sock =
+            super::resolve_socket_path_named(Some(Path::new("/tmp/minimal-test")), true, "alpha")
+                .unwrap();
+        assert_eq!(
+            sock,
+            Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha/ssh.sock")
+        );
+    }
+
+    /// The default VM's paths must be byte-for-byte unchanged, whether the name
+    /// is spelled `default` or left unset (NET-053).
+    #[test]
+    fn default_vm_paths_are_unchanged() {
+        let base = Path::new("/tmp/minimal-test/providers/local-minvmd0");
+        for name in [None, Some("default")] {
+            let dir = super::resolve_provider_dir_named(
+                Some(Path::new("/tmp/minimal-test")),
+                true,
+                name.unwrap_or("default"),
+            )
+            .unwrap();
+            assert_eq!(dir, base);
+            let sock = super::resolve_socket_path_named(
+                Some(Path::new("/tmp/minimal-test")),
+                true,
+                name.unwrap_or("default"),
+            )
+            .unwrap();
+            assert_eq!(sock, base.join("ssh.sock"));
+        }
+    }
+
+    /// The native `minimald` backend hosts no VMs, so a named VM must be
+    /// refused there rather than silently resolved to the base provider dir:
+    /// `min --vm alpha` against the native backend would otherwise talk to
+    /// the default daemon while claiming to talk to alpha. The default VM
+    /// still resolves — it is the only VM that backend has.
+    ///
+    /// Linux-only: `client_provider_kind` forces Minvmd on macOS, so a
+    /// `false` there is not the native backend.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_backend_refuses_a_named_vm() {
+        let err =
+            super::resolve_provider_dir_named(Some(Path::new("/tmp/minimal-test")), false, "alpha")
+                .expect_err("a named VM on the native backend must be refused");
+        assert!(
+            err.to_string()
+                .contains("named VMs need the minvmd provider"),
+            "the refusal must say what a named VM needs: {err}"
+        );
+
+        assert_eq!(
+            super::resolve_provider_dir_named(
+                Some(Path::new("/tmp/minimal-test")),
+                false,
+                paths::DEFAULT_VM_NAME,
+            )
+            .unwrap(),
+            Path::new("/tmp/minimal-test/providers/local-minimald0")
+        );
+    }
+
+    /// A VM name outside the allowlist must be refused, not resolved to a
+    /// directory outside the provider dir; the refusal states the rule.
+    #[test]
+    fn vm_name_must_fit_the_allowlist() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "../sibling",
+            "a b",
+            "Alpha",
+            "-alpha",
+            "guest",
+        ] {
+            let err =
+                super::resolve_provider_dir_named(Some(Path::new("/tmp/minimal-test")), true, name)
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid VM name"),
+                "name {name:?} must be rejected as invalid, got: {err}"
+            );
+        }
+        assert!(super::set_vm_name("a/b").is_err());
+    }
+
+    /// `--vm` published at dispatch must steer every default-arg resolve this
+    /// process makes (NET-052). The global is process-wide and first-call-wins,
+    /// so the assertion runs in a spawned copy of this test binary: under
+    /// plain `cargo test` the crate's tests share one process, and a global
+    /// set in this test would leak into the default-VM tests above (nextest
+    /// isolates per test, but the crate must pass under both).
+    #[test]
+    fn set_vm_name_steers_the_default_resolvers() {
+        const CHILD: &str = "MINIMAL_CLIENT_VM_STEER_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // The child, whose process-global starts unset: the assertion.
+            super::set_vm_name("alpha").unwrap();
+            assert_eq!(super::vm_name(), "alpha");
+            let dir = resolve_provider_dir(Some(Path::new("/tmp/minimal-test")), true).unwrap();
+            assert_eq!(
+                dir,
+                Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha")
+            );
+            let sock = resolve_socket_path(Some(Path::new("/tmp/minimal-test")), true).unwrap();
+            assert_eq!(
+                sock,
+                Path::new("/tmp/minimal-test/providers/local-minvmd0/alpha/ssh.sock")
+            );
+            return;
+        }
+        // The parent: re-run just this test in a child process carrying the
+        // marker, so the global is set — and stays — in the child alone.
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("set_vm_name_steers_the_default_resolvers")
+            .env(CHILD, "1")
+            .output()
+            .expect("spawning the test binary for the steering assertion");
+        assert!(
+            out.status.success(),
+            "the steering assertion failed in the child:\n{}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 
@@ -1440,6 +1868,79 @@ mod tests {
             None => unsafe { std::env::remove_var("GIT_CEILING_DIRECTORIES") },
         }
         assert_eq!(plain_probe, None, "non-repo must probe to None");
+    }
+
+    /// Enumerating the host's VMs covers the default VM plus every named one
+    /// with a state dir — default first, the rest alphabetical — and skips the
+    /// trappings a provider dir also holds (NET-057 lists across every entry
+    /// this returns; NET-058's resolution probes them).
+    #[test]
+    fn enumerates_the_default_vm_then_every_named_one() {
+        let base = tempfile::tempdir().unwrap();
+        let provider = base.path().join("providers").join("local-minvmd0");
+        for vm in ["beta", "alpha"] {
+            std::fs::create_dir_all(provider.join(vm)).unwrap();
+        }
+        // The provider dir's own trappings: a socket file and a reserved,
+        // non-VM directory. Neither is a VM, and neither must fail the
+        // enumeration.
+        std::fs::write(provider.join("ssh.sock"), b"").unwrap();
+        std::fs::create_dir_all(provider.join("guest")).unwrap();
+
+        let vms = super::enumerate_vm_sockets(Some(base.path()), true).unwrap();
+        assert_eq!(
+            vms,
+            vec![
+                super::VmSocket {
+                    vm: "default".to_string(),
+                    sock: provider.join("ssh.sock"),
+                },
+                super::VmSocket {
+                    vm: "alpha".to_string(),
+                    sock: provider.join("alpha").join("ssh.sock"),
+                },
+                super::VmSocket {
+                    vm: "beta".to_string(),
+                    sock: provider.join("beta").join("ssh.sock"),
+                },
+            ]
+        );
+    }
+
+    /// A host with no provider dir yet still enumerates the default VM: a
+    /// socket nothing serves yet is a valid probe, not an error — the host's
+    /// set is enumerated, not the running half of it.
+    #[test]
+    fn a_host_with_no_provider_dir_still_lists_the_default_vm() {
+        let base = tempfile::tempdir().unwrap();
+        let vms = super::enumerate_vm_sockets(Some(base.path()), true).unwrap();
+        assert_eq!(
+            vms,
+            vec![super::VmSocket {
+                vm: paths::DEFAULT_VM_NAME.to_string(),
+                sock: base
+                    .path()
+                    .join("providers")
+                    .join("local-minvmd0")
+                    .join("ssh.sock"),
+            }]
+        );
+    }
+
+    /// The native `minimald` backend hosts no VMs, so it enumerates nothing:
+    /// callers fall back to the one socket that backend serves. (Linux-only,
+    /// as [`super::native_backend_refuses_a_named_vm`]: `client_provider_kind`
+    /// forces the minvmd kind on macOS, so a `false` there is not the native
+    /// backend.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_native_backend_enumerates_no_vms() {
+        let base = tempfile::tempdir().unwrap();
+        assert!(
+            super::enumerate_vm_sockets(Some(base.path()), false)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// An initialized repository with an unborn `HEAD` (no commits yet) still

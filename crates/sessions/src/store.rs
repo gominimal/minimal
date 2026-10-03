@@ -1102,21 +1102,28 @@ mod tests {
             // An OwnIp session carrying a non-default policy, so the round-trip
             // tests prove a configured policy — the live source for the
             // GetSessionPolicy RPC — survives a disk round-trip, not just the
-            // all-`None` default.
+            // all-`None` default. Every egress field is set, deny_subnets
+            // included, so a field dropped on write shows up as a diff.
             network: crate::NetworkMode::OwnIp,
             policy: crate::SessionPolicy::new(
                 Some(crate::EgressPolicy {
                     allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
                     allow_dns_hosts: None,
                     allow_protocols: None,
+                    deny_subnets: Some(vec!["192.168.0.0/16".to_string()]),
                 }),
                 None,
             ),
             status: SessionStatus::default(),
-            // Deliberately the non-default (`--no-hooks`): `true` is the
-            // serde default, so a fixture using it would round-trip
+            // Deliberately the non-default shapes: `hooks_enabled: false`
+            // and a present `box_addresses` are both serde defaults to
+            // `None`/`true`, so a fixture using those would round-trip
             // green even if the field were dropped on write.
             hooks_enabled: false,
+            box_addresses: Some(crate::BoxAddresses {
+                switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+                loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+            }),
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),

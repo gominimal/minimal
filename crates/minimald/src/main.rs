@@ -233,6 +233,25 @@ pub struct ListenArgs {
     #[clap(hide = true)]
     timekeep_listener_port: Option<u32>,
 
+    /// Port the host-side hostname proxy must listen on, when this deployment
+    /// pins one — the port clients point `HTTP(S)_PROXY` at, whose documented
+    /// default is 7654. Unset (the default) tries that default first and only
+    /// when it is busy asks the OS for a free port, which the daemon reports
+    /// wherever a client needs it: `min ls` prints it, and a second daemon on
+    /// the same machine gets its own port instead of silently losing hostname
+    /// routing. A pinned port that is busy stays a hard failure — the
+    /// operator named it, and moving the listener would hide the loss.
+    #[arg(long)]
+    hostname_proxy_port: Option<u16>,
+
+    /// Port the box-zone answerer must listen on (UDP), when this deployment
+    /// pins one — the port the host's resolver is pointed at to answer
+    /// `*.min.internal`, whose documented default is 7656. Unset (the
+    /// default) gives it the same try-the-default-then-select treatment the
+    /// hostname proxy's flag documents.
+    #[arg(long)]
+    zone_answerer_port: Option<u16>,
+
     /// Daemonize: spawn minimald in a new session (setsid) and return once the
     /// SSH socket accepts connections, or an 8s timeout elapses. Used by the
     /// `min` CLI to auto-start a native daemon on Linux.
@@ -246,6 +265,18 @@ pub struct ListenArgs {
     /// install.
     #[arg(long)]
     gvproxy_bin: Option<std::path::PathBuf>,
+
+    /// Keep the shipped allow-all egress default for a box that declares no
+    /// `egress` section (NET-077). While the deny-all default is in force
+    /// (see [`sessions::EGRESS_DEFAULT_PHASE`]), an own-address box created
+    /// with no egress declaration reaches nothing outside itself (NET-074)
+    /// and shows `deny all` in `min session policy` (NET-075). Opt out to
+    /// keep the prior default — a deployment that cannot carry the change in
+    /// this release — and retire the flag once yours declares its boxes'
+    /// egress. A box that declares its own egress section is unaffected
+    /// either way.
+    #[arg(long, default_value_t = false)]
+    egress_deny_all_opt_out: bool,
 }
 
 /// An error at the top level of minimald.
@@ -427,16 +458,6 @@ fn lock_held(path: &std::path::Path) -> std::io::Result<bool> {
 }
 
 async fn async_main() -> Result<(), MainError> {
-    // With `networking-proxy` on, both the `ring` (workspace rustls) and the
-    // `aws-lc-rs` (google-cloud) providers are compiled in, so rustls cannot
-    // auto-pick one and panics ("no process-level CryptoProvider") the first time
-    // a config is built — e.g. when a session build reaches the remote-cache
-    // HTTPS client, off the proxy's own install path. Install ring explicitly
-    // here (idempotent; the proxy's later install no-ops). Without
-    // networking-proxy only one provider is present and rustls auto-installs it.
-    #[cfg(feature = "networking-proxy")]
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     // Use hardcoded configuration if we are the init process (`argv[0] == "/init"`), which
     // would indicate we are operating in a single-purpose micro-vm.
     //
@@ -459,6 +480,24 @@ async fn async_main() -> Result<(), MainError> {
                 // In-VM (DM1/3/4) the PTask attaches to the host gvproxy over the
                 // vsock shuttle, so no in-guest gvproxy binary path is needed.
                 gvproxy_bin: None,
+                // The node ports are the host's, not the daemon's: minvmd
+                // assigns them before the VM boots (NET-025) and hands them
+                // on the kernel command line, so the guest binds exactly
+                // what the host's box table already admits (NET-138) and the
+                // host gvproxy publishes it at the same number. Binds as
+                // handed and selects none; a boot that carries no tokens — an
+                // older minvmd, a native run — falls back to default-then-
+                // select, the pre-handoff behaviour. The tokens are read
+                // once the log sink is live, below, because a token present
+                // but unusable is a surfaced boot error, which `Cli`
+                // construction has nowhere to raise.
+                hostname_proxy_port: None,
+                zone_answerer_port: None,
+                // The microVM's pid-1 has no flags to read: the guest runs
+                // the egress default its host's build ships — the rollout
+                // phase [`sessions::EGRESS_DEFAULT_PHASE`] carries — not
+                // opted out.
+                egress_deny_all_opt_out: false,
             }),
             global_args: GlobalArgs {
                 minimal_state_dir: Some(DaemonAbsPath::try_new("/run/minimal").unwrap().into()),
@@ -499,6 +538,30 @@ async fn async_main() -> Result<(), MainError> {
     let logger = DaemonLogger::install(log_mode)?;
 
     let listen_args = cli.listen_args().unwrap();
+
+    // The node ports this daemon listens on, resolved once: the tokens the
+    // VM host handed on the boot line in a microVM, the CLI's otherwise.
+    // The read lives here, once the log sink is live, because a token
+    // present but unusable is a surfaced boot failure, not a fallback: the
+    // daemon would otherwise publish a listener the host's box table does
+    // not name (NET-025, NET-138) and strand every client pointed at the
+    // handed one. A handed pair that cannot bind — something in the guest
+    // already holds a port — fails the boot here too, probed in the bind
+    // base the daemon's own listeners use, rather than surfacing after
+    // READY, when the host already believes the VM healthy.
+    let (hostname_proxy_port, zone_answerer_port) = if is_minimal_microvm() {
+        let proxy = guest::handed_proxy_port().map_err(|e| MainError::Other(e.to_string()))?;
+        let answerer =
+            guest::handed_answerer_port().map_err(|e| MainError::Other(e.to_string()))?;
+        guest::probe_handed_node_ports(proxy, answerer)
+            .map_err(|e| MainError::IO(e, "binding the handed node ports"))?;
+        (proxy, answerer)
+    } else {
+        (
+            listen_args.hostname_proxy_port,
+            listen_args.zone_answerer_port,
+        )
+    };
 
     // Daemonize before doing any work: re-exec ourselves in a new session and
     // wait until the SSH socket is accepting connections, then return so the
@@ -576,6 +639,70 @@ async fn async_main() -> Result<(), MainError> {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
+    }
+
+    // NET-079: the daemon's own classifier leaf, entered at start so its own
+    // traffic is decided as the daemon's (NET-080), never classed with a
+    // box's, and so the daemon sits in a *sibling* of every box leaf — never
+    // above them, where a controller it enabled could make the box leaves
+    // domain invalid (spike finding F). Each box then joins its own leaf in
+    // the sandbox's pre-exec closure and unshares its cgroup namespace onto
+    // it, which is what keeps a box out of every other leaf on the tree (see
+    // `sandbox2::classifier`).
+    //
+    // In the guest this is pid 1, which mounts cgroup2 itself
+    // (`guest::enter_rootfs`) and so builds the tree here; a tree it could
+    // not build is a broken image, not a deployment state, and
+    // `session_host` refuses a host-address box on it (design §7.1).
+    // Natively the installer installs the tree and delegates it to this
+    // account, and entering it is a migration whose common ancestor this
+    // daemon can write only from *inside* the tree: the installer's `--pid`
+    // step or a `Delegate=yes` unit places it. A daemon left outside keeps
+    // running and places no box — `create_session_leaf` decides that per
+    // launch, by migrating a throwaway child, so no box is ever spawned into
+    // a join it dies making.
+    let tree_root = std::path::Path::new(sandbox2::classifier::TREE_ROOT);
+    if let Err(e) = sandbox2::classifier::enter_daemon_leaf(tree_root) {
+        if guest::is_microvm_daemon() {
+            tracing::error!(
+                error = %e,
+                tree = sandbox2::classifier::TREE_ROOT,
+                "entering the daemon's own classifier leaf: this guest image \
+                 cannot decide per box, and host-address boxes will be refused"
+            );
+        } else {
+            tracing::warn!(
+                error = %e,
+                tree = sandbox2::classifier::TREE_ROOT,
+                daemon_cgroup = ?sandbox2::classifier::own_cgroup_path(),
+                install = %sandbox2::classifier::install_hint(),
+                "entering the daemon's own classifier leaf failed, so every \
+                 box launch now decides its placement by whether it can \
+                 migrate into the tree: enter it with the installer's --pid \
+                 step, or start the daemon from a Delegate=yes unit"
+            );
+        }
+    }
+
+    // NET-079: the empty leaves a daemon death left behind are swept here, at
+    // the next start, so a leaf named by a session's id is never mistaken for
+    // a leftover its next launch could take: a fresh launch finding one
+    // reports the collision. A leaf that still holds a session refuses its
+    // own removal and stays, which is the emptiness the sweep tests by.
+    match sandbox2::classifier::sweep_box_leaves(tree_root) {
+        Ok(swept) if swept.is_empty() => {}
+        Ok(swept) => tracing::info!(
+            count = swept.len(),
+            leaves = ?swept
+                .iter()
+                .map(|leaf| leaf.display().to_string())
+                .collect::<Vec<_>>(),
+            "swept the empty classifier leaves a previous daemon left behind"
+        ),
+        Err(e) => tracing::debug!(
+            error = %e,
+            "sweeping the box cohort at start"
+        ),
     }
 
     // R1.5/R1.6: when the microVM config requested a data volume
@@ -758,6 +885,21 @@ async fn async_main() -> Result<(), MainError> {
         // not spawn gvproxy in-guest. The UDS path is DM2.
         in_microvm: cli.listen_args().unwrap().vsock,
         state_volume_mounted,
+        // The node ports, resolved once above: the ones the VM host handed
+        // in a microVM, the CLI's otherwise; `None` tries the documented
+        // default and only when it is busy asks the OS for a free port
+        // (NET-024/NET-025).
+        hostname_proxy_port,
+        zone_answerer_port,
+        // The daemon derives its switch /24 from its instance id (NET-027);
+        // no CLI flag pins one yet.
+        switch_subnet_octet: None,
+        // NET-077: the deployment's opt-out of the deny-all egress default —
+        // the one daemon-side knob the default has.
+        deny_all_opt_out: cli
+            .listen_args()
+            .expect("the daemon path is `run`, which carries listen args")
+            .egress_deny_all_opt_out,
     };
     // Ensure the SSH host key is accessible in a instance-specific known_hosts file.
     // R1.2: load once and reuse in the vsock beacon so there is no redundant disk read.
@@ -846,9 +988,10 @@ async fn async_main() -> Result<(), MainError> {
     if !cli.listen_args().unwrap().vsock {
         // standard path, listening on UDS socket.
         //
-        // The B5 host-side egress proxy (:7654) and B8 mTLS reverse proxy
-        // (:7655) are bound and served by `Server::run` for both DM2 (here) and
-        // DM1 (the vsock path below), so no separate startup bind happens here.
+        // The B5 host-side egress proxy (on its configured port, or one the
+        // OS selected) is bound and served by `Server::run` for both DM2
+        // (here) and DM1 (the vsock path below), so no separate startup bind
+        // happens here.
 
         if let Err(e) = std::fs::remove_file(cli.listen_on())
             && e.kind() != std::io::ErrorKind::NotFound
@@ -1018,8 +1161,90 @@ fn is_microvm_init(pid: u32, argv0: Option<&std::ffi::OsStr>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_microvm_init;
+    use super::*;
     use std::ffi::OsStr;
+
+    /// Builds a `Cli` for a native (UDS) daemon with deterministic state and
+    /// cache overrides, so path-derived assertions do not depend on the
+    /// ambient `$XDG_*`/home environment.
+    fn test_cli(instance_num: u32) -> Cli {
+        Cli {
+            command: Command::Run(ListenArgs {
+                instance_num,
+                vsock: false,
+                mount_dev: false,
+                mount_rootfs: None,
+                mk_mount_state_volume: None,
+                rlimit_nofile: None,
+                timekeep_listener_port: None,
+                // The CLI's own defaults: no pinned ports, and the shipped
+                // egress default stays in force.
+                hostname_proxy_port: None,
+                zone_answerer_port: None,
+                detach: false,
+                gvproxy_bin: None,
+                egress_deny_all_opt_out: false,
+            }),
+            global_args: GlobalArgs {
+                minimal_state_dir: Some(CwdRelative::from(
+                    DaemonAbsPath::try_new("/tmp/minimald-test-state").unwrap(),
+                )),
+                minimal_cache_dir: Some(CwdRelative::from(
+                    DaemonAbsPath::try_new("/tmp/minimald-test-cache").unwrap(),
+                )),
+                stdlib_dir: None,
+                num_parallel_builds: None,
+            },
+        }
+    }
+
+    #[test]
+    fn cli_resolves_state_and_cache_overrides() {
+        let cli = test_cli(0);
+        assert_eq!(cli.minimal_state_dir().as_str(), "/tmp/minimald-test-state");
+        assert_eq!(cli.minimal_cache_dir().as_str(), "/tmp/minimald-test-cache");
+    }
+
+    #[test]
+    fn cli_instance_num_defaults_to_zero_without_run() {
+        let cli = Cli {
+            command: Command::Completions(CompletionsArgs { shell: Shell::Bash }),
+            global_args: GlobalArgs {
+                minimal_state_dir: None,
+                minimal_cache_dir: None,
+                stdlib_dir: None,
+                num_parallel_builds: None,
+            },
+        };
+        assert_eq!(cli.instance_num(), 0);
+    }
+
+    #[test]
+    fn cli_instance_num_reads_run_args() {
+        assert_eq!(test_cli(7).instance_num(), 7);
+    }
+
+    #[test]
+    fn cli_ssh_args_proxy_targets_the_listen_socket() {
+        let cli = test_cli(0);
+        let (opts, name) = cli.ssh_args();
+        let proxy = opts
+            .iter()
+            .find(|(k, _)| *k == "ProxyCommand")
+            .expect("ssh_args must include a ProxyCommand");
+        assert!(proxy.1.contains(cli.listen_on().as_str()));
+        assert_eq!(name, "local-minimald0");
+    }
+
+    #[test]
+    fn cli_listen_on_points_at_instance_ssh_sock() {
+        let cli = test_cli(3);
+        let sock = cli.listen_on();
+        assert_eq!(
+            sock.as_str(),
+            "/tmp/minimald-test-state/providers/local-minimald3/ssh.sock"
+        );
+    }
 
     #[test]
     fn the_microvm_init_is_pid_1_named_init() {

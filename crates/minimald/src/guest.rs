@@ -9,7 +9,10 @@
 //! * pid-1 hygiene — mount `/dev` (devtmpfs; the kernel does NOT auto-mount it
 //!   for an initramfs root), `/proc`, and `/sys`;
 //! * entering the generic upstream rootfs — mount the ext4 root block device
-//!   and `chroot` into it so the userland (`/bin/sh`, libs) resolves.
+//!   and `chroot` into it so the userland (`/bin/sh`, libs) resolves;
+//! * the node ports the VM host hands the boot line — read into the daemon's
+//!   listener config, so it binds them as handed (NET-025); a token present
+//!   but unusable is a surfaced boot failure, not a fallback.
 //!
 //! Per the spec we keep this minimal and "run as pid-1, revisit if zombie
 //! reaping bites".
@@ -24,6 +27,154 @@ use tokio_vsock::{VMADDR_CID_HOST, VsockAddr, VsockStream};
 /// Vsock port the guest connects out to (on the host, CID 2) to announce it has
 /// booted. The host listens here for the one-shot `READY` marker.
 const BOOT_MARKER_PORT: u32 = 7350;
+
+// ── The node ports the boot line hands the daemon ───────────────────────
+
+/// Boot token the VM host puts on the kernel command line to hand the guest
+/// daemon its hostname-proxy port (NET-025): the kernel starts `/init` with
+/// every unrecognized `KEY=VALUE` token set as an environment variable, so
+/// the daemon reads it back from its environment. Mirrors the token `minvmd`'s
+/// `vm.rs` writes — keep the two in step.
+pub const HANDED_PROXY_PORT_TOKEN: &str = "MINIMALD_HOSTNAME_PROXY_PORT";
+
+/// Boot token the VM host hands the guest daemon its zone-answerer port on
+/// (NET-025); see [`HANDED_PROXY_PORT_TOKEN`] for how the tokens travel.
+pub const HANDED_ANSWERER_PORT_TOKEN: &str = "MINIMALD_ZONE_ANSWERER_PORT";
+
+/// The hostname-proxy port the VM host handed this daemon on the boot line,
+/// if it handed one. The daemon binds it as handed and never selects
+/// another: the host's box table already names exactly this port (NET-138),
+/// so a daemon-chosen replacement would publish a listener the host's gate
+/// refuses to carry (NET-081) — and strand every client pointed at the
+/// handed one.
+///
+/// `Ok(None)` when the boot carries no token — an older minvmd, a native
+/// run, or a host that handed `0` as its "pick one yourself" — leaving the
+/// daemon its pre-handoff default-then-select behaviour. An error when the
+/// token is present but carries no usable port: a surfaced boot failure
+/// ([`HandedPortError`]), never a fallback.
+pub fn handed_proxy_port() -> Result<Option<u16>, HandedPortError> {
+    handed_port(HANDED_PROXY_PORT_TOKEN)
+}
+
+/// The zone-answerer port the VM host handed this daemon on the boot line,
+/// if it handed one; see [`handed_proxy_port`] for the handoff and its
+/// binding rule.
+pub fn handed_answerer_port() -> Result<Option<u16>, HandedPortError> {
+    handed_port(HANDED_ANSWERER_PORT_TOKEN)
+}
+
+/// A boot token the host put a port on that does not carry one (NET-025):
+/// present on the command line but not a port number. Surfaced, not
+/// swallowed: a handoff that arrived broken is a host or transport fault
+/// the boot must name — falling back to the daemon's own selection would
+/// publish a listener the host's box table does not name (NET-138), and
+/// strand every client pointed at the handed one.
+#[derive(Debug)]
+pub struct HandedPortError {
+    /// The boot token the unusable value arrived on.
+    pub token: &'static str,
+    /// The value as it arrived on the boot line.
+    pub value: String,
+}
+
+impl std::fmt::Display for HandedPortError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "boot token {} carries no usable port: {:?}",
+            self.token, self.value
+        )
+    }
+}
+
+impl std::error::Error for HandedPortError {}
+
+/// Reads one handed port off the boot line's environment. `Ok(None)` — the
+/// token is absent, or carries `0`, the host's "pick one yourself" — leaves
+/// the daemon its default-then-select fallback; an error — the token is
+/// present but not a usable port — is a surfaced boot failure, never a
+/// fallback.
+fn handed_port(token: &'static str) -> Result<Option<u16>, HandedPortError> {
+    let Some(raw) = std::env::var(token).ok() else {
+        return Ok(None);
+    };
+    match raw.trim().parse::<u16>() {
+        Ok(0) => Ok(None),
+        Ok(port) => Ok(Some(port)),
+        Err(_) => Err(HandedPortError { token, value: raw }),
+    }
+}
+
+/// Probes that the handed node ports can actually be bound, in the microVM's
+/// bind base (`0.0.0.0`, what the daemon's own listeners use) — binding each
+/// handed one, the proxy over TCP and the answerer over UDP, and dropping
+/// the probe bindings at once. Called on the pid-1 boot path before the
+/// daemon starts, so a handed port that cannot bind — held by something
+/// already in the guest, or reserved by the kernel — fails the boot here,
+/// with the error surfaced to the host, rather than after READY, when the
+/// host already believes the VM healthy and no log line would reach it.
+///
+/// No guest process exists before READY — this runs on the boot path — so
+/// the probe window is the daemon's own: nothing competes for the ports
+/// between this probe and the listeners' bind.
+pub fn probe_handed_node_ports(
+    proxy_port: Option<u16>,
+    answerer_port: Option<u16>,
+) -> std::io::Result<()> {
+    let bind = |label: &str, transport: &str, port: u16| {
+        format!("binding the handed {label} port {port} ({transport}) in the guest")
+    };
+    if let Some(port) = proxy_port {
+        std::net::TcpListener::bind(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::UNSPECIFIED,
+            port,
+        )))
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("{}: {e}", bind("hostname-proxy", "tcp", port)),
+            )
+        })?;
+    }
+    if let Some(port) = answerer_port {
+        std::net::UdpSocket::bind(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::UNSPECIFIED,
+            port,
+        )))
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("{}: {e}", bind("zone-answerer", "udp", port)),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Whether this daemon is the microVM's init: pid 1, run as `init` — the
+/// kernel runs the initramfs `/init` (this binary) as pid-1, and nothing else
+/// satisfies both halves.
+///
+/// The lib side of the check `main` keeps for its own gating
+/// (`is_minimal_microvm` there, for `reboot(2)`): `argv[0]` is
+/// caller-controlled, so it cannot be trusted alone, and pid-1 alone is also
+/// no proof — a native daemon running as a container's init satisfies it. The
+/// classifier asks it one question only a guest answers "yes" to (design
+/// §7.1): a box this daemon cannot place is a box it refuses.
+pub fn is_microvm_daemon() -> bool {
+    is_microvm_init(std::process::id(), std::env::args_os().next().as_deref())
+}
+
+/// Pure form of [`is_microvm_daemon`], so the spoofing cases stay testable —
+/// neither a process's pid nor its `argv[0]` can be set from within a test.
+#[must_use]
+pub fn is_microvm_init(pid: u32, argv0: Option<&std::ffi::OsStr>) -> bool {
+    pid == 1
+        && argv0
+            .map(|a0| std::path::Path::new(a0).file_name() == Some(std::ffi::OsStr::new("init")))
+            .unwrap_or(false)
+}
 
 /// Writes the two-line beacon payload (`READY\n<openssh-pubkey>\n`) to the
 /// given async writer.
@@ -214,6 +365,77 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&ptmx);
         if let Err(e) = std::os::unix::fs::symlink("pts/ptmx", &ptmx) {
             tracing::warn!(error = %e, "linking /dev/ptmx -> pts/ptmx; interactive PTY sessions may fail");
+        }
+    }
+
+    // NET-079: cgroup2, mounted with `nsdelegate` so the cgroup namespace a
+    // box unshares onto its own leaf is a delegation boundary — the property
+    // that keeps a box from writing its way out of the leaf its verdict is
+    // decided on. The daemon builds the tree itself once this mount is up (it
+    // enters its leaf at start, which creates it — pid 1 needs no privileged
+    // step); the same path is what the installer provisions natively.
+    //
+    // Strict, not best-effort: a guest that cannot build this tree is a
+    // broken image, not a deployment state — there is no privileged step a
+    // person could run inside the VM to fix it, and a host-address box that
+    // ran unenforced here would speak with the VM's address and no verdict at
+    // all (design §7.1). Boot still continues — the daemon keeps serving the
+    // modes that need no classification — but the failure is logged at error
+    // level with the consequence named, and `session_host` refuses a
+    // host-address session on it.
+    let cgroup2 = format!("{NEWROOT}/sys/fs/cgroup");
+    if let Err(e) = std::fs::create_dir_all(&cgroup2) {
+        tracing::error!(
+            error = %e,
+            "creating the cgroup2 mountpoint: a broken guest image; \
+             host-address boxes will be refused"
+        );
+    }
+    let cgroup2_target = CString::new(cgroup2.as_str()).expect("no NUL in the cgroup2 mountpoint");
+    // SAFETY: mount(2) with valid C strings; `data` carries the `nsdelegate`
+    // option and is read for the duration of the call.
+    let mounted = unsafe {
+        libc::mount(
+            c"cgroup2".as_ptr(),
+            cgroup2_target.as_ptr(),
+            c"cgroup2".as_ptr(),
+            0,
+            c"nsdelegate".as_ptr().cast(),
+        )
+    };
+    // `EBUSY` (already mounted) is success for an idempotent mount — same
+    // tolerance as `raw_mount`, which cannot carry the `data` option. But an
+    // existing mount only counts if it carries `nsdelegate`: the delegation
+    // boundary is a property of the superblock, fixed at the first mount, so
+    // what this boot inherited is what the boxes would get.
+    let failure = if mounted == 0 {
+        None
+    } else {
+        let e = std::io::Error::last_os_error();
+        (e.raw_os_error() != Some(libc::EBUSY)).then_some(e)
+    };
+    // The initramfs itself has no /proc at this point; the one just mounted
+    // under the new root shows this very mount namespace, which is the table
+    // the question is about.
+    let mountinfo =
+        std::fs::read_to_string(format!("{NEWROOT}/proc/self/mountinfo")).unwrap_or_default();
+    let delegated = sandbox2::classifier::host_cgroup2_mounts(&mountinfo)
+        .into_iter()
+        .any(|(mountpoint, nsdelegate)| nsdelegate && mountpoint.ends_with("sys/fs/cgroup"));
+    match (failure, delegated) {
+        (None, true) => tracing::info!(
+            mountpoint = %cgroup2,
+            "mounted cgroup2 with nsdelegate for the per-box classifier tree"
+        ),
+        (failure, _) => {
+            let error = failure
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "the existing cgroup2 mount carries no nsdelegate".to_string());
+            tracing::error!(
+                error = %error,
+                "mounting cgroup2 with nsdelegate: a broken guest image; \
+                 host-address boxes will be refused"
+            );
         }
     }
 
@@ -524,10 +746,11 @@ pub fn mount_state_volume(device: &str, mountpoint: &str) -> std::io::Result<()>
 
 /// Quiesce the state volume before VMM teardown (spec R2.1): `syncfs(2)` the
 /// mount to flush all pending writes and the ext4 journal to the block device,
-/// then best-effort lazy-detach the mount so a clean stop leaves the journal
-/// closed. A syncfs error propagates; an unmount failure is logged and
-/// swallowed — the data is already synced, so the worst case is a journal
-/// replay on the next boot.
+/// then best-effort trim the freed extents back to the host, then best-effort
+/// lazy-detach the mount so a clean stop leaves the journal closed. A syncfs
+/// error propagates; a trim or unmount failure is logged and swallowed — the
+/// data is already synced, so the worst case is a journal replay on the next
+/// boot.
 pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -538,6 +761,19 @@ pub fn quiesce_state_volume(mountpoint: &str) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     drop(dir);
+
+    // Best-effort trim before teardown: a clean stop is the one moment the
+    // guest can return every freed extent to the host, and unlike the
+    // maintenance sweep it must not be skipped when nothing else ran. The
+    // error is logged and swallowed — the data is already synced, so a failed
+    // trim only strands extents for the next boot's sweep to reclaim.
+    if let Err(error) = trim_state_volume(mountpoint) {
+        tracing::warn!(
+            mountpoint,
+            %error,
+            "trimming state volume before teardown (best-effort; already synced)"
+        );
+    }
 
     let c_mountpoint = CString::new(mountpoint)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in mountpoint"))?;
@@ -1042,10 +1278,20 @@ pub async fn bring_up_root_egress() -> std::io::Result<crate::net::switch::Switc
         tracing::warn!(error = %e, "installing /etc/resolv.conf for guest egress (DNS may fail)");
     }
 
-    // Relay the tap to the host gvproxy over the vsock shuttle (CID 2).
-    let relay =
-        switch::attach_to_switch_vsock(tap_fd, VSOCK_HOST_CID, VSOCK_GVPROXY_SHUTTLE_PORT, None)
-            .await?;
+    // Relay the tap to the host gvproxy over the vsock shuttle (CID 2). The
+    // daemon relay carries no gate, so it emits no deprecation notice; its
+    // lease is the daemon's own address (NET-084: a frame out of this tap
+    // whose source is anything else is rejected at the relay), and the
+    // subnet passed is the one the guest is configured on above.
+    let relay = switch::attach_to_switch_vsock(
+        tap_fd,
+        VSOCK_HOST_CID,
+        VSOCK_GVPROXY_SHUTTLE_PORT,
+        None,
+        ip,
+        DEFAULT_SUBNET,
+    )
+    .await?;
     tracing::info!(%cidr, %gateway, "guest root egress up via host gvproxy shuttle");
     Ok(relay)
 }
@@ -1280,6 +1526,125 @@ fn mount_if_absent(target: &str, source: &str, fstype: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The handed ports are read off the environment the kernel passes
+    /// through from the boot tokens: a present token parses, an absent one
+    /// counts as not handed, `0` is the host's own "pick one yourself", and
+    /// a present-but-unusable one is a surfaced boot error naming the token
+    /// and the value it carried — a broken handoff is not papered over with
+    /// a fallback that would publish a listener the host's box table does
+    /// not name (NET-025, NET-138).
+    // SAFETY: env mutation here races only other reads of the same variables,
+    // and nextest runs every test in its own process.
+    #[test]
+    fn handed_ports_are_read_off_the_boot_line() {
+        unsafe {
+            std::env::set_var(HANDED_PROXY_PORT_TOKEN, "7654");
+            std::env::set_var(HANDED_ANSWERER_PORT_TOKEN, "7656");
+        }
+        assert_eq!(handed_proxy_port().unwrap(), Some(7654));
+        assert_eq!(handed_answerer_port().unwrap(), Some(7656));
+
+        // A present token that carries no port is the surfaced error, not a
+        // quiet absence: the boot names the token and the value it carried.
+        unsafe { std::env::set_var(HANDED_PROXY_PORT_TOKEN, "no-port-here") };
+        let error = handed_proxy_port().expect_err("an unusable token is an error");
+        assert_eq!(error.token, HANDED_PROXY_PORT_TOKEN);
+        assert_eq!(error.value, "no-port-here");
+
+        // The OS-picks `0` the host never hands is its "pick one yourself":
+        // not handed, and the daemon falls back to its own selection.
+        unsafe { std::env::set_var(HANDED_PROXY_PORT_TOKEN, "0") };
+        assert_eq!(handed_proxy_port().unwrap(), None);
+
+        // No token at all: the pre-handoff default-then-select behaviour.
+        unsafe {
+            std::env::remove_var(HANDED_PROXY_PORT_TOKEN);
+            std::env::remove_var(HANDED_ANSWERER_PORT_TOKEN);
+        }
+        assert_eq!(handed_proxy_port().unwrap(), None);
+        assert_eq!(handed_answerer_port().unwrap(), None);
+    }
+
+    /// The eager bind the pid-1 boot owes its handed ports: each handed one
+    /// binds in the microVM's bind base — the proxy over TCP, the answerer
+    /// over UDP — and nothing left bound when the probe returns. An absent
+    /// port is probed by nothing, and a held port fails with the port and
+    /// its transport named: the boot-fatal case
+    /// `vm_hosted_daemon_binds_handed_port` drives end to end.
+    #[test]
+    fn the_handed_node_ports_bind_for_the_probe_and_free_again() {
+        // Two ports nothing else holds, probed both at once: the proxy's TCP
+        // bind and the answerer's UDP bind succeed and are dropped.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let held = listener.local_addr().unwrap().port();
+        let free_tcp = loop {
+            let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = probe.local_addr().unwrap().port();
+            if port != held {
+                break port;
+            }
+        };
+        let free_udp = loop {
+            let probe = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+            let port = probe.local_addr().unwrap().port();
+            if port != held && port != free_tcp {
+                break port;
+            }
+        };
+        probe_handed_node_ports(Some(free_tcp), Some(free_udp))
+            .expect("two free ports bind for the probe and free again");
+        // The probe's bindings were dropped: the ports bind again at once.
+        assert!(std::net::TcpListener::bind(("127.0.0.1", free_tcp)).is_ok());
+        assert!(std::net::UdpSocket::bind(("127.0.0.1", free_udp)).is_ok());
+
+        // A handed port something already holds fails the probe, with the
+        // port and its transport in the reason.
+        let error = probe_handed_node_ports(Some(held), None)
+            .expect_err("a held port cannot bind for the probe");
+        assert!(
+            error.to_string().contains(&held.to_string()),
+            "the failure names the port it could not bind, got: {error}"
+        );
+
+        // Nothing handed is nothing bound: the no-token boot probes nothing.
+        probe_handed_node_ports(None, None).expect("no handed port binds nothing");
+    }
+
+    /// Only the microVM's init is the microVM daemon: both halves of
+    /// [`is_microvm_daemon`] are needed, because either one alone is spoofable
+    /// or satisfiable by something else. The classifier's guest refusal — a
+    /// host-address box a guest cannot place is refused, not run unenforced —
+    /// must fire for the guest alone.
+    #[test]
+    fn only_the_microvms_init_is_the_guest_daemon() {
+        use std::ffi::OsStr;
+
+        for (pid, argv0) in [
+            (1_u32, Some(OsStr::new("/init"))),
+            (1, Some(OsStr::new("init"))),
+            (1, Some(OsStr::new("/sbin/init"))),
+        ] {
+            assert!(
+                is_microvm_init(pid, argv0),
+                "pid 1 whose argv[0] basename is init is the microVM's init"
+            );
+        }
+        for (pid, argv0, why) in [
+            (
+                1_u32,
+                Some(OsStr::new("/sbin/minimald")),
+                "pid 1 run as itself",
+            ),
+            (1, None, "no argv[0] at all"),
+            (2, Some(OsStr::new("/init")), "the first fork, not pid 1"),
+        ] {
+            assert!(
+                !is_microvm_init(pid, argv0),
+                "{why} is not the microVM's init"
+            );
+        }
+    }
 
     /// The derivation in [`FITRIM`] must land on the number the kernel
     /// actually decodes. `0xc018_5879` is the value every asm-generic Linux

@@ -4,11 +4,12 @@
 #
 # Builds a throwaway git repo with a fixed tag topology and Conventional
 # Commit history (no network, no checkout of the real repo) and asserts the
-# derivation contract: feat -> minor, fix/perf and everything else -> patch,
-# breaking changes detected from `!` AND from body-only footers but never
-# moving the number while ALLOW_MAJOR is off, pre-release tags skipped over as
-# the range base yet counted by the strictly-greater lint, and --check's two
-# rules. Run directly or via `just test-shell`.
+# derivation contract: feat -> minor, a breaking change under any type -> minor
+# (never a major while ALLOW_MAJOR is off), fix/perf and everything else ->
+# patch, breaking changes detected from `!` AND from body-only footers,
+# pre-release tags skipped over as the range base yet counted by the
+# strictly-greater lint, and --check's two rules. Run directly or via
+# `just test-shell`.
 
 set -euo pipefail
 
@@ -258,6 +259,31 @@ expect 1 "package.version 0.6.0 is not strictly greater than the newest tag v0.7
 expect 0 "package.version 0.7.0 satisfies" "check: declaring above the stray tag passes" -- check 0.7.0
 git -C "$repo" tag -d v0.7.0-rc1 >/dev/null
 git -C "$repo" branch -q -D stray
+
+# --- a breaking change under a non-feat type: minor, not patch ---------------
+#
+# The isolated case: a range whose only notable commit is a breaking change
+# under a fix/other type. It used to derive a PATCH (a `fix!:` after v0.5.4 was
+# 0.5.5); a breaking change is a minor whatever its type while 0.x/alpha.
+
+commit "chore: tag a fresh base" v0.6.0
+commit "fix(lcache)!: drop the legacy lock format"
+expect_out "0.7.0" "a lone breaking fix bumps minor, not patch" -- nv --next
+expect_out "minor" "a lone breaking fix reports a minor bump" -- nv --bump
+expect 1 "package.version 0.6.1 is behind the commits since v0.6.0, which require a minor bump to at least 0.7.0 (1 breaking change(s): " \
+    "check: a patch over a lone breaking fix fails, naming the breaking change" -- check 0.6.1
+expect 0 "package.version 0.7.0 satisfies" "check: the breaking fix's minor passes" -- check 0.7.0
+
+commit "fix(op): retire the legacy manifest
+
+BREAKING CHANGE: the manifest file format changed"
+expect_out "0.7.0" "a footer-only breaking fix is still a minor" -- nv --next
+expect_out "minor" "a footer-only breaking fix reports a minor" -- nv --bump
+expect_notes "both breaking fixes render under Breaking changes" \
+    "### Breaking changes" "- **lcache**: drop the legacy lock format (" \
+    "- **op**: retire the legacy manifest (" \
+    "  BREAKING CHANGE: the manifest file format changed"
+refute_notes "a breaking fix is not also filed under Fixes" "### Fixes"
 
 # --- malformed input -----------------------------------------------------------
 

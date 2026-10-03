@@ -42,6 +42,18 @@ pub async fn system(w: &mut BundleWriter, paths: &DiagPaths) -> Result<(), anyho
     let info = diagnostics::system_info(&[&paths.state, &paths.cache, &paths.cwd]).await;
     let json = serde_json_lenient::to_vec_pretty(&info).context("serializing system info")?;
     w.add_bytes("host/system.json", &json, Redaction::None)
+        .await?;
+
+    // NET-122/NET-123: the host's naming surface — the resolver hook state
+    // (the macOS resolver file or the Linux routing-domain link), the
+    // reserved range's loopback aliases as a bind probe found them, and
+    // whether the host is on the 127.0.0.1 interim. Ports, interface names
+    // and loopback addresses are all it holds — the hook's detail never
+    // echoes a foreign nameserver — so nothing needs redacting.
+    let naming = crate::resolver::naming_surface().await;
+    let json = serde_json_lenient::to_vec_pretty(&naming)
+        .context("serializing the host naming surface")?;
+    w.add_bytes("host/net-naming.json", &json, Redaction::None)
         .await
 }
 
@@ -535,10 +547,13 @@ fn is_not_found(err: &anyhow::Error) -> bool {
 
 // ── providers/local-<kind><n>/ discovery ───────────────────────────────────────────
 
-/// Provider instance dirs under `<state>/providers`, sorted. Empty when the
-/// providers dir doesn't exist (nothing was ever spawned); any other
-/// filesystem error is an `Err` — "no daemon was ever spawned here" must
-/// never be claimed on the strength of an EACCES.
+/// Provider instance dirs under `<state>/providers`, sorted, plus every named
+/// VM nested in a minvmd instance dir as its own `local-minvmd0/<vm>` entry
+/// (NET-052) — so the bundle lists every VM by name. The default VM keeps the
+/// bare provider entry; a named VM's state dir is the per-name subdirectory
+/// (NET-054). Empty when the providers dir doesn't exist (nothing was ever
+/// spawned); any other filesystem error is an `Err` — "no daemon was ever
+/// spawned here" must never be claimed on the strength of an EACCES.
 pub async fn provider_dirs(state: &Path) -> Result<Vec<(String, PathBuf)>, std::io::Error> {
     let mut entries = match tokio::fs::read_dir(state.join("providers")).await {
         Ok(entries) => entries,
@@ -554,11 +569,44 @@ pub async fn provider_dirs(state: &Path) -> Result<Vec<(String, PathBuf)>, std::
             continue;
         };
         if name.starts_with("local-") {
-            dirs.push((name, entry.path()));
+            dirs.push((name.clone(), entry.path()));
+            // Only the minvmd backend hosts VMs; a native minimald instance
+            // dir has no per-name subdirectories to descend into.
+            if name.starts_with("local-minvmd") {
+                dirs.extend(named_vms(&name, &entry.path()).await);
+            }
         }
     }
     dirs.sort();
     Ok(dirs)
+}
+
+/// The named VMs under one minvmd provider dir, as
+/// (`<provider>/<vm>`, state dir) entries. A subdirectory is a VM only when
+/// its name is a valid VM name — an unnamed directory a tool left behind must
+/// not be reported as a VM, and the in-guest diagnostic bundle's `guest/`
+/// directory is among the names the validator reserves, so it never reads as
+/// a VM either. An unreadable provider dir yields no VMs rather than failing
+/// the whole listing: the provider entry above still says what it holds.
+async fn named_vms(provider: &str, dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let mut vms: Vec<(String, PathBuf)> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if !entry.file_type().await.is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Some(vm) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if paths::validate_vm_name(&vm).is_err() {
+            continue;
+        }
+        vms.push((format!("{provider}/{vm}"), entry.path()));
+    }
+    vms
 }
 
 /// Non-log per-provider evidence: what the instance dir holds, its raw
@@ -616,20 +664,84 @@ pub async fn provider_files(
     }
 
     let status_dir = dir.to_path_buf();
-    let status = tokio::task::spawn_blocking(move || provider_status(&status_dir))
-        .await
-        .context("provider status worker")?;
+    // The entry's VM name, resolved before the move: status.json names the
+    // VM this state belongs to alongside its state directory and socket, so
+    // every VM in the bundle is identifiable at a glance (NET-052).
+    let status_vm = vm_of_entry(name);
+    let status =
+        tokio::task::spawn_blocking(move || provider_status(status_vm.as_deref(), &status_dir))
+            .await
+            .context("provider status worker")?;
     let json = serde_json_lenient::to_vec_pretty(&status).context("serializing provider status")?;
     w.add_bytes(
         &format!("providers/{name}/status.json"),
         &json,
         Redaction::None,
     )
+    .await?;
+
+    // The data volume's apparent vs allocated size. A sparse `data-vol.raw`
+    // reports its full 256 GiB to `len()`, while `st_blocks * 512` is what it
+    // actually occupies — the number that says whether a machine holding tens
+    // of GB is healthy or silently full.
+    let volume_dir = dir.to_path_buf();
+    let volume = tokio::task::spawn_blocking(move || volume_info(&volume_dir))
+        .await
+        .context("volume info worker")?;
+    let json = serde_json_lenient::to_vec_pretty(&volume).context("serializing volume info")?;
+    w.add_bytes(
+        &format!("providers/{name}/volume.json"),
+        &json,
+        Redaction::None,
+    )
     .await
+}
+
+/// The data volume image's apparent and allocated sizes. `apparent_bytes` is
+/// `Metadata::len()` — the full sparse size — while `allocated_bytes` is
+/// `st_blocks * 512`, what the image actually occupies on disk.
+#[derive(Serialize)]
+struct VolumeInfo {
+    path: String,
+    exists: bool,
+    apparent_bytes: Option<u64>,
+    allocated_bytes: Option<u64>,
+    /// A non-`NotFound` stat failure (permission, I/O). "Absent" and
+    /// "unreadable" are different diagnoses and must not collapse into the
+    /// same `exists: false`, mirroring `guest::volume_fallback`.
+    error: Option<String>,
+}
+
+/// Reads the data volume image's sizes, best-effort: an absent image is
+/// `exists: false` with `None` sizes, while a non-`NotFound` stat failure is
+/// preserved in `error` rather than reported as a missing image.
+fn volume_info(dir: &Path) -> VolumeInfo {
+    use std::os::unix::fs::MetadataExt as _;
+    let image = dir.join("data-vol.raw");
+    let (meta, error) = match std::fs::metadata(&image) {
+        Ok(m) => (Some(m), None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+    VolumeInfo {
+        path: image.display().to_string(),
+        exists: meta.is_some(),
+        apparent_bytes: meta.as_ref().map(std::fs::Metadata::len),
+        allocated_bytes: meta.as_ref().map(|m| m.blocks() * 512),
+        error,
+    }
 }
 
 #[derive(Serialize)]
 struct ProviderStatus {
+    /// The VM this entry serves: `default` for a bare minvmd provider dir,
+    /// the per-name subdirectory for a named VM (`local-minvmd0/alpha`), and
+    /// `None` for the native minimald backend, which hosts no VMs.
+    vm: Option<String>,
+    /// The VM's state directory — the dir this status was read from.
+    state_dir: PathBuf,
+    /// The daemon's UDS: `<state dir>/ssh.sock`.
+    socket: PathBuf,
     /// Raw lifecycle from `minvmd.toml` — never repaired/written back.
     state: Option<toml::Table>,
     state_read_error: Option<String>,
@@ -639,12 +751,24 @@ struct ProviderStatus {
     minimald_alive: Option<bool>,
 }
 
+/// The VM a provider entry names: the per-name subdirectory of a nested entry
+/// (`local-minvmd0/alpha` → `alpha`), the default VM for a bare minvmd
+/// provider dir, and `None` for the native minimald backend, which hosts no
+/// VMs.
+fn vm_of_entry(name: &str) -> Option<String> {
+    if let Some((_, vm)) = name.rsplit_once('/') {
+        return Some(vm.to_owned());
+    }
+    name.starts_with("local-minvmd")
+        .then(|| paths::DEFAULT_VM_NAME.to_owned())
+}
+
 /// Reads the provider's lifecycle state and probes the advisory locks.
 ///
 /// Deliberately *not* `StateDir::effective_state()`, which repairs stale state
 /// by writing `Stopped` back — a diagnostic must never mutate what it reads.
 /// Synchronous (file locks and `std::fs`); callers run it on a blocking thread.
-fn provider_status(dir: &Path) -> ProviderStatus {
+fn provider_status(vm: Option<&str>, dir: &Path) -> ProviderStatus {
     // `StateDir::new` runs `create_dir_all`, so probing a provider whose
     // directory had been deleted would recreate it — leaving ghost state
     // behind and making this collector a mutation, which the paragraph above
@@ -659,6 +783,9 @@ fn provider_status(dir: &Path) -> ProviderStatus {
         Err(e) => (None, Some(e.to_string())),
     };
     ProviderStatus {
+        vm: vm.map(str::to_owned),
+        state_dir: dir.to_path_buf(),
+        socket: dir.join(paths::SSH_SOCK_FILE),
         state,
         state_read_error,
         minvmd_alive: state_dir.daemon_alive().ok(),
@@ -956,5 +1083,140 @@ mod tests {
                 "provenance note lacks {expected:?}"
             );
         }
+    }
+
+    /// One provider dir with two named VMs beside the guest payload and the
+    /// default VM, plus a native instance dir: `provider_dirs` must list every
+    /// VM as its own entry (`local-minvmd0/<vm>`), keep the default VM as the
+    /// bare provider entry, and never report the guest payload as a VM.
+    #[tokio::test]
+    async fn provider_dirs_lists_named_vms() {
+        let state = tempfile::TempDir::new().unwrap();
+        let providers = state.path().join("providers");
+        let minvmd = providers.join("local-minvmd0");
+        for dir in ["guest", "alpha", "beta"] {
+            std::fs::create_dir_all(minvmd.join(dir)).unwrap();
+        }
+        std::fs::create_dir_all(providers.join("local-minimald0")).unwrap();
+
+        let listed = provider_dirs(state.path()).await.unwrap();
+        let names: Vec<&str> = listed.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "local-minimald0",
+                "local-minvmd0",
+                "local-minvmd0/alpha",
+                "local-minvmd0/beta",
+            ],
+            "every VM must be listed by name"
+        );
+        for (name, dir) in &listed {
+            assert_eq!(
+                dir,
+                &providers.join(name),
+                "each entry's dir must be the entry path under providers/"
+            );
+        }
+    }
+
+    /// The bundle must identify every VM it collected: status.json names the
+    /// VM, its state directory, and its socket (NET-052's diagnostics).
+    #[tokio::test]
+    async fn status_json_names_the_vm_its_state_dir_and_socket() {
+        let state = tempfile::TempDir::new().unwrap();
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+        let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
+
+        // A default VM's bare provider dir and a named VM's per-name subdir.
+        let alpha = state.path().join("providers/local-minvmd0/alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(state.path().join("providers/local-minvmd0")).unwrap();
+        provider_files(
+            &mut w,
+            "local-minvmd0",
+            &state.path().join("providers/local-minvmd0"),
+        )
+        .await
+        .unwrap();
+        provider_files(&mut w, "local-minvmd0/alpha", &alpha)
+            .await
+            .unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+
+        let files = unpack(&out, "r").await;
+        let default_status =
+            String::from_utf8(files["providers/local-minvmd0/status.json"].clone()).unwrap();
+        assert!(
+            default_status.contains(&format!("\"vm\": \"{}\"", paths::DEFAULT_VM_NAME)),
+            "the default VM's status must name it: {default_status}"
+        );
+        let alpha_status =
+            String::from_utf8(files["providers/local-minvmd0/alpha/status.json"].clone()).unwrap();
+        assert!(
+            alpha_status.contains("\"vm\": \"alpha\""),
+            "the named VM's status must name it: {alpha_status}"
+        );
+        assert!(
+            alpha_status.contains(&format!("\"state_dir\": \"{}\"", alpha.display())),
+            "the named VM's status must give its state directory: {alpha_status}"
+        );
+        assert!(
+            alpha_status.contains(&format!(
+                "\"socket\": \"{}\"",
+                alpha.join("ssh.sock").display()
+            )),
+            "the named VM's status must give its socket: {alpha_status}"
+        );
+    }
+
+    /// A sparse data volume must report both its apparent and allocated sizes:
+    /// `len()` alone makes a 256 GiB sparse image look full when it occupies
+    /// almost nothing.
+    #[tokio::test]
+    async fn volume_json_records_apparent_and_allocated_sizes() {
+        let state = tempfile::TempDir::new().unwrap();
+        let out_dir = tempfile::TempDir::new().unwrap();
+        let out = out_dir.path().join("diag.tar.zst");
+        let mut w = BundleWriter::create(&out, "r", "v").await.unwrap();
+
+        let provider = state.path().join("providers/local-minvmd0");
+        std::fs::create_dir_all(&provider).unwrap();
+        // A sparse file: 1 MiB apparent, one 4 KiB block allocated. Write
+        // without truncation so the apparent size stays 1 MiB.
+        let image = provider.join("data-vol.raw");
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&image)
+            .unwrap();
+        f.set_len(1024 * 1024).unwrap();
+        f.write_all(&[0u8; 4096]).unwrap();
+
+        provider_files(&mut w, "local-minvmd0", &provider)
+            .await
+            .unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+
+        let files = unpack(&out, "r").await;
+        let volume: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["providers/local-minvmd0/volume.json"]).unwrap();
+        assert_eq!(volume["exists"], true);
+        assert_eq!(volume["apparent_bytes"], 1024 * 1024);
+        assert!(
+            volume["allocated_bytes"].as_u64().unwrap() < 1024 * 1024,
+            "a sparse image's allocated size must be far below its apparent size: {volume}"
+        );
+        assert!(
+            volume["allocated_bytes"].as_u64().unwrap() >= 4096,
+            "the written block must be counted: {volume}"
+        );
     }
 }

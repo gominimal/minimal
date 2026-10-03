@@ -1,5 +1,6 @@
 [package]
 name = "mip"
+description = "The Minimal package/build CLI."
 rust-version.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -49,3 +50,6 @@ version.workspace = true
 
 [dev-dependencies]
 serial_test.workspace = true
+
+[lints]
+workspace = true

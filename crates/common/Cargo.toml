@@ -1,5 +1,6 @@
 [package]
 name = "common"
+description = "Common types and utilities (e.g. SpecHash) used across the codebase."
 version = "0.0.1"
 rust-version.workspace = true
 license.workspace = true
@@ -48,3 +49,6 @@ codespan-reporting.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
+
+[lints]
+workspace = true

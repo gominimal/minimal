@@ -57,6 +57,9 @@ pub enum AttachError {
     /// client still owes a patches upload + `FinalizeSession`
     /// before a shell can be minted.
     SessionPending,
+    /// The session host is alive but busy (its mailbox stayed full past the
+    /// attach deadline). The client should retry.
+    SessionBusy,
 }
 
 impl std::error::Error for AttachError {
@@ -84,6 +87,9 @@ impl fmt::Display for AttachError {
                 "session isn't attachable yet (still awaiting either \
                  SubmitVerdict or FinalizeSession)"
             ),
+            AttachError::SessionBusy => {
+                write!(f, "session host is busy; retry the attach once it drains")
+            }
         }
     }
 }
@@ -128,6 +134,69 @@ pub(crate) struct SessionConfig {
     /// route on spawn, relinks on rename, and withdraws on stop/destroy.
     #[cfg(target_os = "linux")]
     pub hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+    /// The answerer's lease book for this host (NET-010): the durable record
+    /// a grant of the reserved local range is arbitrated through. The actor
+    /// asks it for this session's box at finalize (NET-010/NET-011) and
+    /// returns the address at destroy — through the registry the publish and
+    /// the withdrawal bookend. Every ask is a synchronous read-modify-write
+    /// under the record's own lock file, so two daemons on one host are
+    /// serialized by the record, not by each other.
+    #[cfg(target_os = "linux")]
+    pub loopback: Arc<crate::net::dns::LoopbackLeaseBook>,
+    /// Whether the daemon opted out of the deny-all egress default
+    /// (NET-077): the launcher and the task path read it to resolve this
+    /// session's effective egress (NET-074), and the start line below logs
+    /// it so a diagnostics bundle can name the posture without the daemon's
+    /// flags.
+    pub deny_all_opt_out: bool,
+}
+
+/// The egress *section* the gate compiles for a session: the materialized
+/// form of [`sessions::effective_egress`]'s answer — `None` for the shipped
+/// allow-all, the deny-all section for an absent declaration under the
+/// in-force default (NET-074), and a declaration verbatim. `phase` is the
+/// rollout phase to resolve under — the launcher and the task path pass
+/// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, while the
+/// tests pass [`sessions::EgressDefaultPhase::InForce`] so the posture the
+/// rollout ends at stays proven while the default is only announced
+/// (NET-076). `opt_out` is the daemon's deny-all opt-out (NET-077), threaded
+/// from the server config.
+///
+/// Shared by the session launcher (the box's own gate) and the task path
+/// ([`crate::exec::task_network`]), so a task runs under the same egress
+/// its session does.
+pub(crate) fn effective_egress_section(
+    policy: &sessions::SessionPolicy,
+    network: sessions::NetworkMode,
+    phase: sessions::EgressDefaultPhase,
+    opt_out: bool,
+) -> Option<sessions::EgressPolicy> {
+    match sessions::effective_egress(policy.egress.as_ref(), network, phase, opt_out) {
+        sessions::EffectiveEgress::DenyAll => Some(sessions::EgressPolicy::deny_all()),
+        sessions::EffectiveEgress::AllowAll => None,
+        sessions::EffectiveEgress::Declared(section) => Some(section),
+    }
+}
+
+/// The policy the gate enforces for a session: its declared ingress, and its
+/// egress resolved to the section [`effective_egress_section`] names — the
+/// deny-all section for an own-address box with no `egress` section once the
+/// default is in force (NET-074), the shipped allow-all for everything an
+/// opt-out (NET-077) or an earlier phase leaves in place, and a declaration
+/// verbatim. `phase` resolves under, exactly as [`effective_egress_section`]
+/// documents. The declaration on the record is left untouched: the strict
+/// `SessionPolicy` a client reads back stays exactly what the box was
+/// launched with.
+pub(crate) fn effective_session_policy(
+    policy: &sessions::SessionPolicy,
+    network: sessions::NetworkMode,
+    phase: sessions::EgressDefaultPhase,
+    opt_out: bool,
+) -> sessions::SessionPolicy {
+    sessions::SessionPolicy {
+        egress: effective_egress_section(policy, network, phase, opt_out),
+        ingress: policy.ingress.clone(),
+    }
 }
 
 /// Lifecycle-dependent state of a session actor: the multi-step create flow
@@ -374,6 +443,10 @@ enum SessionMessage {
     /// The daemon's shared gvproxy switch, reached through the session because
     /// that is the handle the task path holds.
     GetNetSwitch(oneshot::Sender<Arc<Mutex<crate::net::SwitchClient>>>),
+    /// Whether this daemon opted out of the deny-all egress default
+    /// (NET-077), read by the task path so a task resolves its session's
+    /// effective egress (NET-074) the same way the launcher does.
+    GetDenyAllOptOut(oneshot::Sender<bool>),
     /// Hand back the session's composition, if it has one. Sourced from
     /// the persisted snapshot: `Session::run` loads it at spawn, so this
     /// answers for an actor brought up from disk after a restart.
@@ -384,6 +457,11 @@ enum SessionMessage {
     /// Hand back an `Arc` clone of this session's hook-scripts-upload lock,
     /// see [`Session::hook_scripts_upload_lock`].
     GetHookScriptsUploadLock(oneshot::Sender<Arc<Mutex<()>>>),
+    /// Register a live direct-tcpip forward relay as belonging to this
+    /// session, so teardown takes it down too: a session that goes away
+    /// aborts its forwards rather than leaving relays pointing into a box
+    /// that no longer exists.
+    TrackForward(tokio::task::AbortHandle),
     /// Kick off a background package build as a session side-op. Replies with
     /// the receiver end of the build's event stream.
     StartBuild {
@@ -431,6 +509,15 @@ pub struct Session {
     /// synchronous register/deregister, never across an `.await`.
     #[cfg(target_os = "linux")]
     hostnames: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
+
+    /// The answerer's lease book for this host ([`SessionConfig::loopback`]):
+    /// where the box's own host loopback address comes from at finalize and
+    /// where it goes back at destroy. Every ask is a synchronous
+    /// read-modify-write under the record's own lock file — never held across
+    /// an `.await` — so the session needs no lock of its own around it and
+    /// two daemons on one host cannot both be granted one address.
+    #[cfg(target_os = "linux")]
+    loopback: Arc<crate::net::dns::LoopbackLeaseBook>,
 
     /// The daemon-scoped gvproxy switch, injected into each `SandboxLauncher`
     /// this session mints so an `OwnIp` PTask attaches to the one per-host
@@ -480,6 +567,18 @@ pub struct Session {
     /// What brought the currently held host up, which decides whether an
     /// interactive attach may respawn it. See [`HostOrigin`].
     host_origin: HostOrigin,
+
+    /// Whether this daemon opted out of the deny-all egress default
+    /// (NET-077), threaded from the server config: the launcher resolves
+    /// this session's effective egress (NET-074) against it, and the task
+    /// path reads it through the handle for the same resolution.
+    deny_all_opt_out: bool,
+
+    /// The live direct-tcpip forwards opened for this session: one abort
+    /// handle per relay the connection layer spawned. Pruned as relays
+    /// finish; every live one is aborted by [`Session::stop_running`], so a
+    /// session that goes away takes its forwards down with it (NET-105).
+    forwards: Vec<tokio::task::AbortHandle>,
 }
 
 /// Why a session host was launched.
@@ -522,8 +621,11 @@ impl Session {
             record,
             net_switch,
             manager,
+            deny_all_opt_out,
             #[cfg(target_os = "linux")]
             hostnames,
+            #[cfg(target_os = "linux")]
+            loopback,
         } = seed;
         Self {
             receiver,
@@ -532,6 +634,7 @@ impl Session {
             minimal_cache_dir,
             daemon_ctx,
             net_switch,
+            deny_all_opt_out,
             tracker: OpTracker::new_root(),
             inner,
             workspace_baseline: WorkspaceBaseline::Unarmed,
@@ -543,8 +646,13 @@ impl Session {
             // conservative default — it is the one value that never licenses
             // a respawn.
             host_origin: HostOrigin::Interactive,
+            // Forwards are registered as their channels open; a session
+            // starts with none.
+            forwards: Vec::new(),
             #[cfg(target_os = "linux")]
             hostnames,
+            #[cfg(target_os = "linux")]
+            loopback,
         }
     }
 
@@ -614,6 +722,30 @@ impl Session {
         };
 
         let (sender, receiver) = mpsc::channel(8);
+        // One line per session start (NET-074/NET-076/NET-077): the rollout
+        // phase this build ships, the daemon's opt-out state, and the
+        // effective egress they leave this box with. The declaration
+        // travels on the record; these three are the facts a reader of a
+        // diagnostics bundle's daemon-log tail needs to explain why a box
+        // can — or cannot — reach anything, without the daemon's flags or
+        // its source at hand.
+        {
+            let record = obj.record();
+            tracing::info!(
+                session = %record.id,
+                name = ?record.name,
+                network = ?record.network,
+                egress_default_phase = ?sessions::EGRESS_DEFAULT_PHASE,
+                deny_all_opt_out = conf.deny_all_opt_out,
+                effective_egress = ?sessions::effective_egress(
+                    record.policy.egress.as_ref(),
+                    record.network,
+                    sessions::EGRESS_DEFAULT_PHASE,
+                    conf.deny_all_opt_out,
+                ),
+                "session starts"
+            );
+        }
         // A weak self-handle so the actor can hand its own mailbox to the
         // runtime objects it spawns without a caller threading it in.
         let weak_self = WeakSessionHandle(sender.downgrade());
@@ -624,37 +756,251 @@ impl Session {
         // (R3.1/R3.6). A `Draft` session has nothing to route to yet, so
         // `register_hostname` no-ops until its loadout finalizes.
         #[cfg(target_os = "linux")]
-        actor.register_hostname(obj.record());
+        actor.register_hostname(obj.record()).await;
 
         tokio::spawn(actor.mainloop());
         Ok(SessionHandle(sender))
     }
 
-    /// Register this session's PTask hostname (R3.1/R3.6). Both HostNet and
-    /// OwnIp resolve to loopback: a HostNet PTask's listeners are on host
-    /// loopback; an OwnIp PTask is reached through a gvproxy-published
-    /// loopback port (#542, the published-loopback model). A NoNet PTask
-    /// exposes no services, so it is not registered — and neither is a
+    /// Register this session's PTask hostname (R3.1/R3.6). A HostNet PTask's
+    /// listeners are on host loopback. An OwnIp PTask routes once the attach
+    /// path has reported its lease — at spawn that report has not happened
+    /// yet, so this registers nothing and the route appears when the box
+    /// attaches (NET-001); on a rename or re-finalize the reported lease is
+    /// already on file and the name re-registers against it, carrying the
+    /// ports the session's ingress declaration publishes (NET-069) — an empty
+    /// set, and so a deny-all gate, when the box declares no ingress: that is
+    /// the posture its own relay gate gives a direct connection, and the
+    /// proxy's must match on every host form (NET-071). A NoNet
+    /// PTask exposes no services, so it is not registered — and neither is a
     /// `Draft` session, which has nothing to route to until its composition
     /// finalizes.
+    ///
+    /// An `OwnIp` PTask is also recorded as the *caller* a proxied request
+    /// from it is checked against (NET-070): its egress declaration, over the
+    /// switch its own relay is attached to, is kept until the box's lease
+    /// joins onto it, and the rules built there are the ones its own outbound
+    /// frames are decided by on the switch
+    /// ([`crate::net::switch::compiled_egress`] over the switch's subnet, so
+    /// the resolver carve-out matches too, and with the box's lease, so the
+    /// verdict's source check does too — NET-084), so a request from the box
+    /// through the hostname proxy meets its own declaration — exactly what a
+    /// direct connection from it meets (NET-071).
     #[cfg(target_os = "linux")]
-    fn register_hostname(&self, record: &Record) {
+    async fn register_hostname(&self, record: &Record) {
         if !self.owns_hostname_route(record) {
             return;
         }
         let name = registry_name(record);
-        let mut reg = self
-            .hostnames
-            .write()
-            .expect("hostname registry lock poisoned");
+        // Scoped: the switch lock is dropped before the registry is taken, so
+        // no path holds both.
+        let subnet = self.net_switch.lock().await.subnet();
         match record.network {
             sessions::NetworkMode::OwnIp => {
-                reg.register_own_ip(record.id, &name);
+                // NET-010/NET-011: finalize publishes the box's declaration
+                // at a host loopback address of its own — granted through the
+                // answerer's record the first time, kept by the stable
+                // session id across a rename, a restart of the actor, or a
+                // restart of the daemon — so the name answers from here to
+                // destroy, whether or not a client ever attaches (NET-013).
+                //
+                // The address is asked for **before** the registry's write
+                // lock, and never underneath it: the ask is a synchronous
+                // read-modify-write of the answerer's record under its lock
+                // file, and this daemon's registry is what every DNS answer
+                // it serves reads — holding one across another daemon's
+                // in-flight grant would stall the answers for the length of
+                // the stall, and the registry is never held across the
+                // record, so the two orders cannot cycle either way. A box
+                // that already published one — a rename, a resume — is
+                // answered from the registry alone, without asking, so no
+                // ask is logged on its account; and two paths that both
+                // miss and both ask are still safe, the ask idempotent by
+                // namespace and answered with the address the first one
+                // recorded.
+                let already_published = {
+                    let reg = self
+                        .hostnames
+                        .read()
+                        .expect("hostname registry lock poisoned");
+                    reg.published_own_address(record.id)
+                };
+                let published =
+                    already_published.or_else(|| self.lease_loopback_address(record, &name));
+                let mut reg = self
+                    .hostnames
+                    .write()
+                    .expect("hostname registry lock poisoned");
+                reg.register_caller(record.id, &name, &record.policy, subnet);
+                let declared = crate::net::switch::declared_request_ports(Some(&record.policy));
+                if let Some(address) = published {
+                    // One warn line per port another box at the same address
+                    // also publishes (NET-129): intrinsic to the shared-address
+                    // mode, reported — the session-start report — and never
+                    // translated.
+                    reg.publish_own_address(record.id, &name, address, declared.clone());
+                } else {
+                    // The box publishes on the node's shared address (spent pool,
+                    // absent range, pending verdict, unreadable record). The same
+                    // shared-address collision check still applies, but the node
+                    // address itself is *not* recorded as the box's own: doing so
+                    // would short-circuit future lease asks through
+                    // `published_own_address` and would need `set_node_address`
+                    // to re-point a recorded node address when the node's grant
+                    // lands. Collisions are reported at the same moment as an
+                    // own-address publish (NET-129), through the same emitter;
+                    // the warn line is the surface today, and the list is kept
+                    // for a listing consumer to come.
+                    let node_address = reg.node_address();
+                    let _collisions = reg.report_shared_address_collisions(
+                        record.id,
+                        &name,
+                        node_address,
+                        declared.clone(),
+                    );
+                }
+                reg.register_own_ip(record.id, &name, declared);
             }
             sessions::NetworkMode::HostNet => {
+                let mut reg = self
+                    .hostnames
+                    .write()
+                    .expect("hostname registry lock poisoned");
                 reg.register_host_net(record.id, &name);
             }
             _ => {}
+        }
+        // The cross-record collision report, at the moment the design puts it
+        // (NET-010, design §7.1: cross-node collisions are reported at session
+        // start, like a port collision) — the same moment the port collision
+        // report above fires at, and the half the daemon's own start report
+        // cannot cover: a grant another state root's daemon makes after this
+        // one booted is one no report this daemon ran at its start will ever
+        // see again. Outside the registry's lock, like the lease ask above:
+        // the report is a read of the record under its lock file beside a
+        // read of the kernel's socket table, and no DNS answer this daemon
+        // serves waits behind it.
+        if matches!(record.network, sessions::NetworkMode::OwnIp) {
+            self.report_unrecorded_publishes();
+        }
+    }
+
+    /// One warn line per reserved-range address a live publish holds on this
+    /// host that the answerer's record for this daemon's state root does not
+    /// name — the cross-record collision report (NET-010), at session start
+    /// like a port collision, through the one emitter the daemon's own start
+    /// report shares
+    /// ([`warn_publish_collision`](crate::net::dns::warn_publish_collision))
+    /// so the two read as one report in a diagnostics bundle's log tail.
+    ///
+    /// A box that publishes on the shared-address interim — a spent pool, an
+    /// absent range, an unreadable record — starts too, and still gets the
+    /// report: the addresses it names are other roots' grants, not this
+    /// box's, and the moment the design asks for is this session's start.
+    #[cfg(target_os = "linux")]
+    fn report_unrecorded_publishes(&self) {
+        for address in self.loopback.unrecorded_publishes() {
+            crate::net::dns::warn_publish_collision(address);
+        }
+    }
+
+    /// Asks the answerer for this box's host loopback address (NET-010) — a
+    /// grant of the reserved local range, arbitrated through the host's one
+    /// lease record — with the one info line the observability contract asks
+    /// for per lease, naming the box and the address (the diagnostics
+    /// bundle's log tail carries these beside each release).
+    ///
+    /// `None` — with the warn line that says why — when the host's pool is
+    /// spent or the answerer cannot answer (an absent range, a pending verdict
+    /// inside the deferred walk's window, an unreadable record): the box then
+    /// publishes on the node's shared address, the mode
+    /// [`HostnameRegistry`](crate::net::dns::HostnameRegistry) already
+    /// answers for, where NET-128 keeps a stopped box from impersonating the
+    /// node and NET-129 keeps the collision reported rather than translated.
+    /// A grant the box already holds — a resumed session asking again after
+    /// a restart — answers with the recorded address, which is how a box's
+    /// address stays stable across a daemon restart, whether or not the
+    /// restarted daemon's range verdict has landed yet (NET-013).
+    #[cfg(target_os = "linux")]
+    fn lease_loopback_address(&self, record: &Record, name: &str) -> Option<std::net::Ipv4Addr> {
+        let namespace = crate::net::dns::LeaseNamespace::Box { session: record.id };
+        match self.loopback.grant(namespace) {
+            crate::net::dns::LoopbackGrant::Granted(address) => {
+                tracing::info!(
+                    session_id = %record.id,
+                    session_name = name,
+                    ip = %address,
+                    action = "loopback-lease",
+                    "leased a host loopback address for the box's published ports"
+                );
+                Some(address)
+            }
+            crate::net::dns::LoopbackGrant::PoolSpent => {
+                tracing::warn!(
+                    session_id = %record.id,
+                    session_name = name,
+                    action = "loopback-pool-spent",
+                    "the host's reserved local range is spent; \
+                     the box's ports publish on the node's shared address"
+                );
+                None
+            }
+            crate::net::dns::LoopbackGrant::RangePending => {
+                tracing::warn!(
+                    session_id = %record.id,
+                    session_name = name,
+                    action = "loopback-range-pending",
+                    "the verdict over the reserved local range is still pending; \
+                     the box's ports publish on the node's shared address \
+                     until the publish-surface walk lands"
+                );
+                None
+            }
+            crate::net::dns::LoopbackGrant::RangeAbsent => {
+                tracing::warn!(
+                    session_id = %record.id,
+                    session_name = name,
+                    action = "loopback-range-absent",
+                    "the reserved local range is absent on this host; \
+                     the box's ports publish on the node's shared address"
+                );
+                None
+            }
+            crate::net::dns::LoopbackGrant::RecordUnavailable => {
+                tracing::warn!(
+                    session_id = %record.id,
+                    session_name = name,
+                    action = "loopback-record-unavailable",
+                    "the answerer's lease record could not be read or written; \
+                     the box's ports publish on the node's shared address"
+                );
+                None
+            }
+        }
+    }
+
+    /// Returns a destroyed box's host loopback address to the host's pool
+    /// (NET-010) — the publish's other half, at the same
+    /// [`Self::lease_loopback_address`] that named the grant — with the one
+    /// info line per release naming the box and the address.
+    ///
+    /// The answer is the record's, not the registry's: a box that published
+    /// on the node's shared address holds no grant, and a box that holds one
+    /// gets exactly that address back — even a box whose publish was lost to
+    /// a restart leaves its grant here, so the record never outlives the
+    /// session it names. No line at all — and no change — for a namespace
+    /// the record does not name.
+    #[cfg(target_os = "linux")]
+    fn release_loopback_address(&self, record: &Record, name: &str) {
+        let namespace = crate::net::dns::LeaseNamespace::Box { session: record.id };
+        if let Some(address) = self.loopback.release(namespace) {
+            tracing::info!(
+                session_id = %record.id,
+                session_name = name,
+                ip = %address,
+                action = "loopback-release",
+                "released a destroyed box's host loopback address back into the pool"
+            );
         }
     }
 
@@ -670,23 +1016,70 @@ impl Session {
             )
     }
 
-    /// Withdraw this session's PTask hostname (R3.5).
+    /// Withdraw this session's PTask hostname (R3.5), and — when the session
+    /// is ending for good — drop its publish and its grant, so neither the
+    /// registry nor the answerer's record outlives the box they pointed at:
+    /// the address returns to the host's pool (NET-010) and every later
+    /// lookup of the name answers NXDOMAIN (NET-012).
+    ///
+    /// A stop is not that: a stopped box still exists — its session record
+    /// survives, and a resume brings the same box back — so `for_good` is
+    /// the destroy paths' alone. A stop withdraws the name's route and
+    /// keeps both halves of the publish, the registry's row and the
+    /// answerer's grant (NET-013: the box's address is its own from
+    /// finalize to destroy, and a stopped box that resumes must find the
+    /// same address waiting, whether the same daemon or a restarted one
+    /// answers — a stop that released the grant would hand the address to
+    /// the next box to finalize and leave the resumed one published
+    /// somewhere else). Shutdown stops every session the same way, which is
+    /// how the grant a restarted daemon re-derives from the answerer's
+    /// record is the very one the box held before the restart.
     ///
     /// Gated on [`Self::owns_hostname_route`] rather than relying on the
     /// registry's no-op behavior: the registry is keyed by name alone, so an
     /// ungated deregister from a session that never registered (`Draft`, or
     /// a non-routable mode) could withdraw an *unrelated* session's route
-    /// that happens to share the same derived name.
+    /// that happens to share the same derived name. A rename withdraws with
+    /// the grant and the publish kept: the re-register that follows it routes
+    /// at the same box, on the same address (NET-001).
+    ///
+    /// The registry's lock is never held across the answerer's record — the
+    /// same rule the grant path's [`Self::lease_loopback_address`] ask
+    /// follows: the release is a synchronous read-modify-write of the record
+    /// under its lock file, and this daemon's registry is what every DNS
+    /// answer it serves reads, so no answer waits behind a destroyed box's
+    /// release. The registry's rows go first, under the write lock alone,
+    /// and the release runs after it is dropped — which is also the safe
+    /// half of that order: while the record still names the grant, no other
+    /// box can be handed the address, so there is no moment where the
+    /// registry answers an address the pool already holds free.
     #[cfg(target_os = "linux")]
-    async fn deregister_hostname(&self) {
+    async fn deregister_hostname(&self, for_good: bool) {
         let record = self.record.record().await.unwrap();
+        if for_good {
+            // NET-010: the destroyed box's publish is withdrawn first, and the
+            // grant it held returns to the host's pool — the grant the
+            // finalize made, released here so the next box may publish on it.
+            // NET-012: the name goes with the publish, so every later lookup
+            // answers NXDOMAIN rather than a stale address.
+            {
+                let mut reg = self
+                    .hostnames
+                    .write()
+                    .expect("hostname registry lock poisoned");
+                reg.unpublish_own_address(record.id);
+                reg.forget_own_address(record.id);
+            }
+            self.release_loopback_address(&record, &registry_name(&record));
+        }
         if !self.owns_hostname_route(&record) {
             return;
         }
-        self.hostnames
+        let mut reg = self
+            .hostnames
             .write()
-            .expect("hostname registry lock poisoned")
-            .deregister(&registry_name(&record));
+            .expect("hostname registry lock poisoned");
+        reg.deregister(&registry_name(&record));
     }
 
     /// The async task which handles interactions with the session.
@@ -856,8 +1249,15 @@ impl Session {
             }
             SessionMessage::Stop(r) => {
                 self.stop_running(true).await;
+                // NET-013: a stop withdraws the name's route — the stopped
+                // box is not answering for clients — but keeps the grant and
+                // the registry's publish row: the session still exists, a
+                // resume brings the same box back, and its address is its
+                // own until destroy. Releasing here would let the next box
+                // to finalize take the address and leave a resumed box
+                // published somewhere else than before it stopped.
                 #[cfg(target_os = "linux")]
-                self.deregister_hostname().await;
+                self.deregister_hostname(false).await;
                 let _ = r.send(());
                 return ControlFlow::Break(Teardown::ManagerInitiated);
             }
@@ -879,9 +1279,10 @@ impl Session {
                 // Withdraw the hostname before the fallible record delete, so
                 // a delete failure leaves a stale on-disk record (repairable
                 // on restart) but never a stale routing entry pointing at a
-                // destroyed session (R3.5).
+                // destroyed session (R3.5). The session is ending for good, so
+                // its lease fact goes with it.
                 #[cfg(target_os = "linux")]
-                self.deregister_hostname().await;
+                self.deregister_hostname(true).await;
                 let _ = r.send(self.record.clone().delete().await);
                 return ControlFlow::Break(Teardown::ManagerInitiated);
             }
@@ -890,6 +1291,12 @@ impl Session {
             }
             SessionMessage::GetHookScriptsUploadLock(r) => {
                 let _ = r.send(Arc::clone(&self.hook_scripts_upload_lock));
+            }
+            SessionMessage::TrackForward(forward) => {
+                // Prune the ones that have finished on their own, so the
+                // list holds the live forwards and nothing else.
+                self.forwards.retain(|h| !h.is_finished());
+                self.forwards.push(forward);
             }
             SessionMessage::StartBuild {
                 rebuild,
@@ -912,6 +1319,13 @@ impl Session {
             }
             SessionMessage::GetNetSwitch(r) => {
                 let _ = r.send(Arc::clone(&self.net_switch));
+            }
+            SessionMessage::GetDenyAllOptOut(r) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
+                let _ = r.send(self.deny_all_opt_out);
             }
             #[cfg(test)]
             SessionMessage::PeekComposition(r) => {
@@ -1321,7 +1735,7 @@ impl Session {
                 record.status = SessionStatus::Active;
                 self.record.write(record.clone()).await?;
                 #[cfg(target_os = "linux")]
-                self.register_hostname(&record);
+                self.register_hostname(&record).await;
                 Ok(ran)
             }
             SessionStatus::Pending => Err(std::io::Error::new(
@@ -1403,27 +1817,48 @@ impl Session {
     /// act on it are bounded: `HostHandle::kill`'s `send_timeout` only bounds
     /// the wait for mailbox *capacity*, so a loop parked mid-`step()` (mailbox
     /// nearly empty) queues the kill yet never processes it, and awaiting that
-    /// loop unbounded would park the caller behind it forever. So a kill that
-    /// cannot be queued, or a loop that does not finish within
-    /// `HOST_PROBE_TIMEOUT` of accepting it, aborts the loop instead of
-    /// waiting on it.
+    /// loop unbounded would park the caller behind it forever.
     ///
-    /// Aborting drops the loop at its await point, so the awaited `NetGuard`
-    /// teardown in `Host::mainloop` is skipped and the wedged host's sandbox
-    /// process and network are orphaned rather than reclaimed here;
-    /// reclamation is a tracked follow-up.
+    /// When the kill cannot be queued the loop is aborted. When the kill
+    /// landed but the loop does not finish within `HOST_PROBE_TIMEOUT`, the
+    /// task is detached rather than aborted so the `NetGuard` teardown at the
+    /// end of `Host::mainloop` can still run once the loop drains.
     async fn kill_and_stop_loop(
         host: &session_host::HostHandle,
         task: &mut JoinHandle<Result<i32, std::io::Error>>,
         for_shutdown: bool,
     ) {
         let killed = host.kill(for_shutdown).await.is_ok();
-        if !killed
-            || tokio::time::timeout(HOST_PROBE_TIMEOUT, &mut *task)
-                .await
-                .is_err()
-        {
+        if !killed {
+            // The kill could not be queued — the host is wedged past the
+            // mailbox-capacity deadline. Abort the loop; the NetGuard
+            // teardown in mainloop is skipped, but the host was already
+            // unreachable.
             task.abort();
+        } else if tokio::time::timeout(HOST_PROBE_TIMEOUT, &mut *task)
+            .await
+            .is_err()
+        {
+            // The kill landed but the loop did not finish within the
+            // deadline. Detach rather than abort: the task continues
+            // running and will run the NetGuard teardown at the end of
+            // mainloop once it drains. Dropping the JoinHandle (when the
+            // caller's `task` binding goes out of scope) detaches it.
+            //
+            // worker-iterate: declined CodeRabbit's "keep timed-out hosts
+            // owned until cleanup is coordinated" finding. The suggested
+            // change — retain the timed-out JoinHandle under supervision and
+            // coordinate sandbox/NetGuard teardown before Destroy deletes the
+            // session or terminal-triggered replacement mints a second host —
+            // is a heavy architectural lift, not a behavior-preserving patch.
+            // It would restructure `SessionInner` to hold and later await the
+            // detached task and thread teardown coordination through both the
+            // Destroy and replacement paths, a change that cannot be validated
+            // here (the wedged-host scenario is not reproducible in this
+            // environment) and that risks regressing the bounded-caller
+            // response (`HOST_PROBE_TIMEOUT`) this function exists to
+            // preserve. The detach-on-timeout trade-off is deliberate and
+            // documented; full reclamation is a tracked follow-up.
         }
     }
 
@@ -1434,6 +1869,14 @@ impl Session {
     /// the daemon-shutdown message (and a terminal reset) rather than a bare
     /// disconnect when the session dies because the daemon is going away.
     async fn stop_running(&mut self, for_shutdown: bool) {
+        // The session's forwards relay into its box: a session that is going
+        // away takes them with it, rather than leaving live relays pointed at
+        // a box that is being torn down. Both teardown paths — `Stop` and
+        // `Destroy` — come through here.
+        for forward in std::mem::take(&mut self.forwards) {
+            forward.abort();
+        }
+
         let inner = match &mut self.inner {
             SessionInner::Active { host, sops, .. } => Some((host.take(), std::mem::take(sops))),
             SessionInner::Draft { .. } => None,
@@ -1455,7 +1898,8 @@ impl Session {
 
     /// Renames the session: persists the new name through the record handle
     /// (a name collision surfaces as the store's `AlreadyExists`), relinks
-    /// the PTask hostname so `<new>.local.min.internal` routes and the old name stops (R3.6).
+    /// the PTask hostname so `<new>.min.internal` routes and the old name
+    /// stops (R3.6).
     async fn rename(&mut self, new_name: String) -> Result<(), std::io::Error> {
         let record = self.record.record().await?;
 
@@ -1474,9 +1918,10 @@ impl Session {
         // Withdraw the route under the pre-rename name before the record
         // mutates; re-register under the new name afterwards. Both calls
         // gate on this session actually owning a route, so a Draft/NoNet
-        // rename never touches the registry.
+        // rename never touches the registry. The lease fact stays: the
+        // re-register routes at the same box (NET-001).
         #[cfg(target_os = "linux")]
-        self.deregister_hostname().await;
+        self.deregister_hostname(false).await;
         let mut new_record = record.clone();
         new_record.name = Some(new_name);
         let written = self.record.write(new_record.clone()).await;
@@ -1488,7 +1933,8 @@ impl Session {
         self.register_hostname(match &written {
             Ok(_) => &new_record,
             Err(_) => &record,
-        });
+        })
+        .await;
 
         written
     }
@@ -1703,8 +2149,9 @@ impl Session {
                     .await
                 {
                     Ok(()) => Ok(()),
-                    Err((channel, sz)) => {
-                        // The host is gone, or wedged past the attach deadline.
+                    Err(session_host::HostAttachError::Closed(channel, sz)) => {
+                        // The host's loop has ended; mint a fresh one from the
+                        // channel it handed back.
                         self.mint_session_host(
                             session_hnd,
                             conn_username,
@@ -1714,6 +2161,14 @@ impl Session {
                             session_keys,
                         )
                         .await
+                    }
+                    Err(session_host::HostAttachError::Timeout) => {
+                        // The host is alive but its mailbox stayed full past
+                        // the attach deadline. Re-minting here would abort a
+                        // busy-but-healthy shell, orphaning its processes and
+                        // skipping its NetGuard teardown. Refuse instead: the
+                        // client can retry once the host drains.
+                        Err(AttachError::SessionBusy)
                     }
                 }
             }
@@ -1730,6 +2185,21 @@ impl Session {
     /// in and comes back out because progress rendering borrows it for the
     /// duration; storing the result is left to the caller, since attach only
     /// keeps a host it could bind to.
+    ///
+    /// `for_hooks` says what the launch is *for*, which `phase` cannot say:
+    /// the phase records the status-gate posture (an attach and a teardown
+    /// hook launch are both `Attached`; finalize's activation launch is
+    /// `Activating`), while this flag marks the launches minted only for
+    /// lifecycle hooks, whose pty nobody reads. It is the launcher's to
+    /// carry, so the launch-scoped decisions downstream (the
+    /// unenforced-placement advisory) can tell a session start from a hook
+    /// run.
+    // Left positional: three call sites, each naming every argument it means,
+    // so a struct would be ceremony rather than clarity.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "three call sites, each naming every argument it means"
+    )]
     async fn launch_host(
         &mut self,
         session_hnd: SessionHandle,
@@ -1738,6 +2208,7 @@ impl Session {
         attach_env: session_host::AttachEnv,
         progress: Option<ChannelProgress>,
         phase: LaunchPhase,
+        for_hooks: bool,
     ) -> Result<(Option<Channel<Msg>>, LaunchedHost), AttachError> {
         let record = self.record.record().await.unwrap();
         let paths = self.paths().await;
@@ -1747,7 +2218,7 @@ impl Session {
         // republish them for the shell to re-read.
         let connection_env = attach_env.connection_env();
         let launcher = self
-            .session_launcher(session_hnd, &record, attach_env, phase)
+            .session_launcher(session_hnd, &record, attach_env, phase, for_hooks)
             .await?;
         // Where the shell-exit prompt's save-then-delete lane archives the
         // changed files. Daemon-side and session-independent; created on
@@ -1787,6 +2258,15 @@ impl Session {
                 // they write to and the process whose namespaces they join.
                 composition: self.composition(),
                 connection_env,
+                // The host owns the box's name-lifecycle half (NET-128): its
+                // `mainloop` marks the name running on the way in and stopped
+                // on the way out, so a shared-address name answers NODATA while
+                // no host is alive to answer it.
+                #[cfg(target_os = "linux")]
+                name_marker: Some(session_host::NameMarker::new(
+                    Arc::clone(&self.hostnames),
+                    record.id,
+                )),
             },
         ));
 
@@ -1910,6 +2390,7 @@ impl Session {
                 session_host::AttachEnv::default(),
                 None,
                 LaunchPhase::Attached,
+                false,
             )
             .await?;
 
@@ -1942,6 +2423,7 @@ impl Session {
                 attach_env,
                 Some(progress),
                 LaunchPhase::Attached,
+                false,
             )
             .await?;
         let channel = channel.expect("progress hands back the channel it was given");
@@ -2112,6 +2594,10 @@ impl Session {
                 session_host::AttachEnv::default(),
                 None,
                 phase,
+                // This launch exists only so the hooks have namespaces to
+                // join — a hook run, not a session start. See
+                // [`Session::launch_host`].
+                true,
             )
             .await
             .map_err(|e| {
@@ -2148,17 +2634,33 @@ impl Session {
         record: &Record,
         attach_env: session_host::AttachEnv,
         phase: LaunchPhase,
+        for_hooks: bool,
     ) -> Result<session_host::SandboxLauncher, AttachError> {
         // R2.1: reject a policy that is incompatible with the network mode
-        // (e.g. egress on a non-`OwnIp` PTask) before launching the host.
+        // (e.g. ingress forwards on a non-`OwnIp` PTask) before launching the
+        // host.
         record
             .validate_policy()
             .map_err(AttachError::InvalidPolicy)?;
         let network_mode = record.network;
-        // Only an `OwnIp` PTask attaches to the switch, so ingress forwards are
-        // only carried for that mode; `validate_policy` has already rejected
-        // ingress configured on any other mode.
-        let ingress = record.policy.ingress.clone();
+        // Only an `OwnIp` PTask attaches to the switch, so the policy's relay
+        // halves — egress verdict and ingress forwards — are only consumed in
+        // that mode. `validate_policy` rejects egress rules only on `NoNet`: a
+        // host-address box may carry them (NET-120), and such a box never
+        // reaches the relay. Only the ingress half is own-address-only, and
+        // `validate_policy` has already rejected it on any other mode.
+        //
+        // NET-074: the gate enforces the *effective* egress — an absent
+        // section on an own-address box is the deny-all section once the
+        // default is in force, this daemon's opt-out excepted (NET-077) —
+        // while the record keeps the declaration untouched for the strict
+        // `GetSessionPolicy` reply.
+        let policy = effective_session_policy(
+            &record.policy,
+            record.network,
+            sessions::EGRESS_DEFAULT_PHASE,
+            self.deny_all_opt_out,
+        );
         Ok(session_host::SandboxLauncher {
             ctx: match phase {
                 LaunchPhase::Attached => self.context(true).await,
@@ -2175,17 +2677,38 @@ impl Session {
             attach_env,
             network_mode,
             net_switch: Arc::clone(&self.net_switch),
-            ingress,
+            policy,
+            // The attach reports the lease through this, so the box's
+            // `<name>.min.internal` proxy route exists exactly while the box
+            // does (NET-001).
+            own_address: Some(crate::net::provider::OwnAddressReporter::new(
+                Arc::clone(&self.hostnames),
+                record.id,
+            )),
+            // The addresses the VM host daemon handed this box's registration
+            // (T66), persisted on the record: the `OwnIp` attach reuses the
+            // handed switch address instead of drawing one the host-side row
+            // would not match — including on a re-attach after a restart,
+            // where the record is the only thing that still knows it.
+            box_addresses: record.box_addresses,
             composition: self.composition(),
             // A weak handle so in-sandbox `min build` can drive session
             // side-ops without keeping the actor alive past teardown.
             session: session.downgrade(),
+            // What this launch is for; see [`Session::launch_host`].
+            for_hooks,
         })
     }
 
     /// Under test, swap in a mock launcher that runs a plain host process wired
     /// to the pty, exercising the session-host runtime without building a real
     /// sandbox (which needs packages unavailable in the unit-test tempdir).
+    ///
+    /// Kept separate from the production launcher: the two return *different*
+    /// launcher types (`SandboxLauncher` vs `MockLauncher`), each with its own
+    /// `SessionProcess`/`SessionGuard` associated types, and `SessionLauncher`
+    /// is not object-safe — merging them would force a boxed/dyn launcher
+    /// through the production spawn path.
     #[cfg(test)]
     async fn session_launcher(
         &mut self,
@@ -2193,13 +2716,14 @@ impl Session {
         record: &Record,
         _attach_env: session_host::AttachEnv,
         _phase: LaunchPhase,
+        _for_hooks: bool,
     ) -> Result<session_host::MockLauncher, AttachError> {
         // Mirror the production R2.1 gate so test launches reject a
         // policy/network-mode mismatch the same way production does.
         record
             .validate_policy()
             .map_err(AttachError::InvalidPolicy)?;
-        Ok(session_host::MockLauncher)
+        Ok(session_host::MockLauncher::default())
     }
 
     /// Return this session's workspace-rooted [`mctx::Context`].
@@ -2235,7 +2759,7 @@ impl Session {
         if record.status != SessionStatus::Active {
             return Err(format!(
                 "session isn't attachable yet (status is {:?}, need Active — \
-                 finish the upload + FinalizeSession sequence first)",
+             finish the upload + FinalizeSession sequence first)",
                 record.status,
             ));
         }
@@ -2285,38 +2809,38 @@ impl Session {
         }
     }
 
-    /// The default `minimal.toml` [`Self::scaffold_mfile_if_missing`] writes:
-    /// `op::InitProject` detects the workspace's stack against the default
-    /// package repo, whose branch head it resolves over the network.
-    #[cfg(not(any(test, feature = "test-support")))]
+    /// The default `minimal.toml` [`Self::scaffold_mfile_if_missing`] writes.
+    ///
+    /// Production: `op::InitProject` detects the workspace's stack against the
+    /// default package repo, whose branch head it resolves over the network.
+    ///
+    /// Under `test`/`test-support`: stand in for that network round-trip. Tests
+    /// run offline, and what they need from the scaffold is that it lands before
+    /// the composition — not what stack detection would have picked. The two
+    /// packages are what `op::InitProject` falls back to when nothing matches.
     fn default_mfile_plan(
         &self,
         wsp: &DaemonAbsPath,
     ) -> Result<(std::path::PathBuf, String), String> {
-        let config = self.workspace_config(wsp)?;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            Ok((
+                wsp.as_utf8_path()
+                    .join(mfile::MFILE_NAME)
+                    .into_std_path_buf(),
+                "[session]\npackages = [\"base\", \"vim\"]\n".to_string(),
+            ))
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let config = self.workspace_config(wsp)?;
 
-        use op::ProjectOp as _;
-        let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| e.to_string())?;
-        let plan = op::InitProject.run(&mut env).map_err(|e| e.to_string())?;
+            use op::ProjectOp as _;
+            let mut env = mctx::ProjectSetup::for_init(config).map_err(|e| e.to_string())?;
+            let plan = op::InitProject.run(&mut env).map_err(|e| e.to_string())?;
 
-        Ok((plan.toml_path, plan.content))
-    }
-
-    /// Under test, stand in for `op::InitProject`'s network round-trip: tests
-    /// run offline, and what they need from the scaffold is that it lands
-    /// before the composition — not what stack detection would have picked.
-    /// Same two packages `op::InitProject` falls back to when nothing matches.
-    #[cfg(any(test, feature = "test-support"))]
-    fn default_mfile_plan(
-        &self,
-        wsp: &DaemonAbsPath,
-    ) -> Result<(std::path::PathBuf, String), String> {
-        Ok((
-            wsp.as_utf8_path()
-                .join(mfile::MFILE_NAME)
-                .into_std_path_buf(),
-            "[session]\npackages = [\"base\", \"vim\"]\n".to_string(),
-        ))
+            Ok((plan.toml_path, plan.content))
+        }
     }
 
     /// Do the actual context construction: run [`mctx::Context::new`] against
@@ -2575,6 +3099,26 @@ impl SessionHandle {
         })
     }
 
+    /// Whether this daemon opted out of the deny-all egress default
+    /// (NET-077), for the task path's effective-egress resolution. A dead
+    /// actor maps to `NotConnected`.
+    pub(crate) async fn deny_all_opt_out(&self) -> Result<bool, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the actor may already be gone; the recv below reports that"
+        )]
+        let _ = self.0.send(SessionMessage::GetDenyAllOptOut(send)).await;
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "a closed oneshot carries no cause beyond the actor being gone"
+        )]
+        recv.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
+        })
+    }
+
     /// Configure the session's loadout from the client's wire contribution:
     /// `Ok(None)` means the composition finalized and the session is now
     /// `Active`; `Ok(Some(response))` means the client must gate the returned
@@ -2745,6 +3289,19 @@ impl SessionHandle {
                 "session actor terminated before the host could be launched",
             ))),
         }
+    }
+
+    /// Registers a forward relay with the session it forwards for, so the
+    /// session aborts it at teardown.
+    ///
+    /// Best-effort by design: a send error means the session actor is
+    /// already gone, in which case the relay is about to learn the same
+    /// thing its client does — there is no session to outlive. The
+    /// connection layer ignores the outcome.
+    pub async fn track_forward(&self, forward: tokio::task::AbortHandle) {
+        // Ignore send errors - a session that is gone has nothing left to
+        // track, and the forward ends with it.
+        let _ = self.0.send(SessionMessage::TrackForward(forward)).await;
     }
 
     pub async fn attach(

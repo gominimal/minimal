@@ -1,5 +1,6 @@
 [package]
 name = "remote-client"
+description = "Client for the Remote Execution Service, driving remote builds against the graph."
 version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
@@ -24,3 +25,6 @@ common.workspace = true
 graph.workspace = true
 orchestrator.workspace = true
 remote-proto.workspace = true
+
+[lints]
+workspace = true

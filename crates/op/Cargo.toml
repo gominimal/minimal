@@ -1,5 +1,6 @@
 [package]
 name = "op"
+description = "Complex operations over the graph and packages (builds, cache object construction)."
 version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
@@ -41,3 +42,6 @@ graph.workspace = true
 mfile.workspace = true
 ot.workspace = true
 sandbox2.workspace = true
+
+[lints]
+workspace = true

@@ -210,6 +210,24 @@ pub fn expand_source(
     resolved_vars: &(impl VarLookup + ?Sized),
     anchors: Anchors<'_>,
 ) -> Result<FileSet, ExpandError> {
+    expand_source_with_plain_dir(raw, resolved_vars, anchors).map(|(fs, _)| fs)
+}
+
+/// Like [`expand_source`], but also reports whether the source was a
+/// plain directory (no glob metacharacters naming an existing
+/// directory) that was rewritten to `dir/**/*`. Callers that apply
+/// plain-directory-only safeguards (default-directory excludes, the
+/// total-size cap) gate them on this flag so explicit globs and
+/// literal files are copied verbatim.
+///
+/// # Errors
+///
+/// See [`ExpandError`].
+pub fn expand_source_with_plain_dir(
+    raw: &str,
+    resolved_vars: &(impl VarLookup + ?Sized),
+    anchors: Anchors<'_>,
+) -> Result<(FileSet, bool), ExpandError> {
     expand_pattern(raw, resolved_vars, anchors, RequireAbsolute::Yes)
 }
 
@@ -241,6 +259,7 @@ pub fn expand_policy_pattern(
         Anchors::home(home_fallback),
         RequireAbsolute::No,
     )
+    .map(|(fs, _)| fs)
 }
 
 /// Whether the expander enforces "result must be absolute." Kept
@@ -257,7 +276,7 @@ fn expand_pattern(
     resolved_vars: &(impl VarLookup + ?Sized),
     anchors: Anchors<'_>,
     require_absolute: RequireAbsolute,
-) -> Result<FileSet, ExpandError> {
+) -> Result<(FileSet, bool), ExpandError> {
     let mut out = String::with_capacity(raw.len());
     // The same expansion with substituted values left *unescaped*.
     // `out` is what `FileSet` receives (glob metacharacters in
@@ -372,10 +391,10 @@ fn expand_pattern(
     // find. Active glob syntax is decided from the raw pattern alone
     // (`raw_has_glob_meta`), so a raw `[X]` — genuine glob syntax —
     // suppresses the rewrite while a substituted `[b]` does not.
-    let pattern = if require_absolute == RequireAbsolute::Yes
+    let plain_directory = require_absolute == RequireAbsolute::Yes
         && !raw_has_glob_meta
-        && std::path::Path::new(&unescaped_normalized).is_dir()
-    {
+        && std::path::Path::new(&unescaped_normalized).is_dir();
+    let pattern = if plain_directory {
         let mut with_glob = normalized;
         if with_glob.ends_with('/') {
             with_glob.push_str("**/*");
@@ -386,7 +405,8 @@ fn expand_pattern(
     } else {
         normalized
     };
-    FileSet::try_new(pattern).map_err(ExpandError::from)
+    let fs = FileSet::try_new(pattern).map_err(ExpandError::from)?;
+    Ok((fs, plain_directory))
 }
 
 /// Drop `.` and empty components, reject any `..` component.

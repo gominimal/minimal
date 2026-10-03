@@ -1,5 +1,6 @@
 [package]
 name = "diagnostics"
+description = "App-agnostic machinery for diagnostic support bundles."
 version = "0.0.1"
 rust-version.workspace = true
 license.workspace = true
@@ -24,3 +25,6 @@ libc.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio-stream.workspace = true
+
+[lints]
+workspace = true

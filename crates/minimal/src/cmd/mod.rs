@@ -19,11 +19,18 @@ use crate::*;
 
 mod admin;
 mod list;
+mod net;
 mod project;
 mod session;
 
+// The Ctrl-C cleanup (`arm_activation_interrupt`) withdraws the row the
+// activation registered with the VM host daemon; the withdrawal lives with
+// the session commands.
+use session::{vm_host_control_sock, withdraw_box_row};
+
 pub use admin::*;
 pub use list::*;
+pub use net::*;
 pub use project::*;
 pub use session::*;
 
@@ -72,8 +79,15 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             TaskCommand::Run(args) => task::cmd_task_run(&cli.global_args, args).await,
         },
         Some(Command::Run(args)) => task::cmd_run(&args),
+        Some(Command::Net(NetArgs {
+            command: NetCommand::Forward(args),
+        })) => cmd_net_forward(&cli.global_args, args).await,
         Some(Command::Dirs) => dirs::cmd_dirs(&cli.global_args),
         Some(Command::Bug(args)) => diag::cmd_bug(&cli.global_args, args).await,
+        Some(Command::Diag(diag::DiagArgs { command })) => match command {
+            diag::DiagCommand::Collect(args) => diag::cmd_bug(&cli.global_args, args).await,
+            diag::DiagCommand::Upload(args) => diag::cmd_diag_upload(args).await,
+        },
         #[cfg(feature = "remote-access")]
         Some(Command::Mesh(MeshArgs { command })) => match command {
             MeshCommand::Status => cmd_mesh_status(&cli.global_args).await,
@@ -81,9 +95,9 @@ pub(crate) async fn run_command(cli: Cli) -> Result<(), anyhow::Error> {
             MeshCommand::Leave => cmd_mesh_leave(&cli.global_args),
         },
         Some(Command::Proxy(args)) => cmd_proxy(&cli.global_args, args).await,
-        #[cfg(feature = "remote-access")]
-        Some(Command::SshForward(args)) => cmd_ssh_forward(&cli.global_args, args).await,
-        Some(Command::Login(args)) => cmd_login(&cli.global_args, args).await,
+        Some(Command::Login(args)) => {
+            cmd_login(&cli.global_args, args, &mut std::io::stdout().lock()).await
+        }
         Some(Command::Version) => cmd_version(&cli.global_args).await,
         Some(Command::Spin(args)) => cmd_spin(&cli.global_args, args).await,
         Some(Command::Init(args)) => cmd_init(&cli.global_args, args)
@@ -252,7 +266,7 @@ impl From<SessionLookup> for minimald_rpc::GetSessionHooksRequest {
 /// Resolve a session by UUID or name, returning its record.
 ///
 /// Used by commands that need the full record before proceeding (destroy,
-/// rename, attach, ssh-forward). If the string parses as a UUID, the session
+/// rename). If the string parses as a UUID, the session
 /// is looked up by ID; otherwise by name. Bails if no session matches.
 pub(crate) async fn resolve_session(
     client: &mut client::Client,
@@ -266,8 +280,8 @@ pub(crate) async fn resolve_session(
 /// the same lookup, with the build it reports asserted before the record is
 /// used for anything.
 ///
-/// The lookup is the first RPC `min session attach`, `min session exec`,
-/// `min session setup-zed`, and `min ssh-forward` make, so the gate rides on
+/// The lookup is the first RPC `min session attach`, `min session exec`, and
+/// `min session setup-zed` make, so the gate rides on
 /// its reply rather than on a `GetVersion` sent ahead of it — an activation
 /// must not pay a round trip for a check the calls it already makes can carry
 /// (#1251). Ordered so the skew is reported ahead of a "no session found":
@@ -654,6 +668,9 @@ pub(crate) fn arm_activation_interrupt(
     session_id: sessions::SessionId,
 ) -> ActivationInterrupt {
     let sock = client::resolve_socket_path(global.minimal_dir.as_deref(), global.use_minvmd());
+    // Resolved here, not inside the task: the withdrawal's socket is the
+    // same provider dir's, and the borrow must not cross the spawn.
+    let control_sock = vm_host_control_sock(global);
     let task = tokio::spawn(async move {
         // Only the first Ctrl-C is intercepted; a second falls through to
         // the default disposition so a wedged cleanup can still be killed.
@@ -668,9 +685,22 @@ pub(crate) fn arm_activation_interrupt(
             && let Ok(mut client) = client::Client::connect(&sock).await
         {
             use minimald_rpc::{AbortSession, AbortSessionRequest};
+            // The record is fetched **before** the abort, which may take it
+            // with the session: it carries the pair the box's registration
+            // handed back (T66), whose row is withdrawn after the abort —
+            // the creator's withdrawal, best-effort. A session that
+            // registered no box (a task session, a native host) holds no
+            // pair, and the withdrawal stays silent for it.
+            let row = get_session_record(&mut client, &session_id.to_string())
+                .await
+                .ok()
+                .and_then(|resp| resp.record);
             let _ = client
                 .oneshot_rpc::<AbortSession>(AbortSessionRequest { id: session_id })
                 .await;
+            if let Some(record) = row {
+                withdraw_box_row(control_sock, record.name.as_deref(), record.box_addresses).await;
+            }
         }
         std::process::exit(130);
     });
