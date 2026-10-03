@@ -287,7 +287,8 @@ fn token_len(s: &str) -> usize {
 ///
 /// A value opening with a quote, optionally backslash-escaped as in a
 /// JSON-encoded argv (`\"x\"`), runs from after that quote to its match:
-/// for an escaped opening quote, the next escaped quote of the same kind;
+/// for an escaped opening quote, the next escaped quote of the same kind
+/// that is not itself a shell-escaped quote (`\\\"`);
 /// otherwise the next quote of the same kind that is not escaped. An
 /// unclosed quote runs to the end of input, so a cut-off value is still
 /// masked. Any other value is a [`token_len`] token.
@@ -299,17 +300,27 @@ fn value_span(s: &str) -> (usize, usize) {
     };
     let start = open + 1;
     let body = &s[start..];
-    let len = if escaped {
-        body.find(&format!("\\{quote}"))
-    } else {
-        let mut prev_backslash = false;
-        body.char_indices().find_map(|(i, c)| {
-            let closes = c == quote && !prev_backslash;
-            prev_backslash = c == '\\' && !prev_backslash;
-            closes.then_some(i)
+    // The quote closes on the run of backslashes before it. Unescaped, an
+    // even run leaves it a real quote. Escaped, the run must be odd (the
+    // escape of the quote itself), and the rest decodes to (run - 1) / 2
+    // backslashes that must again be even: `\"` closes, but the `\\\"` of a
+    // shell-escaped quote inside a JSON string does not.
+    let closes = |run: usize| {
+        if escaped {
+            !run.is_multiple_of(2) && (run / 2).is_multiple_of(2)
+        } else {
+            run.is_multiple_of(2)
+        }
+    };
+    let mut run = 0;
+    let len = body
+        .char_indices()
+        .find_map(|(i, c)| {
+            let close = c == quote && closes(run);
+            run = if c == '\\' { run + 1 } else { 0 };
+            close.then(|| if escaped { i - 1 } else { i })
         })
-    }
-    .unwrap_or(body.len());
+        .unwrap_or(body.len());
     (start, len)
 }
 
@@ -804,6 +815,10 @@ mod tests {
             (
                 r#"min://argv ["sh","-c","PASSWORD=\"two words\" cmd"]"#,
                 "words",
+            ),
+            (
+                r#"min://argv ["sh","-c","PASSWORD=\"foo\\\"hunter2\" cmd"]"#,
+                "hunter2",
             ),
             ("Authorization: Bearer 'abc123'", "abc123"),
         ] {
