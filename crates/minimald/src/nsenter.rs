@@ -246,6 +246,21 @@ pub enum NsenterError {
         source: nix::Error,
     },
 
+    /// The shim could not move itself into a deny-all box's classifier leaf
+    /// before joining its namespaces. The join is the one write that must
+    /// precede `setns` (see [`shim_main`]), and for a deny-all box it is also
+    /// the one placement a verdict cannot survive failing: a process left
+    /// outside the leaf runs where nothing refuses its connections, so the
+    /// injected run stops rather than silently run unenforced. For any other
+    /// leaf the same failure is advisory (NET-079's exception) and never
+    /// yields this error.
+    #[error("joining the deny-all box's classifier leaf {}", leaf.display())]
+    JoinDenyLeaf {
+        leaf: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The injected program could not be started. `ENOMEM` from the fork means
     /// the sandbox's PID namespace has no live init left to reparent to — the
     /// session shell exited while we were joining.
@@ -605,8 +620,10 @@ pub struct ShimArgs {
 ///
 /// # Errors
 ///
-/// [`NsenterError::Setns`] if the namespaces cannot be joined, and
-/// [`NsenterError::Spawn`] if the program cannot be started inside them.
+/// [`NsenterError::JoinDenyLeaf`] if the box is deny-all and its classifier
+/// leaf cannot be joined, [`NsenterError::Setns`] if the namespaces cannot be
+/// joined, and [`NsenterError::Spawn`] if the program cannot be started inside
+/// them.
 pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     // SAFETY: `command_in_session` placed a pidfd on this descriptor and it
     // survived the exec; nothing else in this freshly-exec'd process owns it.
@@ -624,16 +641,32 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     // the leaf, and the program forked below inherits it with everything
     // else.
     //
-    // Not fatal: a host that cannot place an injected process does not refuse
-    // it on that ground (NET-079's exception) — it runs in the daemon's leaf
-    // instead, and the box's own processes are placed either way. This shim
-    // has no logger (it runs before any runtime is built), so the failure goes
-    // to the inherited stderr, which is the daemon's.
+    // Fatal for a deny leaf, advisory for any other: a process that stays
+    // out of a deny-all box's leaf is a process of a box whose declaration
+    // admits nothing running where nothing refuses its connections — the
+    // one placement failure a verdict cannot survive, so the injected run
+    // stops rather than silently run unenforced. Any other leaf is the
+    // cohort's identity alone, and a host that cannot place an injected
+    // process does not refuse it on that ground (NET-079's exception): it
+    // runs in the daemon's leaf instead, and the box's own processes are
+    // placed either way. This shim has no logger (it runs before any
+    // runtime is built), so the failure goes to the inherited stderr, which
+    // is the daemon's.
     if let Some(leaf) = &args.classifier_leaf {
         let leaf = sandbox2::config::ClassifierLeaf::new(leaf);
-        if let Err(e) = sandbox2::classifier::place_pid(&leaf.procs(), std::process::id()) {
+        if let Err(source) = sandbox2::classifier::place_pid(&leaf.procs(), std::process::id()) {
+            if leaf.is_deny() {
+                eprintln!(
+                    "minimald: joining the deny-all box's classifier leaf {}: {source}",
+                    leaf.dir().display()
+                );
+                return Err(NsenterError::JoinDenyLeaf {
+                    leaf: leaf.dir().to_path_buf(),
+                    source,
+                });
+            }
             eprintln!(
-                "minimald: joining the session's classifier leaf {}: {e}",
+                "minimald: joining the session's classifier leaf {}: {source}",
                 leaf.dir().display()
             );
         }
@@ -891,7 +924,8 @@ mod tests {
     /// and the injection joins nothing but the namespaces.
     #[test]
     fn the_classifier_leaf_travels_on_the_shims_argv_when_one_is_set() {
-        let leaf = sandbox2::config::ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/b");
+        let leaf =
+            sandbox2::config::ClassifierLeaf::new("/sys/fs/cgroup/minimald.slice/boxes/allow/b");
         let shim = tempfile::NamedTempFile::new().expect("a temp file to stand in for the shim");
 
         let mut sleep = Command::new("/bin/sleep")

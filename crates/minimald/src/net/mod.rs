@@ -41,6 +41,15 @@ pub(crate) mod provider;
 // (NET-136). Relay-internal, so no more public than this.
 pub(crate) mod dns_gate;
 
+// The cgroup classifier a host-address box's egress verdict is decided on
+// (NET-079): the deny-or-allow subtree a box's declaration places its leaf
+// in, and the start-time fact of whether this host can decide per box at
+// all — the fact the create response carries and session start advises
+// with. Public because the daemon's `main` (a separate bin crate) records
+// the start-time fact before it serves. Carries unit tests over a
+// stand-in tree, so it is not `#[cfg(not(test))]`.
+pub mod classifier;
+
 // WireGuard mesh peer (Unit 4). Compiled only under `networking-wg` so the
 // default build carries no WireGuard code (R4.7).
 #[cfg(feature = "networking-wg")]
