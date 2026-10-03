@@ -783,6 +783,19 @@ mod tests {
         (sh, child_pid)
     }
 
+    /// Every box unshares its own IPC namespace, so a process injected into a
+    /// box has to be able to join it: the joinable set includes IPC, and
+    /// [`namespaces_to_join`] picks it up wherever the box's differs from ours.
+    #[test]
+    fn the_ipc_namespace_is_one_an_injected_process_joins() {
+        assert!(
+            Namespace::ALL.contains(&Namespace::Ipc),
+            "an injected process must join its box's IPC namespace"
+        );
+        assert_eq!(Namespace::Ipc.proc_name(), "ipc");
+        assert_eq!(Namespace::Ipc.clone_flag(), CloneFlags::CLONE_NEWIPC);
+    }
+
     #[test]
     fn resolves_the_grandchild_not_the_forking_process() {
         let (mut sh, expected) = shell_with_one_child();
