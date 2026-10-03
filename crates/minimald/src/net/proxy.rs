@@ -726,7 +726,8 @@ fn split_absolute_form(target: &str) -> Option<(&str, &str)> {
 /// host the request was routed to. `Connection: close` is added ahead of the
 /// received headers (a `close` option wins over `keep-alive`, RFC 9112 §9.6),
 /// because only this first request on the connection is rewritten; a request
-/// offering an `Upgrade` keeps its connection as it asked. Every other header
+/// offering an upgrade (`Upgrade` plus a `Connection: upgrade` option) keeps its
+/// connection as it asked. Every other header
 /// and any buffered body bytes pass through verbatim. A head with any other
 /// target is returned as is.
 fn rewrite_absolute_form(head: &[u8]) -> Cow<'_, [u8]> {
@@ -769,9 +770,18 @@ fn rewrite_absolute_form(head: &[u8]) -> Cow<'_, [u8]> {
     out.extend_from_slice(authority.as_bytes());
     out.extend_from_slice(b"\r\n");
     let header_lines = head_lines(&headers[request_line_end + 1..]);
-    let offers_upgrade = header_lines
-        .iter()
-        .any(|line| header_parts(line).is_some_and(|(name, _)| is_header(name, b"upgrade")));
+    // An upgrade is offered only by an `Upgrade` header together with the
+    // `upgrade` option in `Connection` (RFC 9112 §9.6); either alone is not one.
+    let has_header = |want: &[u8], token: Option<&[u8]>| {
+        header_lines.iter().any(|line| {
+            header_parts(line).is_some_and(|(name, value)| {
+                is_header(name, want)
+                    && token.is_none_or(|token| value_tokens(value).any(|t| is_token(t, token)))
+            })
+        })
+    };
+    let offers_upgrade =
+        has_header(b"upgrade", None) && has_header(b"connection", Some(b"upgrade"));
     if !offers_upgrade {
         out.extend_from_slice(b"Connection: close\r\n");
     }
@@ -1648,6 +1658,30 @@ mod tests {
             ),
             "GET /ws HTTP/1.1\r\nHost: web.min.internal\r\n\
              Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+        );
+        // The `upgrade` option is found case-insensitively in a token list.
+        assert_eq!(
+            rewrite(
+                b"GET http://web.min.internal/ws HTTP/1.1\r\n\
+                  Upgrade: websocket\r\nconnection: keep-alive , UPGRADE\r\n\r\n"
+            ),
+            "GET /ws HTTP/1.1\r\nHost: web.min.internal\r\n\
+             Upgrade: websocket\r\nconnection: keep-alive , UPGRADE\r\n\r\n"
+        );
+        // An `Upgrade` header without the `Connection: upgrade` option offers no
+        // upgrade (RFC 9112 §9.6), so the connection is still forced to close.
+        assert_eq!(
+            rewrite(
+                b"GET http://web.min.internal/ws HTTP/1.1\r\n\
+                  Upgrade: websocket\r\nConnection: keep-alive\r\n\r\n"
+            ),
+            "GET /ws HTTP/1.1\r\nHost: web.min.internal\r\nConnection: close\r\n\
+             Upgrade: websocket\r\nConnection: keep-alive\r\n\r\n"
+        );
+        assert_eq!(
+            rewrite(b"GET http://web.min.internal/ws HTTP/1.1\r\nUpgrade: websocket\r\n\r\n"),
+            "GET /ws HTTP/1.1\r\nHost: web.min.internal\r\nConnection: close\r\n\
+             Upgrade: websocket\r\n\r\n"
         );
     }
 
