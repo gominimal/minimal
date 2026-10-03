@@ -512,14 +512,36 @@ async fn create_classifier_decision(in_microvm: bool) -> classifier::Decision {
 /// the advisory is never a prompt: it names what a person may run, and
 /// running it (and any privilege prompt it carries) is the person's act,
 /// never the session start's.
+///
+/// The state it names is the box outcome the cause leaves, with the
+/// "whatever the boxes' declarations say" clause carried only while that
+/// outcome names no refusals: natively the step's and the mount's causes
+/// leave even a deny-all box running unenforced, while the two probe causes
+/// refuse a deny-all box at placement — an advisory that said "whatever the
+/// declarations say" over a refusal would deny the refusal a person is about
+/// to hit — and in the guest every cause refuses.
 fn classifier_advisory_text(cause: classifier::Cause, guest: bool) -> String {
     let mut advisory = format!(
         "note: this host cannot decide a host-address box's egress verdict \
-         per box: {}. While it cannot, {} — whatever the boxes' declarations \
-         say",
+         per box: {}. While it cannot, {}",
         cause.detail(),
         cause.host_ip_box_outcome(guest),
     );
+    // The clause holds exactly while the outcome sentence names no
+    // refusals — the same causes [`classifier::Cause::host_ip_box_outcome`]
+    // spells "run unenforced" for on a native host, mirrored here so the
+    // clause and the outcome it qualifies cannot drift apart. `guest` is
+    // folded into the mirror: every guest outcome names refusals.
+    if !guest
+        && matches!(
+            cause,
+            classifier::Cause::StepNotInstalled
+                | classifier::Cause::CannotConfine
+                | classifier::Cause::GuestTableNotLoaded
+        )
+    {
+        advisory.push_str(" — whatever the boxes' declarations say");
+    }
     if let Some(command) = cause.install_command() {
         // The command ends the advisory with nothing after it, so the line
         // a person copies from the terminal is the command, verbatim.
@@ -3444,6 +3466,72 @@ mod tests {
             None,
             "a decided host still decides an own-address box's verdict on \
              address leases, not on the cgroup tree"
+        );
+    }
+
+    /// The advisory over the two probe causes (NET-079), pinned pure: no
+    /// stand-in can carry either — a fake tree's probe child never places,
+    /// so the stand-ins answer a step or mount cause, and a stand-in that
+    /// carried a decided tree would need a table whose refusal the probe
+    /// could read. The two are the exception's one limit: natively the
+    /// outcome names the refusal — a deny-all host-address box is refused at
+    /// placement — so the advisory must not claim the boxes' declarations do
+    /// not matter over a refusal a person is about to hit. The table a
+    /// reload would fix still names the command; the probe no command can
+    /// make run names none. And in the guest every cause refuses, so the
+    /// clause never appears there either.
+    #[test]
+    fn advisory_over_a_probe_cause_names_the_refusal_not_a_blanket_unenforced() {
+        let not_effective =
+            super::classifier_advisory_text(classifier::Cause::TableNotEffective, false);
+        assert!(
+            not_effective.contains(
+                "its deny-all host-address boxes are refused and its other \
+                 host-address boxes run unenforced"
+            ),
+            "the probe cause's advisory names the refusal, got: {not_effective}"
+        );
+        assert!(
+            !not_effective.contains("whatever the boxes' declarations say"),
+            "the clause holds only while no box is refused, got: {not_effective}"
+        );
+        assert!(
+            not_effective.contains("sudo scripts/install-host-classifier.sh"),
+            "a table the marker vouches for but the probe does not is the one \
+             the step's install reloads, so the advisory still carries the \
+             command, got: {not_effective}"
+        );
+        assert!(
+            !not_effective.contains('?'),
+            "the advisory names what a person may run; it never asks: {not_effective}"
+        );
+
+        let unreadable =
+            super::classifier_advisory_text(classifier::Cause::ProbeUnreadable, false);
+        assert!(
+            unreadable.contains(
+                "its deny-all host-address boxes are refused and its other \
+                 host-address boxes run unenforced"
+            ),
+            "an unreadable probe leaves the same refusal-naming outcome, \
+             got: {unreadable}"
+        );
+        assert!(
+            !unreadable.contains("whatever the boxes' declarations say"),
+            "the clause still does not apply, got: {unreadable}"
+        );
+        assert!(
+            !unreadable.contains("install-host-classifier"),
+            "no command is known to make a probe run, so none is named, \
+             got: {unreadable}"
+        );
+
+        let guest =
+            super::classifier_advisory_text(classifier::Cause::StepNotInstalled, true);
+        assert!(
+            !guest.contains("whatever the boxes' declarations say"),
+            "a guest refuses a deny-all box on every cause, so its advisory \
+             must not claim the declarations do not matter, got: {guest}"
         );
     }
 
