@@ -418,14 +418,18 @@ static CREATE_CLASSIFIER_STANDIN: std::sync::Mutex<Option<(std::path::PathBuf, O
 /// process — a create driven by another test would answer over it too.
 #[cfg(any(test, feature = "test-support"))]
 pub fn install_create_classifier_standin(root: std::path::PathBuf, mountinfo: Option<String>) {
-    *CREATE_CLASSIFIER_STANDIN.lock().unwrap() = Some((root, mountinfo));
+    *CREATE_CLASSIFIER_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((root, mountinfo));
 }
 
 /// Withdraws the stand-in [`install_create_classifier_standin`] installed, so
 /// later creates answer over the production tree and mount table again.
 #[cfg(any(test, feature = "test-support"))]
 pub fn clear_create_classifier_standin() {
-    *CREATE_CLASSIFIER_STANDIN.lock().unwrap() = None;
+    *CREATE_CLASSIFIER_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
 /// The classifier tree and mount table the create-time read answers over: the
@@ -435,7 +439,11 @@ pub fn clear_create_classifier_standin() {
 /// each launch's read answer over.
 fn create_classifier_tree() -> (std::path::PathBuf, Option<String>) {
     #[cfg(any(test, feature = "test-support"))]
-    if let Some(pair) = CREATE_CLASSIFIER_STANDIN.lock().unwrap().clone() {
+    if let Some(pair) = CREATE_CLASSIFIER_STANDIN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
         return pair;
     }
     (
@@ -3059,7 +3067,11 @@ mod tests {
     // The guard is taken before the server is even built and held across
     // both awaited creates on purpose: the stand-in is process-global, so
     // another test's create in the window would answer over it too.
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the stand-in is process-global, so the guard must span the awaited \
+                  creates it is installed for"
+    )]
     #[tokio::test]
     async fn native_host_advises_classifier_install_without_prompt() {
         let _standin_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
@@ -3180,7 +3192,11 @@ mod tests {
     // The guard is taken before the server is even built and held across
     // the awaited creates on purpose: the stand-in is process-global, so
     // another test's create in the window would answer over it too.
-    #[allow(clippy::await_holding_lock)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the stand-in is process-global, so the guard must span the awaited \
+                  creates it is installed for"
+    )]
     #[tokio::test]
     async fn create_response_shows_enforcement_none_while_the_host_cannot_decide() {
         let _standin_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
