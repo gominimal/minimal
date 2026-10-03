@@ -33,6 +33,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_vsock::{VsockAddr, VsockStream};
 
+use sessions::core::egress::{DynamicPortVerdict, IngressRules};
 use sessions::{IngressPolicy, IpProto, PortMapping};
 
 /// The forwarder-expose request body gvproxy's `POST /services/forwarder/expose`
@@ -395,6 +396,75 @@ pub async fn remove_ingress(control: &ControlChannel, bound: &[PortForwarder]) {
     }
 }
 
+/// NET-016's publish: exposes **one** mapping on the switch's forwarder —
+/// a port a process in the box is listening on, published at `published`
+/// (the box's own address, NET-010) at the port the process listens on,
+/// both sides the same number, exactly as a declaration's mapping publishes
+/// its external port. Returns the [`ExposedMapping`] that identifies the
+/// forward, for [`unexpose_mapping`] when the listener closes.
+///
+/// The single mapping of the listener watcher, not [`apply_ingress`]: a
+/// declaration's forwards are bound once at publish and held until the box
+/// stops (NET-121), while these come and go with the processes inside the
+/// box (NET-016, NET-017), one at a time, and only after the shared verdict
+/// permitted the port. The forward is bound *before* the caller admits the
+/// port at the box's gate — the same order the declaration's apply holds —
+/// so there is no window in which the gate admits a port nothing answers.
+///
+/// # Errors
+///
+/// The expose error, for the caller to say and decide about: the caller
+/// keeps the port unadmitted, says the failure once per streak, and retries
+/// on the per-port backoff its refusals have earned.
+pub async fn expose_mapping(
+    control: &ControlChannel,
+    published: Ipv4Addr,
+    ptask_ip: Ipv4Addr,
+    port: u16,
+) -> io::Result<ExposedMapping> {
+    let mapping = PortMapping {
+        external_port: port,
+        internal_port: port,
+        proto: IpProto::Tcp,
+    };
+    let req = expose_request(&mapping, published, ptask_ip);
+    post_json(control, "/services/forwarder/expose", &req)
+        .await
+        .map(|()| ExposedMapping {
+            local: req.local,
+            protocol: req.protocol,
+        })
+}
+
+/// NET-017's withdraw: unexposes one mapping [`expose_mapping`] bound for a
+/// listener that has since closed, so the box's address stops answering at
+/// the port. The caller refuses the port at the box's gate *first* — the
+/// order [`PortForwarder::revoke`] holds for a declared forward — so no new
+/// connection crosses the gap between a listener already gone and a gate
+/// that still admits the port. A declared port's forward never comes down
+/// this path: it is not the watcher's (NET-081's sub-requirement — a
+/// withdrawal applies only to the runtime-published set), and nothing a
+/// process closing a listener does can withdraw what the declaration holds.
+///
+/// # Errors
+///
+/// The unexpose error, for the caller to say and decide about: a forward
+/// that fails to come down still stands at its `local`, so the caller keeps
+/// it in its published set — retrying the unexpose on every poll the box
+/// still runs and through the passes the stop that ends the watcher makes,
+/// and re-admitting the port if its listener returns before they run —
+/// never leaving it standing unowned for the switch's lifetime.
+pub async fn unexpose_mapping(
+    control: &ControlChannel,
+    mapping: &ExposedMapping,
+) -> io::Result<()> {
+    let req = UnexposeRequest {
+        local: mapping.local.clone(),
+        protocol: mapping.protocol.clone(),
+    };
+    post_json(control, "/services/forwarder/unexpose", &req).await
+}
+
 /// Why a runtime port-publish request was refused **before** the switch was
 /// asked anything: the typed error NET-044's deny arm answers with, rather
 /// than a bare message, so a caller can tell "this box denies dynamic
@@ -513,36 +583,24 @@ impl fmt::Display for ExposeFailure {
 /// `Ok(DynamicIngress::Allow)` when the box allows the port; the typed
 /// refusal saying why not otherwise.
 ///
-/// The mode decides first and the range second, so a box that denies never
-/// reveals whether the port would have been in range, and a box that allows
-/// still keeps the declaration's own gate: the `dynamic_allowed_range` is the
-/// set of ports the box opted in (unset means none were), and a request
-/// outside it is refused wherever it came from.
+/// The stance and the range are [`IngressRules::dynamic_verdict`]'s to
+/// derive — the one derivation this decision and the listen watcher's
+/// verdict share, so the two runtime ingress surfaces cannot part ways on a
+/// port — and this is the half that renders each fact as the refusal the
+/// box's `min net expose` prints.
 pub fn dynamic_ingress_decision(
     ingress: Option<&IngressPolicy>,
     port: u16,
 ) -> Result<sessions::DynamicIngress, ExposeRefusal> {
-    let Some(ingress) = ingress else {
-        return Err(ExposeRefusal::DeniedByPolicy);
-    };
-    match ingress
-        .dynamic_ingress
-        .unwrap_or(sessions::DynamicIngress::Deny)
-    {
-        sessions::DynamicIngress::Deny => Err(ExposeRefusal::DeniedByPolicy),
-        sessions::DynamicIngress::Ask => Err(ExposeRefusal::AskNeedsAnswer),
-        sessions::DynamicIngress::Allow => {
-            let Some(range) = ingress.dynamic_allowed_range else {
-                return Err(ExposeRefusal::NoDynamicRange);
-            };
-            if port < range.0 || port > range.1 {
-                return Err(ExposeRefusal::OutOfRange {
-                    requested: port,
-                    range,
-                });
-            }
-            Ok(sessions::DynamicIngress::Allow)
-        }
+    match IngressRules::from_policy(ingress).dynamic_verdict(port) {
+        DynamicPortVerdict::Allow => Ok(sessions::DynamicIngress::Allow),
+        DynamicPortVerdict::Deny => Err(ExposeRefusal::DeniedByPolicy),
+        DynamicPortVerdict::Ask => Err(ExposeRefusal::AskNeedsAnswer),
+        DynamicPortVerdict::NoRange => Err(ExposeRefusal::NoDynamicRange),
+        DynamicPortVerdict::OutOfRange { range } => Err(ExposeRefusal::OutOfRange {
+            requested: port,
+            range,
+        }),
     }
 }
 
@@ -1341,6 +1399,79 @@ mod tests {
             dynamic_ingress_decision(Some(&ask), 3000),
             Err(ExposeRefusal::AskNeedsAnswer),
         );
+    }
+
+    #[test]
+    fn expose_and_listen_share_one_verdict() {
+        // `min net expose` and the listen watcher are two runtime ingress
+        // surfaces over one box, so the stance and the range they read are
+        // one derivation ([`IngressRules::dynamic_verdict`]), and this pins
+        // the two surfaces to it over every shape the box's declaration can
+        // take: absent stance, deny, ask, allow; absent range and one opted
+        // in; in-range at both bounds and out-of-range at either edge.
+        //
+        // The declaration is the listen verdict's own half (NET-121), so
+        // every policy below declares nothing: on these rows the verdict is
+        // `Publish` or `Deny`, and `Publish` holds exactly where the expose
+        // decision allows.
+        use sessions::DynamicIngress;
+        use sessions::core::egress::ListenVerdict;
+
+        const LOW: u16 = 3000;
+        const HIGH: u16 = 3010;
+        let stances = [
+            (None, "absent"),
+            (Some(DynamicIngress::Deny), "deny"),
+            (Some(DynamicIngress::Ask), "ask"),
+            (Some(DynamicIngress::Allow), "allow"),
+        ];
+        let ranges = [(None, "no range"), (Some((LOW, HIGH)), "3000-3010")];
+        for port in [LOW - 1, LOW, HIGH, HIGH + 1] {
+            for (stance, stance_name) in stances {
+                for (range, range_name) in ranges {
+                    let ingress = IngressPolicy {
+                        dynamic_ingress: stance,
+                        dynamic_allowed_range: range,
+                        ..Default::default()
+                    };
+                    let decision = dynamic_ingress_decision(Some(&ingress), port);
+                    let listen = IngressRules::from_policy(Some(&ingress))
+                        .listen_verdict(IpProto::Tcp, port);
+                    // The agreement the shared derivation buys: the watcher
+                    // publishes exactly the ports the expose decision allows.
+                    let allowed = decision == Ok(DynamicIngress::Allow);
+                    let expected_listen = if allowed {
+                        ListenVerdict::Publish
+                    } else {
+                        ListenVerdict::Deny
+                    };
+                    assert_eq!(
+                        listen, expected_listen,
+                        "stance {stance_name}, range {range_name}, port {port}"
+                    );
+                    // And the refusal names its own fact, stance before
+                    // range, in the words `min net expose` prints.
+                    let expected_decision = match stance {
+                        None | Some(DynamicIngress::Deny) => Err(ExposeRefusal::DeniedByPolicy),
+                        Some(DynamicIngress::Ask) => Err(ExposeRefusal::AskNeedsAnswer),
+                        Some(DynamicIngress::Allow) => match range {
+                            None => Err(ExposeRefusal::NoDynamicRange),
+                            Some((low, high)) if low <= port && port <= high => {
+                                Ok(DynamicIngress::Allow)
+                            }
+                            Some(range) => Err(ExposeRefusal::OutOfRange {
+                                requested: port,
+                                range,
+                            }),
+                        },
+                    };
+                    assert_eq!(
+                        decision, expected_decision,
+                        "stance {stance_name}, range {range_name}, port {port}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
