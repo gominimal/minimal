@@ -462,7 +462,10 @@ pub fn clear_create_classifier_standin() {
 /// test stand-in's when one is installed, else the production pair — the
 /// tree the installer lays out at [`sandbox2::classifier::TREE_ROOT`] and
 /// this daemon's own mount table, the same facts the start-time read and
-/// each launch's read answer over.
+/// each launch's read answer over. The mount table rides as the knob the
+/// shared read carries: the stand-in's stands in for the daemon's own live
+/// read, which [`crate::session_host::re_read_classifier_fact`] performs on
+/// the blocking pool.
 fn create_classifier_tree() -> (std::path::PathBuf, Option<String>) {
     #[cfg(any(test, feature = "test-support"))]
     if let Some(pair) = CREATE_CLASSIFIER_STANDIN
@@ -472,33 +475,33 @@ fn create_classifier_tree() -> (std::path::PathBuf, Option<String>) {
     {
         return pair;
     }
-    (
-        std::path::PathBuf::from(sandbox2::classifier::TREE_ROOT),
-        sandbox2::classifier::own_mountinfo(),
-    )
+    (std::path::PathBuf::from(sandbox2::classifier::TREE_ROOT), None)
 }
 
-/// The create-time classifier read (NET-079), on the blocking pool — the
+/// The create-time classifier read (NET-079): the one shared fact
+/// [`crate::session_host::re_read_classifier_fact`] every host-address
+/// path answers over — the same read each launch performs over the same
+/// pair of a tree and a mount table, so the create's advisory and the
+/// launch that follows it cannot disagree over what this host is. The
 /// probe it attaches when the facts are all in binds a listener, forks a
-/// child, and waits, exactly as the daemon's start-time read does, so an
-/// async caller never runs it on the worker a session is being created on.
-/// A read that could not run at all is its own cause — an unreadable table
-/// is not a verdict, and the create must not report a host as deciding per
-/// box over evidence it never gathered.
+/// child, and waits, so it runs on the blocking pool, and an async caller
+/// never runs it on the worker a session is being created on. A read that
+/// could not run at all is its own cause — an unreadable table is not a
+/// verdict, and the create must not report a host as deciding per box
+/// over evidence it never gathered.
 async fn create_classifier_decision(in_microvm: bool) -> classifier::Decision {
     let (root, mountinfo) = create_classifier_tree();
-    tokio::task::spawn_blocking(move || {
-        classifier::decide_now(&root, mountinfo.as_deref(), in_microvm)
-    })
-    .await
-    .unwrap_or_else(|join| {
-        tracing::warn!(
-            error = %join,
-            "the create-time classifier check did not run; treating this \
-             host as unable to decide per box"
-        );
-        classifier::Decision::undecidable(classifier::Cause::ProbeUnreadable)
-    })
+    match crate::session_host::re_read_classifier_fact(root, mountinfo, in_microvm).await {
+        Ok((_, decision)) => decision,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "the create-time classifier check did not run; treating this \
+                 host as unable to decide per box"
+            );
+            classifier::Decision::undecidable(classifier::Cause::ProbeUnreadable)
+        }
+    }
 }
 
 /// The advisory a cause yields for the reply (NET-079): the cause in words,

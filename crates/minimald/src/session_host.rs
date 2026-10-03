@@ -2545,6 +2545,46 @@ fn launch_mountinfo(knob: Option<String>) -> Option<String> {
     knob.or_else(sandbox2::classifier::own_mountinfo)
 }
 
+/// The classifier fact every session-bearing path reads the host for,
+/// freshly, on the blocking pool: the mount table the tree answers over —
+/// the knob's when one was set, the daemon's own, read live, when none was
+/// ([`launch_mountinfo`]) — and the decision over the tree and that one
+/// table (NET-079), returned together because the two are one fact: a
+/// caller that decides a box over a table and then answers over another has
+/// read nothing.
+///
+/// Shared by every path that decides a host-address box on the host's own
+/// cgroup tree, so they cannot drift: the launch's read — the decision the
+/// placement, the recorded enforcement, and the refusal all answer over —
+/// and the create response's read, whose advisory and enforcement ride the
+/// reply to the start that is about to rely on the same host. Each caller
+/// reads fresh rather than keeping the start-time reading, because the
+/// fact the decision rests on is the table's *effect* (design §7.4): a
+/// marker survives whatever emptied the table and the refusal does not,
+/// and a kept reading would survive it the same way.
+///
+/// The mount table rides back out beside the decision because the launch
+/// answers its placement over the same one table the decision just read —
+/// one blocking hop, so the live mount-table read never runs on the async
+/// worker a session is being created on. `Err` says the read did not run
+/// at all — the blocking task was lost or panicked — which is each
+/// caller's own cause to name: a launch that cannot read the fact cannot
+/// place a box, while a create that cannot read reports the host as
+/// unable to decide per box, never as deciding.
+pub(crate) async fn re_read_classifier_fact(
+    root: std::path::PathBuf,
+    mountinfo_knob: Option<String>,
+    guest: bool,
+) -> std::io::Result<(Option<String>, crate::net::classifier::Decision)> {
+    tokio::task::spawn_blocking(move || {
+        let mountinfo = launch_mountinfo(mountinfo_knob);
+        let decision = crate::net::classifier::decide_now(&root, mountinfo.as_deref(), guest);
+        (mountinfo, decision)
+    })
+    .await
+    .map_err(std::io::Error::other)
+}
+
 /// Creates the classifier leaf this session's host-address box is placed in
 /// (NET-079), under the tree the privileged step installs on a native host
 /// (`scripts/install-host-classifier.sh`) and the guest daemon mounts for
@@ -3179,24 +3219,20 @@ impl SessionLauncher for SandboxLauncher {
         // The whole decision is kept, not only its verdict bit: the refusal
         // and the advice below say which box they are for out of the cause
         // that produced it, so the launch's words and the start-up line
-        // name the same ground. The knob's `None` — every production path —
-        // is the daemon's own mount table read live here, never "no table
-        // at all": a launch that answered over no table would read even a
-        // guest's `nsdelegate` cgroup2 as not real and refuse every
-        // host-address box in it as a broken image, so the live read and
-        // the decision share this one blocking hop, and the same one table
-        // is what the placement below answers over too.
+        // name the same ground. The read itself is the one shared fact
+        // every host-address path answers over — [`re_read_classifier_fact`],
+        // the same read the create response answers over — and the knob's
+        // `None` — every production path — is the daemon's own mount table
+        // read live inside it, never "no table at all": a launch that
+        // answered over no table would read even a guest's `nsdelegate`
+        // cgroup2 as not real and refuse every host-address box in it as a
+        // broken image, so the live read and the decision share that one
+        // blocking hop, and the same one table is what the placement below
+        // answers over too.
         let (leaf, decision) = if matches!(network_mode, NetworkMode::HostNet) {
-            let root = classifier_root.clone();
-            let knob = classifier_mountinfo.clone();
-            let (mountinfo, decision) = tokio::task::spawn_blocking(move || {
-                let mountinfo = launch_mountinfo(knob);
-                let decision =
-                    crate::net::classifier::decide_now(&root, mountinfo.as_deref(), guest);
-                (mountinfo, decision)
-            })
-            .await
-            .map_err(io::Error::other)?;
+            let (mountinfo, decision) =
+                re_read_classifier_fact(classifier_root.clone(), classifier_mountinfo.clone(), guest)
+                    .await?;
             let leaf = create_session_leaf(
                 &classifier_root,
                 mountinfo.as_deref(),
