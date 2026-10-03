@@ -424,7 +424,11 @@ pub struct SessionConfig {
     /// so a client that predates the field gets hooks, not silence.
     #[serde(default = "default_hooks_enabled")]
     pub hooks_enabled: bool,
-    /// Free-form attributes (typed by the caller).
+    /// Free-form attributes (typed by the caller), persisted onto the
+    /// session's record. The daemon adds one key of its own at create:
+    /// `egress_enforcement` (NET-079), the per-box egress enforcement this
+    /// host's verdict gives a host-address session, recorded so the state
+    /// outlives the activate message that reported it.
     #[serde(default)]
     pub attrs: std::collections::BTreeMap<String, String>,
 }
@@ -652,6 +656,43 @@ pub struct CreateSessionResponse {
     /// is where the user is about to rely on the names the surface answers.
     #[serde(default)]
     pub answerer_bound: bool,
+    /// The classifier advisory this host's verdict owes the session start
+    /// (NET-079): `Some` only while the box host cannot decide a
+    /// host-address box's egress verdict per box, naming the cause in
+    /// words, the state that leaves the box in — unenforced, whatever its
+    /// declaration says — and the exact command that installs the
+    /// classifier's privileged step only when that step is the cause that
+    /// is missing, because a host that cannot confine a box is not
+    /// cleared by installing anything. Spelled by the daemon, which is
+    /// the one that read the host; printed by the client verbatim, and
+    /// never a prompt — running the command (and any privilege prompt it
+    /// carries) is the person's act, never the session start's, because a
+    /// host-address box runs unenforced on such a host rather than
+    /// refused.
+    ///
+    /// `None` from a host that decides per box: silence is that host's
+    /// state, and a client reading `None` prints exactly what it printed
+    /// before this field. `None` from a daemon that predates it reads the
+    /// same way — nothing said, so nothing to print.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_advisory: Option<String>,
+    /// The per-box egress enforcement this host's verdict gives a
+    /// host-address session (NET-079): `per_box` when this host can decide
+    /// a box's verdict on a classifier leaf of its own, `none` when it
+    /// cannot and the box runs with the host's address and no verdict of
+    /// its own — the machine spelling the launch's own record uses, so a
+    /// script reads the state as data and not by parsing the prose around
+    /// it. `None` for a session that is not host-address: an own-address
+    /// or none box's verdict is decided on address leases, never on the
+    /// host's cgroup tree.
+    ///
+    /// The daemon records the same fact onto the session's record at
+    /// create, so the state outlives this reply — the activation path's
+    /// one look at it. `None` from a daemon that predates the field is
+    /// that daemon's silence, never a decided `per_box`: a client that
+    /// reads nothing here claims nothing from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_enforcement: Option<String>,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -1656,6 +1697,11 @@ mod tests {
             // line `min session activate` prints from it (NET-018) must not
             // be able to silently drop off.
             answerer_bound: true,
+            // And the classifier state (NET-079): the advisory a start
+            // prints and the enforcement a host-address box runs under
+            // must not be able to silently drop off either.
+            classifier_advisory: None,
+            egress_enforcement: None,
         };
         let json = serde_json_lenient::to_string(&resp).expect("serializes");
         assert!(
@@ -1681,6 +1727,8 @@ mod tests {
             zone_answerer_port: None,
             interim_loopback: false,
             answerer_bound: false,
+            classifier_advisory: None,
+            egress_enforcement: None,
         };
         let json = serde_json_lenient::to_string(&opted_out).expect("serializes");
         assert!(
@@ -1699,6 +1747,113 @@ mod tests {
             ..opted_out
         };
         assert_eq!(round_trip(&opted_in), opted_in);
+    }
+
+    /// The classifier state a host that cannot decide per box puts on its
+    /// create replies (NET-079), pinned on the wire: the unenforced state
+    /// as `egress enforcement none` in the machine spelling — `per_box` on
+    /// a host that decides, so the two hosts stay distinguishable to
+    /// whatever reads the field — the cause in words inside the advisory,
+    /// and the install command only for the cause it clears. A daemon
+    /// that predates both fields decodes with neither: silence, never a
+    /// decided `per_box`.
+    #[test]
+    fn create_response_carries_the_classifier_state() {
+        // The host whose step is missing: the advisory names the cause in
+        // words, names the state it leaves the box in, and carries the
+        // exact command that installs the privileged step.
+        let step_missing = CreateSessionResponse {
+            id: SessionId::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            daemon_version: Some("0.6.0".into()),
+            hostname_routing_unavailable: None,
+            hostname_proxy_port: None,
+            zone_answerer_port: None,
+            interim_loopback: false,
+            deny_all_opt_out: None,
+            answerer_bound: false,
+            classifier_advisory: Some(
+                "note: this host cannot decide a host-address box's egress \
+                 verdict per box: the classifier's privileged step is not \
+                 installed on this host. While it cannot, its host-address \
+                 boxes run unenforced — whatever the boxes' declarations \
+                 say. Install the classifier's privileged step with:\n  \
+                 sudo scripts/install-host-classifier.sh --user <the account \
+                 this daemon runs as> --cohort-address <cohort address> \
+                 --node-plane-address <node-plane address>"
+                    .to_string(),
+            ),
+            egress_enforcement: Some("none".into()),
+        };
+        let json = serde_json_lenient::to_string(&step_missing).expect("serializes");
+        assert!(
+            json.contains(r#""egress_enforcement":"none""#),
+            "the unenforced state must ride the wire in the machine spelling, got: {json}",
+        );
+        assert!(
+            json.contains("the classifier's privileged step is not installed"),
+            "the advisory names its cause in words, got: {json}",
+        );
+        assert!(
+            json.contains("sudo scripts/install-host-classifier.sh"),
+            "the step's cause names the exact command that installs it, got: {json}",
+        );
+        assert_eq!(round_trip(&step_missing), step_missing);
+
+        // The host that cannot confine a box: the same state, named without
+        // a command — installing the step over such a tree would leave the
+        // cause standing, so the advisory must not name one.
+        let cannot_confine = CreateSessionResponse {
+            classifier_advisory: Some(
+                "note: this host cannot decide a host-address box's egress \
+                 verdict per box: no cgroup2 mount with nsdelegate covers \
+                 the classifier tree, so a box could migrate out of its \
+                 leaf. While it cannot, its host-address boxes run \
+                 unenforced — whatever the boxes' declarations say."
+                    .to_string(),
+            ),
+            egress_enforcement: Some("none".into()),
+            ..step_missing
+        };
+        let json = serde_json_lenient::to_string(&cannot_confine).expect("serializes");
+        assert!(
+            !json.contains("install-host-classifier"),
+            "a cause no command clears names no command, got: {json}",
+        );
+        assert_eq!(round_trip(&cannot_confine), cannot_confine);
+
+        // The decided host: nothing to say, so nothing on the wire — a
+        // client of either build reads the reply it always read.
+        let decided = CreateSessionResponse {
+            classifier_advisory: None,
+            egress_enforcement: Some("per_box".into()),
+            ..cannot_confine
+        };
+        let json = serde_json_lenient::to_string(&decided).expect("serializes");
+        assert!(
+            json.contains(r#""egress_enforcement":"per_box""#),
+            "a host that decides per box says so in the machine spelling, got: {json}",
+        );
+        assert!(
+            !json.contains("classifier_advisory"),
+            "a decided host carries no advisory, got: {json}",
+        );
+        assert_eq!(round_trip(&decided), decided);
+
+        // A daemon that predates both fields: the reply it always sent
+        // decodes with neither, and absence must not read as a decided
+        // `per_box` — an older daemon's silence is not evidence of
+        // anything, and a client that reads nothing claims nothing.
+        let pre_field: Errorable<CreateSessionResponse> = serde_json_lenient::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000001","daemon_version":"0.5.0"}"#,
+        )
+        .expect("a pre-field CreateSession reply must still decode");
+        match pre_field {
+            Errorable::Ok(c) => {
+                assert!(c.classifier_advisory.is_none());
+                assert_eq!(c.egress_enforcement, None);
+            }
+            Errorable::Err { error } => panic!("expected Ok, got {error}"),
+        }
     }
 
     /// A daemon that predates `hostname_routing_unavailable` must still decode,
