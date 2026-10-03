@@ -303,7 +303,7 @@ const DELEGATION_FILES: [&str; 3] = ["cgroup.procs", "cgroup.threads", "cgroup.s
 /// families it read: a family it did not read is a family whose bypass it
 /// cannot see.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Family {
+pub enum Family {
     /// IPv4 loopback, where a connection the chain rejects with `icmpx
     /// admin-prohibited` reads as EHOSTUNREACH.
     V4,
@@ -356,7 +356,7 @@ const PROCS_FILE: &str = "cgroup.procs";
 /// read: one leg of the probe, kept per family so the decision's record
 /// names the evidence it rests on and not only the verdict it settled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Observed {
+pub enum Observed {
     /// `connect()` completed: the filter admitted a connection out of a
     /// deny leaf, which a loaded table never does.
     Connected,
@@ -391,7 +391,7 @@ impl Observed {
 /// rests on and no marker can vouch for (design §7.4) — a marker survives
 /// a reboot whose reload failed; the refusal it vouched for does not.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Reading {
+pub enum Reading {
     /// Every family read was refused with an errno in [`REJECT_SET`]: the
     /// table is loaded and its chain is refusing, each leg's observation
     /// carried for the record.
@@ -462,9 +462,9 @@ impl Reading {
     /// for: its control connection failed or no child was placed, so it
     /// names no evidence. No production surface reads a leg on its own —
     /// the reading is what they answer with — so the accessor is the
-    /// tests'.
-    #[cfg(test)]
-    pub(crate) fn legs(&self) -> Vec<(Family, Observed)> {
+    /// root lane's, whose live proof pins the errno each family of a
+    /// loaded table reads.
+    pub fn legs(&self) -> Vec<(Family, Observed)> {
         match self {
             Self::Refused(legs) | Self::NotRefused { families: legs, .. } => legs.clone(),
             Self::Inconclusive { .. } => Vec::new(),
@@ -475,7 +475,7 @@ impl Reading {
     /// what the leg there met, errno included — the evidence, spelled once
     /// so the decision that logs it and a bundle's tail agree by
     /// construction.
-    pub(crate) fn record(&self) -> String {
+    pub fn record(&self) -> String {
         match self {
             Self::Refused(families) => format!(
                 "the table refused the probe out of a deny leaf on every family read ({})",
@@ -893,7 +893,12 @@ fn bind_probe_listeners() -> std::io::Result<Vec<(Family, TcpListener)>> {
 /// waits, so an async caller runs it on the blocking pool; it logs one
 /// record per run, naming every family it read and what the leg there met,
 /// the errno included.
-pub(crate) fn read_filter(root: &Path) -> Reading {
+///
+/// The one probe surface outside the crate: the native lane's root harness
+/// proves the *loaded* table's effect with the daemon's own probe, over a
+/// scratch tree the installer laid out — the only artifact that can
+/// produce the reading. No other caller reads a reading directly.
+pub fn read_filter(root: &Path) -> Reading {
     // Held for the probe's whole duration: a listener nothing holds is the
     // dead-listener case the control leg exists to catch.
     let listeners = match bind_probe_listeners() {
@@ -2317,242 +2322,6 @@ mod tests {
             first,
             "nothing is kept between readings: the fact is the tree's own, \
              re-read per launch"
-        );
-    }
-
-    /// The loaded table's name, the installer's spelling of it: the daemon
-    /// reads only its marker, so this is the proof's own name for what it
-    /// loads and removes.
-    const TABLE_NAME: &str = "minimal_class";
-
-    /// The host's live cgroup2 mount for the proof below: the deepest mount
-    /// in the daemon's own mount table that is the hierarchy itself (its
-    /// namespace root is `/`, so it is not another cgroup namespace's view)
-    /// and carries `nsdelegate` — the two facts the installer's own
-    /// `verify_mount` demands of the tree it lays out.
-    fn live_cgroup2_mount() -> Option<std::path::PathBuf> {
-        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-        let mut mount: Option<(usize, std::path::PathBuf)> = None;
-        for line in mountinfo.lines() {
-            let fields: Vec<&str> = line.split(' ').collect();
-            let Some(sep) = fields.iter().position(|field| *field == "-") else {
-                continue;
-            };
-            if fields.len() < sep + 4 || fields[sep + 1] != "cgroup2" {
-                continue;
-            }
-            let options = fields[sep + 3];
-            if fields[3] != "/" || !options.split(',').any(|option| option == "nsdelegate") {
-                continue;
-            }
-            if mount
-                .as_ref()
-                .is_none_or(|(depth, _)| fields[4].len() > *depth)
-            {
-                mount = Some((fields[4].len(), fields[4].into()));
-            }
-        }
-        mount.map(|(_, mountpoint)| mountpoint)
-    }
-
-    /// A non-root account to delegate the scratch tree to: the install
-    /// refuses to delegate to root (that would hand every box the account
-    /// that owns the tree), so the proof takes the first human-range account
-    /// in the password database — the account a development host's daemon
-    /// runs as.
-    fn delegate_account() -> Option<String> {
-        let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
-        passwd.lines().find_map(|line| {
-            let fields: Vec<&str> = line.split(':').collect();
-            let uid: u32 = fields.get(2)?.parse().ok()?;
-            let name = fields.first()?;
-            (1000..=60000).contains(&uid).then(|| name.to_string())
-        })
-    }
-
-    /// The proof's own artifacts, removed on the way out however the proof
-    /// ended: the table first (it outlives the cgroups it is keyed on), then
-    /// the scratch tree with `rmdir`, never a remove-all — on a real
-    /// cgroup2 these are cgroups, and the kernel's own refusal to remove
-    /// one that still holds a process is the guard wanted here (the probe's
-    /// child is reaped and its leaf gone before this runs, so the tree is
-    /// empty).
-    struct ScratchInstall {
-        root: PathBuf,
-    }
-
-    impl Drop for ScratchInstall {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("nft")
-                .args(["delete", "table", "inet", TABLE_NAME])
-                .status();
-            for dir in [
-                self.root.join(sandbox2::classifier::TABLE_MARKER),
-                self.root
-                    .join(sandbox2::classifier::BOXES_DIR)
-                    .join(sandbox2::config::DENY_DIR),
-                self.root
-                    .join(sandbox2::classifier::BOXES_DIR)
-                    .join(sandbox2::config::ALLOW_DIR),
-                self.root.join(sandbox2::classifier::BOXES_DIR),
-                sandbox2::classifier::daemon_leaf(&self.root),
-                self.root.clone(),
-            ] {
-                let _ = std::fs::remove_dir(&dir);
-            }
-        }
-    }
-
-    /// The loaded table's live refusal, read the way a deny-all box's
-    /// connections meet it: the installer's own `nft -f` transaction laid out
-    /// over a scratch delegated tree on this host's real cgroup2, and
-    /// [`read_filter`] reading it — the observed errno per family, `reject
-    /// with icmpx admin-prohibited` as EHOSTUNREACH over IPv4 loopback and
-    /// EACCES over IPv6. The stand-in trees above pin the decision's
-    /// reading of a reading; this one proves a reading itself, over the
-    /// only artifact that can produce it — and closes with the decision
-    /// that rests on it, read live over the tree it was proved on.
-    ///
-    /// `#[ignore]`d, and declined with a printed reason on a host that
-    /// cannot run it: it needs root (the install chowns the tree and loads
-    /// the table), `nft`, both loopback families, and a cgroup2 mounted
-    /// with `nsdelegate` — and it never runs over a host's own install: a
-    /// tree at [`sandbox2::classifier::TREE_ROOT`] or an already-loaded
-    /// `minimal_class` table is that host's, not this proof's to replace.
-    /// Run it with `sudo just test-ignored` on a Linux host with nftables;
-    /// no CI lane runs it.
-    #[test]
-    #[ignore = "needs root + nft + a live cgroup2; run by `just test-ignored`; declines over a host's own install"]
-    fn the_installers_table_refuses_the_probe_over_a_scratch_tree() {
-        // SAFETY: geteuid has no failure modes or preconditions.
-        if unsafe { libc::geteuid() } != 0 {
-            eprintln!(
-                "skipping the_installers_table_refuses_the_probe_over_a_scratch_tree: \
-                 the install this proof runs needs root to delegate the \
-                 scratch tree and load the table (try: sudo just test-ignored)"
-            );
-            return;
-        }
-        if std::process::Command::new("nft")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!(
-                "skipping the_installers_table_refuses_the_probe_over_a_scratch_tree: \
-                 no nft on this host — the install's nftables transaction is \
-                 the artifact under proof (apt install nftables)"
-            );
-            return;
-        }
-        if std::process::Command::new("nft")
-            .args(["list", "table", "inet", TABLE_NAME])
-            .output()
-            .is_ok_and(|out| out.status.success())
-        {
-            eprintln!(
-                "skipping the_installers_table_refuses_the_probe_over_a_scratch_tree: \
-                 a table named {TABLE_NAME} is already loaded — this proof \
-                 never replaces a host's own table"
-            );
-            return;
-        }
-        if std::path::Path::new(sandbox2::classifier::TREE_ROOT).exists() {
-            eprintln!(
-                "skipping the_installers_table_refuses_the_probe_over_a_scratch_tree: \
-                 a classifier tree is already installed at {} — this proof \
-                 never runs over a host's own install",
-                sandbox2::classifier::TREE_ROOT
-            );
-            return;
-        }
-        let Some(mountpoint) = live_cgroup2_mount() else {
-            eprintln!(
-                "skipping the_installers_table_refuses_the_probe_over_a_scratch_tree: \
-                 no cgroup2 mounted with nsdelegate on this host — the \
-                 install's verify_mount would refuse the scratch tree, and a \
-                 tree on a mount without it confines nothing"
-            );
-            return;
-        };
-        let Some(account) = delegate_account() else {
-            eprintln!(
-                "skipping the_installers_table_refuses_the_probe_over_a_scratch_tree: \
-                 no non-root account to delegate the scratch tree to (the \
-                 install refuses to delegate to root)"
-            );
-            return;
-        };
-        // Both loopback families, because the proof reads one errno from
-        // each: a host with no IPv6 loopback would read its V4 leg alone,
-        // and that is the host's own state, not a failed refusal.
-        if let Err(cause) = std::net::TcpListener::bind("[::1]:0") {
-            eprintln!(
-                "skipping the_installers_table_refuses_the_probe_over_a_scratch_tree: \
-                 no IPv6 loopback on this host ({cause}), so the V6 leg it \
-                 reads EACCES from cannot be read"
-            );
-            return;
-        }
-
-        // The scratch tree, under the host's own cgroup2 so the loaded
-        // rules are keyed on a path this host's probe can enter — named by
-        // this proof, never the daemon's slice.
-        let scratch = mountpoint.join(format!("minimald-proof-{}", std::process::id()));
-        let _install = ScratchInstall {
-            root: scratch.clone(),
-        };
-        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../scripts/install-host-classifier.sh");
-        let installed = std::process::Command::new("bash")
-            .arg(script)
-            .arg("--root")
-            .arg(&scratch)
-            .arg("--user")
-            .arg(account)
-            .arg("--cohort-address")
-            .arg(TEST_COHORT_ADDRESS)
-            .arg("--node-plane-address")
-            .arg(TEST_NODE_PLANE_ADDRESS)
-            .output()
-            .expect("running the privileged step over the scratch tree");
-        assert!(
-            installed.status.success(),
-            "the install lays out the scratch tree and loads its table: {}{}",
-            String::from_utf8_lossy(&installed.stdout),
-            String::from_utf8_lossy(&installed.stderr),
-        );
-
-        // The reading: the table's refusal as the probe's legs met it, one
-        // errno per family — the two loopbacks the decision's proofs name.
-        let reading = read_filter(&scratch);
-        let legs = reading.legs();
-        assert!(
-            matches!(reading, Reading::Refused(_)),
-            "the loaded table refuses the probe out of the deny subtree, got: {}",
-            reading.record()
-        );
-        assert_eq!(
-            legs.iter().find(|(family, _)| *family == Family::V4),
-            Some(&(Family::V4, Observed::Refused(libc::EHOSTUNREACH))),
-            "IPv4 loopback reads the rejection as EHOSTUNREACH: {}",
-            reading.record()
-        );
-        assert_eq!(
-            legs.iter().find(|(family, _)| *family == Family::V6),
-            Some(&(Family::V6, Observed::Refused(libc::EACCES))),
-            "IPv6 loopback reads the same rejection as EACCES: {}",
-            reading.record()
-        );
-
-        // And the decision that rests on it: over the scratch tree the
-        // daemon's own facts — its mount table, the step's subtrees and
-        // marker, the refusal just read — say this host decides per box.
-        let mountinfo = sandbox2::classifier::own_mountinfo();
-        let decision = decide_now(&scratch, mountinfo.as_deref(), false);
-        assert!(
-            decision.can_decide_per_box(),
-            "the fresh decision over the installed scratch tree reads per box: {decision:?}"
         );
     }
 }
