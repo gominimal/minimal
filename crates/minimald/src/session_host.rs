@@ -4662,15 +4662,23 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                                 )
                                 .await
                             {
-                                // The binding answers on its own time: the
-                                // human may sit at the dialog for as long as
-                                // they like, so only the hand-off is bounded.
+                                // The human may sit at the dialog for as long
+                                // as they like, so only the hand-off is
+                                // bounded. The answer is awaited on a spawned
+                                // task, never inside this loop: a host parked
+                                // on a human stops pumping the pty and stops
+                                // answering probes, and the probes that
+                                // decide `is_alive` would report a live host
+                                // dead.
                                 Ok(()) => {
-                                    // The binding dropping mid-prompt is the
-                                    // nobody-attached case again.
-                                    let answer = binding_recv.await.ok();
-                                    tracing::info!(port, answer = ?answer, "the attached client answered the runtime port publish ask");
-                                    let _ = reply.send(answer);
+                                    tokio::spawn(async move {
+                                        // The binding dropping mid-prompt — a
+                                        // detach, a shed, a daemon shutdown —
+                                        // is the nobody-attached case again.
+                                        let answer = binding_recv.await.ok();
+                                        tracing::info!(port, answer = ?answer, "the attached client answered the runtime port publish ask");
+                                        let _ = reply.send(answer);
+                                    });
                                 }
                                 Err(send_error) => {
                                     // The ask never reached a human. On a

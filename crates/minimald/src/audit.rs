@@ -18,6 +18,7 @@
 //! a publish the switch refused, or an allow the human denied, is worse
 //! than no line at all.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -47,6 +48,19 @@ pub(crate) enum DecidedBy {
     /// The daemon itself, failing an `ask` closed with nobody attached to
     /// answer.
     Daemon,
+}
+
+/// Who made the decision, in the kebab-case spelling the record serializes
+/// with — the same way the log line names the decider, so a reader of one
+/// finds the other without translating.
+impl fmt::Display for DecidedBy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BoxPolicy => write!(f, "box-policy"),
+            Self::AttachedHuman => write!(f, "attached-human"),
+            Self::Daemon => write!(f, "daemon"),
+        }
+    }
 }
 
 /// What became of the request the decision was about.
