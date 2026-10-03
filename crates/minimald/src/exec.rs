@@ -23,7 +23,7 @@ use russh::{
 use sessions::SessionId;
 use tempfile::TempDir;
 use tokio::net::unix::pipe;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -843,15 +843,55 @@ impl<S: Exec> ExecTask<S> {
         // stream on the same channel as a separate extended-data type.
         let mut w = ws.make_writer();
         let mut e = ws.make_writer_ext(Some(1));
-        let mut r = rs.make_reader();
+
+        // Drive `rs.wait()` directly rather than `rs.make_reader()` so we
+        // see `ChannelMsg::Close` and `None` (sender dropped) — the signals
+        // that the SSH client is gone. `make_reader()` reduces the read half
+        // to a bare `AsyncRead`, which only surfaces `ChannelMsg::Data` and
+        // `ChannelMsg::Eof`; a lost client then looks like a normal stdin
+        // EOF, and a silent child (sleep, quiet build) keeps running
+        // indefinitely (gominimal/inbox#813).
+        let (mut stdin_tx, mut stdin_rx) = pipe::pipe().expect("exec stdin pipe");
+        let (client_lost_tx, client_lost_rx) = watch::channel(false);
+
+        let pump = spawn(async move {
+            loop {
+                match rs.wait().await {
+                    Some(russh::ChannelMsg::Data { data }) => {
+                        if stdin_tx.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Normal stdin EOF: close the pipe so the bridge sees
+                    // EOF, but do NOT signal client loss.
+                    Some(russh::ChannelMsg::Eof) => break,
+                    // Channel closed or sender dropped: the SSH client is
+                    // gone — signal the bridge to kill the child.
+                    Some(russh::ChannelMsg::Close) | None => {
+                        let _ = client_lost_tx.send(true);
+                        break;
+                    }
+                    Some(_) => {}
+                }
+            }
+        });
 
         let stream = self.exec.exec(self.session.clone());
-        let exit_status = bridge(self.channel_id, stream, &mut r, &mut w, &mut e).await;
+        let exit_status = bridge(
+            self.channel_id,
+            stream,
+            &mut stdin_rx,
+            &mut w,
+            &mut e,
+            client_lost_rx,
+        )
+        .await;
 
+        pump.abort();
         let _ = w.flush().await;
         let _ = e.flush().await;
 
-        drop(r);
+        drop(stdin_rx);
         let _ = ws.eof().await;
         let _ = ws.exit_status(exit_status).await; // otherwise considered -1
         let _ = ws.close().await; // needed to release the remote
@@ -867,6 +907,10 @@ impl<S: Exec> ExecTask<S> {
 /// SSH client sends stdin EOF mid-sequence, subsequent children get
 /// immediate EOF on their stdin without us having to keep reading.
 ///
+/// `client_lost` is a watch receiver set to `true` when the SSH client
+/// disconnects (channel close or sender drop). The bridge kills the
+/// current child and stops the sequence when it fires.
+///
 /// On any non-zero exit the sequence stops and that code is returned —
 /// matching `set -e` shell semantics for chained task invocations. If
 /// the stream yields an `Err` item (e.g. setup failed in the producer),
@@ -881,6 +925,7 @@ async fn bridge<S, P, R, W, E>(
     r: &mut R,
     w: &mut W,
     e: &mut E,
+    mut client_lost: watch::Receiver<bool>,
 ) -> u32
 where
     P: Process,
@@ -907,7 +952,16 @@ where
                 break;
             }
         };
-        last_exit = bridge_one(channel_id.clone(), process, r, w, e, &mut stdin_open).await;
+        last_exit = bridge_one(
+            channel_id.clone(),
+            process,
+            r,
+            w,
+            e,
+            &mut stdin_open,
+            &mut client_lost,
+        )
+        .await;
         if last_exit != 0 {
             break;
         }
@@ -932,8 +986,8 @@ where
 /// unaffected.
 ///
 /// So the loop ends on the *first* of: both output streams at EOF, the
-/// child exiting, or an SSH-channel write failing. On child exit we
-/// then, in order:
+/// child exiting, the SSH client disconnecting, or an SSH-channel write
+/// failing. On child exit we then, in order:
 ///
 /// 1. **Drain what is already buffered** ([`drain_ready`]): everything
 ///    the child wrote before exiting is sitting in the pipe and still
@@ -958,9 +1012,10 @@ where
 /// the SSH writes live in branch *handlers*, which run after the
 /// `select!` has already resolved.
 ///
-/// On an SSH-channel write failure we stop and `start_kill` the child:
-/// with no one reading its output the pipe buffer would fill, the child
-/// would block on write, and `wait` would never resolve.
+/// On an SSH-channel write failure or client disconnect we stop and
+/// `start_kill` the child: with no one reading its output the pipe
+/// buffer would fill, the child would block on write, and `wait` would
+/// never resolve.
 ///
 /// `stdin_open` is threaded by `&mut` so once the SSH client closes
 /// stdin (EOF or read error), every subsequent child in the sequence
@@ -972,6 +1027,7 @@ async fn bridge_one<P, R, W, E>(
     w: &mut W,
     e: &mut E,
     stdin_open: &mut bool,
+    client_lost: &mut watch::Receiver<bool>,
 ) -> u32
 where
     P: Process,
@@ -1085,6 +1141,19 @@ where
             // `drain_ready` covers. Nothing here touches `process`, so
             // the `&mut process` this future holds is uncontended.
             status = process.wait() => child_exit = Some(status),
+
+            // The SSH client disconnected (channel close or sender
+            // drop). Kill the child and stop — same path as a failed
+            // SSH write (gominimal/inbox#813).
+            res = client_lost.changed() => {
+                if res.is_ok() && *client_lost.borrow() {
+                    tracing::warn!(
+                        %channel_id,
+                        "exec: ssh client disconnected; killing child",
+                    );
+                    ssh_write_failed = true;
+                }
+            }
         }
     }
 
@@ -2174,6 +2243,12 @@ mod tests {
     use super::bridge;
     use super::testing::{MockEndpoints, build_mock, build_mock_seq};
 
+    /// A never-firing client-loss signal for tests that exercise the
+    /// bridge without modelling a disconnect.
+    fn client_lost() -> tokio::sync::watch::Receiver<bool> {
+        tokio::sync::watch::channel(false).1
+    }
+
     /// A session record carrying `mode`, with everything else at its default.
     #[cfg(target_os = "linux")]
     fn record_with(mode: sessions::NetworkMode) -> sessions::Record {
@@ -2525,6 +2600,7 @@ mod tests {
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -2595,6 +2671,7 @@ mod tests {
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -2649,6 +2726,7 @@ mod tests {
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -2671,6 +2749,126 @@ mod tests {
         assert!(
             !second.ctrl.was_killed(),
             "nothing beyond the exec's own command was spawned, let alone killed"
+        );
+    }
+
+    /// gominimal/inbox#813: a lost client on the *read* side — the SSH
+    /// channel closes or its sender drops while the child is silent —
+    /// must still kill the child. `make_reader()` used to reduce the
+    /// read half to a bare `AsyncRead`, which only surfaces `Data` and
+    /// `Eof`; a lost client then looked like stdin EOF and a silent
+    /// child (sleep, quiet build) kept running indefinitely. The
+    /// client-loss watch signal must end the bridge and kill the child
+    /// even though the child never writes a byte.
+    #[tokio::test]
+    async fn bridge_kills_silent_child_when_client_disconnects() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                stdin_reader: _stdin_reader,
+                stdout_writer,
+                stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+        // A silent child: nothing on stdout or stderr, and it never
+        // exits on its own.
+        drop(stdout_writer);
+        drop(stderr_writer);
+
+        // SSH stdin closed: bridge sees EOF immediately.
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        // The client-loss signal fires: the SSH channel closed.
+        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost_rx,
+            )
+            .await
+        });
+
+        client_lost_tx.send(true).unwrap();
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a lost client must kill a silent child promptly, not hang the bridge")
+            .unwrap();
+        // A killed mock waits back Ok(None), which the bridge maps to 1.
+        assert_eq!(exit, 1);
+        assert!(
+            ctrl.was_killed(),
+            "a silent child must be killed when its client disconnects"
+        );
+    }
+
+    /// gominimal/inbox#813: stdin EOF alone — the client closing its
+    /// input but keeping the channel open — must NOT kill a silent
+    /// child. EOF is a normal close, not a disconnect; the child keeps
+    /// running and the bridge returns the child's own exit code.
+    #[tokio::test]
+    async fn bridge_does_not_kill_silent_child_on_stdin_eof() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                stdin_reader: _stdin_reader,
+                stdout_writer,
+                stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+        // A silent child: nothing on stdout or stderr.
+        drop(stdout_writer);
+        drop(stderr_writer);
+
+        // SSH stdin closed: bridge sees EOF immediately.
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+
+        // The client-loss signal never fires: the channel stays open.
+        let (_client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost_rx,
+            )
+            .await
+        });
+
+        // The child exits cleanly on its own; the bridge must return its
+        // code without killing it.
+        ctrl.signal_exit(7).await;
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("stdin EOF alone must not hang the bridge")
+            .unwrap();
+        assert_eq!(exit, 7);
+        assert!(
+            !ctrl.was_killed(),
+            "stdin EOF is a normal close, not a disconnect; the child must not be killed"
         );
     }
 
@@ -2713,6 +2911,7 @@ mod tests {
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -2779,6 +2978,7 @@ mod tests {
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -2831,6 +3031,7 @@ mod tests {
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
@@ -2877,6 +3078,7 @@ mod tests {
                 &mut bridge_stdin,
                 &mut bridge_stdout,
                 &mut bridge_stderr,
+                client_lost(),
             )
             .await
         });
