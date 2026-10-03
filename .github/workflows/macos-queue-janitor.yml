@@ -1,0 +1,59 @@
+name: macOS queue janitor
+
+# Cancels ci-macos.yml merge-queue runs whose queue group no longer exists.
+# ci-macos.yml keys its concurrency on github.ref, and a group's ref
+# (gh-readonly-queue/main/pr-N-<base sha>) is new on every rebuild, so a
+# rebuild never cancels the previous group's run; GitHub expressions have no
+# split or regex to key the group on the PR number instead. Orphaned runs then
+# hold the single self-hosted macOS runner ahead of every live group, pushing
+# the queue past its check timeout and into more rebuilds.
+#
+# Advisory housekeeping: never add this job to the required checks.
+#
+# All the logic lives in scripts/cancel-stale-queue-runs.sh so it can be run
+# and tested outside CI; this workflow is the triggers and the token.
+
+on:
+    # Every group build or rebuild, which is exactly when orphans appear.
+    merge_group:
+        branches: ["main"]
+    schedule:
+        # Backstop for rebuilds that start no new janitor run.
+        - cron: "*/10 * * * *"
+    workflow_dispatch:
+        inputs:
+            execute:
+                description: "Actually cancel (unchecked = dry-run preview in the logs)"
+                type: boolean
+                default: false
+
+# Cancelling runs needs actions:write; the merge-queue query reads the repo.
+permissions:
+    actions: write
+    contents: read
+
+# Never let two janitor runs race over the same run list.
+concurrency:
+    group: macos-queue-janitor
+    cancel-in-progress: false
+
+jobs:
+    reap:
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        if: github.event_name == 'workflow_dispatch' || github.repository == 'gominimal/minimal'
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+              with:
+                  persist-credentials: false
+            - name: Cancel stale macOS merge-queue runs
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  REPO: ${{ github.repository }}
+                  # merge_group and schedule runs always execute; a manual
+                  # dispatch honours the checkbox (default: dry run).
+                  EXECUTE: ${{ github.event_name != 'workflow_dispatch' || inputs.execute }}
+              run: |
+                  args=(--workflow ci-macos.yml --branch main)
+                  [ "$EXECUTE" = "true" ] && args+=(--execute)
+                  scripts/cancel-stale-queue-runs.sh "${args[@]}"
