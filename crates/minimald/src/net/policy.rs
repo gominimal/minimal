@@ -413,11 +413,15 @@ pub enum ExposeRefusal {
     NoDynamicRange,
     /// The requested port lies outside the declared `dynamic_allowed_range`.
     OutOfRange { requested: u16, range: (u16, u16) },
-    /// The box holds no address pair on file — the hand a VM host's
-    /// registration gave it (T66), which names both the loopback address its
-    /// declaration publishes on and the switch address its forwards deliver
-    /// to — so there is nowhere to bind and nothing to forward to.
+    /// The box holds no published address — neither the hand a VM host's
+    /// registration gave it (T66) nor an address the hostname registry
+    /// published for it — so there is nowhere to bind. A capability gap:
+    /// waiting does not fix it.
     NoPublishedAddress,
+    /// The box has a published address but no running PTask attached to the
+    /// switch — no lease reported yet, or the spawn that held one has ended —
+    /// so there is nothing to forward to until the box is started.
+    NotAttached,
     /// The port is published already, live, by this box.
     AlreadyPublished(u16),
 }
@@ -444,6 +448,10 @@ impl fmt::Display for ExposeRefusal {
             Self::NoPublishedAddress => write!(
                 f,
                 "this box has no published address on file to expose a port at"
+            ),
+            Self::NotAttached => write!(
+                f,
+                "this box has no address on the switch yet; start the box and try again"
             ),
             Self::AlreadyPublished(port) => {
                 write!(f, "port {port} is published already by this box")
@@ -1331,6 +1339,18 @@ mod tests {
                 .to_string()
                 .contains("denied for this box")
         );
+        // The two missing-address halves say which half is missing: no
+        // published address is a capability gap, no switch address is a box
+        // that is not attached yet — and neither reads as a policy deny.
+        let unpublished = ExposeRefusal::NoPublishedAddress.to_string();
+        let unattached = ExposeRefusal::NotAttached.to_string();
+        assert!(
+            unpublished.contains("no published address"),
+            "{unpublished}"
+        );
+        assert!(unattached.contains("start the box"), "{unattached}");
+        assert_ne!(unpublished, unattached);
+        assert!(!unattached.contains("denied") && !unpublished.contains("denied"));
         assert!(
             ExposeFailure::Refused(refusal)
                 .to_string()

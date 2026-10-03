@@ -50,6 +50,12 @@ pub(crate) struct OwnIpGuard {
     /// stops, each able to unbind its port and end its connections. Removed
     /// on teardown. Empty when no ingress was configured.
     exposed: Vec<PortForwarder>,
+    /// The box's runtime publishes (NET-044), shared with its session actor.
+    /// They deliver to this spawn's lease, so they come down with it, beside
+    /// `exposed`: the next spawn takes a new lease and starts with none,
+    /// never with a forward aimed at the stale one. `None` for a task, which
+    /// publishes nothing at runtime.
+    runtime_ingress: Option<crate::net::provider::RuntimeIngress>,
     /// The lease ip this guard's attach holds, passed to `detach` so the
     /// lease is released with the count (T66) — handed or drawn alike, a
     /// lease's life is its attachment's.
@@ -133,6 +139,15 @@ impl NetGuard for OwnIpGuard {
             // reach a still-running switch first.
             if !self.exposed.is_empty() {
                 crate::net::policy::remove_ingress(&self.control, &self.exposed).await;
+            }
+            // The runtime publishes deliver to the same lease, so they take
+            // the same path down — and the box refuses new ones until its
+            // next spawn attaches.
+            if let Some(runtime_ingress) = &self.runtime_ingress {
+                let runtime = runtime_ingress.detach();
+                if !runtime.is_empty() {
+                    crate::net::policy::remove_ingress(&self.control, &runtime).await;
+                }
             }
             if let Err(e) = self.switch.lock().await.detach(self.lease_ip).await {
                 tracing::warn!(error = %e, "detaching OwnIp PTask from switch on session end");
@@ -417,6 +432,7 @@ async fn finish_own_ip_attach(
         switch: Arc::clone(switch),
         control,
         exposed,
+        runtime_ingress: own_address.map(crate::net::provider::OwnAddressReporter::runtime_ingress),
         lease_ip,
     })
 }
@@ -1853,6 +1869,148 @@ mod tests {
             vec![format!("{HANDED}:8080"), format!("{HANDED}:9090")],
             "teardown unbinds what the hand addressed: {unbound:?}"
         );
+        fake.abort();
+    }
+
+    /// NET-044 across a respawn: a runtime publish delivers to the lease of
+    /// the spawn that was running when it was made, and leases are per-spawn,
+    /// so it follows the declared forwards — the spawn's teardown unbinds it
+    /// beside them, and the box refuses new publishes until a spawn attaches
+    /// again. The next spawn, on a new lease, starts with no runtime forward
+    /// at all: nothing is left delivering to the stale address.
+    #[tokio::test]
+    async fn runtime_forwards_come_down_with_the_spawn_they_deliver_to() {
+        const FIRST_LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 9);
+        const SECOND_LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 10);
+        const PUBLISHED: Ipv4Addr = Ipv4Addr::new(127, 0, 64, 9);
+        let dir = tempfile::TempDir::new().unwrap();
+        let scenario = attach_scenario(&dir, "gvproxy.sock");
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (handed_tx, _handed_rx) = mpsc::channel(4);
+        let fake = spawn_control_channel_deciding(
+            scenario.control_path.clone(),
+            |_, _| ok(),
+            events_tx,
+            handed_tx,
+        );
+        let switch = vm_host_switch();
+        let policy = declared_two_ports();
+        let control = ControlChannel::Unix(scenario.control_path.clone());
+        scenario
+            .registry
+            .write()
+            .expect("registry lock")
+            .publish_own_address(
+                sessions::SessionId::nil(),
+                "web",
+                PUBLISHED,
+                BTreeSet::from([8080, 9090]),
+            );
+        // The session actor's cell, shared with every spawn's guard through
+        // the reporter, as the launcher wires it.
+        let runtime = crate::net::provider::RuntimeIngress::default();
+        let reporter = scenario
+            .reporter
+            .clone()
+            .with_runtime_ingress(runtime.clone());
+
+        // First spawn: attach, then a runtime publish delivering to its lease.
+        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            scenario.tap_fd,
+            control.clone(),
+            FIRST_LEASE,
+            "web",
+            Some(&policy),
+            Some(&reporter),
+            false,
+        )
+        .await
+        .expect("the first spawn attaches");
+        collect_until(&mut events_rx, "/services/dns/add", 1).await;
+        let forwarder = crate::net::policy::expose_dynamic(
+            &control,
+            PUBLISHED,
+            FIRST_LEASE,
+            3000,
+            sessions::IpProto::Tcp,
+            None,
+        )
+        .await
+        .expect("the runtime publish binds");
+        let exposed = collect_until(&mut events_rx, "/services/forwarder/expose", 1).await;
+        assert!(
+            exposed
+                .iter()
+                .any(|(_, body)| body.contains(&format!("\"remote\":\"{FIRST_LEASE}:3000\""))),
+            "the runtime publish delivers to the first spawn's lease: {exposed:?}"
+        );
+        runtime
+            .record(crate::net::provider::LiveIngressForward {
+                mapping: minimald_rpc::LiveMapping {
+                    local: forwarder.local().to_string(),
+                    internal_port: forwarder.internal_port(),
+                    proto: sessions::IpProto::Tcp,
+                },
+                forwarder,
+            })
+            .expect("a running spawn records the publish");
+
+        // The spawn ends: its teardown unbinds the runtime forward with the
+        // declared ones, and the box is detached until the next spawn.
+        Box::new(guard).teardown().await;
+        let unbound = collect_until(&mut events_rx, "/services/forwarder/unexpose", 3).await;
+        assert!(
+            locals_of(&unbound, "/services/forwarder/unexpose")
+                .contains(&format!("{PUBLISHED}:3000")),
+            "the spawn's teardown unbinds the runtime forward: {unbound:?}"
+        );
+        assert!(runtime.snapshot().is_empty(), "nothing is listed as live");
+        assert!(
+            runtime.is_detached(),
+            "the box refuses publishes while no spawn is attached"
+        );
+
+        // Second spawn, on a new lease: it starts with no runtime forward,
+        // and publishes are accepted again.
+        let second_tap = attach_scenario(&dir, "unused.sock").tap_fd;
+        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            second_tap,
+            control.clone(),
+            SECOND_LEASE,
+            "web",
+            Some(&policy),
+            Some(&reporter),
+            false,
+        )
+        .await
+        .expect("the second spawn attaches");
+        let reattached = collect_until(&mut events_rx, "/services/dns/add", 1).await;
+        assert!(
+            !reattached
+                .iter()
+                .any(|(_, body)| body.contains(&format!("\"remote\":\"{FIRST_LEASE}:"))),
+            "nothing delivers to the stale lease after the respawn: {reattached:?}"
+        );
+        assert!(
+            runtime.snapshot().is_empty(),
+            "the new spawn inherits no runtime forward"
+        );
+        assert!(
+            !runtime.is_detached(),
+            "the new spawn's attach accepts publishes again"
+        );
+        assert_eq!(
+            scenario
+                .registry
+                .read()
+                .expect("registry lock")
+                .own_lease(sessions::SessionId::nil()),
+            Some(SECOND_LEASE),
+            "the registry's lease, which the next publish delivers to, is the new spawn's"
+        );
+        Box::new(guard).teardown().await;
         fake.abort();
     }
 
