@@ -488,7 +488,16 @@ impl Container {
 ///   boxes/                every box leaf lives under here, and the daemon
 ///                         never places itself under it (NET-078's two
 ///                         identities)
-///     <box-id>/           one leaf per box, named by its session id, created
+///     deny/               the subtree a box whose declaration admits no
+///                         destination lives in: the packet-filter rule that
+///                         refuses a deny-all box's connections matches this
+///                         subtree by cgroup path, so no leaf may sit
+///                         directly under `boxes/` — one there would be
+///                         decided by no rule at all (NET-079)
+///     allow/              every other box, whatever it declared: the shipped
+///                         allow-all included, and its traffic is one of the
+///                         cohort's (NET-078)
+///       <box-id>/         one leaf per box, named by its session id, created
 ///                         before the spawn and removed after the box is
 ///                         reaped; an empty one a daemon death left behind is
 ///                         swept at the next daemon start
@@ -541,6 +550,7 @@ impl Container {
 /// asserts: the host-side `cgroup.procs` holds the box's pid while the box
 /// reads `0::/`.
 pub mod classifier {
+    use crate::config;
     use std::path::{Path, PathBuf};
 
     /// The daemon's tree root: where the host's cgroup2 mount carries the
@@ -557,6 +567,20 @@ pub mod classifier {
     /// The host-address cohort: every box leaf lives under here, and the
     /// daemon never places itself under it (NET-078's two identities).
     pub const BOXES_DIR: &str = "boxes";
+
+    /// The presence marker of the packet-filter table the privileged step
+    /// installs (NET-079): a cgroup directory under the tree root — on real
+    /// cgroupfs a plain file cannot exist, so the marker is a cgroup that
+    /// holds no process, and on the stand-in trees a test rehearses against
+    /// it is a directory. The step writes it *after* the one `nft -f`
+    /// transaction that loads the table succeeds, so it records "the table
+    /// that decides a deny-all box's connections is loaded" — and the daemon
+    /// probes it read-only, because listing a table needs the very
+    /// capability the step runs with (`nft list table` is CAP_NET_ADMIN).
+    /// Nothing else creates it: the guest builds its own tree but no table,
+    /// so a guest's marker is honestly absent and its recorded state says
+    /// the table is not there.
+    pub const TABLE_MARKER: &str = "classifier-table";
 
     /// The conventional cgroup2 mountpoint: where the box's classifier tree
     /// is bound for the join, and where the cover — the design's read-only
@@ -612,11 +636,20 @@ pub mod classifier {
         }
     }
 
-    /// The leaf for `box_id` under `root` — a directory in the daemon's own
-    /// namespaces, resolved before any of the box's namespaces exist.
+    /// The leaf for `box_id` under `root`, in the cohort subtree `verdict`
+    /// picks — `<root>/boxes/<deny|allow>/<box-id>`, never
+    /// `<root>/boxes/<box-id>`: both subtrees share one depth, so the
+    /// cohort's source-identity match (NET-078) covers a leaf in either
+    /// subtree at the same level, and the deny-all refusal (NET-079) matches
+    /// the `deny` subtree alone — a leaf directly under the cohort would be
+    /// decided by no rule at all, which is why none may sit there. A
+    /// directory in the daemon's own namespaces, resolved before any of the
+    /// box's namespaces exist.
     #[must_use]
-    pub fn box_leaf(root: &Path, box_id: &str) -> PathBuf {
-        root.join(BOXES_DIR).join(sanitize_box_id(box_id))
+    pub fn box_leaf(root: &Path, box_id: &str, verdict: config::Verdict) -> PathBuf {
+        root.join(BOXES_DIR)
+            .join(verdict.dir_name())
+            .join(sanitize_box_id(box_id))
     }
 
     /// The name of the report file the box's pre-exec closure writes into
@@ -633,19 +666,24 @@ pub mod classifier {
         format!("minimal-closure-{box_id}")
     }
 
-    /// Creates the box's leaf under `root`, before the box's first process
-    /// exists. Requires the tree the privileged step installs (or the guest
-    /// daemon builds): `<root>/boxes` must already exist and be delegated to
-    /// the daemon's account, and its absence is the `NotFound` that tells the
-    /// daemon this host has no per-box classifier at all — the box then runs
+    /// Creates the box's leaf under `root`, in the subtree `verdict` picks,
+    /// before the box's first process exists. Requires the tree the
+    /// privileged step installs (or the guest daemon builds): the cohort's
+    /// two subtrees must already exist and be delegated to the daemon's
+    /// account, and their absence is the `NotFound` that tells the daemon
+    /// this host has no per-box classifier at all — the box then runs
     /// unenforced, never refused (NET-079's exception).
     ///
     /// A leaf that already exists is surfaced, not reused: the leaf is named
     /// by its session's id, so on a fresh launch an existing one is a
     /// collision — another session holds it — and [`sweep_box_leaves`] has
     /// already taken the empty directories a daemon death leaves behind.
-    pub fn create_box_leaf(root: &Path, box_id: &str) -> std::io::Result<PathBuf> {
-        let leaf = box_leaf(root, box_id);
+    pub fn create_box_leaf(
+        root: &Path,
+        box_id: &str,
+        verdict: config::Verdict,
+    ) -> std::io::Result<PathBuf> {
+        let leaf = box_leaf(root, box_id, verdict);
         std::fs::create_dir(&leaf).map(|()| leaf)
     }
 
@@ -691,29 +729,40 @@ pub mod classifier {
     /// a cgroup holds a process is the sweep's own test of emptiness: a leaf
     /// that goes was nobody's, and a leaf that stays belongs to a session the
     /// daemon no longer knows — which is the collision its next launch
-    /// reports rather than a directory it reuses. A missing `boxes/` is not
-    /// an error; it is the host with no tree at all.
+    /// reports rather than a directory it reuses. A missing cohort is not an
+    /// error; it is the host with no tree at all.
+    ///
+    /// Sweeps *both* subtrees and nothing else: a box's leaf is always under
+    /// one of them (NET-079), so the cohort's own direct children — the two
+    /// subtrees the step installs — are not the sweep's to test. A leaf left
+    /// directly under the cohort by a daemon predating the subtrees is not
+    /// swept either: `rmdir` on a direct child would remove the subtrees
+    /// themselves the moment both were empty, so the sweep keeps to the
+    /// leaves it could own.
     ///
     /// Returns the leaves it removed, so the caller can say what it swept.
     pub fn sweep_box_leaves(root: &Path) -> std::io::Result<Vec<PathBuf>> {
         let mut swept = Vec::new();
-        let entries = match std::fs::read_dir(root.join(BOXES_DIR)) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(swept),
-            Err(e) => return Err(e),
-        };
-        for entry in entries {
-            let Ok(entry) = entry else { continue };
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            // `rmdir` refuses — `EBUSY` over a real tree, `ENOTEMPTY` over a
-            // stand-in holding a `cgroup.procs` — whatever still has a
-            // session in it, and that refusal is kept, not an error: the
-            // sweep owes a leaf its removal only when the leaf is empty.
-            if std::fs::remove_dir(&path).is_ok() {
-                swept.push(path);
+        for subtree in [config::DENY_DIR, config::ALLOW_DIR] {
+            let entries = match std::fs::read_dir(root.join(BOXES_DIR).join(subtree)) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            for entry in entries {
+                let Ok(entry) = entry else { continue };
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                // `rmdir` refuses — `EBUSY` over a real tree, `ENOTEMPTY`
+                // over a stand-in holding a `cgroup.procs` — whatever still
+                // has a session in it, and that refusal is kept, not an
+                // error: the sweep owes a leaf its removal only when the
+                // leaf is empty.
+                if std::fs::remove_dir(&path).is_ok() {
+                    swept.push(path);
+                }
             }
         }
         Ok(swept)
@@ -723,7 +772,10 @@ pub mod classifier {
     /// the daemon-side half of the placement, proved by doing it: a
     /// throwaway child of this process migrates into a throwaway leaf and
     /// back out, and the probe succeeding is the only evidence that the join
-    /// the box's own pre-exec closure makes can succeed.
+    /// the box's own pre-exec closure makes can succeed. The leaf is made in
+    /// the subtree `verdict` picks, the same one the launch's own leaf will
+    /// live in: the subtrees share one delegation, but the probe answers for
+    /// the cgroup the box is actually about to be placed in.
     ///
     /// The kernel gates that migration on write permission to the
     /// `cgroup.procs` of the *common ancestor* of source and destination, so
@@ -738,17 +790,19 @@ pub mod classifier {
     /// own pid-1 hand in the guest — needs no help, and every launch pays
     /// one throwaway migration for the proof.
     #[cfg(target_os = "linux")]
-    pub fn probe_child_placement(root: &Path) -> std::io::Result<()> {
-        // A throwaway leaf under the cohort, named by this daemon's pid and
-        // a per-process counter so two concurrent probes in one daemon never
-        // share one. The counter is a static atomic: the probe is called
-        // from a single daemon process, and the counter's only job is to
-        // make each probe's leaf unique within that process.
+    pub fn probe_child_placement(root: &Path, verdict: config::Verdict) -> std::io::Result<()> {
+        // A throwaway leaf under the cohort, in the verdict's subtree, named
+        // by this daemon's pid and a per-process counter so two concurrent
+        // probes in one daemon never share one. The counter is a static
+        // atomic: the probe is called from a single daemon process, and the
+        // counter's only job is to make each probe's leaf unique within that
+        // process.
         static PROBE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = PROBE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let leaf = box_leaf(
             root,
             &format!("placement-probe-{}-{}", std::process::id(), n),
+            verdict,
         );
         std::fs::create_dir(&leaf)?;
         let placed = place_child_in(&leaf.join("cgroup.procs"));
@@ -884,20 +938,45 @@ pub mod classifier {
     }
 
     /// The command a person runs on this host to give this daemon a
-    /// classifier tree: the installer takes the account the daemon runs as,
-    /// and the hint spells the whole command so the advisory that carries it
-    /// never has to name a placeholder for the one thing the daemon knows.
+    /// classifier tree: the installer takes the account the daemon runs as
+    /// and the two source identities the classification rests on (NET-078 —
+    /// what the boxes cohort leaves as, and what the rest of the slice
+    /// leaves as; the step refuses to render one without the other, so a
+    /// hint that named neither is a command the step itself refuses). The
+    /// hint spells the whole command, so the advisory that carries it never
+    /// has to name a placeholder for the one thing the daemon knows — only
+    /// for the two things this host does.
     #[cfg(target_os = "linux")]
     #[must_use]
     pub fn install_hint() -> String {
         match own_account() {
-            Some(account) => {
-                format!("sudo scripts/install-host-classifier.sh --user {account}")
-            }
+            Some(account) => format!(
+                "sudo scripts/install-host-classifier.sh --user {account} \
+                 --cohort-address <cohort address> --node-plane-address \
+                 <node-plane address>"
+            ),
             None => "sudo scripts/install-host-classifier.sh --user \
-                 <the account this daemon runs as>"
+                 <the account this daemon runs as> --cohort-address \
+                 <cohort address> --node-plane-address <node-plane address>"
                 .to_string(),
         }
+    }
+
+    /// Makes one level of the classifier layout, taking `AlreadyExists` as
+    /// success: more than one hand builds the layout — the installer's,
+    /// a previous daemon's, this entry's own on a restart — and a level is
+    /// owed exactly one maker, so an entry that finds one made is not an
+    /// error to report but the common case to build on. Every other errno is
+    /// the caller's, unchanged: a `NotFound` is a parent this entry could not
+    /// make, a `PermissionDenied` a tree this account has no privilege over.
+    fn make_cgroup(dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir(dir).or_else(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
     }
 
     /// Moves this process into `root`'s [`DAEMON_LEAF`], as the daemon does at
@@ -917,37 +996,60 @@ pub mod classifier {
     /// it can place a box in from one it cannot, and nothing boxes into a
     /// leaf before that.
     ///
-    /// Also asks the kernel for the `memory` controller on the cohort —
-    /// best-effort, and safe: `boxes/` holds no process, so enabling a
-    /// controller on it breaks no internal-process rule. A leaf without it
-    /// carries no `memory.max` at all, so no reader — a diagnostics bundle
-    /// on the host side, or the box itself under the design's own cover —
-    /// can name the limit a box's verdict is decided on.
+    /// Also asks the kernel for the `memory` controller on the cohort and on
+    /// both of its subtrees — best-effort, and safe: none of them holds a
+    /// process, so enabling a controller on any of them breaks no
+    /// internal-process rule. A leaf without it carries no `memory.max` at
+    /// all, so no reader — a diagnostics bundle on the host side, or the box
+    /// itself under the design's own cover — can name the limit a box's
+    /// verdict is decided on.
     pub fn enter_daemon_leaf(root: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(root.join(BOXES_DIR))?;
+        // The layout, top down: the tree root, the cohort, both of its
+        // subtrees, then this daemon's own leaf. `create_dir` makes no
+        // parent, so each level is made only once the one above it stands —
+        // and the guest's pid 1, the one entry that has the privilege to
+        // build any of it, boots into a cgroup2 with nothing in it,
+        // `minimald.slice` included: the installer is the only other maker
+        // of that root, and natively this account cannot make it, so a root
+        // that is not there is the guest's to build and a native host's to
+        // be left outside. Already-there is the common case everywhere else
+        // (the installer made the root, a previous daemon made the rest).
+        make_cgroup(root)?;
+        let mut tree = vec![root.join(BOXES_DIR)];
+        for dir in &tree {
+            make_cgroup(dir)?;
+        }
+        for subtree in [config::DENY_DIR, config::ALLOW_DIR] {
+            let dir = root.join(BOXES_DIR).join(subtree);
+            make_cgroup(&dir)?;
+            tree.push(dir);
+        }
         let daemon = daemon_leaf(root);
-        std::fs::create_dir(&daemon).or_else(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        })?;
+        make_cgroup(&daemon)?;
         // Over a stand-in tree (a test's) this writes a plain file; over a
         // real tree the kernel takes `+memory` as a subtree_control command
         // and may refuse it — a host without the memory controller, or one
-        // that has it threaded off, still gets its boxes placed.
-        if let Err(e) = std::fs::write(
-            root.join(BOXES_DIR).join("cgroup.subtree_control"),
-            "+memory\n",
-        ) && e.kind() != std::io::ErrorKind::NotFound
-            && e.kind() != std::io::ErrorKind::PermissionDenied
-        {
-            tracing::warn!(
-                error = %e,
-                "enabling the memory controller on the box cohort; a box leaf \
-                 may carry no memory.max for a reader to name its limit from"
-            );
+        // that has it threaded off, still gets its boxes placed. The cohort
+        // comes first and the subtrees after it: over a real tree a
+        // controller reaches a cgroup only once the cgroup above it has
+        // enabled it, so the cascade order is the only one that works. The
+        // tree root is not in the cascade and must not be: this process is
+        // still a member of it until the `place_pid` below moves it out, and
+        // a controller enabled on a cgroup that holds a process makes its
+        // children `domain invalid` — the daemon's own leaf among them, the
+        // very cgroup this entry exists to take.
+        for dir in &tree {
+            if let Err(e) = std::fs::write(dir.join("cgroup.subtree_control"), "+memory\n")
+                && e.kind() != std::io::ErrorKind::NotFound
+                && e.kind() != std::io::ErrorKind::PermissionDenied
+            {
+                tracing::warn!(
+                    error = %e,
+                    "enabling the memory controller on {} ; a box leaf \
+                     may carry no memory.max for a reader to name its limit from",
+                    dir.display()
+                );
+            }
         }
         place_pid(&daemon.join("cgroup.procs"), std::process::id())
     }
@@ -1696,10 +1798,11 @@ impl<C: Channel> Sandbox<C> {
         // network namespace confines, so a family that reaches past the
         // namespace is refused in every box.  The filter is installed in the
         // child after hakoniwa has set up namespaces and credentials but
-        // before exec, using `prctl` + `seccomp` via libc only.  A caller on a
-        // foreign ABI — a 32-bit binary on an x86_64 host, say — dies with
-        // SIGSYS on its first syscall in every box; the family list names
-        // native-ABI calls only.
+        // before exec, using `prctl` + `seccomp` via libc only.  A caller on
+        // the 32-bit compat ABI (i386 on x86_64, arm on aarch64) is judged
+        // against its own socket/socketpair numbers, and its socketcall(2)
+        // socket and socketpair sub-calls return ENOSYS; only a truly foreign
+        // ABI, or x32, dies with SIGSYS on its first syscall.
         #[cfg(target_os = "linux")]
         let socket_family_filter = {
             let filter = socket_family_filter_for_plan(plan);
@@ -2595,6 +2698,15 @@ const AUDIT_ARCH: u32 = 0xc000_003e; // AUDIT_ARCH_X86_64
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const AUDIT_ARCH: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
 
+/// The 32-bit compat ABI the kernel also answers to on this architecture.
+/// The filter admits it under the same family rules as the native ABI so
+/// 32-bit binaries (gcc -m32, wine, i386 toolchain helpers) run inside a
+/// box instead of dying with SIGSYS on their first syscall.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const COMPAT_AUDIT_ARCH: u32 = 0x4000_0003; // AUDIT_ARCH_I386
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const COMPAT_AUDIT_ARCH: u32 = 0x4000_0028; // AUDIT_ARCH_ARM
+
 /// The x32 ABI shares `AUDIT_ARCH_X86_64` and marks its syscalls by setting
 /// this bit in `nr`, so a plain compare against `SYS_socket` would let an x32
 /// caller through.  The filter kills any such call instead.
@@ -2620,6 +2732,34 @@ pub struct SocketFamilyFilter {
 const SYS_SOCKET: i64 = libc::SYS_socket;
 #[cfg(target_os = "linux")]
 const SYS_SOCKETPAIR: i64 = libc::SYS_socketpair;
+/// The compat ABI numbers its syscalls from its own table, so the filter
+/// compares a compat caller against these, never against the native
+/// `SYS_socket`/`SYS_socketpair` (41 on x86_64 is `dup` on i386).  Kernel ABI
+/// constants the `libc` crate does not expose for the compat table.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const COMPAT_SYS_SOCKET: u32 = 359; // __NR_socket, i386
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const COMPAT_SYS_SOCKETPAIR: u32 = 360; // __NR_socketpair, i386
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const COMPAT_SYS_SOCKET: u32 = 281; // __NR_socket, arm EABI
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const COMPAT_SYS_SOCKETPAIR: u32 = 288; // __NR_socketpair, arm EABI
+/// The 32-bit multiplexed socket entry point.  The filter returns `ENOSYS`
+/// for its socket-creating sub-calls on the compat ABI because seccomp cannot
+/// read their address-family argument (it sits behind a pointer), so a compat
+/// caller creates sockets only through the direct `socket(2)`/`socketpair(2)`
+/// the filter judges.  Every other sub-call acts on an fd the seal already
+/// judged, so it stays allowed.  Nr 102 is `__NR_socketcall` on i386; on
+/// arm EABI (and so the aarch64 compat table) it is `sys_ni_syscall`, so the
+/// rule only bites on x86_64.
+#[cfg(target_os = "linux")]
+const COMPAT_SYS_SOCKETCALL: u32 = 102;
+/// The `socketcall(2)` sub-call numbers (`SYS_SOCKET`, `SYS_SOCKETPAIR` in
+/// `<linux/net.h>`) that create a socket from a caller-chosen family.
+#[cfg(target_os = "linux")]
+const SOCKETCALL_SOCKET: u32 = 1;
+#[cfg(target_os = "linux")]
+const SOCKETCALL_SOCKETPAIR: u32 = 8;
 
 /// Build the socket-family filter for a seal: a classic BPF seccomp program
 /// that admits the `socket()`/`socketpair()` calls whose address family the
@@ -2642,12 +2782,18 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
     // Return the default allow action when the syscall is not one we restrict
     // or when the address family is allowed.
     let allow_action = libc::SECCOMP_RET_ALLOW;
-    // A caller on a foreign ABI (another audit arch, or x32 on x86_64) dies
-    // with SIGSYS on its first syscall in every box, networked ones included:
-    // this check sits before the syscall-number dispatch, and the numbers
-    // would not mean the same thing on another ABI, so the filter kills
-    // rather than guesses.  A 32-bit binary in a host-address or own-address
-    // box dies here, where it ran before the seal reached every box.
+    // Return ENOSYS for socketcall(2)'s socket and socketpair sub-calls on
+    // the compat ABI: seccomp cannot read their address-family argument (it
+    // sits behind a pointer), so a compat caller creates sockets only through
+    // the direct socket(2) and socketpair(2) the filter judges.  This fails
+    // closed: a 32-bit libc built to create sockets via socketcall(2) gets no
+    // new sockets rather than unsealed ones, while its connect/send/recv and
+    // the other sub-calls on already-judged fds keep working.
+    let enosys_action = libc::SECCOMP_RET_ERRNO | (libc::ENOSYS as u32);
+    // A caller on a truly foreign ABI (neither the native audit arch nor its
+    // 32-bit compat ABI), or on x32 on x86_64, dies with SIGSYS on its first
+    // syscall: the syscall numbers would not mean the same thing, so the
+    // filter kills rather than guessing.
     let kill_action = libc::SECCOMP_RET_KILL_PROCESS;
 
     // The families the seal admits, in the order the verdict tail compares
@@ -2692,61 +2838,101 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
         k: action,
     };
 
+    // The socket dispatch and verdict tail for one ABI, given that ABI's
+    // `socket` and `socketpair` numbers, with the syscall number already
+    // loaded.  Relative jumps keep it correct wherever it is placed.
+    let socket_verdict = |socket_nr: u32, socketpair_nr: u32| {
+        let mut tail = vec![
+            // socket() -> load arg0; else -> check socketpair.
+            jeq(socket_nr, 1, 0),
+            // socketpair() -> load arg0; anything else jumps past the whole
+            // verdict tail to the default allow — one skip per admitted-family
+            // verdict pair plus the refuse and allow returns that end it.
+            jeq(
+                socketpair_nr,
+                0,
+                u8::try_from(2 * admitted.len() + 2).expect("seccomp jump offset fits u8"),
+            ),
+            // Load arg0 (the address family).
+            load(OFFSET_ARG0),
+        ];
+        // The verdict tail: both seals are allowlists, so each admitted family
+        // gets an allow return and whatever is left over is refused.
+        for family in admitted {
+            // family matches -> the allow return; anything else falls through
+            // to the next comparison, or to the refuse return past the last.
+            tail.push(jeq(*family, 0, 1));
+            tail.push(ret(allow_action));
+        }
+        // The seal's verdict for every family it does not admit, EAFNOSUPPORT.
+        tail.push(ret(refuse_action));
+        // The default allow for every syscall that creates no socket.
+        tail.push(ret(allow_action));
+        tail
+    };
+
     // Classic BPF seccomp program.  `jt` and `jf` are the number of
     // instructions to skip after the current one (0 means "fall through to the
-    // next instruction").  Indices below are for x86_64; aarch64 has no x32
-    // guard, so everything from the `SYS_socket` compare on sits two lower
-    // (relative jumps in that tail are unchanged).
-    let mut filter: Vec<libc::sock_filter> = vec![
-        // 0: load arch.
-        load(OFFSET_ARCH),
-        // 1: native ABI -> 3; anything else -> 2.
-        jeq(AUDIT_ARCH, 1, 0),
-        // 2: kill: foreign ABI.
-        ret(kill_action),
-        // 3: load syscall number.
-        load(OFFSET_NR),
-    ];
+    // next instruction").
+    //
+    //   0: load arch
+    //   1: native ABI -> native block
+    //   2: compat ABI -> compat block
+    //   3: kill (a truly foreign ABI: its numbers would mean other syscalls)
+    //   native block: load nr, x32 guard (x86_64), native socket verdict
+    //   compat block: load nr, socketcall(SOCKET|SOCKETPAIR) -> ENOSYS,
+    //                 compat socket verdict
+    //
+    // Each ABI is judged against its own syscall table: the compat ABI's
+    // numbers differ from the native ones, so one shared dispatch would let a
+    // compat socket(AF_VSOCK) through as an unrelated native number.
+    let mut native: Vec<libc::sock_filter> = vec![load(OFFSET_NR)];
     #[cfg(target_arch = "x86_64")]
     {
-        // 4: nr >= X32_SYSCALL_BIT -> 5; else -> 6.
-        filter.push(libc::sock_filter {
+        // nr >= X32_SYSCALL_BIT -> kill: x32 ABI; else -> the socket verdict.
+        native.push(libc::sock_filter {
             code: (libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K) as u16,
             jt: 0,
             jf: 1,
             k: X32_SYSCALL_BIT,
         });
-        // 5: kill: x32 ABI.
-        filter.push(ret(kill_action));
+        native.push(ret(kill_action));
     }
-    // 6: socket() -> 8; else -> 7.
-    filter.push(jeq(SYS_SOCKET as u32, 1, 0));
-    // 7: socketpair() -> 8; anything else jumps past the whole verdict tail
-    // to the default allow — one skip per admitted-family verdict pair plus
-    // the refuse and allow returns that end it.
-    filter.push(jeq(
-        SYS_SOCKETPAIR as u32,
-        0,
-        (2 * admitted.len() + 2) as u8,
-    ));
-    // 8: load arg0 (the address family).
-    filter.push(load(OFFSET_ARG0));
-    // The verdict tail: both seals are allowlists, so each admitted family
-    // gets an allow return and whatever is left over is refused.  The `none`
-    // seal's one-family list is the tail the `none` box has always run; the
-    // confined-families seal's list is the namespace-confined set.  Relative
-    // jumps stay correct for either list.
-    for family in admitted {
-        // family matches -> the allow return; anything else falls through to
-        // the next comparison, or to the refuse return past the last one.
-        filter.push(jeq(*family, 0, 1));
-        filter.push(ret(allow_action));
-    }
-    // The seal's verdict for every family it does not admit, EAFNOSUPPORT.
-    filter.push(ret(refuse_action));
-    // The default allow for every syscall that creates no socket, reached
-    // both by falling through and by instruction 7's jump.
-    filter.push(ret(allow_action));
+    native.extend(socket_verdict(SYS_SOCKET as u32, SYS_SOCKETPAIR as u32));
+
+    let mut compat: Vec<libc::sock_filter> = vec![
+        load(OFFSET_NR),
+        // socketcall(2) -> load its call number; else -> the compat socket
+        // verdict past the sub-call dispatch.
+        jeq(COMPAT_SYS_SOCKETCALL, 0, 5),
+        // Load arg0 (the socketcall call number).
+        load(OFFSET_ARG0),
+        // SYS_SOCKET -> ENOSYS; else -> check SYS_SOCKETPAIR.
+        jeq(SOCKETCALL_SOCKET, 1, 0),
+        // SYS_SOCKETPAIR -> ENOSYS; any other sub-call -> allow.
+        jeq(SOCKETCALL_SOCKETPAIR, 0, 1),
+        ret(enosys_action),
+        // Every other sub-call acts on an fd the seal already judged.
+        ret(allow_action),
+    ];
+    compat.extend(socket_verdict(COMPAT_SYS_SOCKET, COMPAT_SYS_SOCKETPAIR));
+
+    let mut filter: Vec<libc::sock_filter> = vec![
+        // 0: load arch.
+        load(OFFSET_ARCH),
+        // 1: native ABI -> native block (skip 2); else -> 2.
+        jeq(AUDIT_ARCH, 2, 0),
+        // 2: compat ABI -> compat block (skip the kill and the native block).
+        jeq(
+            COMPAT_AUDIT_ARCH,
+            u8::try_from(1 + native.len()).expect("seccomp jump offset fits u8"),
+            0,
+        ),
+        // 3: kill: truly foreign ABI.
+        ret(kill_action),
+    ];
+    filter.extend(native);
+    filter.extend(compat);
 
     SocketFamilyFilter {
         program: filter,
@@ -3543,8 +3729,9 @@ mod tests {
     /// NET-038. The none-box filter refuses `AF_VSOCK` sockets (which bypass the
     /// network namespace) while still allowing the local `AF_UNIX` sockets the
     /// sandbox's own minenv socket depends on, leaves every other syscall alone,
-    /// and kills a caller on a foreign ABI rather than letting it through.  The
-    /// production runtime effect is proved by
+    /// admits the 32-bit compat ABI under the same family rules as the native
+    /// ABI, and kills a caller on a truly foreign ABI rather than letting it
+    /// through.  The production runtime effect is proved by
     /// `network_none_blocks_all_outside_sockets` in the minimald root integration
     /// harness; this unit test evaluates the program
     /// [`build_socket_family_filter`] produces and installs the production
@@ -3641,8 +3828,9 @@ mod tests {
             run_seccomp_program(&filter.program, nr as u32, arch, arg0)
         };
         let refuse = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
-        // AUDIT_ARCH_I386: the compat ABI an x86_64 kernel also answers to.
-        const FOREIGN_ARCH: u32 = 0x4000_0003;
+        let enosys = libc::SECCOMP_RET_ERRNO | (libc::ENOSYS as u32);
+        // AUDIT_ARCH_S390: a truly foreign arch the filter must still kill.
+        const FOREIGN_ARCH: u32 = 0x8000_0016;
 
         assert_eq!(
             run(libc::SYS_socket, AUDIT_ARCH, libc::AF_VSOCK as u32),
@@ -3664,10 +3852,62 @@ mod tests {
             libc::SECCOMP_RET_ALLOW,
             "a syscall that creates no socket must stay allowed"
         );
+        // The compat ABI is admitted under the same family rules as native,
+        // judged against its own syscall numbers.
+        let compat_socket = i64::from(COMPAT_SYS_SOCKET);
+        let compat_socketpair = i64::from(COMPAT_SYS_SOCKETPAIR);
+        assert_eq!(
+            run(compat_socket, COMPAT_AUDIT_ARCH, libc::AF_VSOCK as u32),
+            refuse,
+            "the compat ABI must refuse AF_VSOCK with EAFNOSUPPORT, not be killed"
+        );
+        assert_eq!(
+            run(compat_socketpair, COMPAT_AUDIT_ARCH, libc::AF_INET as u32),
+            refuse,
+            "the compat ABI must refuse socketpair(AF_INET) with EAFNOSUPPORT"
+        );
+        assert_eq!(
+            run(compat_socket, COMPAT_AUDIT_ARCH, libc::AF_UNIX as u32),
+            libc::SECCOMP_RET_ALLOW,
+            "the compat ABI must keep AF_UNIX allowed"
+        );
+        // The native socket number names an unrelated compat syscall (`dup`
+        // on i386), so it must not be judged as socket(2) on the compat ABI.
+        assert_eq!(
+            run(libc::SYS_socket, COMPAT_AUDIT_ARCH, libc::AF_VSOCK as u32),
+            libc::SECCOMP_RET_ALLOW,
+            "the compat ABI must be judged against its own syscall table"
+        );
+        assert_eq!(
+            run(libc::SYS_read, COMPAT_AUDIT_ARCH, 0),
+            libc::SECCOMP_RET_ALLOW,
+            "the compat ABI must allow a syscall that creates no socket"
+        );
+        // socketcall(2) returns ENOSYS on the compat ABI: seccomp cannot
+        // read its family argument, and the filter already covers the
+        // direct socket(2) and socketpair(2) syscalls individually.
+        let socketcall = i64::from(COMPAT_SYS_SOCKETCALL);
+        assert_eq!(
+            run(socketcall, COMPAT_AUDIT_ARCH, SOCKETCALL_SOCKET),
+            enosys,
+            "socketcall(SYS_SOCKET) must return ENOSYS on the compat ABI"
+        );
+        assert_eq!(
+            run(socketcall, COMPAT_AUDIT_ARCH, SOCKETCALL_SOCKETPAIR),
+            enosys,
+            "socketcall(SYS_SOCKETPAIR) must return ENOSYS on the compat ABI"
+        );
+        // SYS_CONNECT (3) acts on an fd the seal already judged.
+        assert_eq!(
+            run(socketcall, COMPAT_AUDIT_ARCH, 3),
+            libc::SECCOMP_RET_ALLOW,
+            "socketcall(SYS_CONNECT) must stay allowed on the compat ABI"
+        );
+        // A truly foreign arch is still killed.
         assert_eq!(
             run(libc::SYS_socket, FOREIGN_ARCH, libc::AF_VSOCK as u32),
             libc::SECCOMP_RET_KILL_PROCESS,
-            "a foreign-ABI caller must be killed, not allowed"
+            "a truly foreign-ABI caller must be killed, not allowed"
         );
         #[cfg(target_arch = "x86_64")]
         assert_eq!(
@@ -3808,6 +4048,43 @@ mod tests {
                 libc::SECCOMP_RET_ALLOW,
                 "{name}: a syscall that creates no socket must stay allowed"
             );
+            // The compat ABI runs under the same seal, judged against its
+            // own syscall numbers.
+            let compat_socket = i64::from(COMPAT_SYS_SOCKET);
+            let compat_socketpair = i64::from(COMPAT_SYS_SOCKETPAIR);
+            assert_eq!(
+                run(compat_socket, COMPAT_AUDIT_ARCH, libc::AF_VSOCK as u32),
+                refuse,
+                "{name}: compat socket(AF_VSOCK) must fail with EAFNOSUPPORT"
+            );
+            assert_eq!(
+                run(compat_socketpair, COMPAT_AUDIT_ARCH, libc::AF_VSOCK as u32),
+                refuse,
+                "{name}: compat socketpair(AF_VSOCK) must fail with EAFNOSUPPORT"
+            );
+            let compat_inet = run(compat_socket, COMPAT_AUDIT_ARCH, libc::AF_INET as u32);
+            let compat_inet6 = run(compat_socket, COMPAT_AUDIT_ARCH, libc::AF_INET6 as u32);
+            if admits_inet {
+                assert_eq!(
+                    compat_inet,
+                    libc::SECCOMP_RET_ALLOW,
+                    "{name}: a networked box must keep compat inet sockets"
+                );
+                assert_eq!(
+                    compat_inet6,
+                    libc::SECCOMP_RET_ALLOW,
+                    "{name}: a networked box must keep compat inet6 sockets"
+                );
+            } else {
+                assert_eq!(
+                    compat_inet, refuse,
+                    "{name}: the none seal must refuse compat AF_INET"
+                );
+                assert_eq!(
+                    compat_inet6, refuse,
+                    "{name}: the none seal must refuse compat AF_INET6"
+                );
+            }
             // The allowlist is what meets "every family the namespace does
             // not confine" without enumerating it: a family outside the
             // list is refused whatever it is, the bypass families the old
@@ -4046,6 +4323,28 @@ mod tests {
             !classifier::tree_is_real(tree, None, false),
             "a host whose mount table cannot be read has no tree to check"
         );
+    }
+
+    /// The install hint names every argument the installer requires of a
+    /// person (NET-078): the account the daemon runs as — the one thing the
+    /// daemon knows and would otherwise make the reader look up — and the
+    /// two source identities, which the step refuses to render one of
+    /// without the other, so a hint without them is a command the installer
+    /// itself refuses. Pinned as data: the daemon's start-up warn line, the
+    /// native unenforced notice and `Cause::StepNotInstalled`'s command all
+    /// carry this string, and the installer's own `--check` hint names the
+    /// same two flags, so the two spellings cannot drift apart unseen.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_hint_names_the_installers_required_identities() {
+        let hint = classifier::install_hint();
+        assert!(
+            hint.contains("install-host-classifier.sh"),
+            "the hint names the privileged step's install: {hint}"
+        );
+        for flag in ["--cohort-address", "--node-plane-address"] {
+            assert!(hint.contains(flag), "the hint names {flag}: {hint}");
+        }
     }
 
     /// The files the kernel makes when a cgroup is created, modelled over a
@@ -4540,7 +4839,17 @@ int main(int argc, char **argv) {
         std::fs::create_dir_all(tree.path().join(classifier::BOXES_DIR))
             .expect("creating the cohort directory");
 
-        let missing = classifier::probe_child_placement(tree.path())
+        // The probe asks its question in the subtree the box it is about is
+        // declared into: a deny-all box is probed in `deny`, so that is the
+        // cohort the stand-in tree needs and the one the throwaway leaf
+        // lands in.
+        let deny = tree
+            .path()
+            .join(classifier::BOXES_DIR)
+            .join(config::DENY_DIR);
+        std::fs::create_dir(&deny).expect("creating the deny subtree");
+
+        let missing = classifier::probe_child_placement(tree.path(), config::Verdict::Deny)
             .expect_err("over a stand-in tree nothing made the probe leaf's cgroup.procs");
         assert_eq!(
             missing.kind(),
@@ -4554,8 +4863,8 @@ int main(int argc, char **argv) {
         // The leaf is named by pid and a per-process counter, so the exact
         // name is not knowable here; what is knowable is that no
         // `placement-probe-` leaf survives the probe.
-        let leftover = std::fs::read_dir(tree.path().join(classifier::BOXES_DIR))
-            .expect("reading the cohort directory")
+        let leftover = std::fs::read_dir(&deny)
+            .expect("reading the deny subtree")
             .filter_map(std::result::Result::ok)
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .any(|name| name.starts_with("placement-probe-"));
@@ -4566,8 +4875,11 @@ int main(int argc, char **argv) {
 
         // A host with no cohort directory at all says the same thing one step
         // earlier: the probe never made its leaf.
-        let bare = classifier::probe_child_placement(tree.path().join("no-such-tree").as_path())
-            .expect_err("the probe cannot make a leaf under a tree that is absent");
+        let bare = classifier::probe_child_placement(
+            tree.path().join("no-such-tree").as_path(),
+            config::Verdict::Deny,
+        )
+        .expect_err("the probe cannot make a leaf under a tree that is absent");
         assert_eq!(
             bare.kind(),
             std::io::ErrorKind::NotFound,
@@ -4585,6 +4897,11 @@ int main(int argc, char **argv) {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
         std::fs::create_dir_all(tree.path().join(classifier::BOXES_DIR))
             .expect("creating the cohort directory");
+        let deny = tree
+            .path()
+            .join(classifier::BOXES_DIR)
+            .join(config::DENY_DIR);
+        std::fs::create_dir(&deny).expect("creating the deny subtree");
 
         let n: usize = std::thread::available_parallelism()
             .map(|p| p.get())
@@ -4593,7 +4910,9 @@ int main(int argc, char **argv) {
         let results: Vec<_> = (0..n)
             .map(|_| {
                 let root = tree.path().to_path_buf();
-                std::thread::spawn(move || classifier::probe_child_placement(&root))
+                std::thread::spawn(move || {
+                    classifier::probe_child_placement(&root, config::Verdict::Deny)
+                })
             })
             .collect::<Vec<_>>()
             .into_iter()
@@ -4615,8 +4934,8 @@ int main(int argc, char **argv) {
         }
 
         // No probe leaf is left behind.
-        let leftover = std::fs::read_dir(tree.path().join(classifier::BOXES_DIR))
-            .expect("reading the cohort directory")
+        let leftover = std::fs::read_dir(&deny)
+            .expect("reading the deny subtree")
             .filter_map(std::result::Result::ok)
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .any(|name| name.starts_with("placement-probe-"));
@@ -4679,14 +4998,21 @@ int main(int argc, char **argv) {
         let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
         let boxes = tree.path().join(classifier::BOXES_DIR);
         std::fs::create_dir_all(&boxes).expect("creating the cohort directory");
+        for subtree in [config::DENY_DIR, config::ALLOW_DIR] {
+            std::fs::create_dir(boxes.join(subtree)).expect("creating the cohort's two subtrees");
+        }
 
         // The box-id is derived from the session's name, which is user input.
+        // A deny-all session names a leaf in the deny subtree — the one
+        // subtree a session's declaration can land it in.
         let hostile = "box ../../cannot --see=or join";
-        let leaf = classifier::create_box_leaf(tree.path(), hostile)
+        let leaf = classifier::create_box_leaf(tree.path(), hostile, config::Verdict::Deny)
             .expect("creating the box's leaf before its first process exists");
         assert_eq!(
             leaf,
-            boxes.join("box....cannot--seeorjoin"),
+            boxes
+                .join(config::DENY_DIR)
+                .join("box....cannot--seeorjoin"),
             "a session name is user input, so the leaf it names must be a \
              single sanitized component: its separators are dropped, so a \
              traversal (`../..`) cannot leave the cohort, and it never starts \
@@ -4736,11 +5062,21 @@ int main(int argc, char **argv) {
         // A leaf that already exists is a collision, not a reuse: the leaf is
         // named by the session that holds it, so a fresh launch finding one
         // is told — and the sweep below has already taken what a daemon
-        // death left behind.
-        classifier::create_box_leaf(tree.path(), "held by another session")
-            .expect("creating the leaf a second session will collide with");
-        let collision = classifier::create_box_leaf(tree.path(), "held by another session")
-            .expect_err("a leaf another session holds is not taken over");
+        // death left behind. The colliding session here is declared into
+        // the allow subtree, so the collision is pinned in the other half of
+        // the cohort too.
+        classifier::create_box_leaf(
+            tree.path(),
+            "held by another session",
+            config::Verdict::Allow,
+        )
+        .expect("creating the leaf a second session will collide with");
+        let collision = classifier::create_box_leaf(
+            tree.path(),
+            "held by another session",
+            config::Verdict::Allow,
+        )
+        .expect_err("a leaf another session holds is not taken over");
         assert_eq!(
             collision.kind(),
             std::io::ErrorKind::AlreadyExists,
@@ -4750,6 +5086,7 @@ int main(int argc, char **argv) {
         classifier::remove_box_leaf(&classifier::box_leaf(
             tree.path(),
             "held by another session",
+            config::Verdict::Allow,
         ))
         .expect("dropping the collision leaf now that it has done its work");
 
@@ -4757,12 +5094,17 @@ int main(int argc, char **argv) {
         // leaves behind — and only those: a leaf that still holds a session
         // is refused by its `rmdir`, over a real tree because the kernel
         // will not remove a cgroup holding a process, and over this stand-in
-        // because the modelled procs file stands in for them.
-        let held = classifier::create_box_leaf(tree.path(), "a live session")
-            .expect("creating the leaf a live session holds");
+        // because the modelled procs file stands in for them. The held leaf
+        // and the abandoned one are deliberately in different subtrees, so
+        // the sweep is proved to walk both and to refuse the occupied one
+        // wherever it sits.
+        let held =
+            classifier::create_box_leaf(tree.path(), "a live session", config::Verdict::Deny)
+                .expect("creating the leaf a live session holds");
         model_cgroup_files(&held);
-        let empty = classifier::create_box_leaf(tree.path(), "an abandoned launch")
-            .expect("creating the leaf a daemon death left behind");
+        let empty =
+            classifier::create_box_leaf(tree.path(), "an abandoned launch", config::Verdict::Allow)
+                .expect("creating the leaf a daemon death left behind");
         assert_eq!(
             classifier::sweep_box_leaves(tree.path()).expect("sweeping the cohort at daemon start"),
             vec![empty.clone()],
@@ -4786,8 +5128,12 @@ int main(int argc, char **argv) {
         // daemon reads this as "no per-box classifier on this host" and runs
         // the box unenforced (NET-079's exception) — or, in the guest, refuses
         // a host-address box rather than run it unenforced (design §7.1).
-        let missing = classifier::create_box_leaf(tree.path().join("no-such-tree").as_path(), "b")
-            .expect_err("a tree that was never installed refuses the leaf");
+        let missing = classifier::create_box_leaf(
+            tree.path().join("no-such-tree").as_path(),
+            "b",
+            config::Verdict::Deny,
+        )
+        .expect_err("a tree that was never installed refuses the leaf");
         assert_eq!(
             missing.kind(),
             std::io::ErrorKind::NotFound,
@@ -4804,26 +5150,42 @@ int main(int argc, char **argv) {
         let box_tree = tempfile::tempdir().expect("a temp dir standing in for the box's tree");
         std::fs::create_dir_all(box_tree.path().join(classifier::BOXES_DIR))
             .expect("creating the cohort directory");
+        for subtree in [config::DENY_DIR, config::ALLOW_DIR] {
+            std::fs::create_dir(box_tree.path().join(classifier::BOXES_DIR).join(subtree))
+                .expect("creating the cohort's two subtrees");
+        }
+        // The box is declared deny-all, so its leaf is in the deny subtree;
+        // the sibling it must not reach sits in the allow subtree, the
+        // farthest leaf from it the cohort offers.
         let leaf = config::ClassifierLeaf::new(
-            classifier::create_box_leaf(box_tree.path(), "cg-probe")
+            classifier::create_box_leaf(box_tree.path(), "cg-probe", config::Verdict::Deny)
                 .expect("creating the box's leaf before its first process exists"),
         );
-        let _sibling = classifier::create_box_leaf(box_tree.path(), "the-other-box")
-            .expect("creating the sibling's leaf, for the box to fail to reach");
+        let _sibling =
+            classifier::create_box_leaf(box_tree.path(), "the-other-box", config::Verdict::Allow)
+                .expect("creating the sibling's leaf, for the box to fail to reach");
         // The kernel made both leaves' files when it made the leaves; over a
         // stand-in tree nothing did, and the box's own join — the write its
         // pre-exec closure makes through the tree the sandbox bound — is
         // into the modelled procs file.
         model_cgroup_files(leaf.dir());
-        model_cgroup_files(&classifier::box_leaf(box_tree.path(), "the-other-box"));
+        model_cgroup_files(&classifier::box_leaf(
+            box_tree.path(),
+            "the-other-box",
+            config::Verdict::Allow,
+        ));
 
         let mountpoint = classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT.to_string();
         let controllers = format!("{mountpoint}/cgroup.controllers");
         let root_procs = format!("{mountpoint}/cgroup.procs");
-        let sibling_procs = classifier::box_leaf(Path::new(&mountpoint), "the-other-box")
-            .join("cgroup.procs")
-            .to_string_lossy()
-            .into_owned();
+        let sibling_procs = classifier::box_leaf(
+            Path::new(&mountpoint),
+            "the-other-box",
+            config::Verdict::Allow,
+        )
+        .join("cgroup.procs")
+        .to_string_lossy()
+        .into_owned();
         let probe_args = vec![
             format!("STATFS:{mountpoint}"),
             format!("READ:{controllers}"),
@@ -5092,23 +5454,27 @@ int main(int argc, char **argv) {
         }
         let root = Path::new(classifier::TREE_ROOT);
         let boxes = root.join(classifier::BOXES_DIR);
-        if !boxes.is_dir() {
-            eprintln!(
-                "{SKIP}: {} is absent — this host has no classifier tree to \
-                 place a box in (scripts/install-host-classifier.sh installs one)",
-                boxes.display()
-            );
-            return;
+        let deny = boxes.join(config::DENY_DIR);
+        let allow = boxes.join(config::ALLOW_DIR);
+        for subtree in [&deny, &allow] {
+            if !subtree.is_dir() {
+                eprintln!(
+                    "{SKIP}: {} is absent — this host has no classifier tree to \
+                     place a box in (scripts/install-host-classifier.sh installs one)",
+                    subtree.display()
+                );
+                return;
+            }
         }
-        if nix::unistd::access(&boxes, nix::unistd::AccessFlags::W_OK).is_err() {
+        if nix::unistd::access(&deny, nix::unistd::AccessFlags::W_OK).is_err() {
             eprintln!(
                 "{SKIP}: {} is not writable by this account — the tree is \
                  installed but not delegated to the account this process runs as",
-                boxes.display()
+                deny.display()
             );
             return;
         }
-        if let Err(e) = classifier::probe_child_placement(root) {
+        if let Err(e) = classifier::probe_child_placement(root, config::Verdict::Deny) {
             eprintln!(
                 "{SKIP}: this process cannot place a child in the tree ({e}; it \
                  runs in {}) — the installer's --pid step or a Delegate=yes unit \
@@ -5121,34 +5487,39 @@ int main(int argc, char **argv) {
         }
 
         // Two leaves of the real cohort, this test's own: the box's, and a
-        // sibling's the box must not reach.
+        // sibling's the box must not reach. The box is declared deny-all, so
+        // its leaf is in the deny subtree; the sibling sits in the allow
+        // subtree, the farthest leaf from it the cohort offers.
         let box_id = format!("host-address-{}", std::process::id());
         let sibling_id = format!("sibling-of-{box_id}");
-        let leaf = classifier::create_box_leaf(root, &box_id)
+        let leaf = classifier::create_box_leaf(root, &box_id, config::Verdict::Deny)
             .expect("creating the box's leaf in the real tree");
-        let sibling = classifier::create_box_leaf(root, &sibling_id)
+        let sibling = classifier::create_box_leaf(root, &sibling_id, config::Verdict::Allow)
             .expect("creating the sibling's leaf in the real tree");
         let mountpoint = classifier::CONVENTIONAL_CGROUP2_MOUNTPOINT.to_string();
         let controllers = format!("{mountpoint}/cgroup.controllers");
         let memory_max = format!("{mountpoint}/memory.max");
         let root_procs = format!("{mountpoint}/cgroup.procs");
-        let sibling_procs = classifier::box_leaf(Path::new(&mountpoint), &sibling_id)
-            .join("cgroup.procs")
-            .to_string_lossy()
-            .into_owned();
+        let sibling_procs =
+            classifier::box_leaf(Path::new(&mountpoint), &sibling_id, config::Verdict::Allow)
+                .join("cgroup.procs")
+                .to_string_lossy()
+                .into_owned();
 
-        // The memory controller on the cohort, the same enabling a running
-        // daemon performs at its start (`enter_daemon_leaf`): without it a
-        // leaf carries no `memory.max` at all, and this proof reads the box's
-        // own limit under the design's cover — the assertion that the box's
-        // verdict is where a runtime looks. Best-effort and warned, as in
-        // the daemon; a host without the controller is one the design's own
-        // diagnostics already tell.
-        if let Err(e) = std::fs::write(boxes.join("cgroup.subtree_control"), "+memory\n")
-            && e.kind() != std::io::ErrorKind::NotFound
-            && e.kind() != std::io::ErrorKind::PermissionDenied
-        {
-            panic!("enabling the memory controller on the real cohort: {e}");
+        // The memory controller on the cohort and on both of its subtrees,
+        // the same enabling a running daemon performs at its start
+        // (`enter_daemon_leaf`): without it a leaf carries no `memory.max` at
+        // all, and this proof reads the box's own limit under the design's
+        // cover — the assertion that the box's verdict is where a runtime
+        // looks. Best-effort and warned, as in the daemon; a host without the
+        // controller is one the design's own diagnostics already tell.
+        for dir in [&boxes, &deny, &allow] {
+            if let Err(e) = std::fs::write(dir.join("cgroup.subtree_control"), "+memory\n")
+                && e.kind() != std::io::ErrorKind::NotFound
+                && e.kind() != std::io::ErrorKind::PermissionDenied
+            {
+                panic!("enabling the memory controller on the real cohort: {e}");
+            }
         }
 
         // The probe holds the box in its leaf for a while — the kernel drops

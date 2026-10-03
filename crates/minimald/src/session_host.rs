@@ -164,6 +164,10 @@ fn log_session_contents(
 
 enum BindingMsg {
     Stdin(Vec<u8>),
+    /// The session was renamed while this binding is attached, so the archive
+    /// the shell-exit prompt's save-then-delete lane writes carries the new
+    /// name rather than the one cloned in at [`Binding::spawn`].
+    Rename(String),
     /// The session process ended, so the binding should tear down and raise the
     /// shell-exit prompt. See [`TeardownCause`] for what the binding surfaces.
     ///
@@ -554,6 +558,7 @@ impl Binding {
                                 () = self.shed.cancelled() => break MainloopExitReason::Shed,
                             }
                         },
+                        BindingMsg::Rename(name) => self.name = name,
                         BindingMsg::TeardownDueToProcessExit { cause, unwind_codes } => {
                             // Before the notices below and before the
                             // shell-exit prompt further down: both render into
@@ -1140,6 +1145,10 @@ pub(crate) struct Launched<P, G> {
 /// Actor messages to a [`Host`].
 enum Message {
     Kill(bool),
+    /// Rename the session: update the host's display name and republish the
+    /// new `MINIMAL_SESSION_NAME` through the per-attach environment channel,
+    /// so the already-running shell picks it up at its next prompt.
+    Rename(String),
     /// Bind a client channel to this host. The [`ConnectionEnv`] rides along
     /// on every attach — not just the one that minted the host — because it
     /// describes the terminal on the other end of *this* channel; the
@@ -1377,6 +1386,23 @@ impl HostHandle {
             Err(_e) => Err(()),
         }
     }
+
+    /// Renames the session: the host updates its display name and republishes
+    /// the new `MINIMAL_SESSION_NAME` through the per-attach environment
+    /// channel, so the already-running shell picks it up at its next prompt.
+    ///
+    /// Best-effort: a dead or wedged host drops the message silently, and the
+    /// record-side rename has already succeeded by the time this is called.
+    pub async fn rename(&self, new_name: String) {
+        let _ = self
+            .sender
+            .send_timeout(
+                Message::Rename(new_name),
+                crate::session::HOST_PROBE_TIMEOUT,
+            )
+            .await;
+    }
+
     /// Binds `c` to this host, carrying the attaching terminal's facts.
     ///
     /// `connection` is merged into the host's stored facts on every attach, so
@@ -1584,19 +1610,25 @@ impl HostIpEnforcement {
 }
 
 /// What the launch's leaf decision means for the box's egress verdict:
-/// a host-address box with a leaf is enforced, a host-address box without
-/// one runs with the host's address and no verdict of its own, and any other
-/// network mode has no host address to decide on at all.
+/// a host-address box with a leaf is enforced — but only while this host
+/// can decide per box at all, the fresh fact the probe read at this
+/// launch: a leaf placed on a host whose table is not loaded decides
+/// nothing while looking decided, so a box in it runs
+/// unenforced and is recorded as such, never reported as enforced over a
+/// refusal that is not there. A host-address box without a leaf runs with
+/// the host's address and no verdict of its own, and any other network
+/// mode has no host address to decide on at all.
 ///
 /// Pure over its inputs, so the mapping is pinned where it is written.
 fn host_ip_enforcement(
     network_mode: NetworkMode,
     leaf: Option<&sandbox2::config::ClassifierLeaf>,
+    can_decide_per_box: bool,
 ) -> Option<HostIpEnforcement> {
     match network_mode {
-        NetworkMode::HostNet => match leaf {
-            Some(_) => Some(HostIpEnforcement::Enforced),
-            None => Some(HostIpEnforcement::Unenforced),
+        NetworkMode::HostNet => match (leaf, can_decide_per_box) {
+            (Some(_), true) => Some(HostIpEnforcement::Enforced),
+            _ => Some(HostIpEnforcement::Unenforced),
         },
         _ => None,
     }
@@ -2119,7 +2151,9 @@ impl AttachEnv {
 
 /// The facts that describe *the terminal currently attached*, as opposed to
 /// the session's own composed environment: `TERM` from the PTY request, plus
-/// the banner's detach hint derived from the channel's session keys.
+/// the banner's detach hint derived from the channel's session keys, and
+/// `MINIMAL_SESSION_NAME` when the session is renamed — republished so the
+/// already-running shell picks up the new name at its next prompt.
 ///
 /// Kept apart from [`AttachEnv`] because its lifetime is different. A session
 /// shell is spawned once and lives across many attaches, so its `environ` is
@@ -2345,6 +2379,26 @@ pub(crate) struct SandboxLauncher {
     /// is `Activating` — only the caller that mints the launch knows what it
     /// is for, which is why it travels on the launcher.
     pub(crate) for_hooks: bool,
+    /// The classifier tree this daemon places host-address boxes in: the
+    /// one the privileged step installs natively, and the guest's own boot
+    /// mounts for itself. A field of the launcher so the launch reads one
+    /// root for its leaf, its probe and its reclaim — and so the
+    /// unenforced-launch test can drive that whole path over a stand-in
+    /// tree it built, which the real tree's kernel-only facts would
+    /// otherwise make undrivable; production sets it from the same
+    /// constant every path reads.
+    pub(crate) classifier_root: std::path::PathBuf,
+    /// The mount table this launch reads the classifier tree's facts over,
+    /// as `/proc/self/mountinfo` spells it: `None` — every production path
+    /// and the start-up check alike — reads the daemon's own, live. A field
+    /// for the same reason [`Self::classifier_root`] is one: the two facts
+    /// of one launch answer over one tree and one mount table, and a
+    /// host's own mount table covers no stand-in tree, so a launch driven
+    /// over one would read every fact as unconfined and never reach the
+    /// placement it was driven to test. The field names which table
+    /// answers, it never fabricates one — no client or box input reaches
+    /// it, and production passes `None`.
+    pub(crate) classifier_mountinfo: Option<String>,
 }
 
 /// Reaps a freshly-spawned sandbox process if the launch is abandoned
@@ -2476,6 +2530,21 @@ impl Drop for BoxLeafGuard {
     }
 }
 
+/// The mount table a host-address launch answers over: the knob's when one
+/// was set, the daemon's own, read live, when none was — the knob's `None`
+/// is every production path ([`SandboxLauncher::classifier_mountinfo`]).
+///
+/// The distinction is not cosmetic. `None` handed through as "no table at
+/// all" makes [`sandbox2::classifier::tree_is_real`] say a real tree is not
+/// real — it answers from the table — so a guest, whose own boot mounted the
+/// `nsdelegate` cgroup2 the tree sits on, would refuse every host-address
+/// box it launched as a broken image, while a native host without a tree
+/// kept running boxes unenforced: the one table read here is what both
+/// halves of the launch — the decision and the placement — answer over.
+fn launch_mountinfo(knob: Option<String>) -> Option<String> {
+    knob.or_else(sandbox2::classifier::own_mountinfo)
+}
+
 /// Creates the classifier leaf this session's host-address box is placed in
 /// (NET-079), under the tree the privileged step installs on a native host
 /// (`scripts/install-host-classifier.sh`) and the guest daemon mounts for
@@ -2484,7 +2553,7 @@ impl Drop for BoxLeafGuard {
 ///
 /// The tree has to be *real* first — on this host's cgroup2, and in the
 /// guest with `nsdelegate` — or the leaf this function would create decides
-/// nothing while looking placed; see [`refuses_unenforced_host_address_box`]
+/// nothing while looking placed; see [`refused_unenforced_host_address_box`]
 /// for the guest, where that state refuses a host-address launch instead of
 /// running it unenforced.
 ///
@@ -2506,21 +2575,17 @@ impl Drop for BoxLeafGuard {
 ///
 /// `Err` means the leaf exists but cannot be this session's: another session
 /// holds it, which a fresh launch of the same id cannot tolerate — two
-/// sessions in one leaf would decide both their verdicts together. It also
-/// means the placement probe failed for a reason other than an absent tree
-/// or a daemon outside the slice: the probe gave no answer about whether a
-/// box can be placed, so the launch is refused rather than run unenforced.
+/// sessions in one leaf would decide both their verdicts together.
 async fn create_session_leaf(
+    root: &std::path::Path,
+    mountinfo: Option<&str>,
     guest: bool,
     session_id: &sessions::SessionId,
     session_name: &str,
+    verdict: sandbox2::config::Verdict,
+    can_decide_per_box: bool,
 ) -> io::Result<Option<sandbox2::config::ClassifierLeaf>> {
-    let root = std::path::Path::new(sandbox2::classifier::TREE_ROOT);
-    if !sandbox2::classifier::tree_is_real(
-        root,
-        sandbox2::classifier::own_mountinfo().as_deref(),
-        guest,
-    ) {
+    if !sandbox2::classifier::tree_is_real(root, mountinfo, guest) {
         tracing::info!(
             session = session_name,
             tree = sandbox2::classifier::TREE_ROOT,
@@ -2533,10 +2598,12 @@ async fn create_session_leaf(
     // The placement the box's own join performs, tried first by a throwaway
     // child of this daemon: the proof is a migration the kernel accepted, not
     // the tree's existence. On the blocking pool, because a fork and its reap
-    // do not belong on an executor thread.
+    // do not belong on an executor thread. The probe makes its leaf in the
+    // subtree this box's verdict picked, the same one its own leaf will
+    // live in.
     let placement = match tokio::task::spawn_blocking({
         let root = root.to_path_buf();
-        move || sandbox2::classifier::probe_child_placement(&root)
+        move || sandbox2::classifier::probe_child_placement(&root, verdict)
     })
     .await
     {
@@ -2549,61 +2616,34 @@ async fn create_session_leaf(
         // that is there but refuses this daemon means the daemon is not
         // inside the delegated slice — the state the installer's `--pid`
         // step exists for, effective on the very next launch because the
-        // probe is per-launch. These two are the genuine "cannot confine"
-        // results: the tree is absent or the daemon is outside the slice.
-        //
-        // Any other error means the probe gave no answer: it does not show
-        // that the tree is absent or that the daemon is outside the slice,
-        // only that the probe itself failed (an I/O error, a fork that could
-        // not run, a leaf the kernel will not take a process into). NET-079's
-        // exception covers a host that cannot decide per box, not a probe
-        // that failed, so the launch is refused with the probe's error rather
-        // than run unenforced; mapped to "no leaf", the guest would also
-        // misreport it as a broken image. The leaf creation below keeps its
-        // own policy for its errors.
-        match e.kind() {
-            std::io::ErrorKind::NotFound => {
-                tracing::info!(
-                    session = session_name,
-                    error = %e,
-                    daemon_cgroup = ?sandbox2::classifier::own_cgroup_path(),
-                    install = %sandbox2::classifier::install_hint(),
-                    "the classifier tree is not installed on this host — the \
-                     placement probe cannot even make its throwaway leaf in \
-                     it; the installer has to install the tree — the \
-                     session's box runs unenforced",
-                );
-                return Ok(None);
-            }
-            std::io::ErrorKind::PermissionDenied => {
-                tracing::info!(
-                    session = session_name,
-                    error = %e,
-                    daemon_cgroup = ?sandbox2::classifier::own_cgroup_path(),
-                    install = %sandbox2::classifier::install_hint(),
-                    "this daemon cannot place a process in the classifier \
-                     tree; it is not inside the delegated slice, so the \
-                     installer's --pid step or a Delegate=yes unit has to \
-                     place it — the session's box runs unenforced",
-                );
-                return Ok(None);
-            }
-            _ => {
-                tracing::warn!(
-                    session = session_name,
-                    error = %e,
-                    daemon_cgroup = ?sandbox2::classifier::own_cgroup_path(),
-                    install = %sandbox2::classifier::install_hint(),
-                    "the placement probe of the classifier tree failed — \
-                     the session's box cannot be placed and the launch is \
-                     refused rather than run unenforced; the probe's error \
-                     is where to start",
-                );
-                return Err(e);
-            }
-        }
+        // probe is per-launch.
+        let (what, hint) = match e.kind() {
+            std::io::ErrorKind::NotFound => (
+                "the classifier tree is not installed on this host — the \
+                 placement probe cannot even make its throwaway leaf in it",
+                "the installer has to install the tree",
+            ),
+            std::io::ErrorKind::PermissionDenied => (
+                "this daemon cannot place a process in the classifier tree",
+                "it is not inside the delegated slice, so the installer's \
+                 --pid step or a Delegate=yes unit has to place it",
+            ),
+            _ => (
+                "the placement probe of the classifier tree failed",
+                "the probe's error is where to start",
+            ),
+        };
+        tracing::info!(
+            session = session_name,
+            error = %e,
+            daemon_cgroup = ?sandbox2::classifier::own_cgroup_path(),
+            install = %sandbox2::classifier::install_hint(),
+            hint,
+            "{what}; {hint} — the session's box runs unenforced",
+        );
+        return Ok(None);
     }
-    match create_or_reclaim_box_leaf(root, session_id) {
+    match create_or_reclaim_box_leaf(root, session_id, verdict) {
         Ok((leaf, reclaimed)) => {
             if reclaimed {
                 tracing::info!(
@@ -2612,6 +2652,35 @@ async fn create_session_leaf(
                     "reclaimed this session's empty classifier leaf — a leftover a \
                      daemon death left behind; the kernel's rmdir emptiness test \
                      let it go, and the launch created it again for this box",
+                );
+            }
+            // One info line per host-address box launch naming its classifier
+            // identity (NET-079's observability): the subtree its declaration
+            // picked, the leaf that verdict placed it in, and whether this
+            // host can decide per box — the fresh fact this launch's probe
+            // just read from the table's effect. A leaf placed on a host
+            // whose table is not loaded decides nothing while looking
+            // decided, so the line never says `per_box` for one.
+            if can_decide_per_box {
+                tracing::info!(
+                    session = session_name,
+                    classifier = verdict.dir_name(),
+                    leaf = %leaf.display(),
+                    host_ip_enforcement = %HostIpEnforcement::Enforced.machine_str(),
+                    "the host-address box's egress verdict is decided on its \
+                     classifier leaf, in the {} subtree",
+                    verdict.dir_name()
+                );
+            } else {
+                tracing::info!(
+                    session = session_name,
+                    classifier = verdict.dir_name(),
+                    leaf = %leaf.display(),
+                    host_ip_enforcement = %HostIpEnforcement::Unenforced.machine_str(),
+                    "the host-address box's leaf is placed in the {} subtree, \
+                     but this host's classifier table is not loaded, so its \
+                     egress verdict is not decided per box",
+                    verdict.dir_name()
                 );
             }
             Ok(Some(sandbox2::config::ClassifierLeaf::new(leaf)))
@@ -2667,14 +2736,15 @@ async fn create_session_leaf(
 fn create_or_reclaim_box_leaf(
     root: &std::path::Path,
     session_id: &sessions::SessionId,
+    verdict: sandbox2::config::Verdict,
 ) -> io::Result<(std::path::PathBuf, bool)> {
     let id = session_id.to_string();
-    match sandbox2::classifier::create_box_leaf(root, &id) {
+    match sandbox2::classifier::create_box_leaf(root, &id, verdict) {
         Ok(leaf) => Ok((leaf, false)),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let leftover = sandbox2::classifier::box_leaf(root, &id);
+            let leftover = sandbox2::classifier::box_leaf(root, &id, verdict);
             sandbox2::classifier::remove_box_leaf(&leftover)
-                .and_then(|()| sandbox2::classifier::create_box_leaf(root, &id))
+                .and_then(|()| sandbox2::classifier::create_box_leaf(root, &id, verdict))
                 .map(|leaf| (leaf, true))
                 .map_err(|refused| {
                     io::Error::new(
@@ -2840,49 +2910,165 @@ fn say_closure_line(line: &str, session: &str) -> bool {
     false
 }
 
-/// Whether a session that could not be placed in a classifier leaf must be
-/// refused rather than launched unenforced.
+/// Whether a host-address box this host cannot give a verdict of its own
+/// must be refused rather than launched unenforced, and with what words:
+/// the gate and the refusal are decided in one place, because the one
+/// thing worse than either alone is a gate that said "refused" for words
+/// that spell what the box did instead.
 ///
-/// In the guest — this daemon being the microVM's pid 1 — the tree was this
-/// daemon's own to build, so a host-address box that cannot be placed in one
-/// has no verdict to run with and no privileged step a person could run to fix
-/// it: the image is broken, and the launch is refused with the error that
-/// says so (design §7.1). Natively the same state is the deployment
-/// exception instead — NET-079's advisory posture, never a refusal.
-fn refuses_unenforced_host_address_box(guest: bool, network_mode: NetworkMode) -> bool {
-    guest && matches!(network_mode, NetworkMode::HostNet)
-}
-
-/// Whether a native launch whose host-address box was not placed in a
-/// classifier leaf advises about that state.
+/// In the guest — this daemon being the microVM's pid 1 — the tree and the
+/// table were this daemon's own boot's work, so there is no privileged step
+/// a person could run to fix either half: a box that cannot be placed in a
+/// leaf has no leaf to decide on at all, and a deny-all box whose table is
+/// not loaded would run placed while nothing refuses its connections — a
+/// verdict that looks decided and is not. The first is a broken guest
+/// image; the second is the interim, guest-side classifier enforcement not
+/// being available yet. Both are refused, each with the error that says
+/// which it is (design §7.1). An allow box needs no verdict enforced, so a
+/// guest that places it runs it.
 ///
-/// The counterpart of [`refuses_unenforced_host_address_box`]: natively an
-/// unplaced host-address box is NET-079's advisory posture, never a refusal
-/// (design §7.4), so every *session* launch that ends without a leaf says so
-/// — once per launch, like the resolver advisory it is modelled on (design
-/// §7.1), never once per daemon. A guest never advises: its unplaced box is
-/// refused, and a box that was placed needs no advice. What this predicate
-/// does not carry is the launch's audience — a launch minted for lifecycle
-/// hooks advises nobody (a hook run is not a session start), which the
-/// launch itself folds in over [`SandboxLauncher::for_hooks`]. Pure over its
-/// inputs, so the gate is pinned where it is written.
-fn advises_unenforced_placement(
+/// Natively, NET-079's exception stands for every state this host can still
+/// fix from itself: the step not installed, a tree no cgroup2 with
+/// `nsdelegate` confines, a box that declares no verdict to enforce. Those
+/// run unenforced, and the record and notice below say so. The exception
+/// stops where the box's own declaration becomes the thing this host cannot
+/// honour — a *placed* deny-all box over one of the two probe causes: a
+/// table whose marker vouches for a refusal the probe did not read
+/// (`TableNotEffective`), and a table whose effect could not be read at all
+/// (`ProbeUnreadable`). Running that box would promise a refusal nothing
+/// here is making, so the launch refuses it and names the cause, because
+/// natively both halves are this host's to fix and the words are what tell
+/// a person which one. Both causes arise only over a tree the step already
+/// installed — the marker and the delegated subtrees gate the probe — so
+/// the refusal is a placed box's, never an unplaced one's: a host that
+/// cannot place a box has nothing decided-looking to refuse, and it keeps
+/// the advisory.
+///
+/// Pure over its inputs, so the gate and its words are pinned where they
+/// are written.
+fn refused_unenforced_host_address_box(
     guest: bool,
     network_mode: NetworkMode,
-    leaf: Option<&sandbox2::config::ClassifierLeaf>,
-) -> bool {
-    matches!(network_mode, NetworkMode::HostNet) && !guest && leaf.is_none()
+    verdict: sandbox2::config::Verdict,
+    placed: bool,
+    decision: Option<&crate::net::classifier::Decision>,
+) -> Option<String> {
+    // Only a host-address box has a verdict the classifier could decide, and
+    // only its launch reads a decision — the two facts are one, so the mode
+    // check and the read are the same check, and a launch that read nothing
+    // refuses nothing here.
+    if !matches!(network_mode, NetworkMode::HostNet) {
+        return None;
+    }
+    // The guest's unplaced box needs no decision read to refuse: there is no
+    // tree to decide anything in, and that is the ground itself.
+    if guest && !placed {
+        return Some(
+            "this guest has no classifier tree to place a host-address \
+             box in: its cgroup2 is not mounted with nsdelegate, so the \
+             box's verdict could not be decided and the box was refused \
+             rather than run unenforced (broken guest image)"
+                .to_string(),
+        );
+    }
+    let decision = decision?;
+    if guest {
+        if verdict == sandbox2::config::Verdict::Deny && !decision.can_decide_per_box() {
+            return Some(
+                "this guest has not loaded the classifier table, so a \
+                 deny-all box's connections would not be refused: the box's \
+                 declaration promises a verdict nothing here refuses yet, \
+                 and the box was refused rather than run unenforced \
+                 (guest-side classifier enforcement is not available yet)"
+                    .to_string(),
+            );
+        }
+        return None;
+    }
+    if placed && verdict == sandbox2::config::Verdict::Deny {
+        return match decision.cause() {
+            Some(crate::net::classifier::Cause::TableNotEffective) => Some(format!(
+                "this host's classifier table is marked loaded but its refusal \
+                 is not in force, so a deny-all box's connections would not be \
+                 refused: the box's declaration promises a verdict nothing here \
+                 enforces, and the box was refused rather than run unenforced \
+                 (the table's refusal is not in force — {} reloads it)",
+                sandbox2::classifier::install_hint()
+            )),
+            Some(crate::net::classifier::Cause::ProbeUnreadable) => Some(
+                "this host's classifier table's effect could not be read, so \
+                 whether a deny-all box's connections would be refused is \
+                 unknown: the box's declaration promises a verdict this host \
+                 cannot prove, and the box was refused rather than run \
+                 unenforced (the table's effect could not be read — this \
+                 daemon's log carries the probe's own failure)"
+                    .to_string(),
+            ),
+            // Everything else natively is the state this host can still fix
+            // from itself — the step not installed, a tree that cannot
+            // confine — or a host that decides, whose refusal no gate makes.
+            // Those keep NET-079's exception, and the record and notice
+            // below say what they run instead.
+            _ => None,
+        };
+    }
+    None
 }
 
-/// The advisory text for a native launch that was not placed in a classifier
-/// leaf: what the state is, and what would change it.
-fn unenforced_placement_notice() -> String {
-    format!(
-        "this host places no classifier leaf for this session: its box \
-         runs with the host's address and no egress verdict of its own \
-         — {}",
-        sandbox2::classifier::install_hint()
-    )
+/// Whether a launch whose host-address box was not placed in a classifier
+/// leaf, or was placed on a host that cannot decide per box, advises about
+/// that state.
+///
+/// The counterpart of [`refused_unenforced_host_address_box`]: an unenforced
+/// host-address box is the advisory posture on *either* kind of host —
+/// natively NET-079's exception, in the guest the interim's own state — so
+/// every *session* launch the record says `none` for says so, once per
+/// launch like the resolver advisory it is modelled on (design §7.1), never
+/// once per daemon. The refusals stand untouched beside it: a box the guest
+/// cannot place is refused and advises nothing (the refusal is that state's
+/// surface), and so is a deny-all box on a table the guest has not loaded,
+/// and natively a deny-all box over either probe cause — the advisory is the
+/// *other* host-address boxes' state, the ones that need no verdict
+/// enforced to run, and the ruling's ask is that their state be said at
+/// every session start, not left as a daemon log line alone. What this
+/// predicate does not carry is the launch's audience — a launch minted for
+/// lifecycle hooks advises nobody (a hook run is not a session start),
+/// which the launch itself folds in over
+/// [`SandboxLauncher::for_hooks`]. Pure over its inputs, so the gate is
+/// pinned where it is written.
+fn advises_unenforced_placement(enforcement: Option<HostIpEnforcement>) -> bool {
+    enforcement == Some(HostIpEnforcement::Unenforced)
+}
+
+/// The advisory text for a launch whose host-address box runs unenforced:
+/// what the state is, and what would change it — spelled for the host and
+/// the state that produced it, so a person reading the log is told which
+/// half of the step this host owes. The guest names no install command:
+/// no privileged step exists inside a microVM, so the person to tell is the
+/// image's builder, and the interim's words are all the guest has to say.
+fn unenforced_placement_notice(
+    guest: bool,
+    leaf: Option<&sandbox2::config::ClassifierLeaf>,
+) -> String {
+    if guest {
+        return "guest-side classifier enforcement is not available yet; \
+                this host-address box runs unenforced (host_ip_enforcement=none)"
+            .to_string();
+    }
+    match leaf {
+        None => format!(
+            "this host places no classifier leaf for this session: its box \
+             runs with the host's address and no egress verdict of its own \
+             — {}",
+            sandbox2::classifier::install_hint()
+        ),
+        Some(_) => format!(
+            "this host's classifier table is not loaded, so the leaf this \
+             session's box was placed in decides nothing: the box runs with \
+             the host's address and no egress verdict of its own — {}",
+            sandbox2::classifier::install_hint()
+        ),
+    }
 }
 
 /// Moves the box's container supervisor into its classifier leaf, now that
@@ -2924,7 +3110,20 @@ impl SessionLauncher for SandboxLauncher {
         // Move the session policy out of `self` up front so it can be applied
         // after the switch attach below (the rest of `self` is consumed first).
         let policy = self.policy;
+        // NET-079: the cohort subtree this box's declaration places its leaf
+        // in, decided from the declaration before anything is reserved and
+        // before its first process exists — the same verdict the plan below
+        // resolves a deny-all box through, and the one the placement's own
+        // leaf is named by. The declaration is fixed at create, so a launch
+        // decides it once and a box is never re-verdicted mid-flight.
+        let classifier_verdict = crate::net::classifier::verdict_of(policy.egress.as_ref());
         let network_mode = self.network_mode;
+        // The classifier tree this daemon places boxes in, moved out before
+        // the rest of `self` is consumed (see the field's doc).
+        let classifier_root = self.classifier_root;
+        // The mount table the launch's classifier facts answer over, moved
+        // out with it (see the field's doc).
+        let classifier_mountinfo = self.classifier_mountinfo;
         let net_switch = self.net_switch;
         let own_address = self.own_address;
         let box_addresses = self.box_addresses;
@@ -2960,57 +3159,124 @@ impl SessionLauncher for SandboxLauncher {
         // to decide and an own-IP box's verdict is its own, on the address
         // it holds. The decision fails closed for the launch — a tree that
         // is absent, or a daemon that cannot place a process in it, leaves
-        // the box unenforced rather than refused natively, while a placement
-        // probe that fails for any other reason refuses it — and never reaches
+        // the box unenforced rather than refused natively — and never reaches
         // the box's own pre-exec closure, which is where an unplaceable join
         // would die taking the leaf it cannot take. The guard owns the leaf
         // until the handoff into `Launched`, so a launch abandoned anywhere
         // in between leaves no leaf behind, and it drops after the process
         // guard below so the box's processes are gone before their leaf is
         // removed.
-        let leaf = if matches!(network_mode, NetworkMode::HostNet) {
-            create_session_leaf(guest, &session_id, &session_name).await?
+        //
+        // Whether this host can decide per box is read fresh, per launch,
+        // from the table's *effect* (design §7.4) — the start reading is not
+        // kept, because a marker survives whatever emptied the table and the
+        // refusal does not, and a start reading would survive it the same
+        // way. The probe binds a listener, forks a child, and waits, so it
+        // runs on the blocking pool, and only a host-address launch reads
+        // one: no other mode has a verdict the cgroup decides, and the one
+        // over the same `classifier_root` the box is placed into, so both
+        // halves of this launch answer over one tree and one mount table.
+        // The whole decision is kept, not only its verdict bit: the refusal
+        // and the advice below say which box they are for out of the cause
+        // that produced it, so the launch's words and the start-up line
+        // name the same ground. The knob's `None` — every production path —
+        // is the daemon's own mount table read live here, never "no table
+        // at all": a launch that answered over no table would read even a
+        // guest's `nsdelegate` cgroup2 as not real and refuse every
+        // host-address box in it as a broken image, so the live read and
+        // the decision share this one blocking hop, and the same one table
+        // is what the placement below answers over too.
+        let (leaf, decision) = if matches!(network_mode, NetworkMode::HostNet) {
+            let root = classifier_root.clone();
+            let knob = classifier_mountinfo.clone();
+            let (mountinfo, decision) = tokio::task::spawn_blocking(move || {
+                let mountinfo = launch_mountinfo(knob);
+                let decision =
+                    crate::net::classifier::decide_now(&root, mountinfo.as_deref(), guest);
+                (mountinfo, decision)
+            })
+            .await
+            .map_err(io::Error::other)?;
+            let leaf = create_session_leaf(
+                &classifier_root,
+                mountinfo.as_deref(),
+                guest,
+                &session_id,
+                &session_name,
+                classifier_verdict,
+                decision.can_decide_per_box(),
+            )
+            .await?;
+            (leaf, Some(decision))
         } else {
-            None
+            (None, None)
         };
         let mut leaf_guard = leaf.clone().map(BoxLeafGuard::new);
 
-        // A host-address box this daemon cannot place is refused in the guest
-        // — the one place a missing tree is a broken image rather than a
-        // deployment state, and the one place there is no installer to run
-        // (design §7.1). Natively the same state runs the box unenforced and
-        // says so in the log instead (NET-079's exception).
-        if leaf.is_none() && refuses_unenforced_host_address_box(guest, network_mode) {
+        // What this launch's leaf decision means for the box's egress
+        // verdict: enforced only while this host can decide per box at all
+        // — the fresh fact the probe just read, the table's refusal in
+        // force — so a leaf placed on a host whose table is not loaded is
+        // recorded as the unenforced state it is, and the refusal and the
+        // advice below read the one decision.
+        let enforcement = host_ip_enforcement(
+            network_mode,
+            leaf.as_ref(),
+            decision.as_ref().is_some_and(|d| d.can_decide_per_box()),
+        );
+
+        // A host-address box this host cannot give a verdict of its own is
+        // refused where the box's own declaration is the thing that cannot
+        // be honoured — never for a state a person could still fix from the
+        // host itself. In the guest that is every state: the tree and the
+        // table were the image's own boot's work, and there is no installer
+        // to run inside a microVM (design §7.1) — a box that cannot be
+        // placed has no leaf to decide on at all, and a deny-all box whose
+        // table is not loaded would run placed while nothing refuses its
+        // connections, a verdict that looks decided and is not. The first
+        // refusal names the broken image it is; the second names the
+        // interim, guest-side classifier enforcement not being available
+        // yet. Natively the same states keep NET-079's exception — the box
+        // runs unenforced and the log says so — except the one state where
+        // the step's own install is standing behind a refusal that is not
+        // in force: a deny-all box placed on either probe cause, refused
+        // rather than run on a refusal nothing here is making. A refused
+        // box never reaches the advisory below — the refusal is the only
+        // thing that launch says; the advisory is for the host-address
+        // boxes that run, the ones a verdict has nothing to enforce in
+        // yet.
+        if let Some(refusal) = refused_unenforced_host_address_box(
+            guest,
+            network_mode,
+            classifier_verdict,
+            leaf.is_some(),
+            decision.as_ref(),
+        ) {
             tracing::error!(
                 session = %session_name,
                 network_mode = ?network_mode,
-                tree = sandbox2::classifier::TREE_ROOT,
-                "refusing a host-address box this guest cannot place in a \
-                 classifier leaf: its cgroup2 tree is missing or mounted \
-                 without namespace delegation, or the daemon cannot place a \
-                 process in it, so the box's egress verdict could not be \
-                 decided — a broken guest image"
+                tree = %classifier_root.display(),
+                placed = leaf.is_some(),
+                refusal = %refusal,
+                "refusing a host-address box this host cannot decide an \
+                 egress verdict for"
             );
-            return Err(io::Error::other(
-                "this guest has no classifier tree to place a host-address \
-                 box in: its cgroup2 is not mounted with nsdelegate, so the \
-                 box's verdict could not be decided and the box was refused \
-                 rather than run unenforced (broken guest image)",
-            ));
+            return Err(io::Error::other(refusal));
         }
 
-        // The advisory for that same state, natively, as a diagnostic record
-        // per launch — on the daemon's log stream, and nowhere else. This is
-        // not the session's stderr channel and not a field any client reads:
-        // the session reply and the CLI's start output are untouched by it,
-        // so a scripted `min session start` never sees this line. What a
-        // person in a session gets is the banner below, written onto the
-        // session's own pty — that banner is the in-session surface, and
-        // this record is its daemon-log twin, attributed to the session and
-        // carrying the decision in the machine spelling a reader greps for
-        // (`host_ip_enforcement`). Carrying the field out to a client — over
-        // the session reply, and surfaced by `min doctor` — is issue #1773,
-        // outside this task's layers.
+        // The advisory for that same state, on either kind of host, as a
+        // diagnostic record per launch — on the daemon's log stream, and
+        // nowhere else. This is not the session's stderr channel and not a
+        // field any client reads: the session reply and the CLI's start
+        // output are untouched by it, so a scripted `min session start`
+        // never sees this line. What a person in a session gets is the
+        // banner below, written onto the session's own pty — that banner is
+        // the in-session surface, and this record is its daemon-log twin,
+        // attributed to the session and carrying the decision in the
+        // machine spelling a reader greps for (`host_ip_enforcement`).
+        // Carrying the field out to a client — over the session reply, and
+        // surfaced by `min doctor` — is issue #1773, outside this task's
+        // layers.
         //
         // At the placement decision, not after the build: a launch that goes
         // no further than this (a tree-less host, an env that fails to
@@ -3019,14 +3285,18 @@ impl SessionLauncher for SandboxLauncher {
         // advises on every session start, the install hint it carries is the
         // answer to a host without the tree, and silencing every launch
         // after the first takes the notice away from exactly the session a
-        // person is about to work in.
+        // person is about to work in. In the guest the hint is not what the
+        // state means — there is no installer to run there — so the notice
+        // is the interim's own words, and the session that just started is
+        // told at its own start, both here in the daemon's log and in the
+        // pty banner below, never per daemon and never for a hook run.
         //
         // A launch minted for lifecycle hooks advises on neither surface: a
         // hook run is not a session start, and its record would count one
         // hook run as one. The placement itself is not gated with it.
-        let advise = advises_unenforced_placement(guest, network_mode, leaf.as_ref()) && !for_hooks;
+        let advise = advises_unenforced_placement(enforcement) && !for_hooks;
         if advise {
-            let notice = unenforced_placement_notice();
+            let notice = unenforced_placement_notice(guest, leaf.as_ref());
             tracing::info!(
                 session = %session_name,
                 host_ip_enforcement = %HostIpEnforcement::Unenforced.machine_str(),
@@ -3189,20 +3459,23 @@ impl SessionLauncher for SandboxLauncher {
 
             let pty = Pty::open(sz).map_err(|e| io::Error::other(format!("pty open: {e}")))?;
 
-            // NET-079: a host-address box this native launch could not place
-            // gets the advisory in the terminal itself — this banner is the
+            // NET-079: a host-address box this launch runs unenforced gets
+            // the advisory in the terminal itself — this banner is the
             // in-session surface, the prose a person at the terminal reads;
             // the record for that same decision went to the daemon's log at
             // the placement decision, which no client reads (issue #1773
             // tracks carrying it out). The person about to type in this
             // session is the one whose egress is not being decided, and the
             // state is the deployment's, not the session's, so the notice
-            // says what would change it. Never in the guest: a guest's
-            // unplaced host-address box never gets this far, its launch
-            // being refused (design §7.1). And never on a hook launch: its
+            // says what would change it. A guest's *refused* box never gets
+            // this far, its launch being refused (design §7.1) — but the
+            // guest's other host-address boxes do, and say the interim's
+            // words: a session started in a VM host that does not enforce
+            // per box yet is told so at its own start, like any host's.
+            // And never on a hook launch: its
             // pty is read by nobody, and a hook run is not a session start.
             if advise {
-                let notice = unenforced_placement_notice();
+                let notice = unenforced_placement_notice(guest, leaf.as_ref());
                 // The same write the shell fallback notice uses, for the
                 // same reasons: onto the pty's slave, best-effort, CRLF —
                 // see the comment there.
@@ -3367,7 +3640,7 @@ impl SessionLauncher for SandboxLauncher {
             // The launch's own decision about this box's egress verdict, so
             // the session can say which it runs under without re-deriving
             // it from things a person never sees.
-            host_ip_enforcement: host_ip_enforcement(network_mode, leaf.as_ref()),
+            host_ip_enforcement: enforcement,
             // The copy the host keeps, so every process injected into the
             // session can join the same leaf.
             leaf,
@@ -4192,6 +4465,24 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     }
                     Message::Attach(channel, sz, connection, keys) => {
                         self.attach(channel, sz, false, connection, keys).await;
+                    }
+                    // Unchanged name: nothing to republish.
+                    Message::Rename(new_name) if new_name == self.session_name => {}
+                    Message::Rename(new_name) => {
+                        self.session_name = new_name.clone();
+                        // The attached binding cloned the old name at spawn
+                        // for its save-then-delete archive; best-effort, since
+                        // the next attach clones the new one anyway.
+                        if let Some((tx, ..)) = self.remote.as_ref() {
+                            let _ = tx.try_send(BindingMsg::Rename(new_name.clone()));
+                        }
+                        // The shell's `environ` is frozen at launch, so the
+                        // new name reaches it the same way `TERM` does: by
+                        // republishing through the per-attach environment
+                        // files the shell re-sources at every prompt.
+                        self.connection_env
+                            .insert("MINIMAL_SESSION_NAME".to_string(), new_name);
+                        self.publish_connection_env().await;
                     }
                     Message::SetTitleCallback(title) => {
                         self.attrs.title = Some((title, SystemTime::now()));
