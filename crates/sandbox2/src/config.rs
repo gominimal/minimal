@@ -510,6 +510,14 @@ impl Config {
     #[must_use]
     pub fn command_env(&self) -> BTreeMap<String, String> {
         let mut env = BTreeMap::new();
+        // The layout default `PATH`, set below; captured up front so a composed
+        // `PATH` can expand `$PATH`/`${PATH}` against it without re-borrowing
+        // `env` while the `set` closure holds it mutably.
+        let default_path = if let WdSetup::Session { .. } = &self.wd {
+            "/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin"
+        } else {
+            "/usr/bin:/bin:/usr/sbin:/sbin"
+        };
         let mut set = |k: &str, v: &str| {
             env.insert(k.to_string(), v.to_string());
         };
@@ -579,7 +587,19 @@ impl Config {
             }
         }
 
-        self.env_vars.iter().for_each(|(var, val)| set(var, val));
+        // A composed `PATH` may extend the layout default by referring to it
+        // as `$PATH` or `${PATH}`; expand that reference so the default
+        // directories are not lost. Every other variable stays literal.
+        self.env_vars.iter().for_each(|(var, val)| {
+            if var == "PATH" {
+                let expanded = val
+                    .replace("${PATH}", default_path)
+                    .replace("$PATH", default_path);
+                set(var, &expanded);
+            } else {
+                set(var, val);
+            }
+        });
         env
     }
 
@@ -942,6 +962,47 @@ mod tests {
 
         assert_eq!(env.get("LANG").map(String::as_str), Some("en_GB.UTF-8"));
         assert_eq!(env.get("EDITOR").map(String::as_str), Some("hx"));
+    }
+
+    /// A composed `PATH` that refers to `$PATH` (or `${PATH}`) extends the
+    /// layout default instead of replacing it verbatim; a `PATH` without a
+    /// reference, and any other variable, stay literal.
+    #[test]
+    fn a_composed_path_expands_its_self_reference() {
+        let mut config = session_config();
+        config
+            .env_vars
+            .insert("PATH".to_string(), "/opt/bin:$PATH".to_string());
+        config
+            .env_vars
+            .insert("EDITOR".to_string(), "hx:$PATH".to_string());
+
+        let env = config.command_env();
+
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/opt/bin:/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin"),
+        );
+        // A non-PATH variable containing `$PATH` stays literal.
+        assert_eq!(env.get("EDITOR").map(String::as_str), Some("hx:$PATH"));
+
+        let mut braced = session_config();
+        braced
+            .env_vars
+            .insert("PATH".to_string(), "/opt/bin:${PATH}".to_string());
+        assert_eq!(
+            braced.command_env().get("PATH").map(String::as_str),
+            Some("/opt/bin:/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin"),
+        );
+
+        let mut literal = session_config();
+        literal
+            .env_vars
+            .insert("PATH".to_string(), "/opt/bin".to_string());
+        assert_eq!(
+            literal.command_env().get("PATH").map(String::as_str),
+            Some("/opt/bin"),
+        );
     }
 
     /// A build sandbox keeps the layout it always had — the extraction of this
