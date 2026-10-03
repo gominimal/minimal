@@ -116,7 +116,8 @@
 #   github_only_allowlist            NET-066/067/072/073/136 + NET-068's e2e
 #                                    half: a hostname-only allowlist runs a
 #                                    real toolchain against github.com and
-#                                    friends, refuses and logs an answer into
+#                                    friends, reaches nothing at all beyond
+#                                    them, refuses and logs an answer into
 #                                    a denied range, answers AAAA/HTTPS/SVCB
 #                                    empty, and lets boxes reach each other by
 #                                    name under both boxes' rules
@@ -4937,10 +4938,14 @@ proof_switch_answers_no_arp_for_the_proxy_address() {
 # the box-zone connects a sibling pair's declarations decided — boxes
 # reaching each other BY NAME, under both boxes' rules.
 #
+# The title's other half is proved from the same box, straight after the
+# fetches: a name the declaration does not name must reach nothing at all,
+# and the window must hold no admission for it.
+#
 # Ordered LAST in the whole-lane run on purpose: it restarts the daemon (see
 # the RUST_LOG note inside) and nothing after it depends on the one before.
 proof_github_only_allowlist() {
-  echo "::group::github-only allowlist: toolchain fetches, one refused answer, empty lookups, box-zone reach"
+  echo "::group::github-only allowlist: toolchain fetches, nothing else, one refused answer, empty lookups, box-zone reach"
 
   # Own-address enforcement lives on the switch: the gate that admits a
   # resolved name's answers is the box's own relay
@@ -4960,6 +4965,7 @@ proof_github_only_allowlist() {
   GOA_D_NAME="e2e-goa-denied"     # the denied-range box
   GOA_P1_NAME="e2e-goa-peer1"     # box-zone peer one
   GOA_P2_NAME="e2e-goa-peer2"     # box-zone peer two
+  GOA_Z_NAME="e2e-goa-nofabric"   # the source-half box: allowed no plane entry
   GOA_P1_PORT=18091               # P1's published responder
   GOA_P2_PORT=18092               # P2's published responder (the reverse leg)
   GOA_CLOSED_PORT=18093           # published by nothing: the conjunction's target half
@@ -5032,6 +5038,27 @@ proof_github_only_allowlist() {
     [ -n "$2" ] && [ "$2" != "HTTP:000" ] && return 0
     return 1
   }
+  # Whether $1 carries the tracing field $2 as $3, whichever log shape this
+  # lane reads. The VM lanes read the guest daemon's console, where tracing
+  # prints a field inline — bare for a `%`-sigil or numeric one
+  # (`target_pass=false`, `source=100.64.0.10`) and quoted for a plain string
+  # one (`session_id="100.64.0.10"`, the rendering the daemon's own unit
+  # tests assert on) — and a native run reads the file log, where the same
+  # field lands as JSON (`"target_pass":false`, `"session_id":"100.64.0.9"`).
+  # A field asserted on must hold in both, or a case that passes on one lane
+  # fails on the other for no reason either lane did anything to deserve.
+  goa_field_is() {
+    case "$1" in
+      *"$2=$3"* | *"$2=\"$3\""* | *"\"$2\":$3"* | *"\"$2\":\"$3\""*) return 0 ;;
+    esac
+    return 1
+  }
+  # The lines of $1 whose record is $2 — one record per line on both log
+  # shapes — so a field check reads one record's own line and cannot borrow
+  # a field off some other record's.
+  goa_records_named() {
+    printf '%s\n' "$1" | grep -F -- "$2" || true
+  }
 
   # The daemon's filter comes from RUST_LOG at spawn, and this lane runs it
   # at `warn` — which drops the DEBUG records half this case reads back: the
@@ -5054,9 +5081,9 @@ proof_github_only_allowlist() {
   # The toolchain box gets its own seed: the shell stack (for bash, curl and
   # socat — no package of the toolchain provides those) plus the toolchain
   # packages the minvmd VM harness composes for NET-068, and the DNS probe.
-  # The other three boxes need only the shell stack, so they share one seed
-  # (a path that already has a session mints another with a warning — the
-  # duplicate check is advisory — and nothing of the boxes is shared).
+  # Every other box in this case needs only the shell stack, so they share
+  # one seed (a path that already has a session mints another with a warning
+  # — the duplicate check is advisory — and nothing of the boxes is shared).
   GOA_T_SEED_DIR="$(hook_mktemp /tmp/mnlgoat.XXXXXX)"
   {
     hook_seed_preamble
@@ -5244,18 +5271,41 @@ GOA_PROBE_EOF
   # is UDP and the declaration allows tcp alone — the resolver carve-out
   # (NET-079) carries it, and the fetches below completing is that proof's
   # own evidence. Each leg prints the admissions the DNS gate made for it,
-  # which are the only grants it could have reached anything by.
+  # which are the only grants it could have reached anything by. One failed
+  # fetch is retried once, because these four legs are the only ones in the
+  # case whose failure can be a registry having a bad minute rather than
+  # the gate's — and a lone attempt cannot tell the two apart.
   goa_fetch() {
     local label="$1" cmd="$2"
-    local before out rc
+    local before out rc text
     before="$(goa_log_lines)"
+    echo "fetch $label: $cmd"
     out="$(mnl session exec "$goa_t_sid" "$cmd" 2>"$WORK/goa-$label.err")"
     rc=$?
-    echo "fetch $label: $cmd"
+    if [ "$rc" -ne 0 ]; then
+      # The retry keeps the window opening at the first attempt, so the
+      # admissions either attempt produced are all in the one window this
+      # leg reads back.
+      echo "  -> exit $rc on the first attempt; retrying once"
+      out="$(mnl session exec "$goa_t_sid" "$cmd" 2>"$WORK/goa-$label.err")"
+      rc=$?
+    fi
     goa_print_net_since "$before" "admitted a resolved name"
     echo "  -> exit $rc"
     if [ "$rc" -ne 0 ]; then
-      echo "::error::$label did not complete (exit $rc) — a hostname-only allowlist must admit every host the tool touches; the window above names the hosts it did, so a host missing from it is the one to add to the declaration"
+      # A 429 or a server-side 5xx from an upstream is their outage, not
+      # this box's DNS gate, and the error line says so when the tool's own
+      # output shows one — so a registry having a bad minute is not read as
+      # a gate regression. It is still a failure: the leg is never skipped
+      # for it, and the retry above already gave the registry its second
+      # chance.
+      text="$out
+$(cat "$WORK/goa-$label.err" 2>/dev/null || true)"
+      if grep -qiE 'toomanyrequests|429|5(00|02|03|04)' <<<"$text"; then
+        echo "::error::$label did not complete (exit $rc), and its output carries a rate-limit or registry-server status (toomanyrequests/429/5xx) — the upstream looks unavailable, which is not this box's DNS gate, but the leg still fails"
+      else
+        echo "::error::$label did not complete (exit $rc) — a hostname-only allowlist must admit every host the tool touches; the window above names the hosts it did, so a host missing from it is the one to add to the declaration"
+      fi
       echo "--- stderr tail ---"; tail -20 "$WORK/goa-$label.err" 2>/dev/null || true
       fail
     fi
@@ -5268,6 +5318,68 @@ GOA_PROBE_EOF
   goa_fetch "npm" "/usr/bin/timeout 90 sh -c 'mkdir -p /tmp/npm-stub && cd /tmp/npm-stub && npm install is-odd --prefix .'"
   goa_fetch "pip" "/usr/bin/timeout 90 pip3 install --target /tmp/pip-stub requests"
   goa_fetch "skopeo" "/usr/bin/timeout 90 skopeo --insecure-policy copy docker://docker.io/library/hello-world dir:/tmp/hw"
+
+  # ---- the title's other half: a name the declaration does not name ---------
+  # The fetches above are the allowed half; the other half is that a name
+  # with no --allow-dns-hosts entry reaches NOTHING. One GET from the same
+  # box, and the assertions are on the outcome — no HTTP response arrived,
+  # whichever way the stack refused it — and on the gate's own record: no
+  # admission for the name, which is the one grant the box's dead subnet
+  # rule could ever have carried a connect on. A reply whose name the gate
+  # does not recognize pins nothing and warns nothing, so the absence has
+  # to be read out of the log rather than inferred from the failure. The
+  # fetches this same run completed are the live control, so the leg is
+  # never skipped for network conditions: a host that cannot reach the
+  # internet fails them first.
+  goa_x_before="$(goa_log_lines)"
+  goa_x_start="$(now_ms)"
+  mnl session exec "$goa_t_sid" \
+    "curl -sS --max-time 10 -o /dev/null -w 'HTTP:%{http_code}' https://example.org" \
+    >"$WORK/goa-example.out" 2>"$WORK/goa-example.err"
+  goa_x_rc=$?
+  goa_x_elapsed=$(( $(now_ms) - goa_x_start ))
+  goa_x_status="$(cat "$WORK/goa-example.out" 2>/dev/null)"
+  goa_x_err="$(tr '\n' ' ' < "$WORK/goa-example.err" 2>/dev/null)"
+  # How it was refused decides what the window is worth waiting for: a
+  # dropped connect owes the log its egress drop (and the asynchronous
+  # writer a moment to land it), a refused lookup owes nothing. The
+  # violation line is printed, never asserted on — this box has been
+  # dropping frames under this rule since the fetches, so R2.7's
+  # per-box-per-rule minute may lawfully have suppressed it here.
+  if grep -qiE 'could not resolve host|name or service not known|resolv.*timed out' <<<"$goa_x_err"; then
+    goa_print_net_since "$goa_x_before" ""
+    goa_x_way="the lookup reached no address the gate had admitted"
+  elif grep -qiE 'timed out|timeout' <<<"$goa_x_err"; then
+    goa_print_net_since "$goa_x_before" "network policy violation"
+    goa_x_way="the connect was silently dropped"
+  elif grep -qi 'reset by peer' <<<"$goa_x_err"; then
+    goa_print_net_since "$goa_x_before" ""
+    echo "::error::the undeclared-name connect was reset, not dropped — something answered a SYN the box's rules refuse"
+    cat "$WORK/goa-example.err" 2>/dev/null || true
+    fail
+  else
+    goa_print_net_since "$goa_x_before" ""
+    echo "::error::the undeclared-name GET failed a way this gate cannot account for: a hostname-only box refuses a name it did not declare by a refused lookup or a silently dropped connect, and curl's report names neither (exit $goa_x_rc: ${goa_x_err:-<none>})"
+    fail
+  fi
+  echo "undeclared-name GET https://example.org -> rc=$goa_x_rc status=${goa_x_status:-<none>} elapsed=${goa_x_elapsed}ms curl: ${goa_x_err:-<none>}"
+  if goa_curl_answered "$goa_x_rc" "${goa_x_status:-}"; then
+    echo "::error::the hostname-only box answered a GET of example.org — a name the declaration does not name, so any reach it travelled is a grant the gate never made"
+    cat "$WORK/goa-example.err" 2>/dev/null || true
+    fail
+  fi
+  if [ "$goa_x_way" = "the connect was silently dropped" ] && [ "$goa_x_elapsed" -lt 6000 ]; then
+    echo "::error::the undeclared-name connect failed in ${goa_x_elapsed}ms — a fast refusal. The fetches in this same run resolved and reached github.com, so a fast failure here is the box's own doing, not weather"
+    cat "$WORK/goa-example.err" 2>/dev/null || true
+    fail
+  fi
+  goa_x_admits="$(goa_records_named "$GOA_RECORDS" 'admitted a resolved name' | grep -F -- 'example.org' || true)"
+  if [ -n "$goa_x_admits" ]; then
+    echo "::error::the DNS gate admitted example.org — a name the declaration does not name, so the hostname-only posture is open"
+    printf '%s\n' "$goa_x_admits" | sed 's/^/  /'
+    fail
+  fi
+  echo "nothing else OK: example.org reached no HTTP response ($goa_x_way), and the window holds no admission for it — so the only reach the fetches above used was the gate's"
 
   # ---- NET-136: AAAA, HTTPS and SVCB lookups get empty answers -------------
   # The A control first, from the same box, the same name and the same
@@ -5390,9 +5502,15 @@ GOA_PROBE_EOF
   # half its published port set. Both directions complete, so the reach
   # holds under both boxes' rules; a port the target never published is
   # refused by the target's half (the connect dies at the switch, nothing
-  # resets it); and the hostname-only box, allowed no plane entry, is
-  # refused by the source's half — its own egress leg drops the SYN before
-  # the switch ever sees it, so the target's relay logs nothing.
+  # resets it); and a box allowed no plane entry at all is refused by the
+  # source's half — its own egress leg drops the SYN before the switch ever
+  # sees it, so the target's relay logs nothing. That last leg runs from a
+  # FRESH box, not from the toolchain box: the violation line it reads is
+  # rate-limited to one per source box and rule per minute (WARN_MIN_INTERVAL,
+  # crates/minimald/src/net/policy.rs), and the toolchain box has been
+  # dropping frames under this rule since its fetches, so an earlier drop
+  # inside the minute lawfully suppresses the line and the leg fails
+  # falsely. A box with nothing behind it has dropped nothing yet.
   goa_p1_sid="$(cd "$GOA_SEED_DIR" && mnl session activate . --no-prompt \
     --name "$GOA_P1_NAME" --network own_ip \
     --allow-subnets 100.64.0.0/10 --allow-protocols tcp \
@@ -5454,15 +5572,52 @@ GOA_PROBE_EOF
     }
   done
 
+  # The source-half box: a fifth box, allowed only the documentation range, so
+  # its egress rules refuse the fabric on their own — the target's published
+  # port would have admitted the connect, and it is the source's half that
+  # must be shown refusing it. Fresh off the shared seed for the rate-limit
+  # reason above, and it needs its switch lease: R2.7 attributes a violation
+  # to the box's own session, which the daemon renders as that address, so
+  # the leg below holds the record to it. A box ships no iproute2 — the
+  # fib_trie read is the switch-ARP proof's own way in.
+  goa_z_sid="$(cd "$GOA_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$GOA_Z_NAME" --network own_ip \
+    --allow-subnets "$GOA_DEAD_CIDR" --allow-protocols tcp \
+    2>"$WORK/goa-activate-z.err")" || {
+    echo "::error::'min session activate' for the no-fabric box failed"
+    echo "--- stderr ---"; cat "$WORK/goa-activate-z.err" 2>/dev/null || true
+    fail
+  }
+  goa_z_sid="$(printf '%s\n' "$goa_z_sid" | tail -n1 | tr -d '\r')"
+  echo "no-fabric box: $goa_z_sid ($GOA_Z_NAME)"
+  mnl session exec "$goa_z_sid" sh -c 'cat /proc/net/fib_trie' \
+    >"$WORK/goa-z-fib.out" 2>"$WORK/goa-z-fib.err" || {
+    echo "::error::could not read /proc/net/fib_trie from the no-fabric box"
+    cat "$WORK/goa-z-fib.err" 2>/dev/null || true
+    fail
+  }
+  goa_z_ip="$(awk '/\|--/ { addr = $2 }
+                   /\/32 host LOCAL/ && addr !~ /^127\./ { print addr; exit }' "$WORK/goa-z-fib.out")"
+  if [ -z "$goa_z_ip" ]; then
+    echo "::error::could not determine the no-fabric box's switch address from /proc/net/fib_trie — the source-half leg below has no session to attribute its violation record to"
+    echo "--- fib_trie ---"; cat "$WORK/goa-z-fib.out" 2>/dev/null || true
+    fail
+  fi
+  echo "  -> its switch lease (the session its violation records are attributed to): $goa_z_ip"
+
   # One cross-box connect, reported: the status, then the window's box-zone
   # records — the answer's validation (it pins nothing) and the connect
   # decision (source_pass/target_pass, the conjunction) — then the
   # assertion. $1 = source box, $2 = label, $3 = url, $4 = marker (a
   # completing leg asserts it; "" = the leg must be refused), $5 = the
-  # record the leg owes the log.
+  # record the leg owes the log, $6 (optional) = a field of that record the
+  # leg must see as false, by its name alone: the conjunction's halves are
+  # each visible in the decision record, and a leg one half refused pins
+  # that half there, so the refusal is read off the record that made it
+  # rather than inferred from the connect dying.
   goa_zone_leg() {
-    local box="$1" label="$2" url="$3" marker="$4" want="$5"
-    local before start rc elapsed status err body
+    local box="$1" label="$2" url="$3" marker="$4" want="$5" half="${6:-}"
+    local before start rc elapsed status err body records
     before="$(goa_log_lines)"
     start="$(now_ms)"
     mnl session exec "$box" \
@@ -5477,6 +5632,15 @@ GOA_PROBE_EOF
     if [[ "$GOA_RECORDS" != *"$want"* ]]; then
       echo "::error::zone leg $label left no '$want' record in the daemon log — the connect decision this case owes the transcript did not happen"
       fail
+    fi
+    if [ -n "$half" ]; then
+      records="$(goa_records_named "$GOA_RECORDS" "$want")"
+      if ! goa_field_is "$records" "$half" false; then
+        echo "::error::zone leg $label's '$want' record does not carry $half=false — the conjunction's half that refused this connect is what that record is for, and it is not in it"
+        printf '%s\n' "$records" | sed 's/^/  /'
+        fail
+      fi
+      echo "  -> the decision record says $half=false: the conjunction's $half half refused this connect"
     fi
     if [ -n "$marker" ]; then
       if ! goa_curl_answered "$rc" "${status:-}" || [ "$status" != "HTTP:200" ]; then
@@ -5517,19 +5681,32 @@ GOA_PROBE_EOF
     "box-zone connection decided at connect"
   goa_zone_leg "$goa_p1_sid" "peer1-to-peer2-unpublished" \
     "http://$GOA_P2_NAME.min.internal:$GOA_CLOSED_PORT/" "" \
-    "box-zone connection decided at connect"
-  goa_zone_leg "$goa_t_sid" "toolchain-to-peer2" \
+    "box-zone connection decided at connect" target_pass
+  goa_zone_leg "$goa_z_sid" "nofabric-to-peer2" \
     "http://$GOA_P2_NAME.min.internal:$GOA_P2_PORT/" "" \
     "network policy violation"
+  # R2.7's `session_id`: the source-half leg's violation must be attributed to
+  # the no-fabric box's own session — its switch lease — not to whichever box
+  # dropped something in the same window. One box's drop being
+  # distinguishable from another's is that field's whole point, and this
+  # leg's refusal is the source box's own doing, so the record that says so
+  # must name it.
+  if ! goa_field_is "$(goa_records_named "$GOA_RECORDS" 'network policy violation')" session_id "$goa_z_ip"; then
+    echo "::error::the source-half leg's 'network policy violation' record is not attributed to the no-fabric box's own session ($goa_z_ip) — R2.7's session_id is what makes one box's drop distinguishable from another's, and the record does not name it"
+    printf '%s\n' "$GOA_RECORDS" | sed 's/^/  /'
+    fail
+  fi
+  echo "  -> the violation record names the source box's own session ($goa_z_ip)"
   echo "NET-072/073 OK: boxes reached each other by name under both boxes' rules; the target's unpublished port and the plane-less box were refused"
 
   mnl session destroy --force "$goa_t_sid" >/dev/null 2>&1 || true
   mnl session destroy --force "$goa_d_sid" >/dev/null 2>&1 || true
   mnl session destroy --force "$goa_p1_sid" >/dev/null 2>&1 || true
   mnl session destroy --force "$goa_p2_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$goa_z_sid" >/dev/null 2>&1 || true
   rm -rf "$GOA_T_SEED_DIR"; GOA_T_SEED_DIR=""
   rm -rf "$GOA_SEED_DIR"; GOA_SEED_DIR=""
-  echo "github-only allowlist OK (toolchain fetched, one refused answer logged, AAAA/HTTPS/SVCB answered empty, boxes reached each other by name)"
+  echo "github-only allowlist OK (toolchain fetched, nothing else reached, one refused answer logged, AAAA/HTTPS/SVCB answered empty, boxes reached each other by name)"
   echo "::endgroup::"
 }
 
