@@ -1398,8 +1398,16 @@ mod tests {
         assert_eq!(withdrawn.path, "/services/forwarder/unexpose");
         assert_eq!(withdrawn.local, format!("{PUBLISHED}:{port}"));
         assert!(!gate.admits_tcp(port));
+        // The supervisor and the program it forked go down together, as the
+        // one process group the launch put them in, so neither outlives the
+        // proof.
+        // SAFETY: `kill` takes a signal number and a process-group id, both
+        // plain integers, and reads no user memory; the id is the group
+        // `process_group` gave this launch, and nothing else signals it.
         let _ = unsafe { libc::kill(-(supervisor.id() as libc::pid_t), libc::SIGKILL) };
-        let _ = supervisor.wait();
+        supervisor
+            .wait()
+            .expect("the box's supervisor reaps after its group is killed");
         server.abort();
     }
 
