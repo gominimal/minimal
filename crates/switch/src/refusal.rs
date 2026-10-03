@@ -846,15 +846,16 @@ impl RefusalEmitter {
     /// live window or not, because nothing after it exists to carry one.
     fn drain(&self, limiter: &mut Limiter, expired_at: Option<Instant>) -> Vec<String> {
         let mut lines = std::mem::take(&mut limiter.owed);
-        let windows = limiter
-            .rows
-            .iter_mut()
-            .map(|row| &mut row.window)
-            .chain(limiter.overflow.values_mut().map(|bucket| &mut bucket.window));
+        let windows = limiter.rows.iter_mut().map(|row| &mut row.window).chain(
+            limiter
+                .overflow
+                .values_mut()
+                .map(|bucket| &mut bucket.window),
+        );
         for window in windows {
-            if expired_at.is_some_and(|now| {
-                now.saturating_duration_since(window.started) < self.window
-            }) {
+            if expired_at
+                .is_some_and(|now| now.saturating_duration_since(window.started) < self.window)
+            {
                 continue;
             }
             if let Some(line) = self.take_owed(window) {
@@ -1513,7 +1514,10 @@ mod tests {
             flood.refuse(&refusal_from(dropped), true, t1),
             Outcome::Emit(_)
         ));
-        assert_eq!(flood.refuse(&refusal_from(dropped), true, t1), Outcome::Quiet);
+        assert_eq!(
+            flood.refuse(&refusal_from(dropped), true, t1),
+            Outcome::Quiet
+        );
         // Past dropped's, held's refusal takes its row the same way — and
         // the queue is full, so dropped's count is the one the bound drops:
         // the oldest line is the one a drain writes first.
@@ -1533,7 +1537,9 @@ mod tests {
             "the oldest line is the one the drain writes: {drained:?}"
         );
         assert!(
-            drained.iter().all(|line| !line.contains("source=100.64.0.12")),
+            drained
+                .iter()
+                .all(|line| !line.contains("source=100.64.0.12")),
             "the dropped row's count is the one the bound drops: {drained:?}"
         );
     }

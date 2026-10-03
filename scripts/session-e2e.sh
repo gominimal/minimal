@@ -146,8 +146,11 @@
 #   unpublished_port_refused_on_vm_host
 #                                    NET-014's VM-lane half: a peer box's
 #                                    connect to a box's unpublished port is
-#                                    refused within 5 s, never timed out,
-#                                    and where a published name reaches the
+#                                    refused within 5 s, never timed out;
+#                                    the host's own connect to the box's
+#                                    published address on an unpublished
+#                                    port is refused the same way, and
+#                                    where a published name reaches the
 #                                    box from the host the host's own
 #                                    connect through that name gets the
 #                                    same refusal
@@ -7816,8 +7819,8 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
 # zone leg included — on every lane that has a switch; THIS case is the VM
 # host's own half of the same requirement, driven where the fabric it
 # describes exists: boxes the VM host daemon registered, the in-guest relay
-# that answers their SYNs, and the host gate that fronts it. Two legs, one
-# transcript line each:
+# that answers their SYNs, and the host gate that fronts it. Three legs,
+# one transcript line each:
 #
 #   * the peer leg — a peer box connects to the target's UNPUBLISHED port by
 #     name and must be refused with the kernel's own connection-refused
@@ -7828,8 +7831,32 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
 #     this peer to this box a moment before, so a fast refusal below can
 #     only be the unpublished port's own.
 #
-#   * the host leg — WHERE a published name reaches the box from the host.
-#     The control IS the condition: the host connects through
+#   * the host address leg — the host connects to the box's PUBLISHED
+#     ADDRESS, the loopback one the VM host daemon allocated it, on a port
+#     nothing published. Host-side forwarders bind only admitted ports, so
+#     a host SYN to an unpublished port is refused by the host kernel and
+#     never reaches the VM: the leg proves the published address refuses
+#     fast — the same connection-refused shape (curl exit 7) within the 5 s
+#     NET-014 asks for, never the connect timeout a silent drop reads as
+#     (exit 28). The control is the condition, the peer leg's own doctrine:
+#     the host reaches the same address's PUBLISHED port and the marker
+#     answers, and the port the leg then refuses is probed first — a port
+#     something on this host answers at that address proves nothing about
+#     the address, and under the macOS 127.0.0.1 interim the published
+#     address IS the shared host loopback, where anything may be listening.
+#     The address itself comes from the VM host daemon's registration
+#     record: neither `min session policy` (which prints a declared mapping
+#     without the address it publishes on) nor the session-start line
+#     (which names only the switch address) carries it, and the daemon's
+#     record — the same one the box-register proof reads its address pair
+#     from — is the one in-tree word for the pair it allocated. The record
+#     is INFO and a daemon's log filter is fixed at spawn, so the case
+#     stops the daemon pair first and lets its own activation autospawn a
+#     host daemon pinned command-locally one step wider than the lane's
+#     `warn,minimald::exec=info`, which drops it.
+#
+#   * the host name leg — WHERE a published name reaches the box from the
+#     host. The control IS the condition: the host connects through
 #     `<name>.min.internal` to the target's published port, every proxy
 #     variable stripped from curl's environment, and the marker answers.
 #     Where that holds, the host's own connect through the same name to the
@@ -7846,13 +7873,22 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
 # refused, the transcript shows the same `rule_matched=… address=… port=…
 # reason=… source=… refusals=N` line (printed, never asserted; the legs
 # assert the refused shape, and the window is the evidence of which leg
-# answered).
+# answered). The address leg's window is printed without the poll for one
+# reason of its own: a SYN its host kernel refuses never reaches the VM,
+# so the leg's expectation is the EMPTY window — and printing it is what
+# shows the refusal came from before the fabric, not through it.
 proof_unpublished_port_refused_on_vm_host() {
   local upr_t_sid="" upr_p_sid="" upr_ready=""
   local upr_ctl_rc="" upr_ctl_status="" upr_ctl_body=""
   local upr_ref_rc="" upr_ref_ms="" upr_ref_status="" upr_ref_err="" upr_ref_answered=""
+  local upr_arec="" upr_addr="" upr_log0="" upr_log0_lines=0
+  local upr_actl_rc="" upr_actl_status="" upr_actl_body=""
+  local upr_probe_rc="" upr_closed_host="" upr_cand=""
+  local upr_aref_rc="" upr_aref_ms="" upr_aref_status="" upr_aref_err="" upr_aref_answered=""
+  local upr_w=""
   local upr_hctl_rc="" upr_hctl_status="" upr_hctl_body=""
   local upr_href_rc="" upr_href_ms="" upr_href_status="" upr_href_err="" upr_href_answered=""
+  local upr_peer_leg="" upr_addr_leg="" upr_name_leg=""
   local upr_before="" upr_start=""
   local upr_t_name="e2e-unpub-target" upr_p_name="e2e-unpub-peer"
   local upr_pub_port=18101 upr_closed_port=18102
@@ -7926,6 +7962,52 @@ proof_unpublished_port_refused_on_vm_host() {
     fi
   }
 
+  # The VM HOST daemon's file log (the proxy case's same sink, newest
+  # first: a dated rotation sorts after the unsuffixed name) — and the
+  # lines this case's own daemon gained, scoped by the snapshot below, so
+  # an earlier run's record for the same box name cannot stand in for this
+  # one's: the files accumulate across runs and days.
+  upr_host_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
+      | sort -r | head -n1
+  }
+  upr_case_log() {
+    local f
+    f="$(upr_host_log)"
+    [ -n "$f" ] || return 0
+    if [ "$f" = "$upr_log0" ] && [ "${upr_log0_lines:-0}" -gt 0 ]; then
+      tail -n +"$((upr_log0_lines + 1))" "$f" 2>/dev/null
+    else
+      # A rotation mid-case: the newest file postdates the snapshot, so
+      # every line in it is this case's own daemon's.
+      cat "$f" 2>/dev/null
+    fi
+  }
+
+  # The host address leg below connects by the box's PUBLISHED ADDRESS, and
+  # the only in-tree word for that address is the registration record the
+  # VM host daemon writes when it allocates the box's row (see the header).
+  # The record is INFO and a daemon's log filter is fixed at spawn from the
+  # RUST_LOG it inherits, and this lane runs the whole script at
+  # `warn,minimald::exec=info`, which drops it — so stop whatever daemon
+  # pair is up (the proxy case's idiom, both of the pair: the session
+  # daemon `min stop` reaches and, on a VM lane, the host daemon `minvmd
+  # stop` does, the one whose environment the pin must reach) and let this
+  # case's own activation below autospawn a fresh host daemon carrying it.
+  # The case stops the pair again on its way out, so the pin never leaks
+  # into the rest of the lane. The snapshot of the host log is taken now,
+  # before the daemon exists, so the record the case reads can only be this
+  # case's own.
+  mnl stop --force >/dev/null 2>&1 || true
+  if [ -n "$E2E_VM" ]; then
+    minvmd stop >/dev/null 2>&1 || true
+  fi
+  upr_log0="$(upr_host_log)"
+  upr_log0_lines=0
+  if [ -n "$upr_log0" ]; then
+    upr_log0_lines="$(wc -l <"$upr_log0" 2>/dev/null)" || upr_log0_lines=0
+  fi
+
   # Two seeds, two dirs on purpose: a path that already holds a live session
   # mints no second one (the browser-path proof's own note), and this case
   # needs two boxes at once.
@@ -7940,7 +8022,8 @@ proof_unpublished_port_refused_on_vm_host() {
   # nothing, so a name's answer can never be the grant, NET-072) — and the
   # target declares its one published port: the control the refusal below
   # is read against, never a substitute for it.
-  upr_t_sid="$(cd "$UPR_T_SEED_DIR" && mnl session activate . --no-prompt \
+  upr_t_sid="$(cd "$UPR_T_SEED_DIR" && RUST_LOG="warn,minimald::exec=info,minvmd=info" \
+    mnl session activate . --no-prompt \
     --name "$upr_t_name" --network own_ip \
     --allow-subnets 100.64.0.0/10 --allow-protocols tcp \
     --ingress "$upr_pub_port:$upr_pub_port" \
@@ -7950,6 +8033,30 @@ proof_unpublished_port_refused_on_vm_host() {
     fail
   }
   upr_t_sid="$(printf '%s\n' "$upr_t_sid" | tail -n1 | tr -d '\r')"
+  # The target's published loopback address, straight from the registration
+  # record the activation just made the host daemon write — one INFO line
+  # naming the box and the address pair it allocated, this case's own
+  # daemon only (the snapshot above scopes the read), and the same record
+  # the box-register proof reads its pair from. The host address leg below
+  # connects by this address; without it there is no leg to run.
+  upr_addr=""
+  for _ in $(seq 1 40); do
+    upr_arec="$(upr_case_log | grep -F "\"box\":\"$upr_t_name\"" \
+      | grep -F 'registered box with the VM host daemon; addresses allocated' | tail -n1)"
+    upr_addr="$(printf '%s\n' "$upr_arec" \
+      | sed -n 's/.*"loopback_address":"\([0-9.]*\)".*/\1/p')"
+    [ -n "$upr_addr" ] && break
+    sleep 0.25
+  done
+  if [ -z "$upr_addr" ]; then
+    echo "::error::the VM host daemon's log carries no registration record naming box '$upr_t_name' and the loopback address it allocated after activate — the host address leg connects by that address and cannot run without it"
+    echo "--- minvmd log (tail) ---"
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log.*' -type f \
+      -exec tail -n 40 {} + 2>/dev/null || true
+    fail
+  fi
+  echo "VM host daemon record: $upr_arec"
+  echo "the target's published loopback address: $upr_addr"
   upr_p_sid="$(cd "$UPR_P_SEED_DIR" && mnl session activate . --no-prompt \
     --name "$upr_p_name" --network own_ip \
     --allow-subnets 100.64.0.0/10 --allow-protocols tcp \
@@ -8046,10 +8153,106 @@ proof_unpublished_port_refused_on_vm_host() {
     cat "$WORK/upr-ref.err" 2>/dev/null || true
     fail
   fi
-  echo "peer leg: the peer box's connect to $upr_t_name.min.internal:$upr_closed_port (published by nothing) -> refused in ${upr_ref_ms} ms (curl exit $upr_ref_rc, never the timeout), while the control reached this same box's published port in this same run; curl: ${upr_ref_err:-<none>}"
+  upr_peer_leg="refused in ${upr_ref_ms} ms (curl exit $upr_ref_rc, never the timeout)"
+  echo "peer leg: the peer box's connect to $upr_t_name.min.internal:$upr_closed_port (published by nothing) -> $upr_peer_leg, while the control reached this same box's published port in this same run; curl: ${upr_ref_err:-<none>}"
   upr_print_net_since "$upr_before" 'no ingress mapping'
 
-  # ---- the host leg: WHERE a published name reaches the box from the host -
+  # ---- the host address leg: the published address refuses fast -------------
+  # The control is the condition, the peer leg's own doctrine: the host
+  # reaches the target's PUBLISHED port at the address the host daemon
+  # allocated it, every proxy variable stripped from curl's environment
+  # (NET-009's rule — no client anywhere needs configuring), and the marker
+  # answers. Without that, a refusal below could not be told from a dead
+  # route.
+  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+    -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+    curl -sS --max-time 8 -o "$WORK/upr-actl.body" -w 'HTTP:%{http_code}' \
+    "http://$upr_addr:$upr_pub_port/" \
+    >"$WORK/upr-actl.out" 2>"$WORK/upr-actl.err"
+  upr_actl_rc=$?
+  upr_actl_status="$(cat "$WORK/upr-actl.out" 2>/dev/null)"
+  upr_actl_body="$(cat "$WORK/upr-actl.body" 2>/dev/null || true)"
+  echo "control: the host's GET http://$upr_addr:$upr_pub_port/ (the published port, at the box's published address) -> ${upr_actl_status:-<none>} ${upr_actl_body:-<no body>}"
+  if [ "$upr_actl_rc" -ne 0 ] || [ "${upr_actl_status:-}" != "HTTP:200" ] \
+     || [[ "$upr_actl_body" != *"$upr_marker"* ]]; then
+    echo "::error::the host never reached the target's published port at its published address $upr_addr — the address leg's refusal below could not be told from a dead route"
+    cat "$WORK/upr-actl.err" 2>/dev/null || true
+    fail
+  fi
+  # The port the leg refuses must be one the box publishes nothing on AND
+  # one nothing on this host answers at that address: the box publishes
+  # $upr_pub_port and nothing else, and a connect that something answers
+  # proves nothing about the address — most of all under the macOS
+  # 127.0.0.1 interim, where the published address IS the shared host
+  # loopback and anything may be listening. Probe each candidate with a
+  # short connect first and take the first one nothing answers; curl exit 0
+  # means something did.
+  upr_closed_host=""
+  for upr_cand in "$upr_closed_port" 18103 18104 18105 18106 18107 18108 18109; do
+    env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+      curl -sS --max-time 2 -o /dev/null \
+      "http://$upr_addr:$upr_cand/" >/dev/null 2>&1
+    upr_probe_rc=$?
+    [ "$upr_probe_rc" -eq 0 ] && continue
+    upr_closed_host="$upr_cand"
+    break
+  done
+  if [ -z "$upr_closed_host" ]; then
+    echo "::error::every candidate unpublished port answered at $upr_addr — the host address leg needs a port the box publishes nothing on and nothing on this host answers"
+    fail
+  fi
+  # The leg: the host's own connect to that address on the unpublished port,
+  # the same proxy-stripped curl, and the address must refuse it fast — the
+  # shape NET-014 asks of the published address, never the timeout shape of
+  # a silent drop.
+  upr_before="$(upr_log_lines)"
+  upr_start="$(now_ms)"
+  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+    -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+    curl -sS --max-time 5 -o /dev/null -w 'HTTP:%{http_code}' \
+    "http://$upr_addr:$upr_closed_host/" \
+    >"$WORK/upr-aref.out" 2>"$WORK/upr-aref.err"
+  upr_aref_rc=$?
+  upr_aref_ms=$(( $(now_ms) - upr_start ))
+  upr_aref_status="$(cat "$WORK/upr-aref.out" 2>/dev/null)"
+  upr_aref_err="$(tr '\n' ' ' < "$WORK/upr-aref.err" 2>/dev/null)"
+  # The answered rule the peer leg above already carries: curl ALWAYS writes
+  # its -w line and `HTTP:000` when nothing answered, so any real status
+  # back — or a zero exit — is an answer, and a port nothing publishes must
+  # not produce one.
+  upr_aref_answered=0
+  [ "$upr_aref_rc" -eq 0 ] && upr_aref_answered=1
+  [ -n "${upr_aref_status:-}" ] && [ "$upr_aref_status" != "HTTP:000" ] && upr_aref_answered=1
+  if [ "$upr_aref_answered" -ne 0 ]; then
+    echo "::error::the host's connect to the unpublished port ANSWERED at the target's published address (curl exit $upr_aref_rc, ${upr_aref_status:-<none>}, ${upr_aref_ms} ms) — the control above reached this same address's published port in this same run, so the answer is an enforcement hole"
+    cat "$WORK/upr-aref.err" 2>/dev/null || true
+    fail
+  fi
+  if [ "$upr_aref_rc" -ne 7 ]; then
+    echo "::error::the host's connect to the unpublished port at the target's published address $upr_addr ended in curl exit $upr_aref_rc after ${upr_aref_ms} ms, not the 7 of a refused connection — the control above reached this same address's published port, so a timeout shape here is the drop NET-014 retires"
+    cat "$WORK/upr-aref.err" 2>/dev/null || true
+    fail
+  fi
+  if [ "$upr_aref_ms" -ge 5000 ]; then
+    echo "::error::the refusal at the target's published address took ${upr_aref_ms} ms (curl exit $upr_aref_rc) — NET-014 asks for the refusal within 5 s, and one that slow is a drop that read as the timeout"
+    cat "$WORK/upr-aref.err" 2>/dev/null || true
+    fail
+  fi
+  upr_addr_leg="refused in ${upr_aref_ms} ms (curl exit $upr_aref_rc, never the timeout)"
+  echo "host address leg: the host's connect to $upr_addr:$upr_closed_host (the box's published address, a port nothing publishes) -> $upr_addr_leg; the host-side forwarders bind only admitted ports, so this SYN was refused before the fabric — the leg proves the published address refuses fast; curl: ${upr_aref_err:-<none>}"
+  # The window printed WITHOUT the poll: a SYN the host kernel refuses never
+  # reaches the VM, so the empty window is this leg's expected evidence —
+  # and a non-empty one is the interesting fact, not a failure of the leg,
+  # whose assertion is the shape above.
+  upr_w="$(upr_net_since "$upr_before")"
+  if [ -n "$upr_w" ]; then
+    printf '%s\n' "$upr_w" | sed 's/^/daemon log: /'
+  else
+    echo "daemon log: (no minimald::net record in this window — nothing forwarded this SYN into the VM)"
+  fi
+
+  # ---- the host name leg: WHERE a published name reaches the box ---------
   # The control is the condition: the host connects through the target's
   # NAME to its published port, every proxy variable stripped from curl's
   # environment (NET-009's rule — no client anywhere needs configuring), and
@@ -8065,10 +8268,12 @@ proof_unpublished_port_refused_on_vm_host() {
   upr_hctl_status="$(cat "$WORK/upr-hctl.out" 2>/dev/null)"
   upr_hctl_body="$(cat "$WORK/upr-hctl.body" 2>/dev/null || true)"
   if [ "$upr_hctl_rc" -eq 6 ]; then
-    echo "host leg: SKIPPED (no published name reaches the box from this host — $upr_t_name.min.internal did not resolve from the host with no proxy settings, curl exit 6: this host's resolver is not pointed at the box zone's answerer. Where one is, the host's own connect through the name to the unpublished port must get the same refusal — the host gate passing that SYN through to the relay that resets it)"
+    upr_name_leg="skipped (the name $upr_t_name.min.internal did not resolve from the host, curl exit 6)"
+    echo "name leg: SKIPPED (no published name reaches the box from this host — $upr_t_name.min.internal did not resolve from the host with no proxy settings, curl exit 6: this host's resolver is not pointed at the box zone's answerer. Where one is, the host's own connect through the name to the unpublished port must get the same refusal — the host gate passing that SYN through to the relay that resets it)"
   elif [ "$upr_hctl_rc" -ne 0 ] || [ "${upr_hctl_status:-}" != "HTTP:200" ] \
      || [[ "$upr_hctl_body" != *"$upr_marker"* ]]; then
-    echo "host leg: SKIPPED (the name resolved but the published port did not answer from the host — curl exit $upr_hctl_rc, ${upr_hctl_status:-<none>}; without that control a refusal below could not be told from a dead route)"
+    upr_name_leg="skipped (the name resolved but the published port did not answer from the host — curl exit $upr_hctl_rc, ${upr_hctl_status:-<none>})"
+    echo "name leg: SKIPPED (the name resolved but the published port did not answer from the host — curl exit $upr_hctl_rc, ${upr_hctl_status:-<none>}; without that control a refusal below could not be told from a dead route)"
     echo "  (host curl: $(tr '\n' ' ' < "$WORK/upr-hctl.err" 2>/dev/null))"
   else
     echo "control: the host's GET through the name to the published port -> ${upr_hctl_status:-<none>} $upr_marker (the name reaches the box from the host)"
@@ -8103,15 +8308,29 @@ proof_unpublished_port_refused_on_vm_host() {
       cat "$WORK/upr-href.err" 2>/dev/null || true
       fail
     fi
-    echo "host leg: the host's connect through $upr_t_name.min.internal:$upr_closed_port (the published name, the unpublished port) -> the same refusal, in ${upr_href_ms} ms (curl exit $upr_href_rc), the host gate passing this SYN through to the relay that reset it; curl: ${upr_href_err:-<none>}"
+    upr_name_leg="refused in ${upr_href_ms} ms (curl exit $upr_href_rc, the host gate passing this SYN through to the relay that reset it)"
+    echo "name leg: the host's connect through $upr_t_name.min.internal:$upr_closed_port (the published name, the unpublished port) -> the same refusal, in ${upr_href_ms} ms (curl exit $upr_href_rc), the host gate passing this SYN through to the relay that reset it; curl: ${upr_href_err:-<none>}"
     upr_print_net_since "$upr_before" 'no ingress mapping'
   fi
 
   mnl session destroy --force "$upr_t_sid" >/dev/null 2>&1 || true
   mnl session destroy --force "$upr_p_sid" >/dev/null 2>&1 || true
+  # Leave the lane as the case found it, in the one way it changed it: the
+  # pair this case's activation autospawned carries the minvmd=info pin
+  # that made the registration record readable, and a later case reading
+  # the same log must not inherit records a filter it never chose let
+  # through. Stopping here is the restore, not a new departure — the next
+  # case's own activation autospawns a fresh pair from the lane's own
+  # RUST_LOG, so no record the pin let through survives it.
+  mnl stop --force >/dev/null 2>&1 || true
+  if [ -n "$E2E_VM" ]; then
+    minvmd stop >/dev/null 2>&1 || true
+  fi
   rm -rf "$UPR_T_SEED_DIR"; UPR_T_SEED_DIR=""
   rm -rf "$UPR_P_SEED_DIR"; UPR_P_SEED_DIR=""
-  echo "unpublished port refused on a VM host OK (the peer box's connect to the target's unpublished port was refused within 5 s, never timed out; and where a published name reached the box from the host, the host's own connect through it got the same refusal)"
+  # Each leg says its own outcome — refused or skipped with its reason —
+  # so the line never claims a leg that did not run.
+  echo "unpublished port refused on a VM host OK (the peer box's connect to $upr_t_name.min.internal:$upr_closed_port, published by nothing, was $upr_peer_leg; the host's connect to the box's published address $upr_addr:$upr_closed_host, a port nothing publishes, was $upr_addr_leg; the host's connect through the published name to the same unpublished port was $upr_name_leg)"
   echo "::endgroup::"
 }
 
