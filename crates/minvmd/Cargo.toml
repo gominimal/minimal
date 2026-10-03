@@ -58,8 +58,15 @@ russh.workspace = true
 # `volume`).
 paths.workspace = true
 version.workspace = true
+# DNS wire parsing for the host-side DNS admission table (`net::dns_pins`,
+# NET-081 deciding NET-066/067 outside the VM): the replies the gate's
+# ingress leg observes on their way to a box are pinned only by reading
+# them. The same parser minimald's in-VM gate reads, so both legs pin from
+# the same wire.
+hickory-proto.workspace = true
 
 [dev-dependencies]
+camino.workspace = true
 serial_test.workspace = true
 tempfile.workspace = true
 russh-sftp.workspace = true
