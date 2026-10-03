@@ -705,6 +705,49 @@ async fn async_main() -> Result<(), MainError> {
         ),
     }
 
+    // NET-079: the guest's own boot load, after the tree above exists and
+    // before the decision below reads it — the one host whose table this
+    // daemon loads itself, because its kernel is its image's alone and no
+    // person can run an installer inside a microVM. The load renders the
+    // installer's table for the tree this daemon just entered its own leaf
+    // of, checks it with `nft -c`, loads it in one transaction, and writes
+    // the presence marker only once it loaded; it logs its own outcome,
+    // check line and load line with the digest of the exact bytes it piped,
+    // and nothing here branches on it — the decision below is the fact's own
+    // reader, and a boot whose load failed reports the guest as unable to
+    // decide per box exactly as a native host without the step does. The
+    // listeners the guest's effect probe connects to are held first and for
+    // the daemon's life, because the probe's evidence is a port that is
+    // refused whenever a launch looks, not one the probe brings with it.
+    if guest::is_microvm_daemon() {
+        if let Err(cause) = minimald::net::classifier::hold_probe_listeners() {
+            tracing::error!(
+                error = %cause,
+                "holding the loopback listener the guest's effect probe \
+                 connects to: without it the table's effect reads as \
+                 unreadable, and host-address boxes will be refused"
+            );
+        }
+        // NET-078's two source identities are the guest's own address on a
+        // guest — the cohort and the node plane share it — but the render is
+        // told them as the two inputs they are, never left to assume.
+        let identity = std::net::IpAddr::V4(minimald::net::DEFAULT_SUBNET.daemon_ip());
+        let render = minimald::net::classifier::GuestRender {
+            tree_root,
+            answerer_address: minimald::net::classifier::ANSWERER_ADDRESS,
+            answerer_port: zone_answerer_port.unwrap_or(minimald::net::answerer::ANSWERER_PORT),
+            cohort_address: identity,
+            node_plane_address: identity,
+            ct_mark_mask: minimald::net::classifier::GUEST_CT_MARK_MASK,
+            mountinfo_override: None,
+        };
+        let _ = minimald::net::classifier::load_guest_table(
+            std::path::Path::new(minimald::net::classifier::GUEST_BASH),
+            std::path::Path::new(minimald::net::classifier::GUEST_NFT),
+            &render,
+        );
+    }
+
     // NET-079: the start-time fact this daemon answers every create with —
     // whether this host can decide a host-address box's egress verdict per
     // box, and why not when it cannot. Read here with its probe attached,

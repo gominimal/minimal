@@ -215,6 +215,26 @@ impl Network for HostIpAddressNetwork {
                 // `/etc/hosts` at the host's loopback.
                 return sandbox2::HostNet.plan().await;
             }
+            // NET-079: a VM host that decides per box resolves a deny-all
+            // host-address box through the guest's own answerer, at the
+            // guest's loopback — the same address and port the loaded table's
+            // dstnat retargets that subtree's DNS-port lookups onto, so the
+            // carve-out the rule admits and the resolver the box is pointed
+            // at are one fact, and nothing outside resolves. The decision the
+            // launch just read is the gate: it is read fresh before every
+            // host-address launch, and a launch's plan follows its own
+            // decision — a guest whose boot's check or load failed, whose
+            // table is gone behind its marker, or whose probe did not read a
+            // refusal falls through to the node's DNS layer below, exactly
+            // as before this host could decide.
+            if self.verdict == sandbox2::config::Verdict::Deny
+                && crate::net::classifier::freshest_decision()
+                    .is_some_and(|decision| decision.can_decide_per_box())
+            {
+                return Ok(NetPlan::host().with_resolver(Resolver::Nameservers(vec![
+                    crate::net::classifier::ANSWERER_ADDRESS,
+                ])));
+            }
             // NET-003: on a VM host, 127.0.0.1 in the namespace a host-address
             // box shares is the guest's loopback, not the host's, and the host
             // resolver `/etc/hosts` would complement is unreachable. The node's

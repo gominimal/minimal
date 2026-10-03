@@ -67,7 +67,7 @@ use sandbox2::config::Verdict;
 /// rejected (design §4.1): the rest of the host's loopback is where the
 /// host's own services and its forwarding resolver listen, and admitting a
 /// deny-all box to them would admit it to everything upstream.
-pub(crate) const ANSWERER_ADDRESS: Ipv4Addr = Ipv4Addr::LOCALHOST;
+pub const ANSWERER_ADDRESS: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
 /// Which cohort subtree `declaration` places a box's leaf in (NET-079): the
 /// deny subtree is for the declaration that admits no destination — the one
@@ -890,21 +890,454 @@ fn bind_probe_listeners() -> std::io::Result<Vec<(Family, TcpListener)>> {
     Ok(listeners)
 }
 
+/// The guest's own copy of the installer, `include_str!` of the very file the
+/// native lane runs — never a restatement: the script is the one authority
+/// for the tree it lays out and the table it renders, and a copy would be a
+/// second authority the moment either lane moved. The guest's load runs the
+/// script's render half only; the daemon has already made its own cgroups.
+const INSTALLER_SCRIPT: &str = include_str!("../../../../scripts/install-host-classifier.sh");
+
+/// Where the guest's `nft` and `bash` live, absolute: the render and the load
+/// both run with the environment cleared, so neither may depend on a `PATH`
+/// this daemon did not choose.
+pub const GUEST_NFT: &str = "/usr/sbin/nft";
+pub const GUEST_BASH: &str = "/bin/bash";
+
+/// The name of the table both lanes load, and the chain a deny-all box's
+/// verdict rides on: `nft list` must show both behind the marker for a
+/// guest's decision to rest on more than the marker's existence.
+const TABLE_NAME: &str = "minimal_class";
+const DENY_OUT_CHAIN: &str = "chain deny_out";
+
+/// The ct-mark bits the guest's own boot classifies with: the step's default,
+/// because a guest's kernel is this image's alone — there is no other
+/// ruleset whose bits could conflict, and the mask recorded beside the
+/// marker keeps the daemon's probe and the loaded table spelling one fact.
+pub const GUEST_CT_MARK_MASK: u32 = 0x3000_0000;
+
+/// The installer's rehearsal seam: honoured only where a caller names a
+/// stand-in mount table, because the production call passes `None` and the
+/// guest then reads the mount table its own kernel wrote.
+const REHEARSAL_MOUNTINFO_ENV: &str = "MINIMAL_OVERRIDE_CGROUP_MOUNTINFO";
+
+/// What the guest's own boot hands the installer's render: the tree this
+/// daemon mounted, the answerer as this daemon serves it, and NET-078's two
+/// source identities — which on a guest are both the guest's own address,
+/// but the render is told so, never left to assume.
+pub struct GuestRender<'a> {
+    /// The tree root this daemon itself laid out: `sandbox2`'s
+    /// `classifier::TREE_ROOT`, under the cgroup2 its boot mounted.
+    pub tree_root: &'a Path,
+    /// The one destination a deny-all box may reach, at the port this
+    /// daemon's answerer serves on this guest.
+    pub answerer_address: Ipv4Addr,
+    pub answerer_port: u16,
+    /// What the boxes cohort leaves as, and what everything else in the
+    /// slice leaves as.
+    pub cohort_address: IpAddr,
+    pub node_plane_address: IpAddr,
+    /// The ct-mark bits the table classifies with.
+    pub ct_mark_mask: u32,
+    /// A stand-in mount table, tests only.
+    pub mountinfo_override: Option<&'a Path>,
+}
+
+/// The guest's rendered table, by the guest's own rules: the installer is
+/// fed to `bash` on its stdin and told everything as argv — `bash -s --` —
+/// with the environment cleared, so no `BASH_ENV`, no `ENV` and no inherited
+/// `PATH` can tell bash what else to read, and no parameter is interpolated
+/// into script text. `--print-ruleset` prints the transaction an install
+/// would hand `nft -f`, which is the transaction the guest hands it.
+pub fn render_guest_ruleset(bash: &Path, params: &GuestRender<'_>) -> Result<Vec<u8>, String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut installer = Command::new(bash);
+    installer
+        .arg("-s")
+        // Ends bash's own option parsing, so the first argument after it is
+        // the script's first flag and never an option bash re-reads.
+        .arg("--")
+        .arg("--print-ruleset")
+        .arg("--root")
+        .arg(params.tree_root)
+        .arg("--answerer-address")
+        .arg(params.answerer_address.to_string())
+        .arg("--answerer-port")
+        .arg(params.answerer_port.to_string())
+        .arg("--cohort-address")
+        .arg(params.cohort_address.to_string())
+        .arg("--node-plane-address")
+        .arg(params.node_plane_address.to_string())
+        .arg("--ct-mark-mask")
+        .arg(format!("0x{:08x}", params.ct_mark_mask))
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(mountinfo) = params.mountinfo_override {
+        installer.env(REHEARSAL_MOUNTINFO_ENV, mountinfo);
+    }
+    let mut child = installer
+        .spawn()
+        .map_err(|cause| format!("spawning {}: {cause}", bash.display()))?;
+    // The script is read from the child's stdin, so feed it and close the
+    // pipe; a child that stops reading before the script ends makes the
+    // write fail, and its own output says why.
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(cause) = stdin.write_all(INSTALLER_SCRIPT.as_bytes()) {
+            tracing::debug!("the installer stopped reading its script: {cause}");
+        }
+    }
+    let printed = child
+        .wait_with_output()
+        .map_err(|cause| format!("waiting on {}: {cause}", bash.display()))?;
+    if !printed.status.success() {
+        return Err(String::from_utf8_lossy(&printed.stderr).trim().to_string());
+    }
+    Ok(printed.stdout)
+}
+
+/// What the guest's load left behind when it succeeded: the digest of the
+/// exact bytes handed to `nft`, over which no later render is ever taken.
+pub struct GuestLoad {
+    pub digest: String,
+}
+
+/// Which half of the guest's own load failed, with the refusing program's
+/// own words: the render, the check, the load itself, or the marker — named
+/// so the daemon's log says what to look at, and so the guest's decision
+/// stays `GuestTableNotLoaded` for every one of them.
+#[derive(Debug)]
+pub enum GuestLoadFailure {
+    Render(String),
+    Check(String),
+    Load(String),
+    Marker(String),
+}
+
+/// The guest's own boot load (NET-079): renders the installer's table for
+/// the tree this daemon mounted, checks it with `nft -c -f -`, loads it with
+/// `nft -f -`, and only then writes the presence marker the daemon's check
+/// reads — the same discipline the installer's own load keeps, over the
+/// same render function's bytes. The check and the load are one render's
+/// bytes, piped, never a re-render; the digest the caller logs covers
+/// exactly those bytes, the same digest the installer's own load prints.
+///
+/// A failure at any point writes no marker, so the decision below reports
+/// the guest as unable to decide per box until a boot that succeeds — and
+/// the failure is this function's to name, nft's own error included.
+pub fn load_guest_table(
+    bash: &Path,
+    nft: &Path,
+    params: &GuestRender<'_>,
+) -> Result<GuestLoad, GuestLoadFailure> {
+    // The marker's discipline first, as the installer's re-install keeps it:
+    // a marker or a stale mask record that cannot come away means the load
+    // stops before touching the table, so nothing ever vouches for a table
+    // this boot did not render.
+    clear_marker_records(params.tree_root).map_err(GuestLoadFailure::Marker)?;
+    let ruleset = render_guest_ruleset(bash, params).map_err(GuestLoadFailure::Render)?;
+    // The check is the render's own verdict on the guest's kernel — the one
+    // expression the guest's image is being fixed to carry — and it is
+    // logged as its own line, with nft's own error when it refuses, because
+    // it is the line the image's builder reads.
+    let checked = run_guest_nft(nft, true, &ruleset);
+    if let Err(cause) = checked {
+        tracing::error!(
+            error = %cause,
+            "the guest's nft -c refused the rendered classifier table: no load ran and no marker was written, so minimald reports no per-box verdict until a boot succeeds"
+        );
+        return Err(GuestLoadFailure::Check(cause));
+    }
+    tracing::info!("the guest's nft -c accepted the rendered classifier table");
+    // The load: one transaction, whole or not at all, over the same bytes
+    // the check read — the ruleset's own prelude deletes any previous table
+    // first, so a failed load leaves the previous one untouched.
+    let loaded = run_guest_nft(nft, false, &ruleset);
+    if let Err(cause) = loaded {
+        tracing::error!(
+            error = %cause,
+            "the guest's nft -f refused the classifier table: the previous table, if any, is untouched and no marker was written, so minimald reports no per-box verdict until a boot succeeds"
+        );
+        return Err(GuestLoadFailure::Load(cause));
+    }
+    let digest = sha256_hex(&ruleset);
+    // The marker last: the mask record beside it first, then the marker —
+    // the commit point, never there without the record — and only after the
+    // load succeeded, so the marker vouches for the table this boot rendered
+    // and nothing else.
+    write_guest_marker(params.ct_mark_mask, params.tree_root).map_err(GuestLoadFailure::Marker)?;
+    tracing::info!(
+        sha256 = %digest,
+        marker = %sandbox2::classifier::TABLE_MARKER,
+        "loaded the guest's classifier table and wrote its presence marker"
+    );
+    Ok(GuestLoad { digest })
+}
+
+/// Removes the marker and every ct-mark mask record beside it, refusing a
+/// load that cannot take a stale one away: on the guest these are cgroups
+/// this daemon made, so only a daemon still holding one keeps the removal
+/// from succeeding.
+fn clear_marker_records(root: &Path) -> Result<(), String> {
+    let marker = root.join(sandbox2::classifier::TABLE_MARKER);
+    if marker.exists() {
+        std::fs::remove_dir(&marker).map_err(|cause| {
+            format!("removing the stale marker at {}: {cause}", marker.display())
+        })?;
+    }
+    for record in std::fs::read_dir(root).map_err(|cause| {
+        format!(
+            "reading {} for stale ct-mark records: {cause}",
+            root.display()
+        )
+    })? {
+        let record = record.map_err(|cause| format!("reading a record's name: {cause}"))?;
+        let name = record.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| name.strip_prefix(MASK_RECORD_PREFIX).is_some())
+        {
+            std::fs::remove_dir(record.path()).map_err(|cause| {
+                format!(
+                    "removing the stale ct-mark record {}: {cause}",
+                    record.path().display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Writes the mask record and then the marker beside it — the commit point,
+/// last, as the installer writes them: on real cgroupfs a directory *is* the
+/// cgroup, and both hold no process and are delegated to nobody.
+fn write_guest_marker(mask: u32, root: &Path) -> Result<(), String> {
+    let record = root.join(format!("{MASK_RECORD_PREFIX}0x{mask:08x}"));
+    std::fs::create_dir(&record).or_else(|cause| {
+        if cause.kind() == std::io::ErrorKind::AlreadyExists {
+            Ok(())
+        } else {
+            Err(format!(
+                "recording the table's ct-mark mask at {}: {cause}",
+                record.display()
+            ))
+        }
+    })?;
+    let marker = root.join(sandbox2::classifier::TABLE_MARKER);
+    std::fs::create_dir(&marker).or_else(|cause| {
+        if cause.kind() == std::io::ErrorKind::AlreadyExists {
+            Ok(())
+        } else {
+            Err(format!(
+                "writing the table's presence marker at {}: {cause}",
+                marker.display()
+            ))
+        }
+    })
+}
+
+/// Runs the guest's `nft` over one render's bytes, with the environment
+/// cleared: `-c` asks it to parse and validate without applying, which is how
+/// the render's own table is checked before anything loads; without it the
+/// batch is applied whole. The bytes are piped, so the digest the caller
+/// names covers exactly what nft received.
+fn run_guest_nft(nft: &Path, check: bool, ruleset: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut load = Command::new(nft);
+    load.env_clear();
+    if check {
+        load.arg("-c");
+    }
+    load.arg("-f")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = load
+        .spawn()
+        .map_err(|cause| format!("spawning {}: {cause}", nft.display()))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(cause) = stdin.write_all(ruleset) {
+            tracing::debug!("the guest's nft stopped reading the ruleset: {cause}");
+        }
+    }
+    let applied = child
+        .wait_with_output()
+        .map_err(|cause| format!("waiting on {}: {cause}", nft.display()))?;
+    if applied.status.success() {
+        return Ok(());
+    }
+    Err(String::from_utf8_lossy(&applied.stderr).trim().to_string())
+}
+
+/// The sha256 of exactly the bytes it is given — the bytes piped to nft, so
+/// a logged digest and a render's bytes can be compared off-host without
+/// re-rendering anything.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+/// What the guest's recheck found when it read its own kernel's table back:
+/// listed with its deny chain, or gone with the reading's own words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Listing {
+    Listed,
+    Gone(String),
+}
+
+/// Reads the guest's loaded table back with `nft list`: the marker says the
+/// load ran, and this is the fact it cannot vouch for — a table emptied by
+/// a flush, a failed reload or a name collision leaves the marker standing.
+/// The table is there when `nft list` succeeds naming the deny chain the
+/// verdict rides on; anything else reads as gone, with nft's own error.
+pub(crate) fn guest_table_listed(nft: &Path) -> Listing {
+    use std::process::{Command, Stdio};
+
+    let listed = Command::new(nft)
+        .env_clear()
+        .arg("list")
+        .arg("table")
+        .arg("inet")
+        .arg(TABLE_NAME)
+        .stdin(Stdio::null())
+        .output();
+    let listed = match listed {
+        Ok(listed) => listed,
+        Err(cause) => {
+            return Listing::Gone(format!(
+                "running {} to list the table: {cause}",
+                nft.display()
+            ));
+        }
+    };
+    if !listed.status.success() {
+        return Listing::Gone(format!(
+            "nft list table inet {TABLE_NAME} failed: {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        ));
+    }
+    if String::from_utf8_lossy(&listed.stdout).contains(DENY_OUT_CHAIN) {
+        return Listing::Listed;
+    }
+    Listing::Gone(format!(
+        "nft lists the table inet {TABLE_NAME} without its {DENY_OUT_CHAIN} chain"
+    ))
+}
+
+/// The probe's loopback listeners, held for the daemon's life: the guest's
+/// effect probe connects to a destination the daemon itself holds, so the
+/// listener must be there before any launch reads the table's effect, not
+/// bound and dropped per reading. A listener the kernel queues against but
+/// nobody accepts would fill its backlog and read the table as
+/// inconclusive, so each one is drained by its own thread — connections
+/// are accepted and dropped, because the probe's evidence is the refused
+/// connect, never a connection's life past it.
+static HELD_PROBE_ENDPOINTS: std::sync::Mutex<Vec<(Family, SocketAddr)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Binds and holds the probe's listeners, one thread per family this host's
+/// loopback can carry: the endpoints it returns are the ones the guest's
+/// readings connect to, for as long as this daemon runs. Native readings
+/// keep binding their own, held for one probe's duration — the guest's
+/// start holds them instead, because a guest that loaded its table at
+/// boot reads its effect per launch, and a listener per reading would be
+/// a port the box never saw refused.
+pub fn hold_probe_listeners() -> std::io::Result<Vec<(Family, SocketAddr)>> {
+    let listeners = bind_probe_listeners()?;
+    let endpoints: Vec<(Family, SocketAddr)> = listeners
+        .iter()
+        .filter_map(|(family, listener)| listener.local_addr().ok().map(|addr| (*family, addr)))
+        .collect();
+    for (family, listener) in listeners {
+        let draining = std::thread::Builder::new()
+            .name(format!("minimald-classifier-probe-{}", family.name()))
+            .spawn(move || {
+                while let Ok(connection) = listener.accept() {
+                    drop(connection);
+                }
+            });
+        draining.map_err(|cause| {
+            std::io::Error::other(format!(
+                "holding the probe's {} listener: {cause}",
+                family.name()
+            ))
+        })?;
+    }
+    *HELD_PROBE_ENDPOINTS
+        .lock()
+        .expect("the probe's listeners are only held by this daemon") = endpoints.clone();
+    Ok(endpoints)
+}
+
+/// Forgets the held listeners, so a test reading the guest's paths does not
+/// read the listeners another test left behind.
+#[cfg(test)]
+pub(crate) fn clear_probe_listeners() {
+    HELD_PROBE_ENDPOINTS
+        .lock()
+        .expect("the probe's listeners are only held by this daemon")
+        .clear();
+}
+
+/// Reads the table's effect over the listeners this daemon holds: the
+/// guest's own reading, whose listener is its boot's, not one bound and
+/// dropped per probe — so the probe's evidence is about the table, never
+/// about whether a listener happened to be there.
+pub(crate) fn read_held_filter(root: &Path) -> Reading {
+    let endpoints = HELD_PROBE_ENDPOINTS
+        .lock()
+        .expect("the probe's listeners are only held by this daemon")
+        .clone();
+    if endpoints.is_empty() {
+        tracing::warn!(
+            "the daemon holds no loopback listener for its effect probe: its boot loaded no classifier table, so the table's effect was never read"
+        );
+        return Reading::Inconclusive {
+            because: "the daemon holds no loopback listener for its effect probe".to_string(),
+        };
+    }
+    read_over(root, &endpoints)
+}
+
 /// Reads the table's effect on this host (NET-079, design §7.4): the probe,
 /// with its own listener — a destination the daemon holds on loopback, on
 /// a port other than the answerer's, is the place a deny-all box's
-/// connections would be refused. The probe binds, forks, connects, and
-/// waits, so an async caller runs it on the blocking pool; it logs one
-/// record per run, naming every family it read and what the leg there met,
-/// the errno included.
+/// connections would be refused. The probe connects and waits, so an async
+/// caller runs it on the blocking pool; it logs one record per run, naming
+/// every family it read and what the leg there met, the errno included.
+///
+/// The healthy refusal is the quiet case — a launch's own record already
+/// names its enforcement — while anything else is the state a person
+/// reading the log has to see: a control leg that did not connect, or a
+/// family that connected, timed out or failed with an errno outside the
+/// reject set, is the launch's own line to carry.
+fn read_over(root: &Path, endpoints: &[(Family, SocketAddr)]) -> Reading {
+    let reading = probe_effect(root, endpoints);
+    if matches!(reading, Reading::Refused(_)) {
+        tracing::debug!(probe = %reading.record(), "the classifier table refused the probe's connection out of a deny leaf");
+    } else {
+        tracing::warn!(probe = %reading.record(), "read the classifier table's effect on this host");
+    }
+    reading
+}
+
+/// Reads the table's effect with a listener of its own, held for the
+/// probe's whole duration — the native reading, whose host binds and drops
+/// per probe; a listener nothing holds is the dead-listener case the
+/// control leg exists to catch.
 ///
 /// The one probe surface outside the crate: the native lane's root harness
 /// proves the *loaded* table's effect with the daemon's own probe, over a
 /// scratch tree the installer laid out — the only artifact that can
 /// produce the reading. No other caller reads a reading directly.
 pub fn read_filter(root: &Path) -> Reading {
-    // Held for the probe's whole duration: a listener nothing holds is the
-    // dead-listener case the control leg exists to catch.
     let listeners = match bind_probe_listeners() {
         Ok(listeners) => listeners,
         Err(cause) => {
@@ -917,16 +1350,7 @@ pub fn read_filter(root: &Path) -> Reading {
         .iter()
         .filter_map(|(family, listener)| listener.local_addr().ok().map(|addr| (*family, addr)))
         .collect();
-    let reading = probe_effect(root, &endpoints);
-    // The healthy refusal is the quiet case — a launch's own record already
-    // names its enforcement — while anything else is the state a person
-    // reading the log has to see.
-    if matches!(reading, Reading::Refused(_)) {
-        tracing::debug!(probe = %reading.record(), "the classifier table refused the probe's connection out of a deny leaf");
-    } else {
-        tracing::info!(probe = %reading.record(), "read the classifier table's effect on this host");
-    }
-    reading
+    read_over(root, &endpoints)
 }
 
 /// The check (NET-079, design §7.4): whether this host can decide a
@@ -951,9 +1375,9 @@ pub fn read_filter(root: &Path) -> Reading {
 ///
 /// The guest answers the same questions, and for the same reason: its
 /// daemon is the microVM's pid 1, so the tree it mounts and the table its
-/// image loads are its own boot's work — and reporting a guest as decided
-/// while its table is not loaded would place a deny-all box in a leaf that
-/// decides nothing while looking decided, on the one host whose image is
+/// boot loads are its own work — and reporting a guest as decided while
+/// its table is not loaded would place a deny-all box in a leaf that
+/// decides nothing while looking decided, on the one host whose daemon is
 /// the fix. The guest's cause is named for the image's builder: no
 /// installer exists inside a microVM, so no command is named for it.
 pub(crate) fn decide(
@@ -961,6 +1385,29 @@ pub(crate) fn decide(
     mountinfo: Option<&str>,
     guest: bool,
     read: impl FnOnce() -> Reading,
+) -> Decision {
+    decide_over(root, mountinfo, guest, read, || {
+        // The native host's facts are the installer's own artifacts, and
+        // the probe reads their effect directly; the guest is the one
+        // host whose kernel the load was handed to, so its marker is
+        // read back against that kernel before anything rests on it.
+        if guest {
+            guest_table_listed(Path::new(GUEST_NFT))
+        } else {
+            Listing::Listed
+        }
+    })
+}
+
+/// [`decide`] with its table's listing handed in — the guest's recheck, as
+/// the one fact the caller can name: the daemon's own call reads its kernel
+/// with `nft list`, and a test reads the listing it is pinning.
+pub(crate) fn decide_over(
+    root: &Path,
+    mountinfo: Option<&str>,
+    guest: bool,
+    read: impl FnOnce() -> Reading,
+    list: impl FnOnce() -> Listing,
 ) -> Decision {
     // The confinement half first: without `nsdelegate` a cgroup namespace
     // is not a delegation boundary, so no leaf under this tree confines a
@@ -977,7 +1424,7 @@ pub(crate) fn decide(
     // in one of them, so one missing is the whole step missing — and the
     // marker the loaded table's presence rests on. Natively that is the
     // step a person can run, so its cause names the install; in the guest
-    // it is the image's own half, so its cause names the table and nothing
+    // it is the boot's own half, so its cause names the table and nothing
     // can be run.
     if !subtrees_delegated(root) || !table_marker_present(root) {
         return Decision::undecidable(if guest {
@@ -985,6 +1432,22 @@ pub(crate) fn decide(
         } else {
             Cause::StepNotInstalled
         });
+    }
+    // The guest's recheck, the one half a native host cannot need: its
+    // kernel is this daemon's own to read, so the marker's claim is checked
+    // against the table itself — `nft list` must name the table and the
+    // deny chain the verdict rides on. A table gone behind its marker is
+    // its own cause, and the probe does not run over it: a reading taken
+    // from a kernel that answers nothing would dress the absence up as the
+    // table not refusing, when the fact is the table not being there.
+    if guest {
+        if let Listing::Gone(why) = list() {
+            tracing::warn!(
+                recheck = %why,
+                "the guest's marker stands over a table that is not there: the launch reads it back before deciding anything per box"
+            );
+            return Decision::undecidable(Cause::TableNotEffective);
+        }
     }
     // The table's half, the one the facts above cannot vouch for: the
     // marker says the install ran, not that the refusal it recorded is
@@ -1008,12 +1471,52 @@ pub(crate) fn decide(
     }
 }
 
-/// [`decide`] with its probe attached: the decision the daemon reads, over
+/// [`decide`] with its probes attached: the decision the daemon reads, over
 /// the tree, mount table, and host kind its caller names for it — the
-/// daemon's own in every production path. The probe binds a listener, forks
-/// a child, and waits, so an async caller runs it on the blocking pool.
+/// daemon's own in every production path. A native host binds a listener
+/// per reading, held for the probe's duration; the guest connects to the
+/// listener its boot holds, because its reading is per launch and the
+/// listener must not be a port that was refused only when the probe was
+/// looking. The probe connects and waits, so an async caller runs it on
+/// the blocking pool.
 pub fn decide_now(root: &Path, mountinfo: Option<&str>, guest: bool) -> Decision {
-    decide(root, mountinfo, guest, || read_filter(root))
+    let decision = decide(root, mountinfo, guest, || {
+        if guest {
+            read_held_filter(root)
+        } else {
+            read_filter(root)
+        }
+    });
+    note_decision(&decision);
+    decision
+}
+
+/// The freshest decision this daemon read — `decide_now`'s own record, held
+/// for the one reader that follows the decision but runs after it: the
+/// guest's network plan, which builds a deny-all box's resolver after the
+/// launch refused everything it must refuse. A guest that decides per box
+/// resolves such a box through its own answerer, the one carve-out its
+/// table admits; a guest that decides nothing keeps the node's DNS layer
+/// (NET-079, design §5.3). Held per launch rather than shared across them,
+/// because the decision is read fresh before each host-address launch — so
+/// what this carries is the launch's own decision, never another's.
+static READ_DECISION: std::sync::Mutex<Option<Decision>> = std::sync::Mutex::new(None);
+
+/// Records the decision the daemon just read, for the reader that follows it.
+pub(crate) fn note_decision(decision: &Decision) {
+    *READ_DECISION
+        .lock()
+        .expect("the decision memo is only written by this daemon") = Some(decision.clone());
+}
+
+/// The decision the current launch read, if it read one: `None` until the
+/// first `decide_now` runs — which every launch's own decision is, so a
+/// plan built before any decision ran is a plan that decides nothing.
+pub(crate) fn freshest_decision() -> Option<Decision> {
+    READ_DECISION
+        .lock()
+        .expect("the decision memo is only written by this daemon")
+        .clone()
 }
 
 /// Whether the cohort's two subtrees are there as the step delegates them:

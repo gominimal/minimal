@@ -105,6 +105,22 @@ readonly DEFAULT_CT_MARK_MASK=0x30000000
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
 
+# sha256_of <text> — the digest of exactly the bytes handed to it: the hex
+# field alone, because sha256sum spells its output "<hex>  -" and shasum
+# "<hex> -". shasum is the macOS spelling of the same sum, so a rehearsal
+# on a Mac digests like an install on a Linux host; neither being there is
+# this step's own failure to name, before anything loads.
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sum="$(printf '%s' "$1" | sha256sum)"
+    elif command -v shasum >/dev/null 2>&1; then
+        sum="$(printf '%s' "$1" | shasum -a 256)"
+    else
+        die "cannot digest the ruleset: this step needs sha256sum (or shasum) to name the sha256 of the bytes it loads"
+    fi
+    printf '%s' "${sum%% *}"
+}
+
 # Rehearsal posture (set iff the stand-in mountinfo below is in play): the
 # caller created the stand-in tree, so the one fact it cannot represent is
 # the root-owned barrier above the delegated leaves — the tree root
@@ -805,13 +821,15 @@ for stale_record in "$tree_root"/"$MASK_RECORD_PREFIX"*; do
     rmdir "$stale_record" 2>/dev/null ||
         die "cannot remove the previous ct-mark mask record at $stale_record: a re-install must leave no record beside a table it did not load"
 done
-ruleset="$(mktemp)"
-render_ruleset >"$ruleset"
-if ! nft -f "$ruleset"; then
-    rm -f "$ruleset"
-    die "nft refused the classifier table: the previous table, if any, is untouched and neither the marker nor its ct-mark mask record was written, so minimald reports no per-box verdict until this step succeeds (nft's own error is above)"
-fi
-rm -f "$ruleset"
+# Render into a variable first, so nothing that touches a disk can sit between
+# rendering and loading. The captured text is byte for byte what render_ruleset
+# wrote: `read -d ''` with an empty delimiter reads without a terminator, so
+# every trailing newline survives (a command substitution would strip them and
+# the digest below would then cover different bytes than nft received).
+IFS= read -r -d '' ruleset < <(render_ruleset) || true
+ruleset_sha256="$(sha256_of "$ruleset")"
+printf '%s' "$ruleset" | nft -f - || die "nft refused the classifier table: the previous table, if any, is untouched and neither the marker nor its ct-mark mask record was written, so minimald reports no per-box verdict until this step succeeds (nft's own error is above)"
+note "loaded the classifier table inet $TABLE_NAME: sha256 $ruleset_sha256, over exactly the bytes piped to nft"
 
 # The presence marker the daemon probes at start, and the ct-mark mask
 # recorded beside it: on real cgroupfs a plain file cannot exist, so each
