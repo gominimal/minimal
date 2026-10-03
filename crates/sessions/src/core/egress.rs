@@ -40,10 +40,21 @@
 //! Beside the frame verdict sits its name-level counterpart, the DNS
 //! rebinding intersection (NET-066, NET-067): the pure decision of which
 //! addresses a name *resolved to* may ever be admitted for a box, once the
-//! box's denies and the infrastructure deny set are subtracted. The relay
-//! (not this module) holds the admission window; what lives here is the
+//! box's denies and the infrastructure deny set are subtracted. The
+//! admission table itself is not here — it is relay state, and there are
+//! two relays holding it, the host-side table that decides a box's
+//! destinations outside the VM (NET-081) and the in-VM precision copy —
+//! so the numbers both tables are bounded by live here, as constants,
+//! that neither leg can drift from the other: the window, the per-name
+//! address cap and the used-pin retention. The host table's own bounds —
+//! the outstanding-query cap and expiry its reply matching holds — live
+//! beside them, named where the cross-leg contract is, so a leg that adds
+//! a copy reads the same numbers rather than inventing its own. What else
+//! lives here is the
 //! arithmetic the window stores the results of, kept pure and free of
 //! resolver I/O so the NET-067 harness can exhaust it.
+
+use std::time::Duration;
 
 use crate::{EgressPolicy, IpProto};
 
@@ -59,6 +70,70 @@ const ETHERTYPE_IPV6: u16 = 0x86DD;
 const IPPROTO_UDP: u8 = 17;
 /// The port DNS is served on: the resolver carve-out's port (NET-079).
 const DNS_PORT: u16 = 53;
+
+/// How long an address a DNS reply admitted stays admitted, from the
+/// instant of the reply the box's own lookup received. The two admission
+/// tables — the host-side one that decides a DNS-resolving box's
+/// destinations outside the VM (NET-081) and the in-VM precision copy
+/// (NET-066) — both hold exactly this window, reading it here, so a pin
+/// can never outlive its window on one leg while it lives on in the other.
+///
+/// It is a *fixed* window where design §5.3's is TTL-bounded — floored at
+/// 600 s, capped at 24 h, a proposal in the design text — and the gates
+/// record that departure at the constant's use site; what the floor buys
+/// (covering the gap between resolution and use) is covered for
+/// established flows by [`DNS_FLOW_IDLE_CAP`] below.
+pub const DNS_ADMISSION_WINDOW: Duration = Duration::from_mins(5);
+
+/// Design §5.3's cap on one name's admitted addresses, at most this many
+/// at once, fail closed: a reply whose A records run past the cap has its
+/// tail refused, so a hostile or pathological answer cannot grow the box's
+/// grant one address at a time. The cap counts what a name *holds* — an
+/// admission whose window has passed is released before the cap is spent —
+/// so a name whose resolved address set rotates keeps its grant. Both
+/// admission tables hold the same cap, reading it here.
+pub const DNS_MAX_ADDRESSES_PER_NAME: usize = 32;
+
+/// How long a pin the box *used* keeps its admitted destination past the
+/// window: design §5.3's conntrack-aware retention, the one staleness
+/// bound on an established flow. The first frame a pin admits establishes
+/// the flow, and the flow keeps its destination until it ends — a FIN or
+/// RST, or this cap reclaiming a flow nothing has ridden for a day — so a
+/// long `git clone` or keep-alive to an allowed name is not severed at the
+/// window's edge. It is also the only release a UDP flow ever gets, UDP
+/// carrying no close signal to read. Both admission tables hold the same
+/// cap, reading it here.
+pub const DNS_FLOW_IDLE_CAP: Duration = Duration::from_hours(24);
+
+/// How many flows one box holds open through its pins at once, fail closed
+/// at the cap: a new flow that finds the table full is admitted by the
+/// window its first frame is inside and not retained — so its retention
+/// ends with the window rather than past it, and the flows already
+/// recorded keep refreshing as they do. Idle entries are swept before the
+/// cap is spent, so what it bounds is live flows. The bound is the
+/// host-side table's alone — its entries are the host daemon's memory,
+/// which a hostile relay holding one pin must not grow one flow at a time,
+/// where the in-VM precision copy's growth is contained by the VM an
+/// escapee already controls.
+pub const DNS_MAX_FLOWS_PER_BOX: usize = 4096;
+
+/// How many of one box's DNS queries the host-side admission table holds
+/// outstanding at once, fail closed: a query past the cap is not recorded,
+/// so no reply can ever match it, and no answer of the box's can pin. The
+/// bound is the table's own memory bound on the reply-matching state below
+/// — the same discipline the per-name cap keeps for admitted addresses —
+/// and it sits far past what a real resolver stack keeps in flight: one
+/// lookup's parallel pair, and a handful of concurrent lookups at most.
+pub const DNS_OUTSTANDING_QUERY_CAP: usize = 16;
+
+/// How long the host-side admission table holds one of a box's outstanding
+/// queries: a DNS exchange is seconds in practice, and a resolver stack's
+/// whole retransmission budget — 5 s an attempt, a few attempts — fits
+/// inside this with room to spare. The entry exists only to pair a reply
+/// with the question it answers, so it has nothing to outlive: past the
+/// expiry a reply is one the box never asked for, and it passes through
+/// unpinned, exactly as an unsolicited one does.
+pub const DNS_QUERY_EXPIRY: Duration = Duration::from_secs(30);
 
 /// Which L2 family a frame belongs to — the first fact the verdict needs,
 /// because three of the four families are decided without any rules.
@@ -571,20 +646,31 @@ fn verdict_ipv4(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
 }
 
 /// The infrastructure deny set of the DNS rebinding intersection (design
-/// §5.3, NET-067): the ranges an allowed name's answer may never be admitted
-/// into, whatever the box's own rules say — the fabric's own space and the
-/// ranges that stand for the host, not destinations.
+/// §5.3, NET-067): the ranges an answer may never be admitted into, whatever
+/// the box's own rules say — the ranges that stand for the host and the
+/// fabric, not destinations.
 ///
-/// Two classes, because one of them is conditional:
+/// Three classes, because two of them are conditional:
 ///
 /// * **Fixed** — link-local and the metadata services living in it, loopback
-///   space, the whole `100.64.0.0/10` plane the switch fabric draws its
-///   subnets from (so no answer can ever name a box, the gateway, or the
-///   daemon itself), and the gateway's own two addresses: the answerer's (the
+///   space, and the gateway's own two addresses: the answerer's (the
 ///   resolver the box's carve-out is keyed to, NET-079) and the helper's (the
 ///   deprecated host-alias literal, NET-004), each held as a `/32` so both
 ///   are named individually rather than only through the plane containing
-///   them. Refused under every declaration.
+///   them; and the four ranges that complete the set — this-host space
+///   (`0.0.0.0/8`, where `0.0.0.0` names the host itself, so the range is
+///   loopback's neighbour), multicast (`224.0.0.0/4`), broadcast
+///   (`255.255.255.255/32`), and the reserved block the broadcast address
+///   ends in (`240.0.0.0/4`) — none of them a destination a name may name.
+///   Refused under every declaration, for every name — a box-zone
+///   name included (NET-072): even a subverted zone answer must not become a
+///   path to the metadata service or loopback, and `host.min.internal`
+///   resolves for the box but is never pinned as reach.
+/// * **The plane** — the whole `100.64.0.0/10` space the switch fabric draws
+///   its subnets from. Refused for answers to names outside the box zone,
+///   so no ordinary name can ever name a box, the gateway, or the daemon;
+///   carved out for box-zone answers, where naming a sibling's lease is the
+///   point (NET-072, NET-073).
 /// * **RFC 1918** — private space, refused *unless the box's
 ///   `egress.allow_subnets` covers the answer*: a developer who wants a name
 ///   to reach the LAN says so by allowing the range, so a name rule cannot
@@ -593,18 +679,22 @@ fn verdict_ipv4(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
 /// Owned outright — no borrow of the policy survives the attach — which is
 /// what keeps [`rebinding_admits`] a pure function over owned addresses and
 /// CIDRs, separate from resolver I/O, as the NET-067 harness requires.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InfrastructureDenySet {
-    /// Ranges refused under every declaration.
+    /// Ranges refused under every declaration, for every name.
     fixed: Vec<Ipv4Cidr>,
+    /// The switch-fabric plane, the one range a box-zone answer is admitted
+    /// in (NET-072): it refuses every answer outside the zone, and every
+    /// zone answer outside it.
+    plane: Ipv4Cidr,
     /// RFC 1918 space, refused unless `allow_subnets` covers the answer.
     rfc1918: Vec<Ipv4Cidr>,
 }
 
 impl InfrastructureDenySet {
-    /// The set for one box's attach: the always-refused ranges, plus the
-    /// gateway's `resolver` (where the box's own queries are answered) and
-    /// `host_alias` (the helper's address) as `/32`s.
+    /// The set for one box's attach: the always-refused ranges, the fabric
+    /// plane, and the gateway's `resolver` (where the box's own queries are
+    /// answered) and `host_alias` (the helper's address) as `/32`s.
     ///
     /// Both gateway addresses lie inside the plane today; they are named
     /// individually so the set still refuses them if the plane is ever
@@ -624,11 +714,21 @@ impl InfrastructureDenySet {
                 cidr("169.254.0.0/16"),
                 // Loopback space.
                 cidr("127.0.0.0/8"),
-                // The plane the switch fabric draws subnets from.
-                cidr("100.64.0.0/10"),
+                // This-host space: `0.0.0.0` names the host itself, so the
+                // range is loopback's neighbour, refused for the same reason.
+                cidr("0.0.0.0/8"),
+                // Multicast: no destination a name may name.
+                cidr("224.0.0.0/4"),
+                // The reserved block, and the broadcast address ending it —
+                // named on its own so the set still refuses it if the
+                // reserved block is ever re-scoped.
+                cidr("240.0.0.0/4"),
+                cidr("255.255.255.255/32"),
                 Ipv4Cidr::exact(resolver),
                 Ipv4Cidr::exact(host_alias),
             ],
+            // The plane the switch fabric draws subnets from.
+            plane: cidr("100.64.0.0/10"),
             rfc1918: vec![
                 cidr("10.0.0.0/8"),
                 cidr("172.16.0.0/12"),
@@ -637,6 +737,25 @@ impl InfrastructureDenySet {
         }
     }
 }
+
+/// The IPv6 half of the infrastructure deny set, as a record for the IPv6
+/// epoch — kept beside the IPv4 set above so the two halves of one set
+/// cannot be spelled apart when the epoch comes.
+///
+/// It decides nothing in v1, on purpose: no IPv6 admission path exists
+/// anywhere (guest IPv6 is disabled, NET-082; AAAA is answered NODATA,
+/// NET-136), so no IPv6 address is ever admitted and the rebinding
+/// intersection above never sees one. It exists so the epoch that carries
+/// IPv6 answers finds the set's IPv6 half already spelled: the unspecified
+/// address (`::`, which names the host the way `0.0.0.0` does), loopback
+/// (`::1`), and the IPv4-mapped space (`::ffff:0:0/96`, the addresses a
+/// dual-stack host answers at — the one class a v6 epoch could reach v4
+/// infrastructure through). The entries are `a::/n` strings rather than a
+/// parsed type, because v1 has no IPv6 CIDR type to parse them into; the
+/// test at the bottom of this file is the record's own proof that every
+/// entry parses as an address and a prefix, so the epoch cannot inherit a
+/// typo.
+pub const IPV6_INFRASTRUCTURE_DENY_RANGES: &[&str] = &["::/128", "::1/128", "::ffff:0:0/96"];
 
 /// Why the rebinding intersection refused one resolved address, carrying the
 /// rule its rate-limited warning is keyed to (mirroring [`DropReason::rule`],
@@ -668,6 +787,27 @@ impl RebindingRefusal {
 /// it, where RFC 1918 is the one infrastructure class an `allow_subnets`
 /// entry exempts.
 ///
+/// `box_zone` marks the answer as one to a name in the box zone
+/// (`*.min.internal`, NET-072). Such an answer is expected to name a
+/// sibling's switch lease, so the fabric plane is carved out for it and no
+/// other range is — the one carve-out a zone name earns, and the reason a
+/// box *resolves* a sibling's name with no `allow_dns_hosts` entry. The
+/// carve-out is exact in both directions: a zone answer is admitted inside
+/// the plane and nowhere else, so an answer to a zone name that names any
+/// other address — RFC 1918, a public host — is refused as infrastructure
+/// exactly as the plane's own addresses are for a name outside the zone,
+/// whatever `allow_subnets` covers. Everything else the set refuses still
+/// refuses a zone answer: the fixed ranges (the metadata service, loopback,
+/// the gateway's own addresses) and the plane's own addresses when the name
+/// is not a zone name.
+///
+/// Admitted here means *may be* admitted: the intersection only splits the
+/// answer set, and whether a survivor becomes reach is the caller's. The
+/// daemon's gate pins a declared name's answers and a zone answer never —
+/// NET-072's carve-out is the resolution's alone, so the reach to the lease
+/// a zone name answered with is decided by the connecting box's declared
+/// subnets at connection time, never by the answer.
+///
 /// Pure over owned addresses and CIDRs, and deliberately separate from any
 /// resolver: the daemon hands this function the addresses a resolver already
 /// returned and learns which of them may ever be admitted, which is what
@@ -675,10 +815,12 @@ impl RebindingRefusal {
 ///
 /// The order of the checks is part of the contract: the box's own denies
 /// first — a declared deny outranks every allowance — then the fixed
-/// infrastructure ranges, then RFC 1918 under its `allow_subnets` exemption.
-/// An undeclared `allow_subnets` (`None`, allow-all) counts as covering the
-/// answer: the box's address dimension is open, so the name path opens with
-/// it rather than refusing answers the box can already reach.
+/// infrastructure ranges, then the plane, which a zone name and any other
+/// name answer from opposite sides — inside it for a zone name, outside it
+/// for every other — then RFC 1918 under its `allow_subnets` exemption.
+/// An undeclared `allow_subnets` (`None`, allow-all) counts as covering
+/// the answer: the box's address dimension is open, so the name path opens
+/// with it rather than refusing answers the box can already reach.
 ///
 /// # Errors
 ///
@@ -686,6 +828,7 @@ impl RebindingRefusal {
 /// refused exactly when a deny or the infrastructure set names it.
 pub fn rebinding_admits(
     answer: [u8; 4],
+    box_zone: bool,
     allow: Option<&[Ipv4Cidr]>,
     deny: Option<&[Ipv4Cidr]>,
     infrastructure: &InfrastructureDenySet,
@@ -700,6 +843,14 @@ pub fn rebinding_admits(
         .iter()
         .any(|cidr| cidr.contains(answer))
     {
+        return Err(RebindingRefusal::Infrastructure);
+    }
+    // NET-072: outside the box zone the plane refuses every answer, so no
+    // ordinary name can ever name a box, the gateway, or the daemon. Inside
+    // the box zone the plane is the whole of the answer's reach: a zone
+    // name names a sibling's lease, so an answer anywhere else is refused
+    // as infrastructure, `allow_subnets` covering it or not.
+    if box_zone != infrastructure.plane.contains(answer) {
         return Err(RebindingRefusal::Infrastructure);
     }
     if infrastructure
@@ -728,12 +879,14 @@ pub struct RebindingSplit {
 /// Splits one name's resolved addresses by [`rebinding_admits`]: the
 /// addresses that may be admitted for the admission window, and the
 /// refusals to log — each refused address with its reason, in the order the
-/// answer carried them. This is the set-shaped wrapper the daemon calls
-/// once per DNS reply; the decision itself stays per-address, which is the
-/// shape the harness proves.
+/// answer carried them. `box_zone` marks the name as a box-zone name
+/// (NET-072) and passes through to [`rebinding_admits`]. This is the
+/// set-shaped wrapper the daemon calls once per DNS reply; the decision
+/// itself stays per-address, which is the shape the harness proves.
 #[must_use]
 pub fn rebinding_intersection(
     answers: &[[u8; 4]],
+    box_zone: bool,
     allow: Option<&[Ipv4Cidr]>,
     deny: Option<&[Ipv4Cidr]>,
     infrastructure: &InfrastructureDenySet,
@@ -743,7 +896,7 @@ pub fn rebinding_intersection(
         refused: Vec::with_capacity(answers.len()),
     };
     for answer in answers {
-        match rebinding_admits(*answer, allow, deny, infrastructure) {
+        match rebinding_admits(*answer, box_zone, allow, deny, infrastructure) {
             Ok(()) => split.admitted.push(*answer),
             Err(reason) => split.refused.push((*answer, reason)),
         }
@@ -1288,11 +1441,13 @@ mod tests {
     /// addresses that no deny and no infrastructure range refuses — a
     /// declared deny first, the fixed ranges under every declaration, and
     /// RFC 1918 only where the box's own `allow_subnets` covers the answer.
+    /// Every answer below comes for a name outside the box zone
+    /// (`box_zone: false`); the zone carve-out is NET-072's own test.
     #[test]
     fn rebinding_intersection_admits_only_clean_answers() {
         let infrastructure = InfrastructureDenySet::new(RESOLVER, HOST_ALIAS);
         let admit = |answer: [u8; 4], allow: Option<&[Ipv4Cidr]>, deny: Option<&[Ipv4Cidr]>| {
-            rebinding_admits(answer, allow, deny, &infrastructure)
+            rebinding_admits(answer, false, allow, deny, &infrastructure)
         };
 
         // A public answer is admitted with no declarations at all (NET-066).
@@ -1305,12 +1460,19 @@ mod tests {
             Err(RebindingRefusal::DeniedSubnet)
         );
 
-        // The fixed infrastructure ranges are refused under every
-        // declaration — link-local and the metadata services in it, loopback,
-        // the plane, and the gateway's own two addresses.
+        // The infrastructure ranges are refused under every declaration —
+        // link-local and the metadata services in it, loopback, the completed
+        // four (this host, multicast, broadcast, reserved), the plane, and
+        // the gateway's own two addresses.
         for refused in [
             [169, 254, 169, 254], // metadata, in link-local
             [127, 0, 0, 1],       // loopback
+            [0, 0, 0, 0],         // this host: 0.0.0.0 names the host itself
+            [0, 1, 2, 3],         // the rest of this-host space
+            [224, 0, 0, 1],       // multicast
+            [239, 255, 255, 254], // multicast's last address
+            [240, 0, 0, 1],       // reserved
+            [255, 255, 255, 255], // broadcast, reserved space's last address
             [100, 64, 0, 9],      // the plane (a box's lease)
             RESOLVER,             // the answerer's own address
             HOST_ALIAS,           // the helper's own address
@@ -1354,6 +1516,126 @@ mod tests {
         );
     }
 
+    /// The IPv6 half of the deny set — the record the IPv6 epoch reads — is
+    /// spelled as ranges that parse: an IPv6 address and a prefix length,
+    /// every entry of it, so the epoch that builds a set from
+    /// [`IPV6_INFRASTRUCTURE_DENY_RANGES`] inherits a set and not a typo.
+    #[test]
+    fn ipv6_infrastructure_ranges_are_spelled_as_ranges() {
+        assert!(
+            !IPV6_INFRASTRUCTURE_DENY_RANGES.is_empty(),
+            "the record must name the ranges it exists to hold"
+        );
+        for range in IPV6_INFRASTRUCTURE_DENY_RANGES {
+            let (address, prefix) = range.split_once('/').unwrap_or_else(|| {
+                panic!("the IPv6 record's entry {range:?} must be spelled as `address/prefix`")
+            });
+            let prefix = prefix.parse::<u8>().unwrap_or_else(|_| {
+                panic!("the IPv6 record's entry {range:?} must carry a numeric prefix")
+            });
+            assert!(
+                prefix <= 128,
+                "the IPv6 record's entry {range:?} must carry an IPv6 prefix"
+            );
+            assert!(
+                address.parse::<std::net::Ipv6Addr>().is_ok(),
+                "the IPv6 record's entry {range:?} must carry an IPv6 address"
+            );
+        }
+    }
+
+    /// NET-072: a box-zone answer is carved out of the fabric plane — a
+    /// sibling's lease is admitted for a zone name with no `allow_dns_hosts`
+    /// entry — and the plane is the whole of the carve-out: a zone answer
+    /// anywhere else is refused as infrastructure like any other, while
+    /// everything else the infrastructure set refuses still refuses a zone
+    /// answer, and the box's own deny still outranks the zone.
+    #[test]
+    fn box_zone_answers_carved_out_of_infrastructure_deny() {
+        let infrastructure = InfrastructureDenySet::new(RESOLVER, HOST_ALIAS);
+        let admit = |answer: [u8; 4], allow: Option<&[Ipv4Cidr]>, deny: Option<&[Ipv4Cidr]>| {
+            rebinding_admits(answer, true, allow, deny, &infrastructure)
+        };
+
+        // A sibling's lease — the plane address a zone name must resolve to
+        // — is admitted with no declarations at all (NET-072), and the
+        // admission holds across the plane's whole span, from its first
+        // address to its last, whatever the box declares.
+        let allow_all = cidrs(&["0.0.0.0/0"]);
+        for lease in [[100, 64, 0, 5], [100, 100, 0, 1], [100, 127, 255, 255]] {
+            admit(lease, None, None).unwrap();
+            admit(lease, Some(allow_all.as_slice()), None).unwrap();
+        }
+
+        // The carve-out is the plane's alone: the fixed ranges still refuse
+        // a zone answer under every declaration — the metadata service,
+        // loopback, and the gateway's own two addresses.
+        for refused in [
+            [169, 254, 169, 254], // metadata, in link-local
+            [127, 0, 0, 1],       // loopback
+            RESOLVER,             // the answerer's own address
+            HOST_ALIAS,           // the helper's own address
+        ] {
+            assert_eq!(
+                admit(refused, None, None),
+                Err(RebindingRefusal::Infrastructure),
+                "{refused:?} is infrastructure, refused for a zone answer too"
+            );
+            // And an explicit allow does not exempt them: the exemption is
+            // RFC 1918's alone.
+            assert_eq!(
+                admit(refused, Some(allow_all.as_slice()), None),
+                Err(RebindingRefusal::Infrastructure),
+                "{refused:?} stays refused even where allow_subnets covers it"
+            );
+        }
+
+        // And the plane is the carve-out's whole width: a zone answer
+        // outside it is refused as infrastructure under every declaration —
+        // RFC 1918, where `allow_subnets` exempts an ordinary name's answer,
+        // as much as a public address — so a zone answer may name nothing
+        // but a sibling's lease.
+        let allow_lan = cidrs(&["10.0.0.0/8"]);
+        let allow_none = cidrs(&[]);
+        for (answer, allow, because) in [
+            (
+                [10, 1, 2, 3],
+                None,
+                "an open address dimension exempts nothing",
+            ),
+            (
+                [10, 1, 2, 3],
+                Some(allow_lan.as_slice()),
+                "a covering allow entry exempts nothing",
+            ),
+            (
+                [10, 1, 2, 3],
+                Some(allow_none.as_slice()),
+                "a deny-all declaration refuses it outright",
+            ),
+            (
+                [203, 0, 113, 9],
+                None,
+                "a public answer is refused the same",
+            ),
+        ] {
+            assert_eq!(
+                admit(answer, allow, None),
+                Err(RebindingRefusal::Infrastructure),
+                "{because}: no zone answer is admitted outside the plane"
+            );
+        }
+
+        // The box's own deny still outranks the zone: a declared deny
+        // refuses a zone answer pointing at the denied range.
+        let deny = cidrs(&["100.64.0.0/16"]);
+        assert_eq!(
+            admit([100, 64, 0, 5], None, Some(deny.as_slice())),
+            Err(RebindingRefusal::DeniedSubnet),
+            "a declared deny refuses a zone answer like any other"
+        );
+    }
+
     /// [`rebinding_intersection`] — the set-shaped wrapper the relay calls per
     /// reply: it splits the answer set exactly (nothing dropped, nothing
     /// duplicated, order preserved), each refusal carrying its reason.
@@ -1371,6 +1653,7 @@ mod tests {
         let deny = cidrs(&["203.0.113.0/24"]);
         let split = rebinding_intersection(
             &answers,
+            false,
             Some(allow.as_slice()),
             Some(deny.as_slice()),
             &infrastructure,
@@ -1606,10 +1889,11 @@ mod kani_proofs {
     /// 4", for the same reason [`two_protocols`] pins two: two rules is
     /// what catches a scan that reads only one element or stops one short
     /// of the end, and a third adds no failure shape while it multiplies
-    /// CBMC's search. Both halves of the infrastructure set ride it too,
-    /// so a set-shaped hole that only opens at three or more rules is
-    /// outside this proof's bound — stated here rather than left to be
-    /// read off the tier text.
+    /// CBMC's search. Both list-shaped halves of the infrastructure set
+    /// ride it too, so a set-shaped hole that only opens at three or more
+    /// rules is outside this proof's bound — stated here rather than left
+    /// to be read off the tier text. The plane rides one symbolic CIDR,
+    /// which is exactly what the set holds it as.
     ///
     /// The unwind bound is 4. No loop this proof unwinds runs past its third
     /// check: the set scans walk lists of at most two CIDRs, the answer-set
@@ -1626,12 +1910,18 @@ mod kani_proofs {
         let deny = two_cidrs();
         let infrastructure = InfrastructureDenySet {
             fixed: two_cidrs().unwrap_or_default(),
+            plane: kani::any(),
             rfc1918: two_cidrs().unwrap_or_default(),
         };
+        // Whether the answers below come for a box-zone name (NET-072) —
+        // the one fact that decides which side of the fabric plane an
+        // answer is admitted on.
+        let box_zone: bool = kani::any();
         // The oracle's one question, restated over CIDR math alone: may this
         // answer be admitted — not denied by the box, not in a fixed
-        // infrastructure range, and not in RFC 1918 that `allow_subnets`
-        // does not cover?
+        // infrastructure range, on the plane's zone-answering side (inside
+        // for a zone name, outside for any other), and not in RFC 1918 that
+        // `allow_subnets` does not cover?
         let admissible = |answer: [u8; 4]| {
             let denied = deny
                 .as_deref()
@@ -1640,6 +1930,7 @@ mod kani_proofs {
                 .fixed
                 .iter()
                 .any(|cidr| cidr.contains(answer));
+            let plane = box_zone != infrastructure.plane.contains(answer);
             let rfc1918 = infrastructure
                 .rfc1918
                 .iter()
@@ -1647,21 +1938,32 @@ mod kani_proofs {
             let covers = allow
                 .as_deref()
                 .is_none_or(|list| list.iter().any(|cidr| cidr.contains(answer)));
-            !denied && !fixed && (!rfc1918 || covers)
+            !denied && !fixed && !plane && (!rfc1918 || covers)
         };
 
         // Part one: the per-address decision, iff the oracle, over every
         // IPv4 answer.
         let answer: [u8; 4] = kani::any();
-        let admitted =
-            rebinding_admits(answer, allow.as_deref(), deny.as_deref(), &infrastructure).is_ok();
+        let admitted = rebinding_admits(
+            answer,
+            box_zone,
+            allow.as_deref(),
+            deny.as_deref(),
+            &infrastructure,
+        )
+        .is_ok();
         assert_eq!(admitted, admissible(answer));
 
         // Part two: the wrapper over a two-answer set — the split is exact,
         // and everything it admitted passes the oracle.
         let answers = [kani::any::<[u8; 4]>(), kani::any::<[u8; 4]>()];
-        let split =
-            rebinding_intersection(&answers, allow.as_deref(), deny.as_deref(), &infrastructure);
+        let split = rebinding_intersection(
+            &answers,
+            box_zone,
+            allow.as_deref(),
+            deny.as_deref(),
+            &infrastructure,
+        );
         let expected: usize = answers.iter().filter(|a| admissible(**a)).count();
         assert_eq!(split.admitted.len(), expected);
         assert_eq!(split.refused.len(), answers.len() - expected);

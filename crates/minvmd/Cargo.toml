@@ -1,5 +1,6 @@
 [package]
 name = "minvmd"
+description = "Host daemon that boots Linux microVMs via libkrun and bridges host UDS to in-VM vsock."
 rust-version.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -30,6 +31,12 @@ sysinfo.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+# The shared, pure frame verdict (`sessions::core::egress`) the host-side
+# egress gate applies per source address (NET-081), and the policy types the
+# host-side box table (NET-138) compiles a namespace's declaration from. The
+# gate runs in `minvmd` itself, outside the VM, so the verdict must be a
+# normal dependency, not a test-only one.
+sessions.workspace = true
 # Shares minimald's portable RPC wire types: `NetworkMode` / `IpProto` drive the
 # VM network mode and VM-wide egress policy (minimald itself is Linux-only and
 # cannot be imported here, but the wire-types crate is portable).
@@ -37,8 +44,10 @@ minimald-rpc.workspace = true
 # The JSON file-log layer both daemons write through, so the on-disk log format
 # has one definition (Unit 4).
 mlog.workspace = true
-# Shared gvproxy-switch primitives (subnet/MAC/`-config` rendering) used by `net`.
-switch.workspace = true
+# Shared gvproxy-switch primitives (subnet/MAC/`-config` rendering) used by
+# `net`, with the Box Egress Proxy's host-side stack peer (`switch::bep_host`,
+# NET-132) that `net` starts beside the switch.
+switch = { workspace = true, features = ["stack-peer"] }
 # Async gvproxy switch supervision in `net`: the background exit-detection task
 # and the async `stop()` teardown run on the tokio runtime the networking layer
 # mandates (no blocking I/O in async context).
@@ -50,11 +59,17 @@ russh.workspace = true
 # `volume`).
 paths.workspace = true
 version.workspace = true
+# DNS wire parsing for the host-side DNS admission table (`net::dns_pins`,
+# NET-081 deciding NET-066/067 outside the VM): the replies the gate's
+# ingress leg observes on their way to a box are pinned only by reading
+# them. The same parser minimald's in-VM gate reads, so both legs pin from
+# the same wire.
+hickory-proto.workspace = true
 
 [dev-dependencies]
+camino.workspace = true
 serial_test.workspace = true
 tempfile.workspace = true
-sessions.workspace = true
 russh-sftp.workspace = true
 
 [lints]

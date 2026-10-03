@@ -1,12 +1,28 @@
 [package]
 name = "switch"
+description = "gvproxy-switch primitives: subnet arithmetic, MAC derivation, vsock constants, config rendering."
 rust-version.workspace = true
 version = "0.0.1"
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
 
+[features]
+# The Box Egress Proxy's host-side stack peer (`bep_host`, NET-132). Off by
+# default so the in-VM `minimald` build, which links this crate for the
+# configuration renderer, pulls in neither smoltcp nor tokio; `minvmd` turns
+# it on and wires the peer beside the switch.
+stack-peer = ["dep:smoltcp", "dep:tokio", "dep:tracing"]
+
 [dependencies]
+# The userspace TCP/IP stack the Box Egress Proxy's host leg runs over
+# (`bep_host`): the leg terminates box connections on the switch subnet
+# in-process, so the proxy's listener address never needs a host-kernel
+# interface.
+smoltcp = { workspace = true, optional = true }
+# The peer's socket, channels and poll task.
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

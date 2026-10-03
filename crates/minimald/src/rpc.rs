@@ -123,11 +123,20 @@ async fn serve_list_sessions(
                 .list()
                 .await
                 .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            // NET-018: the answerer's half of the report, and nothing else —
+            // the one fact this daemon can know (see the field's doc on the
+            // reply for why the daemon probes nothing beyond itself for it).
+            // The observability line that names the surface is the answerer's
+            // own startup line, not this reply's: a daemon whose answerer
+            // has not come up pays nothing per list.
+            let hostname_proxy_port = s.hostname_proxy_port().await;
+            let zone_answerer_port = s.zone_answerer_port().await;
             Ok(ListSessionsResponse {
                 daemon_version: Some(OWN_VERSION.to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
-                hostname_proxy_port: s.hostname_proxy_port().await,
-                zone_answerer_port: s.zone_answerer_port().await,
+                hostname_proxy_port,
+                zone_answerer_port,
+                answerer_bound: zone_answerer_port.is_some(),
                 resource_pool,
                 // `git` is left `None`: the daemon cannot probe it — on
                 // macOS it runs in the minvmd guest, where the host's
@@ -289,17 +298,21 @@ async fn serve_create_session(
                         "session created"
                     );
                     // NET-123: the session-start loopback probe, before any
-                    // of this session's names publish. One info line with the
-                    // probe result and the surface it picked; the interim
-                    // flag on the reply is what tells the client to surface
-                    // the naming advisory again (NET-122).
-                    let interim_loopback = session_start_loopback_probe(&id).await;
+                    // of this session's names publish. Its interim flag on
+                    // the reply is what tells the client to surface the
+                    // naming advisory again (NET-122). NET-018 reads the
+                    // answerer's half straight off the state, not off this
+                    // probe: the range the probe covers is the guest's on a
+                    // VM-backed host, so it is not the reply's fact to read.
+                    let interim_loopback = session_start_loopback_probe(&id).await.interim();
+                    let hostname_proxy_port = s.hostname_proxy_port().await;
+                    let zone_answerer_port = s.zone_answerer_port().await;
                     Errorable::Ok(minimald_rpc::CreateSessionResponse {
                         id,
                         daemon_version: Some(OWN_VERSION.to_string()),
                         hostname_routing_unavailable: s.proxy_unavailable().await,
-                        hostname_proxy_port: s.hostname_proxy_port().await,
-                        zone_answerer_port: s.zone_answerer_port().await,
+                        hostname_proxy_port,
+                        zone_answerer_port,
                         interim_loopback,
                         // The rollout's one fact the client cannot know from
                         // its own build (NET-077), carried on the reply the
@@ -307,6 +320,7 @@ async fn serve_create_session(
                         // notice (NET-076) can stay off a deployment that has
                         // already chosen to keep the shipped default.
                         deny_all_opt_out: Some(s.deny_all_opt_out().await),
+                        answerer_bound: zone_answerer_port.is_some(),
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
@@ -324,22 +338,17 @@ async fn serve_create_session(
         .await
 }
 
-/// The session-start loopback probe (NET-123): bind-probe the reserved local
-/// range before this session publishes, log the one session-start line with
-/// the probe result and the surface it picked, and return the interim
-/// verdict — whether the range read absent — as the reply flag that tells
-/// the client to surface the naming advisory again (NET-122).
-///
-/// The probe is 254 binds with port 0 — milliseconds for the whole range —
-/// and each bind is a blocking syscall, so it runs on the blocking pool
-/// rather than the connection's worker. A probe task that panics or is lost
-/// reads as absent: without a verdict the daemon may not report the range
-/// present, so the reply carries the interim.
+/// The bind probe over the reserved local range, on the blocking pool —
+/// [`session_start_loopback_probe`]'s mechanism half, so the session-start
+/// semantics and their log line stay on the wrapper. Cost and failure read
+/// are the session-start one's: 254 binds with port 0, milliseconds for the
+/// whole range, and a probe task that panics or is lost reads as absent,
+/// because without a verdict the daemon may not report the range present.
 ///
 /// The probe measures the daemon's own host and nothing else — whose
 /// loopback that is on each platform, and why there is no per-target arm
 /// here, is `net::loopback`'s module doc.
-async fn session_start_loopback_probe(session_id: &sessions::SessionId) -> bool {
+async fn run_loopback_probe() -> crate::net::loopback::RangeProbe {
     // The probe to run: the test stand-in when one is installed (a Linux
     // host's real bind can never produce the absent arm), else the real
     // bind probe.
@@ -347,7 +356,7 @@ async fn session_start_loopback_probe(session_id: &sessions::SessionId) -> bool 
     let probe_fn = crate::net::loopback::session_start_probe;
     #[cfg(not(any(test, feature = "test-support")))]
     let probe_fn = crate::net::loopback::probe;
-    let probe = tokio::task::spawn_blocking(probe_fn)
+    tokio::task::spawn_blocking(probe_fn)
         .await
         .unwrap_or_else(|join| {
             tracing::warn!(
@@ -356,16 +365,101 @@ async fn session_start_loopback_probe(session_id: &sessions::SessionId) -> bool 
                  the reserved local range as absent"
             );
             crate::net::loopback::RangeProbe::failed_to_run()
-        });
-    let interim_loopback = probe.interim();
+        })
+}
+
+/// The session-start loopback probe (NET-123): bind-probe the reserved local
+/// range before this session publishes, log the one session-start line with
+/// the probe result and the publish surface it picked, and return the
+/// verdict the reply carries — the interim flag is its `interim()`. The
+/// range's presence is no part of the name-surface verdict (NET-018): the
+/// loopback it covers is the guest's on a VM-backed host, where it always
+/// reads present, so the answerer-bound fact the replies do carry is the
+/// daemon's only honest one — see
+/// [`minimald_rpc::ListSessionsResponse::answerer_bound`].
+async fn session_start_loopback_probe(session_id: &SessionId) -> crate::net::loopback::RangeProbe {
+    let probe = run_loopback_probe().await;
     tracing::info!(
         session_id = %session_id,
         probe = %probe.summary(),
         surface = %probe.surface(),
-        interim_loopback,
+        interim_loopback = probe.interim(),
         "session-start loopback probe picked the publish surface"
     );
-    interim_loopback
+    probe
+}
+
+/// How long [`log_live_name_surface`] lets the proxy's driver finish
+/// recording its port before the line names the proxy's state: the two
+/// listeners start together and normally land within milliseconds of one
+/// another, so this is a settle, not a wait. A proxy still unrecorded past
+/// it is one that is genuinely still coming up — a startup retry backing
+/// off over a port some other process holds (NET-021) — and the surface
+/// line must not sit behind it; the proxy's own startup line corrects the
+/// record the moment it lands.
+const PROXY_PORT_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// NET-018's observability line, and NET-019's half said with it: the
+/// answerer this daemon holds bound — its half of the native condition —
+/// and that the hostname proxy keeps serving beside it, with the port a
+/// client that captured `HTTP(S)_PROXY` keeps routing through.
+///
+/// Emitted once, from the answerer driver's serving tail (`server.rs`), at
+/// the moment the fact it names comes to be: the answerer's bind is the
+/// daemon's half of the native verdict, so that driver's success is the one
+/// point in this daemon's own log that can record it. And it is the
+/// daemon's moment, not a request's — a daemon no client has ever asked
+/// still logs it, where the first-RPC emission round 1 shipped needed a
+/// client to come and ask before the bundle had a line to tail.
+///
+/// The wording stops at what this daemon can see, and claims no more: the
+/// answerer is bound on a port. Native DNS becomes the live name surface on
+/// the *host* only once the host's own resolver routes the zone to that
+/// answerer — the host's half of the condition (the resolver hook and the
+/// published range), which no line this daemon writes can read — so the
+/// line says exactly that and points at `min ls`, where the host's verdict
+/// is reported from the one three-fact function both verbs print from
+/// (and the session start logs its verdict beside its advisory, on the
+/// host that read it).
+///
+/// The proxy's port may still be recording when the answerer binds — the
+/// two listeners are started together on detached drivers and neither waits
+/// for the other — so the proxy half is read after [`PROXY_PORT_SETTLE`]
+/// rather than at the instant of the bind; a proxy that has not landed by
+/// then is named as not serving, and its own startup line corrects the
+/// record when it does.
+pub(crate) async fn log_live_name_surface(state: &ServerStateHandle, zone_answerer_port: u16) {
+    let hostname_proxy_port = settled_proxy_port(state).await;
+    let proxy_half = match hostname_proxy_port {
+        Some(port) => format!("the hostname proxy keeps serving on 127.0.0.1:{port}"),
+        None => "the hostname proxy is not serving (yet)".to_string(),
+    };
+    tracing::info!(
+        answerer_bound = true,
+        zone_answerer_port,
+        proxy_serves = hostname_proxy_port.is_some(),
+        hostname_proxy_port = ?hostname_proxy_port,
+        "this daemon's box-zone answerer is bound on 127.0.0.1:{zone_answerer_port}; \
+         native DNS is the live name surface on the host once its resolver routes \
+         the zone to it; `min ls` reports the host's surface; {proxy_half}"
+    );
+}
+
+/// [`log_live_name_surface`]'s read of the proxy's port: the recorded port
+/// when it is already there, else polled until it lands or
+/// [`PROXY_PORT_SETTLE`] runs out.
+async fn settled_proxy_port(state: &ServerStateHandle) -> Option<u16> {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(25);
+    let deadline = tokio::time::Instant::now() + PROXY_PORT_SETTLE;
+    loop {
+        if let Some(port) = state.hostname_proxy_port().await {
+            return Some(port);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 /// `ConfigureLoadout`: composes a created session's loadout from the
@@ -2936,6 +3030,172 @@ mod tests {
         );
     }
 
+    /// NET-018: once the answerer is serving beside the proxy, the replies
+    /// report the one fact that is the daemon's to know — its answerer
+    /// bound — and the one log line, emitted the moment the answerer binds,
+    /// names that surface and that the hostname proxy keeps serving beside
+    /// it: the verdict switches what a client *reports*, never what the
+    /// proxy does (NET-019). NET-019's other half is proved on this
+    /// daemon's own proxy too: after the native line, one request still
+    /// routes through the listener whose port the reply carries — the
+    /// pure verdict in `proxy`'s test routes through a serve loop a test
+    /// spun up itself; this is the daemon's. The answerer is the half the
+    /// daemon's start path brings up on a detached driver; here it is
+    /// driven to serving the same way, the proxy beside it — the proxy
+    /// first, so the answerer's line reads an already-recorded port
+    /// deterministically rather than racing the proxy's record moment.
+    ///
+    /// The fresh-daemon list first proves the absent half: no answerer, no
+    /// bound report — and no surface line at all, the line being the
+    /// answerer's bind moment, not a request's.
+    // The answerer helper binds the host loopback, so this test runs only
+    // where the helper does. The stand-in window covers the awaited
+    // create — the one call left that runs the process-global probe — for
+    // the same reason the interim tests take it. The log assertions say
+    // `contains`, never `equals`: the capture buffer is shared
+    // process-wide, and any test that drives an answerer to serving
+    // writes a surface line into it.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the stand-in window has to cover the awaited create's probe"
+    )]
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn name_surface_reported_when_both_deployed() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::time::Duration;
+
+        let log = crate::test_harness::captured_log();
+        let _standin_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // A daemon with neither listener up reports the read that changes
+        // nothing: not bound.
+        let bare = client.call::<ListSessions>(&()).await;
+        assert!(
+            !bare.answerer_bound,
+            "a daemon whose answerer has not come up must not report it bound"
+        );
+
+        // Bring both listeners to serving — the startup loops
+        // `start_host_proxies` spawns — with a compressed backoff. The
+        // proxy first: the answerer's serving tail is what logs the
+        // surface line, and its proxy half reads the recorded port, so
+        // recording it before the answerer binds is what makes the line's
+        // "keeps serving" half deterministic here.
+        let compressed =
+            crate::server::RetryBackoff::new(Duration::from_millis(5), Duration::from_millis(40));
+        let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        crate::server::retry_hostname_proxy_until_serving(
+            server.state.clone(),
+            loopback,
+            compressed,
+        )
+        .await;
+        crate::server::retry_zone_answerer_until_serving(
+            server.state.clone(),
+            loopback,
+            compressed,
+        )
+        .await;
+
+        // Both listeners up: the list and create replies report the
+        // answerer bound, and the activation reply carries the same fact
+        // the list does.
+        let listed = client.call::<ListSessions>(&()).await;
+        assert!(
+            listed.answerer_bound,
+            "a daemon whose answerer serves reports it bound"
+        );
+        let created = client
+            .call::<CreateSession>(&req("surface-native", "/uwu"))
+            .await
+            .ok()
+            .expect("a create on a host whose answerer serves must succeed");
+        assert!(
+            created.answerer_bound,
+            "the activation reply carries the same bound fact the list does"
+        );
+
+        // The log says what this daemon knows and no more: the bound
+        // answerer and its port — the one fact the replies carry — that
+        // native DNS waits on the host's resolver before it is the live
+        // surface there, that `min ls` reports the host's verdict, and the
+        // proxy's half beside it. The assertions read the message, plus the
+        // two fields a bundle's reader greps (`answerer_bound`,
+        // `proxy_serves`); the rest of the field quoting is the
+        // subscriber's business.
+        let log = log.contents();
+        let answerer_line = log
+            .lines()
+            .find(|line| line.contains("box-zone answerer is bound"))
+            .expect("the answerer's bind logs one line a diagnostics bundle can tail");
+        let answerer_port = created
+            .zone_answerer_port
+            .expect("with the answerer up, the reply carries its port");
+        assert!(
+            answerer_line.contains("answerer_bound=true"),
+            "the line's field is the fact the daemon knows, not a surface verdict: {answerer_line}"
+        );
+        assert!(
+            answerer_line.contains(&format!("is bound on 127.0.0.1:{answerer_port}")),
+            "the line names the bound answerer and its port: {answerer_line}"
+        );
+        assert!(
+            answerer_line.contains("once its resolver routes the zone"),
+            "the line says native DNS waits on the host's resolver routing the zone: {answerer_line}"
+        );
+        assert!(
+            answerer_line.contains("`min ls` reports the host's surface"),
+            "the line points at where the host's verdict is reported: {answerer_line}"
+        );
+        assert!(
+            !answerer_line.contains("the live name surface is native"),
+            "the daemon cannot read the host's resolver, so the line must not claim its surface: \
+             {answerer_line}"
+        );
+        assert!(
+            answerer_line.contains("proxy_serves=true"),
+            "the line says the proxy still serves beside the answerer (NET-019): {answerer_line}"
+        );
+        assert!(
+            answerer_line.contains("the hostname proxy keeps serving"),
+            "the line says the proxy keeps serving, in the words its reader reads: {answerer_line}"
+        );
+        let port = created
+            .hostname_proxy_port
+            .expect("with the proxy up, the reply carries its port");
+        assert!(
+            answerer_line.contains(&format!("127.0.0.1:{port}")),
+            "the line names the port a client keeps routing through: {answerer_line}"
+        );
+
+        // NET-019 on the daemon's own proxy: the verdict that just reported
+        // native DNS stops nothing — one request still routes through the
+        // listener whose port the reply carries. The registry holds the
+        // create's session as a host-net route the way the session-start
+        // path registers one, so the request has a target to reach.
+        let backend_port = crate::net::proxy::spawn_backend().await;
+        server
+            .state
+            .sessions_manager()
+            .await
+            .hostnames()
+            .write()
+            .expect("hostname registry lock poisoned")
+            .register_host_net(created.id, "surface-native");
+        let routed = crate::net::proxy::proxy_get(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            &format!("surface-native.min.internal:{backend_port}"),
+        )
+        .await;
+        assert!(
+            routed.contains("200 OK"),
+            "the daemon's own proxy still routes beside the native verdict (NET-019), got: {routed}"
+        );
+    }
+
     #[tokio::test]
     async fn get_session_policy_returns_the_policy_configured_at_launch() {
         // R2.6: GetSessionPolicy reads the live per-session policy from the
@@ -2957,6 +3217,7 @@ mod tests {
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: NetworkMode::OwnIp,
                     policy: SessionPolicy::new(Some(egress.clone()), None),
+                    box_addresses: None,
                     hooks_enabled: true,
                     attrs: Default::default(),
                 },
@@ -2992,6 +3253,7 @@ mod tests {
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: NetworkMode::OwnIp,
                     policy,
+                    box_addresses: None,
                     hooks_enabled: true,
                     attrs: Default::default(),
                 },
@@ -3307,6 +3569,7 @@ mod tests {
                     project_path: HostAbsPath::try_new("/uwu").unwrap(),
                     network: NetworkMode::NoNet,
                     policy: SessionPolicy::new(Some(egress), None),
+                    box_addresses: None,
                     hooks_enabled: true,
                     attrs: Default::default(),
                 },

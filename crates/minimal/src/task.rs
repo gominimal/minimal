@@ -621,6 +621,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         project_path: abs_path.clone(),
         network: sessions::NetworkMode::HostNet,
         policy: sessions::SessionPolicy::default(),
+        box_addresses: None,
         // Same default as an activate with no flags, matching the
         // loadout handling below. `min task run` has no `--no-hooks` of
         // its own; a `--keep` session is attachable later, so its hooks

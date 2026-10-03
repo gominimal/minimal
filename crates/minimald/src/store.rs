@@ -391,6 +391,7 @@ mod tests {
             project_path: HostAbsPath::try_new("/home/alice/proj").unwrap(),
             network: NetworkMode::default(),
             policy: Default::default(),
+            box_addresses: None,
             hooks_enabled: true,
             status: SessionStatus::default(),
             attrs: Default::default(),

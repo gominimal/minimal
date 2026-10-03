@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -77,6 +78,27 @@ pub struct PortMapping {
     /// Transport protocol for this mapping.
     pub proto: IpProto,
 }
+
+/// The hostnames NET-068's integration test exercises. Kept in `sessions` so
+/// the `minimald` unit fixture and the `minvmd` integration test share one
+/// list and cannot drift.
+///
+/// Docker Hub serves image blobs through a 307 redirect that lands on either
+/// of its CDNs, `production.cloudflare.docker.com` or
+/// `production.cloudfront.docker.com`, so a container pull needs both.
+#[doc(hidden)]
+pub const NET068_TOOLCHAIN_EGRESS_HOSTS: &[&str] = &[
+    "github.com",
+    "codeload.github.com",
+    "raw.githubusercontent.com",
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "registry-1.docker.io",
+    "auth.docker.io",
+    "production.cloudflare.docker.com",
+    "production.cloudfront.docker.com",
+];
 
 /// Effective egress policy for a session.
 ///
@@ -554,6 +576,24 @@ where
     Ok(name.filter(|name| !name.is_empty()))
 }
 
+/// The pair of addresses a VM host daemon allocates for a box and hands
+/// back to its creator (T66): where the box lives on the switch, and where
+/// it is published on the guest's loopback.
+///
+/// One type because the pair is one fact — handed together over the
+/// registration, carried together in the create request, recorded together
+/// on the session record — and every consumer of one half needs to be able
+/// to say it came from a host allocation, not a local draw.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoxAddresses {
+    /// The box's address on the switch: the lease its frames must carry
+    /// (NET-084) and the key the host-side box table's row is filed under.
+    pub switch_address: Ipv4Addr,
+    /// The box's address on the guest's loopback, from the slice the host
+    /// switch publishes at.
+    pub loopback_address: Ipv4Addr,
+}
+
 /// The on-disk row/record pertaining to a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
@@ -604,6 +644,19 @@ pub struct Record {
     /// behaviour from that default.
     #[serde(default = "hooks_enabled_default")]
     pub hooks_enabled: bool,
+
+    /// The addresses the VM host daemon handed this box's registration at
+    /// activation (T66): the switch address the attach path configures the
+    /// tap with instead of drawing its own, and the published loopback
+    /// address the host side names the box by. Persisted so a re-attach —
+    /// including after a daemon restart — attaches with the same address
+    /// the host table still holds a row for; drawing a fresh one would
+    /// silently orphan the row and drop the box to the egress gate's
+    /// unregistered-source interim. Defaults to `None` for records that
+    /// predate the field (every pre-T66 session): those boxes self-allocate
+    /// exactly as they always have.
+    #[serde(default)]
+    pub box_addresses: Option<BoxAddresses>,
 
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
@@ -757,6 +810,7 @@ mod tests {
             policy,
             status: SessionStatus::default(),
             hooks_enabled: true,
+            box_addresses: None,
             attrs: BTreeMap::new(),
         }
     }
