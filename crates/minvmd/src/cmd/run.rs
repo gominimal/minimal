@@ -1164,6 +1164,9 @@ fn loopback_answers(port: u16) -> bool {
 /// port is free only when the wildcard bind succeeds *and* no listener
 /// answers a connection on `127.0.0.1` at that port
 /// ([`loopback_answers`]), and the skip reason names which probe refused it.
+/// The fallback is held to the same two probes ([`fallback_port`]): the OS
+/// draws its candidates under the same `SO_REUSEADDR` semantics, so a draw
+/// another VM is already serving on loopback is passed over, never handed.
 /// The answerer's UDP probe is unchanged: a UDP socket never accepts a
 /// connection, so the bind is the whole question there.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
@@ -1197,13 +1200,49 @@ fn assign_node_port(preferred: u16, udp: bool) -> Result<NodePortAssignment> {
             skipped: None,
         });
     };
-    let port =
-        probe(0).context("the node's default port is held and no OS-assigned port is available")?;
+    let port = fallback_port(|| probe(0), udp)?;
     Ok(NodePortAssignment {
         port,
         preferred,
         skipped: Some(skipped),
     })
+}
+
+/// How many candidates the OS-assigned fallback draws before giving up
+/// ([`fallback_port`]). The OS draws each candidate out of the ephemeral
+/// range, so a candidate that is already served on loopback is a rare draw
+/// and the next one lands elsewhere; the bound is only the pathological-host
+/// guard, never a shape a shared host reaches.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const FALLBACK_PORT_ATTEMPTS: usize = 8;
+
+/// Hands out the OS-assigned fallback port for a preferred one some probe
+/// refused ([`assign_node_port`]), holding every candidate it draws to the
+/// same two probes the preferred port is held to. The OS draws out of the
+/// ephemeral range under the same `SO_REUSEADDR` semantics the wildcard bind
+/// carries, so on macOS it can hand back a port another VM's hostname surface
+/// already serves on the loopback address — the same collision the
+/// preferred-port probes exist to prevent. A served candidate is released and
+/// the next one drawn; a host whose every draw lands on a served port fails
+/// the boot naming the conflict, and never hands a port two VMs would share.
+///
+/// The candidate source is a parameter so the tests can hand the picker a
+/// known sequence: production passes the port-0 bind, which is the OS's own
+/// draw, released the moment its number is read.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn fallback_port(mut next: impl FnMut() -> std::io::Result<u16>, udp: bool) -> Result<u16> {
+    use anyhow::Context as _;
+    for _ in 0..FALLBACK_PORT_ATTEMPTS {
+        let port = next()
+            .context("the node's default port is held and no OS-assigned port is available")?;
+        if udp || !loopback_answers(port) {
+            return Ok(port);
+        }
+    }
+    Err(anyhow::anyhow!(
+        "no OS-assigned port is free: every one of the {FALLBACK_PORT_ATTEMPTS} \
+         candidates drawn is already answering on loopback"
+    ))
 }
 
 #[cfg(test)]
@@ -1424,6 +1463,97 @@ mod tests {
             assigned_udp.port, free_udp,
             "a free UDP preferred port is handed unchanged"
         );
+    }
+
+    #[test]
+    fn node_port_fallback_skips_a_candidate_served_on_loopback() {
+        // The OS-assigned fallback draws its candidates under the same
+        // SO_REUSEADDR semantics the wildcard bind carries, so on macOS a draw
+        // can land on a port another VM's hostname surface already serves on
+        // the loopback address — the very collision the preferred-port probes
+        // exist to prevent. The candidate source is injected here because the
+        // OS cannot be asked for a particular draw, and the sequence is one
+        // served draw before a free one: the fallback has to release the
+        // served candidate and hand the free one, never the served draw as-is.
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let served = held.local_addr().unwrap().port();
+        assert!(
+            super::loopback_answers(served),
+            "the loopback probe sees the listener on 127.0.0.1:{served}"
+        );
+        // A candidate no listener answers at, drawn from the same OS the
+        // production picker draws from and released before use — and redrawn
+        // in the one case the draw lands on the port this test holds, which
+        // is a real shape on macOS (see [`super::loopback_answers`]).
+        let free = (0..16)
+            .map(|_| {
+                let draw = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+                let port = draw.local_addr().unwrap().port();
+                drop(draw);
+                port
+            })
+            .find(|port| *port != served && !super::loopback_answers(*port))
+            .expect("a candidate with no listener answering on loopback");
+        let candidates = [served, free];
+        let mut drawn = candidates.into_iter();
+        let handed = super::fallback_port(|| Ok(drawn.next().unwrap()), false).unwrap();
+        assert_eq!(
+            handed, free,
+            "the fallback hands the first candidate no listener answers on"
+        );
+    }
+
+    #[test]
+    fn node_port_fallback_fails_when_every_drawn_candidate_is_served() {
+        // A host whose every draw lands on a served port fails the boot naming
+        // the conflict: handing the candidate anyway would hand two VMs one
+        // hostname surface, which is the collision this assignment exists to
+        // prevent. The refusal is bounded, not a spin.
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let served = held.local_addr().unwrap().port();
+        let mut drawn = 0usize;
+        let err = super::fallback_port(
+            || {
+                drawn += 1;
+                Ok(served)
+            },
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("answering on loopback"),
+            "the refusal names the conflict, got: {err}"
+        );
+        assert_eq!(
+            drawn,
+            super::FALLBACK_PORT_ATTEMPTS,
+            "the fallback gives up after its bounded attempts, it does not spin"
+        );
+    }
+
+    #[test]
+    fn node_port_fallback_hands_udp_candidates_without_the_loopback_probe() {
+        // The answerer's UDP probe is unchanged on the fallback path too: a
+        // UDP socket never accepts a connection, so a listener answering TCP on
+        // the loopback address is no conflict for it and the first candidate
+        // drawn is handed as drawn.
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let served = held.local_addr().unwrap().port();
+        assert!(
+            super::loopback_answers(served),
+            "the loopback probe sees the listener on 127.0.0.1:{served}"
+        );
+        let mut drawn = 0usize;
+        let handed = super::fallback_port(
+            || {
+                drawn += 1;
+                Ok(served)
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(handed, served, "the UDP fallback hands the first draw");
+        assert_eq!(drawn, 1, "one candidate drawn, no TCP probe applied to it");
     }
 
     #[test]
