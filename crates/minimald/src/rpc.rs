@@ -132,6 +132,30 @@ async fn serve_list_sessions(
             // has not come up pays nothing per list.
             let hostname_proxy_port = s.hostname_proxy_port().await;
             let zone_answerer_port = s.zone_answerer_port().await;
+            // NET-079: the per-box egress enforcement the create recorded on
+            // each session's record — `per_box` when this host could decide a
+            // host-address box's verdict on a classifier leaf of its own,
+            // `none` when it could not and the box runs unenforced — read
+            // back per entry, in parallel, so the listing shows the same
+            // state the create response and the effective-policy read show,
+            // without a follow-up round trip per session. A record that
+            // fails to read degrades to `None`: nothing said is the same
+            // silence the other surfaces read as "not a host-address
+            // session", so one unreadable record fails no listing.
+            let enforcement = futures::future::join_all(infos.iter().map(|i| async {
+                mngr
+                    .get_record(SessionKeyPredicate::Id(i.id))
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|record| {
+                        record
+                            .attrs
+                            .get(HOST_IP_ENFORCEMENT_ATTR)
+                            .map(|value| Box::new(value.clone()))
+                    })
+            }))
+            .await;
             Ok(ListSessionsResponse {
                 daemon_version: Some(OWN_VERSION.to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
@@ -145,12 +169,14 @@ async fn serve_list_sessions(
                 // client fills it host-side after the reply.
                 sessions: infos
                     .into_iter()
-                    .map(|i| ListSessionsEntry {
+                    .zip(enforcement)
+                    .map(|(i, host_ip_enforcement)| ListSessionsEntry {
                         id: i.id,
                         name: i.name,
                         project_path: Some(i.project_path),
                         status: i.status,
                         git: None,
+                        host_ip_enforcement,
                         attrs: i.attrs.map(|a| minimald_rpc::RunningSessionAttrs {
                             last_stdout: a.stdout_last.map(|i| i.into()),
                             last_stdin: a.stdin_last.map(|i| i.into()),
@@ -295,11 +321,11 @@ async fn serve_create_session(
             let classifier_cause = decision.cause();
             let classifier_advisory =
                 classifier_cause.map(|cause| classifier_advisory_text(cause, in_microvm));
-            let egress_enforcement = create_egress_enforcement(req.config.network, &decision);
-            if let Some(enforcement) = egress_enforcement {
+            let host_ip_enforcement = create_host_ip_enforcement(req.config.network, &decision);
+            if let Some(enforcement) = host_ip_enforcement {
                 req.config
                     .attrs
-                    .insert(EGRESS_ENFORCEMENT_ATTR.to_string(), enforcement.to_string());
+                    .insert(HOST_IP_ENFORCEMENT_ATTR.to_string(), enforcement.to_string());
             }
 
             Ok(match mngr.create_session(req.config, ssh_username).await {
@@ -335,7 +361,7 @@ async fn serve_create_session(
                                 .map_or_else(|| "", classifier::Cause::detail),
                             classifier_install = ?classifier_cause
                                 .and_then(classifier::Cause::install_command),
-                            egress_enforcement = ?egress_enforcement,
+                            host_ip_enforcement = ?host_ip_enforcement,
                             advisory = ?advisory,
                             "session create carried the classifier advisory"
                         );
@@ -369,7 +395,7 @@ async fn serve_create_session(
                         // same fact the reply repeats for the one message the
                         // activation path spends on it.
                         classifier_advisory,
-                        egress_enforcement: egress_enforcement.map(str::to_string),
+                        host_ip_enforcement: host_ip_enforcement.map(str::to_string),
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
@@ -391,12 +417,12 @@ async fn serve_create_session(
 /// enforcement under, for a host-address session: `per_box` when this host
 /// can decide the box's egress verdict on a classifier leaf of its own,
 /// `none` when it cannot and the box runs unenforced — the machine spelling
-/// the create reply and the launch's own record share, so whatever reads the
-/// record reads the state as data. Recorded at create so the state outlives
-/// the activate message that first reported it: the record is what a later
-/// command resolves and the bundle's sessions collector carries, long after
-/// this reply is spent.
-const EGRESS_ENFORCEMENT_ATTR: &str = "egress_enforcement";
+/// the create reply, the listing entry, the effective-policy reply and the
+/// launch's own record share, so whatever reads the record reads the state
+/// as data. Recorded at create so the state outlives the create response
+/// that first reported it: the record is what a later command resolves and
+/// the bundle's sessions collector carries, long after this reply is spent.
+const HOST_IP_ENFORCEMENT_ATTR: &str = "host_ip_enforcement";
 
 /// The test stand-in for the create-time classifier read: the tree root and
 /// mount table a test wants the read to answer over, standing in for the
@@ -513,7 +539,7 @@ fn classifier_advisory_text(cause: classifier::Cause, guest: bool) -> String {
 /// none box's verdict is decided on address leases, never on the host's
 /// cgroup tree, so `None` — not `none` — is what their replies say, the same
 /// nothing a daemon that predates the field says.
-fn create_egress_enforcement(
+fn create_host_ip_enforcement(
     network: minimald_rpc::NetworkMode,
     decision: &classifier::Decision,
 ) -> Option<&'static str> {
@@ -971,20 +997,26 @@ async fn serve_get_session_policy(
 
 /// The `GetEffectiveSessionPolicy` reply for one record's policy and network
 /// mode: the egress half resolved to what the gate enforces, the ingress half
-/// verbatim. `phase` is the rollout phase to resolve under — the handler
-/// serves [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships,
-/// while the tests pass [`sessions::EgressDefaultPhase::InForce`] so the
-/// deny-all posture the rollout ends at stays proven while the default is
-/// only announced (NET-076).
+/// verbatim, and NET-079's enforcement state for a host-address box — the
+/// same fact the create reply reported, read back off the record's
+/// [`HOST_IP_ENFORCEMENT_ATTR`] so the policy read and the create agree on
+/// what the declarations actually do on this host. `phase` is the rollout
+/// phase to resolve under — the handler serves
+/// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, while the
+/// tests pass [`sessions::EgressDefaultPhase::InForce`] so the deny-all
+/// posture the rollout ends at stays proven while the default is only
+/// announced (NET-076).
 pub(crate) fn effective_policy_reply(
     policy: &sessions::SessionPolicy,
     network: sessions::NetworkMode,
     phase: sessions::EgressDefaultPhase,
     opt_out: bool,
+    host_ip_enforcement: Option<String>,
 ) -> minimald_rpc::EffectiveSessionPolicy {
     minimald_rpc::EffectiveSessionPolicy {
         egress: sessions::effective_egress(policy.egress.as_ref(), network, phase, opt_out),
         ingress: policy.ingress.clone(),
+        host_ip_enforcement,
     }
 }
 
@@ -1020,12 +1052,21 @@ async fn serve_get_effective_session_policy(
                 None => Ok(Errorable::Err {
                     error: "no session found".to_string(),
                 }),
-                Some(record) => Ok(Errorable::Ok(effective_policy_reply(
-                    &record.policy,
-                    record.network,
-                    sessions::EGRESS_DEFAULT_PHASE,
-                    opt_out,
-                ))),
+                Some(record) => {
+                    // NET-079's enforcement state, read off the record the
+                    // create wrote it on — never re-probed here, because the
+                    // state that answers is the one the box runs under, and
+                    // the record is where the create left it.
+                    let host_ip_enforcement =
+                        record.attrs.get(HOST_IP_ENFORCEMENT_ATTR).cloned();
+                    Ok(Errorable::Ok(effective_policy_reply(
+                        &record.policy,
+                        record.network,
+                        sessions::EGRESS_DEFAULT_PHASE,
+                        opt_out,
+                        host_ip_enforcement,
+                    )))
+                }
             }
         })
         .await
@@ -2990,11 +3031,11 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        let id = client
+        let created = client
             .call::<CreateSession>(&req("my session", "/uwu"))
             .await
-            .unwrap()
-            .id;
+            .unwrap();
+        let id = created.id;
         assert!(id != SessionId::nil());
 
         let get_session = client
@@ -3023,6 +3064,13 @@ mod tests {
                 status: sessions::SessionStatus::Pending,
                 // /uwu is not a git repository, so the probe yields nothing.
                 git: None,
+                // The same enforcement state the create response above
+                // carried (NET-079), read back off the record the create
+                // wrote it on — pinned to the create's own answer, not to a
+                // literal, because this create answers over the real host's
+                // classifier facts and the state is this host's verdict,
+                // whatever it is.
+                host_ip_enforcement: created.host_ip_enforcement.map(Box::new),
                 attrs: None,
             }]
         );
@@ -3215,7 +3263,7 @@ mod tests {
             "the logged line must name this cause too, got: {confine_line}"
         );
         assert!(
-            confine_line.contains("egress_enforcement=Some(\"none\")"),
+            confine_line.contains("host_ip_enforcement=Some(\"none\")"),
             "the logged line must carry the enforcement recorded for the host-address box, got: {confine_line}"
         );
     }
@@ -3253,11 +3301,11 @@ mod tests {
         let created = client.call::<CreateSession>(&deny_all).await.unwrap();
 
         assert_eq!(
-            created.egress_enforcement.as_deref(),
+            created.host_ip_enforcement.as_deref(),
             Some("none"),
             "a deny-all box running unenforced on a host that cannot decide \
              per box must show egress enforcement none, got: {:?}",
-            created.egress_enforcement
+            created.host_ip_enforcement
         );
         assert!(
             created
@@ -3281,7 +3329,7 @@ mod tests {
             .attrs;
         assert_eq!(
             attrs
-                .get(super::EGRESS_ENFORCEMENT_ATTR)
+                .get(super::HOST_IP_ENFORCEMENT_ATTR)
                 .map(String::as_str),
             Some("none"),
             "the record must carry the per-box enforcement the create \
@@ -3305,7 +3353,7 @@ mod tests {
             .expect("the own-address session has a record")
             .attrs;
         assert!(
-            !attrs.contains_key(super::EGRESS_ENFORCEMENT_ATTR),
+            !attrs.contains_key(super::HOST_IP_ENFORCEMENT_ATTR),
             "an own-address box's verdict is decided on address leases, so \
              its record carries no per-box enforcement, got: {attrs:?}"
         );
@@ -3316,7 +3364,7 @@ mod tests {
         // reply's own pure half says it — the same machine spelling the
         // launch's record uses.
         assert_eq!(
-            super::create_egress_enforcement(
+            super::create_host_ip_enforcement(
                 NetworkMode::HostNet,
                 &classifier::Decision::decided()
             ),
@@ -3325,7 +3373,7 @@ mod tests {
              enforced"
         );
         assert_eq!(
-            super::create_egress_enforcement(NetworkMode::OwnIp, &classifier::Decision::decided()),
+            super::create_host_ip_enforcement(NetworkMode::OwnIp, &classifier::Decision::decided()),
             None,
             "a decided host still decides an own-address box's verdict on \
              address leases, not on the cgroup tree"
@@ -3854,10 +3902,12 @@ mod tests {
                 NetworkMode::OwnIp,
                 sessions::EgressDefaultPhase::InForce,
                 false,
+                None,
             ),
             EffectiveSessionPolicy {
                 egress: EffectiveEgress::DenyAll,
                 ingress: None,
+                host_ip_enforcement: None,
             },
             "an own-address box with no egress section must answer deny-all in force",
         );
@@ -3869,6 +3919,7 @@ mod tests {
         let deny_all = EffectiveSessionPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
+            host_ip_enforcement: None,
         };
         let wire = serde_json_lenient::to_string(&minimald_rpc::Errorable::Ok(deny_all.clone()))
             .expect("the deny-all reply must serialize");
@@ -3896,6 +3947,7 @@ mod tests {
                 NetworkMode::OwnIp,
                 sessions::EGRESS_DEFAULT_PHASE,
                 false,
+                None,
             ),
             "the wire must answer the shipped phase's resolution for a bare box",
         );
@@ -3954,6 +4006,7 @@ mod tests {
             EffectiveSessionPolicy {
                 egress: EffectiveEgress::AllowAll,
                 ingress: None,
+                host_ip_enforcement: None,
             },
             "behind the opt-out, an absent egress section keeps the shipped allow-all",
         );

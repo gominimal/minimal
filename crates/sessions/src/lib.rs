@@ -345,17 +345,37 @@ pub enum EffectiveEgress {
 /// resolved into [`EffectiveEgress::DenyAll`] or [`EffectiveEgress::AllowAll`],
 /// so a reader cannot mistake "no declaration" for "no rules".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-// Same reason as the attribute on `SessionPolicy`: the response rides an
-// `#[serde(untagged)]` `Errorable`, and the daemon's `{"error": "..."}` reply
-// must fall through to the `Err` arm rather than decode as a valid policy —
-// a silent false negative on a security-introspection command.
-#[serde(deny_unknown_fields)]
+// Unlike `SessionPolicy` this carries no `deny_unknown_fields`: its `egress`
+// is required, not an `Option`, so the daemon's `{"error": "..."}` reply
+// still falls through the `#[serde(untagged)]` `Errorable`'s `Ok` arm to
+// `Err` on its own and never masquerades as a valid policy. And a field this
+// shape can gain — the enforcement below arrived after the type was on the
+// wire — must stay ignorable, so an older client still decodes a newer
+// daemon's reply that carries a key it does not know rather than failing the
+// whole `min session policy` read.
 pub struct EffectiveSessionPolicy {
     /// The effective egress: the declaration, or the default the rollout
     /// phase and the daemon's opt-out leave in force.
     pub egress: EffectiveEgress,
     /// Ingress policy; `None` when no explicit ingress config is present.
     pub ingress: Option<IngressPolicy>,
+    /// The per-box egress enforcement this host's verdict gives the session
+    /// (NET-079): `per_box` when the box host can decide a host-address box's
+    /// egress verdict on a classifier leaf of its own, `none` when it cannot
+    /// and the box runs with the host's address and no verdict of its own.
+    /// `None` for a session that is not host-address — an own-address or none
+    /// box's verdict is decided on address leases, never on the host's
+    /// cgroup tree — and from a daemon that predates the field, whose
+    /// silence never reads as a decided `per_box`. Carried beside the rules
+    /// because the enforcement is what makes them true or not: on a host that
+    /// cannot decide per box a deny-all declaration prints `deny all` beside
+    /// an enforcement of `none`, the state the box actually runs in, rather
+    /// than a verdict that looks decided and is not.
+    ///
+    /// Read off the record the create recorded the fact on, so the state
+    /// outlives the create response that first reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip_enforcement: Option<String>,
 }
 
 /// Resolves the effective egress of a box (NET-074/NET-077): a declared

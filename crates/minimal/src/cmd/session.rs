@@ -1722,7 +1722,18 @@ pub fn classifier_advisory_start_line(
 /// resolved to its list or its default (`allow all`; `deny subnets` reads
 /// `(none)` when nothing is denied), or, for a box that declared no egress
 /// at all, the default its daemon resolved to (`deny all` once the deny-all
-/// default is in force; `allow all` behind the opt-out or before it) — the
+/// default is in force; `allow all` behind the opt-out or before it), with
+/// NET-079's per-box enforcement beside the egress rows when the daemon
+/// reported one: a host-address box's verdict is decided on the host's
+/// cgroup tree, so the egress block that says what the box may reach also
+/// says whether this host can decide that per box — `none` beside a
+/// declaration that then describes the box's posture, not its fact: the
+/// state the box actually runs in, spelled in the machine's own words
+/// (`per_box`/`none`, the same spellings the record, the listing, and the
+/// daemon's log line carry), never an invented prose of its own. An
+/// own-address box, a none box, and a reply that carries no state say
+/// nothing there — the row a render prints from silence would be the
+/// decided-looking one a pre-field daemon never sent — the
 /// node-plane baseline set the helper enumerates beside it (NET-130: the
 /// categories the in-VM daemon's own registry and cache fetches are to
 /// reach, one row a category's subnets, headed by the posture the
@@ -1788,6 +1799,22 @@ pub fn format_policy(
             }
             write_rules(out, "deny subnets", egress.deny_subnets.as_ref(), "(none)")?;
         }
+    }
+    // NET-079's per-box enforcement, as the egress block's closing row: a
+    // host-address box's verdict is decided on the host's cgroup tree, so
+    // this is the row that says whether the rules above are decided per box
+    // at all — and a `deny all` printed beside an enforcement of `none` is
+    // the honest rendering, the posture the box declared beside the state it
+    // actually runs in, rather than a verdict that looks decided and is not.
+    // The value is the reply's, verbatim in the machine spelling: the row a
+    // person reads here names the same fact the record's
+    // `host_ip_enforcement` attribute and the daemon's log line carry, so the
+    // three surfaces agree by construction. Printed only when the daemon
+    // reported a state — `None`, for a session that is not host-address or
+    // from a daemon that predates the field, prints nothing rather than a
+    // row silence never carried.
+    if let Some(enforcement) = &effective.host_ip_enforcement {
+        writeln!(out, "  per-box enforcement  {enforcement}")?;
     }
     // The node-plane baseline set, beside the box's rules (NET-130): the
     // helper's built-in enumeration of the categories the in-VM daemon's own
@@ -2595,6 +2622,7 @@ mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: Some(DynamicIngress::Allow),
             }),
+            host_ip_enforcement: None,
         };
         let mut out = Vec::new();
         format_policy(&mut out, &policy, NetworkMode::OwnIp, None).unwrap();
@@ -2622,6 +2650,7 @@ mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: Some(DynamicIngress::Ask),
             }),
+            host_ip_enforcement: None,
         };
         let mut out = Vec::new();
         format_policy(&mut out, &policy, NetworkMode::OwnIp, None).unwrap();
@@ -2645,6 +2674,7 @@ mod tests {
         let policy = EffectiveSessionPolicy {
             egress: EffectiveEgress::Declared(sessions::EgressPolicy::default()),
             ingress: None,
+            host_ip_enforcement: None,
         };
         let mut out = Vec::new();
         format_policy(&mut out, &policy, NetworkMode::OwnIp, None).unwrap();
@@ -2663,6 +2693,7 @@ mod tests {
         let deny_all = EffectiveSessionPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
+            host_ip_enforcement: None,
         };
         let mut out = Vec::new();
         format_policy(&mut out, &deny_all, NetworkMode::OwnIp, None).unwrap();
@@ -2680,6 +2711,7 @@ mod tests {
         let allow_all = EffectiveSessionPolicy {
             egress: EffectiveEgress::AllowAll,
             ingress: None,
+            host_ip_enforcement: None,
         };
         let mut out = Vec::new();
         format_policy(&mut out, &allow_all, NetworkMode::OwnIp, None).unwrap();
@@ -2696,7 +2728,7 @@ mod tests {
     /// recorded.
     fn create_reply(
         advisory: Option<&str>,
-        egress_enforcement: Option<&str>,
+        host_ip_enforcement: Option<&str>,
     ) -> minimald_rpc::CreateSessionResponse {
         minimald_rpc::CreateSessionResponse {
             id: sessions::SessionId::nil(),
@@ -2708,7 +2740,7 @@ mod tests {
             interim_loopback: false,
             deny_all_opt_out: None,
             classifier_advisory: advisory.map(str::to_string),
-            egress_enforcement: egress_enforcement.map(str::to_string),
+            host_ip_enforcement: host_ip_enforcement.map(str::to_string),
         }
     }
 
@@ -2819,6 +2851,7 @@ mod tests {
                 dynamic_allowed_range: Some((3000, 3999)),
                 dynamic_ingress: Some(DynamicIngress::Allow),
             }),
+            host_ip_enforcement: None,
         };
         let mut out = Vec::new();
         format_policy(&mut out, &policy, NetworkMode::OwnIp, None).unwrap();

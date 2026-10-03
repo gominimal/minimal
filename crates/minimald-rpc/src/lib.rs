@@ -199,6 +199,25 @@ pub struct ListSessionsEntry {
     #[serde(default)]
     pub git: Option<Box<GitInfo>>,
     pub attrs: Option<RunningSessionAttrs>,
+    /// The per-box egress enforcement this host's verdict gave the session
+    /// (NET-079): `per_box` when the host could decide a host-address box's
+    /// verdict on a classifier leaf of its own at create, `none` when it
+    /// could not and the box runs with the host's address and no verdict of
+    /// its own. Read off the record the create wrote it on, so a listing
+    /// shows the same state the create response and `min session policy`
+    /// show — no per-session follow-up round trip. `None` for a session
+    /// that is not host-address, for a record from a daemon that predates
+    /// the field, and when the record could not be read back; defaulted so
+    /// an entry from an older daemon still decodes, with the same silence
+    /// the other surfaces read as "not a host-address session".
+    ///
+    /// Boxed the way [`ListSessionsEntry::git`] is: the picker enums that
+    /// wrap an entry copy whole rows by value, and this field is one
+    /// machine word of state riding at the end of the row. On the wire it
+    /// is a plain string either way — the box is a client-side size
+    /// choice, invisible to the JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip_enforcement: Option<Box<String>>,
 }
 
 /// The git state of a session's project path, probed by the client on the
@@ -426,9 +445,11 @@ pub struct SessionConfig {
     pub hooks_enabled: bool,
     /// Free-form attributes (typed by the caller), persisted onto the
     /// session's record. The daemon adds one key of its own at create:
-    /// `egress_enforcement` (NET-079), the per-box egress enforcement this
+    /// `host_ip_enforcement` (NET-079), the per-box egress enforcement this
     /// host's verdict gives a host-address session, recorded so the state
-    /// outlives the activate message that reported it.
+    /// outlives the create response that reported it and can be read back
+    /// by `GetEffectiveSessionPolicy` and the listing without re-probing
+    /// the host.
     #[serde(default)]
     pub attrs: std::collections::BTreeMap<String, String>,
 }
@@ -659,16 +680,19 @@ pub struct CreateSessionResponse {
     /// The classifier advisory this host's verdict owes the session start
     /// (NET-079): `Some` only while the box host cannot decide a
     /// host-address box's egress verdict per box, naming the cause in
-    /// words, the state that leaves the box in — unenforced, whatever its
-    /// declaration says — and the exact command that installs the
+    /// words, the state that leaves the box in — unenforced, except that
+    /// a deny-all declaration is refused at placement while the probe
+    /// that would decide it cannot be read — and the exact command that
+    /// installs the
     /// classifier's privileged step only when that step is the cause that
     /// is missing, because a host that cannot confine a box is not
     /// cleared by installing anything. Spelled by the daemon, which is
     /// the one that read the host; printed by the client verbatim, and
     /// never a prompt — running the command (and any privilege prompt it
-    /// carries) is the person's act, never the session start's, because a
-    /// host-address box runs unenforced on such a host rather than
-    /// refused.
+    /// carries) is the person's act, never the session start's: the start
+    /// still hands the box the host's address and runs it unenforced, and
+    /// only a deny-all declaration is refused later, at placement, while
+    /// the probe that would decide it cannot be read.
     ///
     /// `None` from a host that decides per box: silence is that host's
     /// state, and a client reading `None` prints exactly what it printed
@@ -680,8 +704,9 @@ pub struct CreateSessionResponse {
     /// host-address session (NET-079): `per_box` when this host can decide
     /// a box's verdict on a classifier leaf of its own, `none` when it
     /// cannot and the box runs with the host's address and no verdict of
-    /// its own — the machine spelling the launch's own record uses, so a
-    /// script reads the state as data and not by parsing the prose around
+    /// its own. Spelled `host_ip_enforcement`, the machine spelling the
+    /// daemon's own record key and log line use, so a script reads the
+    /// state as data and not by parsing the prose around
     /// it. `None` for a session that is not host-address: an own-address
     /// or none box's verdict is decided on address leases, never on the
     /// host's cgroup tree.
@@ -692,7 +717,7 @@ pub struct CreateSessionResponse {
     /// that daemon's silence, never a decided `per_box`: a client that
     /// reads nothing here claims nothing from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub egress_enforcement: Option<String>,
+    pub host_ip_enforcement: Option<String>,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -1804,7 +1829,7 @@ mod tests {
             // prints and the enforcement a host-address box runs under
             // must not be able to silently drop off either.
             classifier_advisory: None,
-            egress_enforcement: None,
+            host_ip_enforcement: None,
         };
         let json = serde_json_lenient::to_string(&resp).expect("serializes");
         assert!(
@@ -1831,7 +1856,7 @@ mod tests {
             interim_loopback: false,
             answerer_bound: false,
             classifier_advisory: None,
-            egress_enforcement: None,
+            host_ip_enforcement: None,
         };
         let json = serde_json_lenient::to_string(&opted_out).expect("serializes");
         assert!(
@@ -1854,7 +1879,7 @@ mod tests {
 
     /// The classifier state a host that cannot decide per box puts on its
     /// create replies (NET-079), pinned on the wire: the unenforced state
-    /// as `egress enforcement none` in the machine spelling — `per_box` on
+    /// as `host_ip_enforcement: none` in the machine spelling — `per_box` on
     /// a host that decides, so the two hosts stay distinguishable to
     /// whatever reads the field — the cause in words inside the advisory,
     /// and the install command only for the cause it clears. A daemon
@@ -1885,11 +1910,11 @@ mod tests {
                  --node-plane-address <node-plane address>"
                     .to_string(),
             ),
-            egress_enforcement: Some("none".into()),
+            host_ip_enforcement: Some("none".into()),
         };
         let json = serde_json_lenient::to_string(&step_missing).expect("serializes");
         assert!(
-            json.contains(r#""egress_enforcement":"none""#),
+            json.contains(r#""host_ip_enforcement":"none""#),
             "the unenforced state must ride the wire in the machine spelling, got: {json}",
         );
         assert!(
@@ -1914,7 +1939,7 @@ mod tests {
                  unenforced — whatever the boxes' declarations say."
                     .to_string(),
             ),
-            egress_enforcement: Some("none".into()),
+            host_ip_enforcement: Some("none".into()),
             ..step_missing
         };
         let json = serde_json_lenient::to_string(&cannot_confine).expect("serializes");
@@ -1928,12 +1953,12 @@ mod tests {
         // client of either build reads the reply it always read.
         let decided = CreateSessionResponse {
             classifier_advisory: None,
-            egress_enforcement: Some("per_box".into()),
+            host_ip_enforcement: Some("per_box".into()),
             ..cannot_confine
         };
         let json = serde_json_lenient::to_string(&decided).expect("serializes");
         assert!(
-            json.contains(r#""egress_enforcement":"per_box""#),
+            json.contains(r#""host_ip_enforcement":"per_box""#),
             "a host that decides per box says so in the machine spelling, got: {json}",
         );
         assert!(
@@ -1953,7 +1978,7 @@ mod tests {
         match pre_field {
             Errorable::Ok(c) => {
                 assert!(c.classifier_advisory.is_none());
-                assert_eq!(c.egress_enforcement, None);
+                assert_eq!(c.host_ip_enforcement, None);
             }
             Errorable::Err { error } => panic!("expected Ok, got {error}"),
         }

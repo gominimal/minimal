@@ -20,6 +20,7 @@ fn entry(n: u128, name: Option<&str>, project: &str) -> minimald_rpc::ListSessio
         project_path: Some(paths::HostAbsPath::try_new(project).unwrap()),
         status: sessions::SessionStatus::Active,
         git: None,
+        host_ip_enforcement: None,
         attrs: None,
     }
 }
