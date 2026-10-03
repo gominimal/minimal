@@ -106,13 +106,19 @@ jobs:
         # The workspace build + libkrun prefix routinely exceed the ~14 GB
         # free on a fresh GitHub-hosted Ubuntu runner. `remove_tool_cache:
         # true` reclaims /opt/hostedtoolcache (~14 GB); the dtolnay step below
-        # reinstalls the Rust toolchain we actually need.
+        # reinstalls the Rust toolchain we actually need. The Android SDK is
+        # removed by the next step instead.
         uses: endersonmenezes/free-disk-space@2a22f8c59cae9cddae7194b33e6b92d023b2b4b8 # v4.0.0
         with:
-          remove_android: true
+          remove_android: false
           remove_dotnet: true
           remove_haskell: true
           remove_tool_cache: true
+      - name: Remove the Android SDK in the background
+        # ~11 GB in many small files: deleting it in the foreground costs
+        # 50-130 s. Detached, it finishes while the toolchain installs and the
+        # cache restores, before the build needs the space.
+        run: setsid nohup sudo rm -rf /usr/local/lib/android >/dev/null 2>&1 &
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
@@ -149,19 +155,20 @@ jobs:
         with:
           tool: cross,nextest
 
-      - name: Cache cargo + build artifacts
-        # Restore-only; the save half (main only) runs at the end of the job.
-        id: cargo-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Cache cargo registry and build artifacts
+        # Swatinem prunes before saving: it drops workspace-crate artifacts
+        # (rebuilt on every run anyway, checkout resets their mtimes) and any
+        # dependency no longer in the graph. The raw actions/cache this
+        # replaces restored and re-saved the whole target/ along the
+        # restore-keys chain, which grew to ~19 GB and took ~6.5 min to
+        # restore. Cargo tags target/<triple>/ as a nested target dir, so the
+        # musl dev and initramfs profiles are kept.
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 # zizmor: ignore[cache-poisoning] test-only lane, nothing published; save-if keeps every non-main ref read-only
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-x86_64-minvmd-kvm-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-x86_64-minvmd-kvm-
+          shared-key: kvm-musl
+          # PR branches restore but never write: multi-GB caches written by
+          # every branch LRU-evict the main entries all PRs restore from.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build static libkrun (musl)
         # Needed at BUILD time: minvmd links libkrun (build.rs link search +
@@ -195,8 +202,10 @@ jobs:
         # -p minvmd -p minimal` unifies minvmd's default `libkrun` feature
         # into the CLI's default-features=false opt-out, linking libkrun into
         # `minimal` (the regression the macOS lane hit and now guards). The
-        # CLI drives the unified session e2e in the test job.
-        run: cargo build -p minimal --bin min --locked
+        # CLI drives the unified session e2e in the test job. Built for the
+        # same musl target and profile as minvmd so the two invocations share
+        # dependency artifacts instead of compiling a second (gnu) graph.
+        run: cargo build -p minimal --bin min --locked --target x86_64-unknown-linux-musl
 
       - name: Archive integration harnesses + stage the testbed
         # `cargo nextest archive` replaces the hand-rolled testbins.json
@@ -219,7 +228,7 @@ jobs:
             --target x86_64-unknown-linux-musl \
             --archive-file testbed/nextest-archive.tar.zst
           cp target/x86_64-unknown-linux-musl/debug/minvmd testbed/minvmd
-          cp target/debug/min testbed/min
+          cp target/x86_64-unknown-linux-musl/debug/min testbed/min
           cp "$RUNNER_TEMP/initramfs.cpio" testbed/initramfs.cpio
           # Prove it before it leaves this job: a dynamically-linked minvmd
           # here means the lane silently stopped testing what we distribute.
@@ -235,20 +244,6 @@ jobs:
           path: testbed/
           if-no-files-found: error
           retention-days: 3
-
-      - name: Save cargo + build artifacts cache (main only)
-        # PR branches restore but never write: multi-GB caches written by
-        # every branch LRU-evict the main entries all PRs restore from.
-        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   test-kvm:
     # TEST phase: no Rust toolchain, no cargo build — download the testbed,
