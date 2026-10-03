@@ -526,7 +526,7 @@ mod transport_error_tests {
     fn gcs_transport_error_is_an_error_not_a_panic() {
         let resp = AnyResponse::Gcs(Err(GcsError::exhausted("dns error")));
         assert!(!FetchResponse::is_success(&resp));
-        assert_ne!(FetchResponse::status_code(&resp), 404);
+        assert_eq!(FetchResponse::status_code(&resp), 0);
         assert!(FetchResponse::error_for_status(resp).is_err());
     }
 }
