@@ -923,8 +923,7 @@ mod tests {
             serde_json_lenient::from_str(r#"{"egress":null,"ingress":null}"#)
                 .expect("a policy predating the field must still parse");
         assert_eq!(
-            legacy.credentialed_upstream,
-            None,
+            legacy.credentialed_upstream, None,
             "no declaration in the JSON is no lane, not an error"
         );
         let json = serde_json_lenient::to_string(&legacy).unwrap();
