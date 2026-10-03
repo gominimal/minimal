@@ -2576,10 +2576,11 @@ mod tests {
             .find(|line| line.starts_with("for addr in ") && line.ends_with("; do"))
             .copied()
             .unwrap_or_else(|| panic!("the program walks the range's addresses: {program}"));
-        let walked: Vec<String> = walk["for addr in ".len()..walk.len() - "; do".len()]
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
+        let list = walk
+            .strip_prefix("for addr in ")
+            .and_then(|rest| rest.strip_suffix("; do"))
+            .expect("the walk line is `for addr in <addresses>; do`");
+        let walked: Vec<String> = list.split_whitespace().map(str::to_string).collect();
         let expected: Vec<String> = switch::loopback::range_hosts()
             .map(|addr| addr.to_string())
             .collect();
@@ -2623,8 +2624,7 @@ mod tests {
         // argument, no environment variable, no file read in — the only
         // identifiers behind its `$` signs are its own two and the one
         // command substitution.
-        for (at, _) in program.match_indices('$') {
-            let rest = &program[at + 1..];
+        for rest in program.split('$').skip(1) {
             let name: String = rest
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
@@ -3008,7 +3008,11 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("for addr in ") && line.ends_with("; do"))
             .unwrap_or_else(|| panic!("the program walks the range's addresses: {program}"));
-        let applied: Vec<Ipv4Addr> = walk["for addr in ".len()..walk.len() - "; do".len()]
+        let list = walk
+            .strip_prefix("for addr in ")
+            .and_then(|rest| rest.strip_suffix("; do"))
+            .expect("the walk line is `for addr in <addresses>; do`");
+        let applied: Vec<Ipv4Addr> = list
             .split_whitespace()
             .filter_map(|address| address.parse().ok())
             .collect();
