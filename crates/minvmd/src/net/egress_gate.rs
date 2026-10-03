@@ -3148,11 +3148,11 @@ fn reply_tuple_of(pkt: &dns_pins::L4Packet) -> egress::FlowTuple {
 /// answer names the switch as its destination — the very address the
 /// control-surface rule refuses. The record is the one thing that tells the
 /// two apart: it exists only for a flow this gate itself delivered toward a
-/// port the box's declaration admitted, and it admits only its exact reverse,
-/// so a box reaching for the switch's API ports still finds them refused,
-/// whatever it dials. Nothing else moves — the lease check the shared verdict
-/// carries still governs every frame, and a destination no record names keeps
-/// every drop it ever took.
+/// port one of the box's applied publishes dials, and it admits only its
+/// exact reverse, so a box reaching for the switch's API ports still finds
+/// them refused, whatever it dials. Nothing else moves — the lease check the
+/// shared verdict carries still governs every frame, and a destination no
+/// record names keeps every drop it ever took.
 fn gate_verdict(
     summary: &FrameSummary,
     l4: Option<&dns_pins::L4Packet>,
@@ -3177,8 +3177,8 @@ fn gate_verdict(
         };
     }
     // NET-040's answer half: a frame whose five-tuple exactly reverses a live
-    // inbound flow this gate's ingress leg recorded — the connection the
-    // row's admitted port received, delivered by this gate itself — passes
+    // inbound flow this gate's ingress leg recorded — the connection a
+    // published port received, delivered by this gate itself — passes
     // without a single rule being consulted, the row's `deny_subnets` and
     // the infrastructure set included, because a destination the box's rules
     // refuse is what a reply to a published port *is*. The record admits its
