@@ -13,6 +13,11 @@ license.workspace = true
 # configuration renderer, pulls in neither smoltcp nor tokio; `minvmd` turns
 # it on and wires the peer beside the switch.
 stack-peer = ["dep:smoltcp", "dep:tokio", "dep:tracing"]
+# The box-side client and channel-wired lane in `bep_host::test_util`: the
+# scaffolding this crate's pool tests drive, and `minvmd`'s delivery tests
+# reuse so they exercise the same delivery path against the real registry
+# and the stand-in acceptor instead of re-implementing a TCP client.
+test-util = ["stack-peer"]
 
 [dependencies]
 # The userspace TCP/IP stack the Box Egress Proxy's host leg runs over
