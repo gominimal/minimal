@@ -123,6 +123,13 @@
 #                                   two daemons on one machine routing
 #   retired_surfaces_gone            NET-109/110: the retired surfaces are gone,
 #                                    and a direct-tcpip forward relays for real
+#   daemon_fetch_under_deny_all_host_address_box
+#                                    NET-080 under the loaded classifier table:
+#                                    the privileged step's tree and table
+#                                    installed, a host-address box declared
+#                                    deny-all, `min add` inside it, and the
+#                                    daemon's own fetch recorded as node-plane
+#                                    traffic naming the box and the package
 #
 # Usage: scripts/session-e2e.sh [case]
 set -uo pipefail # not -e: capture failures so we can dump diagnostics
@@ -197,6 +204,12 @@ RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
 BEPB_SEED_DIR_A="" # seeded by the proxy-source proof below; removed on teardown
 BEPB_SEED_DIR_B="" # its second box's seed; removed on teardown
+NET080_SEED_DIR="" # seeded by the daemon-fetch proof below; removed on teardown
+# The classifier tree+table the daemon-fetch proof installs when the lane has
+# none. A run that dies between that install and the proof's own uninstall must
+# not leave a host's packet filter deciding behind it, so the teardown unloads
+# whatever this flag says is ours.
+NET080_CLASSIFIER_INSTALLED=""
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -471,6 +484,17 @@ teardown() {
   if [ -n "$E2E_VM" ]; then
     minvmd stop >/dev/null 2>&1 || true
   fi
+  # The daemon-fetch proof's classifier tree+table, if a mid-proof death left
+  # them: the daemon stop above comes first because the uninstall refuses while
+  # a live leaf or process holds the tree (its own guard) — and the daemon sits
+  # in the tree's own leaf once the proof placed it. The removal is best-effort
+  # here (a teardown that cannot sudo says nothing and removes nothing); the
+  # proof's own happy path uninstalls and CHECKS it took, this is only the net
+  # under the failure paths.
+  if [ -n "$NET080_CLASSIFIER_INSTALLED" ]; then
+    sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 || true
+    NET080_CLASSIFIER_INSTALLED=""
+  fi
   [ -n "$SEED_DIR" ] && rm -rf "$SEED_DIR"
   [ -n "$SEEDED_MFILE" ] && rm -f "$SEEDED_MFILE"
   [ -n "$TASK_SEED_DIR" ] && rm -rf "$TASK_SEED_DIR"
@@ -527,6 +551,7 @@ teardown() {
   [ -n "$SECOND_SEED_DIR" ] && rm -rf "$SECOND_SEED_DIR"
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
+  [ -n "$NET080_SEED_DIR" ] && rm -rf "$NET080_SEED_DIR"
   # The proxy-source proof's two boxes: their project dirs are removed on its
   # success path, but every failure path in it goes straight to `fail`, so the
   # trap is the one place that always sees them.
@@ -1450,6 +1475,389 @@ proof_own_ip_egress_declared_and_enforced() {
   mnl session destroy --force "$deny_all_sid" >/dev/null 2>&1 || true
   rm -rf "$EGRESS_SEED_DIR"; EGRESS_SEED_DIR=""
   echo "own-IP egress declared and enforced OK"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# NET-080 end to end under the real table: the daemon's own package fetch
+# survives a deny-all host-address box on the same host and is recorded as
+# node-plane traffic, naming the box it fetched for. Every other proof in
+# this script runs on a host whose classifier step has not run — the daemon
+# places no box, and every box is unenforced — so this one installs the real
+# thing and drives the user path across it: the privileged step's tree and
+# table at the /sys/fs/cgroup/minimald.slice the daemon itself looks for, a
+# host-address box declared deny-all, an in-box `min add` of a registry
+# package (never a source build: that leg is issue #1872, outside this
+# proof), and the node-plane record naming the box and the package.
+#
+# The install is this proof's own and this proof's to remove: the happy path
+# uninstalls before it returns and checks that it took, and the teardown
+# uninstalls whatever a mid-proof death left (the flag it sets below), so a
+# lane is never left carrying a table it did not ask for. Both source
+# identities are rendered from the host's own default-route source address,
+# so the classification is in force — the daemon's leaf and the cohort are
+# distinct, and the marks and the translation are real — while no packet on
+# the lane changes the source it would have left with anyway. A host that
+# already carries a classifier install is left alone: this proof installs
+# its own but replaces no host's.
+#
+# Where the table cannot be loaded the proof self-skips and prints why; on
+# CI's native lane the same gates are lane faults, because that lane claims
+# to load what this proof installs. One skip is a fact about the target
+# everywhere: a VM lane's daemon runs in the guest, and the table is a host
+# install the proof has no seat inside the guest to make.
+#
+# The one thing this seat cannot drive is said in the transcript, not
+# skipped silently: a connection FROM the box refused. The table refuses
+# exactly the deny subtree's connections, and a box reaches that subtree
+# only by admitting no destination at all — the strict `deny all` shape
+# (allow_subnets, allow_dns_hosts and allow_protocols each an empty list),
+# which the shipped CLI cannot type, because every egress flag maps an
+# empty list to an unset field (crates/minimal/src/cmd/session.rs) — so a
+# CLI-declared box, this one with deny 0.0.0.0/0 included, lands in
+# boxes/allow, where the loaded table refuses nothing. The live refusal
+# this proof does pin is the daemon's own: host_ip_enforcement=per_box is
+# the verdict a host gets only when the daemon's probe connection out of a
+# deny leaf was refused by this table, read fresh before this box's
+# launch. The deny subtree's refusal of a box's own connection is owned
+# live by the root lane: deny_all_host_ip_box_answers_the_proxy_over_a_
+# loaded_table, with snat_identity_is_seen_by_the_peer for the node
+# plane's identity.
+proof_daemon_fetch_under_deny_all_host_address_box() {
+  echo "::group::the daemon's own fetch under a loaded classifier table (NET-080)"
+
+  # A VM lane's daemon is in the guest and the classifier table is a host
+  # install: the native lane is the one that loads it, and this skip is a
+  # fact about the target, never about the host's capability.
+  if [ -n "$E2E_VM" ]; then
+    echo "daemon-fetch proof SKIPPED (VM-backed target: minimald runs in the guest and the classifier table is a host install; the native lane loads it)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The daemon's file log is JSON lines (crates/mlog/src/lib.rs), so every
+  # needle below is the JSON spelling of the field or message it pins — and
+  # the box's id is part of the record needle, because a whole-lane run has
+  # already recorded a node-plane fetch for the sandbox proof's own `min
+  # add`, and this proof must pin ITS box's record, not any other's.
+  # `|| true` because a find -exec whose grep finds nothing exits nonzero,
+  # and the callers assert on the captured text.
+  net080_log() { # $1 = the fixed string; prints the matching daemon-log lines
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+      -exec grep -hF -- "$1" {} + 2>/dev/null || true
+  }
+
+  # The proof's own uninstall, in the order the installer requires: the
+  # box's leaf empties when the session is destroyed, the daemon's when it
+  # stops — the uninstall refuses while a live leaf or process holds the
+  # tree, its own guard, which is why the stop comes before it. Returns the
+  # uninstall's exit status, so the happy path can fail on a removal that
+  # did not happen.
+  net080_unwind() {
+    if [ -n "${net080_sid:-}" ]; then
+      mnl session destroy --force "$net080_sid" >/dev/null 2>&1 || true
+    fi
+    mnl stop --force >/dev/null 2>&1 || true
+    if [ -n "$NET080_CLASSIFIER_INSTALLED" ]; then
+      sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1
+    fi
+  }
+
+  # ---- the gates: one fact each, printed when it is missing ---------------
+  net080_why=""
+  if ! command -v nft >/dev/null 2>&1; then
+    net080_why="no nft on PATH: the classifier table is loaded with it"
+  elif ! command -v ip >/dev/null 2>&1; then
+    net080_why="no ip on PATH: the proof cannot derive the default-route source address the install renders both identities from"
+  elif ! sudo -n true >/dev/null 2>&1; then
+    net080_why="no passwordless sudo: the install that loads the tree and the table needs root"
+  elif [ -e /sys/fs/cgroup/minimald.slice ] || sudo -n nft list table inet minimal_class >/dev/null 2>&1; then
+    net080_why="this host already carries a classifier install (the tree at /sys/fs/cgroup/minimald.slice or the table inet minimal_class), and this proof replaces no host's own"
+  elif ! "$ROOT/scripts/install-host-classifier.sh" --print-ruleset \
+      --cohort-address 127.0.0.1 --node-plane-address 127.0.0.1 \
+      >/dev/null 2>"$WORK/net080-mount.err"; then
+    # The installer's own mount rehearsal, unprivileged and touching nothing:
+    # it runs the same mount check an install runs, so its refusing is the
+    # one fact the cheaper gates cannot read — no cgroup2 mount with
+    # nsdelegate, rooted at the hierarchy's own root, covers the tree.
+    net080_why="the installer's own mount check refuses this host: $(head -n1 "$WORK/net080-mount.err" 2>/dev/null || true)"
+  else
+    # The host's own default-route source address: the one identity both
+    # planes are rendered from. The install refuses half a classification,
+    # and this proof refuses to guess an address it cannot derive.
+    net080_src="$(ip route get 1.1.1.1 2>/dev/null \
+      | sed -n 's/.* src \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+    [ -n "$net080_src" ] \
+      || net080_why="no default-route source address to render the install's two identities from"
+  fi
+  if [ -n "$net080_why" ]; then
+    if [ -n "${CI:-}" ]; then
+      echo "::error::a CI native lane must be able to load the classifier table: $net080_why"
+      fail
+    fi
+    echo "::warning::daemon-fetch proof SKIPPED — the classifier table cannot be loaded on this host"
+    echo "  ($net080_why)"
+    echo "  asserted on the native CI lane, where the privileged step's tree and table load"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # ---- the install: this proof's tree and table ---------------------------
+  # The daemon is stopped first, so the one this proof drives starts under
+  # the install and under this proof's RUST_LOG: the node-plane record and
+  # the launch line are INFO records from minimald::net::classifier and
+  # minimald::session_host, a daemon's filter comes from RUST_LOG at
+  # autospawn, and the lane's default filter would drop both before they
+  # reached the file this proof reads them from. The command-local
+  # assignment below keeps the rest of the lane at its own filter.
+  mnl stop --force >/dev/null 2>&1 || true
+  # Set before the install, so a death between its nft transaction and its
+  # last note still leaves the teardown a table to remove.
+  NET080_CLASSIFIER_INSTALLED=1
+  if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" \
+      --cohort-address "$net080_src" --node-plane-address "$net080_src" \
+      >"$WORK/net080-install.out" 2>"$WORK/net080-install.err"; then
+    echo "::error::the classifier install failed, so no table is loaded and nothing below can be asserted"
+    echo "--- installer stderr ---"; cat "$WORK/net080-install.err" 2>/dev/null || true
+    fail
+  fi
+  net080_install_out="$(cat "$WORK/net080-install.out" 2>/dev/null || true)"
+  if [[ "$net080_install_out" != *"installed the classifier tree"* ]] \
+     || [[ "$net080_install_out" != *"loaded the classifier table"* ]]; then
+    echo "::error::the classifier install did not report both its tree and its table"
+    echo "--- installer output ---"; printf '%s\n' "$net080_install_out"
+    fail
+  fi
+  echo "install: the privileged step laid out the tree at /sys/fs/cgroup/minimald.slice and loaded the classifier table inet minimal_class, both identities $net080_src — the host's own source, so the classification is in force and no packet changes the source it would have left with anyway"
+  if [ ! -e /sys/fs/cgroup/minimald.slice/classifier-table ]; then
+    echo "::error::the table's presence marker is missing at /sys/fs/cgroup/minimald.slice/classifier-table: the daemon reads no per-box verdict without it"
+    fail
+  fi
+  echo "marker: the table's presence marker is in place — minimald records a per-box verdict only while it is there"
+
+  # ---- the box: a host-address box declared deny-all ----------------------
+  # deny 0.0.0.0/0 is the CLI's deny-all spelling for a host-address box, the
+  # same explicit stand-in NET-074's e2e case names for the in-force default
+  # the phase does not yet ship.
+  NET080_SEED_DIR="$(hook_mktemp /tmp/mnl80.XXXXXX)"
+  hook_seed_preamble >"$NET080_SEED_DIR/minimal.toml"
+  mkdir "$NET080_SEED_DIR/.git"
+  net080_sid="$(cd "$NET080_SEED_DIR" && RUST_LOG="warn,minimald::exec=info,minimald::net::classifier=info,minimald::session_host=info" \
+    mnl session activate . --no-prompt --name e2e-net080-deny-all \
+    --network host_ip --deny-subnets 0.0.0.0/0 2>"$WORK/net080-activate.err")" || {
+    echo "::error::'min session activate --network host_ip --deny-subnets 0.0.0.0/0' failed under the loaded table"
+    cat "$WORK/net080-activate.err" 2>/dev/null || true
+    fail
+  }
+  net080_sid="$(printf '%s\n' "$net080_sid" | tail -n1 | tr -d '\r')"
+  echo "activate: the host-address box $net080_sid is declared deny-all (deny 0.0.0.0/0)"
+
+  # ---- the daemon's placement: the one migration it cannot make itself ----
+  # A native daemon starts wherever its starter left it (user.slice), so the
+  # common ancestor of its starting cgroup and the slice is the root-owned
+  # hierarchy root — the barrier that stops a box climbing out is the same
+  # fact that stops the daemon climbing in. The installer's --pid step is
+  # the supported placement, and the placement probe is per launch, so the
+  # next box this daemon launches is decided on a leaf of its own. Found
+  # off /proc, keyed on comm (a cmdline match would take an editor holding
+  # a file under crates/minimald for the daemon itself) and on this
+  # account, so another account's daemon is never placed in this proof's
+  # tree.
+  net080_daemons=""
+  for net080_proc in /proc/[0-9]*; do
+    [ -r "$net080_proc/comm" ] || continue
+    read -r net080_comm <"$net080_proc/comm" 2>/dev/null || continue
+    [ "$net080_comm" = "$min_daemon" ] || continue
+    [ -O "$net080_proc" ] || continue
+    net080_daemons="$net080_daemons${net080_daemons:+ }${net080_proc#/proc/}"
+  done
+  net080_pid="${net080_daemons%% *}"
+  if [ -z "$net080_pid" ] || [ "${net080_daemons#"$net080_pid"}" != "" ]; then
+    echo "::error::expected exactly one $min_daemon under this account to place in its leaf, found: ${net080_daemons:-none}"
+    fail
+  fi
+  if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --pid "$net080_pid" \
+      >"$WORK/net080-place.out" 2>"$WORK/net080-place.err"; then
+    echo "::error::the installer's --pid step could not place $min_daemon $net080_pid in its leaf"
+    echo "--- installer stderr ---"; cat "$WORK/net080-place.err" 2>/dev/null || true
+    fail
+  fi
+  net080_place_out="$(cat "$WORK/net080-place.out" 2>/dev/null || true)"
+  if [[ "$net080_place_out" != *"placed $net080_pid in"* ]]; then
+    echo "::error::the --pid step did not report placing $min_daemon $net080_pid"
+    echo "--- installer output ---"; printf '%s\n' "$net080_place_out"
+    fail
+  fi
+  echo "place: $min_daemon $net080_pid is inside the slice, so the next box it launches is decided on a leaf of its own"
+
+  # ---- the capability gate: this proof drives a box, so a host that cannot
+  # run one cannot run it. Observed fact, degraded on a developer host, a
+  # lane fault on CI (the posture proof's rule).
+  if ! mnl session exec "$net080_sid" 'true' >"$WORK/net080-gate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$net080_sid" 'true' >"$WORK/net080-gate.err" 2>&1; }; then
+    if [ -z "${CI:-}" ]; then
+      echo "::warning::daemon-fetch proof SKIPPED — this host cannot run a session sandbox, so the in-box 'min add' cannot be driven"
+      echo "  (exec: $(head -n1 "$WORK/net080-gate.err" 2>/dev/null || true))"
+      echo "  the tree and table this proof installed are uninstalled below; asserted on the native CI lane"
+      net080_unwind || true
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::a CI native lane that cannot run a session sandbox cannot drive NET-080: the in-box 'min add' is the proof"
+    cat "$WORK/net080-gate.err" 2>/dev/null || true
+    fail
+  fi
+
+  # ---- the box's launch record: the subtree its declaration picked, the
+  # leaf it was placed in, and the fresh verdict the host read before it.
+  # `per_box` is not a claim the launch makes about itself: it is the
+  # verdict a host gets only when the daemon's probe connection out of a
+  # deny leaf was refused the way this table refuses — so pinning it pins
+  # the table refusing, not merely loaded.
+  net080_launch="$(net080_log 'egress verdict is decided on its classifier leaf')"
+  if [[ "$net080_launch" != *'"classifier":"allow"'* ]]; then
+    echo "::error::the box's launch record does not name the allow subtree a CLI-declared box lands in: $net080_launch"
+    fail
+  fi
+  if [[ "$net080_launch" != *"boxes/allow/$net080_sid"* ]]; then
+    echo "::error::the box's launch record does not name this box's own leaf (boxes/allow/$net080_sid): $net080_launch"
+    fail
+  fi
+  if [[ "$net080_launch" != *'"host_ip_enforcement":"per_box"'* ]]; then
+    echo "::error::the box's launch record does not say per_box: the daemon's probe out of a deny leaf was not refused by the loaded table, so this host does not decide per box and the fetch below would not be node plane at all: $net080_launch"
+    fail
+  fi
+  echo "launch: the box is placed in its own leaf boxes/allow/$net080_sid, in the allow subtree, and the host decides per box — the daemon's probe connection out of a deny leaf was refused by the loaded table before this launch"
+
+  # ---- the box's own egress, before: the declaration as `min session policy`
+  # reads it back, and one connection out of the box — printed either way
+  # (weather cannot be told from enforcement from this seat), and asserted
+  # after only where this before-half answered.
+  net080_policy_before="$(mnl session policy "$net080_sid" 2>"$WORK/net080-policy-before.err")" || {
+    echo "::error::'min session policy' failed for the deny-all host-address box"
+    cat "$WORK/net080-policy-before.err" 2>/dev/null || true
+    fail
+  }
+  if [[ "$net080_policy_before" != *"0.0.0.0/0"* ]]; then
+    echo "::error::the box's policy does not read back the declared deny 0.0.0.0/0"
+    printf '%s\n' "$net080_policy_before"
+    fail
+  fi
+  echo "policy: the box's declaration reads back deny 0.0.0.0/0"
+  net080_answered=0
+  mnl session exec "$net080_sid" \
+    "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://example.com" \
+    >"$WORK/net080-ctrl-before.out" 2>"$WORK/net080-ctrl-before.err"
+  net080_rc=$?
+  net080_status_before="$(cat "$WORK/net080-ctrl-before.out" 2>/dev/null)"
+  # The egress proof's judge: curl always writes its -w line, so a real
+  # answer is a zero exit OR any status back, whatever curl then thought of
+  # the certificate.
+  if [ "$net080_rc" -eq 0 ] \
+     || { [ -n "$net080_status_before" ] && [ "$net080_status_before" != "HTTP:000" ]; }; then
+    net080_answered=1
+    echo "control: the box completed a connection to https://example.com ($net080_status_before) — the cohort's egress under the loaded table"
+  else
+    echo "control: the box did not complete a connection to https://example.com in this run (rc=$net080_rc) — either weather, or the declared deny enforced somewhere this seat cannot see; the connection half is printed, and asserted after only if this before-half had answered"
+  fi
+
+  # ---- the install inside the box, driven like a user: a REAL pty attach (a
+  # pipe cannot answer the session-exit prompt), the driver's default stream
+  # — the tool absent before, `min add`, `hash -r`, its version banner —
+  # answered with the detach lane so the session survives the after-reads.
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  net080_attach_out="$(E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" "$ADD_TOOL" \
+    min ${E2E_MINIMAL_ARGS:-} session attach "$net080_sid" 2>"$WORK/net080-attach.err")" || {
+    echo "::error::the pty attach to the deny-all host-address box failed"
+    echo "--- transcript ---"; printf '%s\n' "$net080_attach_out"
+    echo "--- driver stderr ---"; cat "$WORK/net080-attach.err" 2>/dev/null || true
+    fail
+  }
+  # Bash globs, never `printf | grep -q`: the pty's progress bars can flood
+  # the transcript, and a grep -q that exits on the first match while
+  # printf is still writing turns SIGPIPE into a false "not found" under
+  # pipefail (the sandbox proof's finding).
+  if [[ "$net080_attach_out" != *TOOL_ABSENT_BEFORE* ]]; then
+    echo "::error::'$ADD_TOOL' was already present before 'min add' (a baseline tool proves nothing)"
+    echo "--- transcript tail ---"; printf '%s\n' "$net080_attach_out" | tail -n 20
+    fail
+  fi
+  if [[ "$net080_attach_out" != *"$ADD_TOOL_MARKER"* ]]; then
+    echo "::error::in-sandbox 'min add $ADD_TOOL' did not make it runnable (no '$ADD_TOOL_MARKER'): the install did not complete"
+    echo "--- transcript tail ---"; printf '%s\n' "$net080_attach_out" | tail -n 20
+    echo "--- driver stderr ---"; cat "$WORK/net080-attach.err" 2>/dev/null || true
+    fail
+  fi
+  echo "install: 'min add $ADD_TOOL' completed inside the deny-all box and made it runnable ('$ADD_TOOL_MARKER' round-tripped) — the daemon fetched it on this same host"
+
+  # ---- the node-plane record: the line the requirement is for. The needle
+  # names this box (see net080_log): the earlier proofs' own installs
+  # recorded fetches of their own, and this proof pins THIS box's.
+  net080_records="$(net080_log "\"box_id\":\"$net080_sid\"")"
+  if [ -z "$net080_records" ]; then
+    echo "::error::the daemon log has no record naming this box: the daemon's own fetch was not recorded"
+    fail
+  fi
+  if [[ "$net080_records" != *"node-plane traffic"* ]]; then
+    echo "::error::the records naming this box are not node-plane records: $net080_records"
+    fail
+  fi
+  if [[ "$net080_records" != *'"leaf":"daemon"'* ]]; then
+    echo "::error::the node-plane record does not name the daemon's own leaf: $net080_records"
+    fail
+  fi
+  if [[ "$net080_records" != *"\"object\":\"$ADD_TOOL"* ]]; then
+    echo "::error::the node-plane record does not name the package fetched: $net080_records"
+    fail
+  fi
+  printf '%s\n' "$net080_records" | sed 's/^/record: /'
+  echo "record: the daemon's own fetch is recorded as node-plane traffic — the daemon's leaf, this box, the package, and the host it left for above"
+
+  # ---- the box's own egress, after: the requirement's fear is that making
+  # the node plane's own traffic survive changed the box's own egress, and
+  # these are the two halves that say it did not.
+  net080_policy_after="$(mnl session policy "$net080_sid" 2>"$WORK/net080-policy-after.err")" || {
+    echo "::error::'min session policy' failed after the install"
+    cat "$WORK/net080-policy-after.err" 2>/dev/null || true
+    fail
+  }
+  if [ "$net080_policy_before" != "$net080_policy_after" ]; then
+    echo "::error::the box's policy does not read back as it did before the daemon's fetch:"
+    diff <(printf '%s\n' "$net080_policy_before") <(printf '%s\n' "$net080_policy_after") || true
+    fail
+  fi
+  echo "egress unchanged: 'min session policy' reads back the same declaration as before the fetch (deny 0.0.0.0/0, and the box still in the allow subtree)"
+  if [ "$net080_answered" -eq 1 ]; then
+    mnl session exec "$net080_sid" \
+      "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://example.com" \
+      >"$WORK/net080-ctrl-after.out" 2>"$WORK/net080-ctrl-after.err"
+    net080_rc=$?
+    net080_status_after="$(cat "$WORK/net080-ctrl-after.out" 2>/dev/null)"
+    if [ "$net080_rc" -ne 0 ] \
+       && { [ -z "$net080_status_after" ] || [ "$net080_status_after" = "HTTP:000" ]; }; then
+      echo "::error::the box's own egress changed across the daemon's fetch: the connection this run's before-half completed ($net080_status_before) did not complete after"
+      cat "$WORK/net080-ctrl-after.err" 2>/dev/null || true
+      fail
+    fi
+    echo "egress unchanged: the box completed the same connection after the fetch as before ($net080_status_after)"
+  fi
+
+  # ---- the half this seat cannot drive, said rather than skipped -----------
+  echo "refused-connect half: pinned here only through the daemon's own probe — the per_box verdict above is the host's fresh fact that the loaded table refuses a connection out of a deny leaf. A connection from THIS box cannot be driven: the classifier's deny subtree is reached only by a box that admits no destination at all, the strict 'deny all' shape the shipped CLI cannot type (every egress flag maps an empty list to an unset field, crates/minimal/src/cmd/session.rs), so a CLI-declared box lands in boxes/allow, where the loaded table refuses nothing. The deny subtree's refusal of a box's own connection is owned live by the root lane's deny_all_host_ip_box_answers_the_proxy_over_a_loaded_table, with snat_identity_is_seen_by_the_peer for the node plane's identity"
+
+  # ---- the proof's own uninstall, and the check that it took ---------------
+  if ! net080_unwind; then
+    echo "::error::the uninstall could not remove this proof's classifier tree — a live leaf or process still holds it"
+    fail
+  fi
+  NET080_CLASSIFIER_INSTALLED=""
+  if [ -e /sys/fs/cgroup/minimald.slice ]; then
+    echo "::error::the classifier tree is still at /sys/fs/cgroup/minimald.slice after the uninstall"
+    fail
+  fi
+  rm -rf "$NET080_SEED_DIR"; NET080_SEED_DIR=""
+  echo "cleanup: the tree and the table this proof installed are gone; the host is as this proof found it"
+  echo "daemon's own fetch under a loaded classifier table OK (NET-080: the deny-all box installed its package, and the daemon's own fetch is recorded as node-plane traffic naming the box and the package)"
   echo "::endgroup::"
 }
 
@@ -8338,6 +8746,11 @@ case "${1:-}" in
     proof_switch_steers_proxy_mac_frames_to_the_host_stack
     proof_switch_answers_no_arp_for_the_proxy_address
     proof_proxy_sees_each_vm_box_by_its_switch_address
+    # Last on purpose: the daemon-fetch proof installs a host classifier
+    # tree and table (its own, removed before it returns) and stops the
+    # daemon to place a fresh one inside the tree, so nothing after it may
+    # rely on the lane's daemon or the host's packet filter as it found them.
+    proof_daemon_fetch_under_deny_all_host_address_box
     ;;
   lifecycle | session_exec | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
@@ -8348,7 +8761,8 @@ case "${1:-}" in
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes \
     | switch_steers_proxy_mac_frames_to_the_host_stack | switch_answers_no_arp_for_the_proxy_address \
-    | proxy_sees_each_vm_box_by_its_switch_address)
+    | proxy_sees_each_vm_box_by_its_switch_address \
+    | daemon_fetch_under_deny_all_host_address_box)
     "proof_$1"
     ;;
   *)
@@ -8364,6 +8778,7 @@ case "${1:-}" in
     echo "         min_internal_names_through_proxy proxy_refuses_like_direct retired_surfaces_gone"
     echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
     echo "         proxy_sees_each_vm_box_by_its_switch_address"
+    echo "         daemon_fetch_under_deny_all_host_address_box"
     exit 2
     ;;
 esac
