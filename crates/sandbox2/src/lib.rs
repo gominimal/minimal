@@ -754,8 +754,8 @@ pub mod classifier {
         let placed = place_child_in(&leaf.join("cgroup.procs"));
         // The throwaway leaf is owed its removal. The child is gone by now,
         // so over a real tree the kernel allows it; a refusal here is left
-        // alone — the probe has its answer, and a stuck probe leaf says so
-        // at the next probe, which removes it first.
+        // alone — the probe has its answer, and the empty leaf is swept at
+        // the next daemon start by `sweep_box_leaves`.
         let _ = std::fs::remove_dir(&leaf);
         placed
     }

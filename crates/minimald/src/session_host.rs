@@ -2506,7 +2506,10 @@ impl Drop for BoxLeafGuard {
 ///
 /// `Err` means the leaf exists but cannot be this session's: another session
 /// holds it, which a fresh launch of the same id cannot tolerate — two
-/// sessions in one leaf would decide both their verdicts together.
+/// sessions in one leaf would decide both their verdicts together. It also
+/// means the placement probe failed for a reason other than an absent tree
+/// or a daemon outside the slice: the probe gave no answer about whether a
+/// box can be placed, so the launch is refused rather than run unenforced.
 async fn create_session_leaf(
     guest: bool,
     session_id: &sessions::SessionId,
@@ -2549,12 +2552,15 @@ async fn create_session_leaf(
         // probe is per-launch. These two are the genuine "cannot confine"
         // results: the tree is absent or the daemon is outside the slice.
         //
-        // Every other error is a transient I/O failure — a filesystem
-        // hiccup, a concurrent probe's race (fixed by unique leaf naming in
-        // `probe_child_placement`, but guarded here regardless), or a
-        // resource shortage — and is surfaced as an error the caller can
-        // retry, rather than silently mapped to "no leaf" which the guest
-        // then reads as a broken image.
+        // Any other error means the probe gave no answer: it does not show
+        // that the tree is absent or that the daemon is outside the slice,
+        // only that the probe itself failed (an I/O error, a fork that could
+        // not run, a leaf the kernel will not take a process into). NET-079's
+        // exception covers a host that cannot decide per box, not a probe
+        // that failed, so the launch is refused with the probe's error rather
+        // than run unenforced; mapped to "no leaf", the guest would also
+        // misreport it as a broken image. The leaf creation below keeps its
+        // own policy for its errors.
         match e.kind() {
             std::io::ErrorKind::NotFound => {
                 tracing::info!(
@@ -2588,10 +2594,10 @@ async fn create_session_leaf(
                     error = %e,
                     daemon_cgroup = ?sandbox2::classifier::own_cgroup_path(),
                     install = %sandbox2::classifier::install_hint(),
-                    "the placement probe of the classifier tree failed with \
-                     a transient I/O error — the session's box cannot be \
-                     placed and the launch is refused rather than run \
-                     unenforced",
+                    "the placement probe of the classifier tree failed — \
+                     the session's box cannot be placed and the launch is \
+                     refused rather than run unenforced; the probe's error \
+                     is where to start",
                 );
                 return Err(e);
             }
@@ -2954,7 +2960,8 @@ impl SessionLauncher for SandboxLauncher {
         // to decide and an own-IP box's verdict is its own, on the address
         // it holds. The decision fails closed for the launch — a tree that
         // is absent, or a daemon that cannot place a process in it, leaves
-        // the box unenforced rather than refused natively — and never reaches
+        // the box unenforced rather than refused natively, while a placement
+        // probe that fails for any other reason refuses it — and never reaches
         // the box's own pre-exec closure, which is where an unplaceable join
         // would die taking the leaf it cannot take. The guard owns the leaf
         // until the handoff into `Launched`, so a launch abandoned anywhere
