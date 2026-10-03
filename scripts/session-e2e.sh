@@ -4068,13 +4068,22 @@ proof_local_range_reserved_by_privileged_step() {
 
   # The range on this host's loopback — the spike's own check, 254 aliases,
   # one per usable host address of the /24: the addresses the daemon's
-  # session-start probe and the CLI's host-side one read.
-  range_aliases="$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')"
-  if [ "$range_aliases" != 254 ]; then
-    echo "::error::the range step did not apply the whole reserved range ($range_aliases of 254 aliases on lo0)"
+  # session-start probe and the CLI's host-side one read. The wait comes
+  # first: the command's `bootstrap` returns before launchd runs the job it
+  # loaded, so a count taken at the return reads 0 — the poll waits for the
+  # run to finish and the range to be whole, and only then are the exit
+  # code and the count final answers.
+  range_wait_unit
+  if [ "$range_wait_exit" != 0 ]; then
+    echo "::error::the range step's job did not exit 0 (last exit code: '$range_wait_exit', $range_wait_count of 254 aliases on lo0)"
+    launchctl print "system/$RANGE_LABEL" 2>&1 | head -40 || true
     fail
   fi
-  echo "the reserved range is present on lo0: $range_aliases aliases"
+  if [ "$range_wait_count" != 254 ]; then
+    echo "::error::the range step did not apply the whole reserved range ($range_wait_count of 254 aliases on lo0)"
+    fail
+  fi
+  echo "the reserved range is present on lo0: $range_wait_count aliases"
 
   # The probe that read absent before the command: the CLI reads the range on
   # the host it runs on, and on this host the range is now installed — so the
@@ -4152,26 +4161,21 @@ proof_local_range_reserved_by_privileged_step() {
     echo "--- output ---"; cat "$WORK/range-cmd2.out" "$WORK/range-cmd2.err" 2>/dev/null || true
     fail
   fi
-  # launchd prints `last exit code = (never exited)` until the re-loaded job
-  # has actually run, so a non-empty value is not yet an answer: the poll
-  # waits for a numeric one, and only then is it required to be 0.
-  range_last_exit=""
-  for _ in $(seq 1 40); do
-    range_last_exit="$(launchctl print "system/$RANGE_LABEL" 2>/dev/null \
-      | sed -n 's/^[[:space:]]*last exit code = //p' | head -n1)"
-    case "$range_last_exit" in
-      "" | *[!0-9]*) sleep 0.25 ;;
-      *) break ;;
-    esac
-  done
-  if [ "$range_last_exit" != 0 ]; then
-    echo "::error::the re-run's job did not exit 0 (last exit code: '$range_last_exit') — the program must skip the aliases it finds, not fail on them"
+  # The same wait as the first count — the re-run's `bootstrap` also
+  # returns before launchd runs the job it loaded (launchd prints `last
+  # exit code = (never exited)` until it has), so neither fact below is an
+  # answer until the poll has seen the run finish and the range still
+  # whole. Then the re-run's two facts read: the job exits 0 because the
+  # program skips the aliases it finds rather than failing on them, and all
+  # 254 are still on lo0 because a re-run removes nothing.
+  range_wait_unit
+  if [ "$range_wait_exit" != 0 ]; then
+    echo "::error::the re-run's job did not exit 0 (last exit code: '$range_wait_exit') — the program must skip the aliases it finds, not fail on them"
     launchctl print "system/$RANGE_LABEL" 2>&1 | head -40 || true
     fail
   fi
-  range_still="$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')"
-  if [ "$range_still" != 254 ]; then
-    echo "::error::the re-run left $range_still of 254 aliases on lo0 — a re-run must remove nothing"
+  if [ "$range_wait_count" != 254 ]; then
+    echo "::error::the re-run left $range_wait_count of 254 aliases on lo0 — a re-run must remove nothing"
     fail
   fi
   echo "the command re-runs clean over the aliases it had already applied: last exit code = 0, all 254 still on lo0"
@@ -4240,6 +4244,38 @@ range_teardown_unit() {
     sudo rm -f /etc/resolver/min.internal
   fi
   RANGE_INSTALLED=""
+}
+
+# Wait for the range unit to finish the run its `bootstrap` started, before
+# anything reads the aliases. `launchctl bootstrap` returns before launchd
+# runs the RunAtLoad job it loaded, so the range lands on lo0
+# asynchronously — a probe polling beside a real install saw the job
+# `running` with 0 aliases, then the count climb 15 → 42 → … → 254, with
+# `last exit code = 0` about 0.9 s after the bootstrap returned — and a
+# count taken at the command's return reads 0. The poll waits, bounded at
+# ~10 s, until `launchctl print` shows a numeric `last exit code` for the
+# job (the program has run to its end) and all 254 aliases are on lo0, then
+# leaves the last values it saw in range_wait_exit and range_wait_count for
+# the caller to assert on — a non-zero exit code or a short count there
+# names which half fell short. Called after every `bootstrap` the case
+# performs (the first install and the re-run), so no count the case reads
+# can precede the run that applies the range. It fails on nothing itself:
+# the caller owns the verdict, because what a non-zero exit code or a short
+# count MEANS differs per step. Reads RANGE_LABEL, which the case sets
+# before its first bootstrap.
+range_wait_unit() {
+  range_wait_exit=""
+  range_wait_count=0
+  for _ in $(seq 1 40); do # 40 × 0.25 s: ~10 s, launchd's async start bounded
+    range_wait_exit="$(launchctl print "system/$RANGE_LABEL" 2>/dev/null \
+      | sed -n 's/^[[:space:]]*last exit code = //p' | head -n1)"
+    range_wait_count="$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')"
+    case "$range_wait_exit" in
+      "" | *[!0-9]*) : ;; # not finished yet: (never exited), or no job to print
+      *) [ "$range_wait_count" = 254 ] && break ;; # run over; the range must be whole
+    esac
+    sleep 0.25
+  done
 }
 
 proof_native_resolution_without_proxy_env() {
