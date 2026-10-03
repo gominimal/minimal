@@ -238,6 +238,10 @@ impl ListenWatcher {
     /// published any more. The declared forwards are not this call's:
     /// they come down with the attachment's own teardown (NET-121).
     pub async fn stop(self) {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the loop may already have ended; the join below is what reports that"
+        )]
         let _ = self.stop.send(true);
         if let Err(join) = self.task.await {
             tracing::warn!(
@@ -1461,13 +1465,24 @@ mod tests {
 
     impl CaptureWriter {
         fn contents(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+            let kept = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            String::from_utf8(kept.clone()).unwrap()
         }
     }
 
     impl std::io::Write for CaptureWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            // A poisoned buffer is a bug in this proof's own code, and the
+            // lines it holds are what the proof reads: recover the buffer
+            // rather than drop the write on the floor.
+            let mut kept = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            kept.extend_from_slice(buf);
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
