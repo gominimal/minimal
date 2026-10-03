@@ -301,13 +301,16 @@ fn parse_request(line: &str) -> Result<BoxControlRequest, serde_json_lenient::Er
 
 /// Allocate the box into the table and write the reply — the addresses on
 /// success, the reason on a refusal. One info line per registration names
-/// the box and both addresses: the diagnostic a bundle's VM host daemon log
-/// is read for.
+/// the box, both addresses and the declared egress the row carries: the
+/// diagnostic a bundle's VM host daemon log is read for.
 fn register_and_reply(
     stream: &mut UnixStream,
     boxes: &BoxRegistry,
     request: RegisterBoxRequest,
 ) -> std::io::Result<()> {
+    // The declaration as the row received it; `null` for a box with no
+    // egress section. A plain struct of strings serialises infallibly.
+    let declared_egress = serde_json_lenient::to_string(&request.egress).unwrap_or_default();
     let spec = ClientBoxSpec {
         name: request.name.clone(),
         ingress_ports: request.ingress_ports,
@@ -319,6 +322,7 @@ fn register_and_reply(
                 box = %record.name(),
                 switch_address = %record.switch_addr(),
                 loopback_address = %record.loopback_addr(),
+                egress = %declared_egress,
                 "registered box with the VM host daemon; addresses allocated"
             );
             BoxControlReply::Addresses(BoxAddresses {
@@ -553,8 +557,8 @@ mod tests {
             "the first box takes the first address of the slice the host switch publishes at"
         );
 
-        // The registration's one info line names the box and both addresses
-        // it handed back.
+        // The registration's one info line names the box, both addresses
+        // it handed back, and the declared egress the row carries.
         let log = capture.contents();
         assert!(
             log.contains("registered box with the VM host daemon; addresses allocated"),
@@ -565,6 +569,11 @@ mod tests {
                 && log.contains(&format!("switch_address={}", web.switch_address))
                 && log.contains(&format!("loopback_address={}", web.loopback_address)),
             "the info line names the box and the addresses it handed back: {log}"
+        );
+        assert!(
+            log.contains(r#""allow_subnets":["10.0.0.0/8"]"#)
+                && log.contains(r#""allow_protocols":["tcp"]"#),
+            "the info line carries the declared egress allow-list: {log}"
         );
 
         // The second registration takes the next address on both runs —

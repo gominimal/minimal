@@ -204,6 +204,9 @@ EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardow
 DA_ORIGIN_SEED_DIR="" # the deny-all answer proof's origin box seed; teardown
 DA_TARGET_SEED_DIR="" # its deny-all target box's seed; removed on teardown
 DA_SIBLING_SEED_DIR="" # its sibling box's seed; removed on teardown
+BOXREG_SEED_DIR="" # the box-registration proof's seed; removed on teardown
+BOXREG_CTRLC_SEED_DIR="" # its Ctrl-C seed (carries bulk data); removed on teardown
+BOXREG_CTRLC_PID="" # its interrupted activate; INT then KILL on teardown
 BEPB_SEED_DIR_A="" # seeded by the proxy-source proof below; removed on teardown
 BEPB_SEED_DIR_B="" # its second box's seed; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
@@ -539,6 +542,8 @@ teardown() {
   [ -n "$DA_ORIGIN_SEED_DIR" ] && rm -rf "$DA_ORIGIN_SEED_DIR"
   [ -n "$DA_TARGET_SEED_DIR" ] && rm -rf "$DA_TARGET_SEED_DIR"
   [ -n "$DA_SIBLING_SEED_DIR" ] && rm -rf "$DA_SIBLING_SEED_DIR"
+  [ -n "$BOXREG_SEED_DIR" ] && rm -rf "$BOXREG_SEED_DIR"
+  [ -n "$BOXREG_CTRLC_SEED_DIR" ] && rm -rf "$BOXREG_CTRLC_SEED_DIR"
   # The proxy-source proof's two boxes: their project dirs are removed on its
   # success path, but every failure path in it goes straight to `fail`, so the
   # trap is the one place that always sees them.
@@ -550,6 +555,14 @@ teardown() {
     kill -INT "$RETIRED_FWD_PID" 2>/dev/null || true
     sleep 0.5 2>/dev/null || true
     kill -9 "$RETIRED_FWD_PID" 2>/dev/null || true
+  fi
+  # The box-registration proof's interrupted activate: its own guard handles
+  # the clean stop, so a run that dies between launching it and the proof's
+  # INT leaves a live activation — the same INT, then the KILL backstop.
+  if [ -n "$BOXREG_CTRLC_PID" ]; then
+    kill -INT "$BOXREG_CTRLC_PID" 2>/dev/null || true
+    sleep 0.5 2>/dev/null || true
+    kill -9 "$BOXREG_CTRLC_PID" 2>/dev/null || true
   fi
   # And the state dir — which is NOT just metadata. On a VM lane it holds the
   # provider's per-VM writable data volume
@@ -658,6 +671,47 @@ hook_log_has() {
 # headless teardown hook — is proved on every lane too, by a marker read
 # back through the session rather than out of a log.
 hook_log_readable() { [ -z "$E2E_VM" ]; }
+# Grep the VM HOST daemon's file log — the counterpart of `hook_log_has` that
+# every VM-backed lane can read, including macOS: minvmd runs on THIS host
+# even when the sessions live inside its VM (the guest minimald's log is the
+# one a VM lane cannot reach, see above), so minvmd's records are the
+# host-side witness of everything the box table does. Prints every matching
+# line across every rotated day-file (newest last); nothing when no record
+# matches.
+minvmd_log_lines() {
+  find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log.*' -type f \
+    -exec grep -h -- "$1" {} + 2>/dev/null
+}
+# The record proving a box's HOST ROW ended, named for the box. A row has TWO
+# writers of its end, and both are the design (NET-138: "a box's attachment to
+# the switch ends or its creator destroys it"; NET-133: "a box's row goes with
+# its shuttle connection"), so this takes either record:
+#   * the creator's withdrawal request — the CLI's destroy or interrupt guard
+#     asking minvmd over the control socket, which writes the INFO record
+#     "withdrew the box's host row; its addresses admit nothing" —
+#   * the same request arriving AFTER the gate already ended the row: the
+#     box's sandbox teardown drops its per-box shuttle connection, the host
+#     egress gate reports the address its admitted frames were attributed to,
+#     and the drainer removes the row — with no record of its own — so the
+#     creator's request then finds no row and the daemon writes the DEBUG
+#     record "no host row held at the withdrawn switch address; already
+#     withdrawn", which answers the goal state ("no row at the named switch
+#     address") as a success. The box-register proof pins its daemon to
+#     `warn,minvmd=debug` so this second record is read here too.
+# Either way the row is gone; prints the matching line, nothing when neither
+# writer recorded one.
+box_row_end_record() {
+  local name="$1" rec=""
+  rec="$(minvmd_log_lines \
+    "withdrew the box's host row; its addresses admit nothing" \
+    | grep -F "\"box\":\"$name\"" | tail -n1)"
+  if [ -z "$rec" ]; then
+    rec="$(minvmd_log_lines \
+      'no host row held at the withdrawn switch address; already withdrawn' \
+      | grep -F "\"box\":\"$name\"" | tail -n1)"
+  fi
+  printf '%s' "$rec"
+}
 
 # The sandbox proof below forks a real session sandbox, which needs
 # unprivileged user namespaces. On Ubuntu 24.04+ the AppArmor restriction
@@ -1462,6 +1516,545 @@ proof_own_ip_egress_declared_and_enforced() {
   mnl session destroy --force "$deny_all_sid" >/dev/null 2>&1 || true
   rm -rf "$EGRESS_SEED_DIR"; EGRESS_SEED_DIR=""
   echo "own-IP egress declared and enforced OK"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# Own-address box ↔ VM host daemon, no provider flag anywhere (T78: the
+# NET-138 client half against a live host, with the host-side egress gate's
+# decision half, NET-081). A box row must exist in the VM host daemon's
+# table for exactly as long as the box it was allocated for — registered on
+# create, withdrawn on destroy and on an activation the user interrupts —
+# and a DECLARED row is what the host-side egress gate decides by.
+#
+# Asserted through the VM host daemon's OWN record, never through the CLI's
+# output: one INFO line per registration and per withdrawal, each naming the
+# box and the address pair it allocated, and minvmd runs on THIS host even
+# when the sessions live inside its VM (see `minvmd_log_lines`), so the case
+# reads on every VM-backed lane — macOS included, where no `--provider` flag
+# is ever passed and the whole story runs exactly as a user's invocation
+# does. The session-start line is asserted too (the task's diagnostics
+# clause), but the row's existence and its end are the daemon's word.
+#
+# Lane gating, by observed fact:
+#   * A native host has no VM host daemon at all, so there is nothing to
+#     register with: the case exists only where the CLI is VM-backed, and
+#     `min_daemon` is this harness's own signal for that (minvmd on Darwin,
+#     or on a Linux run whose E2E_MINIMAL_ARGS names local-minvmd). The
+#     skip is the case's, said plainly.
+#   * The box needs the switch: no gvproxy binary means no own-address box
+#     can come up at all — the sibling own-IP proofs gate the same way — so
+#     there would be no row to observe.
+#
+# Two things about the driving, both load-bearing:
+#   * No `--provider` is passed by this case — `mnl` already carries the
+#     lane's E2E_MINIMAL_ARGS, which on the macOS runner is nothing at all.
+#     That is the point: the registration must happen because the CLI is
+#     VM-backed, not because a flag asked for it.
+#   * A daemon's log filter comes from RUST_LOG at spawn, and this harness
+#     quiets the whole run to `warn`, which drops the INFO records every
+#     assertion below reads. The case stops the daemon first so its own
+#     activation autospawns a fresh one, pinned command-locally to
+#     `warn,minvmd=debug` (the established idiom, one level deeper) — the
+#     CLI's stdout stays quiet for the session-id extraction, while the
+#     daemon still records the withdrawal of a row that ended before the
+#     creator's request arrived (a DEBUG record; see the next bullet). The
+#     case stops the daemon again on its way out, so the pinned filter
+#     never leaks into the rest of the lane.
+#   * A row's end has TWO writers and the withdrawal assertions below take
+#     either one (`box_row_end_record`): the creator's request answered with
+#     a row (INFO), or the same request finding the gate's attachment-end
+#     drainer had already ended the row when the box's sandbox teardown
+#     dropped its shuttle connection (DEBUG "already withdrawn" — the goal
+#     state either way). Which one wins the destroy below is a race the
+#     design blesses on purpose: both ends are a withdrawn row.
+#
+# The Ctrl-C half interrupts in [create returned, session Active] — the
+# window the CLI's interrupt guard covers. It cannot sleep its way in from
+# a hook (on_activate runs daemon-side INSIDE the create, before the guard
+# exists), so the trigger is host-visible instead: the deny-all
+# announcement a bare box prints to stderr immediately before arming the
+# guard (the same NET-076 text the egress proof above asserts), with the
+# fixture's bulk data holding the activation in the window long enough for
+# the SIGINT to land well inside it.
+#
+# Ordered in the whole-lane run right after `restart`: that proof already
+# stopped and respawned the daemon, so nothing behind it shares a live
+# session, and the cases ahead of `hostnames_recover` spawn their own
+# daemons anyway. A standalone run is the same shape — the case's first
+# command is the stop.
+proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag() {
+  local boxreg_sid="" boxreg_record="" boxreg_switch="" boxreg_loopback=""
+  local boxreg_start="" boxreg_dst="" boxreg_try="" boxreg_dst_out=""
+  local boxreg_dst_rc="" boxreg_live_dst="" boxreg_withdrawn=""
+  local boxreg_withdraw_addr="" boxreg_ctrlc_armed="" boxreg_ctrlc_rc=""
+  local boxreg_ctrlc_switch="" boxreg_ctrlc_gone="" boxreg_declared_sid=""
+  local boxreg_declared_switch="" boxreg_declared_out="" boxreg_declared_rc=""
+  local boxreg_declared_reach_ok="" boxreg_refuse_start_ms=""
+  local boxreg_refuse_rc="" boxreg_refuse_elapsed_ms="" boxreg_refuse_status=""
+  local boxreg_refuse_err="" boxreg_gate_drop=""
+  echo "::group::own-address box registers with the VM host daemon, no provider flag (T78)"
+
+  if [ "$min_daemon" != minvmd ]; then
+    echo "own-address box registration proof SKIPPED (this run's daemon is minimald: a native host has no VM host daemon for a box to register with — the proof runs where the CLI is VM-backed, which macOS is with no flag at all)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "own-address box registration proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so no own-address box can come up)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The seeds: one plain project, and one carrying bulk data for the Ctrl-C
+  # half (the upload of it is the interruptible window — see there). Both
+  # seeded like every other fixture, plus the bare `.git` marker that makes
+  # the headless upload gate ship them.
+  BOXREG_SEED_DIR="$(hook_mktemp /tmp/mnlbr.XXXXXX)"
+  hook_seed_preamble > "$BOXREG_SEED_DIR/minimal.toml"
+  mkdir "$BOXREG_SEED_DIR/.git"
+
+  BOXREG_CTRLC_SEED_DIR="$(hook_mktemp /tmp/mnlbc.XXXXXX)"
+  hook_seed_preamble > "$BOXREG_CTRLC_SEED_DIR/minimal.toml"
+  mkdir "$BOXREG_CTRLC_SEED_DIR/.git"
+  # 64 MiB of random data. The activate that carries it uploads the project
+  # before it can finish, and that upload — over the VM bridge on the lanes
+  # this case runs on — is a multi-second window, so the interrupt below
+  # lands inside [create returned, session Active] rather than racing the
+  # far end of it. A plain byte count, not an `m` suffix: GNU and BSD dd
+  # spell those differently.
+  dd if=/dev/urandom of="$BOXREG_CTRLC_SEED_DIR/bulk.bin" bs=1048576 count=64 \
+    >/dev/null 2>&1
+
+  # Stop whatever daemon is up so the first activation below autospawns a
+  # fresh one under the pinned record filter (see the header comment).
+  mnl stop --force >/dev/null 2>&1 || true
+
+  # ---- (a) create registers the box with the VM host daemon ----------------
+  boxreg_sid="$(cd "$BOXREG_SEED_DIR" && RUST_LOG="warn,minvmd=debug" mnl session activate . \
+    --no-prompt --name e2e-box-reg --network own_ip 2>"$WORK/boxreg-activate.err")" || {
+    echo "::error::'min session activate --network own_ip' (no provider flag) failed"
+    cat "$WORK/boxreg-activate.err" 2>/dev/null || true
+    fail
+  }
+  boxreg_sid="$(printf '%s\n' "$boxreg_sid" | tail -n1 | tr -d '\r')"
+  if ! printf '%s' "$boxreg_sid" | grep -Eqx \
+    '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+    echo "::error::activate's last stdout line is not a session id: '$boxreg_sid'"
+    cat "$WORK/boxreg-activate.err" 2>/dev/null || true
+    fail
+  fi
+  echo "bare own-address box: $boxreg_sid (activated with no provider flag)"
+
+  # The registration, straight from the VM host daemon's record: one INFO
+  # line per box, naming it and the address pair it allocated. The CLI could
+  # print anything; this is the daemon's own word that the row exists.
+  for _ in $(seq 1 40); do
+    boxreg_record="$(minvmd_log_lines \
+      'registered box with the VM host daemon; addresses allocated' \
+      | grep -F '"box":"e2e-box-reg"' | tail -n1)"
+    [ -n "$boxreg_record" ] && break
+    sleep 0.25
+  done
+  if [ -z "$boxreg_record" ]; then
+    echo "::error::the VM host daemon's log carries no registration record for box 'e2e-box-reg' after activate"
+    echo "--- minvmd log (tail) ---"
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log.*' -type f \
+      -exec tail -n 40 {} + 2>/dev/null || true
+    fail
+  fi
+  boxreg_switch="$(printf '%s\n' "$boxreg_record" \
+    | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
+  boxreg_loopback="$(printf '%s\n' "$boxreg_record" \
+    | sed -n 's/.*"loopback_address":"\([0-9.]*\)".*/\1/p')"
+  echo "VM host daemon record: $boxreg_record"
+  if [ -z "$boxreg_switch" ] || [ -z "$boxreg_loopback" ]; then
+    echo "::error::the VM host daemon's registration record does not name the switch and loopback addresses it allocated"
+    fail
+  fi
+
+  # The session-start line: one stderr line naming the VM host daemon (and
+  # the VM) the box registered with, plus the switch address — the
+  # diagnostics half of the contract. The addresses on it are the SAME pair
+  # this registration handed back, so the two records must agree; on a
+  # VM-backed host the line always carries the VM name, because a registered
+  # box only ever exists there.
+  boxreg_start="$(grep -F 'BOX REGISTRATION:' "$WORK/boxreg-activate.err" | tail -n1)"
+  if [ -z "$boxreg_start" ]; then
+    echo "::error::activate printed no BOX REGISTRATION line on stderr"
+    cat "$WORK/boxreg-activate.err" 2>/dev/null || true
+    fail
+  fi
+  echo "session start: $boxreg_start"
+  if ! printf '%s' "$boxreg_start" | grep -Fq "box 'e2e-box-reg'" \
+    || ! printf '%s' "$boxreg_start" | grep -Fq "registered with the VM host daemon on VM '" \
+    || ! printf '%s' "$boxreg_start" | grep -Fq "switch address $boxreg_switch"; then
+    echo "::error::the session-start registration line does not name the box, its VM host and the switch address the daemon recorded ($boxreg_switch)"
+    fail
+  fi
+  echo "create: the row is in the VM host daemon's table, and session start names the same switch address"
+
+  # ---- the destination the declared box below must be refused, proven live --
+  # Same doctrine as the egress proof above: a non-completion only means
+  # enforcement if this lane can reach the destination at all, so the SAME
+  # connection is first completed from the box with NO egress section
+  # (allow-all while the shipped default is only announced). The destination
+  # is a literal public anycast endpoint, live on 443 and chosen so nothing
+  # the declared box admits can ever cover it — no resolver has to agree with
+  # anything for the probe to run. curl always writes its -w line, and
+  # `HTTP:000` when nothing answered, so a completed exchange is a zero exit
+  # OR any real status back.
+  for boxreg_dst in 1.1.1.1 9.9.9.9; do
+    for boxreg_try in 1 2 3; do
+      boxreg_dst_out="$(mnl session exec "$boxreg_sid" \
+        "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 20 https://$boxreg_dst/" \
+        2>"$WORK/boxreg-dst-live.err")"
+      boxreg_dst_rc=$?
+      if [ "$boxreg_dst_rc" -eq 0 ] \
+        || { [ -n "${boxreg_dst_out:-}" ] && [ "$boxreg_dst_out" != "HTTP:000" ]; }; then
+        boxreg_live_dst="$boxreg_dst"
+        echo "control GET https://$boxreg_dst/ from the bare box -> ${boxreg_dst_out:-<none>} (attempt ${boxreg_try}/3): the destination is live on this lane, so the declared box below must be refused this same connection"
+        break
+      fi
+      echo "control GET https://$boxreg_dst/ from the bare box failed on attempt ${boxreg_try}/3 (rc ${boxreg_dst_rc}, got '${boxreg_dst_out:-<none>}')"
+      cat "$WORK/boxreg-dst-live.err" 2>/dev/null || true
+      [ "$boxreg_try" -lt 3 ] && sleep 3
+    done
+    [ -n "$boxreg_live_dst" ] && break
+  done
+  if [ -z "$boxreg_live_dst" ]; then
+    echo "::warning::the bare box reached no candidate destination on this run, so the declared box's refusal below is skipped as a weather warning (without this control a non-completion would be indistinguishable from a dead route)"
+  fi
+
+  # ---- (b) destroy withdraws the row ---------------------------------------
+  # Either writer counts (`box_row_end_record`): the daemon ends the row when
+  # the box's sandbox teardown drops its per-box shuttle connection, and the
+  # CLI's own withdrawal request lands alongside that — whoever answers first,
+  # the row ends with a record naming the box and its switch address.
+  mnl session destroy --force "$boxreg_sid" \
+    >"$WORK/boxreg-destroy.out" 2>"$WORK/boxreg-destroy.err" \
+    || { echo "::error::'min session destroy' failed"; cat "$WORK/boxreg-destroy.err" 2>/dev/null || true; fail; }
+  for _ in $(seq 1 40); do
+    boxreg_withdrawn="$(box_row_end_record e2e-box-reg)"
+    [ -n "$boxreg_withdrawn" ] && break
+    sleep 0.25
+  done
+  if [ -z "$boxreg_withdrawn" ]; then
+    echo "::error::the VM host daemon's log carries no record of the row of box 'e2e-box-reg' ending after 'min session destroy' — neither the creator's withdrawal (INFO) nor the same request finding the gate's attachment-end drainer already ended the row (DEBUG \"already withdrawn\")"
+    echo "--- 'min session destroy' output ---"
+    cat "$WORK/boxreg-destroy.out" 2>/dev/null || true
+    cat "$WORK/boxreg-destroy.err" 2>/dev/null || true
+    echo "--- minvmd log (tail) ---"
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log.*' -type f \
+      -exec tail -n 40 {} + 2>/dev/null || true
+    fail
+  fi
+  boxreg_withdraw_addr="$(printf '%s\n' "$boxreg_withdrawn" \
+    | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
+  echo "VM host daemon record: $boxreg_withdrawn"
+  if [ "$boxreg_withdraw_addr" != "$boxreg_switch" ]; then
+    echo "::error::the withdrawal names switch address ${boxreg_withdraw_addr:-<none>}, not the $boxreg_switch the registration allocated — a different row"
+    fail
+  fi
+  echo "destroy: the row is withdrawn, the same address pair the registration allocated"
+
+  # ---- (c) a Ctrl-C during the activation withdraws the row -----------------
+  # The CLI arms its Ctrl-C guard the moment the create RPC returns — before
+  # that an interrupt would kill it with the row still published — and drops
+  # the guard once the session is Active. The guard aborts the half-built
+  # session, withdraws the box row, and exits 130. What the HOST can see of
+  # "the create returned" is the deny-all announcement a box with no egress
+  # section prints to stderr immediately before the guard is armed, so this
+  # half polls the backgrounded activation's stderr for it and interrupts
+  # only once it has appeared — never sleeping a fixed delay and hoping.
+  # Not `mnl ... &`: mnl is a function, so `$!` would be a subshell that
+  # ignores SIGINT; exec the binary so the pid is `min`'s and Ctrl-C reaches
+  # it.
+  # shellcheck disable=SC2086
+  ( cd "$BOXREG_CTRLC_SEED_DIR" && RUST_LOG="warn,minvmd=debug" exec min ${E2E_MINIMAL_ARGS:-} session activate . \
+    --no-prompt --name e2e-box-ctrlc --network own_ip ) \
+    >"$WORK/boxreg-ctrlc.out" 2>"$WORK/boxreg-ctrlc.err" &
+  BOXREG_CTRLC_PID=$!
+  # Cold VM boots overrun the 150 s spawn ceiling the recipes pin, so the
+  # poll's budget is a full cold boot (0.5 s × 600) rather than the warm
+  # case's seconds.
+  for _ in $(seq 1 600); do
+    if grep -q "Heads-up: the next release denies all external reach" \
+      "$WORK/boxreg-ctrlc.err" 2>/dev/null; then
+      boxreg_ctrlc_armed=1
+      break
+    fi
+    if ! kill -0 "$BOXREG_CTRLC_PID" 2>/dev/null; then
+      break
+    fi
+    sleep 0.5
+  done
+  if [ -z "$boxreg_ctrlc_armed" ]; then
+    echo "::error::the interrupted activation never announced the deny-all default on stderr — the create did not return (or failed outright), so the Ctrl-C guard was never in play"
+    cat "$WORK/boxreg-ctrlc.err" 2>/dev/null || true
+    kill -9 "$BOXREG_CTRLC_PID" 2>/dev/null || true
+    BOXREG_CTRLC_PID=""
+    fail
+  fi
+  # The row must be in the table before the interrupt lands — the daemon's
+  # record, not the CLI's stderr, so the withdrawal below reads in the right
+  # order: registered, then withdrawn by the interrupt.
+  for _ in $(seq 1 40); do
+    boxreg_record="$(minvmd_log_lines \
+      'registered box with the VM host daemon; addresses allocated' \
+      | grep -F '"box":"e2e-box-ctrlc"' | tail -n1)"
+    [ -n "$boxreg_record" ] && break
+    sleep 0.25
+  done
+  if [ -z "$boxreg_record" ]; then
+    echo "::error::box 'e2e-box-ctrlc' never registered with the VM host daemon before the interrupt"
+    kill -9 "$BOXREG_CTRLC_PID" 2>/dev/null || true
+    BOXREG_CTRLC_PID=""
+    fail
+  fi
+  boxreg_ctrlc_switch="$(printf '%s\n' "$boxreg_record" \
+    | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
+  echo "interrupt window: the create returned and the row is registered; sending Ctrl-C"
+  kill -INT "$BOXREG_CTRLC_PID" 2>/dev/null || true
+  for _ in $(seq 1 120); do
+    kill -0 "$BOXREG_CTRLC_PID" 2>/dev/null || break
+    sleep 0.25
+  done
+  if kill -0 "$BOXREG_CTRLC_PID" 2>/dev/null; then
+    echo "::error::the interrupted activation did not end on Ctrl-C (the guard aborts the session and exits 130)"
+    cat "$WORK/boxreg-ctrlc.err" 2>/dev/null || true
+    kill -9 "$BOXREG_CTRLC_PID" 2>/dev/null || true
+    BOXREG_CTRLC_PID=""
+    fail
+  fi
+  wait "$BOXREG_CTRLC_PID" 2>/dev/null
+  boxreg_ctrlc_rc=$?
+  BOXREG_CTRLC_PID=""
+  echo "interrupted activate: exit $boxreg_ctrlc_rc — $(grep -F 'Aborting activation' "$WORK/boxreg-ctrlc.err" | tail -n1)"
+  if [ "$boxreg_ctrlc_rc" -ne 130 ]; then
+    echo "::error::the interrupted activate exited $boxreg_ctrlc_rc, not the 130 a Ctrl-C-aborted command exits with"
+    fail
+  fi
+  # The guard's own marker: the abort ran, rather than the process dying on
+  # SIGINT's default disposition — which would leave the row published and
+  # the session Pending, the exact bug this half exists to catch.
+  if ! grep -q "Aborting activation; cleaning up session" "$WORK/boxreg-ctrlc.err"; then
+    echo "::error::the CLI's abort marker is missing from the interrupted activation's stderr — the guard did not run"
+    cat "$WORK/boxreg-ctrlc.err" 2>/dev/null || true
+    fail
+  fi
+  # The guard's withdrawal request is the only writer of this row's end — no
+  # sandbox exists yet, so no shuttle connection has ever opened and the gate's
+  # attachment-end drainer has nothing to report — but `box_row_end_record`
+  # still takes either shape, for the row that ends before the request lands
+  # (a respawned daemon, say).
+  for _ in $(seq 1 40); do
+    boxreg_withdrawn="$(box_row_end_record e2e-box-ctrlc)"
+    [ -n "$boxreg_withdrawn" ] && break
+    sleep 0.25
+  done
+  if [ -z "$boxreg_withdrawn" ]; then
+    echo "::error::the VM host daemon's log carries no record of the row of box 'e2e-box-ctrlc' ending after the Ctrl-C — the guard's withdrawal request left no trace of the row ending, by either writer"
+    echo "--- interrupted activation (stderr) ---"
+    cat "$WORK/boxreg-ctrlc.err" 2>/dev/null || true
+    echo "--- minvmd log (tail) ---"
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log.*' -type f \
+      -exec tail -n 40 {} + 2>/dev/null || true
+    fail
+  fi
+  boxreg_withdraw_addr="$(printf '%s\n' "$boxreg_withdrawn" \
+    | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
+  echo "VM host daemon record: $boxreg_withdrawn"
+  if [ "$boxreg_withdraw_addr" != "$boxreg_ctrlc_switch" ]; then
+    echo "::error::the withdrawal names switch address ${boxreg_withdraw_addr:-<none>}, not the $boxreg_ctrlc_switch the interrupted registration allocated — a different row"
+    fail
+  fi
+  # And the half-built session must be gone, not left holding the name: the
+  # guard aborted it and the daemon's reap is the backstop. The id never
+  # reached stdout (the guard exits before the id is printed), so the NAME
+  # is what the listing can be checked against.
+  boxreg_ctrlc_gone=""
+  for _ in $(seq 1 80); do
+    if ! mnl ls 2>/dev/null | grep -Fq "e2e-box-ctrlc"; then
+      boxreg_ctrlc_gone=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$boxreg_ctrlc_gone" ]; then
+    echo "::error::the interrupted activation's session survived the Ctrl-C (still listed)"
+    mnl ls 2>/dev/null || true
+    fail
+  fi
+  echo "Ctrl-C: the row is withdrawn and the half-built session is gone"
+
+  # ---- (d) a DECLARED row is what the host-side gate decides by -------------
+  # The four egress fields from the egress proof above: an allow CIDR no live
+  # destination sits inside, one allowed name, TCP+UDP, and a deny CIDR. The
+  # register request carries the expanded declaration verbatim, so the row
+  # the VM host daemon holds for this box is the declared one the host gate
+  # decides by.
+  boxreg_declared_sid="$(cd "$BOXREG_SEED_DIR" && RUST_LOG="warn,minvmd=debug" mnl session activate . --no-prompt \
+    --name e2e-box-declared --network own_ip \
+    --allow-subnets 203.0.113.0/24 \
+    --allow-dns-hosts example.com \
+    --allow-protocols tcp \
+    --allow-protocols udp \
+    --deny-subnets 198.51.100.0/24 \
+    2>"$WORK/boxreg-declared.err")" || {
+    echo "::error::'min session activate' with the four egress fields failed"
+    cat "$WORK/boxreg-declared.err" 2>/dev/null || true
+    fail
+  }
+  boxreg_declared_sid="$(printf '%s\n' "$boxreg_declared_sid" | tail -n1 | tr -d '\r')"
+  if ! printf '%s' "$boxreg_declared_sid" | grep -Eqx \
+    '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+    echo "::error::the declared box's activate did not end with a session id: '$boxreg_declared_sid'"
+    cat "$WORK/boxreg-declared.err" 2>/dev/null || true
+    fail
+  fi
+  for _ in $(seq 1 40); do
+    boxreg_record="$(minvmd_log_lines \
+      'registered box with the VM host daemon; addresses allocated' \
+      | grep -F '"box":"e2e-box-declared"' | tail -n1)"
+    [ -n "$boxreg_record" ] && break
+    sleep 0.25
+  done
+  if [ -z "$boxreg_record" ]; then
+    echo "::error::the declared box never registered its row with the VM host daemon"
+    fail
+  fi
+  boxreg_declared_switch="$(printf '%s\n' "$boxreg_record" \
+    | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
+  echo "declared box: $boxreg_declared_sid — VM host daemon record: $boxreg_record"
+
+  # Close the chain from the declaration to the row: the VM host daemon's
+  # record for this box must carry the switch address the CLI reported at
+  # session start AND the declared allow-list, field by field. The record's
+  # `egress` field is the declaration exactly as the row received it.
+  boxreg_start="$(grep -F 'BOX REGISTRATION:' "$WORK/boxreg-declared.err" | tail -n1)"
+  if [ -z "$boxreg_declared_switch" ] \
+    || ! printf '%s' "$boxreg_start" | grep -Fq "box 'e2e-box-declared'" \
+    || ! printf '%s' "$boxreg_start" | grep -Fq "switch address $boxreg_declared_switch"; then
+    echo "::error::the declared box's session-start line ('${boxreg_start:-<none>}') does not name the switch address the VM host daemon recorded ('${boxreg_declared_switch:-<none>}')"
+    fail
+  fi
+  for boxreg_try in '203.0.113.0/24' 'example.com' '\"tcp\"' '\"udp\"' '198.51.100.0/24'; do
+    if ! printf '%s' "$boxreg_record" | grep -Fq "$boxreg_try"; then
+      echo "::error::the VM host daemon's row for the declared box does not carry the declared egress entry $boxreg_try"
+      fail
+    fi
+  done
+  if ! printf '%s' "$boxreg_record" | grep -Fq '"egress":"{'; then
+    echo "::error::the VM host daemon's record for the declared box carries no egress declaration"
+    fail
+  fi
+  echo "declared row: the VM host daemon holds switch address $boxreg_declared_switch (as session start reported) and the declared allow-list"
+
+  # The declared box's own allowed connection must complete first: it proves
+  # both this lane's network and the allowed path, and on the SAME run it
+  # separates a policy drop below from a dead network — which is what lets
+  # the refusal be a hard fail rather than a weather warning.
+  boxreg_declared_reach_ok=0
+  for boxreg_try in 1 2 3; do
+    boxreg_declared_out="$(mnl session exec "$boxreg_declared_sid" \
+      "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 30 https://example.com" \
+      2>"$WORK/boxreg-declared-reach.err")"
+    boxreg_declared_rc=$?
+    if [ "$boxreg_declared_rc" -eq 0 ] && [ "${boxreg_declared_out:-}" = "HTTP:200" ]; then
+      boxreg_declared_reach_ok=1
+      break
+    fi
+    echo "allowed-connection probe https://example.com failed on attempt ${boxreg_try}/3 (rc ${boxreg_declared_rc}, got '${boxreg_declared_out:-<none>}')"
+    cat "$WORK/boxreg-declared-reach.err" 2>/dev/null || true
+    [ "$boxreg_try" -lt 3 ] && sleep "$((boxreg_try * 3))"
+  done
+  if [ "$boxreg_declared_reach_ok" -ne 1 ]; then
+    echo "::warning::the declared box's allowed connection to https://example.com did not complete, so the refusal below is skipped as a weather warning (the row is registered; the behavioural half needs the public internet)"
+  elif [ -z "$boxreg_live_dst" ]; then
+    echo "::warning::the declared box's refusal is skipped as a weather warning (no candidate destination was live from the bare box above)"
+  else
+    # The refusal, hard-failed on every shape that is not a silent drop: an
+    # answer, a reset, or a fast failure — bracketed by the two controls that
+    # completed in this same run, so none of them can be weather.
+    boxreg_refuse_start_ms="$(now_ms)"
+    mnl session exec "$boxreg_declared_sid" \
+      "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://$boxreg_live_dst/" \
+      >"$WORK/boxreg-refuse.out" 2>"$WORK/boxreg-refuse.err"
+    boxreg_refuse_rc=$?
+    boxreg_refuse_elapsed_ms=$(( $(now_ms) - boxreg_refuse_start_ms ))
+    boxreg_refuse_status="$(cat "$WORK/boxreg-refuse.out" 2>/dev/null)"
+    boxreg_refuse_err="$(tr '\n' ' ' < "$WORK/boxreg-refuse.err" 2>/dev/null)"
+    echo "undeclared GET https://$boxreg_live_dst/ from the declared box -> rc=$boxreg_refuse_rc status=${boxreg_refuse_status:-<none>} elapsed=${boxreg_refuse_elapsed_ms}ms curl: ${boxreg_refuse_err:-<none>}"
+    if [ "$boxreg_refuse_rc" -eq 0 ] \
+      || { [ -n "${boxreg_refuse_status:-}" ] && [ "$boxreg_refuse_status" != "HTTP:000" ]; }; then
+      echo "::error::the declared box's connection to $boxreg_live_dst answered — the bare box completed this same connection above and this box's own allowed connection completed, so the declared egress did not enforce"
+      cat "$WORK/boxreg-refuse.err" 2>/dev/null || true
+      fail
+    fi
+    if printf '%s' "$boxreg_refuse_err" | grep -qi 'reset by peer'; then
+      echo "::error::the declared box's undeclared connection was reset by the destination, not dropped silently"
+      cat "$WORK/boxreg-refuse.err" 2>/dev/null || true
+      fail
+    fi
+    if [ "$boxreg_refuse_elapsed_ms" -lt 6000 ]; then
+      echo "::error::the declared box's undeclared connection failed in ${boxreg_refuse_elapsed_ms}ms — a fast refusal, not a silent drop. Both controls completed in this run (the bare box reached the destination, and this box reached its allowed name), so the network is alive and the fast failure is this box's own doing"
+      cat "$WORK/boxreg-refuse.err" 2>/dev/null || true
+      fail
+    fi
+    echo "declared egress: the undeclared destination $boxreg_live_dst is refused (no answer and no reset until the 10 s timeout), while the bare box completed the same connection and this box completed its allowed one"
+
+    # The host-side gate's own account, where the frame reached it. An honest
+    # box's in-guest egress leg applies the same declared policy and refuses
+    # the undeclared frame first, so minvmd's drop record is the backstop's,
+    # not the refusal's proof — printed when it is there, with this box's own
+    # source address, and said plainly when it is not. The row the gate
+    # decides by is the one asserted above.
+    boxreg_gate_drop="$(minvmd_log_lines \
+      'dropped a frame leaving the VM at the host-side egress gate' \
+      | grep -F "\"source\":\"$boxreg_declared_switch\"" | tail -n1)"
+    if [ -n "$boxreg_gate_drop" ]; then
+      echo "host gate: $boxreg_gate_drop"
+    else
+      echo "host gate: no host-side drop record — the box's own in-guest egress leg answered first, which is the design order"
+    fi
+  fi
+
+  # The declared box's row ends like the bare one's, in the daemon's record —
+  # by either writer, same as (b) above.
+  mnl session destroy --force "$boxreg_declared_sid" \
+    >"$WORK/boxreg-declared-destroy.out" 2>"$WORK/boxreg-declared-destroy.err" \
+    || { echo "::error::'min session destroy' failed for the declared box"; cat "$WORK/boxreg-declared-destroy.err" 2>/dev/null || true; fail; }
+  for _ in $(seq 1 40); do
+    boxreg_withdrawn="$(box_row_end_record e2e-box-declared)"
+    [ -n "$boxreg_withdrawn" ] && break
+    sleep 0.25
+  done
+  if [ -z "$boxreg_withdrawn" ]; then
+    echo "::error::the declared box's row was not withdrawn by its destroy — no record by either writer"
+    echo "--- 'min session destroy' output ---"
+    cat "$WORK/boxreg-declared-destroy.out" 2>/dev/null || true
+    cat "$WORK/boxreg-declared-destroy.err" 2>/dev/null || true
+    echo "--- minvmd log (tail) ---"
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log.*' -type f \
+      -exec tail -n 40 {} + 2>/dev/null || true
+    fail
+  fi
+  boxreg_withdraw_addr="$(printf '%s\n' "$boxreg_withdrawn" \
+    | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
+  echo "VM host daemon record: $boxreg_withdrawn"
+  if [ "$boxreg_withdraw_addr" != "$boxreg_declared_switch" ]; then
+    echo "::error::the declared box's withdrawal names switch address ${boxreg_withdraw_addr:-<none>}, not the $boxreg_declared_switch its registration allocated — a different row"
+    fail
+  fi
+
+  # Leave the lane as the case found it: the daemon this case pinned is
+  # stopped, so the next command's autospawn carries the harness's own filter
+  # again, and the seeds go now rather than waiting for teardown.
+  mnl stop --force >/dev/null 2>&1 || true
+  rm -rf "$BOXREG_SEED_DIR"; BOXREG_SEED_DIR=""
+  rm -rf "$BOXREG_CTRLC_SEED_DIR"; BOXREG_CTRLC_SEED_DIR=""
+  echo "own-address box registers with the VM host daemon OK (create registers, destroy and Ctrl-C withdraw, the declared row is what the host gate decides by — no provider flag anywhere)"
   echo "::endgroup::"
 }
 
@@ -8789,6 +9382,7 @@ case "${1:-}" in
     proof_skip_scaffold
     proof_sandbox
     proof_restart
+    proof_own_ip_box_registers_with_the_vm_host_without_a_provider_flag
     proof_fresh_install_own_ip_ingress_publishes_loopback
     proof_network_posture_from_stock_install
     proof_fresh_linux_kvm_activate_local_minvmd
@@ -8807,6 +9401,7 @@ case "${1:-}" in
     ;;
   lifecycle | session_exec | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
+    | own_ip_box_registers_with_the_vm_host_without_a_provider_flag \
     | network_posture_from_stock_install | native_resolution_without_proxy_env \
     | box_name_resolves_natively_without_proxy \
     | hostnames_recover_and_two_daemons_route \
@@ -8823,6 +9418,7 @@ case "${1:-}" in
     echo "  no argument: every proof, in the whole-lane order"
     echo "  cases: lifecycle session_exec session_rename session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run hooks"
     echo "         skip_scaffold sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
+    echo "         own_ip_box_registers_with_the_vm_host_without_a_provider_flag"
     echo "         network_posture_from_stock_install native_resolution_without_proxy_env"
     echo "         box_name_resolves_natively_without_proxy"
     echo "         fresh_linux_kvm_activate_local_minvmd fresh_arm64_kvm_activate_local_minvmd"
