@@ -935,7 +935,8 @@ async fn guest_kernel_accepts_rendered_ruleset() {
         // The refusal branch: the image owes the kernel expressions the
         // table uses, and nft's own words — naming the missing expression —
         // are the diagnosis this test fails carrying, never a quiet miss.
-        let refusal = guest.boot_log_lines(&["nft -c refused the rendered classifier table"]);
+        let refusal =
+            guest.boot_log_lines(&["nft -c did not accept the rendered classifier table"]);
         panic!(
             "the guest's nft -c did not accept the rendered classifier table; \
              the boot log carries {} refusal line(s) for the image's builder:\n{}\n\

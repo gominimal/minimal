@@ -942,14 +942,134 @@ pub struct GuestRender<'a> {
     pub mountinfo_override: Option<&'a Path>,
 }
 
+/// How long one of the guest's own runs — the render under `bash`, the
+/// check and the load under `nft` — may run before the boot stops waiting
+/// for it. These run in pid 1 before READY, where a child that never
+/// returns would stop the daemon from ever serving and nobody is watching
+/// to interrupt it, so past the bound the child is killed and the half it
+/// was running fails as its own `GuestLoadFailure`, logged like any other.
+/// It is generous for runs that take milliseconds each, and it is the
+/// guest's bound, not the host installer's: a step a person runs under
+/// sudo is theirs to interrupt, while a boot has only this.
+const GUEST_CHILD_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Feeds one of the guest's own runs the bytes it reads on stdin, then
+/// waits for it, both inside the bound it is given. The feed is part of
+/// the run — a child that never reads would hold the write, and a bound
+/// that covered only the waiting would bound half of it — so the bytes go
+/// in from a thread beside the wait, and the kill that ends an overrun
+/// closes the pipe under it.
+fn run_guest_child_bounded(
+    mut child: std::process::Child,
+    program: &Path,
+    feeds: &[u8],
+    bound: Duration,
+) -> Result<std::process::Output, String> {
+    use std::io::Write as _;
+
+    let stdin = child.stdin.take();
+    std::thread::scope(|run| {
+        if let Some(mut stdin) = stdin {
+            run.spawn(move || {
+                if let Err(cause) = stdin.write_all(feeds) {
+                    tracing::debug!(
+                        "{} stopped reading what it was fed: {cause}",
+                        program.display()
+                    );
+                }
+            });
+        }
+        wait_for_child_bounded(child, program, bound)
+    })
+}
+
+/// Waits for one of the guest's own runs and reads it back, for as long as
+/// `bound` gives it. Past the bound the child is killed and reaped — pid 1
+/// has nobody else to collect it — and the run fails as its own error,
+/// naming the program and the bound it overran, so the half it was part of
+/// reports a `GuestLoadFailure` like any other. A child that finishes
+/// inside the bound is read the way `wait_with_output` reads it: its own
+/// output whole, with the refusing program's own words in its `stderr`.
+///
+/// The bound covers the child the boot spawned, not anything that child
+/// backgrounded: no process group is set, so a process a script left
+/// behind keeps its own pipes open past the kill, and is bounded by the
+/// session's lifetime instead — the same caveat the hook runner's own
+/// bound keeps.
+fn wait_for_child_bounded(
+    mut child: std::process::Child,
+    program: &Path,
+    bound: Duration,
+) -> Result<std::process::Output, String> {
+    use std::io::Read as _;
+
+    // Poll, never block: a blocking wait cannot be taken back, and the
+    // bound is only as good as the wait's own way to see the clock.
+    const POLL: Duration = Duration::from_millis(10);
+    let deadline = std::time::Instant::now() + bound;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(cause) => return Err(format!("waiting on {}: {cause}", program.display())),
+        }
+        if std::time::Instant::now() < deadline {
+            std::thread::sleep(POLL);
+            continue;
+        }
+        // The bound is spent. Signal the child, reap it so pid 1 does not
+        // carry it as a zombie, and fail the run in its own right: no load
+        // happened, so nothing may be marked present behind it.
+        if let Err(cause) = child.kill() {
+            return Err(format!("killing {}: {cause}", program.display()));
+        }
+        if let Err(cause) = child.wait() {
+            return Err(format!("waiting on {}: {cause}", program.display()));
+        }
+        return Err(format!(
+            "{} was still running after {bound:?}: the guest's \
+             boot does not wait longer than that in pid 1 before READY",
+            program.display(),
+        ));
+    };
+    let mut stdout = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_end(&mut stdout)
+            .map_err(|cause| format!("reading {}'s output: {cause}", program.display()))?;
+    }
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_end(&mut stderr)
+            .map_err(|cause| format!("reading {}'s error output: {cause}", program.display()))?;
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// The guest's rendered table, by the guest's own rules: the installer is
 /// fed to `bash` on its stdin and told everything as argv — `bash -s --` —
 /// with the environment cleared, so no `BASH_ENV`, no `ENV` and no inherited
 /// `PATH` can tell bash what else to read, and no parameter is interpolated
 /// into script text. `--print-ruleset` prints the transaction an install
-/// would hand `nft -f`, which is the transaction the guest hands it.
+/// would hand `nft -f`, which is the transaction the guest hands it. The
+/// run is held to the boot's own bound, [`GUEST_CHILD_DEADLINE`], and a
+/// render that outlives it is killed and fails as its own
+/// `GuestLoadFailure`.
 pub fn render_guest_ruleset(bash: &Path, params: &GuestRender<'_>) -> Result<Vec<u8>, String> {
-    use std::io::Write as _;
+    render_guest_ruleset_over(bash, params, GUEST_CHILD_DEADLINE)
+}
+
+/// [`render_guest_ruleset`] with the bound the caller names, so a test can
+/// hold the run to a bound small enough to outrun; the boot's own bound
+/// everywhere else.
+pub fn render_guest_ruleset_over(
+    bash: &Path,
+    params: &GuestRender<'_>,
+    bound: Duration,
+) -> Result<Vec<u8>, String> {
     use std::process::{Command, Stdio};
 
     let mut installer = Command::new(bash);
@@ -978,20 +1098,13 @@ pub fn render_guest_ruleset(bash: &Path, params: &GuestRender<'_>) -> Result<Vec
     if let Some(mountinfo) = params.mountinfo_override {
         installer.env(REHEARSAL_MOUNTINFO_ENV, mountinfo);
     }
-    let mut child = installer
+    let child = installer
         .spawn()
         .map_err(|cause| format!("spawning {}: {cause}", bash.display()))?;
-    // The script is read from the child's stdin, so feed it and close the
-    // pipe; a child that stops reading before the script ends makes the
-    // write fail, and its own output says why.
-    if let Some(mut stdin) = child.stdin.take()
-        && let Err(cause) = stdin.write_all(INSTALLER_SCRIPT.as_bytes())
-    {
-        tracing::debug!("the installer stopped reading its script: {cause}");
-    }
-    let printed = child
-        .wait_with_output()
-        .map_err(|cause| format!("waiting on {}: {cause}", bash.display()))?;
+    // The script is read from the child's stdin, and the feed is part of
+    // the run's own bound: the helper holds both to it, and its kill ends
+    // a bash that never returned.
+    let printed = run_guest_child_bounded(child, bash, INSTALLER_SCRIPT.as_bytes(), bound)?;
     if !printed.status.success() {
         return Err(String::from_utf8_lossy(&printed.stderr).trim().to_string());
     }
@@ -1005,10 +1118,11 @@ pub struct GuestLoad {
     pub digest: String,
 }
 
-/// Which half of the guest's own load failed, with the refusing program's
-/// own words: the render, the check, the load itself, or the marker — named
-/// so the daemon's log says what to look at, and so the guest's decision
-/// stays `GuestTableNotLoaded` for every one of them.
+/// Which half of the guest's own load failed, with the run's own words —
+/// the refusing program's error, or, for a run that never answered, the
+/// bound it overran: the render, the check, the load itself, or the
+/// marker — named so the daemon's log says what to look at, and so the
+/// guest's decision stays `GuestTableNotLoaded` for every one of them.
 #[derive(Debug)]
 pub enum GuestLoadFailure {
     Render(String),
@@ -1028,10 +1142,25 @@ pub enum GuestLoadFailure {
 /// A failure at any point writes no marker, so the decision below reports
 /// the guest as unable to decide per box until a boot that succeeds — and
 /// the failure is this function's to name, nft's own error included.
+/// Every run is held to the boot's own bound, [`GUEST_CHILD_DEADLINE`]: a
+/// render, check or load that never answers is killed and fails like any
+/// other refusal.
 pub fn load_guest_table(
     bash: &Path,
     nft: &Path,
     params: &GuestRender<'_>,
+) -> Result<GuestLoad, GuestLoadFailure> {
+    load_guest_table_over(bash, nft, params, GUEST_CHILD_DEADLINE)
+}
+
+/// [`load_guest_table`] with the bound the caller names, so a test can
+/// hold a run to a bound small enough to outrun; the boot's own bound
+/// everywhere else.
+pub fn load_guest_table_over(
+    bash: &Path,
+    nft: &Path,
+    params: &GuestRender<'_>,
+    bound: Duration,
 ) -> Result<GuestLoad, GuestLoadFailure> {
     // The marker's discipline first, as the installer's re-install keeps it:
     // a marker or a stale mask record that cannot come away means the load
@@ -1050,7 +1179,7 @@ pub fn load_guest_table(
         );
         return Err(GuestLoadFailure::Marker(cause));
     }
-    let ruleset = match render_guest_ruleset(bash, params) {
+    let ruleset = match render_guest_ruleset_over(bash, params, bound) {
         Ok(ruleset) => ruleset,
         Err(cause) => {
             tracing::error!(
@@ -1064,25 +1193,27 @@ pub fn load_guest_table(
     };
     // The check is the render's own verdict on the guest's kernel — the one
     // expression the guest's image is being fixed to carry — and it is
-    // logged as its own line, with nft's own error when it refuses, because
-    // it is the line the image's builder reads.
-    let checked = run_guest_nft(nft, true, &ruleset);
+    // logged as its own line, with nft's own error when it refuses and the
+    // bound it overran when it never answers, because it is the line the
+    // image's builder reads.
+    let checked = run_guest_nft(nft, true, &ruleset, bound);
     if let Err(cause) = checked {
         tracing::error!(
             error = %cause,
-            "the guest's nft -c refused the rendered classifier table: no load ran and no marker was written, so minimald reports no per-box verdict until a boot succeeds"
+            "the guest's nft -c did not accept the rendered classifier table: no load ran and no marker was written, so minimald reports no per-box verdict until a boot succeeds"
         );
         return Err(GuestLoadFailure::Check(cause));
     }
     tracing::info!("the guest's nft -c accepted the rendered classifier table");
     // The load: one transaction, whole or not at all, over the same bytes
     // the check read — the ruleset's own prelude deletes any previous table
-    // first, so a failed load leaves the previous one untouched.
-    let loaded = run_guest_nft(nft, false, &ruleset);
+    // first, so a failed load leaves the previous one untouched, a killed
+    // one no less: the batch never commits.
+    let loaded = run_guest_nft(nft, false, &ruleset, bound);
     if let Err(cause) = loaded {
         tracing::error!(
             error = %cause,
-            "the guest's nft -f refused the classifier table: the previous table, if any, is untouched and no marker was written, so minimald reports no per-box verdict until a boot succeeds"
+            "the guest's nft -f did not load the classifier table: the previous table, if any, is untouched and no marker was written, so minimald reports no per-box verdict until a boot succeeds"
         );
         return Err(GuestLoadFailure::Load(cause));
     }
@@ -1175,9 +1306,9 @@ fn write_guest_marker(mask: u32, root: &Path) -> Result<(), String> {
 /// cleared: `-c` asks it to parse and validate without applying, which is how
 /// the render's own table is checked before anything loads; without it the
 /// batch is applied whole. The bytes are piped, so the digest the caller
-/// names covers exactly what nft received.
-fn run_guest_nft(nft: &Path, check: bool, ruleset: &[u8]) -> Result<(), String> {
-    use std::io::Write as _;
+/// names covers exactly what nft received, and the run — feed and wait
+/// both — is held to the bound the caller hands down from the boot's own.
+fn run_guest_nft(nft: &Path, check: bool, ruleset: &[u8], bound: Duration) -> Result<(), String> {
     use std::process::{Command, Stdio};
 
     let mut load = Command::new(nft);
@@ -1190,17 +1321,10 @@ fn run_guest_nft(nft: &Path, check: bool, ruleset: &[u8]) -> Result<(), String> 
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = load
+    let child = load
         .spawn()
         .map_err(|cause| format!("spawning {}: {cause}", nft.display()))?;
-    if let Some(mut stdin) = child.stdin.take()
-        && let Err(cause) = stdin.write_all(ruleset)
-    {
-        tracing::debug!("the guest's nft stopped reading the ruleset: {cause}");
-    }
-    let applied = child
-        .wait_with_output()
-        .map_err(|cause| format!("waiting on {}: {cause}", nft.display()))?;
+    let applied = run_guest_child_bounded(child, nft, ruleset, bound)?;
     if applied.status.success() {
         return Ok(());
     }
@@ -3748,6 +3872,114 @@ mod tests {
         );
     }
 
+    /// The boot's own runs are bounded, because they run in pid 1 before
+    /// READY, where a `bash` or an `nft` that never returns would stop the
+    /// daemon from ever serving and nobody is watching to interrupt it:
+    /// each run is killed past the bound it is held to and the half it was
+    /// part of fails as its own `GuestLoadFailure`, logged like any other
+    /// with the bound it overran, and no marker is written for a table
+    /// nobody loaded. The marker a successful load wrote is taken away
+    /// before each run that does not, so its absence after is the failed
+    /// load's own doing and not a boot that never reached its tree. The
+    /// boot's own bound is the generous one; this test drives the same
+    /// load over a bound small enough to outrun.
+    #[test]
+    #[serial_test::serial]
+    fn guest_bash_and_nft_runs_that_outlive_their_bound_fail_and_leave_no_marker() {
+        let mount = standin_mount();
+        let root = &mount.root;
+        let guest_ip = IpAddr::V4(crate::net::SwitchSubnet::default().daemon_ip());
+        let params = guest_params(&mount, Some(&mount.mountinfo), guest_ip, guest_ip);
+        let accepted = tempfile::tempdir().expect("a temp dir holding the recording nft");
+        let nft = recording_nft(accepted.path(), &[]);
+        let bound = Duration::from_millis(750);
+
+        // A load that succeeds, so a marker is standing for each failed run
+        // to take away.
+        let marker_stands = || {
+            load_guest_table(&guest_bash(), &nft, &params)
+                .expect("the load runs over an nft stub that accepts it");
+            assert!(
+                root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+                "the load that succeeded wrote the marker"
+            );
+        };
+        marker_stands();
+
+        // A stand-in that never returns: pure shell — a busy loop, not a
+        // `sleep`, because the render hands its children an environment
+        // with no PATH to resolve anything on.
+        let hung = tempfile::tempdir().expect("a temp dir holding the hung children");
+        let never_returns = |dir: &Path, name: &str, script: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, script).expect("writing the child that never returns");
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("the child that never returns is executable");
+            path
+        };
+
+        // A `bash` that never returns: the render's own run, the first
+        // child the load spawns, and no check or load ran behind it.
+        let hung_bash = never_returns(hung.path(), "bash", "#!/bin/sh\nwhile :; do :; done\n");
+        match load_guest_table_over(&hung_bash, &nft, &params, bound) {
+            Err(GuestLoadFailure::Render(cause)) => assert!(
+                cause.contains("was still running after 750ms"),
+                "the render's own failure names the run it killed and the \
+                 bound it overran: {cause}"
+            ),
+            other => {
+                panic!("a render that never returns is the render's own failure, not {other:?}")
+            }
+        }
+        assert!(
+            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            "a render that never returned writes no marker, and takes the \
+             standing one away first"
+        );
+
+        // An `nft` that never returns: the check is the first call it
+        // takes, so no load ran behind it.
+        marker_stands();
+        let hung_nft = never_returns(hung.path(), "nft", "#!/bin/sh\nwhile :; do :; done\n");
+        match load_guest_table_over(&guest_bash(), &hung_nft, &params, bound) {
+            Err(GuestLoadFailure::Check(cause)) => assert!(
+                cause.contains("was still running after 750ms"),
+                "the check's own failure names the run it killed and the \
+                 bound it overran: {cause}"
+            ),
+            other => panic!("a check that never returns is the check's own failure, not {other:?}"),
+        }
+        assert!(
+            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            "no load ran behind a check that never answered, so no marker stands"
+        );
+
+        // And the load's own run is bounded the same way: an `nft` that
+        // accepts the check and never returns from the load. The `Load`
+        // failure is only reachable through a render that ran and a check
+        // that accepted, so the variant itself says which half overran.
+        marker_stands();
+        let late = tempfile::tempdir().expect("a temp dir holding the late nft");
+        let late_nft = never_returns(
+            late.path(),
+            "nft",
+            "#!/bin/sh\n[ \"$1\" = \"-c\" ] && exit 0\nwhile :; do :; done\n",
+        );
+        match load_guest_table_over(&guest_bash(), &late_nft, &params, bound) {
+            Err(GuestLoadFailure::Load(cause)) => assert!(
+                cause.contains("was still running after 750ms"),
+                "the load's own failure names the run it killed and the \
+                 bound it overran: {cause}"
+            ),
+            other => panic!("a load that never returns is the load's own failure, not {other:?}"),
+        }
+        assert!(
+            !root.join(sandbox2::classifier::TABLE_MARKER).is_dir(),
+            "a table nobody loaded is not marked present"
+        );
+    }
+
     /// The guest's boot order, as the order the boot itself keeps
     /// (NET-079): the loopback the probe's listeners bind on is up before
     /// they are held — a guest's kernel leaves `lo` down until something
@@ -3820,7 +4052,10 @@ mod tests {
         // still loads, because the marker's table is not the listeners'.
         let cause = std::io::Error::other("the loopback would not come up");
         let _ = std::fs::remove_dir_all(root.join(sandbox2::classifier::TABLE_MARKER));
-        let (ran, held_at_load) = (std::cell::RefCell::new(Vec::new()), std::cell::Cell::new(None));
+        let (ran, held_at_load) = (
+            std::cell::RefCell::new(Vec::new()),
+            std::cell::Cell::new(None),
+        );
         boot_guest_classifier(
             || {
                 ran.borrow_mut().push("loopback");
