@@ -21,8 +21,8 @@
 # SAFETY:
 #   * DRY-RUN BY DEFAULT — prints what it would cancel; changes nothing until
 #     you pass --execute.
-#   * A failed or null merge-queue query, a truncated entry list, or an entry
-#     without a head commit aborts before anything is cancelled: a live set
+#   * A failed or null merge-queue query, a missing or truncated entry list,
+#     or an entry without a head commit aborts before anything is cancelled: a live set
 #     is never inferred from an error. A genuinely empty queue (no entries)
 #     is valid and makes every listed group run stale.
 #   * A cancel refused for any reason but "already finished" (HTTP 409) does
@@ -112,7 +112,8 @@ queue_raw="$("$GH" api graphql -f query="$query" \
 live_json="$(jq -c '
     if (.errors // []) | length > 0 then error("graphql errors: \(.errors | map(.message) | join("; "))")
     elif .data.repository.mergeQueue == null then error("mergeQueue is null")
-    elif .data.repository.mergeQueue.entries.pageInfo.hasNextPage then error("entry list truncated")
+    elif (.data.repository.mergeQueue.entries.nodes | type) != "array" then error("entry list missing")
+    elif .data.repository.mergeQueue.entries.pageInfo.hasNextPage != false then error("entry list truncated")
     elif any(.data.repository.mergeQueue.entries.nodes[]; .headCommit.oid == null) then error("an entry has no head commit")
     else [.data.repository.mergeQueue.entries.nodes[].headCommit.oid]
     end' <<<"$queue_raw")" \

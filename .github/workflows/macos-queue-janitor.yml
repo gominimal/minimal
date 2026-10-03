@@ -13,25 +13,24 @@ name: macOS queue janitor
 # All the logic lives in scripts/cancel-stale-queue-runs.sh so it can be run
 # and tested outside CI; this workflow is the triggers and the token.
 #
-# No merge_group trigger: a merge_group run takes its workflow definition from
-# the group commit, so a queued change could rewrite this job while it holds
-# actions:write. Every trigger below runs main's definition and main's script.
+# No merge_group or workflow_dispatch trigger: a merge_group run takes its
+# workflow definition from the group commit, and a dispatch can name any
+# pushed branch, so either would let unmerged code run this job while it
+# holds actions:write. Both triggers below run main's definition and main's
+# script.
 
 on:
     # A new ci-macos.yml run is requested, which is exactly when a group
     # rebuild leaves the previous group's run orphaned.
-    workflow_run:
+    # workflow_run is safe here: the job checks out main (the default for this
+    # event), never the triggering run's ref, artifacts or outputs, and reads
+    # nothing from the event beyond its `event` name.
+    workflow_run: # zizmor: ignore[dangerous-triggers] runs main's checkout only; nothing from the triggering run is executed or read beyond its event name
         workflows: ["CI (macOS)"]
         types: [requested]
     schedule:
         # Backstop for a rebuild whose orphan outlives the request above.
         - cron: "*/10 * * * *"
-    workflow_dispatch:
-        inputs:
-            execute:
-                description: "Actually cancel (unchecked = dry-run preview in the logs)"
-                type: boolean
-                default: false
 
 # Cancelling runs needs actions:write; the merge-queue query reads the repo.
 permissions:
@@ -49,9 +48,8 @@ jobs:
         timeout-minutes: 5
         # Only a requested merge-queue run can orphan another; skip the rest.
         if: >-
-            github.event_name == 'workflow_dispatch' ||
-            (github.repository == 'gominimal/minimal' &&
-             (github.event_name != 'workflow_run' || github.event.workflow_run.event == 'merge_group'))
+            github.repository == 'gominimal/minimal' &&
+            (github.event_name != 'workflow_run' || github.event.workflow_run.event == 'merge_group')
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
@@ -60,10 +58,6 @@ jobs:
               env:
                   GH_TOKEN: ${{ github.token }}
                   REPO: ${{ github.repository }}
-                  # workflow_run and schedule runs always execute; a manual
-                  # dispatch honours the checkbox (default: dry run).
-                  EXECUTE: ${{ github.event_name != 'workflow_dispatch' || inputs.execute }}
-              run: |
-                  args=(--workflow ci-macos.yml --branch main)
-                  [ "$EXECUTE" = "true" ] && args+=(--execute)
-                  scripts/cancel-stale-queue-runs.sh "${args[@]}"
+              # A dry run is `scripts/cancel-stale-queue-runs.sh` without
+              # --execute, run locally with a user token.
+              run: scripts/cancel-stale-queue-runs.sh --workflow ci-macos.yml --branch main --execute

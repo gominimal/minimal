@@ -135,15 +135,17 @@ else
     bad "403 case: cancels '$(cancelled)'"
 fi
 
-# 6–10. A failed, errored, null, truncated or head-less queue answer cancels
-#       nothing.
-for kind in fail errors null truncated headless; do
+# 6–12. A failed, errored, null, entry-less, node-less, truncated or
+#       head-less queue answer cancels nothing.
+for kind in fail errors null no-entries no-nodes truncated headless; do
     fresh
     run_obj 9 aaa "$Q/pr-9-x" >"$STUB_DIR/runs-queued.jsonl"
     case "$kind" in
         fail)      touch "$STUB_DIR/queue.fail" ;;
         errors)    echo '{"errors":[{"message":"nope"}],"data":null}' >"$STUB_DIR/queue.json" ;;
         null)      echo '{"data":{"repository":{"mergeQueue":null}}}' >"$STUB_DIR/queue.json" ;;
+        no-entries) echo '{"data":{"repository":{"mergeQueue":{"entries":null}}}}' >"$STUB_DIR/queue.json" ;;
+        no-nodes)  echo '{"data":{"repository":{"mergeQueue":{"entries":{"pageInfo":{"hasNextPage":false},"nodes":null}}}}}' >"$STUB_DIR/queue.json" ;;
         truncated) echo '{"data":{"repository":{"mergeQueue":{"entries":{"pageInfo":{"hasNextPage":true},"nodes":[]}}}}}' >"$STUB_DIR/queue.json" ;;
         headless)  echo '{"data":{"repository":{"mergeQueue":{"entries":{"pageInfo":{"hasNextPage":false},"nodes":[{"headCommit":null}]}}}}}' >"$STUB_DIR/queue.json" ;;
     esac
