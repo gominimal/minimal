@@ -1951,6 +1951,10 @@ mod tests {
                     local: forwarder.local().to_string(),
                     internal_port: forwarder.internal_port(),
                     proto: sessions::IpProto::Tcp,
+                    // The gate-less runtime publish this test drives: the
+                    // field's default, spelled for the same reason the other
+                    // fields are.
+                    pending: false,
                 },
                 forwarder,
             })

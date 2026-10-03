@@ -1027,6 +1027,22 @@ pub struct LiveMapping {
     pub internal_port: u16,
     /// The transport the forward carries.
     pub proto: IpProto,
+    /// Whether the box's own relay gate has admitted the port yet. A runtime
+    /// publish binds on the host at once, but the frame only reaches the box
+    /// through the relay gate its attach installed — and that gate admits the
+    /// ports the *declaration* named, so a port published at runtime is
+    /// refused at the relay until the gate's admitted set grows to include
+    /// runtime-published ports. A mapping that reads `pending` is bound, and
+    /// a connection to its `local` is answered by the relay, not by the box.
+    ///
+    /// Filled by the daemon at read time (the serving handler compares the
+    /// mapping against the gate's compile set), never stored with the
+    /// forwarder — the state is a fact about the box, not about the bind.
+    /// Defaults to `false` on the wire so a reply from a daemon older than
+    /// the field still decodes, reading as "not pending" rather than failing
+    /// the whole list.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 impl LiveMapping {
@@ -1590,16 +1606,28 @@ mod tests {
                 local: "127.0.64.2:3000".to_string(),
                 internal_port: 3000,
                 proto: IpProto::Tcp,
+                // A runtime publish the relay gate has not admitted yet:
+                // bound on the host, but the box's own gate still refuses it.
+                pending: true,
             },
             LiveMapping {
                 local: "127.0.64.2:5353".to_string(),
                 internal_port: 5353,
                 proto: IpProto::Udp,
+                pending: false,
             },
         ];
         assert_eq!(
             round_trip(&Errorable::Ok(live.clone())),
             Errorable::Ok(live)
+        );
+
+        // The reachability half rides the wire by name: a pending publish
+        // says so in the JSON any client of the RPC reads.
+        let json = serde_json_lenient::to_string(&live[0]).unwrap();
+        assert!(
+            json.contains("\"pending\":true"),
+            "the mapping's pending state is part of its wire shape: {json}"
         );
 
         let decoded: Errorable<Vec<LiveMapping>> =
@@ -1617,6 +1645,7 @@ mod tests {
             local: "127.0.64.2:3000".to_string(),
             internal_port: 3000,
             proto: IpProto::Tcp,
+            pending: false,
         };
         assert_eq!(mapping.host_port(), Some(("127.0.64.2", 3000)));
     }

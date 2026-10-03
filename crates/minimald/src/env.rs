@@ -571,6 +571,7 @@ impl Env {
                 Utf8PathBuf::try_from(sandbox.rootfs().to_path_buf()).unwrap(),
             )
             .unwrap(),
+            name: args.name.clone(),
             runtime_env: runtime_env.clone(),
             state_dir: args.state_base_dir.clone(),
             working: args.cwd.clone(),
@@ -824,6 +825,11 @@ impl sandbox2::Channel for BridgeChannel {
 struct SessionChannel {
     ctx: Context,
     graph: Graph,
+    /// The box's name, as the environment was built with it — the one fact
+    /// about the box that outlives its record, so the paths the record read
+    /// fails on can still say whose request they were in the one line every
+    /// expose request owes the log.
+    name: String,
     /// The sandbox rootfs, into which freshly-installed packages are hardlinked.
     rootfs: DaemonAbsPath,
     /// The host directory backing `/state`.
@@ -1491,47 +1497,107 @@ impl SessionChannel {
     /// process inside the box sends to publish one of its ports. The session
     /// that owns this channel decides it against the box's `dynamic_ingress`
     /// setting and publishes when it allows (NET-044); the reply carries the
-    /// address the port was published on, or the typed refusal's own reason.
+    /// address the port was published on — said honestly: bound on the host,
+    /// but the box's own relay gate has not admitted the port yet, so a
+    /// connection to it is answered by the relay, not by the box — or the
+    /// typed refusal's own reason.
+    ///
+    /// One info line per request on every path (NET-044's observability): the
+    /// actor logs each request it sees, and this channel logs the ones no
+    /// actor can — a port that is not a number, a session that is gone, and
+    /// the record the actor could not read, whose line the actor cannot write
+    /// because the box's name lives in that record and this channel holds its
+    /// own copy. Every line names the box, the port as given, and the outcome.
     async fn expose_port(&self, stream: &mut UnixStream, port: &str) {
-        let Ok(port) = port.parse::<u16>() else {
-            #[expect(
-                clippy::let_underscore_must_use,
-                reason = "the reply channel is best-effort: a peer that sent no port number \
-                          may be gone before the reply lands, and there is nowhere to report \
-                          that to"
-            )]
-            let _ = writeln!(stream, "error: '{port}' is not a port number");
-            return;
+        let port_number = match port.parse::<u16>() {
+            Ok(number) => number,
+            Err(_) => {
+                tracing::info!(
+                    name = %self.name,
+                    port = %port,
+                    outcome = "refused",
+                    reason = %format_args!("'{port}' is not a port number"),
+                    "dynamic ingress expose"
+                );
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the reply channel is best-effort: a peer that sent no port \
+                              number may be gone before the reply lands, and there is \
+                              nowhere to report that to"
+                )]
+                let _ = writeln!(stream, "error: '{port}' is not a port number");
+                return;
+            }
         };
-        let Some(session) = self.session.upgrade() else {
-            #[expect(
-                clippy::let_underscore_must_use,
-                reason = "the reply channel is best-effort: a peer may be gone before the \
-                          reply lands, and there is nowhere to report that to"
-            )]
-            let _ = writeln!(stream, "error: session is gone");
-            return;
+        let session = match self.session.upgrade() {
+            Some(session) => session,
+            None => {
+                tracing::info!(
+                    name = %self.name,
+                    port = %port,
+                    outcome = "refused",
+                    reason = "the session is gone",
+                    "dynamic ingress expose"
+                );
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the reply channel is best-effort: a peer may be gone before \
+                              the reply lands, and there is nowhere to report that to"
+                )]
+                let _ = writeln!(stream, "error: session is gone");
+                return;
+            }
         };
-        match session.expose_dynamic(port).await {
+        match session.expose_dynamic(port_number).await {
             Ok(mapping) => {
                 #[expect(
                     clippy::let_underscore_must_use,
-                    reason = "the reply channel is best-effort: a peer may be gone before the \
-                              reply lands, and there is nowhere to report that to"
+                    reason = "the reply channel is best-effort: a peer may be gone before \
+                              the reply lands, and there is nowhere to report that to"
                 )]
                 let _ = writeln!(
                     stream,
-                    "msg:published port {} at {}",
+                    "msg:published port {} at {}; not yet reachable",
                     mapping.internal_port, mapping.local
                 );
             }
-            Err(e) => {
+            Err(failure) => {
+                // The failures no actor saw, or the one the actor could not
+                // name: the record-read failure reached the actor but its
+                // line cannot be written there — the box's name lives in the
+                // record it could not read. The dead-actor failure never
+                // reached one. Every other failure already left its line in
+                // the actor, which saw the record; logging here too would
+                // make two lines for one request.
+                match &failure {
+                    crate::net::policy::ExposeFailure::RecordUnreadable { .. } => {
+                        tracing::info!(
+                            name = %self.name,
+                            port = %port,
+                            outcome = "refused",
+                            reason = %failure,
+                            "dynamic ingress expose"
+                        );
+                    }
+                    crate::net::policy::ExposeFailure::Publish { source, .. }
+                        if source.kind() == std::io::ErrorKind::NotConnected =>
+                    {
+                        tracing::info!(
+                            name = %self.name,
+                            port = %port,
+                            outcome = "refused",
+                            reason = %failure,
+                            "dynamic ingress expose"
+                        );
+                    }
+                    _ => {}
+                }
                 #[expect(
                     clippy::let_underscore_must_use,
-                    reason = "the reply channel is best-effort: a peer may be gone before the \
-                              reply lands, and there is nowhere to report that to"
+                    reason = "the reply channel is best-effort: a peer may be gone before \
+                              the reply lands, and there is nowhere to report that to"
                 )]
-                let _ = writeln!(stream, "error: {e}");
+                let _ = writeln!(stream, "error: {failure}");
             }
         }
     }
@@ -2158,6 +2224,16 @@ mod tests {
     /// `SessionChannel` wired to them with a dummy receiver so handlers can be
     /// driven directly.
     fn setup_channel() -> (TempDir, TempDir, TempDir, SessionChannel) {
+        setup_channel_with(crate::session::WeakSessionHandle::dangling(), "web")
+    }
+
+    /// [`setup_channel`] for a channel bound to the session that owns it: the
+    /// session's weak handle and the box's name, so the paths that reach into
+    /// the session — the expose hop — can be driven against a live one.
+    fn setup_channel_with(
+        session: crate::session::WeakSessionHandle,
+        name: &str,
+    ) -> (TempDir, TempDir, TempDir, SessionChannel) {
         let cwd = tempdir().unwrap();
         let state = tempdir().unwrap();
         let home = tempdir().unwrap();
@@ -2177,6 +2253,7 @@ mod tests {
 
         let (_tx, rx) = mpsc::channel(1);
         let channel = SessionChannel {
+            name: name.to_string(),
             rootfs: DaemonAbsPath::try_new(
                 Utf8PathBuf::try_from(rootfs.path().to_path_buf()).unwrap(),
             )
@@ -2193,7 +2270,7 @@ mod tests {
                 .unwrap(),
             has_packages: HashSet::new(),
             ot: None,
-            session: crate::session::WeakSessionHandle::dangling(),
+            session,
             runtime_env: RuntimeEnv::default(),
             ctx,
             graph,
@@ -2265,6 +2342,132 @@ mod tests {
             read_lines(&theirs),
             vec!["error: session is gone"],
             "a numeric port is routed to the session that owns the channel"
+        );
+    }
+
+    /// NET-044's observability for the paths no session actor ever sees — the
+    /// ones a `min net expose` request can take without one deciding it: a
+    /// port that is not a number, a session that is gone, and a record the
+    /// actor could not read, whose line the actor cannot write because the
+    /// box's name lives in the record it could not read. This channel holds
+    /// its own copy of the name, so it writes those lines; each request
+    /// leaves exactly one, naming the box, the port as given, and the
+    /// outcome. Every path the actor does see leaves its own line there,
+    /// pinned by the expose tests in `session`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expose_logs_every_path_from_the_channel() {
+        let capture = crate::test_harness::captured_log();
+
+        // A port that is not a number, and a session that is gone: two
+        // requests a dangling channel answers on its own.
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel();
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%http", &mut ours).await;
+        drop(ours);
+        assert_eq!(
+            read_lines(&theirs),
+            vec!["error: 'http' is not a port number"],
+            "a non-numeric port is refused as one"
+        );
+
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%3000", &mut ours).await;
+        drop(ours);
+        assert_eq!(
+            read_lines(&theirs),
+            vec!["error: session is gone"],
+            "a numeric port is routed to the session that owns the channel"
+        );
+
+        // A session whose record cannot be read: the actor returns its own
+        // typed failure — it cannot name the box — and the line is this
+        // channel's, which knows the name without the record.
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        let id =
+            crate::test_harness::create_configured_session(&mut client, "recweb", "/tmp").await;
+        let manager = server.state.sessions_manager().await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+            .await
+            .unwrap()
+            .expect("the session resolves");
+        // The record, made unreadable on disk: the read every expose request
+        // does now fails, before any decision exists to log.
+        let sessions_dir = server
+            .state
+            .minimal_state_dir()
+            .await
+            .as_utf8_path()
+            .as_std_path()
+            .join("sessions");
+        let records: Vec<std::path::PathBuf> = std::fs::read_dir(&sessions_dir)
+            .expect("the state root holds the sessions dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path().join("record.json"))
+            .collect();
+        assert_eq!(records.len(), 1, "one session, one record: {records:?}");
+        std::fs::write(&records[0], "not a record").expect("the record is made unreadable");
+
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel_with(handle.downgrade(), "recweb");
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%3000", &mut ours).await;
+        drop(ours);
+        let lines = read_lines(&theirs);
+        assert_eq!(lines.len(), 1, "one reply: {lines:?}");
+        assert!(
+            lines[0].starts_with("error: reading the session record for port 3000 failed:"),
+            "the reply is the typed record-read failure: {lines:?}"
+        );
+
+        // One line per request across all three, each naming the box and the
+        // port as given.
+        let logged = capture.contents();
+        let expose: Vec<&str> = logged
+            .lines()
+            .filter(|line| line.contains("dynamic ingress expose"))
+            .collect();
+        assert_eq!(
+            expose.len(),
+            3,
+            "one line per request, including the ones no actor saw: {logged}"
+        );
+        assert!(
+            expose[0].contains("name=web")
+                && expose[0].contains("port=http")
+                && expose[0].contains("outcome=\"refused\"")
+                && expose[0].contains("reason='http' is not a port number"),
+            "the non-numeric port's line names the port as given: {expose[0]}"
+        );
+        assert!(
+            expose[1].contains("name=web")
+                && expose[1].contains("port=3000")
+                && expose[1].contains("outcome=\"refused\"")
+                && expose[1].contains("reason=the session is gone"),
+            "the gone session's line says so: {expose[1]}"
+        );
+        assert!(
+            expose[2].contains("name=recweb")
+                && expose[2].contains("port=3000")
+                && expose[2].contains("outcome=\"refused\"")
+                && expose[2].contains("reason=reading the session record for port 3000 failed"),
+            "the record-read failure's line names the box, whose name the \
+             unreadable record could not: {expose[2]}"
         );
     }
 

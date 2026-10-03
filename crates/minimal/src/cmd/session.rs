@@ -1820,11 +1820,14 @@ pub fn format_policy(
 /// (NET-044): one row a publish — the address its forward is bound on, and
 /// the in-box port it forwards to — shaped like the declared mapping rows
 /// above it, so the two read as one surface: what the box declared, and what
-/// it went on to publish. A box that published nothing prints no section: an
-/// empty header would claim a distinction between "nothing published" and
-/// "nothing publishable" the listing has no way to draw — the declaration
-/// above already says what is permitted, and silence says the box used none
-/// of it.
+/// it went on to publish. A row whose port the box's relay gate has not
+/// admitted yet says so rather than reading as reachable: the publish is
+/// bound on the host, but a connection to it is answered by the relay, not by
+/// the box, until the gate's admitted set grows to include runtime-published
+/// ports. A box that published nothing prints no section: an empty header
+/// would claim a distinction between "nothing published" and "nothing
+/// publishable" the listing has no way to draw — the declaration above
+/// already says what is permitted, and silence says the box used none of it.
 ///
 /// Shared by `min session policy`'s printer and the tests that pin the
 /// rendering, the way [`format_policy`] is.
@@ -1837,10 +1840,15 @@ pub fn write_live_ingress(
     }
     writeln!(out, "live ingress (published at runtime)")?;
     for mapping in live {
+        let reachability = if mapping.pending {
+            "  (pending; not yet reachable)"
+        } else {
+            ""
+        };
         writeln!(
             out,
-            "  {}  {} → :{}",
-            mapping.proto, mapping.local, mapping.internal_port
+            "  {}  {} → :{}{}",
+            mapping.proto, mapping.local, mapping.internal_port, reachability
         )?;
     }
     Ok(())
@@ -2664,6 +2672,7 @@ mod tests {
             local: "127.0.64.21:3000".to_string(),
             internal_port: 3000,
             proto: IpProto::Tcp,
+            pending: false,
         }];
 
         // Beside the declaration: the declared dynamic surface first, then
@@ -2701,11 +2710,13 @@ mod tests {
                     local: "127.0.64.21:3000".to_string(),
                     internal_port: 3000,
                     proto: IpProto::Tcp,
+                    pending: false,
                 },
                 minimald_rpc::LiveMapping {
                     local: "127.0.64.21:5353".to_string(),
                     internal_port: 5353,
                     proto: IpProto::Udp,
+                    pending: false,
                 },
             ],
         )
@@ -2724,6 +2735,56 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "",
             "a box that published nothing prints no live section"
+        );
+    }
+
+    /// A runtime mapping is bound on the host before the box's own relay gate
+    /// has admitted the port, so the publish is a fact with a caveat until the
+    /// gate's admitted set grows to include runtime-published ports. Both
+    /// surfaces `min session policy` reads say it: the rendered text marks
+    /// the row pending rather than letting it read as reachable, and the
+    /// mapping's JSON — the shape any client of the RPC reads, and the data
+    /// these rows render — carries the state with it.
+    #[test]
+    fn policy_shows_pending_live_mapping() {
+        let pending = minimald_rpc::LiveMapping {
+            local: "127.0.64.21:3000".to_string(),
+            internal_port: 3000,
+            proto: IpProto::Tcp,
+            pending: true,
+        };
+        let admitted = minimald_rpc::LiveMapping {
+            local: "127.0.64.21:5353".to_string(),
+            internal_port: 5353,
+            proto: IpProto::Udp,
+            pending: false,
+        };
+
+        // The text: the pending row says so — bound, but the box's gate has
+        // not admitted the port yet — and the admitted row reads as reachable.
+        let mut out = Vec::new();
+        write_live_ingress(&mut out, &[pending.clone(), admitted.clone()]).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  tcp  127.0.64.21:3000 → :3000  (pending; not yet reachable)\n"),
+            "a mapping the gate has not admitted reads as pending: {rendered}"
+        );
+        assert!(
+            rendered.contains("  udp  127.0.64.21:5353 → :5353\n"),
+            "a mapping the gate admitted reads as reachable, with no caveat: {rendered}"
+        );
+
+        // The JSON: the mapping's own shape carries the state, so a client
+        // reading the wire can tell the two apart without the renderer.
+        let pending_json = serde_json_lenient::to_string(&pending).unwrap();
+        assert!(
+            pending_json.contains("\"pending\":true"),
+            "the pending mapping's JSON says so: {pending_json}"
+        );
+        let admitted_json = serde_json_lenient::to_string(&admitted).unwrap();
+        assert!(
+            admitted_json.contains("\"pending\":false"),
+            "the admitted mapping's JSON says so: {admitted_json}"
         );
     }
 

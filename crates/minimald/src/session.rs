@@ -2148,14 +2148,19 @@ impl Session {
     /// One info line per request, naming the box, the port, the decision its
     /// `dynamic_ingress` setting made, and the outcome, so a diagnostics
     /// bundle's daemon log tail carries every expose request with what became
-    /// of it.
+    /// of it. The one path this actor cannot name a box on is a record that
+    /// does not read — the box's name lives in it — so that path returns its
+    /// own typed failure for the env channel to log, which knows the name
+    /// without the record.
     async fn expose_dynamic(
         &mut self,
         port: u16,
     ) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
         let record = match self.record.record().await {
             Ok(record) => record,
-            Err(e) => return Err(crate::net::policy::ExposeFailure::Publish { port, source: e }),
+            Err(e) => {
+                return Err(crate::net::policy::ExposeFailure::RecordUnreadable { port, source: e })
+            }
         };
         let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
         // The setting the request is evaluated against (NET-043), spelled the
@@ -2193,17 +2198,35 @@ impl Session {
                 reason = %source,
                 "dynamic ingress expose"
             ),
+            Err(crate::net::policy::ExposeFailure::RecordUnreadable { .. }) => {
+                // Unreachable from the publish below: the record-read failure
+                // is returned above, before an outcome exists to log. The line
+                // that request owes the log is written by the env channel,
+                // which knows the box's name without the record.
+            }
         }
         outcome
+    }
+
+    /// The actor's own answer to "is a box running behind this session": an
+    /// `active` session holding a live host. A stopped box's record still
+    /// reads `active`, but the actor resurrected for it holds no host — so
+    /// this, not the record's status, is what a publish must consult (and
+    /// what `IsBusy` consults for the same reason).
+    fn has_live_host(&self) -> bool {
+        matches!(
+            &self.inner,
+            SessionInner::Active { host: Some((h, _)), .. } if h.is_alive()
+        )
     }
 
     /// The publish half of [`Session::expose_dynamic`], run once the request's
     /// decision is known for the log. Everything the box can refuse without
     /// asking the switch runs first — the policy decision (NET-043), the
-    /// live-duplicate check, and the address pair the publish needs — so a
-    /// refused request is refused with nothing bound and nothing asked
-    /// (NET-047). Only then is the switch asked to bind, and the forwarder is
-    /// recorded only once it accepted.
+    /// live-duplicate check, the box running, and the address pair the publish
+    /// needs — so a refused request is refused with nothing bound and nothing
+    /// asked (NET-047). Only then is the switch asked to bind, and the
+    /// forwarder is recorded only once it accepted.
     async fn publish_exposed_port(
         &mut self,
         record: &Record,
@@ -2229,35 +2252,56 @@ impl Session {
             )));
         }
 
-        // The publish rides the address pair the box's declared ports bind
-        // with: the loopback address its declaration publishes on, and the
-        // switch address its forwards deliver to. A VM host's registration
-        // handed the box that pair (T66). A native host's self-allocated box
-        // was handed none, so it rides what the hostname registry holds for
-        // its session instead (design §7.1): the address the box published
-        // at — where its declared ports bind and its name answers — and the
-        // lease its running PTask reported, which those same forwards
-        // deliver to. The two halves are refused apart, so the box's
-        // `min net expose` says which one is missing: nothing published is a
-        // capability gap — the daemon has no default of its own to stand in
-        // with (NET-010), so the request is refused rather than bound at an
-        // address nobody chose for this box — while no lease, or a spawn
-        // that has ended, is a box not attached yet, which starting it fixes.
-        let (loopback_address, switch_address) = match record.box_addresses {
-            Some(addresses) => (addresses.loopback_address, addresses.switch_address),
-            None => {
-                let registry = self
-                    .hostnames
-                    .read()
-                    .expect("hostname registry lock poisoned");
-                let Some(published) = registry.published_own_address(record.id) else {
-                    return Err(ExposeFailure::Refused(ExposeRefusal::NoPublishedAddress));
-                };
-                let Some(lease) = registry.own_lease(record.id) else {
-                    return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
-                };
-                (published, lease)
-            }
+        // A publish needs a box standing behind it. A stopped box's record
+        // still reads `active` — Stop keeps the grant, the publish row and
+        // the record (NET-013) — but the actor this request reached holds no
+        // host, and a forward bound for its lease would name an address
+        // nothing answers for. Refused here, before the registry is read or
+        // the switch asked anything, so a stopped box asks nothing and
+        // holds nothing (NET-047); starting the box again is what fixes it.
+        if !self.has_live_host() {
+            return Err(ExposeFailure::Refused(ExposeRefusal::NotRunning));
+        }
+
+        // The publish rides the address the box's declared ports bind at and
+        // its name answers at (NET-010): the hostname registry's published
+        // own address, the one source the declared path reads too, through
+        // `OwnAddressReporter::published_address`. Never the raw handed
+        // loopback address: a hand the loopback verdict has not vouched for
+        // publishes at the `127.0.0.1` interim (NET-123 §7.1), and a hand a
+        // landed verdict overrules is moved off by the landing's sweep — the
+        // registry row is the address that actually binds, so the runtime
+        // publish and the declaration answer at the one address a connection
+        // reaches. The hand's `switch_address` (T66) — or, for a native
+        // host's self-allocated box, the lease its running PTask reported
+        // (design §7.1) — is what the forward delivers to, and it is taken
+        // from the record and the registry without preference between the
+        // two ways a box came by it.
+        //
+        // The two halves are refused apart, so the box's `min net expose`
+        // says which one is missing: nothing published is a capability gap —
+        // the daemon has no default of its own to stand in with (NET-010),
+        // so the request is refused rather than bound at an address nobody
+        // chose for this box — while no lease is a box not attached yet,
+        // which starting it fixes.
+        let (loopback_address, switch_address) = {
+            let registry = self
+                .hostnames
+                .read()
+                .expect("hostname registry lock poisoned");
+            let Some(published) = registry.published_own_address(record.id) else {
+                return Err(ExposeFailure::Refused(ExposeRefusal::NoPublishedAddress));
+            };
+            let switch_address = match record.box_addresses {
+                Some(addresses) => addresses.switch_address,
+                None => {
+                    let Some(lease) = registry.own_lease(record.id) else {
+                        return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
+                    };
+                    lease
+                }
+            };
+            (published, switch_address)
         };
         // The lease is per-spawn: the registry keeps the last one reported
         // until the box is destroyed, so a spawn that has ended leaves it
@@ -2285,14 +2329,27 @@ impl Session {
         // Recorded only now, with the switch's acceptance in hand: a publish
         // that failed leaves nothing in the list (NET-047), so the rows the
         // policy surfaces read never name a port the switch is not holding.
-        // A spawn that ended while the publish was in flight took the
-        // runtime forwards down already; this one is unbound here instead
-        // of recorded, so nothing outlives the lease it delivers to.
+        // The liveness read and the record push are one synchronous step —
+        // nothing is awaited between them — so the stopped-box answer and the
+        // push cannot disagree, and `stop_running`'s unexpose sweep (which
+        // runs in this actor's own turn, over `take_all`) stays complete: a
+        // box that went down in the window the bind was in flight has its
+        // just-bound forward unbound here instead of recorded, so nothing
+        // outlives the lease it delivers to.
         let mapping = minimald_rpc::LiveMapping {
             local: forwarder.local().to_string(),
             internal_port: forwarder.internal_port(),
             proto: sessions::IpProto::Tcp,
+            // A fact about the box's relay gate, not about the bind: the
+            // serving handler fills it on every read, from the gate's
+            // compile set. Stored false here — never rendered from the
+            // stored cell.
+            pending: false,
         };
+        if !self.has_live_host() {
+            crate::net::policy::remove_ingress(&control, &[forwarder]).await;
+            return Err(ExposeFailure::Refused(ExposeRefusal::NotRunning));
+        }
         if let Err(stale) = self
             .live_ingress
             .record(crate::net::provider::LiveIngressForward {
