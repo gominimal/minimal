@@ -1686,8 +1686,12 @@ impl SessionGate {
         // fact the ingress gate above decided the frame by, checked here so
         // the record's invariant holds by construction at the recording
         // call, not by the caller's position in the leg.
+        // TCP reads both halves of the admission set — declared (NET-121)
+        // and listen-published (NET-016) — so a deny-all box can answer a
+        // connection to a port its listener published, as it can one to a
+        // declared port.
         let published = match pkt.proto {
-            IPPROTO_TCP => self.allowed.contains(&pkt.dst.port()),
+            IPPROTO_TCP => self.admits_tcp(pkt.dst.port()),
             IPPROTO_UDP => self.udp_allowed.contains(&pkt.dst.port()),
             _ => false,
         };
@@ -3119,10 +3123,30 @@ pub(crate) mod tests {
             "no stance: the range alone publishes nothing"
         );
 
+        assert!(
+            gate.record_delivered_inbound(&tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, SRC, 9999))
+                .is_none(),
+            "no reply-flow record opens for an unpublished port"
+        );
+
         // The watcher publishes 9999: the runtime-published half admits it,
         // beside the declared set.
         gate.admit_published(9999);
         assert!(gate.admits_tcp(9999));
+        assert!(
+            matches!(
+                gate.record_delivered_inbound(&tcp_frame(
+                    ETHERTYPE_IPV4,
+                    IPPROTO_TCP,
+                    SYN,
+                    SRC,
+                    9999
+                )),
+                Some(egress::InboundFlow::Recorded { .. })
+            ),
+            "a connection to a listen-published port opens a reply-flow record, so the box can answer it"
+        );
+        assert_eq!(gate.inbound_flow_records(), 1);
         assert!(
             blocked_syn(
                 &tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, SRC, 9999),
