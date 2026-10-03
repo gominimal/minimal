@@ -2769,7 +2769,69 @@ impl Session {
             }
             None => (None, spawn.await),
         };
-        Ok((channel, spawned.map_err(AttachError::SpawnFailed)?))
+        let (host, task, host_ip_enforcement) = spawned.map_err(AttachError::SpawnFailed)?;
+        // NET-079: the launch that just ran its own outcome for this
+        // session's box, recorded on the box's record here — the one path
+        // every launch takes, so an attach, an exec, an activation and a
+        // hook run all record the placement they each made.
+        self.record_launch_outcome(host_ip_enforcement).await;
+        Ok((channel, (host, task)))
+    }
+
+    /// Records the launch's own placement outcome on this session's record
+    /// (NET-079): `per_box` when the launch placed this session's
+    /// host-address box in a classifier leaf of the host's tree, `none` when
+    /// it did not. The box's record of its own launch, in the daemon-owned
+    /// field the read surfaces show, rather than the host's state as it
+    /// stands now — so a box launched unenforced stays `none` for its life,
+    /// whatever a later launch of another box decided.
+    ///
+    /// Best-effort by design: the box is running by the time this writes, so
+    /// a record that cannot be read or written costs the box its row — the
+    /// reads degrade to the host's state for a box whose launch could not be
+    /// recorded — and never costs the launch its box.
+    async fn record_launch_outcome(
+        &self,
+        host_ip_enforcement: Option<minimald_rpc::HostIpEnforcement>,
+    ) {
+        let Some(enforcement) = host_ip_enforcement else {
+            // Not a host-address box: its verdict is decided on address
+            // leases, never on the host's cgroup tree, so there is no
+            // per-box outcome to record and nothing to lower it by.
+            return;
+        };
+        match self.record.record().await {
+            Ok(mut record) => {
+                record.host_ip_enforcement = Some(enforcement);
+                // NET-079's observability: one info line per host-address
+                // box launch, carrying what this launch recorded in the
+                // machine spelling every surface and log line share — so
+                // the bundle's tail says each box's own outcome beside the
+                // launch lines that decided it.
+                tracing::info!(
+                    session_id = %self.record.id(),
+                    host_ip_enforcement = %enforcement.machine_str(),
+                    "the launch recorded its host-address box's egress \
+                     enforcement on the session record",
+                );
+                if let Err(e) = self.record.write(record).await {
+                    tracing::warn!(
+                        session_id = %self.record.id(),
+                        error = %e,
+                        "could not write the launch's egress enforcement to \
+                         the session record; reads fall back to the host's \
+                         state for this box",
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                session_id = %self.record.id(),
+                error = %e,
+                "could not read the session record back to record the \
+                 launch's egress enforcement; reads fall back to the host's \
+                 state for this box",
+            ),
+        }
     }
 
     /// Produces this session's arm result for [`WorkspaceBaseline`]: the
@@ -3227,7 +3289,25 @@ impl Session {
         record
             .validate_policy()
             .map_err(AttachError::InvalidPolicy)?;
-        Ok(session_host::MockLauncher::default())
+        // Mirror the production classifier half too, as the outcome alone:
+        // a mock launch records what the daemon's one node fact says this
+        // host can decide — the fact a test's injected reading sets — so the
+        // launches a test drives record each box's own outcome over the same
+        // fact the real launcher's per-launch read produces. The mock has no
+        // sandbox, so it models the placement's outcome, not the placement:
+        // which box a leaf goes to, and the mapping from a placement to the
+        // state it leaves the box in, are the production launcher's, pinned
+        // in session_host's launch proofs. A session that is not
+        // host-address keeps the plain mock — its verdict is decided on
+        // address leases, never on the host's cgroup tree, so there is no
+        // per-box outcome for its launches to record.
+        if record.network == sessions::NetworkMode::HostNet {
+            Ok(session_host::MockLauncher::with_host_ip_enforcement(
+                crate::session_host::host_ip_enforcement_fact().enforcement,
+            ))
+        } else {
+            Ok(session_host::MockLauncher::default())
+        }
     }
 
     /// Return this session's workspace-rooted [`mctx::Context`].

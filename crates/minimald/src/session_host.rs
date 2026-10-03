@@ -2546,10 +2546,11 @@ fn launch_mountinfo(knob: Option<String>) -> Option<String> {
 ///
 /// Held as a process-global rather than a field on the server's state for
 /// the same reason: the start-up read that seeds it runs before any server
-/// exists, and each surface that shows a session — the listing, the
-/// effective-policy reply, the create reply — derives its answer from it at
-/// read time, so all of them name the state the host is in now and none can
-/// show one a later re-read replaced.
+/// exists. It is the node's half of every surface that shows a session: the
+/// create reply states it outright (no box has launched yet to have its own
+/// outcome), each read surface's refusal gate answers over its cause, and
+/// the listing and the effective-policy reply lower a box's own launch
+/// record by its state — never raise one to it.
 ///
 /// `cause` rides beside the state because the two are one fact: the state a
 /// display shows and the advice the create reply carries both come from the
@@ -2636,11 +2637,22 @@ pub(crate) fn clear_host_ip_enforcement_fact() {
 }
 
 /// The per-box egress enforcement a session's display surfaces show
-/// (NET-079): the daemon's one classifier fact, for a host-address box the
-/// classifier did not refuse, and nothing for any other box — an own-address
-/// or none box's verdict is decided on address leases, never on the host's
-/// cgroup tree, and a box the classifier refused at placement has no state
-/// to show, because the refusal is what its launch said.
+/// (NET-079): the box's own launch record — what the launch that produced
+/// this box decided about it, `per_box` if it placed the box in a classifier
+/// leaf and `none` if it did not — for a host-address box the classifier did
+/// not refuse, and nothing for any other box. An own-address or none box's
+/// verdict is decided on address leases, never on the host's cgroup tree, and
+/// a box the classifier refused at placement has no state to show, because
+/// the refusal is what its launch said.
+///
+/// The record is lowered by the daemon's one node fact, never raised: a box
+/// launched `per_box` on a host whose table has since stopped deciding shows
+/// `none`, because the state the box's own record claims is not one this
+/// host can currently honour — and a box launched unenforced stays `none`
+/// for its life, whatever a later launch of another box decided, because
+/// the outcome belongs to the launch that produced it, not to the node as it
+/// stands now. Only a host-address box that has not launched yet — a created
+/// session, or one whose host never minted — shows the fact alone.
 ///
 /// The refusal half is the launch's own gate —
 /// [`refused_unenforced_host_address_box`] — so a display cannot disagree
@@ -2651,13 +2663,14 @@ pub(crate) fn clear_host_ip_enforcement_fact() {
 /// default — places, and its gate refuses nothing, so the state shows as it
 /// stands.
 ///
-/// Pure over its inputs, so the gate and its words are pinned where they are
-/// written.
+/// Pure over its inputs, so the gate and its lowering are pinned where they
+/// are written.
 pub(crate) fn displayed_host_ip_enforcement(
     guest: bool,
     network_mode: NetworkMode,
     verdict: sandbox2::config::Verdict,
     fact: &HostIpEnforcementFact,
+    launch_record: Option<HostIpEnforcement>,
 ) -> Option<minimald_rpc::HostIpEnforcement> {
     if refused_unenforced_host_address_box(
         guest,
@@ -2671,7 +2684,21 @@ pub(crate) fn displayed_host_ip_enforcement(
         return None;
     }
     match network_mode {
-        NetworkMode::HostNet => Some(fact.enforcement),
+        NetworkMode::HostNet => Some(match launch_record {
+            // The box's own launch outcome: shown as recorded while the host
+            // can still decide per box, lowered to the undecidable state the
+            // host is in when it cannot — never raised above either.
+            Some(recorded) => match (recorded, fact.enforcement) {
+                (HostIpEnforcement::PerBox, HostIpEnforcement::PerBox) => {
+                    HostIpEnforcement::PerBox
+                }
+                _ => HostIpEnforcement::None,
+            },
+            // No box of this session has launched yet, so there is no
+            // outcome to show: the node's state is the best either half of
+            // the daemon knows about a box that does not exist yet.
+            None => fact.enforcement,
+        }),
         _ => None,
     }
 }
@@ -4032,6 +4059,14 @@ pub(crate) struct MockLauncher {
     /// observe network teardown; `None` for the plain mock (mirroring
     /// `HostNet`/`NoNet`).
     net_guard: Option<Box<dyn sandbox2::NetGuard>>,
+    /// The per-box egress enforcement this mock launch reports (NET-079):
+    /// seeded by the session's test launcher from the daemon's one node fact,
+    /// so a test that injects a classifier reading and re-reads the fact has
+    /// the launches it drives record each box's own outcome over it. The mock
+    /// has no sandbox, so it places nothing and models the placement's
+    /// outcome as the fact's state; the real launcher's placement-to-outcome
+    /// mapping is pinned where it is written, in this module's launch proofs.
+    host_ip_enforcement: Option<HostIpEnforcement>,
 }
 
 #[cfg(test)]
@@ -4040,6 +4075,18 @@ impl MockLauncher {
     pub(crate) fn with_net_guard(net_guard: Box<dyn sandbox2::NetGuard>) -> Self {
         Self {
             net_guard: Some(net_guard),
+            host_ip_enforcement: None,
+        }
+    }
+
+    /// A mock whose launch carries `host_ip_enforcement` as its placement
+    /// outcome — the value the session's test launcher seeds from the
+    /// daemon's node fact, so a test's launches record each box's own
+    /// outcome over the fact a test's injected reading set.
+    pub(crate) fn with_host_ip_enforcement(host_ip_enforcement: HostIpEnforcement) -> Self {
+        Self {
+            host_ip_enforcement: Some(host_ip_enforcement),
+            ..Default::default()
         }
     }
 }
@@ -4082,7 +4129,7 @@ impl SessionLauncher for MockLauncher {
             seal_injection: false,
             // The mock has no sandbox, so no classifier placed it anywhere.
             leaf: None,
-            host_ip_enforcement: None,
+            host_ip_enforcement: self.host_ip_enforcement,
         })
     }
 }
@@ -4328,17 +4375,32 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
     ///
     /// Returns the [`HostHandle`] alongside the [`JoinHandle`] of the runtime
     /// loop, so the owner can await full teardown (process reaped, sandbox guard
-    /// dropped) after issuing a [`HostHandle::kill`].
+    /// dropped) after issuing a [`HostHandle::kill`], and the per-box egress
+    /// enforcement this launch placed the box under (NET-079) — the launch's
+    /// own outcome, carried out beside the host it produced so the session
+    /// can record it on the box's behalf without asking the running host
+    /// back for what its launch already decided.
     pub async fn spawn<L>(
         launcher: L,
         params: HostParams,
-    ) -> Result<(HostHandle, JoinHandle<Result<i32, std::io::Error>>), std::io::Error>
+    ) -> Result<
+        (
+            HostHandle,
+            JoinHandle<Result<i32, std::io::Error>>,
+            Option<HostIpEnforcement>,
+        ),
+        std::io::Error,
+    >
     where
         L: SessionLauncher<Process = P, Guard = G>,
     {
         let (host, handle) = Self::build(launcher, params).await?;
+        // Read out before `mainloop` takes the host: the value is the
+        // launch's own, set once by `build` and never updated, and the
+        // host's attrs stay what `get_attrs` serves for the session's life.
+        let host_ip_enforcement = host.attrs.host_ip_enforcement;
         let task = tokio::spawn(host.mainloop());
-        Ok((handle, task))
+        Ok((handle, task, host_ip_enforcement))
     }
 
     /// Builds the host and its handle from a launcher without spawning the

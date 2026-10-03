@@ -365,23 +365,24 @@ pub struct EffectiveSessionPolicy {
     pub egress: EffectiveEgress,
     /// Ingress policy; `None` when no explicit ingress config is present.
     pub ingress: Option<IngressPolicy>,
-    /// The per-box egress enforcement this host's verdict gives the session
-    /// (NET-079): `per_box` when the box host can decide a host-address box's
-    /// egress verdict on a classifier leaf of its own, `none` when it cannot
-    /// and the box runs with the host's address and no verdict of its own.
-    /// `None` for a session that is not host-address — an own-address or none
-    /// box's verdict is decided on address leases, never on the host's
-    /// cgroup tree — and from a daemon that predates the field, whose
-    /// silence never reads as a decided `per_box`. Carried beside the rules
-    /// because the enforcement is what makes them true or not: on a host that
-    /// cannot decide per box a deny-all declaration prints `deny all` beside
-    /// an enforcement of `none`, the state the box actually runs in, rather
+    /// The per-box egress enforcement the session's box actually runs under
+    /// (NET-079): `per_box` when the box's own launch placed it in a
+    /// classifier leaf of its own, `none` when it did not and the box runs
+    /// with the host's address and no verdict of its own. `None` for a
+    /// session that is not host-address — an own-address or none box's
+    /// verdict is decided on address leases, never on the host's cgroup
+    /// tree — and from a daemon that predates the field, whose silence
+    /// never reads as a decided `per_box`. Carried beside the rules because
+    /// the enforcement is what makes them true or not: on a host that cannot
+    /// decide per box a deny-all declaration prints `deny all` beside an
+    /// enforcement of `none`, the state the box actually runs in, rather
     /// than a verdict that looks decided and is not.
     ///
-    /// Derived at read time, over the session's own declaration and network
-    /// mode, from the daemon's one classifier fact — the same fact the
-    /// listing answers over — so the reply always names the state the host
-    /// is in now, never one recorded earlier that a re-read has replaced.
+    /// The state it names is the box's own launch record — the same one
+    /// [`Record::host_ip_enforcement`] holds and the listing answers over —
+    /// lowered to `none` when the host can no longer decide per box, never
+    /// raised above it, and the host's current state only until the box's
+    /// first launch has a record of its own to show.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_ip_enforcement: Option<String>,
 }
@@ -728,6 +729,30 @@ pub struct Record {
     #[serde(default)]
     pub box_addresses: Option<BoxAddresses>,
 
+    /// The per-box egress enforcement this session's own launch placed its
+    /// host-address box under (NET-079): `per_box` when the launch placed the
+    /// box in a classifier leaf of the host's cgroup tree, `none` when it did
+    /// not — the box's own record of its launch, kept on the session record
+    /// rather than in `attrs` so no client can assert it, and daemon-owned
+    /// from its first write: the create strips the key for every mode and
+    /// only a launch ever sets this field.
+    ///
+    /// The reading surfaces show this record, not the host's current state:
+    /// a box launched unenforced stays `none` for its life even after a later
+    /// launch decides per box, because the outcome is a fact about the launch
+    /// that produced it and never about the host as it stands now. Only the
+    /// display halves lower it — a host whose table has since stopped
+    /// deciding reads as `none` for every box on it — never raise it.
+    ///
+    /// `None` for a session that is not host-address (its verdict is decided
+    /// on address leases, never on the host's cgroup tree) and for a
+    /// host-address box that has not launched yet, whose reads fall back to
+    /// the host's state. Defaults to `None` for records that predate the
+    /// field: pre-existing sessions had no launch to record, and their reads
+    /// answer over the host's state exactly as they did before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip_enforcement: Option<HostIpEnforcement>,
+
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
 }
@@ -881,6 +906,7 @@ mod tests {
             status: SessionStatus::default(),
             hooks_enabled: true,
             box_addresses: None,
+            host_ip_enforcement: None,
             attrs: BTreeMap::new(),
         }
     }

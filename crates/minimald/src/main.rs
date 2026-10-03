@@ -731,11 +731,12 @@ async fn async_main() -> Result<(), MainError> {
         sandbox2::classifier::own_mountinfo().as_deref(),
         guest::is_microvm_daemon(),
     );
-    // The fact every surface that shows a session derives its per-box
-    // enforcement from (NET-079): seeded here from the start-up read, so the
-    // daemon's first answer already names this host, and refreshed by each
-    // host-address launch's own re-read, so no surface shows a state a
-    // re-read has replaced.
+    // The daemon's node half of per-box egress enforcement (NET-079): seeded
+    // here from the start-up read, so the daemon's first create answer
+    // already names this host, and refreshed by each host-address launch's
+    // own re-read — the state the create reply carries, the cause every
+    // surface's refusal gate answers over, and what lowers a box's own
+    // launch record to `none` when the host can no longer decide per box.
     minimald::session_host::set_host_ip_enforcement_fact(&classifier_decision);
     if let Some(cause) = classifier_decision.cause() {
         tracing::info!(

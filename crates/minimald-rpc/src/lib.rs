@@ -213,22 +213,22 @@ pub struct ListSessionsEntry {
     #[serde(default)]
     pub git: Option<Box<GitInfo>>,
     pub attrs: Option<RunningSessionAttrs>,
-    /// The per-box egress enforcement this host's verdict gives the session
-    /// (NET-079): [`HostIpEnforcement::PerBox`] when this host can decide a
-    /// host-address box's verdict on a classifier leaf of its own,
-    /// [`HostIpEnforcement::None`] when it cannot and the box runs with the
-    /// host's address and no verdict of its own. Derived at read time from
-    /// the daemon's one classifier fact — seeded by its start-up read,
-    /// refreshed by each host-address launch's re-read — so a listing
-    /// always shows the state the host is in now, the same fact the create
-    /// response and `min session policy` answer over, with no per-session
-    /// follow-up round trip. `None` for a session that is not host-address
-    /// (its verdict is decided on address leases, never on the host's
-    /// cgroup tree), for a host-address box the classifier refused, whose
-    /// launch said the refusal, and when the record could not be read back
-    /// — defaulted so an entry from an older daemon still decodes, with the
-    /// same silence the other surfaces read as "not a host-address
-    /// session".
+    /// The per-box egress enforcement the session's box actually runs under
+    /// (NET-079): [`HostIpEnforcement::PerBox`] when the box's own launch
+    /// placed it in a classifier leaf of the host's tree,
+    /// [`HostIpEnforcement::None`] when it did not and the box runs with the
+    /// host's address and no verdict of its own. The box's own launch record,
+    /// lowered to `none` by the daemon's one classifier fact when the host
+    /// can no longer decide per box and never raised above it — so a box
+    /// launched unenforced stays `none` for its life, whatever a later launch
+    /// of another box decided — and the fact alone only while the session's
+    /// box has not launched yet, the same state the create response answers
+    /// over. `None` for a session that is not host-address (its verdict is
+    /// decided on address leases, never on the host's cgroup tree), for a
+    /// host-address box the classifier refused, whose launch said the
+    /// refusal, and when the record could not be read back — defaulted so an
+    /// entry from an older daemon still decodes, with the same silence the
+    /// other surfaces read as "not a host-address session".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_ip_enforcement: Option<HostIpEnforcement>,
 }
