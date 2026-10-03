@@ -1148,7 +1148,7 @@ impl Context {
         match mode {
             AddDepMode::BuildPackages => {
                 if let Some(h) = doc["stack"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved);
+                    did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved)?;
                     println!("Added {} to stack.build_packages", resolved.join(", "));
                 } else {
                     return Err(Error::Other(anyhow!(
@@ -1158,7 +1158,7 @@ impl Context {
             }
             AddDepMode::RuntimePackages => {
                 if let Some(h) = doc["stack"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved);
+                    did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved)?;
                     println!("Added {} to stack.runtime_packages", resolved.join(", "));
                 } else {
                     return Err(Error::Other(anyhow!(
@@ -1171,7 +1171,7 @@ impl Context {
                     && let Some(t) = tasks.get_mut(&name)
                     && let Some(t) = t.as_table_mut()
                 {
-                    did_edit |= upsert_toml_packages_list(t, "packages", &resolved);
+                    did_edit |= upsert_toml_packages_list(t, "packages", &resolved)?;
                     println!("Added {} to tasks.{}.packages", resolved.join(", "), name);
                 } else {
                     return Err(Error::Other(anyhow!(
@@ -1182,7 +1182,7 @@ impl Context {
             }
             AddDepMode::SessionPackages => {
                 if let Some(h) = doc["session"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "packages", &resolved);
+                    did_edit |= upsert_toml_packages_list(h, "packages", &resolved)?;
                 } else {
                     doc.insert(
                         "session",
@@ -1218,27 +1218,53 @@ pub enum AddDepMode {
     SessionPackages,
 }
 
-fn upsert_toml_packages_list<T: TableLike>(t: &mut T, key: &str, upsert: &[String]) -> bool {
+fn upsert_toml_packages_list<T: TableLike>(
+    t: &mut T,
+    key: &str,
+    upsert: &[String],
+) -> Result<bool, Error> {
     if let Some(bp) = t.get_mut(key) {
-        let mut existing: Vec<_> = bp
-            .as_array()
-            .unwrap()
+        let arr = bp.as_array_mut().ok_or_else(|| {
+            Error::Other(anyhow!(
+                "`{key}` in minimal.toml must be an array of package names"
+            ))
+        })?;
+
+        let existing: Vec<String> = arr
             .iter()
-            .map(|i| i.as_str().unwrap())
-            .collect();
+            .map(|i| {
+                i.as_str().map(str::to_owned).ok_or_else(|| {
+                    Error::Other(anyhow!(
+                        "`{key}` in minimal.toml must be an array of package names"
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        // For multi-line arrays, copy the last element's prefix decor so pushed
+        // elements land on their own line with matching indentation.
+        let last_prefix = arr
+            .get(arr.len().saturating_sub(1))
+            .and_then(|v| v.decor().prefix())
+            .and_then(|p| p.as_str())
+            .filter(|s| s.contains('\n'))
+            .map(str::to_owned);
 
         let mut did_edit = false;
-        upsert.iter().for_each(|p| {
-            if !existing.contains(&p.as_str()) {
-                existing.push(p);
+        for p in upsert {
+            if !existing.iter().any(|e| e == p) {
+                let mut value = Value::from(p.as_str());
+                if let Some(prefix) = &last_prefix {
+                    value.decor_mut().set_prefix(prefix.as_str());
+                }
+                arr.push(value);
                 did_edit = true;
             }
-        });
-        *bp = Item::Value(Value::Array(Array::from_iter(existing)));
-        did_edit
+        }
+        Ok(did_edit)
     } else {
         t.insert(key, Item::Value(Value::Array(Array::from_iter(upsert))));
-        true
+        Ok(true)
     }
 }
 
@@ -1613,6 +1639,67 @@ mod tests {
             String::from_utf8(std::fs::read(&mfile_path).unwrap())
                 .unwrap()
                 .contains("[session]\npackages = [\"uroot\"]")
+        );
+    }
+
+    #[test]
+    fn upsert_packages_preserves_multiline_layout() {
+        let mut doc = indoc! {r#"
+            packages = [
+              "base", # essential
+              "vim",
+              "git",
+            ]
+        "#}
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        assert!(
+            upsert_toml_packages_list(doc.as_table_mut(), "packages", &["python".to_string()])
+                .unwrap()
+        );
+
+        assert_eq!(
+            doc.to_string(),
+            indoc! {r#"
+                packages = [
+                  "base", # essential
+                  "vim",
+                  "git",
+                  "python",
+                ]
+            "#}
+        );
+    }
+
+    #[test]
+    fn upsert_packages_keeps_single_line() {
+        let mut doc = "packages = [\"base\", \"vim\"]\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        assert!(
+            upsert_toml_packages_list(doc.as_table_mut(), "packages", &["python".to_string()])
+                .unwrap()
+        );
+
+        assert_eq!(
+            doc.to_string(),
+            "packages = [\"base\", \"vim\", \"python\"]\n"
+        );
+    }
+
+    #[test]
+    fn upsert_packages_errors_on_non_array() {
+        let mut doc = "packages = \"base\"\n".parse::<DocumentMut>().unwrap();
+
+        let err =
+            upsert_toml_packages_list(doc.as_table_mut(), "packages", &["python".to_string()])
+                .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "`packages` in minimal.toml must be an array of package names"
         );
     }
 
