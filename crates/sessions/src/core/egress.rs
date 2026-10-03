@@ -27,11 +27,15 @@
 //!   around the rules.
 //! * **IPv4 is decided by the box's rules** — `allow_protocols`, then
 //!   `deny_subnets`, then `allow_subnets` (a `None` dimension allows all, a
-//!   `Some([])` one allows nothing) — with one carve-out: a UDP datagram to
-//!   the resolver Minimal owns for the box, at that resolver's address and
+//!   `Some([])` one allows nothing) — with two carve-outs, each before the
+//!   rules and each granted by its own author: a UDP datagram to the
+//!   resolver Minimal owns for the box, at that resolver's address and
 //!   port, is admitted under any declaration including deny-all (NET-079,
 //!   NET-134), because a box that cannot resolve cannot use an allow list
-//!   of names either.
+//!   of names either; and the Box Egress Proxy's address is admitted for
+//!   a box that declared a credentialed upstream (NET-134), because the
+//!   proxy is that lane's infrastructure — the one destination a box
+//!   reaches by declaring the upstream, never by allowing its address.
 //!
 //! The rules are compiled once per box at attach
 //! ([`EgressRules::from_policy`]); the per-frame work is [`summarize`] plus
@@ -373,6 +377,21 @@ pub struct EgressRules {
     /// gateway), which the carve-out admits at [`DNS_PORT`] under any
     /// declaration.
     resolver: [u8; 4],
+    /// The Box Egress Proxy's address on the switch this box attaches to,
+    /// for a box that declared a credentialed upstream (NET-134): the one
+    /// destination admitted beside the rules — whatever they say about it,
+    /// the way the resolver carve-out does — because the proxy is that
+    /// lane's infrastructure and the credentials it redeems are the lane's
+    /// own, so no egress rule of the box's decides them. `None`, the shape
+    /// [`EgressRules::new`] and [`EgressRules::from_policy`] build, is no
+    /// lane: the address is then no more the box's infrastructure than any
+    /// other, a frame to it is decided by the rules alone, and the
+    /// host-side gate refuses it under the box-to-host default-deny.
+    ///
+    /// The declaration itself is [`crate::CredentialedUpstream`]'s; this is
+    /// the address it names, resolved from the switch subnet at compile
+    /// time the way the resolver above is.
+    credentialed_upstream: Option<[u8; 4]>,
     /// The box's lease on the switch — the one source address its frames
     /// may carry, which the verdict rejects any other of (NET-084). Known
     /// when the box is attached, the same moment the policy is compiled.
@@ -382,6 +401,11 @@ pub struct EgressRules {
 impl EgressRules {
     /// Assembles a rule set from its dimensions. The shape the Kani proof
     /// and [`EgressRules::from_policy`] share.
+    ///
+    /// Never a lane: a rule set built here declares no credentialed
+    /// upstream, so the proxy's address is decided by the dimensions alone
+    /// — the proof's oracle holds that shape, and a box on a lane carries
+    /// its declaration through [`Self::with_credentialed_upstream`].
     #[must_use]
     pub fn new(
         allow_protocols: Option<Vec<u8>>,
@@ -395,6 +419,7 @@ impl EgressRules {
             allow_subnets,
             deny_subnets,
             resolver,
+            credentialed_upstream: None,
             lease,
         }
     }
@@ -436,6 +461,24 @@ impl EgressRules {
     #[must_use]
     pub fn resolver(&self) -> [u8; 4] {
         self.resolver
+    }
+
+    /// Marks this rule set's box as one that declared a credentialed
+    /// upstream (NET-134): `proxy` is the Box Egress Proxy's address on the
+    /// switch this box attaches to, and a frame to it is admitted beside
+    /// the rules — whatever they say about the address — because the proxy
+    /// is that lane's infrastructure, the one destination a box reaches by
+    /// declaring the upstream rather than by allowing its address.
+    ///
+    /// The caller is the compile of a whole session policy, the only place
+    /// that holds both halves — the declaration ([`crate::CredentialedUpstream`],
+    /// carried on the [`crate::SessionPolicy`]) and the switch subnet its
+    /// address is drawn from — so the address arrives already resolved and
+    /// the verdict reads one field.
+    #[must_use]
+    pub fn with_credentialed_upstream(mut self, proxy: [u8; 4]) -> Self {
+        self.credentialed_upstream = Some(proxy);
+        self
     }
 
     /// The compiled `allow_subnets`, `None` when the dimension allows all —
@@ -592,8 +635,11 @@ pub fn foreign_source(summary: &FrameSummary, lease: [u8; 4]) -> Option<DropReas
 /// first, so a frame from a foreign source is rejected whatever family or
 /// destination it carries (NET-084); the resolver carve-out then comes
 /// before the rules, so a box that denies the resolver's own subnet still
-/// resolves (NET-079); `deny_subnets` then carves out of what the allows
-/// admit; and a drop never depends on the rule lists being sorted.
+/// resolves (NET-079); the credentialed lane's proxy address comes with it,
+/// before every rule, so a box that declared the upstream reaches the proxy
+/// whatever its rules say (NET-134); `deny_subnets` then carves out of what
+/// the allows admit; and a drop never depends on the rule lists being
+/// sorted.
 #[must_use]
 pub fn verdict(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
     if let Some(reason) = foreign_source(summary, rules.lease) {
@@ -610,7 +656,7 @@ pub fn verdict(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
     }
 }
 
-/// The IPv4 half of the verdict: the carve-out, then the three declared
+/// The IPv4 half of the verdict: the two carve-outs, then the three declared
 /// dimensions. `summary`'s address and protocol are read only after the
 /// [`FrameFamily::Truncated`] case has been ruled out, so both are `Some`
 /// here.
@@ -622,9 +668,23 @@ fn verdict_ipv4(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
         return FrameVerdict::Drop(DropReason::Truncated);
     };
     // NET-079 / NET-134: the resolver Minimal owns for the box is the one
-    // carve-out from a deny-all verdict — at its address and port, whatever
-    // the rules say, because no box can be denied its own resolution.
+    // carve-out the system itself grants — at its address and port, whatever
+    // the rules say, because no box can be denied its own resolution. The
+    // proxy's address below is the one a box's own declaration grants.
     if proto == IPPROTO_UDP && dst == rules.resolver && summary.dst_port == DNS_PORT {
+        return FrameVerdict::Admit;
+    }
+    // NET-134: the Box Egress Proxy's address for a box that declared a
+    // credentialed upstream — the lane's infrastructure, admitted at the
+    // address whatever the rules say and at any port, exactly as the
+    // host-side gate admits it, so the two legs of a frame's path out of a
+    // VM never disagree about the one destination neither decides by the
+    // box's rules. A declaration the box never made admits nothing: the
+    // frame falls through to the rules below, which drop it under a
+    // deny-all the way they drop any other destination.
+    if let Some(proxy) = rules.credentialed_upstream
+        && dst == proxy
+    {
         return FrameVerdict::Admit;
     }
     if let Some(allow) = &rules.allow_protocols
@@ -1208,6 +1268,60 @@ mod tests {
         assert!(
             admits(&ipv4_frame(IPPROTO_UDP, RESOLVER, DNS_PORT), &denied_subnet),
             "the carve-out comes before the deny rules"
+        );
+    }
+
+    /// NET-134: the Box Egress Proxy's address is a declared lane's
+    /// infrastructure — the one destination admitted beside the rules,
+    /// granted by the box's own declaration where the resolver carve-out is
+    /// granted by the system. A deny-all rule set carrying the lane
+    /// admits a frame to the proxy's address at the proxy's listener port,
+    /// and at any other port and protocol — the lane is the address's, and
+    /// the host-side gate admits it the same way, so the two legs of a
+    /// frame's path out of a VM never disagree — while still dropping every
+    /// other destination: the lane adds reach at one address and nowhere
+    /// else. Without the declaration the same rules drop the proxy's
+    /// address like any other, so neither a deny's absence nor an allow's
+    /// presence can stand in for the declaration, and the refusal the
+    /// box-to-host default-deny owes a lane-less box stays the host-side
+    /// gate's to make.
+    #[test]
+    fn credentialed_lane_admits_the_proxy_address_under_deny_all() {
+        // The Box Egress Proxy's address on the switch these tests' resolver
+        // and lease are drawn from (broadcast - 3 of the default /16).
+        const PROXY: [u8; 4] = [100, 64, 255, 252];
+        let laned = deny_all().with_credentialed_upstream(PROXY);
+        assert!(
+            admits(&ipv4_frame(IPPROTO_TCP, PROXY, 8118), &laned),
+            "a frame to the proxy's address is admitted beside the deny-all"
+        );
+        assert!(
+            admits(&ipv4_frame(IPPROTO_TCP, PROXY, 443), &laned),
+            "the lane holds the address at every port, as the host-side gate holds it"
+        );
+        assert!(
+            admits(&ipv4_frame(IPPROTO_UDP, PROXY, 53), &laned),
+            "and for every protocol"
+        );
+        assert!(
+            admits(&ipv4_frame(IPPROTO_UDP, RESOLVER, DNS_PORT), &laned),
+            "the resolver carve-out is untouched beside the lane"
+        );
+        // And nowhere else: the lane buys the one address, not the rules.
+        assert!(
+            !admits(&ipv4_frame(IPPROTO_TCP, [203, 0, 113, 7], 443), &laned),
+            "an outside destination stays denied"
+        );
+        assert!(
+            !admits(&ipv4_frame(IPPROTO_TCP, [100, 64, 255, 254], 8118), &laned),
+            "the host alias on the same switch is not the lane's address"
+        );
+        // No declaration, no lane: the rules alone decide, and under
+        // deny-all they drop the proxy's address the way they drop any
+        // other.
+        assert!(
+            !admits(&ipv4_frame(IPPROTO_TCP, PROXY, 8118), &deny_all()),
+            "the declaration is the one thing that opens the address"
         );
     }
 
