@@ -8281,8 +8281,11 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
 # ---------------------------------------------------------------------------
 # The proxy is a credentialed lane's infrastructure (NET-134): the one
 # host-side destination a box reaches by DECLARING the upstream, never by
-# allowing its address. Two cases below prove the two halves on the real
-# host-side gate, from inside a real box:
+# allowing its address. A frame out of a box must clear two gates to reach
+# it — the box's own relay (the session daemon's egress relay, the first
+# gate, on every host) and, on a VM-backed lane, the VM host's gate
+# (minvmd's) — and the two cases below prove the lane's presence and its
+# absence against both, from inside a real box:
 #
 #   * deny_all_box_reaches_proxy_and_no_other_host_port — a deny-all box
 #     that declared the lane reaches the proxy's acceptor on its listener
@@ -8290,15 +8293,21 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
 #   * box_without_credentialed_lane_cannot_reach_proxy — a box with no
 #     lane, allow-all rules included so only the lane's absence can refuse
 #     the address, has every frame to the proxy's address dropped at the
-#     gate: the connect runs out its window with no reset, and the daemon's
-#     log says so, one line naming the box — rate-limited to one per
-#     source per rule per interval, so a probe's retransmits share it.
+#     FIRST gate, its own relay, inside the guest: the connect runs out its
+#     window with no reset, and the host gate's log stays silent, because
+#     the frame never crossed the switch to reach it. The refusal's own
+#     rate-limited line — one per box per rule per interval, so a probe's
+#     retransmits share it — is written by the guest-side relay into a
+#     tmpfs no host path reaches on a VM lane (see hook_log_readable), so
+#     the case reads it only where the relay's log is on this host, and
+#     pins its count and fields where they are machine-readable: the
+#     native switch test that watches the relay drop the same frame.
 #
 # Both gate on MINVMD_GVPROXY_BIN like the switch cases above: without a
 # switch there is no gate to observe, and the case prints what it cannot
 # assert and returns 0.
 #
-# The host daemon's log is the sink the gate's lines land in, and the
+# The host daemon's log is the sink the host gate's lines land in, and the
 # helpers below read it the way the proxy-source case does: newest file
 # first (the daemon rotates daily), scoped to the lines the running case's
 # daemon added since the case's own snapshot, so an unscoped grep cannot
@@ -8579,7 +8588,7 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
 
   cred_begin
 
-  local proxy_ip proxy_port node_ip nolane_sid nolane_ip start_ms elapsed_ms warn_wait warn_lines
+  local proxy_ip proxy_port node_ip nolane_sid nolane_ip start_ms elapsed_ms
   proxy_ip="100.64.255.252"
   proxy_port="8118"
   node_ip="100.64.255.253"
@@ -8633,9 +8642,10 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
   fi
 
   # The probe: to the proxy's address, on the proxy's listener port. The
-  # gate drops the SYN (and every retransmit the box's kernel sends inside
-  # the window) — a drop is not a reset, nothing is sent back toward the
-  # box — so the connect runs out its timeout with no answer at all.
+  # box's own relay — the first gate a frame out of the box must clear, on
+  # every host — drops the SYN and every retransmit the box's kernel sends
+  # inside the window (a drop is not a reset, nothing is sent back toward
+  # the box), so the connect runs out its timeout with no answer at all.
   start_ms="$(now_ms)"
   mnl session exec "$nolane_sid" \
     "/usr/bin/socat /dev/null TCP:$proxy_ip:$proxy_port,connect-timeout=15" \
@@ -8646,7 +8656,7 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
   }
   elapsed_ms=$(( $(now_ms) - start_ms ))
   if grep -q 'Connection refused' "$WORK/cred-nolane-probe.err" 2>/dev/null; then
-    echo "::error::the no-lane box's connection to the proxy's address was reset — the frame reached the host's stack, so the gate did not drop it as the lane's absence demands"
+    echo "::error::the no-lane box's connection to the proxy's address was reset — the frame reached the host's stack, so neither the box's relay nor the host gate dropped it as the lane's absence demands"
     cat "$WORK/cred-nolane-probe.err" 2>/dev/null || true
     cred_fail
   fi
@@ -8656,49 +8666,39 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
     cred_fail
   fi
 
-  # The warn the observability contract asks for: the daemon's log carries
-  # the refused frame — naming its source, the box's own switch address,
-  # and the rule that dropped it — one line per source per rule per
-  # interval, so the probe's retransmits (five or more SYNs inside the
-  # window) must have produced exactly one line, not one per frame.
-  warn_wait=0
-  while [ "$warn_wait" -le 10 ]; do
-    if cred_case_log | grep -q -- "egress-uncredentialed-proxy-destination"; then
-      break
+  # Where the refusal now happens decides what this host can see. The frame
+  # dies at the box's own relay — the first gate a frame out of the box must
+  # clear, on every host — which on this VM-backed lane is the in-VM daemon,
+  # whose file log is the guest tmpfs no host path reaches (see
+  # hook_log_readable). Its positive witness is the warn the observability
+  # contract asks for — the refused frame logged once, naming its source, the
+  # box's own switch address, and the rule that dropped it, one line per
+  # source per rule per interval so the probe's retransmits (five or more
+  # SYNs inside the window) share it. On a VM lane that line is unreadable
+  # from here, so the case pins its count and its fields where they are
+  # machine-readable — the native switch test
+  # a_laneless_box_frame_to_the_proxy_listener_is_dropped_and_counted — and
+  # reads it here only on a lane whose relay logs to this host, failing
+  # closed where it runs and saying what it skipped where it cannot.
+  if hook_log_readable; then
+    if [ -z "$(hook_log_has 'egress-uncredentialed-proxy-destination')" ]; then
+      echo "::error::the daemon's log never named the refused frame to the proxy's address (looked for the rule 'egress-uncredentialed-proxy-destination' among the relay's own lines on this host)"
+      cred_fail
     fi
-    warn_wait=$((warn_wait + 1))
-    sleep 1
-  done
-  if ! cred_case_log | grep -q -- "egress-uncredentialed-proxy-destination"; then
-    echo "::error::the daemon's log never named the refused frame to the proxy's address (waited ${warn_wait}s among this case's lines for the rule 'egress-uncredentialed-proxy-destination')"
-    echo "the control was reset through the same fabric ${elapsed_ms}ms before, so the drop happened and only its line is missing"
-    cred_host_log_tail
-    cred_fail
+    echo "relay-side warn line: found the proxy-lane drop the relay owes the no-lane box"
+  else
+    echo "relay-side warn line skipped (guest-side daemon log on VM lane — its count and fields are pinned by the native switch test)"
   fi
-  # The line's source field is read in the file log's own shape: the detached
-  # daemon's sink is the flat-JSON layer both daemons share (the same
-  # `minvmd.log.<date>` the box-register proof greps for '"box":"…"'), which
-  # renders the field as `"source":"<addr>"` — a `source=<addr>` text grep
-  # matches nothing the daemon ever wrote and the assertion can never pass.
-  if ! cred_case_log | grep -- "egress-uncredentialed-proxy-destination" \
-    | grep -qF -- "\"source\":\"$nolane_ip\""; then
-    echo "::error::the proxy-lane drop line does not name the no-lane box's own address ($nolane_ip) as the source"
+  # What this host CAN observe is the consequence of a first-gate refusal:
+  # the frame never crossed the switch, so the VM host's gate never saw it
+  # and minvmd's log says nothing about it. That silence is the pin — a
+  # proxy-lane line in the host gate's log would mean the frame reached the
+  # host, the exception the relay no longer makes. The control above was
+  # reset through the same fabric, so the box and its path are live, and
+  # the absence below is the drop, not a dead fabric.
+  if cred_case_log | grep -q -- "egress-uncredentialed-proxy-destination"; then
+    echo "::error::the minvmd gate logged a proxy-lane drop for the no-lane box — the box's own relay must refuse the frame before the switch, so the host gate never sees it"
     cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | tail -n5 | sed 's/^/  /'
-    cred_fail
-  fi
-  # The box beside the source — the plan's diagnostics line wants the refused
-  # frame logged "with the box and the reason", and the box is the row's own
-  # name, read from the same flat-JSON shape the source field above is.
-  if ! cred_case_log | grep -- "egress-uncredentialed-proxy-destination" \
-    | grep -qF -- "\"box\":\"e2e-cred-nolane\""; then
-    echo "::error::the proxy-lane drop line does not name the no-lane box by its row's name (e2e-cred-nolane)"
-    cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | tail -n5 | sed 's/^/  /'
-    cred_fail
-  fi
-  warn_lines="$(cred_case_log | grep -c -- "egress-uncredentialed-proxy-destination")"
-  if [ "$warn_lines" -ne 1 ]; then
-    echo "::error::$warn_lines proxy-lane drop lines for one source inside one interval — the warn must be rate-limited to one line per source per rule per interval"
-    cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | tail -n8 | sed 's/^/  /'
     cred_fail
   fi
 
@@ -8706,7 +8706,7 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
   rm -rf "$CRED_NO_LANE_SEED_DIR"
   CRED_NO_LANE_SEED_DIR=""
   cred_restore
-  echo "a box without a credentialed lane cannot reach the proxy's address OK (control reset at the node's own address, silence at $proxy_ip:$proxy_port for ${elapsed_ms}ms, one warn line from $nolane_ip)"
+  echo "a box without a credentialed lane cannot reach the proxy's address OK (control reset at the node's own address, silence at $proxy_ip:$proxy_port for ${elapsed_ms}ms from $nolane_ip, refused at the box's relay so the host gate stayed silent)"
   echo "::endgroup::"
 }
 
