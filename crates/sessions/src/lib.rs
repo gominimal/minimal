@@ -623,6 +623,47 @@ pub struct BoxAddresses {
     pub loopback_address: Ipv4Addr,
 }
 
+/// The per-box egress enforcement state a host-address session's verdict runs
+/// under (NET-079): `per_box` when the session's own launch placed its box in
+/// a classifier leaf of the host's cgroup tree — the state a host that can
+/// decide per box gives the host-address boxes it launches — and `none` when
+/// the launch did not, because the host cannot decide per box at all, or
+/// because the box got no leaf to be decided on, and the box runs with the
+/// host's address and no verdict of its own.
+///
+/// Defined here — beside the [`Record`] field that carries a box's own launch
+/// outcome — rather than in the RPC crate that first spelled it, because the
+/// record is a session-plane type that crate already depends on; the RPC
+/// crate re-exports it under the path its clients spell, so no wire form
+/// changes.
+///
+/// The default is `none` — a daemon that has not read its host, or one whose
+/// host cannot decide, both spell the state the boxes on it run in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostIpEnforcement {
+    /// The box's launch placed it in a classifier leaf: its egress verdict is
+    /// decided on that leaf of its own.
+    PerBox,
+    /// The box runs with the host's address and no verdict of its own.
+    #[default]
+    None,
+}
+
+impl HostIpEnforcement {
+    /// The machine spelling the stringly surfaces carry — the create
+    /// response, the effective-policy reply, the daemon's log lines — so a
+    /// script that greps one surface for the state finds the same word on
+    /// every other.
+    #[must_use]
+    pub fn machine_str(self) -> &'static str {
+        match self {
+            Self::PerBox => "per_box",
+            Self::None => "none",
+        }
+    }
+}
+
 /// The on-disk row/record pertaining to a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {

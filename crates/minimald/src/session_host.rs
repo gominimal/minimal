@@ -28,6 +28,10 @@ use crate::session_delta::DeltaSource;
 use crate::sessions::SessionControl;
 use sessions::NetworkMode;
 use sessions::keys::{ChordMatcher, FeedOutcome, KeyAction, SessionKeys};
+// The one per-box egress enforcement type (NET-079): shared with the session
+// record that carries a box's own launch outcome, so a launch's decision and
+// the record it lands on are one type with no conversion between them.
+use minimald_rpc::HostIpEnforcement;
 use std::sync::Arc;
 
 mod pty;
@@ -1571,42 +1575,15 @@ pub struct HostAttrs {
 
     /// What the launch decided about this session's box and the host's
     /// address (NET-079, design §7.2's "declared and enforced" attribute):
-    /// `Enforced` when the box's egress verdict is decided on a classifier
-    /// leaf of its own, `Unenforced` when the host could not decide per box
+    /// `PerBox` when the box's egress verdict is decided on a classifier
+    /// leaf of its own, `None` when the host could not decide per box
     /// and the box runs with the host's address and no verdict of its own —
     /// the state a session-start notice says to the person in the terminal.
     ///
     /// A launch-time attribute, set once by the launch and never updated:
-    /// `None` for a none box or an own-IP box, whose verdicts are decided on
-    /// address leases rather than the host's cgroup tree.
+    /// no value for a none box or an own-IP box, whose verdicts are decided
+    /// on address leases rather than the host's cgroup tree.
     pub(crate) host_ip_enforcement: Option<HostIpEnforcement>,
-}
-
-/// What a host-address box's launch decided about its egress verdict
-/// (NET-079): whether the box is classified in a cgroup leaf of its own, or
-/// runs with the host's address and no verdict of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HostIpEnforcement {
-    /// The box was placed in a classifier leaf; its verdict is decided there.
-    Enforced,
-    /// The host could not decide per box; the box runs unenforced.
-    Unenforced,
-}
-
-impl HostIpEnforcement {
-    /// The spelling the machine-readable surfaces carry for this decision:
-    /// `per_box` when the box's verdict is decided on a classifier leaf of
-    /// its own, `none` when the host could not decide per box and the box
-    /// runs with the host's address and no verdict of its own — the state
-    /// the session-start notice names. The launch's diagnostic record spells
-    /// it with this, so a script or a bundle reads the decision as data and
-    /// not by parsing the prose around it.
-    pub(crate) fn machine_str(self) -> &'static str {
-        match self {
-            Self::Enforced => "per_box",
-            Self::Unenforced => "none",
-        }
-    }
 }
 
 /// What the launch's leaf decision means for the box's egress verdict:
@@ -1627,8 +1604,8 @@ fn host_ip_enforcement(
 ) -> Option<HostIpEnforcement> {
     match network_mode {
         NetworkMode::HostNet => match (leaf, can_decide_per_box) {
-            (Some(_), true) => Some(HostIpEnforcement::Enforced),
-            _ => Some(HostIpEnforcement::Unenforced),
+            (Some(_), true) => Some(HostIpEnforcement::PerBox),
+            _ => Some(HostIpEnforcement::None),
         },
         _ => None,
     }
@@ -2949,7 +2926,7 @@ async fn create_session_leaf(
                     session = session_name,
                     classifier = verdict.dir_name(),
                     leaf = %leaf.display(),
-                    host_ip_enforcement = %HostIpEnforcement::Enforced.machine_str(),
+                    host_ip_enforcement = %HostIpEnforcement::PerBox.machine_str(),
                     "the host-address box's egress verdict is decided on its \
                      classifier leaf, in the {} subtree",
                     verdict.dir_name()
@@ -2959,7 +2936,7 @@ async fn create_session_leaf(
                     session = session_name,
                     classifier = verdict.dir_name(),
                     leaf = %leaf.display(),
-                    host_ip_enforcement = %HostIpEnforcement::Unenforced.machine_str(),
+                    host_ip_enforcement = %HostIpEnforcement::None.machine_str(),
                     "the host-address box's leaf is placed in the {} subtree, \
                      but this host's classifier table is not loaded, so its \
                      egress verdict is not decided per box",
@@ -3320,7 +3297,7 @@ fn refused_unenforced_host_address_box(
 /// [`SandboxLauncher::for_hooks`]. Pure over its inputs, so the gate is
 /// pinned where it is written.
 fn advises_unenforced_placement(enforcement: Option<HostIpEnforcement>) -> bool {
-    enforcement == Some(HostIpEnforcement::Unenforced)
+    enforcement == Some(HostIpEnforcement::None)
 }
 
 /// The advisory text for a launch whose host-address box runs unenforced:
@@ -3581,7 +3558,7 @@ impl SessionLauncher for SandboxLauncher {
             let notice = unenforced_placement_notice(guest, leaf.as_ref());
             tracing::info!(
                 session = %session_name,
-                host_ip_enforcement = %HostIpEnforcement::Unenforced.machine_str(),
+                host_ip_enforcement = %HostIpEnforcement::None.machine_str(),
                 notice = %notice,
                 "the session's host-address box runs unenforced on this host",
             );

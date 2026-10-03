@@ -169,37 +169,18 @@ pub struct RunningSessionAttrs {
 }
 
 /// The per-box egress enforcement state a host-address session's verdict
-/// runs under (NET-079), as the daemon that owns the cgroup tree states it:
-/// `per_box` when the host can decide a host-address box's egress verdict on
-/// a classifier leaf of its own, `none` when it cannot and the box runs with
-/// the host's address and no verdict of its own.
+/// runs under (NET-079), spelled `per_box` when the session's own launch
+/// placed its box in a classifier leaf of the host's cgroup tree and `none`
+/// when it did not and the box runs with the host's address and no verdict
+/// of its own.
 ///
-/// The default is `none` — a daemon that has not read its host yet, or one
-/// whose host cannot decide, both spell the state the boxes on it run in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HostIpEnforcement {
-    /// The host can decide per box: a host-address box's verdict is decided
-    /// on a classifier leaf of its own.
-    PerBox,
-    /// The host cannot decide per box: the box runs with the host's address
-    /// and no verdict of its own.
-    #[default]
-    None,
-}
-
-impl HostIpEnforcement {
-    /// The machine spelling the stringly surfaces carry — the create
-    /// response, the effective-policy reply, the daemon's log lines — so a
-    /// script that greps one surface for the state finds the same word on
-    /// every other.
-    pub fn machine_str(self) -> &'static str {
-        match self {
-            Self::PerBox => "per_box",
-            Self::None => "none",
-        }
-    }
-}
+/// The type is defined in the sessions crate — beside the
+/// [`Record`](sessions::Record) field that carries a box's own launch
+/// outcome, a session-plane type this crate already depends on — and
+/// re-exported here so the paths this crate's clients spell stay what they
+/// were: the listing's [`ListSessionsEntry::host_ip_enforcement`] answers in
+/// it, and the stringly surfaces carry its machine spelling.
+pub use sessions::HostIpEnforcement;
 
 /// An entry in the ListSessions response.
 ///

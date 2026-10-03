@@ -2157,13 +2157,13 @@ fn host_ip_enforcement_says_what_the_launch_decided() {
 
     assert_eq!(
         decided(NetworkMode::HostNet, Some(leaf.clone()), true),
-        Some(super::HostIpEnforcement::Enforced),
+        Some(super::HostIpEnforcement::PerBox),
         "a host-address box with a leaf has its egress verdict decided on it, \
          while this host can decide per box"
     );
     assert_eq!(
         decided(NetworkMode::HostNet, Some(leaf.clone()), false),
-        Some(super::HostIpEnforcement::Unenforced),
+        Some(super::HostIpEnforcement::None),
         "a leaf placed on a host whose table is not loaded decides nothing \
          while looking decided: the record says the state it is, never \
          `per_box` over a refusal that is not there"
@@ -2171,7 +2171,7 @@ fn host_ip_enforcement_says_what_the_launch_decided() {
     for can_decide_per_box in [true, false] {
         assert_eq!(
             decided(NetworkMode::HostNet, None, can_decide_per_box),
-            Some(super::HostIpEnforcement::Unenforced),
+            Some(super::HostIpEnforcement::None),
             "a host-address box with no leaf runs with the host's address and \
              no verdict of its own — the state the session-start notice names"
         );
@@ -2712,7 +2712,7 @@ async fn unenforcing_native_host_runs_host_ip_box_unenforced() {
     }
     assert_eq!(
         super::host_ip_enforcement(NetworkMode::HostNet, None, false),
-        Some(super::HostIpEnforcement::Unenforced),
+        Some(super::HostIpEnforcement::None),
         "a host-address box with no leaf is recorded unenforced, whatever it \
          declared"
     );
@@ -3264,10 +3264,10 @@ fn the_guests_unenforced_host_address_box_advises_with_the_interim() {
     // `refused_unenforced_host_address_box`'s business, and a box that runs
     // unenforced advises wherever it runs.
     assert!(super::advises_unenforced_placement(Some(
-        super::HostIpEnforcement::Unenforced
+        super::HostIpEnforcement::None
     )));
     assert!(!super::advises_unenforced_placement(Some(
-        super::HostIpEnforcement::Enforced
+        super::HostIpEnforcement::PerBox
     )));
     assert!(!super::advises_unenforced_placement(None));
     // The mapping that feeds the gate says `none` on either host kind for
@@ -3275,11 +3275,11 @@ fn the_guests_unenforced_host_address_box_advises_with_the_interim() {
     // boxes share with the native host's.
     assert_eq!(
         super::host_ip_enforcement(NetworkMode::HostNet, None, false),
-        Some(super::HostIpEnforcement::Unenforced)
+        Some(super::HostIpEnforcement::None)
     );
     assert_eq!(
         super::host_ip_enforcement(NetworkMode::HostNet, None, true),
-        Some(super::HostIpEnforcement::Unenforced)
+        Some(super::HostIpEnforcement::None)
     );
 
     // The guest's notice: the interim's words, the machine spelling of the
@@ -3486,7 +3486,7 @@ fn a_guests_placed_unenforced_host_address_box_advises_at_its_start() {
     let enforcement = super::host_ip_enforcement(NetworkMode::HostNet, Some(&leaf), false);
     assert_eq!(
         enforcement,
-        Some(super::HostIpEnforcement::Unenforced),
+        Some(super::HostIpEnforcement::None),
         "a box placed on a guest that has not loaded its table runs \
          unenforced, never enforced over a refusal that is not there"
     );
@@ -3547,7 +3547,7 @@ fn a_guests_placed_unenforced_host_address_box_advises_at_its_start() {
     let enforced = super::host_ip_enforcement(NetworkMode::HostNet, Some(&leaf), true);
     assert_eq!(
         enforced,
-        Some(super::HostIpEnforcement::Enforced),
+        Some(super::HostIpEnforcement::PerBox),
         "a placed box on a host that decided per box runs enforced"
     );
     assert!(!super::advises_unenforced_placement(enforced));
