@@ -182,7 +182,7 @@ impl<W: BundleSink> BundleWriter<W> {
     /// [`crate::redact::scrub_secrets`] before writing, so credentials that
     /// landed in log tails before this fix are cleaned too. When any line
     /// was changed the manifest records [`Redaction::Scrubbed`] rather than
-    /// `None` or `TailCapped`.
+    /// `None`, or [`Redaction::TailCappedScrubbed`] rather than `TailCapped`.
     pub async fn add_file_tail(
         &mut self,
         path: &str,
@@ -211,12 +211,11 @@ impl<W: BundleSink> BundleWriter<W> {
         // it was logged before this fix.
         let scrubbed = scrub_lines(&contents);
         let was_scrubbed = scrubbed != contents;
-        let redaction = if was_scrubbed {
-            Redaction::Scrubbed
-        } else if capped {
-            Redaction::TailCapped
-        } else {
-            Redaction::None
+        let redaction = match (capped, was_scrubbed) {
+            (true, true) => Redaction::TailCappedScrubbed,
+            (true, false) => Redaction::TailCapped,
+            (false, true) => Redaction::Scrubbed,
+            (false, false) => Redaction::None,
         };
         self.add_bytes(path, &scrubbed, redaction).await
     }
@@ -627,6 +626,7 @@ pub(crate) mod tests {
         w.add_file_tail("logs/minimald.log", &log, 1024)
             .await
             .unwrap();
+        w.add_file_tail("logs/capped.log", &log, 40).await.unwrap();
         w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
             .await
             .unwrap();
@@ -646,6 +646,12 @@ pub(crate) mod tests {
         assert_eq!(
             manifest["collected"][0]["redaction"], "scrubbed",
             "manifest must record scrubbed redaction"
+        );
+        let capped = std::str::from_utf8(&files["logs/capped.log"]).unwrap();
+        assert!(!capped.contains("FAKETOKEN"), "got: {capped}");
+        assert_eq!(
+            manifest["collected"][1]["redaction"], "tail-capped-scrubbed",
+            "a capped, scrubbed tail must still read as partial"
         );
     }
 

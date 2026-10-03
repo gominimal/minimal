@@ -312,8 +312,8 @@ pub async fn cmd_bug(global: &GlobalArgs, args: BugArgs) -> Result<(), anyhow::E
             ""
         },
     );
-    println!("Review the contents before sharing; send it to the minimal dev team.");
     if !args.upload {
+        println!("Review the contents before sharing; send it to the minimal dev team.");
         return Ok(());
     }
     // After the bundle is on disk, never instead of it. An upload that fails

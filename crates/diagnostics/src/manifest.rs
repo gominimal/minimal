@@ -26,6 +26,11 @@ pub enum Redaction {
     /// Free-text credential scrubbing was applied; the content may differ
     /// from the original.
     Scrubbed,
+    /// Only the trailing portion of a large file was captured, and
+    /// free-text credential scrubbing changed it: both [`Self::TailCapped`]
+    /// and [`Self::Scrubbed`] hold, so a reader still sees the file is
+    /// partial.
+    TailCappedScrubbed,
 }
 
 /// Top-level manifest, serialized as the bundle's `manifest.json`.

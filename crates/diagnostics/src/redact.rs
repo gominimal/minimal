@@ -204,7 +204,9 @@ pub fn masked_process_env(is_value_allowed: impl Fn(&str) -> bool) -> BTreeMap<S
 /// - URL userinfo (`scheme://<redacted>@host`).
 /// - Well-known token prefixes: `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
 ///   `github_pat_`, `sk-`, `xoxa-`, `xoxb-`, `xoxp-`, `AKIA` + 16 hex.
-/// - `key=value` pairs whose key trips [`is_sensitive_key`].
+/// - `key=value` pairs whose key trips [`is_sensitive_key`], including a
+///   quoted value (`PASSWORD='two words'`, or `PASSWORD=\"x\"` inside a
+///   JSON-encoded argv).
 /// - The value after a long flag whose name trips [`is_sensitive_key`]
 ///   (`--password hunter2`).
 ///
@@ -268,10 +270,47 @@ fn find_next_credential(input: &str) -> Option<CredentialMatch> {
 }
 
 /// Length of the token at the start of `s`: it runs to the next whitespace,
-/// quote, or end of input.
+/// quote, backslash-escaped quote (the closing `\"` of a JSON-encoded
+/// string), or end of input.
 fn token_len(s: &str) -> usize {
-    s.find(|c: char| c.is_whitespace() || c == '\'' || c == '"')
-        .unwrap_or(s.len())
+    s.char_indices()
+        .find(|&(i, c)| {
+            c.is_whitespace()
+                || c == '\''
+                || c == '"'
+                || (c == '\\' && s[i + 1..].starts_with(['\'', '"']))
+        })
+        .map_or(s.len(), |(i, _)| i)
+}
+
+/// Offset and length of the value at the start of `s`.
+///
+/// A value opening with a quote, optionally backslash-escaped as in a
+/// JSON-encoded argv (`\"x\"`), runs from after that quote to its match:
+/// for an escaped opening quote, the next escaped quote of the same kind;
+/// otherwise the next quote of the same kind that is not escaped. An
+/// unclosed quote runs to the end of input, so a cut-off value is still
+/// masked. Any other value is a [`token_len`] token.
+fn value_span(s: &str) -> (usize, usize) {
+    let escaped = s.starts_with('\\') && s[1..].starts_with(['\'', '"']);
+    let open = usize::from(escaped);
+    let Some(quote) = s[open..].chars().next().filter(|&c| c == '\'' || c == '"') else {
+        return (0, token_len(s));
+    };
+    let start = open + 1;
+    let body = &s[start..];
+    let len = if escaped {
+        body.find(&format!("\\{quote}"))
+    } else {
+        let mut prev_backslash = false;
+        body.char_indices().find_map(|(i, c)| {
+            let closes = c == quote && !prev_backslash;
+            prev_backslash = c == '\\' && !prev_backslash;
+            closes.then_some(i)
+        })
+    }
+    .unwrap_or(body.len());
+    (start, len)
 }
 
 /// Matches `Authorization: <type> <credential>` or
@@ -297,11 +336,11 @@ fn find_auth_header(input: &str) -> Option<CredentialMatch> {
             let after_scheme = scheme_start + scheme_len;
             let after_scheme_str = &rest[after_scheme..];
             let cred = after_scheme_str.trim_start();
-            let cred_skip = after_scheme_str.len() - cred.len();
-            let cred_len = token_len(cred);
+            let (cred_offset, cred_len) = value_span(cred);
             if cred_len == 0 {
                 return None;
             }
+            let cred_skip = after_scheme_str.len() - cred.len() + cred_offset;
             let start = after_header + after_scheme + cred_skip;
             Some(CredentialMatch {
                 start,
@@ -395,8 +434,8 @@ fn find_sensitive_key_value(input: &str) -> Option<CredentialMatch> {
         if !is_sensitive_key(&input[key_start..eq_idx]) {
             return None;
         }
-        let val_start = eq_idx + 1;
-        let val_len = token_len(&input[val_start..]);
+        let (val_offset, val_len) = value_span(&input[eq_idx + 1..]);
+        let val_start = eq_idx + 1 + val_offset;
         (val_len > 0).then_some(CredentialMatch {
             start: val_start,
             end: val_start + val_len,
@@ -738,6 +777,57 @@ mod tests {
         assert_eq!(
             scrub_secrets(r#"min://argv ["gh","--token","sekrit"]"#),
             r#"min://argv ["gh","--token","<redacted:len=6>"]"#
+        );
+    }
+
+    /// A quoted value is masked to its closing quote, whether the quote is
+    /// raw (a shell string) or backslash-escaped (the JSON-encoded argv
+    /// minimald logs).
+    #[test]
+    fn scrub_masks_quoted_values() {
+        for (input, secret) in [
+            ("PASSWORD='hunter2' cmd", "hunter2"),
+            ("PASSWORD=\"hunter2\" cmd", "hunter2"),
+            ("--password='hunter2'", "hunter2"),
+            ("--password=\"hunter2\"", "hunter2"),
+            ("PASSWORD='two words'", "two words"),
+            ("PASSWORD='two words", "two words"),
+            ("PASSWORD=\"a\\\"b\" x", "b"),
+            (
+                r#"min://argv ["sh","-c","export GITHUB_TOKEN='abc123' && x"]"#,
+                "abc123",
+            ),
+            (
+                r#"min://argv ["sh","-c","PASSWORD=\"hunter2\" cmd"]"#,
+                "hunter2",
+            ),
+            (
+                r#"min://argv ["sh","-c","PASSWORD=\"two words\" cmd"]"#,
+                "words",
+            ),
+            ("Authorization: Bearer 'abc123'", "abc123"),
+        ] {
+            let out = scrub_secrets(input);
+            assert!(!out.contains(secret), "{input:?} leaked {secret:?}: {out}");
+            assert_eq!(scrub_secrets(&out), out, "{input:?} is not idempotent");
+        }
+        assert_eq!(
+            scrub_secrets("PASSWORD='hunter2' cmd"),
+            "PASSWORD='<redacted:len=7>' cmd"
+        );
+        assert_eq!(
+            scrub_secrets(r#"["sh","-c","PASSWORD=\"two words\" cmd"]"#),
+            r#"["sh","-c","PASSWORD=\"<redacted:len=9>\" cmd"]"#
+        );
+    }
+
+    /// The escape before a JSON-encoded closing quote is not part of the
+    /// credential: the recorded length stays true and the escaping intact.
+    #[test]
+    fn scrub_stops_before_an_escaped_closing_quote() {
+        assert_eq!(
+            scrub_secrets(r#"curl -H \"Authorization: Bearer abc123\" x"#),
+            r#"curl -H \"Authorization: Bearer <redacted:len=6>\" x"#
         );
     }
 
