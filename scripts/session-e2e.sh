@@ -8311,10 +8311,10 @@ proof_published_proxy_routes_from_host() {
   fi
 
   # The port the VM's node proxy is published on, on the HOST's loopback —
-  # the one line `min ls` prints for exactly this purpose. On the VM backend
-  # the line names the VM whose port it is (`VM <vm> listening on ...`); the
-  # native spelling has no VM to name, so the parse takes either, `-E`
-  # because a BRE `\?` is not portable to the macOS lane's BSD sed.
+  # the one line `min ls` prints for exactly this purpose. With one VM the
+  # line names none; with several, each line carries its VM's name padded
+  # into a column. The parse keys on `listening on` so it takes either
+  # spelling, `-E` for one syntax across GNU sed and the macOS lane's BSD sed.
   pubp_line=""
   for _ in $(seq 1 40); do
     pubp_ls="$(mnl ls 2>&1)"
@@ -8329,7 +8329,7 @@ proof_published_proxy_routes_from_host() {
   fi
   echo "published proxy: $pubp_line"
   pubp_port="$(printf '%s\n' "$pubp_line" \
-    | sed -En 's/^HOSTNAME PROXY:  (VM [^ ]* )?listening on 127\.0\.0\.1:([0-9]+) .*/\2/p')"
+    | sed -En 's/^HOSTNAME PROXY: .*listening on 127\.0\.0\.1:([0-9]+) .*/\1/p')"
   if [ -z "$pubp_port" ]; then
     echo "::error::the HOSTNAME PROXY line names no loopback port: '$pubp_line'"
     fail
