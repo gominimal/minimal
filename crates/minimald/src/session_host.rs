@@ -545,6 +545,10 @@ impl Binding {
                 };
                 // The asker going away before the answer is not an error to
                 // relay: the reply's fate was always the asker's.
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may be gone; its reply's fate was always its own"
+                )]
                 let _ = reply.send(answer);
             }
             tokio::select! {
@@ -802,6 +806,11 @@ impl Binding {
     {
         // `\r\n`: the remote terminal is in raw mode, so a bare newline
         // stair-steps off the right margin.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a client that cannot take the lead-in line cannot take the dialog either; \
+                      the dialog's own result is the answer to relay"
+        )]
         let _ = w
             .write_all(format!("\r\n{name} asks to publish port {port}.\r\n").as_bytes())
             .await;
@@ -4648,6 +4657,10 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     // dialog nobody can see.
                     Message::AskExpose { port, reply } => match self.remote.as_ref() {
                         None => {
+                            #[expect(
+                                clippy::let_underscore_must_use,
+                                reason = "the asker may already be gone; there is nothing to answer then"
+                            )]
                             let _ = reply.send(None);
                         }
                         Some((tx, ..)) => {
@@ -4677,6 +4690,10 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                                         // is the nobody-attached case again.
                                         let answer = binding_recv.await.ok();
                                         tracing::info!(port, answer = ?answer, "the attached client answered the runtime port publish ask");
+                                        #[expect(
+                                            clippy::let_underscore_must_use,
+                                            reason = "the asker may already be gone; there is nothing to answer then"
+                                        )]
                                         let _ = reply.send(answer);
                                     });
                                 }
@@ -4689,6 +4706,10 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                                     // host-level answer below is what the
                                     // asker sees: nobody is attached.
                                     tracing::warn!(port, error = %send_error, "the ask could not reach the attached client");
+                                    #[expect(
+                                        clippy::let_underscore_must_use,
+                                        reason = "the asker may already be gone; there is nothing to answer then"
+                                    )]
                                     let _ = reply.send(None);
                                 }
                             }

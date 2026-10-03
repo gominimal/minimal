@@ -3828,6 +3828,16 @@ async fn ask_expose_without_a_binding_answers_no_one() {
         "no binding means nobody is attached to answer the ask"
     );
 
+    // Teardown of the host this test minted. Best-effort both ways: the kill
+    // of a host that is fine, and a join that a wedged loop would outrun.
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "the host this test minted is not the fact under test; a kill that lands is enough"
+    )]
     let _ = handle.kill(false).await;
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "the ask already answered is the fact; the loop may outlive the test's bound"
+    )]
     let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
 }
