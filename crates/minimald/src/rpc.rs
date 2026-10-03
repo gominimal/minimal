@@ -324,7 +324,10 @@ async fn serve_create_session(
                     // recorded for a host-address box — so the daemon's log,
                     // the bundle's tail, carries what this reply told the
                     // person in the terminal, beside the start line and each
-                    // launch's own record.
+                    // launch's own record. The advisory rides as a field,
+                    // Debug-escaped, because the line a person copies their
+                    // command from must stay one line: the terminal gets the
+                    // two-line spelling, the log gets the same text whole.
                     if let Some(advisory) = &classifier_advisory {
                         tracing::info!(
                             session_id = %id,
@@ -333,7 +336,8 @@ async fn serve_create_session(
                             classifier_install = ?classifier_cause
                                 .and_then(classifier::Cause::install_command),
                             egress_enforcement = ?egress_enforcement,
-                            "session create carried the classifier advisory: {advisory}"
+                            advisory = ?advisory,
+                            "session create carried the classifier advisory"
                         );
                     }
                     // NET-123: the session-start loopback probe, before any
@@ -407,18 +411,20 @@ static CREATE_CLASSIFIER_STANDIN: std::sync::Mutex<Option<(std::path::PathBuf, O
 /// Points the create-time classifier read at `root` and `mountinfo` for the
 /// rest of this process — the stand-in state a test built. See
 /// [`CREATE_CLASSIFIER_STANDIN`].
+///
+/// The tests that use this take the probe-test mutex in this module's test
+/// module for the whole install→create→assert→clear window: the stand-in is
+/// process-global, so under libtest — where the tests of one binary share a
+/// process — a create driven by another test would answer over it too.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn install_create_classifier_standin(
-    root: std::path::PathBuf,
-    mountinfo: Option<String>,
-) {
+pub fn install_create_classifier_standin(root: std::path::PathBuf, mountinfo: Option<String>) {
     *CREATE_CLASSIFIER_STANDIN.lock().unwrap() = Some((root, mountinfo));
 }
 
 /// Withdraws the stand-in [`install_create_classifier_standin`] installed, so
 /// later creates answer over the production tree and mount table again.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn clear_create_classifier_standin() {
+pub fn clear_create_classifier_standin() {
     *CREATE_CLASSIFIER_STANDIN.lock().unwrap() = None;
 }
 
@@ -447,16 +453,18 @@ fn create_classifier_tree() -> (std::path::PathBuf, Option<String>) {
 /// box over evidence it never gathered.
 async fn create_classifier_decision(in_microvm: bool) -> classifier::Decision {
     let (root, mountinfo) = create_classifier_tree();
-    tokio::task::spawn_blocking(move || classifier::decide_now(&root, mountinfo.as_deref(), in_microvm))
-        .await
-        .unwrap_or_else(|join| {
-            tracing::warn!(
-                error = %join,
-                "the create-time classifier check did not run; treating this \
-                 host as unable to decide per box"
-            );
-            classifier::Decision::undecidable(classifier::Cause::ProbeUnreadable)
-        })
+    tokio::task::spawn_blocking(move || {
+        classifier::decide_now(&root, mountinfo.as_deref(), in_microvm)
+    })
+    .await
+    .unwrap_or_else(|join| {
+        tracing::warn!(
+            error = %join,
+            "the create-time classifier check did not run; treating this \
+             host as unable to decide per box"
+        );
+        classifier::Decision::undecidable(classifier::Cause::ProbeUnreadable)
+    })
 }
 
 /// The advisory a cause yields for the reply (NET-079): the cause in words,
@@ -476,11 +484,14 @@ fn classifier_advisory_text(cause: classifier::Cause, guest: bool) -> String {
         cause.host_ip_box_outcome(guest),
     );
     if let Some(command) = cause.install_command() {
+        // The command ends the advisory with nothing after it, so the line
+        // a person copies from the terminal is the command, verbatim.
         advisory.push_str(&format!(
             ". Install the classifier's privileged step with:\n  {command}"
         ));
+    } else {
+        advisory.push('.');
     }
-    advisory.push('.');
     advisory
 }
 
@@ -501,12 +512,14 @@ fn create_egress_enforcement(
     if network != minimald_rpc::NetworkMode::HostNet {
         return None;
     }
-    Some(if decision.can_decide_per_box() {
-        crate::session_host::HostIpEnforcement::Enforced
-    } else {
-        crate::session_host::HostIpEnforcement::Unenforced
-    }
-    .machine_str())
+    Some(
+        if decision.can_decide_per_box() {
+            crate::session_host::HostIpEnforcement::Enforced
+        } else {
+            crate::session_host::HostIpEnforcement::Unenforced
+        }
+        .machine_str(),
+    )
 }
 
 /// The bind probe over the reserved local range, on the blocking pool —
@@ -2972,10 +2985,12 @@ mod tests {
     /// answer. Returns the tree guard, which the caller keeps alive for as
     /// long as the stand-in answers.
     fn standin_tree() -> (tempfile::TempDir, std::path::PathBuf) {
-        let tree =
-            tempfile::tempdir().expect("a temp dir standing in for the classifier tree");
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the classifier tree");
         let root = tree.path().to_path_buf();
-        for verdict in [sandbox2::config::Verdict::Deny, sandbox2::config::Verdict::Allow] {
+        for verdict in [
+            sandbox2::config::Verdict::Deny,
+            sandbox2::config::Verdict::Allow,
+        ] {
             let subtree = root
                 .join(sandbox2::classifier::BOXES_DIR)
                 .join(verdict.dir_name());
@@ -3015,10 +3030,17 @@ mod tests {
         tree
     }
 
-    /// How many times `needle` appears in `haystack` — for asserting a log
-    /// tail gained exactly the lines a create owed it.
-    fn occurrences(haystack: &str, needle: &str) -> usize {
-        haystack.match_indices(needle).count()
+    /// The classifier-advisory lines this session's create produced (the
+    /// NET-079 observability contract). Attributed by session id, because
+    /// under libtest the capture buffer is shared by every test in the
+    /// binary — assertions on it say `contains`, never `equals`.
+    fn classifier_lines(log: &str, session_id: &SessionId) -> Vec<String> {
+        let message = "session create carried the classifier advisory";
+        let id = format!("session_id={session_id}");
+        log.lines()
+            .filter(|line| line.contains(message) && line.contains(&id))
+            .map(str::to_string)
+            .collect()
     }
 
     /// NET-079: a native create on a host that cannot decide per box answers
@@ -3034,15 +3056,22 @@ mod tests {
     /// the command when one applies, and the per-box enforcement the reply
     /// and the record both carry — the bundle's tail then says what every
     /// create said.
+    // The guard is taken before the server is even built and held across
+    // both awaited creates on purpose: the stand-in is process-global, so
+    // another test's create in the window would answer over it too.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn native_host_advises_classifier_install_without_prompt() {
+        let _standin_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let server = TestServer::new().await;
         let mut client = server.connect().await;
         let capture = crate::test_harness::captured_log();
 
         let _tree = install_step_missing_standin();
-        let step_missing =
-            client.call::<CreateSession>(&req("step-missing", "/uwu")).await.unwrap();
+        let step_missing = client
+            .call::<CreateSession>(&req("step-missing", "/uwu"))
+            .await
+            .unwrap();
         let advisory = step_missing
             .classifier_advisory
             .expect("a create on a step-missing host carries the advisory");
@@ -3068,8 +3097,10 @@ mod tests {
         // The cannot-confine stand-in over the same box: the cause is the
         // mount's, so the advisory names it and nothing to run.
         let _tree = install_cannot_confine_standin();
-        let cannot_confine =
-            client.call::<CreateSession>(&req("cannot-confine", "/uwu")).await.unwrap();
+        let cannot_confine = client
+            .call::<CreateSession>(&req("cannot-confine", "/uwu"))
+            .await
+            .unwrap();
         super::clear_create_classifier_standin();
         let advisory = cannot_confine
             .classifier_advisory
@@ -3090,28 +3121,46 @@ mod tests {
             "the advisory names what a person may run; it never asks: {advisory}"
         );
 
-        // One line per advisory-carrying create — the two above, and nothing
-        // else this test created — naming the cause, the command when one
-        // applies, and the enforcement the reply and the record carry.
+        // One line per advisory-carrying create, attributed by the session
+        // it carried — the cause, the command when one applies, and the
+        // enforcement the reply and the record both carry.
         let tail = capture.contents();
+        let step_line = classifier_lines(&tail, &step_missing.id);
         assert_eq!(
-            occurrences(&tail, "session create carried the classifier advisory"),
-            2,
+            step_line.len(),
+            1,
             "each advisory-carrying create must log exactly one line naming \
              it, got: {tail}"
         );
+        let step_line = &step_line[0];
         assert!(
-            tail.contains("the classifier's privileged step is not installed"),
-            "the logged line must name the cause, got: {tail}"
+            step_line.contains("advisory=\"note: this host cannot decide"),
+            "the logged line must carry the advisory's own text, not only \
+             its facts, got: {step_line}"
         );
         assert!(
-            tail.contains("sudo scripts/install-host-classifier.sh"),
-            "the logged line must carry the command when one applies, got: {tail}"
+            step_line.contains("the classifier's privileged step is not installed"),
+            "the logged line must name the cause, got: {step_line}"
         );
         assert!(
-            tail.contains("egress_enforcement=Some(\"none\")"),
-            "the logged line must carry the enforcement recorded for the \
-             host-address box, got: {tail}"
+            step_line.contains("sudo scripts/install-host-classifier.sh"),
+            "the logged line must carry the command when one applies, got: {step_line}"
+        );
+        let confine_line = classifier_lines(&tail, &cannot_confine.id);
+        assert_eq!(
+            confine_line.len(),
+            1,
+            "each advisory-carrying create must log exactly one line naming \
+             it, got: {tail}"
+        );
+        let confine_line = &confine_line[0];
+        assert!(
+            confine_line.contains("no cgroup2 mount with nsdelegate covers the classifier tree"),
+            "the logged line must name this cause too, got: {confine_line}"
+        );
+        assert!(
+            confine_line.contains("egress_enforcement=Some(\"none\")"),
+            "the logged line must carry the enforcement recorded for the host-address box, got: {confine_line}"
         );
     }
 
@@ -3128,8 +3177,13 @@ mod tests {
     /// pinned pure, because no stand-in can make the probe read a refusal:
     /// a tree the facts say is decided and a table that is still refusing
     /// cannot both be built here.
+    // The guard is taken before the server is even built and held across
+    // the awaited creates on purpose: the stand-in is process-global, so
+    // another test's create in the window would answer over it too.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn create_response_shows_enforcement_none_while_the_host_cannot_decide() {
+        let _standin_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
@@ -3161,9 +3215,14 @@ mod tests {
         let record = client
             .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(created.id))
             .await;
-        let attrs = &record.record.expect("the created session has a record").attrs;
+        let attrs = &record
+            .record
+            .expect("the created session has a record")
+            .attrs;
         assert_eq!(
-            attrs.get(super::EGRESS_ENFORCEMENT_ATTR).map(String::as_str),
+            attrs
+                .get(super::EGRESS_ENFORCEMENT_ATTR)
+                .map(String::as_str),
             Some("none"),
             "the record must carry the per-box enforcement the create \
              recorded, got: {attrs:?}"
@@ -3181,7 +3240,10 @@ mod tests {
         let reply = client
             .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(own_address))
             .await;
-        let attrs = &reply.record.expect("the own-address session has a record").attrs;
+        let attrs = &reply
+            .record
+            .expect("the own-address session has a record")
+            .attrs;
         assert!(
             !attrs.contains_key(super::EGRESS_ENFORCEMENT_ATTR),
             "an own-address box's verdict is decided on address leases, so \
@@ -3194,7 +3256,10 @@ mod tests {
         // reply's own pure half says it — the same machine spelling the
         // launch's record uses.
         assert_eq!(
-            super::create_egress_enforcement(NetworkMode::HostNet, &classifier::Decision::decided()),
+            super::create_egress_enforcement(
+                NetworkMode::HostNet,
+                &classifier::Decision::decided()
+            ),
             Some("per_box"),
             "a host that can decide per box must show a host-address box as \
              enforced"
@@ -3292,10 +3357,11 @@ mod tests {
         );
     }
 
-    /// Serializes the window in which a loopback-probe stand-in is installed:
-    /// the stand-in is process-global (`net::loopback`), so under libtest —
-    /// where every test in this binary shares one process — a create driven
-    /// by another test would read it too. Nextest runs each test in its own
+    /// Serializes the window in which a process-global stand-in is installed
+    /// — a loopback-probe one (`net::loopback`) or a create-time classifier
+    /// one ([`install_create_classifier_standin`]): under libtest — where
+    /// every test in this binary shares one process — a create driven by
+    /// another test would read it too. Nextest runs each test in its own
     /// process; the mutex keeps the in-process runner as safe.
     static PROBE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
