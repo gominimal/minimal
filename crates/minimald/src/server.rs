@@ -260,9 +260,11 @@ impl ServerState {
         // Construct the per-host switch once, here at daemon scope, so a single
         // gvproxy runs for the host and a single allocator never reuses an
         // address for the daemon's lifetime (R1.4/R1.6). Its config/socket/pid
-        // live under a dedicated subdir of the daemon state dir. The shared
-        // `Arc` is the single source of truth, injected into every per-launch
-        // `SandboxLauncher` through the sessions manager.
+        // live under `<state>/gvproxy/<daemon_id>/`, keyed per daemon instance
+        // so two native daemons sharing a state root never unlink each
+        // other's control socket or overwrite each other's config or pid
+        // file. The shared `Arc` is the single source of truth, injected into
+        // every per-launch `SandboxLauncher` through the sessions manager.
         // DM1/3/4 (in a libkrun VM): attach `OwnIp` PTasks to the host gvproxy
         // (owned by `minvmd`) over a vsock shuttle. DM2 (native Linux): spawn +
         // own gvproxy locally.
