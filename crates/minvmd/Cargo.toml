@@ -69,6 +69,7 @@ hickory-proto.workspace = true
 [dev-dependencies]
 camino.workspace = true
 serial_test.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 russh-sftp.workspace = true
 # The Box Egress Proxy stand-in acceptor's tests drive the delivery against a

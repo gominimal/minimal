@@ -765,6 +765,10 @@ included, with every refusal logged (NET-001 to NET-004).
     tier:   T0
     verify: cargo nextest run -p minimald absent_range_publishes_interim_and_readvises
     <!-- design §7.1; unwanted; the interim is a per-host state that the privileged step supersedes -->
+  - WHERE the host is macOS THE SYSTEM SHALL name, in NET-122's advisory command, a privileged step that installs a boot-time service, from root-owned non-user-writable paths and reading no configuration, which applies exactly the reserved local range to the host loopback at install and at every boot.
+    tier:   T0
+    verify: cargo nextest run -p minimal advisory_command_reserves_the_range_on_macos
+    <!-- design §7.1 (the privileged step, one command with one privilege elevation shared with the answerer unit); state+event; Linux takes no range step — the whole 127/8 binds on `lo` — and its command keeps the routing-domain link's routable-scope address, without which resolved never consults the routing domain -->
 
 - **NET-124** WHEN a lookup asks for a record type other than A for a name a box or node holds in the box zone THE SYSTEM SHALL answer NODATA.
   tier:     T0
