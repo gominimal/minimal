@@ -2137,6 +2137,18 @@ impl Session {
     async fn rename(&mut self, new_name: String) -> Result<(), std::io::Error> {
         let record = self.record.record().await?;
 
+        // Renaming to the name the session already has is an error, not a
+        // no-op: `save` deliberately treats same-id same-name as a no-op (a
+        // status promotion re-saves an unchanged name), so without this guard
+        // a rename-to-self would silently succeed and report a rename that
+        // did not happen.
+        if record.name.as_deref() == Some(new_name.as_str()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("session is already named `{new_name}`"),
+            ));
+        }
+
         // Withdraw the route under the pre-rename name before the record
         // mutates; re-register under the new name afterwards. Both calls
         // gate on this session actually owning a route, so a Draft/NoNet
@@ -2145,7 +2157,7 @@ impl Session {
         #[cfg(target_os = "linux")]
         self.deregister_hostname(false).await;
         let mut new_record = record.clone();
-        new_record.name = Some(new_name);
+        new_record.name = Some(new_name.clone());
         let written = self.record.write(new_record.clone()).await;
 
         // Re-register whichever name stuck (the new one on success, the old
@@ -2160,6 +2172,19 @@ impl Session {
             false,
         )
         .await;
+
+        // Forward the new name to the running host so the shell's
+        // `$MINIMAL_SESSION_NAME` is republished through the per-attach
+        // environment channel. Best-effort: the record-side rename has
+        // already succeeded, and a dead host drops the message silently.
+        if written.is_ok()
+            && let SessionInner::Active {
+                host: Some((host, _)),
+                ..
+            } = &self.inner
+        {
+            host.rename(new_name).await;
+        }
 
         written
     }
