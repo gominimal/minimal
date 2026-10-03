@@ -1051,23 +1051,14 @@ pub fn record_node_plane_fetch(box_id: &str, host: &str, object: &str) {
 
 /// The host a fetch location is fetched from, spelled for the two forms the
 /// configured remote cache takes: the mirror URL's own host, or the bucket
-/// a GCS location names. The mirror's URL is wrapped privately by
-/// `common`'s newtype, and the URL its `Debug` prints is the one spelling
-/// of it that reaches this crate, so the host is read from that print the
-/// way the URL's own parser would: between its scheme and the first
-/// delimiter. A `host()` accessor on the newtype would replace this with a
-/// reach through, and none is available without leaving the daemon's own
-/// files.
+/// a GCS location names. The mirror's host is read from the URL the
+/// newtype holds — its own `host_str`, the parsed host with no scheme and
+/// no port — never from a rendering of it: a `Debug` print is a formatting
+/// choice of the newtype's, and a spelling that changes with it changes
+/// which host the record names while nothing else does.
 pub(crate) fn cache_host(location: &AnyUrl) -> String {
     match location {
-        AnyUrl::Https(https) => {
-            let printed = format!("{https:?}");
-            let url = printed
-                .strip_prefix("ReqwestUrl(")
-                .and_then(|inner| inner.strip_suffix(')'))
-                .unwrap_or(printed.as_str());
-            url_host(url).to_owned()
-        }
+        AnyUrl::Https(https) => https.host_str().unwrap_or_default().to_owned(),
         AnyUrl::Gcs(gcs) => gcs.bucket.clone(),
     }
 }
@@ -2150,6 +2141,40 @@ mod tests {
         assert!(
             lines[0].contains(&fetched.to_string()) && !lines[0].contains(second),
             "the first record is the first fetch, not a summary: {lines:?}"
+        );
+    }
+
+    /// NET-080: the host each fetch's record names, read from the location
+    /// the configured remote cache takes. The mirror's is the URL's own
+    /// host — the parsed host, with neither the port nor the path nor the
+    /// scheme spelled beside it — and the GCS location's is the bucket it
+    /// names, the spelling `mctx` resolves `gs://…` and a bare bucket name
+    /// into. Both spellings are what a person reading a bundle's daemon-log
+    /// tail matches the fetch against, so a host read out of a rendering
+    /// of the URL rather than out of the URL itself is a host the record
+    /// can silently stop naming.
+    #[test]
+    fn cache_host_reads_https_host_and_gcs_bucket() {
+        let mirror = AnyUrl::Https(
+            common::fetchers::ReqwestUrl::try_from(
+                "https://cache.example.com:8443/prefix/index.shisha",
+            )
+            .expect("the configured remote cache's mirror URL parses"),
+        );
+        assert_eq!(
+            cache_host(&mirror),
+            "cache.example.com",
+            "the mirror's host is the URL's own host: neither its port nor its \
+             path is part of the host a fetch leaves for"
+        );
+        let bucket = AnyUrl::Gcs(common::fetchers::GcsUrl {
+            bucket: "projects/_/buckets/minimal-cache".to_string(),
+            object: String::new(),
+        });
+        assert_eq!(
+            cache_host(&bucket),
+            "projects/_/buckets/minimal-cache",
+            "a GCS location's host is the bucket it names"
         );
     }
 
