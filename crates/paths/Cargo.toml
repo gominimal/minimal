@@ -1,5 +1,6 @@
 [package]
 name = "paths"
+description = "Realm-tagged path types distinguishing host, sandbox, and daemon filesystems."
 rust-version.workspace = true
 version = "0.0.1"
 edition.workspace = true
