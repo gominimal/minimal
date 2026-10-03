@@ -5065,9 +5065,7 @@ proof_github_only_allowlist() {
   # then italicizes every field NAME and dims the `=` beside it: a record's
   # `target_pass=false` reaches the boot log as
   # `<italic>target_pass</italic><dimmed>=</dimmed>false`, so no `name=value`
-  # ever appears contiguously — the message and the value stay plain, which
-  # is why every earlier leg of this case matched fine while the first
-  # field assertion (the unpublished zone leg's) failed on both VM lanes.
+  # ever appears contiguously — the message and the value stay plain.
   # The SGR codes are stripped here, at the one reader both the assertions
   # and the printed transcript go through, so a field reads the same on the
   # console shape as on the file shape it was written against. The escape
