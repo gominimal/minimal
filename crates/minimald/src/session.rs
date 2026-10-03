@@ -1602,6 +1602,10 @@ impl Session {
                 let _ = reply.send(self.expose_dynamic(port).await);
             }
             SessionMessage::LiveIngress(r) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
                 let _ = r.send(self.live_ingress_snapshot());
             }
             SessionMessage::GetRecord(r) => {
@@ -3590,6 +3594,10 @@ impl SessionHandle {
     ) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the actor may already be gone; the recv below reports that"
+        )]
         let _ = self
             .0
             .send(SessionMessage::ExposeDynamic { port, reply: send })
@@ -3614,6 +3622,10 @@ impl SessionHandle {
     ) -> Result<Vec<minimald_rpc::LiveMapping>, std::io::Error> {
         let (send, recv) = oneshot::channel();
         // Ignore send errors - the recv will also fail.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the actor may already be gone; the recv below reports that"
+        )]
         let _ = self.0.send(SessionMessage::LiveIngress(send)).await;
         #[expect(
             clippy::map_err_ignore,

@@ -5037,6 +5037,12 @@ async fn fake_forwarder(
             } else {
                 "Internal Server Error"
             };
+            // The request is what the test wants; a peer that closed before the
+            // answer drained ends the round, which the next accept serves.
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the answer's fate is not what the stand-in records; the request is"
+            )]
             let _ = stream
                 .write_all(
                     format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n").as_bytes(),

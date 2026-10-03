@@ -1494,15 +1494,31 @@ impl SessionChannel {
     /// address the port was published on, or the typed refusal's own reason.
     async fn expose_port(&self, stream: &mut UnixStream, port: &str) {
         let Ok(port) = port.parse::<u16>() else {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the reply channel is best-effort: a peer that sent no port number \
+                          may be gone before the reply lands, and there is nowhere to report \
+                          that to"
+            )]
             let _ = writeln!(stream, "error: '{port}' is not a port number");
             return;
         };
         let Some(session) = self.session.upgrade() else {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the reply channel is best-effort: a peer may be gone before the \
+                          reply lands, and there is nowhere to report that to"
+            )]
             let _ = writeln!(stream, "error: session is gone");
             return;
         };
         match session.expose_dynamic(port).await {
             Ok(mapping) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the reply channel is best-effort: a peer may be gone before the \
+                              reply lands, and there is nowhere to report that to"
+                )]
                 let _ = writeln!(
                     stream,
                     "msg:published port {} at {}",
@@ -1510,6 +1526,11 @@ impl SessionChannel {
                 );
             }
             Err(e) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the reply channel is best-effort: a peer may be gone before the \
+                              reply lands, and there is nowhere to report that to"
+                )]
                 let _ = writeln!(stream, "error: {e}");
             }
         }
@@ -2219,6 +2240,11 @@ mod tests {
         let (_state, _rootfs, _cwd, mut chan) = setup_channel();
         let (mut ours, theirs) = UnixStream::pair().unwrap();
 
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
         chan.handle("net-expose%http", &mut ours).await;
         drop(ours);
         assert_eq!(
@@ -2228,6 +2254,11 @@ mod tests {
         );
 
         let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
         chan.handle("net-expose%3000", &mut ours).await;
         drop(ours);
         assert_eq!(
