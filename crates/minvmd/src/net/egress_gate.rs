@@ -128,6 +128,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -338,6 +339,16 @@ const UNKNOWN_SOURCE_RULE: &str = "egress-unknown-source";
 /// so the frame is refused before any row or phase is consulted, in force in
 /// every phase, and no interim and no row can ever admit it.
 const SWITCH_CONTROL_RULE: &str = "egress-switch-control-surface";
+
+/// The rule name for one inbound flow the gate refused at a box's reply-flow
+/// cap (NET-040's answer half): the flow is refused *at ingress* — the
+/// opening frame is never delivered toward the box, so the client's connect
+/// fails rather than the box's session — while the flows the table already
+/// recorded keep refreshing and keep their replies admitted. Its own rule,
+/// not the switch-control or the row verdict's, because what it names is a
+/// bound the host keeps on the flows a published box's ingress can earn
+/// records for, not a destination any rules decided.
+const INBOUND_FLOW_CAP_RULE: &str = "egress-inbound-flow-cap";
 
 /// The port the resolver carve-out is keyed to at the gateway (NET-079):
 /// DNS, over UDP or TCP (a query falls back to TCP on truncation, so the
@@ -1203,8 +1214,9 @@ fn refuse_head(limiter: &DropLimiter, refused: &RefusedHead) {
 #[expect(
     clippy::too_many_arguments,
     reason = "the relay's full state in one place: both directions' halves, the \
-              deciding table, the DNS admission table and the node-plane baseline \
-              set, the limiter, and the phase — splitting it would hide one of them"
+              deciding table, the DNS admission table, the reply-flow tables and the \
+              node-plane baseline set, the limiter, and the phase — splitting it would \
+              hide one of them"
 )]
 async fn relay_frames(
     guest: Prefixed<OwnedReadHalf>,
@@ -1213,6 +1225,7 @@ async fn relay_frames(
     guest_tx: OwnedWriteHalf,
     table: BoxTable,
     pins: dns_pins::DnsPins,
+    replies: ReplyTables,
     baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
     phase: UnregisteredSourcePhase,
@@ -1222,9 +1235,12 @@ async fn relay_frames(
         guest_tx,
         table.clone(),
         pins.clone(),
+        replies.clone(),
         Arc::clone(&limiter),
     ));
-    let egress = relay_guest_to_switch(guest, switch_tx, table, pins, baseline, limiter, phase);
+    let egress = relay_guest_to_switch(
+        guest, switch_tx, table, pins, replies, baseline, limiter, phase,
+    );
     tokio::pin!(egress);
     // The two legs race, because neither can see the other's end. The egress
     // leg blocks on the guest, which has no reason to speak while it is idle,
@@ -2243,6 +2259,14 @@ async fn copy_switch_to_guest(
 /// pins nothing — not from the box's resolver, not a name the row declared,
 /// refused by the rebinding intersection — still reaches the box in full.
 ///
+/// One class is *written*, not only read: the reply-flow records
+/// ([`ReplyTables`], NET-040's answer half). A frame this leg delivers toward
+/// a registered box's admitted port is recorded as that box's inbound flow —
+/// the one thing that lets the box answer it back through the gate — and at
+/// the box's cap the new flow is refused, the one ingress refusal this gate
+/// makes: the frame is not written on and the client's connect fails, while
+/// the recorded flows keep refreshing.
+///
 /// The framing mirrors the egress leg's ([`relay_frames_to_switch`]): the
 /// same two-byte little-endian length claim, the same zero-length skip, and
 /// the same refusal of a claim past the maximum — the switch is the side
@@ -2258,6 +2282,7 @@ async fn relay_switch_frames_to_guest(
     mut guest: OwnedWriteHalf,
     table: BoxTable,
     pins: dns_pins::DnsPins,
+    replies: ReplyTables,
     limiter: Arc<DropLimiter>,
 ) -> io::Result<()> {
     let mut len_buf = [0u8; 2];
@@ -2284,6 +2309,32 @@ async fn relay_switch_frames_to_guest(
             ));
         }
         switch.read_exact(&mut frame[..n]).await?;
+        // NET-040's answer half, this gate's recording half: one frame this
+        // leg is about to deliver toward a registered box, at a port the
+        // row's declaration admitted, is the one thing that opens a
+        // reply-flow record for it — a bare SYN over TCP, the first datagram
+        // over UDP, never a mid-stream segment, and never a frame the box
+        // sent (the egress leg's lookup never inserts) — and at the box's
+        // cap the new flow is refused here, toward the client: the frame is
+        // not written on, the connect fails, the refusal is counted and
+        // said, and the flows already recorded keep refreshing.
+        //
+        // The parse is the egress leg's own shape — the same allocation-free,
+        // bounds-checked header read — and the row and port checks narrow
+        // before the table's lock is taken, so only a frame delivered to a
+        // published port of a registered box costs the table a word. It sits
+        // ahead of the DNS observation below because a frame the gate refuses
+        // is not delivered, and nothing that was not delivered may be
+        // observed as though it had been.
+        if let Some(pkt) = dns_pins::parse_ipv4_l4(&frame[..n])
+            && let Some(record) = table.by_source(pkt.dst.ip().octets())
+            && matches!(
+                replies.observe_delivered(&record, &pkt, &limiter, Instant::now()),
+                Some(egress::InboundFlow::RefusedAtCap)
+            )
+        {
+            continue;
+        }
         // The pre-check is three comparisons; the parse it guards is the one
         // that bounds-checks the datagram before the table reads a word of it.
         if dns_pins::is_ipv4_udp(&frame[..n])
@@ -2305,13 +2356,21 @@ async fn relay_switch_frames_to_guest(
 /// the relay's exit: whichever way the relay ended — the guest's clean
 /// close, an error on either end, or a frame claim the gate refused — the
 /// addresses it carried go to the table as a withdrawal report **and** to
-/// the DNS admission table as a retire, and the relay's outcome is passed
-/// through.
+/// the DNS admission table as a retire **and** to the reply-flow tables as
+/// the same, and the relay's outcome is passed through.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the two socket halves, the table, the DNS admission table, the reply-flow \
+              tables, the baseline, the limiter and the phase are each a distinct input to \
+              the relay's life; grouping them would name the bundle without naming the \
+              members"
+)]
 async fn relay_guest_to_switch(
     mut guest: Prefixed<OwnedReadHalf>,
     mut switch: OwnedWriteHalf,
     table: BoxTable,
     pins: dns_pins::DnsPins,
+    replies: ReplyTables,
     baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
     phase: UnregisteredSourcePhase,
@@ -2326,6 +2385,7 @@ async fn relay_guest_to_switch(
         &mut switch,
         &table,
         &pins,
+        &replies,
         &baseline,
         &limiter,
         phase,
@@ -2347,8 +2407,13 @@ async fn relay_guest_to_switch(
     // — a re-attachment starts fail-closed, until its own lookups pin again.
     // A control connection files no report at all: one fresh connection per
     // control request is the daemon's own client's shape, and constant churn
-    // is not box end.
+    // is not box end. The reply-flow records go with them, on the same
+    // event: a record is an admission the box's published port earned while
+    // its traffic could reach the switch, so it goes with the connection
+    // that carried it, and a re-attachment answers only what its own ingress
+    // admits again.
     pins.retire(&attributed);
+    replies.retire(&attributed);
     table.report_withdrawals(std::mem::take(&mut attributed));
     outcome
 }
@@ -2367,16 +2432,17 @@ async fn relay_guest_to_switch(
 )]
 #[expect(
     clippy::too_many_arguments,
-    reason = "the two socket halves, the table, the DNS admission table, the baseline, the \
-              limiter, the phase and the attribution are each a distinct input to every \
-              frame the loop decides; grouping them would name the bundle without naming \
-              the members"
+    reason = "the two socket halves, the table, the DNS admission table, the reply-flow \
+              tables, the baseline, the limiter, the phase and the attribution are each a \
+              distinct input to every frame the loop decides; grouping them would name the \
+              bundle without naming the members"
 )]
 async fn relay_frames_to_switch(
     guest: &mut Prefixed<OwnedReadHalf>,
     switch: &mut OwnedWriteHalf,
     table: &BoxTable,
     pins: &dns_pins::DnsPins,
+    replies: &ReplyTables,
     baseline: &NodePlaneBaseline,
     limiter: &DropLimiter,
     phase: UnregisteredSourcePhase,
@@ -2418,21 +2484,22 @@ async fn relay_frames_to_switch(
         // the table's parse supplies them — the same allocation-free,
         // bounds-checked read the in-VM relay's is.
         let l4 = dns_pins::parse_ipv4_l4(&frame[..n]);
-        let admitted = match gate_verdict(&summary, l4.as_ref(), table, baseline, pins, phase) {
-            Ok(admitted) => admitted,
-            Err(GateDrop::SwitchControlSurface { src, dst_port }) => {
-                limiter.warn_switch_surface(src, dst_port);
-                continue;
-            }
-            Err(GateDrop::Infrastructure { src, dst, dst_port }) => {
-                limiter.warn_infrastructure(src, dst, dst_port);
-                continue;
-            }
-            Err(dropped) => {
-                limiter.emit(summary.source(), dropped.rule());
-                continue;
-            }
-        };
+        let admitted =
+            match gate_verdict(&summary, l4.as_ref(), table, baseline, pins, replies, phase) {
+                Ok(admitted) => admitted,
+                Err(GateDrop::SwitchControlSurface { src, dst_port }) => {
+                    limiter.warn_switch_surface(src, dst_port);
+                    continue;
+                }
+                Err(GateDrop::Infrastructure { src, dst, dst_port }) => {
+                    limiter.warn_infrastructure(src, dst, dst_port);
+                    continue;
+                }
+                Err(dropped) => {
+                    limiter.emit(summary.source(), dropped.rule());
+                    continue;
+                }
+            };
         // The interim's admit is the one admission that owes a line: no row
         // bounded this frame, and the host must be able to see that it passed.
         if let GateAdmit::Unregistered { src } = admitted {
@@ -2604,7 +2671,11 @@ enum GateAdmit {
     /// undeclared-destination one for a row that declared DNS hosts, is
     /// decided beside them by the host-side DNS admission table
     /// ([`crate::net::dns_pins`]), whose pins are the answers the box's own
-    /// lookups received.
+    /// lookups received. The row's *ingress* earns admissions too: a frame
+    /// whose five-tuple exactly reverses a live inbound flow this gate
+    /// recorded at the row's admitted port is the row's as well, decided by
+    /// the reply-flow table ([`ReplyTables`]) ahead of every rule the row
+    /// holds.
     Row,
     /// The announced interim admitted the frame: its source is an address the
     /// plan could hand to a box but no published namespace holds, so no rules
@@ -2616,11 +2687,308 @@ enum GateAdmit {
     },
 }
 
+/// The gate's reply-flow records (NET-040's answer half): one [`BoxReplies`]
+/// entry per registered box the gate's ingress leg has delivered an opening
+/// packet to, keyed by the row's switch address — the same key the gate
+/// resolves every frame's source and destination through. Cheap to clone:
+/// every clone shares the same entries, and the handle the gate holds is the
+/// one its two legs and its verdict all read.
+///
+/// The two halves of the rule, both of them the shared [`egress::ReplyFlows`]
+/// decision — the same type, timers and per-box cap the in-guest relay's table
+/// holds, read from one place, so both gates hold one number:
+///
+/// * [`Self::observe_delivered`], the ingress leg's half, is the one place a
+///   record is opened — run on a frame the leg is about to deliver toward a
+///   registered box, at a port the row's declaration admitted, so only a
+///   packet the host itself passed to the box can ever mint the admission a
+///   reply rides on. A frame the box sent never reaches it, and the box's
+///   own egress is a lookup, never an insertion.
+/// * [`Self::reply_admits`], the verdict's half, admits a frame whose
+///   five-tuple exactly reverses a live record — decided ahead of the
+///   control-surface check and of every rule the row holds, so a box whose
+///   egress declares nothing still answers the connections its published
+///   port received, and the forwarder a host-published port rides, whose
+///   dials arrive at the box NAT'd from the switch's own address, still
+///   gets its answers back.
+///
+/// Entries go with the row's traffic, on the same event the DNS admission
+/// table's do ([`Self::retire`], beside the withdrawal report that ends the
+/// row, NET-133), so a re-attachment answers only the flows its own ingress
+/// admits again — fail closed, until a client connects once more.
+#[derive(Clone)]
+pub(crate) struct ReplyTables {
+    /// The shared state behind every [`ReplyTables`] clone.
+    inner: Arc<ReplyInner>,
+}
+
+/// The per-gate state behind every [`ReplyTables`] clone.
+struct ReplyInner {
+    /// One entry per registered box the gate has recorded for, keyed by the
+    /// row's switch address. Bounded by the plan's address run — an entry
+    /// exists only for an address a row was published at — and bounded
+    /// within by the shared per-box cap ([`egress::REPLY_MAX_FLOWS_PER_BOX`]),
+    /// which is where a flood of inbound flows toward one box stops.
+    boxes: Mutex<HashMap<[u8; 4], Arc<BoxReplies>>>,
+}
+
+/// One box's reply-flow records, and the once-per-box lines' state beside
+/// them.
+struct BoxReplies {
+    /// The row the entry was built from: the record whose admitted port the
+    /// recorded flows arrived at. Held so a re-registration at the same
+    /// address — a new record, a new declaration — is told apart from the
+    /// entry the address holds, and judged against the declaration the
+    /// flows' ports were published under.
+    record: Arc<BoxRecord>,
+    /// The box's reply-flow records: the shared table, with its windows and
+    /// its per-box cap, behind the one lock a single decision takes.
+    flows: Mutex<egress::ReplyFlows>,
+    /// Whether the box's first-record line has been said.
+    first_record: AtomicBool,
+    /// Whether the table-filled line has been said.
+    table_filled: AtomicBool,
+}
+
+impl BoxReplies {
+    /// The entry for `record`: the shared table at the plan's own windows
+    /// and cap, and both once-per-box lines still unsaid.
+    fn new(record: &Arc<BoxRecord>) -> Self {
+        Self {
+            record: Arc::clone(record),
+            flows: Mutex::new(egress::ReplyFlows::new()),
+            first_record: AtomicBool::new(false),
+            table_filled: AtomicBool::new(false),
+        }
+    }
+
+    /// Claims the first-record line: `true` exactly once per box.
+    fn claim_first_record(&self) -> bool {
+        !self.first_record.swap(true, Ordering::Relaxed)
+    }
+
+    /// Claims the table-first-filled line: `true` exactly once per box, the
+    /// first time an insert takes the table to its cap.
+    fn claim_table_filled(&self) -> bool {
+        !self.table_filled.swap(true, Ordering::Relaxed)
+    }
+}
+
+impl ReplyTables {
+    /// An empty table: entries appear when the ingress leg first delivers an
+    /// opening packet toward a published box, and go when the row's shuttle
+    /// connection ends.
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(ReplyInner {
+                boxes: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// The entry the row's address holds, read-only: `None` for a box no
+    /// delivered packet has recorded for yet — the lookup the egress leg's
+    /// half runs on every frame a row holds, which must never mint an entry
+    /// of its own.
+    fn entry_of(&self, src: [u8; 4]) -> Option<Arc<BoxReplies>> {
+        self.inner
+            .boxes
+            .lock()
+            .expect("the reply-flow table's lock is held only across one decision")
+            .get(&src)
+            .cloned()
+    }
+
+    /// The entry the row's address holds, built from `record` on first sight
+    /// — the one place an entry is created, on a frame the gate is about to
+    /// deliver — and rebuilt when a re-registration put a different record
+    /// at the same address: the flows the old entry held belong to the ports
+    /// the old declaration published, and the flows the new declaration may
+    /// earn are not open yet.
+    fn entry(&self, record: &Arc<BoxRecord>) -> Arc<BoxReplies> {
+        let key = record.switch_addr().octets();
+        let mut boxes = self
+            .inner
+            .boxes
+            .lock()
+            .expect("the reply-flow table's lock is held only across one decision");
+        if let Some(entry) = boxes.get(&key)
+            && Arc::ptr_eq(&entry.record, record)
+        {
+            return Arc::clone(entry);
+        }
+        let entry = Arc::new(BoxReplies::new(record));
+        boxes.insert(key, Arc::clone(&entry));
+        entry
+    }
+
+    /// The ingress leg's half: what one frame the leg is about to deliver
+    /// toward `record`'s box did to its reply-flow records. `None` means the
+    /// frame is not one the table reads — its destination port is not one
+    /// the row's declaration admitted, so no record applies and the frame
+    /// is delivered as the ingress-only traffic it is. `Some(outcome)` is
+    /// the shared decision's own classification, and of it only
+    /// [`egress::InboundFlow::RefusedAtCap`] tells the caller not to
+    /// deliver: the box's table is at its cap, the flow is refused *at
+    /// ingress* — the frame is not written on, the client's connect fails —
+    /// the refusal is counted and said, and the flows already recorded keep
+    /// refreshing.
+    ///
+    /// The two lines a box's first record and first fill say — one per box,
+    /// naming the box, its admitted port and its cap — are emitted here, at
+    /// the table's own transitions, so a diagnostic bundle's daemon log tail
+    /// reads a box whose replies were or were not being admitted (R2.7).
+    pub(crate) fn observe_delivered(
+        &self,
+        record: &Arc<BoxRecord>,
+        pkt: &dns_pins::L4Packet,
+        limiter: &DropLimiter,
+        now: Instant,
+    ) -> Option<egress::InboundFlow> {
+        // Only a port the row's declaration admitted is recorded — the same
+        // fact the publish half of the gate decides by — so a record exists
+        // only for a flow toward a port the box published, never for one
+        // toward an ephemeral port of the box's own egress.
+        if !record.admitted_ports().contains(&pkt.dst.port()) {
+            return None;
+        }
+        let entry = self.entry(record);
+        let mut flows = entry
+            .flows
+            .lock()
+            .expect("the reply-flow table's lock is held only across one decision");
+        let outcome = flows.observe_inbound(reply_tuple_of(pkt), pkt.tcp_flags, now);
+        match outcome {
+            egress::InboundFlow::Recorded { filled } => {
+                if entry.claim_first_record() {
+                    tracing::info!(
+                        switch_addr = %record.switch_addr(),
+                        namespace = %record.name(),
+                        port = pkt.dst.port(),
+                        client = %pkt.src,
+                        "recorded the box's first inbound flow at its admitted port"
+                    );
+                }
+                if filled && entry.claim_table_filled() {
+                    tracing::info!(
+                        switch_addr = %record.switch_addr(),
+                        namespace = %record.name(),
+                        cap = flows.cap(),
+                        "the box's reply-flow table has filled; new inbound flows are refused at the cap"
+                    );
+                }
+            }
+            egress::InboundFlow::RefusedAtCap => {
+                limiter.warn_inbound_flow_refused(
+                    record.switch_addr().octets(),
+                    record.name(),
+                    &pkt.src.to_string(),
+                );
+            }
+            egress::InboundFlow::Refreshed
+            | egress::InboundFlow::Ended
+            | egress::InboundFlow::Untracked => {}
+        }
+        Some(outcome)
+    }
+
+    /// The verdict's half: whether one frame `record`'s box sent reverses a
+    /// live inbound flow this gate recorded — the exact-reverse rule, with
+    /// the record's own end (a FIN or RST on the flow) read here too. `None`
+    /// for an entry, or an entry built from another record at the same
+    /// address, admits nothing: the frame stays with the row's own rules.
+    pub(crate) fn reply_admits(
+        &self,
+        record: &Arc<BoxRecord>,
+        pkt: &dns_pins::L4Packet,
+        now: Instant,
+    ) -> bool {
+        let Some(entry) = self.entry_of(record.switch_addr().octets()) else {
+            return false;
+        };
+        if !Arc::ptr_eq(&entry.record, record) {
+            return false;
+        }
+        let mut flows = entry
+            .flows
+            .lock()
+            .expect("the reply-flow table's lock is held only across one decision");
+        flows.reply_admits(reply_tuple_of(pkt), pkt.tcp_flags, now)
+    }
+
+    /// Retires the entries of the boxes whose traffic the relay that ended
+    /// carried — the same event that withdraws their rows and retires their
+    /// DNS admission entries (the relay's attribution, filed beside the
+    /// withdrawal report, NET-133), so a reply-flow record never outlives
+    /// the connection its box's ingress rode. A re-attachment answers only
+    /// what its own ingress admits again, fail closed until a client
+    /// connects.
+    pub(crate) fn retire(&self, sources: &[[u8; 4]]) {
+        let mut boxes = self
+            .inner
+            .boxes
+            .lock()
+            .expect("the reply-flow table's lock is held only across one decision");
+        for src in sources {
+            boxes.remove(src);
+        }
+    }
+
+    /// How many of the box's inbound flows have been refused at its
+    /// reply-flow cap — the per-box counter a status surface reads, so a
+    /// box whose clients' connects were refused reads so in the host
+    /// daemon's own report. `None` for a box whose ingress has not been
+    /// delivered to at all: there is no entry to read.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the status surface that reads it is a follow-up outside this gate; the \
+                      counter is entry state, maintained at the refusal in every build"
+        )
+    )]
+    pub(crate) fn refused_at_cap_of(&self, src: [u8; 4]) -> Option<u64> {
+        let entry = self.entry_of(src)?;
+        let flows = entry
+            .flows
+            .lock()
+            .expect("the reply-flow table's lock is held only across one decision");
+        Some(flows.refused_at_cap())
+    }
+
+    /// Shrinks the box's per-box cap — the window hook's twin, for the
+    /// relay-level proof that a flood of inbound flows stops at the cap
+    /// without holding a thousand records first.
+    #[cfg(test)]
+    pub(crate) fn shrink_cap_of(&self, record: &Arc<BoxRecord>, cap: usize) {
+        let entry = self.entry(record);
+        let mut flows = entry
+            .flows
+            .lock()
+            .expect("the reply-flow table's lock is held only across one decision");
+        flows.shrink_cap(cap);
+    }
+}
+
+/// The reply-flow identity one L4 packet's addressing spells, in the
+/// direction the packet itself traveled — the same key the in-guest relay's
+/// table builds, so the shared decision's reverse lookup means the same thing
+/// on both gates.
+fn reply_tuple_of(pkt: &dns_pins::L4Packet) -> egress::FlowTuple {
+    egress::FlowTuple::new(
+        pkt.proto,
+        pkt.src.ip().octets(),
+        pkt.src.port(),
+        pkt.dst.ip().octets(),
+        pkt.dst.port(),
+    )
+}
+
 /// The gate's admit-or-drop decision for one frame summary against the
 /// host-side table (NET-081): pure — a function of the summary, the table,
-/// the baseline set, the phase and the DNS admission table, nothing else —
-/// and deliberately separate from the relay loop that applies it, the same
-/// discipline the shared verdict keeps.
+/// the baseline set, the phase, the DNS admission table and the reply-flow
+/// tables, nothing else — and deliberately separate from the relay loop that
+/// applies it, the same discipline the shared verdict keeps.
 ///
 /// The frame's source address is the whole of the routing: the node plane's
 /// own address is decided by the baseline set ([`NodePlaneBaseline`], the
@@ -2644,15 +3012,29 @@ enum GateAdmit {
 /// so a row's `allow_subnets` admits nothing in it — RFC 1918 under an
 /// explicit allowance excepted — and the pin arm a name-declaring row earns
 /// for its undeclared destinations never reaches it. The order is the
-/// contract: control surface, then the source (a baseline-decided node
-/// frame, a row, or the phase's unknown-source decision), then the
-/// infrastructure set, then the row's rules, then the pin arm.
+/// contract: the reply-flow record, then the control surface, then the source
+/// (a baseline-decided node frame, a row, or the phase's unknown-source
+/// decision), then the infrastructure set, then the row's rules, then the pin
+/// arm.
+///
+/// The reply-flow record goes ahead of the control-surface check because the
+/// answer to a host-published port's connection is a frame *to the gateway*:
+/// the forwarder dials the box from the switch's own address, so the box's
+/// answer names the switch as its destination — the very address the
+/// control-surface rule refuses. The record is the one thing that tells the
+/// two apart: it exists only for a flow this gate itself delivered toward a
+/// port the box's declaration admitted, and it admits only its exact reverse,
+/// so a box reaching for the switch's API ports still finds them refused,
+/// whatever it dials. Nothing else moves — the lease check the shared verdict
+/// carries still governs every frame, and a destination no record names keeps
+/// every drop it ever took.
 fn gate_verdict(
     summary: &FrameSummary,
     l4: Option<&dns_pins::L4Packet>,
     table: &BoxTable,
     baseline: &NodePlaneBaseline,
     pins: &dns_pins::DnsPins,
+    replies: &ReplyTables,
     phase: UnregisteredSourcePhase,
 ) -> Result<GateAdmit, GateDrop> {
     let Some(src) = summary.source() else {
@@ -2669,6 +3051,23 @@ fn gate_verdict(
             FrameVerdict::Drop(reason) => Err(GateDrop::Verdict(reason)),
         };
     }
+    // NET-040's answer half: a frame whose five-tuple exactly reverses a live
+    // inbound flow this gate's ingress leg recorded — the connection the
+    // row's admitted port received, delivered by this gate itself — passes
+    // without a single rule being consulted, the row's `deny_subnets` and
+    // the infrastructure set included, because a destination the box's rules
+    // refuse is what a reply to a published port *is*. The record admits its
+    // exact reverse and nothing else: the box's next connection finds no
+    // record, and no frame the box sends can open one, so a box cannot mint
+    // this admission — it can only answer a flow a client's packet earned.
+    // A frame no record admits stays exactly where it was, with every check
+    // below deciding it as it always has.
+    if let Some(pkt) = l4
+        && let Some(record) = table.by_source(src)
+        && replies.reply_admits(&record, pkt, Instant::now())
+    {
+        return Ok(GateAdmit::Row);
+    }
     // The switch's own address is a control surface, not a destination a
     // box's egress rules decide (design §4.1, §7.1). Every frame from a box
     // to the gateway — the address the resolver answers at, and the one
@@ -2682,7 +3081,13 @@ fn gate_verdict(
     // decision and before the interim, so no allow-all row and no announced
     // concession can admit a frame at the switch's own address, and it reads
     // no phase at all, so it binds unchanged when the per-box default binds.
-    // The resolver carve-out falls through to the decision behind this check
+    // The one frame it does not see is the reply the record above admitted:
+    // a forwarder's dial arrives at the box from the switch's own address,
+    // so the box's answer to it names the gateway — and that answer, the
+    // exact reverse of a flow this gate delivered toward the box's admitted
+    // port, is not a reach for the control surface but the half of a
+    // connection the host itself opened. The resolver carve-out falls
+    // through to the decision behind this check
     // — the row's own rules or the phase — which still decides it, so the
     // carve-out admits exactly what it admitted before, and the refusal adds
     // a ceiling without moving any floor.

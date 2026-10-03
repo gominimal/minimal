@@ -1311,9 +1311,7 @@ impl ReplyFlows {
         // The opening packet: a bare SYN for TCP, any datagram for UDP,
         // nothing for any other shape or protocol.
         let opening = tuple.proto == IPPROTO_UDP
-            || (tuple.proto == IPPROTO_TCP
-                && flags & TCP_SYN != 0
-                && flags & TCP_ACK == 0);
+            || (tuple.proto == IPPROTO_TCP && flags & TCP_SYN != 0 && flags & TCP_ACK == 0);
         if !opening {
             return InboundFlow::Untracked;
         }
@@ -1327,11 +1325,12 @@ impl ReplyFlows {
         self.flows.insert(
             tuple,
             ReplyRecord {
-                deadline: now + if tuple.proto == IPPROTO_TCP {
-                    self.tcp_idle_cap
-                } else {
-                    self.udp_unreplied_window
-                },
+                deadline: now
+                    + if tuple.proto == IPPROTO_TCP {
+                        self.tcp_idle_cap
+                    } else {
+                        self.udp_unreplied_window
+                    },
                 replied: false,
             },
         );
@@ -2314,14 +2313,12 @@ mod tests {
             InboundFlow::Recorded { filled: false }
         );
         assert!(flows.reply_admits(datagram.reversed(), 0, t0));
-        assert!(flows
-            .record_of(datagram)
-            .is_some_and(|record| record.was_replied()));
-        assert!(flows.reply_admits(
-            datagram.reversed(),
-            0,
-            t0 + REPLY_UDP_UNREPLIED_WINDOW
-        ));
+        assert!(
+            flows
+                .record_of(datagram)
+                .is_some_and(|record| record.was_replied())
+        );
+        assert!(flows.reply_admits(datagram.reversed(), 0, t0 + REPLY_UDP_UNREPLIED_WINDOW));
         assert!(!flows.reply_admits(
             datagram.reversed(),
             0,

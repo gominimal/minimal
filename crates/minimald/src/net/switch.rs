@@ -1167,7 +1167,8 @@ impl SessionGate {
             return false;
         };
         let tuple = reply_tuple(&pkt);
-        self.flows.reply_admits(tuple, pkt.tcp_flags, Instant::now())
+        self.flows
+            .reply_admits(tuple, pkt.tcp_flags, Instant::now())
     }
 
     /// NET-040's answer half, the ingress leg's half: what one frame the leg
@@ -1277,7 +1278,12 @@ impl SessionGate {
     /// relay-level proofs that drive a record open, answered and expired,
     /// which cannot be written against a five-minute window.
     #[cfg(test)]
-    pub(crate) fn shrink_reply_windows(&self, unreplied: Duration, replied: Duration, tcp_idle: Duration) {
+    pub(crate) fn shrink_reply_windows(
+        &self,
+        unreplied: Duration,
+        replied: Duration,
+        tcp_idle: Duration,
+    ) {
         self.flows.shrink_windows(unreplied, replied, tcp_idle);
     }
 
@@ -1343,7 +1349,12 @@ impl ReplyFlowGate {
     }
 
     /// The recording half, at the table the mutex holds.
-    fn observe_inbound(&self, tuple: egress::FlowTuple, flags: u8, now: Instant) -> egress::InboundFlow {
+    fn observe_inbound(
+        &self,
+        tuple: egress::FlowTuple,
+        flags: u8,
+        now: Instant,
+    ) -> egress::InboundFlow {
         self.flows
             .lock()
             .expect("the reply-flow lock is held only across one decision")
@@ -3550,19 +3561,17 @@ pub(crate) mod tests {
         // as it stays live.
         let handshake = egress_tcp_segment(LEASE, 8080, client, 51000, SYN | ACK);
         harness.box_end.write_all(&handshake).unwrap();
-        let sent =
-            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
-                .await
-                .expect("the reply reached the switch")
-                .expect("the switch side stays open");
+        let sent = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the reply reached the switch")
+            .expect("the switch side stays open");
         assert_eq!(sent, handshake, "the box's answer passed on the record");
         let payload = egress_tcp_segment(LEASE, 8080, client, 51000, ACK);
         harness.box_end.write_all(&payload).unwrap();
-        let sent =
-            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
-                .await
-                .expect("the reply's payload reached the switch")
-                .expect("the switch side stays open");
+        let sent = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the reply's payload reached the switch")
+            .expect("the switch side stays open");
         assert_eq!(sent, payload, "an established conversation keeps answering");
 
         // A second client's conversation answers on its own record — the
@@ -3572,11 +3581,10 @@ pub(crate) mod tests {
         assert_delivered(&mut harness, &second_syn).await;
         let second_answer = egress_tcp_segment(LEASE, 8080, PEER, 41000, SYN | ACK);
         harness.box_end.write_all(&second_answer).unwrap();
-        let sent =
-            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
-                .await
-                .expect("the second conversation's reply reached the switch")
-                .expect("the switch side stays open");
+        let sent = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the second conversation's reply reached the switch")
+            .expect("the switch side stays open");
         assert_eq!(sent, second_answer, "one record per conversation");
 
         // The box's own outbound connect to the very same client is still
@@ -3587,11 +3595,10 @@ pub(crate) mod tests {
         let sentinel = arp_frame(LEASE);
         harness.box_end.write_all(&own).unwrap();
         harness.box_end.write_all(&sentinel).unwrap();
-        let next =
-            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
-                .await
-                .expect("the relay forwards the sentinel")
-                .expect("the switch side stays open");
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
         assert_eq!(next, sentinel, "the box's own connect is still dropped");
 
         // The first record said the once-per-box line, naming the box and
@@ -3616,13 +3623,8 @@ pub(crate) mod tests {
         use crate::net::dns_gate::tests::RESOLVER;
         let mut harness = spawn_test_relay(&deny_all_with_published_ports());
         let client = Ipv4Addr::new(203, 0, 113, 7);
-        let records = |harness: &RelayHarness| {
-            harness
-                .gate
-                .as_ref()
-                .expect("gated")
-                .inbound_flow_records()
-        };
+        let records =
+            |harness: &RelayHarness| harness.gate.as_ref().expect("gated").inbound_flow_records();
 
         // A delivered bare SYN to the published port opens the flow.
         let syn = egress_tcp_segment(client, 51000, LEASE, 8080, SYN);
@@ -3686,7 +3688,11 @@ pub(crate) mod tests {
                 .expect("the relay forwards the sentinel")
                 .expect("the switch side stays open");
         assert_eq!(forwarded, sentinel, "the deny-all box's connect is dropped");
-        assert_eq!(records(&harness), 2, "no frame the box sent opened a record");
+        assert_eq!(
+            records(&harness),
+            2,
+            "no frame the box sent opened a record"
+        );
     }
 
     /// A reply-flow record ends four ways, and only those: at the FIN or RST
@@ -3695,16 +3701,13 @@ pub(crate) mod tests {
     /// with the relay.
     #[tokio::test]
     async fn reply_records_end_on_fin_rst_timeout_and_revocation() {
-        let mut harness = spawn_test_relay_with(
-            &deny_all_with_published_ports(),
-            |gate| {
-                gate.shrink_reply_windows(
-                    Duration::from_millis(150),
-                    Duration::from_millis(150),
-                    Duration::from_millis(150),
-                )
-            },
-        );
+        let mut harness = spawn_test_relay_with(&deny_all_with_published_ports(), |gate| {
+            gate.shrink_reply_windows(
+                Duration::from_millis(150),
+                Duration::from_millis(150),
+                Duration::from_millis(150),
+            )
+        });
         let client = Ipv4Addr::new(203, 0, 113, 7);
 
         // The connect, delivered and recorded.
@@ -3717,22 +3720,23 @@ pub(crate) mod tests {
         // new traffic the deny-all rules drop, silently.
         let close = egress_tcp_segment(LEASE, 8080, client, 51000, FIN | ACK);
         harness.box_end.write_all(&close).unwrap();
-        let sent =
-            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
-                .await
-                .expect("the close passed")
-                .expect("the switch side stays open");
+        let sent = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the close passed")
+            .expect("the switch side stays open");
         assert_eq!(sent, close, "the box's close is part of the conversation");
         let trailing = egress_tcp_segment(LEASE, 8080, client, 51000, ACK);
         let sentinel = arp_frame(LEASE);
         harness.box_end.write_all(&trailing).unwrap();
         harness.box_end.write_all(&sentinel).unwrap();
-        let next =
-            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
-                .await
-                .expect("the relay forwards the sentinel")
-                .expect("the switch side stays open");
-        assert_eq!(next, sentinel, "a record the box's FIN ended admits nothing");
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, sentinel,
+            "a record the box's FIN ended admits nothing"
+        );
 
         // The client's RST ends it from its own side, delivered though the
         // closing frame still is.
@@ -3744,12 +3748,14 @@ pub(crate) mod tests {
         let answer = egress_tcp_segment(LEASE, 8080, client, 51000, ACK);
         harness.box_end.write_all(&answer).unwrap();
         harness.box_end.write_all(&sentinel).unwrap();
-        let next =
-            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
-                .await
-                .expect("the relay forwards the sentinel")
-                .expect("the switch side stays open");
-        assert_eq!(next, sentinel, "a record the client's RST ended admits nothing");
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, sentinel,
+            "a record the client's RST ended admits nothing"
+        );
 
         // The window's edge: nothing rode the flow for the shrunk window,
         // so the conversation it was opened for is over and the box
@@ -3759,29 +3765,23 @@ pub(crate) mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
         harness.box_end.write_all(&answer).unwrap();
         harness.box_end.write_all(&sentinel).unwrap();
-        let next =
-            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
-                .await
-                .expect("the relay forwards the sentinel")
-                .expect("the switch side stays open");
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
         assert_eq!(next, sentinel, "an expired record admits nothing");
 
         // Revocation — and session stop, the same line — ends every record
         // without reading the wire at all.
         deliver_inbound(&mut harness, &syn).await;
         assert_delivered(&mut harness, &syn).await;
-        harness
-            .gate
-            .as_ref()
-            .expect("gated")
-            .end_inbound_flows();
+        harness.gate.as_ref().expect("gated").end_inbound_flows();
         harness.box_end.write_all(&answer).unwrap();
         harness.box_end.write_all(&sentinel).unwrap();
-        let next =
-            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
-                .await
-                .expect("the relay forwards the sentinel")
-                .expect("the switch side stays open");
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
         assert_eq!(next, sentinel, "a revoked ingress admits no reply");
 
         // Session stop ends the records with the relay: the gate outlives
@@ -3804,10 +3804,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn inbound_flows_refused_at_the_per_box_cap() {
         let capture = crate::test_harness::captured_log();
-        let mut harness =
-            spawn_test_relay_with(&deny_all_with_published_ports(), |gate| {
-                gate.shrink_reply_cap(2);
-            });
+        let mut harness = spawn_test_relay_with(&deny_all_with_published_ports(), |gate| {
+            gate.shrink_reply_cap(2);
+        });
         let client = Ipv4Addr::new(203, 0, 113, 7);
         let gate = harness.gate.clone().expect("gated");
 
@@ -3817,7 +3816,11 @@ pub(crate) mod tests {
             deliver_inbound(&mut harness, &syn).await;
             assert_delivered(&mut harness, &syn).await;
         }
-        assert_eq!(gate.inbound_flow_records(), 2, "the table holds its cap of flows");
+        assert_eq!(
+            gate.inbound_flow_records(),
+            2,
+            "the table holds its cap of flows"
+        );
         // The fill line was said once, naming the cap.
         assert!(
             capture
@@ -3851,11 +3854,10 @@ pub(crate) mod tests {
         assert_delivered(&mut harness, &segment).await;
         let answer = egress_tcp_segment(LEASE, 8080, client, 51000, ACK);
         harness.box_end.write_all(&answer).unwrap();
-        let sent =
-            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
-                .await
-                .expect("the recorded flow's reply still passes")
-                .expect("the switch side stays open");
+        let sent = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the recorded flow's reply still passes")
+            .expect("the switch side stays open");
         assert_eq!(sent, answer, "the cap refuses new flows, not live ones");
 
         // And a second refused flow counts again — the counter is per
