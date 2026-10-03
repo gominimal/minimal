@@ -582,9 +582,24 @@ pub fn hostname_proxy_start_line(vm: Option<&str>, port: u16) -> String {
 /// backend, where the session that just started landed on one VM of several
 /// and its proxy port is that VM's, and nothing on the native backend, whose
 /// one daemon hosts no VMs to name.
+///
+/// Keyed on the provider kind the daemon connection resolves through — the
+/// same rule [`super::session::daemon_provider_kind`] states — and never on
+/// `use_minvmd()`: the flag is how Linux asks for the VM host, while macOS
+/// reaches it with no flag at all, and a start line that keyed on the flag
+/// would name no VM for exactly the host whose every invocation is
+/// VM-backed.
 #[must_use]
 pub fn hostname_proxy_start_vm(global: &GlobalArgs) -> Option<&'static str> {
-    global.use_minvmd().then(client::vm_name)
+    hostname_proxy_vm(super::session::daemon_provider_kind(global))
+}
+
+/// [`hostname_proxy_start_vm`]'s gate as a fact about the backend kind, so
+/// the tests can drive the macOS combination the flag cannot express:
+/// `Minvmd` with no provider flag at all.
+#[must_use]
+pub fn hostname_proxy_vm(kind: paths::ProviderKind) -> Option<&'static str> {
+    (kind == paths::ProviderKind::Minvmd).then(client::vm_name)
 }
 
 /// Format the session list for the given output mode. Split from

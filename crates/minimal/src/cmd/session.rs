@@ -41,10 +41,10 @@ const BOX_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// The control socket lives beside the ssh socket in the minvmd
 /// provider-instance dir — the dir the daemon connection resolves through.
 /// A refusal (an exhausted address plan, a malformed declaration, a pair
-/// that is not the row's) surfaces here as an error naming the reason; the
-/// caller degrades a failed registration to a warning rather than failing
-/// the activation, and a failed withdrawal to one rather than failing the
-/// destroy it rides on.
+/// that is not the row's) surfaces here as an error naming the reason; a
+/// failed registration fails the activation it was for — the session does
+/// not start with the box unregistered — while a failed withdrawal
+/// degrades to a warning rather than failing the destroy it rides on.
 async fn control_request_with_vm_host(
     sock_path: &std::path::Path,
     request: minimald_rpc::BoxControlRequest,
@@ -103,20 +103,43 @@ async fn register_box_with_vm_host(
     }
 }
 
-/// The VM host daemon's control socket, when this invocation can reach one
-/// (T66): it sits beside the ssh socket in the provider dir the daemon
-/// connection resolves through, so the client finds both by the same rule
-/// — named VMs included, since the resolution reads the same process-global
-/// VM name.
+/// The provider kind this invocation's daemon connection resolves through:
+/// `client_provider_kind`, the same key the socket resolution itself and the
+/// fabric display turn on. Every gate that decides whether the host is
+/// VM-backed keys on this and never on `use_minvmd()` — the flag is the
+/// linux-only way to *ask* for the VM host, while macOS has no native
+/// backend, so a flagless invocation there is minvmd-backed all the same
+/// and the flag's own reading would leave exactly that host with no box
+/// registration, no control socket to withdraw through, and a start line
+/// that names no VM (NET-081's macOS half).
+pub(crate) fn daemon_provider_kind(global: &GlobalArgs) -> paths::ProviderKind {
+    client::client_provider_kind(global.use_minvmd())
+}
+
+/// The VM host daemon's control socket, when the daemon this invocation
+/// talks to is minvmd-backed (T66): it sits beside the ssh socket in the
+/// provider dir the daemon connection resolves through, so the client
+/// finds both by the same rule — named VMs included, since the resolution
+/// reads the same process-global VM name.
+///
+/// Keyed on the provider kind — [`daemon_provider_kind`], the rule the
+/// fabric display already uses — never on `use_minvmd()` alone: the flag is
+/// how Linux asks for the VM host, and macOS reaches it with no flag at
+/// all, so the destroy and Ctrl-C withdrawals must resolve their socket for
+/// the kind, or a macOS box's row would stay published when its session
+/// goes.
 ///
 /// Silent by design: an invocation that owes nothing — no VM host, an
 /// unresolvable dir — asks for nothing, and the withdrawal's own warning is
 /// the one that names the row left published.
-pub(crate) fn vm_host_control_sock(global: &GlobalArgs) -> Option<std::path::PathBuf> {
-    if !global.use_minvmd() {
+pub(crate) fn vm_host_control_sock(
+    kind: paths::ProviderKind,
+    minimal_dir: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    if kind != paths::ProviderKind::Minvmd {
         return None;
     }
-    let ssh_sock = client::resolve_socket_path(global.minimal_dir.as_deref(), true).ok()?;
+    let ssh_sock = client::resolve_socket_path(minimal_dir, true).ok()?;
     ssh_sock
         .parent()
         .map(|dir| dir.join(minvmd::control::CONTROL_SOCK_FILE))
@@ -173,7 +196,12 @@ pub(crate) async fn withdraw_box_row(
             // another protocol's answer — the row asked for is not
             // withdrawn, so say so.
             minimald_rpc::BoxControlReply::Addresses(handed) if handed == addresses => {
-                tracing::debug!(box = %name, "withdrew the box's host row");
+                tracing::info!(
+                    box = %name,
+                    switch_address = %handed.switch_address,
+                    loopback_address = %handed.loopback_address,
+                    "withdrew the box's host row; its addresses admit nothing"
+                );
             }
             minimald_rpc::BoxControlReply::Addresses(handed) => {
                 tracing::warn!(
@@ -210,61 +238,46 @@ pub(crate) async fn withdraw_box_row(
     }
 }
 
-/// Registers this activation's box with the VM host daemon, when there is
-/// one to register with (T66), returning the addresses it handed back —
-/// `None` when there is nothing to register or the registration could not
-/// be made.
+/// Registers this activation's box with the VM host daemon, when the daemon
+/// this invocation talks to is minvmd-backed (T66), returning the addresses
+/// it handed back — `Ok(None)` when there is nothing to register.
 ///
-/// The box this activation creates is registerable only on a minvmd-backed
-/// host, and only when it is an own-address box: a `host_ip` box shares the
-/// node's own row in the host table, and a `none` box has no switch address
-/// at all — both register nothing and attach exactly as they always have.
+/// The box this activation creates is registerable only when the daemon
+/// connection resolves through minvmd — [`daemon_provider_kind`], never
+/// `use_minvmd()`: the flag is how Linux asks for the VM host, and macOS
+/// reaches it with no flag at all, so keying on the flag would leave a macOS
+/// box with no row and its declared egress applied nowhere — and only when
+/// it is an own-address box: a `host_ip` box shares the node's own row in
+/// the host table, and a `none` box has no switch address at all — both
+/// register nothing and attach exactly as they always have.
 ///
-/// A registration that cannot be made — no control socket (a supervisor
-/// predating it), a refusal, the deadline — degrades to a warning and
-/// `None`, never to a failed activation: the box still creates, but
-/// unregistered. No host-side row holds it, so its frames run unattributed
-/// — the egress gate's announced interim admits what it admits — until the
-/// gate's per-box default is in force, which then fails closed for the box
-/// (#1790). The warning says so.
+/// A registration that cannot be made — an unresolvable provider dir, a
+/// refusal, the deadline — fails the activation with its cause rather than
+/// degrading to a warning: a box that went on to create unregistered would
+/// run with no host-side row holding it (NET-138), its frames unattributed
+/// and its declared egress decided by no row the host gate (NET-081) reads,
+/// so the session does not start half-admitted. The error is the one line
+/// session start owes this failure.
 async fn register_box_for_activation(
-    global: &GlobalArgs,
+    kind: paths::ProviderKind,
+    minimal_dir: Option<&std::path::Path>,
     network: sessions::NetworkMode,
     name: &str,
     policy: &sessions::SessionPolicy,
-) -> Option<sessions::BoxAddresses> {
-    if !global.use_minvmd() || network != sessions::NetworkMode::OwnIp {
-        return None;
+) -> anyhow::Result<Option<sessions::BoxAddresses>> {
+    if kind != paths::ProviderKind::Minvmd || network != sessions::NetworkMode::OwnIp {
+        return Ok(None);
     }
     // The control socket sits beside the ssh socket in the provider dir the
     // daemon connection resolves through, so the client finds both by the
     // same rule — named VMs included, since the resolution reads the same
     // process-global VM name.
-    let ssh_sock = match client::resolve_socket_path(global.minimal_dir.as_deref(), true) {
-        Ok(path) => path,
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                "cannot resolve the VM host provider dir; the box registration \
-                 is skipped and the box runs unregistered — its frames \
-                 unattributed — until the egress gate's per-box default is in \
-                 force (fail-closed then; #1790)"
-            );
-            return None;
-        }
-    };
-    let Some(sock_path) = ssh_sock
+    let ssh_sock = client::resolve_socket_path(minimal_dir, true)
+        .context("resolving the VM host provider dir to register the box's host row")?;
+    let sock_path = ssh_sock
         .parent()
         .map(|dir| dir.join(minvmd::control::CONTROL_SOCK_FILE))
-    else {
-        tracing::warn!(
-            "no provider dir resolved for the ssh socket; the box registration \
-             is skipped and the box runs unregistered — its frames \
-             unattributed — until the egress gate's per-box default is in \
-             force (fail-closed then; #1790)"
-        );
-        return None;
-    };
+        .ok_or_else(|| anyhow::anyhow!("no provider dir resolved for the ssh socket"))?;
     // The declaration, as this activation expanded it: the ingress rules
     // reduced to the external ports they admit — the shape the host row
     // holds — and the egress policy verbatim.
@@ -291,33 +304,57 @@ async fn register_box_for_activation(
     .await;
     match registration {
         Ok(Ok(addresses)) => {
-            tracing::debug!(
+            tracing::info!(
                 box = %name,
                 switch_address = %addresses.switch_address,
                 loopback_address = %addresses.loopback_address,
-                "VM host daemon handed the box its addresses"
+                "registered the box with the VM host daemon; its addresses are \
+                 the host table's to decide by"
             );
-            Some(addresses)
+            Ok(Some(addresses))
         }
-        Ok(Err(error)) => {
-            tracing::warn!(
-                %error,
-                "the box registration failed; the box runs unregistered — its \
-                 frames unattributed — until the egress gate's per-box default \
-                 is in force (fail-closed then; #1790)"
-            );
-            None
-        }
-        Err(_) => {
-            tracing::warn!(
-                after = ?BOX_CONTROL_TIMEOUT,
-                "the VM host daemon did not answer the box registration in time; \
-                 the box runs unregistered — its frames unattributed — until \
-                 the egress gate's per-box default is in force (fail-closed \
-                 then; #1790)"
-            );
-            None
-        }
+        Ok(Err(error)) => Err(error.context(
+            "registering the box with the VM host daemon failed; the session \
+             does not start with the box unregistered",
+        )),
+        Err(_) => Err(anyhow::anyhow!(
+            "the VM host daemon did not answer the box registration in \
+             {BOX_CONTROL_TIMEOUT:?}; the session does not start with the box \
+             unregistered"
+        )),
+    }
+}
+
+/// The session-start line for a box the activation registered with the VM
+/// host daemon (T66): the one line the start output owes the registration,
+/// naming the VM host daemon the row lives on and the switch address the box
+/// was handed — the facts a bundle's CLI transcript then answers without
+/// reaching for the daemon's log, and the one line the host that reaches the
+/// VM host daemon with no provider flag at all (NET-081's macOS half) has to
+/// show for its own boxes.
+///
+/// `vm` is the VM host the line names, by the same rule
+/// [`hostname_proxy_start_line`] names the proxy's: the selected VM on the VM
+/// backend, `None` on a backend that hosts no VMs. A registered box only ever
+/// exists on the former, so the `None` shape is the defensive one, mirroring
+/// the sibling start line's.
+#[must_use]
+pub fn box_registered_start_line(
+    vm: Option<&str>,
+    name: &str,
+    addresses: &sessions::BoxAddresses,
+) -> String {
+    match vm {
+        Some(vm) => format!(
+            "BOX REGISTRATION:  box '{name}' registered with the VM host daemon on VM '{vm}' · \
+             switch address {}",
+            addresses.switch_address
+        ),
+        None => format!(
+            "BOX REGISTRATION:  box '{name}' registered with the VM host daemon · \
+             switch address {}",
+            addresses.switch_address
+        ),
     }
 }
 
@@ -550,13 +587,18 @@ pub(crate) async fn activate_session(
     // own. Every other shape of activation — a host-ip box sharing the
     // node's own row, a none box with no switch address, a native daemon
     // with no box table — registers nothing and attaches as it always has.
-    // This is the last fallible client-side step, so a failure from here on
-    // owes the row its creator's withdrawal (T66): the sites below send it.
-    // The control socket is resolved once, here, and the withdrawals ride
-    // on it.
-    let control_sock = vm_host_control_sock(global);
+    // A registration that cannot be made ends the activation here, with its
+    // cause: no session exists yet to clean up, and a box that went on to
+    // create unregistered would run with no host-side row to decide its
+    // egress by, so this is the one failure that never falls back. Past
+    // here, the row exists and every later failure owes it its creator's
+    // withdrawal (T66): the sites below send it. The control socket is
+    // resolved once, here, and the withdrawals ride on it.
+    let kind = daemon_provider_kind(global);
+    let control_sock = vm_host_control_sock(kind, global.minimal_dir.as_deref());
     config.box_addresses = register_box_for_activation(
-        global,
+        kind,
+        global.minimal_dir.as_deref(),
         config.network,
         config
             .name
@@ -564,7 +606,7 @@ pub(crate) async fn activate_session(
             .expect("the session name is minted before the create"),
         &config.policy,
     )
-    .await;
+    .await?;
 
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
@@ -622,14 +664,18 @@ pub(crate) async fn activate_session(
                     // the abandoned row's addresses stay spent by design
                     // (the host's cursors never regress), but its
                     // admissions are withdrawn above, and the retry leaves
-                    // no row behind.
+                    // no row behind. The re-registration can itself fail —
+                    // the plan can be exhausted by then — and that failure
+                    // ends the retry loop the same way the first one would
+                    // have, with its cause.
                     config.box_addresses = register_box_for_activation(
-                        global,
+                        kind,
+                        global.minimal_dir.as_deref(),
                         config.network,
                         config.name.as_deref().expect("just re-minted"),
                         &config.policy,
                     )
-                    .await;
+                    .await?;
                     continue;
                 }
                 // A create failure that is not a retryable autogen collision
@@ -660,6 +706,27 @@ pub(crate) async fn activate_session(
         )
         .await;
         return Err(error);
+    }
+    // The registration's own half of the session-start output (T66): one line
+    // naming the VM host daemon the box's row lives on and the switch address
+    // it was handed, beside the `tracing::info!` line the same registration
+    // writes. The line is the one a bundle reads off the CLI transcript to say
+    // whether this box has a host row — which is the question the host that
+    // reaches the VM host daemon with no provider flag at all (NET-081's macOS
+    // half) otherwise answers nowhere in its own output. A box that registered
+    // nothing — a native host, a host-ip box sharing the node's own row, a
+    // `none` box with no switch address — prints nothing: it has no row to
+    // name. Keyed on the provider kind the registration itself keyed on, never
+    // on `use_minvmd()`, so the flagless VM-backed host prints it too.
+    if let Some(addresses) = config.box_addresses.as_ref() {
+        eprintln!(
+            "{}",
+            box_registered_start_line(
+                hostname_proxy_vm(kind),
+                config.name.as_deref().unwrap_or("-"),
+                addresses,
+            )
+        );
     }
     warn_if_hostname_routing_down(
         created.hostname_routing_unavailable.as_deref(),
@@ -1582,8 +1649,7 @@ pub async fn cmd_session_policy(
             // carry — and it has no host-side gate the set would describe —
             // so that arm passes `None` and the block is left out rather
             // than printed from a plan the session does not attach to.
-            let fabric = (client::client_provider_kind(global.use_minvmd())
-                == paths::ProviderKind::Minvmd)
+            let fabric = (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
                 .then_some(switch::SwitchSubnet::default());
             let mut out = std::io::stdout();
             format_policy(&mut out, &policy, record.network, fabric)?;
@@ -2290,7 +2356,12 @@ pub(crate) async fn destroy_session(
         // presenting the pair the registration handed back. Best-effort: a
         // withdrawal that cannot be made leaves the row published and warns
         // rather than failing a destroy that already succeeded.
-        withdraw_box_row(vm_host_control_sock(global), name, box_addresses).await;
+        withdraw_box_row(
+            vm_host_control_sock(daemon_provider_kind(global), global.minimal_dir.as_deref()),
+            name,
+            box_addresses,
+        )
+        .await;
     } else {
         bail!("DestroySession returned an error from the daemon");
     }
@@ -2704,7 +2775,8 @@ mod tests {
     /// hands back the two addresses the create request then carries — and
     /// the decision about whether to register at all is the activation's:
     /// only a minvmd-backed host with an own-address box registers, and a
-    /// refusal surfaces as a sentence, not a failed activation.
+    /// refusal is an error carrying its reason, the one the activation
+    /// ends with rather than creating the box unregistered.
     #[tokio::test]
     async fn activate_registers_box_with_vm_host() {
         let policy = sessions::SessionPolicy {
@@ -2751,9 +2823,16 @@ mod tests {
             minimal_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
         };
-        let handed = register_box_for_activation(&global, NetworkMode::OwnIp, "web", &policy)
-            .await
-            .expect("the registration is answered with addresses");
+        let handed = register_box_for_activation(
+            paths::ProviderKind::Minvmd,
+            global.minimal_dir.as_deref(),
+            NetworkMode::OwnIp,
+            "web",
+            &policy,
+        )
+        .await
+        .expect("a registration that cannot be made is the activation's error")
+        .expect("an own-address box on a VM-backed host registers");
         assert_eq!(
             handed.switch_address,
             std::net::Ipv4Addr::new(100, 64, 0, 2)
@@ -2779,29 +2858,37 @@ mod tests {
 
         // Every other shape of activation registers nothing: a native
         // daemon has no box table, a host-ip box shares the node's own row.
-        // Neither touches a socket, so a plain global (no provider, no
-        // dir) suffices.
-        let native = GlobalArgs::default();
+        // Neither touches a socket, so neither needs a dir.
         assert!(
-            register_box_for_activation(&native, NetworkMode::OwnIp, "web", &policy)
-                .await
-                .is_none(),
+            register_box_for_activation(
+                paths::ProviderKind::Minimald,
+                None,
+                NetworkMode::OwnIp,
+                "web",
+                &policy,
+            )
+            .await
+            .expect("a native host answers the activation, not the control socket")
+            .is_none(),
             "a native daemon hosts no box table to register on"
         );
-        let vm_host = GlobalArgs {
-            provider: Some(Provider::LocalMinvmd),
-            ..Default::default()
-        };
         assert!(
-            register_box_for_activation(&vm_host, NetworkMode::HostNet, "web", &policy)
-                .await
-                .is_none(),
+            register_box_for_activation(
+                paths::ProviderKind::Minvmd,
+                global.minimal_dir.as_deref(),
+                NetworkMode::HostNet,
+                "web",
+                &policy,
+            )
+            .await
+            .expect("a host-ip box registers nothing, and that is no failure")
+            .is_none(),
             "a host-ip box shares the node's own row and registers nothing"
         );
 
         // The refusal shape: a daemon that answers with a reason produces an
-        // error naming it — what the activation warns on and continues
-        // from, never a failed create.
+        // error naming it — the cause the activation ends with at session
+        // start, never a box created unregistered.
         let refused_dir = tempfile::TempDir::new().unwrap();
         let refused_path = refused_dir.path().join("control.sock");
         let _refused_requests = fake_vm_host(
@@ -2854,8 +2941,14 @@ mod tests {
         };
         // The withdrawal the destroy side owes: the pair comes off the
         // session record, the control socket off the provider dir the
-        // daemon connection resolves through.
-        withdraw_box_row(vm_host_control_sock(&global), Some("web"), Some(handed)).await;
+        // daemon connection resolves through — reached by the provider kind,
+        // the flag-independent rule, exactly as the destroy does.
+        withdraw_box_row(
+            vm_host_control_sock(paths::ProviderKind::Minvmd, global.minimal_dir.as_deref()),
+            Some("web"),
+            Some(handed),
+        )
+        .await;
         {
             let seen = requests.lock().unwrap();
             assert_eq!(seen.len(), 1, "one withdrawal, one request");
@@ -2871,24 +2964,325 @@ mod tests {
 
         // And a session that registered nothing owes nothing: no pair, no
         // name, no VM host — each sends nothing, on the same socket.
-        withdraw_box_row(vm_host_control_sock(&global), Some("web"), None).await;
+        withdraw_box_row(
+            vm_host_control_sock(paths::ProviderKind::Minvmd, global.minimal_dir.as_deref()),
+            Some("web"),
+            None,
+        )
+        .await;
         assert_eq!(
             requests.lock().unwrap().len(),
             1,
             "no pair on the record, no withdrawal"
         );
-        withdraw_box_row(vm_host_control_sock(&global), None, Some(handed)).await;
+        withdraw_box_row(
+            vm_host_control_sock(paths::ProviderKind::Minvmd, global.minimal_dir.as_deref()),
+            None,
+            Some(handed),
+        )
+        .await;
         assert_eq!(
             requests.lock().unwrap().len(),
             1,
             "no name on the record, no withdrawal"
         );
-        let native = GlobalArgs::default();
-        withdraw_box_row(vm_host_control_sock(&native), Some("web"), Some(handed)).await;
+        withdraw_box_row(
+            vm_host_control_sock(paths::ProviderKind::Minimald, None),
+            Some("web"),
+            Some(handed),
+        )
+        .await;
         assert_eq!(
             requests.lock().unwrap().len(),
             1,
             "no VM host to withdraw from, no withdrawal"
+        );
+    }
+
+    /// The macOS shape of every VM-backed gate (NET-081's other half): the
+    /// provider flag is how Linux *asks* for the VM host, so on a host where
+    /// minvmd is the only backend the flag is unset even though every
+    /// invocation is VM-backed. Each gate therefore keys on the provider kind
+    /// the daemon connection resolves through — `client_provider_kind`,
+    /// which folds that platform in — and never on the flag's own reading:
+    /// a flagless macOS activation would otherwise register no box, resolve
+    /// no control socket to withdraw through, and name no VM on its start
+    /// line.
+    ///
+    /// The rule is stated as an expectation about the kinds, each gate is
+    /// then driven by kind — the combination the flag cannot express — and
+    /// the activation path itself is driven flagless, end to end, the way a
+    /// host with no native backend runs it: on such a host the registration,
+    /// the start line, and the create's carried addresses all happen with no
+    /// flag at all, which is exactly what a gate that read the flag would
+    /// skip.
+    #[tokio::test]
+    async fn vm_backed_gates_key_on_the_provider_kind_not_the_flag() {
+        // The premise, then the rule as an expectation about the kinds rather
+        // than about the rule's own implementation: a flagless invocation
+        // reads `use_minvmd` as false on every host, and the kind it resolves
+        // through is minvmd exactly on a host with no native backend to fall
+        // back to.
+        let flagless = GlobalArgs::default();
+        assert!(
+            !flagless.use_minvmd(),
+            "no provider flag, no flag reading: the premise of the macOS shape"
+        );
+        let flagless_kind = if cfg!(target_os = "macos") {
+            paths::ProviderKind::Minvmd
+        } else {
+            paths::ProviderKind::Minimald
+        };
+        assert_eq!(
+            daemon_provider_kind(&flagless),
+            flagless_kind,
+            "a flagless invocation is VM-backed exactly where minvmd is the \
+             only backend"
+        );
+        let flagged = GlobalArgs {
+            provider: Some(Provider::LocalMinvmd),
+            ..Default::default()
+        };
+        assert!(
+            flagged.use_minvmd(),
+            "--provider local-minvmd is the flag's own reading"
+        );
+        assert_eq!(
+            daemon_provider_kind(&flagged),
+            paths::ProviderKind::Minvmd,
+            "--provider local-minvmd asks for the VM host by name"
+        );
+
+        // The registration gate, driven by kind on one provider dir: the
+        // minvmd kind registers through the control socket sitting beside
+        // the ssh socket, the native kind asks for nothing from it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let requests = fake_vm_host(
+            provider_dir.join("control.sock"),
+            r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
+        )
+        .await;
+        let policy = sessions::SessionPolicy::default();
+        let handed = register_box_for_activation(
+            paths::ProviderKind::Minvmd,
+            Some(dir.path()),
+            NetworkMode::OwnIp,
+            "web",
+            &policy,
+        )
+        .await
+        .expect("a minvmd-backed own-address box registers")
+        .expect("the registration hands addresses back");
+        assert_eq!(
+            handed.switch_address,
+            std::net::Ipv4Addr::new(100, 64, 0, 2)
+        );
+        assert!(
+            register_box_for_activation(
+                paths::ProviderKind::Minimald,
+                Some(dir.path()),
+                NetworkMode::OwnIp,
+                "web",
+                &policy,
+            )
+            .await
+            .expect("the native kind registers nothing, and that is no failure")
+            .is_none(),
+            "the native backend hosts no box table to register on"
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "only the minvmd kind asked the VM host for a row"
+        );
+
+        // The control-socket gate the destroy and Ctrl-C withdrawals resolve
+        // through, and the start line's VM name: both read the kind.
+        assert_eq!(
+            vm_host_control_sock(paths::ProviderKind::Minvmd, Some(dir.path())),
+            Some(provider_dir.join("control.sock")),
+            "a minvmd-backed host's control socket sits beside its ssh socket"
+        );
+        assert!(
+            vm_host_control_sock(paths::ProviderKind::Minimald, Some(dir.path())).is_none(),
+            "the native backend has no control socket to withdraw through"
+        );
+        assert_eq!(
+            hostname_proxy_vm(paths::ProviderKind::Minvmd),
+            Some(client::vm_name()),
+            "a minvmd-backed host names its VM on the start line"
+        );
+        assert_eq!(
+            hostname_proxy_vm(paths::ProviderKind::Minimald),
+            None,
+            "the native backend hosts no VMs to name"
+        );
+
+        // The activation path, driven flagless — no provider flag anywhere —
+        // against the same stand-ins the refused-registration test uses,
+        // resolved the way the invocation itself resolves
+        // them: a VM host daemon recorded as running behind the provider dir
+        // the flagless kind names, and a real daemon behind the ssh socket in
+        // the dir that same kind resolves the daemon connection through. On a
+        // host with no native backend the two are one dir, and the
+        // registration, the start line, and the create's carried addresses
+        // all happen with the flag unset; on a host with a native backend the
+        // same invocation asks the VM host for nothing, and any gate that
+        // reached for the VM host anyway would be seen here asking.
+        let state = tempfile::TempDir::new().unwrap();
+        let vm_provider_dir = client::resolve_provider_dir(Some(state.path()), true).unwrap();
+        std::fs::create_dir_all(&vm_provider_dir).unwrap();
+        let vm_state = minvmd::state::StateDir::new(vm_provider_dir.clone()).unwrap();
+        vm_state
+            .write_state(&minvmd::state::State {
+                lifecycle: minvmd::lifecycle::Lifecycle::Running,
+                ..minvmd::state::State::stopped()
+            })
+            .unwrap();
+        let _alive = vm_state.try_acquire_alive_lock().unwrap();
+        let handed = sessions::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
+        };
+        let requests = fake_vm_host(
+            vm_provider_dir.join(minvmd::control::CONTROL_SOCK_FILE),
+            r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
+        )
+        .await;
+        let server = minimald::test_harness::TestServer::new().await;
+        let ssh_sock =
+            client::resolve_socket_path(Some(state.path()), flagless.use_minvmd()).unwrap();
+        std::fs::create_dir_all(ssh_sock.parent().expect("the ssh socket has a parent")).unwrap();
+        server.listen_on_uds(&ssh_sock).await;
+
+        let project = tempfile::TempDir::new().unwrap();
+        let global = GlobalArgs {
+            minimal_dir: Some(state.path().to_path_buf()),
+            no_input: true,
+            ..Default::default()
+        };
+        let args = ActivateArgs {
+            name: Some("gate-web".to_string()),
+            path: Some(project.path().to_str().unwrap().to_string()),
+            network: CliNetworkMode::OwnIp,
+            sync: Some(SyncMode::None),
+            no_loadouts: true,
+            no_prompt: true,
+            attach: false,
+            ..bare_activate_args()
+        };
+        activate_session(&global, args, false).await.expect(
+            "a flagless activation reaches a session on the backend its kind \
+             resolves to",
+        );
+
+        // The row: asked for on the VM host the flagless kind resolved to, or
+        // not asked for at all — the kind's own answer, never the flag's.
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            usize::from(flagless_kind == paths::ProviderKind::Minvmd),
+            "the flagless activation asked the VM host for a row exactly when \
+             its provider kind is minvmd"
+        );
+        // And the create's half: the pair a minvmd-backed registration handed
+        // back travels to the daemon on the create request, so the record the
+        // daemon holds names it; a native host's record carries no pair at
+        // all, because nothing was registered to hand it one.
+        let mut after = server.connect().await;
+        let record = after
+            .call::<minimald_rpc::GetSessionRecord>(&minimald_rpc::GetSessionRecordRequest::Name(
+                "gate-web".to_string(),
+            ))
+            .await
+            .record
+            .expect("the flagless activation created the session");
+        assert_eq!(
+            record.box_addresses,
+            (flagless_kind == paths::ProviderKind::Minvmd).then_some(handed),
+            "the create carried the addresses the registration handed back, \
+             or nothing when nothing was registered"
+        );
+    }
+
+    /// The failure half of NET-081's registration: a VM host daemon that
+    /// refuses the box's registration ends the activation with the refusal's
+    /// cause — the session does not start with the box unregistered — and no
+    /// session is left behind. The full activation is driven through
+    /// `activate_session`, so the path proven is the user's: the refusal
+    /// surfaces as the session-start error, not as a warning beside a box
+    /// that created anyway.
+    #[tokio::test]
+    async fn registration_failure_is_surfaced_at_session_start() {
+        // The state dir: a VM host daemon recorded as Running with its alive
+        // lock held (so the activation's autospawn sees one and spawns
+        // nothing), its control socket refusing every registration, and a
+        // real daemon behind the ssh socket the activation connects to — so
+        // the create is one refusal away from succeeding when the
+        // registration goes first.
+        let state = tempfile::TempDir::new().unwrap();
+        let provider_dir = state.path().join("providers").join("local-minvmd0");
+        let state_dir = minvmd::state::StateDir::new(provider_dir.clone()).unwrap();
+        state_dir
+            .write_state(&minvmd::state::State {
+                lifecycle: minvmd::lifecycle::Lifecycle::Running,
+                ..minvmd::state::State::stopped()
+            })
+            .unwrap();
+        let _alive = state_dir.try_acquire_alive_lock().unwrap();
+        let requests = fake_vm_host(
+            provider_dir.join("control.sock"),
+            r#"{"error":"the switch's address plan is exhausted; no box address remains"}"#
+                .to_string(),
+        )
+        .await;
+        let server = minimald::test_harness::TestServer::new().await;
+        server.listen_on_uds(&provider_dir.join("ssh.sock")).await;
+
+        // A project directory with nothing special about it: the activation
+        // is refused at the registration, before any of the loadout or
+        // upload steps that would need one.
+        let project = tempfile::TempDir::new().unwrap();
+        let global = GlobalArgs {
+            provider: Some(Provider::LocalMinvmd),
+            minimal_dir: Some(state.path().to_path_buf()),
+            no_input: true,
+            ..Default::default()
+        };
+        let args = ActivateArgs {
+            name: Some("web".to_string()),
+            path: Some(project.path().to_str().unwrap().to_string()),
+            network: CliNetworkMode::OwnIp,
+            no_prompt: true,
+            attach: false,
+            ..bare_activate_args()
+        };
+        let error = activate_session(&global, args, false)
+            .await
+            .expect_err("a refused registration ends the activation");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("registering the box with the VM host daemon failed"),
+            "the error names what failed: {rendered}"
+        );
+        assert!(
+            rendered.contains("address plan is exhausted"),
+            "the error carries the daemon's cause: {rendered}"
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "the refusal answered exactly one registration"
+        );
+
+        // And the session did not fall back to running unregistered: the
+        // daemon behind the ssh socket holds no session at all.
+        let mut client = server.connect().await;
+        let listed = client.call::<minimald_rpc::ListSessions>(&()).await;
+        assert!(
+            listed.sessions.is_empty(),
+            "no session was created for the unregistered box"
         );
     }
 }
