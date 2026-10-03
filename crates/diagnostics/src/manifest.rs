@@ -23,6 +23,9 @@ pub enum Redaction {
     /// A streamed source exceeded its cap; only the leading portion was
     /// captured and the rest was discarded mid-stream.
     Truncated,
+    /// Free-text credential scrubbing was applied; the content may differ
+    /// from the original.
+    Scrubbed,
 }
 
 /// Top-level manifest, serialized as the bundle's `manifest.json`.

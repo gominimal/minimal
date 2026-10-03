@@ -177,6 +177,12 @@ impl<W: BundleSink> BundleWriter<W> {
 
     /// Copies up to the last `cap` bytes of `src` to `path`. Files over the
     /// cap are recorded as tail-capped; smaller ones as unredacted copies.
+    ///
+    /// Content is scrubbed line-wise through
+    /// [`crate::redact::scrub_secrets`] before writing, so credentials that
+    /// landed in log tails before this fix are cleaned too. When any line
+    /// was changed the manifest records [`Redaction::Scrubbed`] rather than
+    /// `None` or `TailCapped`.
     pub async fn add_file_tail(
         &mut self,
         path: &str,
@@ -200,12 +206,19 @@ impl<W: BundleSink> BundleWriter<W> {
             .read_to_end(&mut contents)
             .await
             .with_context(|| format!("reading {}", src.display()))?;
-        let redaction = if capped {
+
+        // Scrub line-wise so a credential in a log tail is cleaned even when
+        // it was logged before this fix.
+        let scrubbed = scrub_lines(&contents);
+        let was_scrubbed = scrubbed != contents;
+        let redaction = if was_scrubbed {
+            Redaction::Scrubbed
+        } else if capped {
             Redaction::TailCapped
         } else {
             Redaction::None
         };
-        self.add_bytes(path, &contents, redaction).await
+        self.add_bytes(path, &scrubbed, redaction).await
     }
 
     /// Records something deliberately withheld from the bundle.
@@ -329,6 +342,33 @@ impl<W: BundleSink> BundleWriter<W> {
         self.writing = false;
         written.with_context(|| format!("adding {full}"))
     }
+}
+
+/// Runs [`crate::redact::scrub_secrets`] on each line of `input`,
+/// preserving line endings. Returns the original `Vec<u8>` unchanged when
+/// no line was modified.
+fn scrub_lines(input: &[u8]) -> Vec<u8> {
+    let text = match std::str::from_utf8(input) {
+        Ok(s) => s,
+        Err(_) => return input.to_vec(),
+    };
+    let mut out = Vec::with_capacity(input.len());
+    let mut changed = false;
+    for line in text.lines() {
+        if changed {
+            out.push(b'\n');
+        }
+        let scrubbed = crate::redact::scrub_secrets(line);
+        if scrubbed.as_ref() != line {
+            changed = true;
+        }
+        out.extend_from_slice(scrubbed.as_bytes());
+    }
+    // Preserve trailing newline.
+    if text.ends_with('\n') {
+        out.push(b'\n');
+    }
+    if changed { out } else { input.to_vec() }
 }
 
 /// Joins a caller-supplied group with a collector's fixed relative path.
@@ -551,6 +591,45 @@ pub(crate) mod tests {
         w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_file_tail_scrubs_credentials() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("minimald.log");
+        std::fs::write(
+            &log,
+            "2024-01-01T00:00:00Z  INFO exec request command=min://argv [\"sh\",\"-c\",\"curl -H 'Authorization: Bearer ghp_FAKETOKEN' https://x/\"]\n",
+        )
+        .unwrap();
+        let out = tmp.path().join("b.tar.zst");
+
+        let mut w = BundleWriter::create(&out, "r", "test-version")
+            .await
+            .unwrap();
+        w.add_file_tail("logs/minimald.log", &log, 1024)
+            .await
+            .unwrap();
+        w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
+            .await
+            .unwrap();
+
+        let files = unpack_bundle(&out, "r").await;
+        let contents = std::str::from_utf8(&files["logs/minimald.log"]).unwrap();
+        assert!(
+            !contents.contains("ghp_FAKETOKEN"),
+            "token must be scrubbed, got: {contents}"
+        );
+        assert!(
+            contents.contains("<redacted:len=13>"),
+            "token must be replaced with placeholder, got: {contents}"
+        );
+        let manifest: serde_json_lenient::Value =
+            serde_json_lenient::from_slice(&files["manifest.json"]).unwrap();
+        assert_eq!(
+            manifest["collected"][0]["redaction"], "scrubbed",
+            "manifest must record scrubbed redaction"
+        );
     }
 
     /// A write cancelled part-way through its tar record must not be followed

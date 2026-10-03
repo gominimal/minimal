@@ -7,6 +7,7 @@
 //! conservative: false positives (masking a harmless value) are
 //! acceptable, false negatives (leaking a secret) are not.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use serde_json_lenient::Value;
@@ -193,6 +194,242 @@ pub fn masked_process_env(is_value_allowed: impl Fn(&str) -> bool) -> BTreeMap<S
         .collect()
 }
 
+/// Masks credential-shaped tokens in free text, fail-closed per token.
+///
+/// Returns `Cow::Borrowed` when nothing was changed, so callers can skip
+/// re-encoding when the input was clean. The scrubber targets:
+///
+/// - `Authorization:` / `Proxy-Authorization:` header values (the credential
+///   after `Bearer`, `Basic`, or `token`).
+/// - URL userinfo (`scheme://<redacted>@host`).
+/// - Well-known token prefixes: `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
+///   `github_pat_`, `sk-`, `xoxa-`, `xoxb-`, `xoxp-`, `AKIA` + 16 hex.
+/// - `key=value` pairs whose key trips [`is_sensitive_key`].
+///
+/// The placeholder reuses [`redaction_placeholder`]'s format so every
+/// redacted value in a bundle reads consistently.
+pub fn scrub_secrets(input: &str) -> Cow<'_, str> {
+    let mut output = String::with_capacity(input.len());
+    let mut rest = input;
+    let mut changed = false;
+
+    while let Some(pos) = find_next_credential(rest) {
+        let matched = &rest[pos.start..pos.end];
+        // A placeholder is already redacted; leave it and advance past it so
+        // scrubbing twice equals scrubbing once.
+        if matched.starts_with("<redacted:len=") {
+            output.push_str(&rest[..pos.end]);
+            rest = &rest[pos.end..];
+            continue;
+        }
+        changed = true;
+        // Copy the safe prefix up to the match.
+        output.push_str(&rest[..pos.start]);
+        // Emit the redacted placeholder.
+        let original_len = pos.end - pos.start;
+        output.push_str(&format!("<redacted:len={original_len}>"));
+        rest = &rest[pos.end..];
+    }
+
+    if changed {
+        output.push_str(rest);
+        Cow::Owned(output)
+    } else {
+        Cow::Borrowed(input)
+    }
+}
+
+/// Byte range of a credential-shaped token found in `input`.
+struct CredentialMatch {
+    start: usize,
+    end: usize,
+}
+
+/// Scans `input` for the first credential-shaped token and returns its byte
+/// range, or `None` when the input is clean.
+fn find_next_credential(input: &str) -> Option<CredentialMatch> {
+    // Authorization / Proxy-Authorization header values.
+    if let Some(m) = find_auth_header(input) {
+        return Some(m);
+    }
+    // URL userinfo.
+    if let Some(m) = find_url_userinfo(input) {
+        return Some(m);
+    }
+    // Well-known token shapes.
+    if let Some(m) = find_known_token(input) {
+        return Some(m);
+    }
+    // key=value with a sensitive key.
+    if let Some(m) = find_sensitive_key_value(input) {
+        return Some(m);
+    }
+    None
+}
+
+/// Matches `Authorization: <type> <credential>` or
+/// `Proxy-Authorization: <type> <credential>`.
+fn find_auth_header(input: &str) -> Option<CredentialMatch> {
+    let lower = input.to_ascii_lowercase();
+    let header_start = lower.find("authorization:")?;
+    let after_header = header_start + "authorization:".len();
+
+    let rest = &input[after_header..];
+    let rest_lower = &lower[after_header..];
+
+    // Skip whitespace between `:` and the scheme.
+    let trimmed = rest.trim_start();
+    let ws_skip = rest.len() - trimmed.len();
+    let scheme_start = ws_skip;
+
+    // Find the auth scheme: Bearer, Basic, or token (case-insensitive).
+    let scheme_len = if rest_lower[scheme_start..].starts_with("bearer") {
+        "bearer".len()
+    } else if rest_lower[scheme_start..].starts_with("basic") {
+        "basic".len()
+    } else if rest_lower[scheme_start..].starts_with("token") {
+        "token".len()
+    } else {
+        return None;
+    };
+
+    let after_scheme = scheme_start + scheme_len;
+    let after_scheme_str = &rest[after_scheme..];
+    let cred = after_scheme_str.trim_start();
+    if cred.is_empty() {
+        return None;
+    }
+    let cred_skip = after_scheme_str.len() - cred.len();
+
+    // The credential runs to the next whitespace, quote, or end of input.
+    let cred_end = cred
+        .find(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+        .unwrap_or(cred.len());
+
+    if cred_end == 0 {
+        return None;
+    }
+
+    Some(CredentialMatch {
+        start: after_header + after_scheme + cred_skip,
+        end: after_header + after_scheme + cred_skip + cred_end,
+    })
+}
+
+/// Matches `scheme://user:password@host` — the userinfo portion.
+fn find_url_userinfo(input: &str) -> Option<CredentialMatch> {
+    // Find `://` then look for `@` after it, with a `:` between them.
+    // Skip past any leading `<redacted:len=N>` placeholder so we don't
+    // match the `://` inside one.
+    let search_start = if input.starts_with("<redacted:len=") {
+        input.find('>').map_or(0, |i| i + 1)
+    } else {
+        0
+    };
+    let tail = &input[search_start..];
+    let scheme_end = tail.find("://")?;
+    let after_scheme = &tail[scheme_end + 3..];
+    let at_pos = after_scheme.find('@')?;
+    let userinfo = &after_scheme[..at_pos];
+    // Must contain a colon (user:password).
+    if !userinfo.contains(':') {
+        return None;
+    }
+    Some(CredentialMatch {
+        start: search_start + scheme_end + 3,
+        end: search_start + scheme_end + 3 + at_pos,
+    })
+}
+
+/// Matches well-known token shapes: GitHub tokens, OpenAI keys, Slack tokens,
+/// AWS access keys.
+fn find_known_token(input: &str) -> Option<CredentialMatch> {
+    let prefixes: &[&str] = &[
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "sk-",
+        "xoxa-",
+        "xoxb-",
+        "xoxp-",
+    ];
+
+    for prefix in prefixes {
+        if let Some(pos) = input.find(prefix) {
+            // The token runs to the next whitespace, quote, or end of input.
+            let rest = &input[pos + prefix.len()..];
+            let token_end = rest
+                .find(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+                .unwrap_or(rest.len());
+            if token_end > 0 {
+                return Some(CredentialMatch {
+                    start: pos,
+                    end: pos + prefix.len() + token_end,
+                });
+            }
+        }
+    }
+
+    // AKIA + 16 uppercase hex chars (AWS access key).
+    if let Some(pos) = input.find("AKIA") {
+        let rest = &input[pos + 4..];
+        if rest.len() >= 16 {
+            let candidate = &rest[..16];
+            if candidate
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            {
+                return Some(CredentialMatch {
+                    start: pos,
+                    end: pos + 4 + 16,
+                });
+            }
+        }
+    }
+
+    None
+}
+
+/// Matches `key=value` where `key` trips [`is_sensitive_key`].
+fn find_sensitive_key_value(input: &str) -> Option<CredentialMatch> {
+    // Scan for `=` preceded by a key-like token. The key is the run of
+    // non-whitespace immediately before `=`, so `--token=value` and
+    // `token=value` both match.
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(eq_pos) = bytes[i..].iter().position(|&b| b == b'=') {
+            let eq_idx = i + eq_pos;
+            // Walk back from `=` to the start of the key token.
+            let key_start = input[..eq_idx]
+                .rfind(char::is_whitespace)
+                .map_or(0, |p| p + 1);
+            let key = &input[key_start..eq_idx];
+            if is_sensitive_key(key) {
+                // Value runs to next whitespace, quote, or end.
+                let val_start = eq_idx + 1;
+                let val_rest = &input[val_start..];
+                let val_end = val_rest
+                    .find(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+                    .unwrap_or(val_rest.len());
+                if val_end > 0 {
+                    return Some(CredentialMatch {
+                        start: val_start,
+                        end: val_start + val_end,
+                    });
+                }
+            }
+            i = eq_idx + 1;
+        } else {
+            break;
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,5 +612,85 @@ mod tests {
                 "{name} must be masked, got: {value}"
             );
         }
+    }
+
+    #[test]
+    fn scrub_masks_authorization_header() {
+        let out = scrub_secrets("curl -H 'Authorization: Bearer abc123' https://x/");
+        assert!(!out.contains("abc123"));
+        assert!(out.contains("Authorization: Bearer <redacted:len=6>"));
+    }
+
+    #[test]
+    fn scrub_masks_authorization_token_header() {
+        let out = scrub_secrets("-H 'Authorization: token ghp_zzz'");
+        assert!(!out.contains("ghp_zzz"));
+        assert!(out.contains("Authorization: token <redacted:len=7>"));
+    }
+
+    #[test]
+    fn scrub_masks_proxy_authorization() {
+        let out = scrub_secrets("Proxy-Authorization: Basic dXNlcjpwYXNz");
+        assert!(!out.contains("dXNlcjpwYXNz"));
+        assert!(out.contains("Proxy-Authorization: Basic <redacted:len=12>"));
+    }
+
+    #[test]
+    fn scrub_masks_url_userinfo() {
+        let out = scrub_secrets("https://user:sekrit@host/path");
+        assert!(!out.contains("sekrit"));
+        assert!(out.contains("https://<redacted:len=11>@host/path"));
+    }
+
+    #[test]
+    fn scrub_masks_bare_github_token() {
+        let out = scrub_secrets("ghp_EXAMPLEEXAMPLEEXAMPLEEXAMPLE0000");
+        assert!(!out.contains("EXAMPLE"));
+        assert!(out.contains("<redacted:len=36>"));
+    }
+
+    #[test]
+    fn scrub_masks_token_flag() {
+        let out = scrub_secrets("--token=ghp_zzz");
+        assert!(!out.contains("ghp_zzz"));
+        assert!(out.contains("--token=<redacted:len=7>"));
+    }
+
+    #[test]
+    fn scrub_masks_sk_token() {
+        let out = scrub_secrets("sk-abcdef1234567890");
+        assert!(!out.contains("abcdef"));
+        assert!(out.contains("<redacted:len=19>"));
+    }
+
+    #[test]
+    fn scrub_masks_slack_token() {
+        let out = scrub_secrets("xoxb-1234567890-abcdef");
+        assert!(!out.contains("1234567890"));
+        assert!(out.contains("<redacted:len=22>"));
+    }
+
+    #[test]
+    fn scrub_masks_aws_access_key() {
+        let out = scrub_secrets("AKIAIOSFODNN7EXAMPLE");
+        assert!(!out.contains("IOSFODNN7EXAMPLE"));
+        assert!(out.contains("<redacted:len=20>"));
+    }
+
+    #[test]
+    fn scrub_passes_ordinary_argv_through() {
+        for argv in ["cargo build --release", "ls -la /tmp"] {
+            let out = scrub_secrets(argv);
+            assert!(matches!(out, Cow::Borrowed(_)), "{argv} should be borrowed");
+            assert_eq!(out, argv);
+        }
+    }
+
+    #[test]
+    fn scrub_is_idempotent() {
+        let input = "curl -H 'Authorization: Bearer abc123' https://user:pw@host/";
+        let once = scrub_secrets(input);
+        let twice = scrub_secrets(&once);
+        assert_eq!(once, twice);
     }
 }
