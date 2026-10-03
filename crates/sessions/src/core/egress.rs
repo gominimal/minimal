@@ -1345,7 +1345,7 @@ mod tests {
     /// box-to-host default-deny owes a lane-less box stays the host-side
     /// gate's to make.
     #[test]
-    fn credentialed_lane_admits_the_proxy_address_under_deny_all() {
+    fn proxy_lane_admits_only_the_listener() {
         // The Box Egress Proxy's address on the switch these tests' resolver
         // and lease are drawn from (broadcast - 3 of the default /16).
         const PROXY: [u8; 4] = [100, 64, 255, 252];

@@ -3045,7 +3045,7 @@ pub(crate) mod tests {
     /// and the refusal a lane-less box meets at the listener is the
     /// host-side gate's, never a substitute the rules make.
     #[tokio::test]
-    async fn credentialed_lane_reaches_the_proxy_address_under_deny_all() {
+    async fn compiled_egress_carries_the_credentialed_lane() {
         // The address the lane admits is the switch's own Box Egress Proxy
         // address (`broadcast - 3` of the default /16), the one the e2e
         // cases probe — read from the subnet, not restated as its own
