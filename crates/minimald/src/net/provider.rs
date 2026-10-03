@@ -29,6 +29,126 @@ use crate::net::policy::ControlChannel;
 pub(crate) struct OwnAddressReporter {
     registry: Arc<RwLock<crate::net::dns::HostnameRegistry>>,
     session_id: SessionId,
+    /// The box's runtime publishes (NET-044), shared with its session actor:
+    /// the attach this reporter rides hands it to the spawn's guard, so the
+    /// runtime forwards come down with the spawn exactly as the declared
+    /// ones do.
+    runtime_ingress: RuntimeIngress,
+}
+
+/// One live runtime publish (NET-044): the forwarder the switch accepted,
+/// paired with the mapping it published — held together, so the list the
+/// policy surfaces read is exactly what the switch holds.
+pub(crate) struct LiveIngressForward {
+    /// The daemon-owned forward: its unexpose releases the port.
+    pub(crate) forwarder: crate::net::policy::PortForwarder,
+    /// The mapping as the policy surfaces read it.
+    pub(crate) mapping: minimald_rpc::LiveMapping,
+}
+
+/// The row the policy surfaces read, not the forwarder's own internals —
+/// `PortForwarder` is a handle, and the mapping is the fact it published.
+impl std::fmt::Debug for LiveIngressForward {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveIngressForward")
+            .field("mapping", &self.mapping)
+            .finish()
+    }
+}
+
+#[derive(Default)]
+struct RuntimeIngressState {
+    /// The spawn that held the box's switch address has ended and no new one
+    /// has attached: a forward published now would deliver to a lease the
+    /// switch may already have handed to another box.
+    detached: bool,
+    forwards: Vec<LiveIngressForward>,
+}
+
+/// The ports a box published at runtime with its own `min net expose`
+/// (NET-044), shared between its session actor — which publishes, lists and
+/// unbinds them at stop — and the guard of the spawn they deliver to. A
+/// runtime forward delivers to that spawn's lease, and leases are per-spawn,
+/// so the forwards follow the declared ones: the spawn's teardown unbinds
+/// them beside its declared forwards, and the next spawn starts with none
+/// rather than inheriting a forward aimed at a stale address.
+#[derive(Clone, Default)]
+pub(crate) struct RuntimeIngress(Arc<std::sync::Mutex<RuntimeIngressState>>);
+
+impl std::fmt::Debug for RuntimeIngress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeIngress")
+            .field("mappings", &self.snapshot())
+            .finish()
+    }
+}
+
+impl RuntimeIngress {
+    fn state(&self) -> std::sync::MutexGuard<'_, RuntimeIngressState> {
+        self.0.lock().expect("runtime ingress lock poisoned")
+    }
+
+    /// The live mappings, in publish order — the rows `min session policy`
+    /// lists beside the declaration.
+    pub(crate) fn snapshot(&self) -> Vec<minimald_rpc::LiveMapping> {
+        self.state()
+            .forwards
+            .iter()
+            .map(|live| live.mapping.clone())
+            .collect()
+    }
+
+    /// Whether `internal_port` is published already, live.
+    pub(crate) fn publishes(&self, internal_port: u16) -> bool {
+        self.state()
+            .forwards
+            .iter()
+            .any(|live| live.mapping.internal_port == internal_port)
+    }
+
+    /// Whether the spawn the box's forwards deliver to has ended with no new
+    /// one attached.
+    pub(crate) fn is_detached(&self) -> bool {
+        self.state().detached
+    }
+
+    /// Records a publish the switch accepted. Refused — handing the forward
+    /// back for the caller to unbind — when the spawn it delivers to ended
+    /// while the publish was in flight, so a forward aimed at a dead lease is
+    /// never recorded as live.
+    pub(crate) fn record(&self, live: LiveIngressForward) -> Result<(), LiveIngressForward> {
+        let mut state = self.state();
+        if state.detached {
+            return Err(live);
+        }
+        state.forwards.push(live);
+        Ok(())
+    }
+
+    /// A spawn attached: its lease is the box's switch address from here on.
+    fn attached(&self) {
+        self.state().detached = false;
+    }
+
+    /// The spawn ended: takes every runtime forward for the guard to unbind
+    /// beside the declared ones, and refuses publishes until the next attach.
+    pub(crate) fn detach(&self) -> Vec<crate::net::policy::PortForwarder> {
+        let mut state = self.state();
+        state.detached = true;
+        std::mem::take(&mut state.forwards)
+            .into_iter()
+            .map(|live| live.forwarder)
+            .collect()
+    }
+
+    /// The box stopped: takes every runtime forward for the session actor to
+    /// unbind.
+    pub(crate) fn take_all(&self) -> Vec<crate::net::policy::PortForwarder> {
+        std::mem::take(&mut self.state().forwards)
+            .into_iter()
+            .map(|live| live.forwarder)
+            .collect()
+    }
 }
 
 impl OwnAddressReporter {
@@ -42,7 +162,22 @@ impl OwnAddressReporter {
         Self {
             registry,
             session_id,
+            runtime_ingress: RuntimeIngress::default(),
         }
+    }
+
+    /// The same reporter, sharing `runtime_ingress` with the session actor
+    /// that publishes into it.
+    #[must_use]
+    pub(crate) fn with_runtime_ingress(mut self, runtime_ingress: RuntimeIngress) -> Self {
+        self.runtime_ingress = runtime_ingress;
+        self
+    }
+
+    /// The box's runtime publishes, for the spawn's guard to unbind at its
+    /// teardown.
+    pub(crate) fn runtime_ingress(&self) -> RuntimeIngress {
+        self.runtime_ingress.clone()
     }
 
     /// Reports `lease` — with the box's ingress declaration as an
@@ -56,6 +191,8 @@ impl OwnAddressReporter {
             .write()
             .expect("hostname registry lock poisoned");
         registry.report_own_address(self.session_id, session_name, lease, ports);
+        drop(registry);
+        self.runtime_ingress.attached();
     }
 
     /// The host loopback address this box's declaration publishes on (NET-010):

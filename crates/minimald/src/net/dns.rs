@@ -1018,6 +1018,17 @@ impl HostnameRegistry {
         self.own_published.get(&session_id).map(|own| own.address)
     }
 
+    /// The switch lease an own-address box's running PTask last reported
+    /// ([`Self::report_own_address`]), by stable session id — the address a
+    /// forward published for the box delivers to, the same one its declared
+    /// ports' forwards name. Read only beside [`Self::published_own_address`]
+    /// by the session that owns the box: the lease is per-spawn, so it is a
+    /// delivery target and never a key a forward is found by.
+    #[must_use]
+    pub fn own_lease(&self, session_id: SessionId) -> Option<Ipv4Addr> {
+        self.own.get(&session_id).map(|own| own.lease)
+    }
+
     /// Withdraws a destroyed box's publish and returns the address it held,
     /// for the session actor to release into the allocator (NET-010) — the
     /// lease's other half, at the same place the release is logged. A box
