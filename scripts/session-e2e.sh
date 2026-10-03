@@ -10565,6 +10565,49 @@ proof_two_named_vms_on_one_machine() {
     tail -n "+$(($1 + 1))" "$f"
   }
 
+  # Diagnostic capture only — never an assertion, never a failure. Each VM's
+  # host daemon runs one gvproxy whose `-listen` control socket sits beside
+  # that VM's state (crates/minvmd/src/net.rs; the default VM's at the
+  # provider root, a named VM's in its per-name subdirectory — the path
+  # recover's beat C reads), and serves the forwarder and lease tables over
+  # HTTP (docs/spikes/2026-06-21-gvproxy-attachment.md §5). Dumping both at
+  # each phase shows whether a port forward outlives the VM it pointed into:
+  # the KVM lane's default-VM proxy path dials a dead guest after a stop.
+  # $1 = the phase label the transcript lines carry.
+  two_vm_diag_forwarders() {
+    local phase="$1" vm sock found="" ep body
+    for vm in default "$tw_name"; do
+      if [ "$vm" = default ]; then sock="$tw_root/gvproxy-switch.sock"; else sock="$tw_alpha/gvproxy-switch.sock"; fi
+      if [ ! -S "$sock" ]; then
+        echo "T61-DIAG forwarders $phase: VM $vm has no control socket at $sock"
+        continue
+      fi
+      found=1
+      for ep in /services/forwarder/all /leases; do
+        body="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+          -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+          curl -sS --max-time 3 --unix-socket "$sock" "http://gvproxy$ep" 2>&1 || true)"
+        echo "T61-DIAG forwarders $phase: VM $vm GET $ep ($sock): ${body:-<empty>}"
+      done
+    done
+    if [ -z "$found" ]; then
+      echo "T61-DIAG forwarders $phase: no control socket at either candidate; gvproxy sockets under $tw_root:"
+      find "$tw_root" -maxdepth 2 -name '*.sock' 2>/dev/null | sed 's/^/  /' || true
+    fi
+    if [ -d /proc ]; then
+      local proc entry
+      for proc in /proc/[0-9]*; do
+        entry="$(tr '\0' ' ' 2>/dev/null <"$proc/cmdline" || true)"
+        case "$entry" in
+          *gvproxy*-listen*) echo "T61-DIAG forwarders $phase: live gvproxy pid ${proc#/proc/}: $entry" ;;
+        esac
+      done
+    else
+      pgrep -fl 'gvproxy.*-listen' 2>/dev/null \
+        | sed "s/^/T61-DIAG forwarders $phase: live gvproxy pid /" || true
+    fi
+  }
+
   # ---- two VMs, each with its own box --------------------------------------
   # The default VM comes down first, whatever an earlier case left running:
   # both boots must happen in THIS case, or the two start records below
@@ -10587,6 +10630,7 @@ proof_two_named_vms_on_one_machine() {
     fail
   fi
   echo "stop: the default VM is down; both boots happen in this case"
+  two_vm_diag_forwarders after-default-stop
   # The shared log snapshot both start records must land after.
   tw_log="$(two_vm_minvmd_log)"
   tw_log_lines=0
@@ -10657,6 +10701,7 @@ proof_two_named_vms_on_one_machine() {
        fail ;;
   esac
   echo "daemons: default '$tw_status_a' · $tw_name '$tw_status_b'"
+  two_vm_diag_forwarders both-up
 
   # ---- NET-057: one listing, both VMs, every box attributed ----------------
   tw_ls="$(mnl ls 2>"$WORK/two-vm-ls.err")" \
@@ -10892,6 +10937,7 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     fail
   fi
   echo "stop: minvmd --vm $tw_name stop -> '$(minvmd --vm "$tw_name" status --json 2>/dev/null || true)'"
+  two_vm_diag_forwarders after-stop
   # The stopped VM contributes nothing to the one listing, silently. Both of
   # the contributions the pre-stop listing above asserted are now gone, and
   # the stop is the only thing that ran between: the listing spans every VM
@@ -10936,6 +10982,7 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
        minvmd status --json 2>&1 || true
        fail ;;
   esac
+  two_vm_diag_forwarders before-net055-dial
   two_vm_route "$tw_port_a" "http://$TWO_VM_A_NAME.min.internal:$TWO_VM_A_PORT/" \
     "NET-055: with $tw_name stopped, the default VM still routes its box's name"
   two_vm_route_want 200 "$TWO_VM_A_MARKER"
