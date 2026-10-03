@@ -466,7 +466,7 @@ async fn file_custody(path: &str) -> Option<FileCustody> {
     let metadata = tokio::fs::metadata(path).await.ok()?;
     Some(FileCustody {
         owner: metadata.uid(),
-        mode: metadata.permissions().mode(),
+        mode: metadata.permissions().mode() & 0o7777,
     })
 }
 
