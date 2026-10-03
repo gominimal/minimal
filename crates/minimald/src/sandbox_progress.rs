@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use crate::net::classifier::{record_node_plane_fetch, url_host, url_object};
 use futures::{Stream, StreamExt as _};
-use ot::{OpId, OpSnapshot, OpTracker, Operation, Progress};
+use ot::{OpId, OpSnapshot, OpStartHook, OpTracker, Operation, Progress};
 
 /// Width of the package-name field, so the meter stays put as names change.
 const NAME_WIDTH: usize = 18;
@@ -39,9 +39,10 @@ pub(crate) struct SandboxProgress {
     /// Every fetch seen since downloads last went idle, finished ones included,
     /// so the meter totals never shrink when one download of several completes.
     fetches: BTreeMap<OpId, Fetch>,
-    /// NET-080: the context this install's fetches are recorded under; `None`
-    /// records nothing, which is every progress but an install's.
-    fetch_record: Option<FetchRecord>,
+    /// NET-080: the hook recording this install's fetches as each starts;
+    /// `None` records nothing, which is every progress but an install's.
+    /// Dropped with the progress, so the record ends with the install.
+    _fetch_hook: Option<OpStartHook>,
     /// Last line written, so an unchanged tree does not repaint.
     last: Option<String>,
 }
@@ -52,7 +53,7 @@ impl SandboxProgress {
             tracker,
             scope,
             fetches: BTreeMap::new(),
-            fetch_record: None,
+            _fetch_hook: None,
             last: None,
         }
     }
@@ -61,8 +62,18 @@ impl SandboxProgress {
     /// traffic, under [`FetchRecord`]'s context — the daemon's own fetches,
     /// made for the box that asked, each named with the host it left for
     /// and the object it brought back.
+    ///
+    /// Recorded from the tracker's op-start hook, not the meter: the meter
+    /// reads a snapshot every paint, and a fetch that starts and ends between
+    /// two paints has left the tree before the next, so a record taken there
+    /// would miss it. The hook sees every op the tree starts, exactly once.
+    /// Without a tracker there is no fetch to see and nothing is recorded.
     pub(crate) fn with_fetch_record(mut self, record: FetchRecord) -> Self {
-        self.fetch_record = Some(record);
+        if let Some(tracker) = &self.tracker {
+            let scope = self.scope.clone();
+            self._fetch_hook =
+                Some(tracker.on_op_start(move |op| record_fetch(&record, scope.as_ref(), op)));
+        }
         self
     }
 
@@ -107,25 +118,15 @@ impl SandboxProgress {
             match self.activity(op) {
                 Some(Activity::Fetch(name)) => {
                     live.insert(row.id);
-                    // NET-080: the first time a fetch op is seen is when it
-                    // starts, so that is where the daemon's own fetch is
-                    // recorded — once per fetch, whatever the repaints, and
-                    // never a fetch the tree does not carry.
-                    let newly_started = self
-                        .fetches
-                        .insert(
-                            row.id,
-                            Fetch {
-                                name,
-                                pos,
-                                len,
-                                live: true,
-                            },
-                        )
-                        .is_none();
-                    if newly_started {
-                        self.record_fetch(op);
-                    }
+                    self.fetches.insert(
+                        row.id,
+                        Fetch {
+                            name,
+                            pos,
+                            len,
+                            live: true,
+                        },
+                    );
                 }
                 Some(Activity::Status(status)) => statuses.push(status),
                 None => {}
@@ -180,40 +181,37 @@ impl SandboxProgress {
             _ => None,
         }
     }
+}
 
-    /// NET-080: one node-plane record for the fetch `op` names, under the
-    /// [`FetchRecord`] this install was started with: the box the fetch was
-    /// made for, and — per operation, the same division the meter shows —
-    /// the host it leaves for and the object it brings back. A package or
-    /// the index is fetched from the configured remote cache; a source from
-    /// the URL it names, spelled as the record writes it — with neither the
-    /// URL's credentials nor its query, which never belong in a log line.
-    /// Scoping is the meter's own: a package outside this install's scope is
-    /// not this install's fetch, while a source or the index names no
-    /// package to scope by and is attributed to whatever is building, the
-    /// same caveat the meter's row carries.
-    fn record_fetch(&self, op: &Operation) {
-        let Some(record) = &self.fetch_record else {
-            return;
-        };
-        let (host, object) = match op {
-            Operation::FetchPkg { name } => (
-                record.cache_host.clone(),
-                record
-                    .objects
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| name.clone()),
-            ),
-            // A source with no scheme is a tarball read off the operator's
-            // own disk: it crosses no network, so it is no node-plane fetch.
-            Operation::FetchSource { url } if !url.contains("://") => return,
-            Operation::FetchSource { url } => (url_host(url), url_object(url)),
-            Operation::FetchIndex => (record.cache_host.clone(), "index".to_owned()),
-            _ => return,
-        };
-        record_node_plane_fetch(&record.box_id, record.leaf, &host, &object);
-    }
+/// NET-080: one node-plane record for the fetch `op` names, under the
+/// [`FetchRecord`] an install was started with: the box the fetch was made
+/// for, and — per operation, the same division the meter shows — the host it
+/// leaves for and the object it brings back. A package or the index is
+/// fetched from the configured remote cache; a source from the URL it names,
+/// spelled as the record writes it — with neither the URL's credentials nor
+/// its query, which never belong in a log line. Scoping is the meter's own: a
+/// package outside the install's `scope` is not this install's fetch, while a
+/// source or the index names no package to scope by and is attributed to
+/// whatever is building, the same caveat the meter's row carries. Run from
+/// the tracker's op-start hook, once per op as it starts.
+fn record_fetch(record: &FetchRecord, scope: Option<&HashSet<String>>, op: &Operation) {
+    let (host, object) = match op {
+        Operation::FetchPkg { name } if scope.is_none_or(|s| s.contains(name)) => (
+            record.cache_host.clone(),
+            record
+                .objects
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| name.clone()),
+        ),
+        // A source with no scheme is a tarball read off the operator's
+        // own disk: it crosses no network, so it is no node-plane fetch.
+        Operation::FetchSource { url } if !url.contains("://") => return,
+        Operation::FetchSource { url } => (url_host(url), url_object(url)),
+        Operation::FetchIndex => (record.cache_host.clone(), "index".to_owned()),
+        _ => return,
+    };
+    record_node_plane_fetch(&record.box_id, record.leaf, &host, &object);
 }
 
 /// NET-080: the context the daemon's own fetches are recorded under — the
@@ -748,22 +746,31 @@ mod tests {
         (log, guard)
     }
 
+    /// The node-plane records in `log`, one per line.
+    fn records(log: &LogCapture) -> Vec<String> {
+        log.contents()
+            .lines()
+            .filter(|line| line.contains("node-plane traffic"))
+            .map(str::to_string)
+            .collect()
+    }
+
     /// NET-080: an install's package fetch is recorded as node-plane traffic
     /// at the seam, where the op starts — one info line naming the box the
     /// fetch was made for, the daemon's own leaf, the cache host it left
     /// for, and the package with its version. One line per fetch, whatever
-    /// the repaints, and none for a fully cached add, which fetches nothing:
-    /// its ops extract and build what the cache already holds.
+    /// the repaints, none for a package outside the install's scope, and
+    /// none for a fully cached add, which fetches nothing: its ops extract
+    /// and build what the cache already holds.
     #[test]
     fn a_fetch_op_start_records_one_node_plane_line() {
         let root = OpTracker::new_root();
-        let _jq = fetch(&root, "jq", 1024, 128);
         let scope = HashSet::from(["jq".to_string()]);
         let (log, _guard) = capture_log();
-        let mut progress =
-            SandboxProgress::new(None, Some(scope.clone())).with_fetch_record(fetch_record());
+        let mut progress = SandboxProgress::new(Some(root.clone()), Some(scope.clone()))
+            .with_fetch_record(fetch_record());
+        let _jq = fetch(&root, "jq", 1024, 128);
 
-        progress.line(&root.snapshot());
         let recorded = log.contents();
         let lines: Vec<&str> = recorded
             .lines()
@@ -797,13 +804,13 @@ mod tests {
         );
 
         // The meter repaints at ~12 Hz while a fetch runs; a fetch is an
-        // event, not a meter, so the repaints record nothing more.
+        // event, not a meter, so the repaints record nothing more. Nor does
+        // a package outside the install's scope: it is not this install's.
         progress.line(&root.snapshot());
+        progress.line(&root.snapshot());
+        let _llvm = fetch(&root, "llvm", 4096, 0);
         assert_eq!(
-            log.contents()
-                .lines()
-                .filter(|line| line.contains("node-plane traffic"))
-                .count(),
+            records(&log).len(),
             1,
             "the fetch is recorded once, at its start"
         );
@@ -811,12 +818,12 @@ mod tests {
         // A fully cached add fetches nothing — extract and build ops over
         // what the cache already holds — so it records nothing.
         let cached = OpTracker::new_root();
+        let (quiet, _guard) = capture_log();
+        let mut cached_progress = SandboxProgress::new(Some(cached.clone()), Some(scope))
+            .with_fetch_record(fetch_record());
         let _extract = cached.new_child().with_op(Operation::ExtractPkg {
             name: "jq".to_string(),
         });
-        let (quiet, _guard) = capture_log();
-        let mut cached_progress =
-            SandboxProgress::new(None, Some(scope)).with_fetch_record(fetch_record());
         assert!(
             cached_progress.line(&cached.snapshot()).is_some(),
             "the cached add still paints its extract"
@@ -836,6 +843,9 @@ mod tests {
     #[test]
     fn each_fetch_kind_is_recorded_with_its_own_host_and_object() {
         let root = OpTracker::new_root();
+        let (log, _guard) = capture_log();
+        let _progress =
+            SandboxProgress::new(Some(root.clone()), None).with_fetch_record(fetch_record());
         let _pkg = root.new_child().with_op(Operation::FetchPkg {
             name: "jq".to_string(),
         });
@@ -843,16 +853,8 @@ mod tests {
             url: "https://github.com/example/example/archive/v1.tar.gz".to_string(),
         });
         let _index = root.new_child().with_op(Operation::FetchIndex);
-        let (log, _guard) = capture_log();
-        let mut progress = SandboxProgress::new(None, None).with_fetch_record(fetch_record());
-        progress.line(&root.snapshot());
 
-        let lines: Vec<String> = log
-            .contents()
-            .lines()
-            .filter(|line| line.contains("node-plane traffic"))
-            .map(str::to_string)
-            .collect();
+        let lines = records(&log);
         assert_eq!(
             lines.len(),
             3,
@@ -890,12 +892,12 @@ mod tests {
     #[test]
     fn a_local_source_is_not_recorded_as_node_plane_traffic() {
         let root = OpTracker::new_root();
+        let (log, _guard) = capture_log();
+        let _progress =
+            SandboxProgress::new(Some(root.clone()), None).with_fetch_record(fetch_record());
         let _source = root.new_child().with_op(Operation::FetchSource {
             url: "../tarballs/v4.tar.gz".to_string(),
         });
-        let (log, _guard) = capture_log();
-        let mut progress = SandboxProgress::new(None, None).with_fetch_record(fetch_record());
-        progress.line(&root.snapshot());
 
         let recorded = log.contents();
         assert!(
@@ -914,12 +916,12 @@ mod tests {
     fn a_source_fetch_record_carries_no_credentials() {
         let root = OpTracker::new_root();
         let url = "https://ghp_deadbeef@github.com/example/example/archive/v1.tar.gz?X-Amz-Signature=deadbeef";
+        let (log, _guard) = capture_log();
+        let _progress =
+            SandboxProgress::new(Some(root.clone()), None).with_fetch_record(fetch_record());
         let _source = root.new_child().with_op(Operation::FetchSource {
             url: url.to_string(),
         });
-        let (log, _guard) = capture_log();
-        let mut progress = SandboxProgress::new(None, None).with_fetch_record(fetch_record());
-        progress.line(&root.snapshot());
 
         let recorded = log.contents();
         let line = recorded
@@ -939,5 +941,33 @@ mod tests {
             !line.contains("ghp_deadbeef") && !line.contains("X-Amz-Signature"),
             "neither the token nor the signature reaches the log: {line}"
         );
+    }
+
+    /// NET-080: a fetch that starts and ends between two paints — gone from
+    /// the tree before the meter's next snapshot — is still recorded, once:
+    /// the record is taken where the op starts, not where the meter looks.
+    #[test]
+    fn a_fetch_that_starts_and_ends_between_ticks_is_still_recorded() {
+        let root = OpTracker::new_root();
+        let (log, _guard) = capture_log();
+        let mut progress =
+            SandboxProgress::new(Some(root.clone()), None).with_fetch_record(fetch_record());
+
+        let jq = root.new_child().with_op(Operation::FetchPkg {
+            name: "jq".to_string(),
+        });
+        jq.set_done();
+        drop(jq);
+
+        let lines = records(&log);
+        assert_eq!(lines.len(), 1, "one fetch, one record: {lines:?}");
+        assert!(
+            lines[0].contains("object=jq (version 1.7.1)"),
+            "the record names the fetch that came and went: {}",
+            lines[0]
+        );
+        // The meter never saw it, and painting now records nothing more.
+        assert_eq!(progress.line(&root.snapshot()), None);
+        assert_eq!(records(&log).len(), 1);
     }
 }
