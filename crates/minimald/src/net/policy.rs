@@ -20,13 +20,13 @@
 //! plumbing: [`PolicyWarnLimiter`], whose rate limit is keyed by box and
 //! rule, and [`Proto`], the transport a dropped frame is logged under.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-use std::collections::HashMap;
 
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -156,15 +156,160 @@ impl ExposedMapping {
     }
 }
 
+/// A declared port's forwarder, owned by the daemon (NET-121): the mapping the
+/// switch bound for it, the internal port it forwards to, and — when the box
+/// carries a session gate — that gate, which the forwarder's own
+/// [`revoke`](Self::revoke) drives. The switch's unexpose removes a forward's
+/// *listener* and leaves the connections it already holds open, so a revoked
+/// port's connections end at the gate: `revoke` refuses the port at the
+/// relay's ingress legs, terminates the connections the gate holds, and only
+/// then unexposes.
+#[derive(Clone)]
+pub struct PortForwarder {
+    mapping: ExposedMapping,
+    internal_port: u16,
+    gate: Option<Arc<super::switch::SessionGate>>,
+    /// Whether this forwarder's ingress was revoked already — set by
+    /// [`Self::revoke`] once its unbind has *succeeded*, so a revocation that
+    /// failed at the switch stays unrevoked and both a retry and the
+    /// teardown's unexpose still have work to do. `Arc`-shared because the
+    /// forwarder is cloned onto the guard's list and every clone must agree
+    /// on whether the forward stands.
+    revoked: Arc<AtomicBool>,
+}
+
+impl PortForwarder {
+    /// The `host:port` the forward is bound on, as [`ExposedMapping`] reads
+    /// it.
+    #[must_use]
+    pub fn local(&self) -> &str {
+        self.mapping.local()
+    }
+
+    /// [`Self::local`] split into the host address and port.
+    #[must_use]
+    pub fn host_port(&self) -> Option<(&str, u16)> {
+        self.mapping.host_port()
+    }
+
+    /// The internal port the forward delivers to — the port a revocation
+    /// refuses at the box's ingress gate.
+    #[must_use]
+    pub fn internal_port(&self) -> u16 {
+        self.internal_port
+    }
+
+    /// Whether this forwarder's ingress was revoked already: its unbind ran
+    /// and succeeded, so no forward stands at its `local` any more, and
+    /// neither a second revocation nor the teardown's unexpose has anything
+    /// left to ask of the switch.
+    #[must_use]
+    pub fn is_revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
+
+    /// Unbinds the forwarder (NET-121): the gate refuses its port from here
+    /// on — terminating the connections it holds — and the switch unexposes
+    /// the forward. The gate first, so no new connection can cross the gap
+    /// between a port the gate still admits and a listener already gone: a
+    /// refused port is answered by the box, not left hanging at a listener
+    /// that no longer exists.
+    ///
+    /// `keep_admitted` names the internal ports that must stay admitted
+    /// because another *live* forwarder still forwards to them — the shape
+    /// two mappings make when both publish the same in-box port. The gate
+    /// refuses by internal port alone (a box's inbound frames carry no trace
+    /// of which external forward they arrived through), so a revocation whose
+    /// internal port is in the set *withholds* the gate's termination rather
+    /// than end a sibling forwarder's connections with it: the unbind is this
+    /// port's whole effect while the sibling stands, and the port's
+    /// connections end when the last forwarder to it is revoked — the first
+    /// moment they can be told apart at all.
+    ///
+    /// # Errors
+    ///
+    /// The unexpose error, after the termination has run: the caller decides
+    /// whether a failed unbind stops its path.
+    pub async fn revoke(
+        &self,
+        control: &ControlChannel,
+        keep_admitted: &HashSet<u16>,
+    ) -> io::Result<()> {
+        let (host, external_port) = self.host_port().unwrap_or(("", 0));
+        if let Some(gate) = &self.gate {
+            if keep_admitted.contains(&self.internal_port) {
+                // A live sibling forwarder still maps another external port
+                // to this internal port: terminating here would end its
+                // connections with this port's, and the gate cannot tell the
+                // two apart. Withheld, and said so — the log tail names each
+                // revocation with its port and its reason (NET-121).
+                tracing::info!(
+                    host,
+                    port = external_port,
+                    internal_port = self.internal_port(),
+                    reason = "internal port still served by another forwarder",
+                    "unbinding ingress forwarder"
+                );
+            } else {
+                let terminated = gate.revoke_port(self.internal_port());
+                tracing::info!(
+                    host,
+                    port = external_port,
+                    internal_port = self.internal_port(),
+                    terminated,
+                    reason = "ingress revoked",
+                    "unbinding ingress forwarder"
+                );
+            }
+        }
+        let req = UnexposeRequest {
+            local: self.mapping.local.clone(),
+            protocol: self.mapping.protocol.clone(),
+        };
+        match post_json(control, "/services/forwarder/unexpose", &req).await {
+            Ok(()) => {
+                tracing::info!(
+                    host,
+                    port = external_port,
+                    reason = "ingress revoked",
+                    "unbound ingress forwarder"
+                );
+                // Marked only now, when the switch has really dropped the
+                // forward: an unbind that failed leaves the forward standing,
+                // so a retry — and the teardown's unexpose — still have work.
+                self.revoked.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(
+                    host,
+                    port = external_port,
+                    error = %e,
+                    reason = "ingress revoked",
+                    "unbinding ingress forwarder failed"
+                );
+                Err(e)
+            }
+        }
+    }
+}
+
 /// Exposes every static port mapping in `ingress` on the switch's `control_sock`
 /// at `published` — the box's own host loopback address (NET-010) — forwarding
-/// to `ptask_ip`, returning a handle per exposed forward for teardown
-/// (R2.3, R2.4-static). The dynamic range, if any, is not applied here — dynamic
-/// port-mapping is split to #553.
+/// to `ptask_ip`, returning one daemon-owned [`PortForwarder`] per bound
+/// forward (R2.3, R2.4-static, NET-121). The dynamic range, if any, is not
+/// applied here — dynamic port-mapping is split to #553.
 ///
-/// On the first failure the already-exposed forwards are rolled back so a partial
-/// apply does not leak forwards onto the switch, and the original error is
-/// returned.
+/// `gate` is the box's session gate, carried into every forwarder so a later
+/// revocation can end its connections (NET-121); `None` for a caller whose
+/// box has no relay — the netns proofs — where a forwarder simply has no
+/// gate to revoke through.
+///
+/// On the first failure the already-bound forwards are rolled back so a
+/// partial apply does not leak forwards onto the switch, and the original
+/// error is returned. The failure says its own line first (NET-121's sub 2):
+/// one warn per failed bind, naming the declared port and the reason, so the
+/// daemon log's tail shows which port of which address could not bind.
 ///
 /// # Errors
 ///
@@ -174,42 +319,252 @@ pub async fn apply_ingress(
     published: Ipv4Addr,
     ptask_ip: Ipv4Addr,
     ingress: &IngressPolicy,
-) -> io::Result<Vec<ExposedMapping>> {
-    let mut exposed: Vec<ExposedMapping> = Vec::with_capacity(ingress.port_mappings.len());
+    gate: Option<&Arc<super::switch::SessionGate>>,
+) -> io::Result<Vec<PortForwarder>> {
+    let mut bound: Vec<PortForwarder> = Vec::with_capacity(ingress.port_mappings.len());
     for mapping in &ingress.port_mappings {
         let req = expose_request(mapping, published, ptask_ip);
         match post_json(control, "/services/forwarder/expose", &req).await {
-            Ok(()) => exposed.push(ExposedMapping {
-                local: req.local,
-                protocol: req.protocol,
+            Ok(()) => bound.push(PortForwarder {
+                mapping: ExposedMapping {
+                    local: req.local,
+                    protocol: req.protocol,
+                },
+                internal_port: mapping.internal_port,
+                gate: gate.cloned(),
+                revoked: Arc::new(AtomicBool::new(false)),
             }),
             Err(e) => {
+                // The failed bind is the failure's own fact, said where it
+                // happened: the declared port, the address it tried to bind
+                // on, and the reason the switch gave. What follows — the
+                // rollback and the caller's refusal to publish — reads it in
+                // the log beside the name that was never registered.
+                tracing::warn!(
+                    port = mapping.external_port,
+                    local = %req.local,
+                    error = %e,
+                    "binding declared ingress port failed"
+                );
                 // Roll back what we managed to expose so a half-applied policy
                 // does not leave dangling forwards on the shared switch.
-                remove_ingress(control, &exposed).await;
+                remove_ingress(control, &bound).await;
                 return Err(e);
             }
         }
     }
-    Ok(exposed)
+    Ok(bound)
 }
 
-/// Removes every forward in `exposed` from the switch's `control_sock` (R2.3
+/// Removes every forward in `bound` from the switch's `control_sock` (R2.3
 /// teardown on PTask exit). Best-effort: a failed unexpose is logged and the
 /// rest still attempted, since teardown runs on the session-end path where there
-/// is no caller left to propagate to.
-pub async fn remove_ingress(control: &ControlChannel, exposed: &[ExposedMapping]) {
-    for mapping in exposed {
+/// is no caller left to propagate to. A bound forward that comes down says one
+/// info line (NET-121), naming the port it unbound — the unbind half of the
+/// per-forwarder bind/unbind pair the daemon log carries. A forward a
+/// revocation already unbound is skipped: the switch holds no forward at its
+/// `local` any more, and asking again would read as a teardown failure that
+/// is none.
+pub async fn remove_ingress(control: &ControlChannel, bound: &[PortForwarder]) {
+    for forwarder in bound {
+        if forwarder.is_revoked() {
+            continue;
+        }
+        let (host, external_port) = forwarder.host_port().unwrap_or(("", 0));
         let req = UnexposeRequest {
-            local: mapping.local.clone(),
-            protocol: mapping.protocol.clone(),
+            local: forwarder.mapping.local.clone(),
+            protocol: forwarder.mapping.protocol.clone(),
         };
-        if let Err(e) = post_json(control, "/services/forwarder/unexpose", &req).await {
+        match post_json(control, "/services/forwarder/unexpose", &req).await {
+            Ok(()) => {
+                tracing::info!(
+                    host,
+                    port = external_port,
+                    reason = "box stopped",
+                    "unbound ingress forwarder"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    local = %forwarder.local(),
+                    error = %e,
+                    "removing ingress port mapping from switch on PTask exit"
+                );
+            }
+        }
+    }
+}
+
+/// Why a runtime port-publish request was refused **before** the switch was
+/// asked anything: the typed error NET-044's deny arm answers with, rather
+/// than a bare message, so a caller can tell "this box denies dynamic
+/// ingress" from "that port is out of range" without parsing prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExposeRefusal {
+    /// The box's `dynamic_ingress` is unset or `deny` — the deny-all default
+    /// an absent declaration means.
+    DeniedByPolicy,
+    /// `dynamic_ingress` is `ask`: the attached human decides (NET-045), and
+    /// with nobody attached — or until that prompt path exists — the request
+    /// fails closed rather than publishing unasked.
+    AskNeedsAnswer,
+    /// `dynamic_ingress` allows, but the box declares no
+    /// `dynamic_allowed_range`: no port was opted in.
+    NoDynamicRange,
+    /// The requested port lies outside the declared `dynamic_allowed_range`.
+    OutOfRange { requested: u16, range: (u16, u16) },
+    /// The box holds no address pair on file — the hand a VM host's
+    /// registration gave it (T66), which names both the loopback address its
+    /// declaration publishes on and the switch address its forwards deliver
+    /// to — so there is nowhere to bind and nothing to forward to.
+    NoPublishedAddress,
+    /// The port is published already, live, by this box.
+    AlreadyPublished(u16),
+}
+
+impl fmt::Display for ExposeRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeniedByPolicy => {
+                write!(f, "dynamic ingress is denied for this box")
+            }
+            Self::AskNeedsAnswer => write!(
+                f,
+                "dynamic ingress is set to ask and nobody is attached to answer"
+            ),
+            Self::NoDynamicRange => write!(
+                f,
+                "this box declares no dynamic port range, so no port can be allowed"
+            ),
+            Self::OutOfRange { requested, range } => write!(
+                f,
+                "port {requested} is outside this box's declared dynamic range {}-{}",
+                range.0, range.1
+            ),
+            Self::NoPublishedAddress => write!(
+                f,
+                "this box has no published address on file to expose a port at"
+            ),
+            Self::AlreadyPublished(port) => {
+                write!(f, "port {port} is published already by this box")
+            }
+        }
+    }
+}
+
+/// Why one runtime port-publish request ended without a publish — the answer
+/// the session actor hands its caller, which is what the box's own
+/// `min net expose` prints.
+#[derive(Debug)]
+pub enum ExposeFailure {
+    /// The box's `dynamic_ingress` decision refused the port: the switch was
+    /// asked nothing, so nothing partial is left behind (NET-047).
+    Refused(ExposeRefusal),
+    /// The publish could not be made — the switch refused the bind, never
+    /// answered, or the box's own record could not be read to decide the
+    /// request. One mapping is one request, so a bind that failed bound
+    /// nothing and asked nothing further (NET-047).
+    Publish { port: u16, source: io::Error },
+}
+
+impl fmt::Display for ExposeFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused(refusal) => write!(f, "{refusal}"),
+            Self::Publish { port, source } => {
+                write!(f, "publishing port {port} failed: {source}")
+            }
+        }
+    }
+}
+
+/// Decides one runtime port-publish request against the box's
+/// `dynamic_ingress` setting (NET-043): `ingress` is the box's declared
+/// ingress half, `None` the deny-all default an absent declaration means.
+/// `Ok(DynamicIngress::Allow)` when the box allows the port; the typed
+/// refusal saying why not otherwise.
+///
+/// The mode decides first and the range second, so a box that denies never
+/// reveals whether the port would have been in range, and a box that allows
+/// still keeps the declaration's own gate: the `dynamic_allowed_range` is the
+/// set of ports the box opted in (unset means none were), and a request
+/// outside it is refused wherever it came from.
+pub fn dynamic_ingress_decision(
+    ingress: Option<&IngressPolicy>,
+    port: u16,
+) -> Result<sessions::DynamicIngress, ExposeRefusal> {
+    let Some(ingress) = ingress else {
+        return Err(ExposeRefusal::DeniedByPolicy);
+    };
+    match ingress
+        .dynamic_ingress
+        .unwrap_or(sessions::DynamicIngress::Deny)
+    {
+        sessions::DynamicIngress::Deny => Err(ExposeRefusal::DeniedByPolicy),
+        sessions::DynamicIngress::Ask => Err(ExposeRefusal::AskNeedsAnswer),
+        sessions::DynamicIngress::Allow => {
+            let Some(range) = ingress.dynamic_allowed_range else {
+                return Err(ExposeRefusal::NoDynamicRange);
+            };
+            if port < range.0 || port > range.1 {
+                return Err(ExposeRefusal::OutOfRange {
+                    requested: port,
+                    range,
+                });
+            }
+            Ok(sessions::DynamicIngress::Allow)
+        }
+    }
+}
+
+/// Publishes one port a process inside the box asked for at runtime
+/// (NET-043/NET-044): the box's own port number, at the address its
+/// registration handed it, forwarded to its own switch address — the same
+/// request shape a declared mapping takes ([`expose_request`]). The caller
+/// decides the request with [`dynamic_ingress_decision`] first; this is the
+/// publish half only.
+///
+/// One mapping is one expose request, so the guarantee [`apply_ingress`]
+/// buys with a rollback is structural here: a request that fails binds
+/// nothing, and there is no earlier forward to roll back — the rejected
+/// request leaves no partial mapping (NET-047). The bind's failure says its
+/// own line, naming the port and the `local` it tried, the way the declared
+/// binds' failures do.
+///
+/// # Errors
+///
+/// Returns the I/O error from the failing `expose` call.
+pub async fn expose_dynamic(
+    control: &ControlChannel,
+    published: Ipv4Addr,
+    ptask_ip: Ipv4Addr,
+    port: u16,
+    proto: IpProto,
+    gate: Option<&Arc<super::switch::SessionGate>>,
+) -> io::Result<PortForwarder> {
+    let req = ExposeRequest {
+        local: format!("{published}:{port}"),
+        remote: format!("{ptask_ip}:{port}"),
+        protocol: protocol_str(proto).to_string(),
+    };
+    match post_json(control, "/services/forwarder/expose", &req).await {
+        Ok(()) => Ok(PortForwarder {
+            mapping: ExposedMapping {
+                local: req.local,
+                protocol: req.protocol,
+            },
+            internal_port: port,
+            gate: gate.cloned(),
+            revoked: Arc::new(AtomicBool::new(false)),
+        }),
+        Err(e) => {
             tracing::warn!(
-                local = %mapping.local,
+                port,
+                local = %req.local,
                 error = %e,
-                "removing ingress port mapping from switch on PTask exit"
+                "binding dynamic ingress port failed"
             );
+            Err(e)
         }
     }
 }
@@ -880,6 +1235,116 @@ mod tests {
         assert!(json.contains("\"local\":\"127.0.0.1:5353\""), "got: {json}");
         assert!(json.contains("\"remote\":\"100.64.0.7:53\""), "got: {json}");
         assert!(json.contains("\"protocol\":\"udp\""), "got: {json}");
+    }
+
+    #[test]
+    fn dynamic_ingress_decision_denies_the_absent_and_explicit_deny() {
+        // NET-043: the setting decides, and an absent declaration is the
+        // deny-all default — the two shapes a request from inside a bare box
+        // meets.
+        let allow = IngressPolicy {
+            dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+            dynamic_allowed_range: Some((3000, 3999)),
+            ..Default::default()
+        };
+        assert_eq!(
+            dynamic_ingress_decision(None, 3000),
+            Err(ExposeRefusal::DeniedByPolicy),
+            "a box that declared no ingress denies every runtime publish"
+        );
+        let deny = IngressPolicy {
+            dynamic_ingress: Some(sessions::DynamicIngress::Deny),
+            dynamic_allowed_range: Some((3000, 3999)),
+            ..Default::default()
+        };
+        assert_eq!(
+            dynamic_ingress_decision(Some(&deny), 3000),
+            Err(ExposeRefusal::DeniedByPolicy),
+        );
+        assert_eq!(
+            dynamic_ingress_decision(Some(&allow), 3000),
+            Ok(sessions::DynamicIngress::Allow),
+        );
+    }
+
+    #[test]
+    fn dynamic_ingress_decision_gates_on_the_declared_range() {
+        // NET-047: an allowed request still has to be in the range the box
+        // opted in — the bounds are inclusive, unset means nothing was opted
+        // in, and `ask` fails closed with nobody to answer it.
+        let allow = IngressPolicy {
+            dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+            dynamic_allowed_range: Some((3000, 3999)),
+            ..Default::default()
+        };
+        for port in [2999, 4000] {
+            assert_eq!(
+                dynamic_ingress_decision(Some(&allow), port),
+                Err(ExposeRefusal::OutOfRange {
+                    requested: port,
+                    range: (3000, 3999),
+                }),
+                "port {port} is outside the range and must be refused by name"
+            );
+        }
+        for port in [3000, 3999] {
+            assert_eq!(
+                dynamic_ingress_decision(Some(&allow), port),
+                Ok(sessions::DynamicIngress::Allow),
+                "the range's own bounds are inside it"
+            );
+        }
+        let no_range = IngressPolicy {
+            dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+            dynamic_allowed_range: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            dynamic_ingress_decision(Some(&no_range), 3000),
+            Err(ExposeRefusal::NoDynamicRange),
+        );
+        let ask = IngressPolicy {
+            dynamic_ingress: Some(sessions::DynamicIngress::Ask),
+            dynamic_allowed_range: Some((3000, 3999)),
+            ..Default::default()
+        };
+        assert_eq!(
+            dynamic_ingress_decision(Some(&ask), 3000),
+            Err(ExposeRefusal::AskNeedsAnswer),
+        );
+    }
+
+    #[test]
+    fn expose_refusals_render_their_own_reasons() {
+        // The typed refusal is what the box's `min net expose` prints, so
+        // each message must name the fact that decided it — not a generic
+        // "refused".
+        let refusal = ExposeRefusal::OutOfRange {
+            requested: 80,
+            range: (3000, 3999),
+        };
+        let rendered = refusal.to_string();
+        assert!(rendered.contains("80"), "{rendered}");
+        assert!(rendered.contains("3000-3999"), "{rendered}");
+        assert!(
+            ExposeRefusal::DeniedByPolicy
+                .to_string()
+                .contains("denied for this box")
+        );
+        assert!(
+            ExposeFailure::Refused(refusal)
+                .to_string()
+                .starts_with(&rendered),
+            "the failure wraps the refusal's own words"
+        );
+        let failed = ExposeFailure::Publish {
+            port: 3000,
+            source: io::Error::other("gvproxy refused"),
+        };
+        assert!(
+            failed.to_string().contains("3000"),
+            "the publish failure names the port it could not bind: {failed}"
+        );
     }
 
     #[test]

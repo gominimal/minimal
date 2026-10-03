@@ -6,8 +6,11 @@
 //! proxy settings (NET-009). The hook that points it is per-OS: a resolver
 //! file under `/etc/resolver/` on macOS, a systemd-resolved routing domain
 //! on a link dedicated to the zone on Linux. This module detects the hook,
-//! renders the exact command that installs it, and reads the reserved
-//! range's loopback state for the diagnostic bundle.
+//! renders the exact command that installs it — and, on macOS, the boot
+//! step that reserves the local range in the same one `sudo` (design §7.1,
+//! NET-123) — reads the reserved range's loopback state for the diagnostic
+//! bundle, and, where the OS installs a range unit, checks its custody
+//! beside the hook it detected.
 //!
 //! Nothing here prompts. Detecting reads files and runs `resolvectl`
 //! read-only; the advisory is pure string assembly over what those reads
@@ -17,7 +20,6 @@
 //! hang).
 
 use serde::Serialize;
-#[cfg(any(test, not(target_os = "macos")))]
 use std::net::Ipv4Addr;
 use std::time::Duration;
 use switch::loopback::RangeProbe;
@@ -34,7 +36,6 @@ pub(crate) const ZONE: &str = "min.internal";
 /// link keeps its servers, domains and default-route flag untouched — a
 /// link that exists for the zone alone is what keeps `resolvectl dns`'s
 /// replace-semantics from ever reaching the host's upstream resolution.
-#[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const ZONE_LINK: &str = "minzone0";
 
 /// The address [`ZONE_LINK`] carries, as a `/32` of global scope: the
@@ -54,7 +55,6 @@ pub(crate) const ZONE_LINK: &str = "minzone0";
 /// sets is configuration nothing consults: the state the native lane's
 /// `getent` failed on before this address existed. A `/32` routes nowhere
 /// beyond the address itself.
-#[cfg(any(test, not(target_os = "macos")))]
 pub(crate) const ZONE_LINK_ADDR: Ipv4Addr = Ipv4Addr::new(100, 127, 255, 254);
 
 /// The reserved local range the daemon publishes per-box addresses from and
@@ -70,6 +70,484 @@ pub(crate) use switch::RESERVED_LOCAL_RANGE;
 /// mDNSResponder (docs/spikes/2026-09-22-macos-loopback-alias.md).
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) const RESOLVER_FILE: &str = "/etc/resolver/min.internal";
+
+/// The label of the LaunchDaemon unit the macOS advisory command installs
+/// beside the resolver file: the boot-time service that re-applies the
+/// reserved local range at every boot (design §7.1's privileged step,
+/// NET-123's macOS half). The unit's plist, its program, the command that
+/// installs both, and the custody checks over them, all name these three
+/// constants — one definition beside the command that writes them, so the
+/// installed unit, the advisory that reinstalls it, and the bundle that
+/// reads it cannot drift apart.
+pub(crate) const RANGE_UNIT_LABEL: &str = "dev.minimal.local-range";
+
+/// The root-owned path the unit's program is installed at, inside the
+/// system-managed helper directory — a path no user can write: `/Library`
+/// and every directory under it is root's, and the custody check
+/// ([`range_step_over`]) walks every directory component of both this
+/// path and the plist's, from `/` down, so a unit under `$HOME` or a
+/// user-owned Homebrew prefix fails custody whatever its files' own owner
+/// reads.
+pub(crate) const RANGE_PROGRAM_PATH: &str =
+    "/Library/PrivilegedHelperTools/dev.minimal.local-range";
+
+/// The root-owned path the unit's plist is installed at: the plist launchd
+/// scans at boot, which is what makes the range re-apply at every one.
+pub(crate) const RANGE_PLIST_PATH: &str = "/Library/LaunchDaemons/dev.minimal.local-range.plist";
+
+/// The directories the two files live in, which the command makes before it
+/// writes them: `mkdir -p`, because a stock host has no
+/// `/Library/PrivilegedHelperTools` and the command must not die on its
+/// first range step.
+#[cfg(any(test, target_os = "macos"))]
+const RANGE_PROGRAM_DIR: &str = "/Library/PrivilegedHelperTools";
+#[cfg(any(test, target_os = "macos"))]
+const RANGE_PLIST_DIR: &str = "/Library/LaunchDaemons";
+
+/// The range program's template
+/// ([`reserve-local-range.sh`](resolver/reserve-local-range.sh)): a `/bin/sh`
+/// script whose [`RANGE_ADDRESS_PLACEHOLDER`] list is replaced at command
+/// time with every usable host address of [`RESERVED_LOCAL_RANGE`]. The
+/// rendered program reads no argument, no environment variable and no file,
+/// and neither template carries an apostrophe — the command that carries
+/// them wraps its whole payload in single quotes, and one inside a body
+/// would close them (see [`macos_command`]).
+#[cfg(any(test, target_os = "macos"))]
+const RANGE_PROGRAM_TEMPLATE: &str = include_str!("resolver/reserve-local-range.sh");
+
+/// The line of [`RANGE_PROGRAM_TEMPLATE`] the render replaces.
+#[cfg(any(test, target_os = "macos"))]
+const RANGE_ADDRESS_PLACEHOLDER: &str = "@RANGE_ADDRESSES@";
+
+/// The unit's plist, as the command writes it: label [`RANGE_UNIT_LABEL`],
+/// ProgramArguments the root-owned program path alone, `RunAtLoad` true, no
+/// `KeepAlive`, no `UserName` (it runs as root), no environment variables.
+#[cfg(any(test, target_os = "macos"))]
+const RANGE_UNIT_PLIST: &str = include_str!("resolver/dev.minimal.local-range.plist");
+
+/// The heredoc delimiters the command carries the two files' bytes under.
+/// Distinctive enough that no rendered byte can close one early: the
+/// program's lines are `ifconfig` aliases and the plist's are XML, and
+/// neither can spell these. The leading `\` in the command quotes the
+/// delimiter, so the body's lines are written byte for byte, never expanded.
+#[cfg(any(test, target_os = "macos"))]
+const RANGE_PROGRAM_HEREDOC: &str = "MINIMAL_RANGE_PROGRAM_EOF";
+#[cfg(any(test, target_os = "macos"))]
+const RANGE_PLIST_HEREDOC: &str = "MINIMAL_RANGE_PLIST_EOF";
+
+/// Whether the command the advisory names also reserves the local range:
+/// on macOS the one `sudo sh -c` writes the resolver file *and* installs
+/// the range unit (design §7.1's privileged step), so the advisory's lead
+/// sentence and its interim fact say so; on Linux the whole `127/8` is
+/// local to `lo`, the command configures the routing-domain link alone,
+/// and it takes no range step.
+///
+/// A constant of the platform, never of the render: the advisory is pure
+/// over the [`RangeStep`] it is handed (see [`advisory_at`]), so the suite
+/// unit-tests both arms' text on every platform it runs on, and this
+/// constant decides only what the *detection* reads on the host it runs
+/// against ([`read_range_step`]).
+#[cfg(target_os = "macos")]
+const COMMAND_RESERVES_THE_RANGE: bool = true;
+#[cfg(not(target_os = "macos"))]
+const COMMAND_RESERVES_THE_RANGE: bool = false;
+
+/// The range program, rendered from [`RANGE_PROGRAM_TEMPLATE`] with every
+/// usable host address of the reserved range
+/// ([`switch::loopback::range_hosts`], host parts 1 to 254 — the addresses
+/// the bind probe reads) filled in at render time, one literal address per
+/// word of the list the program walks. The rendered script reads no
+/// argument, no environment variable and no file — its one read is the
+/// interface's own state, reported by the same absolute-path system tool
+/// the aliases are added with, so nothing user-writable can change what it
+/// applies — and it applies exactly the reserved range and nothing else:
+/// each address is one `/32` lo0 alias by the two-address `ifconfig` form
+/// the loopback-alias spike verified against lo0, and an address `lo0`
+/// already carries is skipped rather than re-added, so a re-run over a
+/// fully- or partially-applied range adds only what is missing (the spike
+/// never measured a re-add, so the program does not rely on one exiting
+/// zero).
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn range_program() -> String {
+    let addresses = switch::loopback::range_hosts()
+        .map(|addr| addr.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    RANGE_PROGRAM_TEMPLATE.replace(RANGE_ADDRESS_PLACEHOLDER, &addresses)
+}
+
+/// One path's custody facts, as the range unit's checks read them: the
+/// owner uid and the permission bits of a file or a directory component.
+/// `mode` is what `stat` reports, `st_mode & 0o7777`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct FileCustody {
+    /// The owning uid.
+    pub owner: u32,
+    /// The permission bits, base 8 (`0644` reads `420`).
+    pub mode: u32,
+}
+
+impl FileCustody {
+    /// Whether this is root's file, with no group or other write: the
+    /// custody every component of the unit's paths and both its files must
+    /// hold — uid 0 owning, and nobody but root able to change what sits
+    /// there.
+    pub(crate) fn root_owned(&self) -> bool {
+        self.owner == 0 && self.mode & 0o022 == 0
+    }
+}
+
+/// The state of the range step on this host, as the advisory, the
+/// session-start log line, and the bundle print it: the one-line view of
+/// [`RangeStep`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub(crate) enum RangeStepState {
+    /// This host's OS installs no range unit: the whole `127/8` is local
+    /// to its loopback (Linux), the advisory's command configures the
+    /// resolver alone, and no custody question arises.
+    #[default]
+    NotNeeded,
+    /// macOS: nothing is installed at the unit's paths.
+    Absent,
+    /// macOS: the unit is installed and every custody check holds over
+    /// its path, its files, its plist and its loaded job.
+    Installed,
+    /// macOS: a custody check failed — [`RangeStep::failed_check`] names it.
+    CustodyFailed,
+}
+
+/// The range step on this host, as the detection reads it beside the hook:
+/// the macOS range unit's state, the custody check that failed when one
+/// did, and the facts the `min bug` bundle records — whether the unit is
+/// installed, the owner and mode of its plist and its program, the
+/// program path the plist runs, and the program path the loaded job runs.
+/// On a host whose OS needs no step, the state alone says so.
+///
+/// The advisory, the log and the bundle are pure over this: the tests hand
+/// the render functions either arm's step and assert its text, so the
+/// suite covers both platforms' behaviour on every platform it runs on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RangeStep {
+    /// The one-line view.
+    pub state: RangeStepState,
+    /// The custody check that failed, spelled out for the advisory and the
+    /// bundle, when one did.
+    pub failed_check: Option<String>,
+    /// The program file's owner and mode, when it exists.
+    pub program: Option<FileCustody>,
+    /// The plist file's owner and mode, when it exists.
+    pub plist: Option<FileCustody>,
+    /// The program path the plist's `ProgramArguments` names, when it
+    /// names one.
+    pub plist_program: Option<String>,
+    /// The program path the loaded job's `Program`/`ProgramArguments`
+    /// names, when a job is loaded under the unit's label.
+    pub loaded_program: Option<String>,
+}
+
+impl RangeStep {
+    /// The step a host whose OS installs no range unit carries: no state
+    /// to read, no custody to check, nothing for the bundle to record —
+    /// Linux's `lo` is the whole `127/8`, so the command the advisory
+    /// names configures the resolver and nothing else.
+    pub(crate) fn not_needed() -> Self {
+        RangeStep {
+            state: RangeStepState::NotNeeded,
+            failed_check: None,
+            program: None,
+            plist: None,
+            plist_program: None,
+            loaded_program: None,
+        }
+    }
+
+    /// Whether the step's custody holds — the fact the advisory's quiet
+    /// arm needs beside the probe's present (NET-123: the advisory stops
+    /// re-surfacing for the range once the probe reads present *and*
+    /// custody holds). A host that needs no step holds vacuously; an
+    /// absent unit does not — a range with no unit behind it is a range
+    /// the next boot removes.
+    pub(crate) fn custody_holds(&self) -> bool {
+        matches!(
+            self.state,
+            RangeStepState::NotNeeded | RangeStepState::Installed
+        )
+    }
+}
+
+/// The facts the range unit's custody checks decide on, as the macOS
+/// detection gathers them and [`range_step_over`] reads them. Pure data,
+/// so the checks over it — the path walk, the file ownership, the plist's
+/// and the loaded job's program paths — are unit-tested on every platform
+/// the suite runs on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+pub(crate) struct RangeFacts {
+    /// The owner and mode of every directory component of both the unit's
+    /// paths, from `/` down, as the walk read them. A component with no
+    /// entry here did not read; the verdict treats it as unverified, never
+    /// as passing.
+    pub components: Vec<(String, FileCustody)>,
+    /// The program file's owner and mode, when it exists.
+    pub program: Option<FileCustody>,
+    /// The plist file's owner and mode, when it exists.
+    pub plist: Option<FileCustody>,
+    /// The program path the plist's `ProgramArguments` names, when it
+    /// names one.
+    pub plist_program: Option<String>,
+    /// The program path the loaded job's `Program`/`ProgramArguments`
+    /// names, when a job is loaded under the unit's label.
+    pub loaded_program: Option<String>,
+}
+
+/// Every directory component of `path`, from `/` down: the walk the
+/// custody check makes, so a path under `$HOME` or a user-owned Homebrew
+/// prefix fails on the component that makes it user-writable, never on the
+/// files' own owner alone. The path's last component — the file — is not a
+/// directory and is not walked here; its custody is checked beside the
+/// walk. Pure, so the walk is unit-tested on every platform the suite runs
+/// on.
+pub(crate) fn path_components(path: &str) -> Vec<String> {
+    let mut components = vec!["/".to_string()];
+    let mut prefix = String::new();
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        prefix.push('/');
+        prefix.push_str(component);
+        components.push(prefix.clone());
+    }
+    components.pop();
+    components
+}
+
+/// The custody wording for a path that is not root's, with what it read.
+fn not_root_owned(what: &str, path: &str, custody: &FileCustody) -> String {
+    format!(
+        "{what} {path} is owned by uid {} with mode {:o}, not root with \
+         no group or other write",
+        custody.owner, custody.mode
+    )
+}
+
+/// The range step the custody facts decide (NET-123's privileged step's
+/// custody, checked where the hook is detected): absent when neither of
+/// the unit's files is installed; installed when every check holds — every
+/// directory component of both paths root-owned with no group or other
+/// write, both files root-owned with no group or other write, the plist's
+/// `ProgramArguments` naming the root-owned program path, and the loaded
+/// job's `Program`/`ProgramArguments` in `launchctl print` naming that
+/// same path, so a job loaded from elsewhere under the label fails
+/// custody; custody failed, naming the first check that did not hold.
+///
+/// Pure over the facts, so every check is unit-tested on every platform
+/// the suite runs on; the macOS detection is the reader that gathers them
+/// ([`range_unit_state`]).
+pub(crate) fn range_step_over(facts: &RangeFacts) -> RangeStep {
+    let mut step = RangeStep {
+        state: RangeStepState::CustodyFailed,
+        failed_check: None,
+        program: facts.program,
+        plist: facts.plist,
+        plist_program: facts.plist_program.clone(),
+        loaded_program: facts.loaded_program.clone(),
+    };
+    // Nothing at either path: the unit is not installed, the interim's
+    // and the missing-range facts' state, and no custody question arises.
+    if facts.program.is_none() && facts.plist.is_none() {
+        step.state = RangeStepState::Absent;
+        return step;
+    }
+    // The walk, from `/` down over both paths, in the order the checks are
+    // stated: a directory a user can write is a unit a user can replace,
+    // whatever the files' own owner reads.
+    let mut walked = Vec::new();
+    for path in [RANGE_PROGRAM_PATH, RANGE_PLIST_PATH] {
+        for component in path_components(path) {
+            if !walked.contains(&component) {
+                walked.push(component);
+            }
+        }
+    }
+    let mut checks = Vec::new();
+    for component in &walked {
+        let Some(custody) = facts
+            .components
+            .iter()
+            .find(|(path, _)| path == component)
+            .map(|(_, custody)| custody)
+        else {
+            checks.push(format!("its directory {component} did not read"));
+            continue;
+        };
+        if !custody.root_owned() {
+            checks.push(not_root_owned("its directory", component, custody));
+        }
+    }
+    // Both files, then what each of them points at.
+    for (what, path, custody) in [
+        ("its program", RANGE_PROGRAM_PATH, facts.program),
+        ("its plist", RANGE_PLIST_PATH, facts.plist),
+    ] {
+        match custody {
+            None => checks.push(format!("{what} {path} is missing")),
+            Some(custody) if !custody.root_owned() => {
+                checks.push(not_root_owned(what, path, &custody));
+            }
+            Some(_) => {}
+        }
+    }
+    match facts.plist_program.as_deref() {
+        None => checks.push(format!(
+            "its plist's ProgramArguments names no program, not the \
+             root-owned {RANGE_PROGRAM_PATH}"
+        )),
+        Some(RANGE_PROGRAM_PATH) => {}
+        Some(other) => checks.push(format!(
+            "its plist's ProgramArguments names {other}, not the \
+             root-owned {RANGE_PROGRAM_PATH}"
+        )),
+    }
+    match facts.loaded_program.as_deref() {
+        None => checks.push(format!(
+            "no job is loaded under the label {RANGE_UNIT_LABEL}, so the \
+             installed files are not the unit that runs"
+        )),
+        Some(RANGE_PROGRAM_PATH) => {}
+        Some(other) => checks.push(format!(
+            "the loaded job under the label {RANGE_UNIT_LABEL} runs {other}, \
+             not the root-owned {RANGE_PROGRAM_PATH}"
+        )),
+    }
+    match checks.first() {
+        None => step.state = RangeStepState::Installed,
+        Some(check) => step.failed_check = Some(check.clone()),
+    }
+    step
+}
+
+/// The program path the plist's `ProgramArguments` names: the first
+/// `<string>` after the `ProgramArguments` key, as launchd reads it.
+/// `None` when the key or its argument is not there. Pure over the file's
+/// bytes, so the parse is unit-tested on every platform the suite runs on.
+pub(crate) fn plist_program_argument(text: &str) -> Option<&str> {
+    let key = text.find("<key>ProgramArguments</key>")?;
+    let argument = text[key..].find("<string>")? + key;
+    let end = text[argument..].find("</string>")? + argument;
+    Some(text[argument + "<string>".len()..end].trim())
+}
+
+/// The program path a `launchctl print` names for the unit: its `program`
+/// line, else the first argument of its `program arguments` block — the
+/// two fields a loaded job's program reaches the reader through.
+/// `None` when neither reads (an output of a job that is not loaded, or
+/// one whose arguments carry nothing). Pure, so the parse is unit-tested
+/// on every platform the suite runs on.
+pub(crate) fn launchctl_program_path(output: &str) -> Option<&str> {
+    for line in output.lines() {
+        if let Some(program) = line.trim().strip_prefix("program = ") {
+            return Some(program.trim());
+        }
+    }
+    let block = output.find("program arguments = {")?;
+    let after = &output[block..];
+    for line in after.lines().skip(1) {
+        let line = line.trim();
+        if line == "}" {
+            return None;
+        }
+        if !line.is_empty() {
+            return Some(line.trim_matches('"'));
+        }
+    }
+    None
+}
+
+/// The owner and mode of `path`, when it exists.
+async fn file_custody(path: &str) -> Option<FileCustody> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    Some(FileCustody {
+        owner: metadata.uid(),
+        mode: metadata.permissions().mode() & 0o7777,
+    })
+}
+
+/// The owner and mode of every directory component of `paths`, from `/`
+/// down, in walk order. A component that did not read simply carries no
+/// facts; the verdict treats that as unverified, never as passing.
+async fn path_component_custody(paths: &[&str]) -> Vec<(String, FileCustody)> {
+    let mut components = Vec::new();
+    for path in paths {
+        for component in path_components(path) {
+            if let Some(custody) = file_custody(&component).await {
+                components.push((component, custody));
+            }
+        }
+    }
+    components
+}
+
+/// The program path the loaded job under [`RANGE_UNIT_LABEL`] names, from
+/// `launchctl print`'s output: `None` when no job is loaded under the
+/// label, or the print could not be read within [`LAUNCHCTL_BOUND`]. One
+/// read-only call of the system's own service manager; nothing it does can
+/// prompt, and a wedged launchd reads as unread — custody unverified, so
+/// the advisory re-surfaces — rather than hanging the activate or `min ls`.
+async fn launchctl_print_program() -> Option<String> {
+    let output = tokio::time::timeout(
+        LAUNCHCTL_BOUND,
+        tokio::process::Command::new("launchctl")
+            .arg("print")
+            .arg(format!("system/{RANGE_UNIT_LABEL}"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    launchctl_program_path(&String::from_utf8(output.stdout).ok()?).map(str::to_string)
+}
+
+/// The range unit's state on this host, read where the hook is detected:
+/// both files' presence, owner and mode; every directory component of both
+/// their paths, from `/` down; the program path the plist's
+/// `ProgramArguments` names; and the program path the loaded job's
+/// `Program`/`ProgramArguments` names in `launchctl print` — the facts
+/// [`range_step_over`] decides custody over. Read-only, and nothing
+/// prompts: the same discipline as the hook detection it sits beside, and
+/// the command that fixes what it finds is the user's to run, never the
+/// session start's (NET-122).
+pub(crate) async fn range_unit_state() -> RangeStep {
+    let facts = RangeFacts {
+        components: path_component_custody(&[RANGE_PROGRAM_PATH, RANGE_PLIST_PATH]).await,
+        program: file_custody(RANGE_PROGRAM_PATH).await,
+        plist: file_custody(RANGE_PLIST_PATH).await,
+        plist_program: tokio::fs::read_to_string(RANGE_PLIST_PATH)
+            .await
+            .ok()
+            .and_then(|text| plist_program_argument(&text).map(str::to_string)),
+        loaded_program: launchctl_print_program().await,
+    };
+    range_step_over(&facts)
+}
+
+/// The range step this host's detection reads beside its hook, for the
+/// advisory, the session-start log line, and the bundle: the unit's state
+/// and custody where the host's OS installs one
+/// ([`COMMAND_RESERVES_THE_RANGE`] — macOS, whose one advisory command
+/// configures the resolver *and* reserves the range); the no-step state
+/// everywhere else, where the loopback already carries the whole `127/8`.
+async fn read_range_step() -> RangeStep {
+    if COMMAND_RESERVES_THE_RANGE {
+        range_unit_state().await
+    } else {
+        RangeStep::not_needed()
+    }
+}
 
 /// `/etc/resolv.conf`: the file every host process's lookup reads (through
 /// the `dns` NSS module), and so the one that must name resolved's stub for
@@ -671,16 +1149,27 @@ fn query_program() -> String {
         .unwrap_or_else(|| "resolvectl".to_string())
 }
 
-/// Reads the host's current hook state (NET-122's detection proper) and the
-/// reason no zone command would reach this host's lookups, when there is one.
-/// Detection is read-only and never prompts: on Linux, two `resolvectl`
-/// queries under one [`RESOLVECTL_BOUND`] deadline — run together, so the
-/// deadline is paid once, and a wedged systemd-resolved reads as absent
-/// rather than hanging the activate — and three file reads; on macOS, one
-/// file read.
-pub(crate) async fn session_detection() -> (Hook, Option<String>) {
+/// Reads the host's current hook state (NET-122's detection proper), the
+/// reason no zone command would reach this host's lookups, when there is
+/// one, and the range step this host's OS carries — its unit's state and
+/// custody where it installs one, the no-step state where it does not
+/// (NET-123's privileged step, checked where the hook is detected). The
+/// three facts are one read of one host: the advisory, the verdict, the
+/// session-start log line and the bundle all draw from it and cannot
+/// disagree about the host. Detection is read-only and never prompts: on
+/// Linux, two `resolvectl` queries under one [`RESOLVECTL_BOUND`] deadline
+/// — run together, so the deadline is paid once, and a wedged
+/// systemd-resolved reads as absent rather than hanging the activate —
+/// and three file reads; on macOS, one file read and the range unit's
+/// custody facts.
+pub(crate) async fn session_detection() -> (Hook, Option<String>, RangeStep) {
     host_detection(RESOLVECTL_BOUND).await
 }
+
+/// The deadline on the macOS range-unit read's one `launchctl print`: the
+/// list's second, on both verbs, since the call is the same and a wedged
+/// launchd must cost neither a wait.
+const LAUNCHCTL_BOUND: Duration = Duration::from_secs(1);
 
 /// [`session_detection`] at [`LIST_RESOLVECTL_BOUND`], the deadline the
 /// list's read carries: `min ls` is the most frequently-invoked verb, so
@@ -689,20 +1178,29 @@ pub(crate) async fn session_detection() -> (Hook, Option<String>) {
 /// it is the proxy's arm, the one that cannot strand the user, so the
 /// worst a wedged resolver costs a list is a second, never the session
 /// start's five.
-async fn ls_detection() -> (Hook, Option<String>) {
+async fn ls_detection() -> (Hook, Option<String>, RangeStep) {
     host_detection(LIST_RESOLVECTL_BOUND).await
 }
 
 #[cfg(target_os = "macos")]
-async fn host_detection(_bound: Duration) -> (Hook, Option<String>) {
+async fn host_detection(_bound: Duration) -> (Hook, Option<String>, RangeStep) {
     // macOS's resolver consults the resolver file directly — there is no
-    // stub for host lookups to bypass, so nothing can block the command,
-    // and the one read this makes carries no deadline to bound.
-    (host_hook().await, None)
+    // stub for host lookups to bypass, so nothing can block the command;
+    // the range unit's one `launchctl print` carries its own
+    // [`LAUNCHCTL_BOUND`], so this read never waits on launchd.
+    (
+        host_hook().await,
+        None,
+        // The range unit's state and custody, read beside the hook: the
+        // same read-only detection, no prompt, and the facts the advisory
+        // and the bundle draw on. The range's own presence stays the bind
+        // probe's fact (see [`live_name_surface_with_range_at`]).
+        read_range_step().await,
+    )
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn host_detection(bound: Duration) -> (Hook, Option<String>) {
+async fn host_detection(bound: Duration) -> (Hook, Option<String>, RangeStep) {
     // The queries' program: the stand-in a test installed, else
     // `resolvectl` itself.
     #[cfg(test)]
@@ -729,6 +1227,12 @@ async fn host_detection(bound: Duration) -> (Hook, Option<String>) {
             nsswitch.as_deref(),
             resolve_module,
         ),
+        // No range step on this host: `lo` carries the whole `127/8`, so
+        // the command's job ends at the resolver. Read through
+        // [`read_range_step`] — the one place the platform's step is
+        // decided — so the state the detection reports is the same fact
+        // the advisory and the render parameterize on.
+        read_range_step().await,
     )
 }
 
@@ -741,14 +1245,61 @@ async fn host_hook() -> Hook {
     }
 }
 
-/// The exact command that points macOS's resolver at the answerer: one
-/// `sudo` writing the resolver file the zone's hook reads. `mkdir -p`
-/// because `/etc/resolver` does not exist until the first hook does.
+/// The exact command that points macOS's resolver at the answerer *and*
+/// installs the range unit that reserves the local range at boot — the one
+/// `sudo` NET-122's advisory names, carrying the range step NET-123's
+/// interim ends with (design §7.1: one command, one privilege elevation,
+/// for one host's configuration).
+///
+/// The steps, in the order they run: `set -e;` first, and every step its own
+/// statement — separated by `;`, or by the newline a heredoc ends — never by
+/// `&&`: POSIX ignores `-e` for every command of an `&&` list except its
+/// last, so a `mkdir` or `printf` that failed inside one would short-circuit
+/// its list silently and the script would run on — the plist landing beside
+/// a resolver file that did not, `launchctl bootstrap` loading the stale
+/// program, and the command exiting 0 over a host it half-configured. As
+/// statements, the first step that fails stops the script itself. Then make
+/// the three directories the files live in (`mkdir -p` because a stock host
+/// has no `/etc/resolver` until the first hook and no [`RANGE_PROGRAM_DIR`]
+/// either, and a re-run must not die on `File exists`), write the resolver
+/// file, then write the unit's program and its plist **from the bytes this
+/// command itself carries** — the heredoc bodies are the rendered
+/// [`range_program`] and [`RANGE_UNIT_PLIST`], quoted delimiters
+/// (`<<\\…`) so nothing inside expands — so no staged copy, no `$PATH`
+/// lookup, no argument and no environment feeds either file.
+/// `chown root:wheel` and the `0755`/`0644` modes then converge both files
+/// to the exact state the custody checks ([`range_step_over`]) verify,
+/// whatever a previous attempt or a tampered host left there. The boot step
+/// loads last: `launchctl bootout` of the old unit first — guarded, because
+/// a first run has nothing to boot out — then `bootstrap` loads the new unit
+/// into the system domain, where launchd starts it at once, asynchronously,
+/// so the range appears on the loopback within about a second of the
+/// command returning, and [`RANGE_UNIT_PLIST`]'s `RunAtLoad` re-applies it
+/// at every boot after. A re-run replaces the unit and re-runs the program
+/// rather than dying on a label collision.
+///
+/// The whole payload rides inside the one pair of single quotes that
+/// `sh -c` takes it under, so neither body the heredocs write may carry an
+/// apostrophe of its own: one inside a body closes the quote, the paste
+/// hangs at a continuation prompt, and `sh -n` rejects the rendered line —
+/// which is why the suite parses both halves of the command and asserts
+/// the bodies carry none (see `advisory_command_reserves_the_range_on_macos`).
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) fn macos_command(port: u16) -> String {
+    let program = range_program();
     format!(
-        "sudo sh -c 'mkdir -p /etc/resolver && printf \"nameserver 127.0.0.1\\nport {port}\\n\" \
-         > {RESOLVER_FILE}'"
+        "sudo sh -c 'set -e; mkdir -p /etc/resolver {RANGE_PROGRAM_DIR} {RANGE_PLIST_DIR} \
+         ; printf \"nameserver 127.0.0.1\\nport {port}\\n\" > {RESOLVER_FILE} \
+         ; cat > {RANGE_PROGRAM_PATH} <<\\{RANGE_PROGRAM_HEREDOC}\n\
+{program}\
+{RANGE_PROGRAM_HEREDOC}\n\
+cat > {RANGE_PLIST_PATH} <<\\{RANGE_PLIST_HEREDOC}\n\
+{RANGE_UNIT_PLIST}\
+{RANGE_PLIST_HEREDOC}\n\
+chown root:wheel {RANGE_PROGRAM_PATH} {RANGE_PLIST_PATH} \
+         ; chmod 0755 {RANGE_PROGRAM_PATH} ; chmod 0644 {RANGE_PLIST_PATH} \
+         ; (launchctl bootout system/{RANGE_UNIT_LABEL} 2>/dev/null || true) \
+         ; launchctl bootstrap system {RANGE_PLIST_PATH}'"
     )
 }
 
@@ -799,25 +1350,43 @@ pub(crate) fn command(port: u16) -> String {
 
 /// The advisory for one session start, as a function of the hook state, the
 /// daemon's interim verdict, whether the reserved local range read present
-/// on this host's own loopback, and whether anything blocks the command
-/// (NET-122, NET-123's interim arm). Pure.
+/// on this host's own loopback, the range step this host's detection read
+/// beside the hook, and whether anything blocks the command (NET-122,
+/// NET-123). Pure.
 ///
 /// `None` — nothing to say — when the hook already routes the zone to this
 /// answerer, the daemon did not publish at the interim, the range read
-/// present on this host's own loopback, *and* nothing blocks the command.
-/// Otherwise the advisory says what is missing and names the exact command.
-/// The interim re-surfaces the advisory even when the hook routes (NET-123:
-/// "re-surface
-/// the advisory of NET-122"): a session on the interim is a fact the user
-/// has no other way to see. The interim fact names the step that ends it:
-/// installing the range on the host — by design §7.1 the job of the same
-/// advisory command on macOS, once that command reserves the range (a
-/// root-held boot step that T76
-/// (<https://github.com/gominimal/minimal/issues/1817>) adds to the command
-/// rendered here). The
-/// command the advisory names is therefore said to configure the resolver,
-/// and the range fact stands beside it rather than under it, so a user who
-/// ran the command is not told it ended the interim. String assembly only.
+/// present on this host's own loopback, the range step holds custody,
+/// *and* nothing blocks the command. Otherwise the advisory says what is
+/// missing and names the exact command. The interim re-surfaces the advisory
+/// even when the hook routes (NET-123: "re-surface the advisory of
+/// NET-122"): a session on the interim is a fact the user has no other way
+/// to see. The interim fact names the step that ends it — installing the
+/// range on the host — and whose job that step is is the platform's: on
+/// macOS the same advisory command does it ([`COMMAND_RESERVES_THE_RANGE`]'s
+/// platform — [`macos_command`]'s one `sudo sh -c` installs the range unit
+/// beside the resolver file it writes), so the fact says the command below
+/// installs the range and ends the interim; on Linux the whole `127/8` is
+/// local to `lo`, no install is needed, and the fact names the range as
+/// what is missing and stops there. Either way the command the advisory
+/// names is the whole of the host's missing configuration: the lead-in says
+/// what it does — on macOS "configure the host's resolver and reserve the
+/// local range", on Linux "configure the host's resolver for the zone" —
+/// and nothing the note asks for stands beside that command unprovided.
+/// String assembly only.
+///
+/// `range_step` is what the detection read beside the hook: the range
+/// unit's state and custody where the host's OS installs one, the no-step
+/// state where none is needed (see [`read_range_step`]). Its custody is
+/// part of the quiet arm — NET-123 stops the advisory re-surfacing for the
+/// range "once the probe reads present and custody holds", and custody
+/// holding is [`RangeStep::custody_holds`]: a probe that reads present over
+/// a unit whose files are not root's, or whose plist points at another
+/// program, is a range the next boot does not re-apply, so the advisory
+/// says the check that failed and names the command that reinstalls both
+/// files. A unit whose files read absent on a probe that reads present —
+/// the aliases without the boot step behind them — is said too, for the
+/// same reason: the range would not survive the next boot.
 ///
 /// `range_present` is this host's own read of the range — the one read the
 /// live-surface verdict shares with this advisory (see
@@ -845,6 +1414,7 @@ pub(crate) fn advisory_at(
     port: u16,
     interim: bool,
     range_present: Option<bool>,
+    range_step: &RangeStep,
     blocker: Option<&str>,
 ) -> Option<String> {
     // A hook routing this answerer's port is configured, but only on a
@@ -854,27 +1424,37 @@ pub(crate) fn advisory_at(
     // lookup consults it, and `*.{ZONE}` would not resolve — NET-122's
     // WHILE clause is about the resolver that works, not the one whose
     // configuration is on paper. The range beside them is the host's own
-    // read, the verdict's read: a hook that routes over a loopback that
-    // lacks the range is a host the verdict calls the proxy, and the
-    // advisory says the range is what is missing there rather than
-    // staying quiet on the daemon's interim flag, which on a VM-backed
-    // host reads the guest's loopback — always present — and not the host
-    // the names resolve on.
-    if hook.routes(port) && !interim && !matches!(range_present, Some(false)) && blocker.is_none() {
+    // read, the verdict's read — and custody is the second half of the
+    // range's own quiet condition (NET-123), so a unit whose files are not
+    // root's does not let the note fall quiet on a probe that reads
+    // present: that is a range the next boot does not re-apply, not a
+    // host whose missing configuration has nothing left to name.
+    if hook.routes(port)
+        && !interim
+        && !matches!(range_present, Some(false))
+        && blocker.is_none()
+        && range_step.custody_holds()
+    {
         return None;
     }
     let mut facts = Vec::new();
     if interim {
-        // The interim ends when the range is installed on the host — the
-        // root-held boot step design §7.1 folds into the macOS advisory
-        // command. That step is T76's to add to the command rendered here
-        // (https://github.com/gominimal/minimal/issues/1817); until it does,
-        // the fact names the range as what is missing and stops there:
-        // it neither claims the command below ends the interim nor claims
-        // nothing ever will.
+        // The interim ends when the range is installed on the host, and
+        // whose job that install is is the platform's: on macOS the same
+        // advisory command installs the range unit (design §7.1 folds the
+        // privileged step into the one `sudo sh -c` the note names), so the
+        // fact says the command below ends the interim; on Linux the whole
+        // `127/8` is local to `lo` and the fact names the range as what is
+        // missing and stops there — there is no step the command could
+        // claim to run.
+        let installs_the_range = if range_step.state == RangeStepState::NotNeeded {
+            ""
+        } else {
+            "; the command below installs the range and ends the interim"
+        };
         facts.push(format!(
             "this session publishes at the shared 127.0.0.1 interim: the \
-             reserved local range {} is not installed on this host's loopback",
+             reserved local range {} is not installed on this host's loopback{installs_the_range}",
             range_text()
         ));
     } else if matches!(range_present, Some(false)) {
@@ -890,6 +1470,36 @@ pub(crate) fn advisory_at(
              host cannot reach",
             range_text()
         ));
+    }
+    if !range_step.custody_holds() {
+        // The range step's own state, beside the probe's. A failed custody
+        // check is said whenever it reads, over an interim or a missing
+        // range or neither: it is the one fact that says *which* step of
+        // the unit is not root's, and the command below is the one that
+        // reinstalls both files. An absent unit is said only when no other
+        // fact already names the range as missing — under the interim, or
+        // on a probe that reads absent, the missing range is the fact and
+        // the command already ends it.
+        match range_step.state {
+            RangeStepState::CustodyFailed => {
+                let check = range_step
+                    .failed_check
+                    .as_deref()
+                    .unwrap_or("its state did not read");
+                facts.push(format!(
+                    "the range unit {RANGE_UNIT_LABEL} fails custody: {check}"
+                ));
+            }
+            RangeStepState::Absent if !interim && !matches!(range_present, Some(false)) => {
+                facts.push(format!(
+                    "the boot-time range unit {RANGE_UNIT_LABEL} is not \
+                     installed, so the reserved local range {} would not be \
+                     re-applied at the next boot",
+                    range_text()
+                ));
+            }
+            _ => {}
+        }
     }
     if !hook.routes(port) {
         facts.push(format!(
@@ -907,9 +1517,15 @@ pub(crate) fn advisory_at(
         Some(blocker) => Some(format!("note: {facts}; {blocker}.")),
         None => {
             let command = command(port);
-            Some(format!(
-                "note: {facts}. Configure the host's resolver for the zone with:\n  {command}"
-            ))
+            // The lead-in says what the command does on this platform:
+            // reserves the local range beside the resolver file where the
+            // OS needs a step for it, the resolver alone where it does not.
+            let lead_in = if range_step.state == RangeStepState::NotNeeded {
+                "Configure the host's resolver for the zone with:"
+            } else {
+                "Configure the host's resolver and reserve the local range with:"
+            };
+            Some(format!("note: {facts}. {lead_in}\n  {command}"))
         }
     }
 }
@@ -941,18 +1557,19 @@ pub(crate) fn advisory_at(
 ///
 /// Printed once per session start, to stderr; never prompts.
 pub(crate) fn session_advisory_at(
-    detection: &(Hook, Option<String>),
+    detection: &(Hook, Option<String>, RangeStep),
     zone_answerer_port: Option<u16>,
     interim_loopback: bool,
     range_present: Option<bool>,
 ) -> Option<String> {
     let port = zone_answerer_port?;
-    let (hook, blocker) = detection;
+    let (hook, blocker, range_step) = detection;
     advisory_at(
         hook,
         port,
         interim_loopback,
         range_present,
+        range_step,
         blocker.as_deref(),
     )
 }
@@ -1038,7 +1655,7 @@ pub(crate) struct LiveSurfaceVerdict {
 /// or one whose lookups bypass the resolver a hook would configure —
 /// cannot read native whatever the range says, so it pays no bind probe.
 pub(crate) async fn live_name_surface_with_range_at(
-    detection: &(Hook, Option<String>),
+    detection: &(Hook, Option<String>, RangeStep),
     zone_answerer_port: Option<u16>,
     answerer_bound: bool,
 ) -> Option<LiveSurfaceVerdict> {
@@ -1046,7 +1663,7 @@ pub(crate) async fn live_name_surface_with_range_at(
     if !answerer_bound {
         return None;
     }
-    let (hook, blocker) = detection;
+    let (hook, blocker, _) = detection;
     // The two cheap facts first: a host whose resolver does not route the
     // zone to the answerer — or one whose lookups bypass the resolver a
     // hook would configure — cannot read native whatever the range says,
@@ -1073,7 +1690,7 @@ pub(crate) async fn live_name_surface_with_range_at(
 /// facts it was decided from staying where the caller that holds them (the
 /// detection, the reply) can log them.
 pub(crate) async fn live_name_surface_at(
-    detection: &(Hook, Option<String>),
+    detection: &(Hook, Option<String>, RangeStep),
     zone_answerer_port: Option<u16>,
     answerer_bound: bool,
 ) -> Option<LiveSurface> {
@@ -1212,8 +1829,11 @@ impl From<&RangeProbe> for BindProbe {
 
 /// The host's naming surface for the diagnostic bundle: the resolver hook
 /// state (the macOS resolver file or the Linux routing-domain link), the
-/// loopback aliases the bind probe found, the probe's result, and whether
-/// the host is on the 127.0.0.1 interim (NET-122, NET-123).
+/// loopback aliases the bind probe found, the probe's result, whether the
+/// host is on the 127.0.0.1 interim, and the range step the detection read
+/// beside the hook — on macOS, whether the range unit is installed, the
+/// owner and mode of its plist and its program, the program path the plist
+/// runs, and the custody verdict over all of it (NET-122, NET-123).
 #[derive(Debug, Serialize)]
 pub(crate) struct NamingSurface {
     /// The zone the hooks and the range serve.
@@ -1228,11 +1848,18 @@ pub(crate) struct NamingSurface {
     pub bind_probe: BindProbe,
     /// Whether the host is on the 127.0.0.1 interim.
     pub interim_loopback: bool,
+    /// The range step this host carries: on macOS the range unit's state
+    /// and custody — whether it is installed, the owner and mode of its
+    /// plist and its program, the program path the plist runs, and the
+    /// custody verdict — else the no-step state of a host whose OS needs
+    /// none. Beside the bind probe's result, so a macOS host still on the
+    /// interim, or holding a unit whose custody fails, reads why.
+    pub range_step: RangeStep,
 }
 
 /// Reads everything [`NamingSurface`] holds, for `min bug` to record.
 pub(crate) async fn naming_surface() -> NamingSurface {
-    let (hook, _) = session_detection().await;
+    let (hook, _, range_step) = session_detection().await;
     // The daemon's session-start probe, run here on the CLI's own host:
     // blocking, so on a blocking thread.
     let probe = tokio::task::spawn_blocking(switch::loopback::probe)
@@ -1252,6 +1879,7 @@ pub(crate) async fn naming_surface() -> NamingSurface {
         interim_loopback: probe.interim(),
         resolver_hook: hook,
         bind_probe: BindProbe::from(&probe),
+        range_step,
     }
 }
 
@@ -1282,6 +1910,79 @@ mod tests {
         ]
     }
 
+    /// Whether `/bin/sh` parses `script`: the shell a user pastes the whole
+    /// command into, and the shell `sudo sh -c` hands its payload to. Parse
+    /// only — nothing runs, so no privilege is ever asked for — and a shell
+    /// that could not be spawned reads as a command that does not parse,
+    /// never as one that does.
+    fn sh_parses(script: &str) -> bool {
+        std::process::Command::new("/bin/sh")
+            .args(["-n", "-c"])
+            .arg(script)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    /// Root's custody facts, the state [`macos_command`] installs: every
+    /// directory component of both the unit's paths root-owned with no
+    /// group or other write, both files root-owned at their modes, and the
+    /// plist and the loaded job both naming the root-owned program path.
+    /// The pure verdict over these facts ([`range_step_over`]) is the
+    /// installed state the advisory's quiet arm needs beside the probe's
+    /// present.
+    fn root_owned_facts() -> RangeFacts {
+        let mut components = Vec::new();
+        for path in [RANGE_PROGRAM_PATH, RANGE_PLIST_PATH] {
+            for component in path_components(path) {
+                components.push((
+                    component,
+                    FileCustody {
+                        owner: 0,
+                        mode: 0o755,
+                    },
+                ));
+            }
+        }
+        RangeFacts {
+            components,
+            program: Some(FileCustody {
+                owner: 0,
+                mode: 0o755,
+            }),
+            plist: Some(FileCustody {
+                owner: 0,
+                mode: 0o644,
+            }),
+            plist_program: Some(RANGE_PROGRAM_PATH.to_string()),
+            loaded_program: Some(RANGE_PROGRAM_PATH.to_string()),
+        }
+    }
+
+    /// The installed range step: the verdict over root's facts, the state
+    /// every custody check holds in.
+    fn installed_range_step() -> RangeStep {
+        range_step_over(&root_owned_facts())
+    }
+
+    /// The range step this platform's advisory renders over — the step its
+    /// own detection reads on a healthy host: an installed unit on macOS,
+    /// the no-step state on Linux. The render's *other* arm is passed
+    /// explicitly by the tests that assert its text (NET-123's
+    /// platform-parameterized tests below): the platform is a parameter of
+    /// the render ([`advisory_at`] takes [`RangeStep`]), never a cfg the
+    /// tests read.
+    #[cfg(target_os = "macos")]
+    fn range_step_on_this_os() -> RangeStep {
+        installed_range_step()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn range_step_on_this_os() -> RangeStep {
+        RangeStep::not_needed()
+    }
+
     // NET-122's test name. The advisory names the exact command and nothing
     // in its path prompts: every builder here is pure over strings and the
     // reads behind `detect` are read-only — no reader is ever opened, so
@@ -1292,8 +1993,15 @@ mod tests {
         let port = 15353;
         // An unconfigured host is advised, with the exact command to run.
         let unconfigured = Hook::absent("test", "no hook for the zone");
-        let advisory = advisory_at(&unconfigured, port, false, None, None)
-            .expect("an unconfigured host must be advised");
+        let advisory = advisory_at(
+            &unconfigured,
+            port,
+            false,
+            None,
+            &range_step_on_this_os(),
+            None,
+        )
+        .expect("an unconfigured host must be advised");
         for marker in command_markers(port) {
             assert!(
                 advisory.contains(&marker),
@@ -1310,14 +2018,22 @@ mod tests {
         // fact holds.
         let configured = Hook::configured("test", Some(port), "routes the zone");
         assert!(
-            advisory_at(&configured, port, false, Some(true), None).is_none(),
+            advisory_at(
+                &configured,
+                port,
+                false,
+                Some(true),
+                &range_step_on_this_os(),
+                None
+            )
+            .is_none(),
             "a configured host must not be re-advised"
         );
 
         // A hook routing a *stale* port is advised: the command points the
         // resolver at this daemon's answerer, not the old one's.
         let stale = Hook::configured("test", Some(port - 1), "routes the zone elsewhere");
-        let advisory = advisory_at(&stale, port, false, None, None)
+        let advisory = advisory_at(&stale, port, false, None, &range_step_on_this_os(), None)
             .expect("a stale hook must be re-advised for this answerer's port");
         for marker in command_markers(port) {
             assert!(
@@ -1328,17 +2044,26 @@ mod tests {
 
         // NET-123's interim arm: a session published at the 127.0.0.1
         // interim re-surfaces the advisory even when the hook routes.
-        let interim = advisory_at(&configured, port, true, None, None)
-            .expect("the interim must re-surface the advisory");
+        let interim = advisory_at(
+            &configured,
+            port,
+            true,
+            None,
+            &range_step_on_this_os(),
+            None,
+        )
+        .expect("the interim must re-surface the advisory");
         assert!(
             interim.contains("127.0.0.1 interim"),
             "the interim advisory must name the interim: {interim}"
         );
         assert!(interim.contains(&range_text()));
         // The interim fact names what is missing — the range on the host's
-        // loopback — and does not claim the command below ends it: the
-        // command rendered today configures the resolver only, and the
-        // range step is not yet part of it (design §7.1 makes it so).
+        // loopback — and whose step ends it is this platform's: the fact's
+        // platform arms (does the command below end the interim, or is
+        // nothing left for it to install?) are pinned by
+        // `interim_advisory_says_the_command_ends_it_on_macos`, on both
+        // arms' steps.
         assert!(
             interim.contains("is not installed on this host's loopback"),
             "the interim advisory must name the missing range: {interim}"
@@ -1366,7 +2091,7 @@ mod tests {
         let port = 15353;
         let detection = session_detection().await;
         let advisory = session_advisory_at(&detection, Some(port), false, None);
-        let (hook, blocker) = &detection;
+        let (hook, blocker, _) = &detection;
         if hook.routes(port) && blocker.is_none() {
             assert!(advisory.is_none(), "configured host must not be advised");
         } else if let Some(blocker) = blocker {
@@ -1448,7 +2173,7 @@ mod tests {
         // at all until some VM's daemon reports a bound answerer, and a
         // VM that reports none keeps the arm that cannot misreport even
         // when a sibling VM's report paid for the read.
-        let detection = (routing_hook(), None);
+        let detection = (routing_hook(), None, RangeStep::not_needed());
         assert!(live_name_surface_at(&detection, None, true).await.is_none());
         assert!(
             live_name_surface_at(&detection, Some(15353), false)
@@ -1471,7 +2196,11 @@ mod tests {
     async fn live_surface_is_the_proxy_when_either_cheap_fact_is_missing() {
         let port = 15353;
         // A hook that does not route: proxy, settled without a probe.
-        let absent = (Hook::absent("test", "no hook"), None);
+        let absent = (
+            Hook::absent("test", "no hook"),
+            None,
+            RangeStep::not_needed(),
+        );
         assert_eq!(
             live_name_surface_at(&absent, Some(port), true).await,
             Some(LiveSurface::Proxy),
@@ -1480,7 +2209,11 @@ mod tests {
         // A dead hook: a routing hook whose stub-bypass blocker
         // makes it configuration no host process consults — the proxy, and
         // both verbs must read it, never native on the hook's word alone.
-        let blocked = (routing_hook(), Some("lookups bypass resolved".to_string()));
+        let blocked = (
+            routing_hook(),
+            Some("lookups bypass resolved".to_string()),
+            RangeStep::not_needed(),
+        );
         assert_eq!(
             live_name_surface_at(&blocked, Some(port), true).await,
             Some(LiveSurface::Proxy),
@@ -1502,7 +2235,12 @@ mod tests {
     async fn activate_and_ls_report_native_surface_verdict_on_host() {
         let port = 15353;
         assert_eq!(
-            live_name_surface_at(&(routing_hook(), None), Some(port), true).await,
+            live_name_surface_at(
+                &(routing_hook(), None, RangeStep::not_needed()),
+                Some(port),
+                true
+            )
+            .await,
             Some(LiveSurface::Native),
             "a routing hook on a bound answerer over this host's present range is \
              native DNS, and both verbs print it"
@@ -1516,13 +2254,17 @@ mod tests {
         // the same: a host the verdict calls native is a host the advisory
         // has nothing to say about, and a host the advisory must warn is
         // one the verdict calls the proxy.
-        let detection = (routing_hook(), None);
+        let detection = (routing_hook(), None, RangeStep::not_needed());
         let advisory = session_advisory_at(&detection, Some(port), false, Some(true));
         assert!(
             advisory.is_none(),
             "a native verdict has no advisory: {advisory:?}"
         );
-        let blocked = (routing_hook(), Some("lookups bypass resolved".to_string()));
+        let blocked = (
+            routing_hook(),
+            Some("lookups bypass resolved".to_string()),
+            RangeStep::not_needed(),
+        );
         assert!(
             session_advisory_at(&blocked, Some(port), false, Some(true)).is_some(),
             "the blocked hook is still the advisory's to say"
@@ -1670,6 +2412,732 @@ mod tests {
         assert!(command.starts_with("sudo"), "{command}");
     }
 
+    // NET-123's privileged step, on the one `sudo sh -c` NET-122 already
+    // renders (design §7.1): the command's own bytes do the whole install —
+    // the program and the plist are written from what the command carries,
+    // not staged, not copied, not read from anywhere user-writable — and
+    // the boot step loads last, so a re-run replaces the unit rather than
+    // dying on its label. Pinned here on the text the render builds from
+    // the same templates the e2e runs; the operator-run
+    // `local_range_reserved_by_privileged_step` (MINIMAL_E2E_PRIVILEGED=1,
+    // a macOS host with passwordless sudo) proves this command against a
+    // real launchd.
+    #[test]
+    fn advisory_command_reserves_the_range_on_macos() {
+        let command = macos_command(15353);
+        // The three files, written in order: the resolver file first
+        // (NET-122's step, unchanged), then the unit's program and plist.
+        let resolver_at = command
+            .find(RESOLVER_FILE)
+            .expect("the resolver step is named");
+        let program_at = command
+            .find(&format!("cat > {RANGE_PROGRAM_PATH}"))
+            .expect("the program step is named");
+        let plist_at = command
+            .find(&format!("cat > {RANGE_PLIST_PATH}"))
+            .expect("the plist step is named");
+        assert!(
+            resolver_at < program_at,
+            "the resolver file is written before the range step's files: {command}"
+        );
+        assert!(program_at < plist_at, "{command}");
+        // The directories the three files live in are made first — a stock
+        // host has no `/etc/resolver` and no `/Library/PrivilegedHelperTools`
+        // either.
+        let mkdir_at = command
+            .find(&format!(
+                "mkdir -p /etc/resolver {RANGE_PROGRAM_DIR} {RANGE_PLIST_DIR}"
+            ))
+            .expect("the directory step is named");
+        assert!(mkdir_at < resolver_at, "{command}");
+        // The bytes the command writes are the bytes the render builds: the
+        // heredoc bodies are byte-identical to the rendered program and to
+        // the plist template, under their quoted delimiters — no staged
+        // copy, no `$PATH` lookup, no argument, no environment, no file
+        // read feeds either one.
+        let program = range_program();
+        assert!(
+            command.contains(&program),
+            "the command carries the rendered program's own bytes: {command}"
+        );
+        assert!(
+            command.contains(RANGE_UNIT_PLIST),
+            "the command carries the plist's own bytes: {command}"
+        );
+        assert!(
+            command.contains(&format!("<<\\{RANGE_PROGRAM_HEREDOC}"))
+                && command.contains(&format!("<<\\{RANGE_PLIST_HEREDOC}")),
+            "the heredoc delimiters are quoted, so the bodies write byte for byte: {command}"
+        );
+        // The command must parse — in the shell a user pastes it into and in
+        // the shell sudo hands its payload to. The whole payload rides inside
+        // the one pair of single quotes, so a single apostrophe in either
+        // body closes them: the paste then hangs at a continuation prompt
+        // and `sh -n` rejects the line, which is what the round found. So
+        // neither body may carry one, and both halves are parsed to prove it.
+        assert!(
+            !program.contains('\''),
+            "the program body carries no apostrophe — the command rides inside \
+             single quotes, and one inside a body closes them: {program}"
+        );
+        assert!(
+            !RANGE_UNIT_PLIST.contains('\''),
+            "the plist body carries no apostrophe — the command rides inside \
+             single quotes, and one inside a body closes them: {RANGE_UNIT_PLIST}"
+        );
+        assert!(
+            sh_parses(&command),
+            "the command must parse in the shell it is pasted into: {command}"
+        );
+        let payload = command
+            .strip_prefix("sudo sh -c '")
+            .and_then(|rest| rest.strip_suffix('\''))
+            .expect("the command is the one sudo sh -c, its payload quoted whole");
+        assert!(
+            sh_parses(payload),
+            "the payload the root shell runs must parse: {payload}"
+        );
+        // Fail closed inside the one command: the payload opens with
+        // `set -e;`, and every step is its own statement — separated by `;`
+        // or by the newline a heredoc ends — because POSIX ignores `-e` for
+        // every command of an `&&` list except its last: a `mkdir` or
+        // `printf` that failed inside one would short-circuit its list
+        // silently and the script would run on, the plist landing beside a
+        // resolver file that did not, `launchctl bootstrap` loading the
+        // stale program, and the command exiting 0 over a host it
+        // half-configured. As statements, the first failure stops the
+        // script before any later step runs. The one compound statement is
+        // the guarded boot-out, whose `|| true` is what makes it guarded —
+        // and that is an OR-list, never an `&&`.
+        assert!(
+            payload.starts_with("set -e;"),
+            "the inner script fails closed — its first step is set -e: {payload}"
+        );
+        let bootout = format!("(launchctl bootout system/{RANGE_UNIT_LABEL} 2>/dev/null || true)");
+        assert!(
+            !payload.replace(&bootout, "").contains("&&"),
+            "no step hides inside an && list, where set -e reaches only the \
+             last command — the payload separates its steps, so the first \
+             failure stops the script: {payload}"
+        );
+        // The steps outside the two bodies substitute nothing — no `$`, no
+        // backtick — and the bodies themselves are quoted-delimiter
+        // (asserted above), so a backtick inside one (the program's comments
+        // carry markdown) writes rather than runs.
+        let steps_only = command.replace(&program, "").replace(RANGE_UNIT_PLIST, "");
+        assert!(
+            !steps_only.contains('$') && !steps_only.contains('`'),
+            "the steps substitute nothing — the bytes they write are the bytes they \
+             carry: {steps_only}"
+        );
+        assert!(
+            !steps_only.contains("cp ") && !steps_only.contains("install "),
+            "nothing is copied in from anywhere, user-writable or not: {steps_only}"
+        );
+        // Root owns both files, at the exact modes the custody checks
+        // verify, before launchd ever reads them.
+        assert!(
+            command.contains(&format!(
+                "chown root:wheel {RANGE_PROGRAM_PATH} {RANGE_PLIST_PATH}"
+            )),
+            "both files are converged to root's ownership: {command}"
+        );
+        assert!(
+            command.contains(&format!("chmod 0755 {RANGE_PROGRAM_PATH}")),
+            "the program is root's alone to run: {command}"
+        );
+        assert!(
+            command.contains(&format!("chmod 0644 {RANGE_PLIST_PATH}")),
+            "the plist is root's alone to write: {command}"
+        );
+        // The boot step loads last: the old unit is booted out first — so a
+        // re-run replaces it and re-runs the program rather than dying on
+        // the label collision — then the new one is bootstrapped, which
+        // loads it into the system domain, where launchd starts it at once,
+        // asynchronously, so the range appears within about a second, and
+        // its RunAtLoad re-applies the range at every boot after.
+        let bootout_at = command.find(&bootout).expect("the boot-out step is named");
+        let bootstrap = format!("launchctl bootstrap system {RANGE_PLIST_PATH}");
+        let bootstrap_at = command
+            .find(&bootstrap)
+            .expect("the bootstrap step is named");
+        assert!(
+            plist_at < bootout_at,
+            "the files are installed before the unit loads: {command}"
+        );
+        assert!(
+            bootout_at < bootstrap_at,
+            "the old unit is booted out before the new one loads: {command}"
+        );
+        assert!(
+            command.ends_with('\''),
+            "the load is the last step: {command}"
+        );
+        // And the resolver step is still NET-122's: the same file, the same
+        // port, in the same one command — the range step stands beside it,
+        // not in front of it.
+        assert!(
+            command.contains("nameserver 127.0.0.1\\nport 15353\\n"),
+            "{command}"
+        );
+    }
+
+    /// The rendered program applies exactly the reserved range and nothing
+    /// else (NET-123): the addresses it walks are exactly the usable host
+    /// addresses of the /24 — the addresses the bind probe probes — each one
+    /// applied by a single absolute-path `ifconfig` alias as a `/32` on lo0,
+    /// and an address lo0 already carries is skipped rather than re-added,
+    /// so a re-run adds only the missing aliases and removes nothing. The
+    /// program reads no argument, no environment variable and no file — its
+    /// one read is the interface's own state, reported by the same
+    /// absolute-path tool — so nothing user-writable can change what the
+    /// boot step applies.
+    #[test]
+    fn range_program_applies_exactly_the_reserved_range() {
+        let program = range_program();
+        let lines: Vec<&str> = program.lines().collect();
+        assert_eq!(
+            lines.first(),
+            Some(&"#!/bin/sh"),
+            "the unit's program is a /bin/sh script: {program}"
+        );
+        // The walk: exactly the range's host addresses, in probe order, and
+        // no address outside the range.
+        let walk = lines
+            .iter()
+            .find(|line| line.starts_with("for addr in ") && line.ends_with("; do"))
+            .copied()
+            .unwrap_or_else(|| panic!("the program walks the range's addresses: {program}"));
+        let list = walk
+            .strip_prefix("for addr in ")
+            .and_then(|rest| rest.strip_suffix("; do"))
+            .expect("the walk line is `for addr in <addresses>; do`");
+        let walked: Vec<String> = list.split_whitespace().map(str::to_string).collect();
+        let expected: Vec<String> = switch::loopback::range_hosts()
+            .map(|addr| addr.to_string())
+            .collect();
+        assert_eq!(
+            walked, expected,
+            "the program walks exactly the addresses the bind probe probes — every \
+             usable host address of the /24 and no address outside it: {program}"
+        );
+        // The one application form: an absolute-path `ifconfig` alias with
+        // the /32 mask, guarded by the skip over what lo0 already carries.
+        assert!(
+            program.contains(
+                "case \" $present \" in *\" $addr \"*) ;; *) /sbin/ifconfig lo0 alias \
+                 \"$addr\" 255.255.255.255 ;; esac"
+            ),
+            "each address is applied as one /32 lo0 alias by absolute path, skipped \
+             when lo0 already carries it: {program}"
+        );
+        assert_eq!(
+            program.matches("/sbin/ifconfig").count(),
+            2,
+            "ifconfig appears exactly twice — the read of the interface's own state \
+             and the alias — both by absolute path: {program}"
+        );
+        // No address outside the range is named anywhere the program acts:
+        // every IPv4-shaped literal on its working lines is one of the
+        // walked addresses or the /32 mask.
+        let addresses: std::collections::BTreeSet<String> = expected.iter().cloned().collect();
+        for line in lines.iter().filter(|line| !line.starts_with('#')) {
+            for word in line.split(|c: char| !c.is_ascii_alphanumeric() && c != '.') {
+                if word.parse::<Ipv4Addr>().is_ok() {
+                    assert!(
+                        addresses.contains(word) || word == "255.255.255.255",
+                        "the program names no address outside the reserved range \
+                         ({word}): {program}"
+                    );
+                }
+            }
+        }
+        // The program substitutes nothing but its own reads: no positional
+        // argument, no environment variable, no file read in — the only
+        // identifiers behind its `$` signs are its own two and the one
+        // command substitution.
+        for rest in program.split('$').skip(1) {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            assert!(
+                rest.starts_with('(') || name == "present" || name == "addr",
+                "the program substitutes nothing but its own reads (found {name:?}) — \
+                 no argument, no environment variable, no file: {program}"
+            );
+        }
+        assert!(
+            !program.contains('<'),
+            "the program reads no file — nothing redirects one in: {program}"
+        );
+        assert!(
+            !program.contains("127.0.0.1"),
+            "the program applies the range, not the interim address: {program}"
+        );
+        assert!(
+            program.contains("set -e"),
+            "an alias that fails fails the program, so the unit says so: {program}"
+        );
+    }
+
+    /// The custody checks over the range unit — NET-123's privileged step,
+    /// checked where the hook is detected: root owns both files with no
+    /// group or other write, the plist's `ProgramArguments` names the
+    /// root-owned program path, and the loaded job under the label runs
+    /// that same path, so files copied in without the unit behind them — or
+    /// a job loaded from elsewhere under the label — are not mistaken for
+    /// the unit. The first check that does not hold is the one the advisory
+    /// and the bundle name.
+    #[test]
+    fn range_step_custody_is_root_owned() {
+        // Root's facts: the state the command installs — installed, custody
+        // holding, which is the advisory's quiet arm beside the probe's
+        // present.
+        let step = range_step_over(&root_owned_facts());
+        assert_eq!(step.state, RangeStepState::Installed);
+        assert!(step.custody_holds(), "root's files hold custody: {step:?}");
+        assert_eq!(step.failed_check, None);
+
+        // Neither file: absent, and no custody question arises — the
+        // interim's state, whose fact is the range's, not the unit's.
+        assert_eq!(
+            range_step_over(&RangeFacts::default()).state,
+            RangeStepState::Absent
+        );
+
+        // The program a user owns, however it reads otherwise: custody
+        // fails, naming the file and the ownership it read.
+        let mut facts = root_owned_facts();
+        facts.program = Some(FileCustody {
+            owner: 501,
+            mode: 0o755,
+        });
+        let step = range_step_over(&facts);
+        assert_eq!(step.state, RangeStepState::CustodyFailed);
+        let check = step.failed_check.as_deref().expect("the check is named");
+        assert!(check.contains(RANGE_PROGRAM_PATH), "{check}");
+        assert!(
+            check.contains("uid 501"),
+            "the check names the owner it read: {check}"
+        );
+
+        // Group-writable is not root's alone, whoever owns it.
+        let mut facts = root_owned_facts();
+        facts.plist = Some(FileCustody {
+            owner: 0,
+            mode: 0o666,
+        });
+        let step = range_step_over(&facts);
+        assert_eq!(step.state, RangeStepState::CustodyFailed);
+        let check = step.failed_check.as_deref().expect("the check is named");
+        assert!(
+            check.contains(RANGE_PLIST_PATH) && check.contains("666"),
+            "the check names the file and the mode it read: {check}"
+        );
+
+        // One file without the other is not the unit: the plist without its
+        // program fails custody on the missing file, not on the ones that
+        // read.
+        let mut facts = root_owned_facts();
+        facts.program = None;
+        let step = range_step_over(&facts);
+        assert_eq!(step.state, RangeStepState::CustodyFailed);
+        let check = step.failed_check.as_deref().expect("the check is named");
+        assert!(
+            check.contains(&format!("{RANGE_PROGRAM_PATH} is missing")),
+            "the check names the file that is not there: {check}"
+        );
+
+        // The plist's ProgramArguments must name the root-owned program:
+        // a plist pointing anywhere else — the easy way to run another
+        // program under a root label — fails custody on exactly that.
+        let mut facts = root_owned_facts();
+        facts.plist_program = Some("/Users/runner/pwned".to_string());
+        let step = range_step_over(&facts);
+        assert_eq!(step.state, RangeStepState::CustodyFailed);
+        let check = step.failed_check.as_deref().expect("the check is named");
+        assert!(
+            check.contains("/Users/runner/pwned") && check.contains(RANGE_PROGRAM_PATH),
+            "the check names the program the plist runs and the one it must: {check}"
+        );
+        // A plist that names no program at all does not pass either.
+        let mut facts = root_owned_facts();
+        facts.plist_program = None;
+        assert_eq!(
+            range_step_over(&facts).state,
+            RangeStepState::CustodyFailed,
+            "a plist with no ProgramArguments is no unit"
+        );
+
+        // And the loaded job must run that same path: a job loaded from
+        // elsewhere under the label — or no job loaded at all — fails
+        // custody, so the installed files alone are never mistaken for a
+        // unit that runs.
+        let mut facts = root_owned_facts();
+        facts.loaded_program = Some("/Users/runner/pwned".to_string());
+        let step = range_step_over(&facts);
+        assert_eq!(step.state, RangeStepState::CustodyFailed);
+        let check = step.failed_check.as_deref().expect("the check is named");
+        assert!(
+            check.contains(RANGE_UNIT_LABEL) && check.contains("/Users/runner/pwned"),
+            "the check names the label and the program the loaded job runs: {check}"
+        );
+        let mut facts = root_owned_facts();
+        facts.loaded_program = None;
+        let step = range_step_over(&facts);
+        assert_eq!(step.state, RangeStepState::CustodyFailed);
+        let check = step.failed_check.as_deref().expect("the check is named");
+        assert!(
+            check.contains(RANGE_UNIT_LABEL),
+            "the check names the label no job is loaded under: {check}"
+        );
+    }
+
+    /// The walk: every directory component of both the unit's paths, from
+    /// `/` down, is checked — not just the files' own owner. That is what
+    /// makes a unit under `$HOME` or a user-owned Homebrew prefix fail
+    /// custody: the component a user can write is inside the unit's path,
+    /// and the failure names it.
+    #[test]
+    fn range_step_custody_walks_every_path_component() {
+        // The walk, from `/` down — the directories, never the file itself
+        // (the file's custody is its own check, beside this one).
+        assert_eq!(
+            path_components(RANGE_PROGRAM_PATH),
+            ["/", "/Library", "/Library/PrivilegedHelperTools"]
+        );
+        assert_eq!(
+            path_components(RANGE_PLIST_PATH),
+            ["/", "/Library", "/Library/LaunchDaemons"]
+        );
+        // A home-directory path walks the same way — and that is the point:
+        // the walk is what makes a unit under `$HOME` fail custody on the
+        // component a user owns, never on the files' own owner alone.
+        assert_eq!(
+            path_components("/Users/runner/dev.minimal.local-range"),
+            ["/", "/Users", "/Users/runner"]
+        );
+        // A user-owned component of the unit's own path fails custody, at
+        // that component, however root-owned both files are.
+        let mut facts = root_owned_facts();
+        let tampered = facts
+            .components
+            .iter_mut()
+            .find(|(path, _)| path == "/Library/PrivilegedHelperTools")
+            .expect("the component is on the walk");
+        tampered.1 = FileCustody {
+            owner: 501,
+            mode: 0o755,
+        };
+        let step = range_step_over(&facts);
+        assert_eq!(step.state, RangeStepState::CustodyFailed);
+        let check = step.failed_check.as_deref().expect("the check is named");
+        assert!(
+            check.contains("its directory /Library/PrivilegedHelperTools is owned by uid 501"),
+            "the check names the directory and the ownership it read: {check}"
+        );
+        // A component that did not read is never counted as passing: the
+        // walk's honest gap is said, not assumed.
+        let mut facts = root_owned_facts();
+        facts.components.clear();
+        let step = range_step_over(&facts);
+        assert_eq!(step.state, RangeStepState::CustodyFailed);
+        assert!(
+            step.failed_check
+                .as_deref()
+                .is_some_and(|check| check.contains("its directory / did not read")),
+            "the walk says which component it could not read: {step:?}"
+        );
+    }
+
+    /// One privilege elevation for the whole host's configuration
+    /// (NET-122's contract, unchanged by the range step the command now
+    /// carries): the command the advisory names is one `sudo sh -c`, and
+    /// nothing inside it escalates on its own — the paste prompts once,
+    /// however many files it writes.
+    #[test]
+    fn macos_advisory_command_elevates_exactly_once() {
+        let command = macos_command(15353);
+        assert_eq!(
+            command.matches("sudo").count(),
+            1,
+            "one privilege elevation for the resolver and the range together: {command}"
+        );
+        assert!(
+            command.starts_with("sudo sh -c '"),
+            "the whole host configuration is the one argument: {command}"
+        );
+        assert_eq!(
+            command.matches("sh -c").count(),
+            1,
+            "and the one shell it runs: {command}"
+        );
+        // No second escalation hiding inside: no `osascript` prompt, no
+        // nested `sudo`, no path the user's shell expands.
+        assert!(!command.contains("osascript"), "{command}");
+        assert!(
+            !command.contains('~'),
+            "the command's paths are absolute, never shell-expanded: {command}"
+        );
+    }
+
+    /// NET-123's re-surface clause, the custody half: the advisory that
+    /// fell quiet on a hook that routes comes back when the unit's custody
+    /// fails — naming the failed check, and the command that reinstalls
+    /// both files — and goes quiet again only when custody holds, the
+    /// probe reading present beside it. The probe's own half is
+    /// `bind_probe_reads_present_after_the_range_step`'s.
+    #[test]
+    fn range_step_custody_failure_resurfaces_the_advisory() {
+        let port = 15353;
+        let configured = routing_hook();
+        // The host the command leaves behind: quiet — the probe present,
+        // custody holding.
+        assert!(
+            advisory_at(
+                &configured,
+                port,
+                false,
+                Some(true),
+                &installed_range_step(),
+                None
+            )
+            .is_none(),
+            "custody holding over a present range is the quiet arm's whole condition"
+        );
+        // Custody failing on the same host: the advisory re-surfaces,
+        // naming the check that failed, whatever the probe says — custody
+        // is the fact the next boot turns on.
+        let mut facts = root_owned_facts();
+        facts.plist_program = Some("/Users/runner/pwned".to_string());
+        let failed = range_step_over(&facts);
+        let check = failed.failed_check.as_deref().expect("the check is named");
+        let advisory = advisory_at(&configured, port, false, Some(true), &failed, None)
+            .expect("a custody failure re-surfaces the advisory");
+        assert!(
+            advisory.contains(check),
+            "the advisory names the failed check: {advisory}"
+        );
+        assert!(
+            advisory.contains(&format!("the range unit {RANGE_UNIT_LABEL} fails custody")),
+            "the advisory says the custody verdict: {advisory}"
+        );
+        assert!(
+            advisory.contains("Configure the host's resolver and reserve the local range with:"),
+            "and names the command that reinstalls both files: {advisory}"
+        );
+        // The same failure under the interim: the interim is said, and the
+        // custody check with it — the one fact that says *which* step of
+        // the unit is not root's.
+        let interim = advisory_at(&configured, port, true, None, &failed, None)
+            .expect("the interim re-surfaces the advisory");
+        assert!(
+            interim.contains(check),
+            "the check is said under the interim too: {interim}"
+        );
+        // And an absent unit over a probe that reads present: the aliases
+        // without the boot step behind them are a range the next boot
+        // removes, not a host with nothing left to say.
+        let advisory = advisory_at(
+            &configured,
+            port,
+            false,
+            Some(true),
+            &range_step_over(&RangeFacts::default()),
+            None,
+        )
+        .expect("an absent unit re-surfaces the advisory");
+        assert!(
+            advisory.contains(&format!(
+                "the boot-time range unit {RANGE_UNIT_LABEL} is not installed"
+            )),
+            "the advisory names the absent unit: {advisory}"
+        );
+    }
+
+    /// The Linux command is byte-identical to the one NET-122 shipped: the
+    /// range step this task adds to the macOS arm must not touch it. Linux
+    /// takes no range step — `lo` carries the whole `127/8` — and the
+    /// dedicated link keeps its address, so the advisory over the
+    /// not-needed step says nothing of the range's unit, its paths or its
+    /// install.
+    #[test]
+    fn linux_advisory_command_is_unchanged() {
+        let port = 15353;
+        assert_eq!(
+            linux_command(port),
+            "sudo sh -c \"[ -e /sys/class/net/minzone0 ] \
+             || ip link add minzone0 type dummy \
+             && ip link set minzone0 up \
+             && ip addr replace 100.127.255.254/32 dev minzone0 \
+             && resolvectl default-route minzone0 false \
+             && resolvectl dns minzone0 127.0.0.1:15353 \
+             && resolvectl domain minzone0 '~min.internal'\""
+        );
+        // The quiet arm over the Linux step: the resolver's alone.
+        let configured = routing_hook();
+        assert!(
+            advisory_at(
+                &configured,
+                port,
+                false,
+                Some(true),
+                &RangeStep::not_needed(),
+                None
+            )
+            .is_none(),
+            "the Linux quiet arm is unchanged by the range step"
+        );
+        let unconfigured = Hook::absent("test", "no hook for the zone");
+        let advisory = advisory_at(
+            &unconfigured,
+            port,
+            false,
+            None,
+            &RangeStep::not_needed(),
+            None,
+        )
+        .expect("an unconfigured Linux host is advised");
+        assert!(
+            advisory.contains("Configure the host's resolver for the zone with:"),
+            "the lead-in names the resolver alone: {advisory}"
+        );
+        assert!(
+            !advisory.contains("reserve the local range"),
+            "the Linux command takes no range step: {advisory}"
+        );
+        // The interim arm over the Linux step: the fact names the range
+        // and stops — no claim that a command installs what it does not.
+        let interim = advisory_at(
+            &configured,
+            port,
+            true,
+            None,
+            &RangeStep::not_needed(),
+            None,
+        )
+        .expect("the interim re-surfaces the advisory");
+        assert!(
+            !interim.contains("the command below installs the range"),
+            "the Linux interim fact claims no range step the command has not: {interim}"
+        );
+    }
+
+    /// The probe's own half of the range step: the addresses the installed
+    /// program applies are exactly the addresses the bind probe probes, so
+    /// the probe that read absent — the interim the advisory names — reads
+    /// present once the step has run. Pinned purely, over the program's
+    /// own bytes and the probe's injected bind (`probe_over`'s stand-in for
+    /// a loopback); the operator-run e2e case (the local-range one, under
+    /// its opt-in) proves the same fact against a real lo0.
+    #[test]
+    fn bind_probe_reads_present_after_the_range_step() {
+        // The addresses the program applies, parsed from its own bytes: the
+        // list its one walk carries.
+        let program = range_program();
+        let walk = program
+            .lines()
+            .find(|line| line.starts_with("for addr in ") && line.ends_with("; do"))
+            .unwrap_or_else(|| panic!("the program walks the range's addresses: {program}"));
+        let list = walk
+            .strip_prefix("for addr in ")
+            .and_then(|rest| rest.strip_suffix("; do"))
+            .expect("the walk line is `for addr in <addresses>; do`");
+        let applied: Vec<Ipv4Addr> = list
+            .split_whitespace()
+            .filter_map(|address| address.parse().ok())
+            .collect();
+        assert_eq!(
+            applied.len(),
+            254,
+            "the program applies every usable host address: {program}"
+        );
+        // The host the step has not run on: none of the range is aliased,
+        // and the probe — the same address list it always reads — reads
+        // absent, the interim.
+        let before = switch::loopback::probe_over(applied.iter().copied(), |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::AddrNotAvailable))
+        });
+        assert!(
+            before.interim(),
+            "a host whose lo0 carries none of the range is on the interim"
+        );
+        // The host after the step: the program's own addresses are the ones
+        // aliased, and the probe over the range's addresses — the exact
+        // list the daemon and the CLI read — finds every one of them. That
+        // is the fact that ends the interim.
+        let after = switch::loopback::probe_over(switch::loopback::range_hosts(), |addr| {
+            if applied.contains(&addr) {
+                Ok(())
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::AddrNotAvailable))
+            }
+        });
+        assert_eq!(after.probed, 254);
+        assert_eq!(after.first_failure, None, "no address the step misses");
+        assert!(
+            after.present(),
+            "the probe reads present over the range the step applied"
+        );
+        assert!(!after.interim());
+    }
+
+    /// NET-123's interim fact, in the platform's arms: on macOS the same
+    /// command ends the interim — the range step is folded into the one
+    /// `sudo` the note names — and on Linux nothing the command runs
+    /// installs a range, so the fact names the range and stops. The render
+    /// takes the step as its parameter, so both arms' text is asserted
+    /// wherever the suite runs.
+    #[test]
+    fn interim_advisory_says_the_command_ends_it_on_macos() {
+        let port = 15353;
+        let configured = routing_hook();
+        // The macOS arm: the fact says the command below installs the
+        // range and ends the interim, and the lead-in says the command
+        // configures the resolver and reserves the range.
+        let interim = advisory_at(
+            &configured,
+            port,
+            true,
+            None,
+            &range_step_over(&RangeFacts::default()),
+            None,
+        )
+        .expect("the interim re-surfaces the advisory");
+        assert!(
+            interim.contains("127.0.0.1 interim") && interim.contains(&range_text()),
+            "the interim and the range are still the fact's own words: {interim}"
+        );
+        assert!(
+            interim.contains("the command below installs the range and ends the interim"),
+            "the macOS interim fact names the command that ends it: {interim}"
+        );
+        assert!(
+            interim.contains("Configure the host's resolver and reserve the local range with:"),
+            "and the lead-in says what the command now does: {interim}"
+        );
+        // The Linux arm: the same fact, no claim about a step the command
+        // does not carry.
+        let interim = advisory_at(
+            &configured,
+            port,
+            true,
+            None,
+            &RangeStep::not_needed(),
+            None,
+        )
+        .expect("the interim re-surfaces the advisory");
+        assert!(
+            !interim.contains("the command below installs the range"),
+            "the Linux fact claims no range step: {interim}"
+        );
+        assert!(
+            interim.contains("Configure the host's resolver for the zone with:"),
+            "the Linux lead-in names the resolver alone: {interim}"
+        );
+    }
+
     #[cfg(any(test, not(target_os = "macos")))]
     #[test]
     fn linux_command_targets_a_dedicated_link_off_the_default_route() {
@@ -1763,8 +3231,15 @@ mod tests {
         assert!(blocker.contains(RESOLVED_STUB), "{blocker}");
 
         let hook = Hook::absent("test", "no link carries a routing domain for the zone");
-        let advisory = advisory_at(&hook, 15353, false, None, Some(&blocker))
-            .expect("a stub-bypassing host is still advised");
+        let advisory = advisory_at(
+            &hook,
+            15353,
+            false,
+            None,
+            &range_step_on_this_os(),
+            Some(&blocker),
+        )
+        .expect("a stub-bypassing host is still advised");
         assert!(
             advisory.contains(&blocker),
             "the advisory says why no command is named: {advisory}"
@@ -1785,8 +3260,15 @@ mod tests {
         // nothing is missing there, so the note carries no dangling `; `
         // where a fact would sit and no dead command either.
         let routed = Hook::configured("test", Some(15353), "the routing domain routes the zone");
-        let advisory = advisory_at(&routed, 15353, false, None, Some(&blocker))
-            .expect("a bypassing host is advised even when its hook routes");
+        let advisory = advisory_at(
+            &routed,
+            15353,
+            false,
+            None,
+            &range_step_on_this_os(),
+            Some(&blocker),
+        )
+        .expect("a bypassing host is advised even when its hook routes");
         assert_eq!(
             advisory,
             format!("note: {blocker}."),
@@ -1860,7 +3342,7 @@ mod tests {
 
         // Which is the whole point: that host's advisory names the command.
         let hook = Hook::absent("test", "no link carries a routing domain for the zone");
-        let advisory = advisory_at(&hook, 15353, false, None, None)
+        let advisory = advisory_at(&hook, 15353, false, None, &range_step_on_this_os(), None)
             .expect("an nss-resolve host is advised the command");
         assert!(
             advisory.contains("sudo"),
@@ -1994,12 +3476,41 @@ mod tests {
                 probed: 254,
                 first_refusal: None,
             },
+            // The range step's record beside the probe's result (NET-123's
+            // diagnostics): whether the unit is installed, its files' owner
+            // and mode, the program path the plist runs, and the custody
+            // verdict over all of it.
+            range_step: installed_range_step(),
         };
         let json = serde_json_lenient::to_string_pretty(&surface).unwrap();
         assert!(json.contains("\"zone\": \"min.internal\""), "{json}");
         assert!(json.contains("127.0.64.0/24"), "{json}");
         assert!(json.contains("\"interim_loopback\": false"), "{json}");
         assert!(json.contains("\"port\": 15353"), "{json}");
+        assert!(
+            json.contains("\"range_step\""),
+            "the bundle carries the range step beside the probe: {json}"
+        );
+        assert!(
+            json.contains("\"state\": \"Installed\""),
+            "the record says the unit is installed: {json}"
+        );
+        assert!(
+            json.contains(&format!("\"plist_program\": \"{RANGE_PROGRAM_PATH}\"")),
+            "the record says which program the plist runs: {json}"
+        );
+        assert!(
+            json.contains("\"owner\": 0"),
+            "the record says who owns the unit's files: {json}"
+        );
+        assert!(
+            json.contains("\"mode\": 493") && json.contains("\"mode\": 420"),
+            "the record carries the files' modes (0755, 0644): {json}"
+        );
+        assert!(
+            json.contains("\"failed_check\": null"),
+            "an installed unit has no failed check to name: {json}"
+        );
     }
 
     // The mechanism under the detection's deadlines: a wedged
@@ -2150,7 +3661,7 @@ mod tests {
              printf 'Global Domains: ~.\\nLink 2 (enp3s0): ~min.internal\\n'\nelse \
              printf 'Global: 10.0.0.1\\nLink 2 (enp3s0): 127.0.0.1:15353\\n'\nfi\n",
         );
-        let (hook, _) = ls_detection().await;
+        let (hook, _, _) = ls_detection().await;
         assert!(
             hook.routes(15353),
             "both queries must read within the one deadline — run together, not \

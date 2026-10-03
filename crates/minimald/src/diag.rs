@@ -1443,4 +1443,35 @@ mod tests {
             "the walk still reaches sessions/: {listing}"
         );
     }
+
+    /// A credential planted in a `minimald.log` is absent from the bundle:
+    /// `add_file_tail` scrubs log tails line-wise.
+    #[tokio::test]
+    async fn diag_bundle_scrubs_credentials_from_log_tails() {
+        let server = TestServer::new().await;
+        let state_dir = server.state.minimal_state_dir().await;
+        let log_dir = state_dir.as_utf8_path().as_std_path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("minimald.log.2026-07-14"),
+            "2024-01-01T00:00:00Z  INFO exec request command=min://argv [\"sh\",\"-c\",\"curl -H 'Authorization: Bearer ghp_FAKETOKEN' https://x/\"]\n",
+        )
+        .unwrap();
+
+        let files = fetch_bundle(&server).await;
+        let contents = String::from_utf8_lossy(&files["logs/minimald.log.2026-07-14"]);
+        assert!(
+            !contents.contains("ghp_FAKETOKEN"),
+            "token must be scrubbed from the log tail, got: {contents}"
+        );
+        assert!(
+            contents.contains("<redacted:len=13>"),
+            "token must be replaced with placeholder, got: {contents}"
+        );
+        // The rest of the line is intact.
+        assert!(
+            contents.contains("curl -H 'Authorization: Bearer"),
+            "non-credential parts must survive, got: {contents}"
+        );
+    }
 }

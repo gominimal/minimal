@@ -1101,6 +1101,7 @@ fn session_run_encodes_a_task_form_not_a_command() {
     let request = minimald_rpc::exec::ExecRequest::TaskRun {
         task: "check".to_string(),
         owns_box: false,
+        args: vec![],
     };
     let wire = request.encode();
     assert_eq!(
@@ -1108,12 +1109,14 @@ fn session_run_encodes_a_task_form_not_a_command() {
         Ok(minimald_rpc::exec::ExecRequest::TaskRun {
             task: "check".to_string(),
             owns_box: false,
+            args: vec![],
         })
     );
 }
 
-/// `min task run <task>` parses with `--keep` off by default; the flag
-/// and the optional path positional are accepted in any order.
+/// `min task run <task>` parses with `--keep` off by default; the `--path`
+/// option and the `--keep` flag are accepted in any order, and every
+/// positional after the task name is a task argument, never a project path.
 #[test]
 fn task_run_parses_task_keep_and_path() {
     use clap::Parser as _;
@@ -1130,14 +1133,38 @@ fn task_run_parses_task_keep_and_path() {
     assert_eq!(a.task, "build");
     assert!(!a.keep);
     assert!(a.path.is_none());
+    assert!(a.args.is_empty());
 
     let a = run_args(&["min", "task", "run", "build", "--keep"]);
     assert!(a.keep);
 
-    let a = run_args(&["min", "task", "run", "--keep", "build", "sub/dir"]);
+    let a = run_args(&["min", "task", "run", "--keep", "build", "--path", "sub/dir"]);
     assert_eq!(a.task, "build");
     assert_eq!(a.path.as_deref(), Some("sub/dir"));
     assert!(a.keep);
+
+    // A positional after the task name is a task argument, not a path.
+    let a = run_args(&["min", "task", "run", "greet", "Alice"]);
+    assert_eq!(a.task, "greet");
+    assert!(a.path.is_none());
+    assert_eq!(a.args, ["Alice"]);
+
+    // `--path` may precede the task name.
+    let a = run_args(&["min", "task", "run", "--path", "sub/dir", "build"]);
+    assert_eq!(a.task, "build");
+    assert_eq!(a.path.as_deref(), Some("sub/dir"));
+
+    // A declared task arg is a `--<name>` flag; it passes through as-is.
+    let a = run_args(&["min", "task", "run", "greet", "--name", "Alice"]);
+    assert_eq!(a.task, "greet");
+    assert_eq!(a.args, ["--name", "Alice"]);
+
+    // A task arg whose name collides with a `min task run` option (`path`,
+    // `keep`) goes after `--`, which ends `min`'s own options.
+    let a = run_args(&["min", "task", "run", "deploy", "--", "--path", "prod"]);
+    assert_eq!(a.task, "deploy");
+    assert!(a.path.is_none());
+    assert_eq!(a.args, ["--path", "prod"]);
 
     // The task name is required.
     assert!(Cli::try_parse_from(["min", "task", "run"]).is_err());
@@ -2512,36 +2539,48 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
         no_input: true,
         vm: None,
     };
+    // Which backend `--provider local-minimald` selects is the platform's
+    // call: on Linux it is the native one, while macOS has no native backend
+    // at all, so `client_provider_kind` folds the flag's reading onto minvmd
+    // there — the same rule every VM-backed gate keys on, flag or no flag.
+    // The expectation is therefore the kind's, not a constant.
+    let native_names_a_vm = cfg!(target_os = "macos");
     assert_eq!(
         hostname_proxy_start_vm(&native),
-        None,
-        "the native backend hosts no VM to name"
+        native_names_a_vm.then_some(paths::DEFAULT_VM_NAME),
+        "the backend the flag selects names a VM exactly where that backend \
+         is the VM one"
     );
 
     // The native line is the single-VM routing line word for word — the same
-    // address in the same words, so the two surfaces read as one.
-    let native_start = hostname_proxy_start_line(hostname_proxy_start_vm(&native), NEXT_RUNG);
-    let mut single = Vec::new();
-    let mut native_resp = reply.clone();
-    native_resp.hostname_proxy_port = Some(NEXT_RUNG);
-    format_ls(
-        &mut single,
-        &LsArgs {
-            raw: false,
-            json: false,
-        },
-        &native_resp,
-        None,
-    )
-    .expect("rendering the single-VM listing");
-    let single = String::from_utf8(single).expect("the listing is UTF-8");
-    assert_eq!(
-        single
-            .lines()
-            .find(|l| l.starts_with("HOSTNAME PROXY:"))
-            .expect("the single-VM listing prints a routing line"),
-        native_start.as_str(),
-        "the native start line and `min ls`'s routing line must be the same \
-         line"
-    );
+    // address in the same words, so the two surfaces read as one. A fact
+    // about the native backend, so it is asserted only where that backend
+    // exists: a host whose every backend is minvmd renders its routing lines
+    // through the VM listing, which names the VM the start line names above.
+    if !native_names_a_vm {
+        let native_start = hostname_proxy_start_line(hostname_proxy_start_vm(&native), NEXT_RUNG);
+        let mut single = Vec::new();
+        let mut native_resp = reply.clone();
+        native_resp.hostname_proxy_port = Some(NEXT_RUNG);
+        format_ls(
+            &mut single,
+            &LsArgs {
+                raw: false,
+                json: false,
+            },
+            &native_resp,
+            None,
+        )
+        .expect("rendering the single-VM listing");
+        let single = String::from_utf8(single).expect("the listing is UTF-8");
+        assert_eq!(
+            single
+                .lines()
+                .find(|l| l.starts_with("HOSTNAME PROXY:"))
+                .expect("the single-VM listing prints a routing line"),
+            native_start.as_str(),
+            "the native start line and `min ls`'s routing line must be the same \
+             line"
+        );
+    }
 }

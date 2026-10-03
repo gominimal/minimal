@@ -839,6 +839,46 @@ async fn serve_get_effective_session_policy(
         .await
 }
 
+/// `GetLiveIngress`: the live dynamic-ingress mappings a session's box
+/// published at runtime (NET-044) — the rows `min session policy` lists beside
+/// the declaration, which is what makes a publish visible rather than only
+/// permitted.
+///
+/// The live actor's own state, so this resolves the session where the policy
+/// RPCs read the record: [`Manager::get_session`] brings a known session's
+/// actor up if it has none running, and an actor holding no host answers an
+/// empty list — the honest answer for a box that is not running, since a
+/// publish lives only while its box does.
+async fn serve_get_live_ingress(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    minimald_rpc::GetLiveIngress
+        .handle_channel(c, async |req| {
+            let mngr = s.sessions_manager().await;
+            let predicate = match req {
+                minimald_rpc::GetLiveIngressRequest::Id(id) => SessionKeyPredicate::Id(id),
+                minimald_rpc::GetLiveIngressRequest::Name(name) => SessionKeyPredicate::Name(name),
+            };
+            let session = mngr
+                .get_session(predicate)
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            match session {
+                None => Ok(Errorable::Err {
+                    error: "no session found".to_string(),
+                }),
+                Some(session) => match session.live_ingress().await {
+                    Ok(live) => Ok(Errorable::Ok(live)),
+                    Err(e) => Ok(Errorable::Err {
+                        error: e.to_string(),
+                    }),
+                },
+            }
+        })
+        .await
+}
+
 /// `GetSessionHooks`: the lifecycle hooks composed into a session, each
 /// with the loadout or project that declared it.
 ///
@@ -1791,6 +1831,7 @@ pub async fn handle_ssh_rpc(
         | AbortSession::NAME
         | GetSessionPolicy::NAME
         | GetEffectiveSessionPolicy::NAME
+        | minimald_rpc::GetLiveIngress::NAME
         | minimald_rpc::GetSessionHooks::NAME
         | SessionDelta::NAME
         | GetSessionScreen::NAME
@@ -1876,6 +1917,9 @@ pub async fn handle_ssh_rpc(
         GetSessionPolicy::NAME => serve!(serve_get_session_policy(s, channel)),
         GetEffectiveSessionPolicy::NAME => {
             serve!(serve_get_effective_session_policy(s, channel))
+        }
+        minimald_rpc::GetLiveIngress::NAME => {
+            serve!(serve_get_live_ingress(s, channel))
         }
         minimald_rpc::GetSessionHooks::NAME => serve!(serve_get_session_hooks(s, channel)),
         SessionDelta::NAME => serve!(serve_session_delta(s, channel)),
@@ -3626,6 +3670,37 @@ mod tests {
             get_session.record.as_ref().unwrap().name,
             Some("renamed".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn rename_session_to_its_current_name_is_an_error() {
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let session_id = fresh_session(&mut client).await;
+
+        // `fresh_session` names the session "stream-test"; renaming it to that
+        // same name must fail rather than silently no-op.
+        let resp = client
+            .call::<RenameSession>(&RenameSessionRequest {
+                id: session_id,
+                new_name: "stream-test".to_string(),
+            })
+            .await;
+
+        assert!(
+            matches!(&resp, Errorable::Err { error } if error.contains("session is already named")),
+            "expected a rename-to-self error, got {resp:?}",
+        );
+
+        // The failed rename left the name intact.
+        let mngr = server.state.sessions_manager().await;
+        let handle = mngr
+            .get_session(SessionKeyPredicate::Id(session_id))
+            .await
+            .unwrap()
+            .expect("freshly-created session should be retrievable");
+        let record = handle.record().await.unwrap();
+        assert_eq!(record.name.as_deref(), Some("stream-test"));
     }
 
     #[tokio::test]

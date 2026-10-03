@@ -481,11 +481,47 @@ enum SessionMessage {
         opts: MaterializeOpts,
         reply: oneshot::Sender<Result<mpsc::Receiver<MaterializeUpdate>, std::io::Error>>,
     },
+    /// Publish `port` for this box at runtime (NET-043): the request a process
+    /// inside the box sends with its own `min net expose`, decided against the
+    /// box's `dynamic_ingress` setting and — when it allows — bound on the
+    /// switch and recorded as a live mapping (NET-044). Answered with the
+    /// published mapping, or the typed reason the request was refused.
+    ExposeDynamic {
+        port: u16,
+        reply:
+            oneshot::Sender<Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>>,
+    },
+    /// The live dynamic-ingress mappings this box published at runtime
+    /// (NET-044) — what the `GetLiveIngress` RPC serves. Empty for a box that
+    /// published none.
+    LiveIngress(oneshot::Sender<Vec<minimald_rpc::LiveMapping>>),
     /// Test-only inspection: an `Arc` clone of the held [`Composition`]
     /// (`None` in `Draft`, or `Active` without one post-restart). Lets tests
     /// assert composition contents without disturbing the lifecycle.
     #[cfg(test)]
     PeekComposition(oneshot::Sender<Option<Arc<Composition>>>),
+}
+
+/// One live dynamic-ingress publish (NET-044): the forwarder the switch
+/// accepted, paired with the mapping it published. Held together — not
+/// re-derived from the forwarder at read time — so the list
+/// [`SessionMessage::LiveIngress`] serves is exactly what the switch holds,
+/// and the teardown that unbinds the one is the list of the other.
+struct LiveIngressForward {
+    /// The daemon-owned forward: its unexpose releases the port.
+    forwarder: crate::net::policy::PortForwarder,
+    /// The mapping as the policy surfaces read it.
+    mapping: minimald_rpc::LiveMapping,
+}
+
+/// The row the policy surfaces read, not the forwarder's own internals —
+/// `PortForwarder` is a handle, and the mapping is the fact it published.
+impl fmt::Debug for LiveIngressForward {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LiveIngressForward")
+            .field("mapping", &self.mapping)
+            .finish()
+    }
 }
 
 /// Manages one session, from the moment its record is allocated: the create
@@ -521,11 +557,20 @@ pub struct Session {
 
     /// The daemon-scoped gvproxy switch, injected into each `SandboxLauncher`
     /// this session mints so an `OwnIp` PTask attaches to the one per-host
-    /// switch (R1.5). Read only by the production `session_launcher`
-    /// (`cfg(not(test))`); the `cfg(test)` mock launcher ignores it, so the
+    /// switch (R1.5). Read by the production `session_launcher`
+    /// (`cfg(not(test))`), and by the runtime port-publish path, which drives
+    /// the switch's forwarder through it (NET-043) in every build; the
+    /// `cfg(test)` mock launcher ignores it for launches, so the
     /// unused-field lint is silenced under test rather than threaded through.
     #[cfg_attr(test, allow(dead_code))]
     net_switch: Arc<Mutex<crate::net::SwitchClient>>,
+
+    /// The ports this box published at runtime with its own `min net expose`
+    /// (NET-044): one entry per port the box's `dynamic_ingress` allowed and
+    /// the switch accepted, held from the publish until the box stops, where
+    /// [`Session::stop_running`] unbinds them. A box that published none —
+    /// and one that is not running — holds an empty list.
+    live_ingress: Vec<LiveIngressForward>,
 
     /// The root of this session's operation tree - tracks long-running
     /// operations for display.
@@ -649,6 +694,9 @@ impl Session {
             // Forwards are registered as their channels open; a session
             // starts with none.
             forwards: Vec::new(),
+            // The same for the ports the box publishes at runtime: nothing is
+            // live until a `min net expose` inside it lands (NET-044).
+            live_ingress: Vec::new(),
             #[cfg(target_os = "linux")]
             hostnames,
             #[cfg(target_os = "linux")]
@@ -755,8 +803,16 @@ impl Session {
         // route exists by the time the caller can observe the session
         // (R3.1/R3.6). A `Draft` session has nothing to route to yet, so
         // `register_hostname` no-ops until its loadout finalizes.
+        //
+        // Never waiting on the range verdict (NET-123 §7.1): this runs
+        // inside the manager's own message handling — the resume an RPC
+        // naming the box brings up, the create, and the bring-up a destroy
+        // makes to run its hooks — so a wait here would park every other
+        // session's operation behind it. A resumed handed box the verdict
+        // has not vouched for publishes at the `127.0.0.1` interim at once,
+        // and the present landing's sweep moves it to its hand.
         #[cfg(target_os = "linux")]
-        actor.register_hostname(obj.record()).await;
+        actor.register_hostname(obj.record(), false).await;
 
         tokio::spawn(actor.mainloop());
         Ok(SessionHandle(sender))
@@ -786,8 +842,15 @@ impl Session {
     /// verdict's source check does too — NET-084), so a request from the box
     /// through the hostname proxy meets its own declaration — exactly what a
     /// direct connection from it meets (NET-071).
+    ///
+    /// `wait_for_verdict` is whether a hand the range verdict has not
+    /// vouched for may wait for it ([`Self::hand_or_interim`]): only the
+    /// box's first finalize does, inside its own actor. Every other
+    /// registration — the pre-live one [`Self::run`] makes from the
+    /// manager's message handling, a rename — publishes such a hand at the
+    /// `127.0.0.1` interim at once, and the present landing moves it.
     #[cfg(target_os = "linux")]
-    async fn register_hostname(&self, record: &Record) {
+    async fn register_hostname(&self, record: &Record, wait_for_verdict: bool) {
         if !self.owns_hostname_route(record) {
             return;
         }
@@ -798,11 +861,36 @@ impl Session {
         match record.network {
             sessions::NetworkMode::OwnIp => {
                 // NET-010/NET-011: finalize publishes the box's declaration
-                // at a host loopback address of its own — granted through the
-                // answerer's record the first time, kept by the stable
-                // session id across a rename, a restart of the actor, or a
-                // restart of the daemon — so the name answers from here to
-                // destroy, whether or not a client ever attaches (NET-013).
+                // at a host loopback address of its own — the one the VM
+                // host daemon handed the box's registration (T66), or one an
+                // earlier finalize published and the registry kept by the
+                // stable session id across a rename, a restart of the actor,
+                // or a restart of the daemon — so the name answers from
+                // here to destroy, whether or not a client ever attaches
+                // (NET-013).
+                //
+                // A box nobody handed an address — a native launch, whose
+                // creator is the daemon itself, or a VM lane whose client
+                // spelled no provider to register with — is still owed a
+                // publish (NET-040: a fresh install's `--network own_ip
+                // --ingress` publishes on the host), so finalize asks the
+                // answerer for one: the host-global allocation NET-010
+                // names, arbitrated through the answerer's authenticated
+                // channel, which no daemon self-assigns beside. The grant is
+                // not the daemon choosing an address — the answerer's one
+                // lease record chooses it, and the release at destroy hands
+                // it back — and it is not a substitute either: it is asked
+                // before any forwarder binds, so the binds and the name
+                // answer at the one address it granted. A grant withheld for
+                // a fault — a spent pool, an unreadable record — publishes
+                // nothing and registers no name, and the attach of a box
+                // that declared ingress fails with "no published address
+                // handed" rather than binding forwards at an address nobody
+                // granted; a grant withheld for the host's surface — an
+                // absent range, a verdict still walking — publishes the box
+                // on the `127.0.0.1` interim (NET-123), so the binds and
+                // the name answer at the one address the host can listen
+                // on.
                 //
                 // The address is asked for **before** the registry's write
                 // lock, and never underneath it: the ask is a synchronous
@@ -814,51 +902,166 @@ impl Session {
                 // record, so the two orders cannot cycle either way. A box
                 // that already published one — a rename, a resume — is
                 // answered from the registry alone, without asking, so no
-                // ask is logged on its account; and two paths that both
+                // ask is logged on its account — unless what it published is
+                // one of the two publishes that are not the box's own
+                // address: the `127.0.0.1` interim, and a reserved-range
+                // address a landed verdict has since overruled. Those ask
+                // again (the two filters below), so the interim cannot
+                // outstay the window that made it and no box holds an
+                // address the surface cannot bind; and two paths that both
                 // miss and both ask are still safe, the ask idempotent by
                 // namespace and answered with the address the first one
                 // recorded.
-                let already_published = {
+                //
+                // A VM-backed box publishes at the address the VM host
+                // daemon handed its registration (T66) — the host's slice of
+                // the reserved local range, not a grant this daemon's in-guest
+                // book could hand out — so the handed address stands in for
+                // the lease before the lease is ever asked for, and the
+                // attach path's expose requests name exactly it as their
+                // `local`. It is never drawn from the pool: the host-side
+                // table's row owns it, so neither the grant's info line nor
+                // the release at destroy runs for a handed box.
+                //
+                // The hand still goes through the verdict the host's publish
+                // surface holds (NET-123 §7.1): the VM host daemon hands
+                // slice addresses without measuring the loopback they bind
+                // on — the root fix is the host daemon measuring before it
+                // hands (#1818) — and on a host whose surface cannot bind
+                // the range the hand names an address no bind will ever
+                // hold. [`vouches_for`] is the gate, and only a **landed
+                // present** verdict passes it: a pending one has measured
+                // nothing, and the hand's own provenance (the host-side
+                // row, which a resumed box keeps its address on, NET-013)
+                // is a fact about who chose the address, not about the
+                // surface it binds on. So a hand the verdict has not
+                // vouched for is not published and not refused either —
+                // the box's first finalize waits for the verdict to land,
+                // bounded by the daemon's one verdict deadline
+                // ([`Self::hand_or_interim`]), so the name publishes once
+                // at its final address: at the hand when the walk lands
+                // present inside the bound, at the interim when it lands
+                // absent or never lands — and the present landing's sweep
+                // upgrades an interim-standing handed box back to its own
+                // hand when the verdict arrives late. Every other
+                // registration publishes such a hand at the interim
+                // without waiting. The recorded publish reads through the
+                // same gate (the first filter above): a hand the landing
+                // has since overruled does not survive in the registry
+                // either.
+                let (already_published, stood_on_interim) = {
                     let reg = self
                         .hostnames
                         .read()
                         .expect("hostname registry lock poisoned");
-                    reg.published_own_address(record.id)
+                    let standing = reg.published_own_address(record.id);
+                    let kept = standing
+                        // The verdict the book holds gates the recorded
+                        // publish exactly as it gates the fresh hand below
+                        // (NET-123): a publish that outlived the verdict
+                        // that vouched for it — a landing has overruled it
+                        // since — names an address the surface cannot bind,
+                        // and the record's memory of it must not keep the
+                        // box standing there. The ask below answers with
+                        // the interim instead.
+                        .filter(|address| self.loopback.vouches_for(*address))
+                        // The `127.0.0.1` interim is the surface's answer,
+                        // never an address the box owns, so a publish
+                        // standing on it asks again: the walk's landing is
+                        // the moment the ask upgrades to a grant — and a box
+                        // the landing misses, because it was stopped across
+                        // it, upgrades at this same ask — where a granted
+                        // address is the box's own and keeps.
+                        .filter(|address| *address != std::net::Ipv4Addr::LOCALHOST);
+                    (kept, standing == Some(std::net::Ipv4Addr::LOCALHOST))
                 };
-                let published =
-                    already_published.or_else(|| self.lease_loopback_address(record, &name));
+                let handed = record
+                    .box_addresses
+                    .map(|addresses| addresses.loopback_address);
+                let published = if already_published.is_some() {
+                    already_published
+                } else {
+                    match handed {
+                        // The hand goes through the verdict the host's
+                        // publish surface holds (NET-123 §7.1) — under a
+                        // verdict that has vouched for it, at the hand;
+                        // under one that has not, at the interim, after the
+                        // bounded wait a first finalize takes so the name
+                        // does not publish twice. Never a grant: a hand is
+                        // only ever replaced by `127.0.0.1`.
+                        Some(hand) => Some(
+                            self.hand_or_interim(
+                                record,
+                                &name,
+                                hand,
+                                wait_for_verdict,
+                                stood_on_interim,
+                            )
+                            .await,
+                        ),
+                        None => self.lease_loopback_address(record, &name),
+                    }
+                };
                 let mut reg = self
                     .hostnames
                     .write()
                     .expect("hostname registry lock poisoned");
+                // The verdict re-read under the write lock: a present
+                // landing that stored its verdict after the answer above
+                // but before this lock may have run its sweep already —
+                // which enumerated the registry without this publish — so a
+                // handed box headed for the interim takes its hand here
+                // instead of standing on the interim until its next
+                // registration. The landing stores the verdict before its
+                // sweep takes the registry, so either the sweep sees this
+                // publish and moves it, or this re-read sees the verdict.
+                // The box cannot have been destroyed under it: a destroy
+                // runs through this session's own mailbox, after this
+                // registration, and the hand is never released to a pool.
+                let published = match promote_interim_to_hand(
+                    &reg,
+                    &self.loopback,
+                    record.id,
+                    &name,
+                    published,
+                    handed,
+                ) {
+                    Some(hand) => {
+                        tracing::warn!(
+                            session_id = %record.id,
+                            session_name = &name,
+                            from = %std::net::Ipv4Addr::LOCALHOST,
+                            to = %hand,
+                            action = "loopback-range-present-box",
+                            "the verdict landed present while the box was \
+                             registering; it publishes at its own hand, not \
+                             the 127.0.0.1 interim"
+                        );
+                        Some(hand)
+                    }
+                    None => published,
+                };
                 reg.register_caller(record.id, &name, &record.policy, subnet);
                 let declared = crate::net::switch::declared_request_ports(Some(&record.policy));
+                if let Some(hand) = handed {
+                    // The hand is the box's own address whether this
+                    // publish lands at it or at the interim the wait's
+                    // expiry stands it on: recorded so the present landing's
+                    // sweep moves a handed box off the interim back to its
+                    // own hand, never to a grant drawn from the pool.
+                    reg.record_own_hand(record.id, hand);
+                }
                 if let Some(address) = published {
                     // One warn line per port another box at the same address
                     // also publishes (NET-129): intrinsic to the shared-address
                     // mode, reported — the session-start report — and never
                     // translated.
                     reg.publish_own_address(record.id, &name, address, declared.clone());
-                } else {
-                    // The box publishes on the node's shared address (spent pool,
-                    // absent range, pending verdict, unreadable record). The same
-                    // shared-address collision check still applies, but the node
-                    // address itself is *not* recorded as the box's own: doing so
-                    // would short-circuit future lease asks through
-                    // `published_own_address` and would need `set_node_address`
-                    // to re-point a recorded node address when the node's grant
-                    // lands. Collisions are reported at the same moment as an
-                    // own-address publish (NET-129), through the same emitter;
-                    // the warn line is the surface today, and the list is kept
-                    // for a listing consumer to come.
-                    let node_address = reg.node_address();
-                    let _collisions = reg.report_shared_address_collisions(
-                        record.id,
-                        &name,
-                        node_address,
-                        declared.clone(),
-                    );
                 }
+                // A box whose grant was withheld registers no name: the
+                // registry's own route is built only from a published
+                // address, so `register_own_ip` leaves the name absent and
+                // the attach path fails the box with the same fact.
                 reg.register_own_ip(record.id, &name, declared);
             }
             sessions::NetworkMode::HostNet => {
@@ -883,6 +1086,63 @@ impl Session {
         if matches!(record.network, sessions::NetworkMode::OwnIp) {
             self.report_unrecorded_publishes();
         }
+    }
+
+    /// Resolves a hand to the address the box publishes at (NET-123 §7.1):
+    /// the hand itself when the verdict vouches for it, the `127.0.0.1`
+    /// interim when it does not — and never anything else. A hand is only
+    /// ever replaced by the interim, so no grant is asked for a handed box:
+    /// the hand is the host-side table's row, and the attach path's forwards
+    /// name it as their `local`.
+    ///
+    /// With `wait_for_verdict` — the box's first finalize — a verdict still
+    /// pending is waited for, bounded by the daemon's one verdict deadline
+    /// ([`crate::net::dns::LoopbackLeaseBook::await_vouch_for`]), so the
+    /// name publishes **once** at its final address rather than moving
+    /// under the clients a live session already has. A verdict that lands
+    /// present inside the bound vouches for the hand; one that lands absent,
+    /// or a deadline that passes first, answers "not vouched". Without it
+    /// the verdict is read as it stands. An unvouched hand publishes the
+    /// interim, with the hand→interim move said out loud in one warn line
+    /// naming the box and both addresses — once, not again on a
+    /// re-registration of a box already standing there
+    /// (`stood_on_interim`). The present landing's sweep upgrades a handed
+    /// box standing at the interim back to its own hand when the verdict
+    /// finally vouches for it
+    /// ([`crate::sessions::land_range_verdict`]'s present arm).
+    ///
+    /// Called outside every registry lock, since the wait is async.
+    #[cfg(target_os = "linux")]
+    async fn hand_or_interim(
+        &self,
+        record: &Record,
+        name: &str,
+        hand: std::net::Ipv4Addr,
+        wait_for_verdict: bool,
+        stood_on_interim: bool,
+    ) -> std::net::Ipv4Addr {
+        let vouched = if wait_for_verdict {
+            self.loopback.await_vouch_for(hand).await
+        } else {
+            self.loopback.vouches_for(hand)
+        };
+        if vouched {
+            return hand;
+        }
+        if !stood_on_interim {
+            tracing::warn!(
+                session_id = %record.id,
+                session_name = name,
+                from = %hand,
+                to = %std::net::Ipv4Addr::LOCALHOST,
+                action = "loopback-hand-to-interim",
+                "the hand's range is not vouched for by a landed present \
+                 verdict; the box's publish — name and route with it — \
+                 moves to the 127.0.0.1 interim, and the present landing \
+                 upgrades it to the hand once the verdict vouches"
+            );
+        }
+        std::net::Ipv4Addr::LOCALHOST
     }
 
     /// One warn line per reserved-range address a live publish holds on this
@@ -910,21 +1170,42 @@ impl Session {
     /// for per lease, naming the box and the address (the diagnostics
     /// bundle's log tail carries these beside each release).
     ///
-    /// `None` — with the warn line that says why — when the host's pool is
-    /// spent or the answerer cannot answer (an absent range, a pending verdict
-    /// inside the deferred walk's window, an unreadable record): the box then
-    /// publishes on the node's shared address, the mode
-    /// [`HostnameRegistry`](crate::net::dns::HostnameRegistry) already
-    /// answers for, where NET-128 keeps a stopped box from impersonating the
-    /// node and NET-129 keeps the collision reported rather than translated.
-    /// A grant the box already holds — a resumed session asking again after
-    /// a restart — answers with the recorded address, which is how a box's
-    /// address stays stable across a daemon restart, whether or not the
-    /// restarted daemon's range verdict has landed yet (NET-013).
+    /// This is the ask a box nobody handed an address takes (NET-040: the
+    /// daemon is the creator of its own native boxes, and a VM lane whose
+    /// client spelled no provider to register with has no host-side creator
+    /// either), and it is not the daemon choosing an address: the answerer's
+    /// record is the host-global allocation NET-010 binds, the one
+    /// authenticated channel every daemon on the host asks through.
+    ///
+    /// `None` — with the warn line that says why — for the two answers that
+    /// are faults rather than facts about the host's surface: a spent pool
+    /// and an unreadable record. The box then publishes nothing and registers
+    /// no name, and the attach of a box that declared ingress fails with
+    /// "no published address handed" rather than binding forwards at an
+    /// address nobody granted — reported, never substituted.
+    ///
+    /// The two answers that are facts about the surface — the range absent,
+    /// the verdict still walking its deferred window — publish the box on the
+    /// `127.0.0.1` interim (NET-123's absent arm): the host can listen there
+    /// whatever its `lo0` carries, so the box's declared ports are published
+    /// and reachable instead of failing at an address the surface cannot
+    /// bind. The interim is recorded as the box's own publish — the name
+    /// routes at it and the attach binds its forwards at it — but it is the
+    /// surface's answer, never an address the box owns, so it cannot outstay
+    /// the window that made it: the walk's landing re-points the boxes
+    /// standing on it when its verdict lands, and a finalize that finds one
+    /// asks again rather than answering from the record. A grant the box
+    /// already holds — a resumed session asking again after a restart —
+    /// answers with the recorded address once a present verdict has landed,
+    /// which is how a box's address stays stable across a daemon restart
+    /// (NET-013); inside a restarted daemon's pending window it answers the
+    /// interim, and the present landing restores the recorded address — no
+    /// reserved-range address publishes under anything but a landed present.
     #[cfg(target_os = "linux")]
     fn lease_loopback_address(&self, record: &Record, name: &str) -> Option<std::net::Ipv4Addr> {
         let namespace = crate::net::dns::LeaseNamespace::Box { session: record.id };
-        match self.loopback.grant(namespace) {
+        let granted = self.loopback.grant(namespace);
+        match granted {
             crate::net::dns::LoopbackGrant::Granted(address) => {
                 tracing::info!(
                     session_id = %record.id,
@@ -933,17 +1214,15 @@ impl Session {
                     action = "loopback-lease",
                     "leased a host loopback address for the box's published ports"
                 );
-                Some(address)
             }
             crate::net::dns::LoopbackGrant::PoolSpent => {
                 tracing::warn!(
                     session_id = %record.id,
                     session_name = name,
                     action = "loopback-pool-spent",
-                    "the host's reserved local range is spent; \
-                     the box's ports publish on the node's shared address"
+                    "the host's reserved local range is spent; the box's \
+                     declared ingress has no address to publish at"
                 );
-                None
             }
             crate::net::dns::LoopbackGrant::RangePending => {
                 tracing::warn!(
@@ -951,20 +1230,19 @@ impl Session {
                     session_name = name,
                     action = "loopback-range-pending",
                     "the verdict over the reserved local range is still pending; \
-                     the box's ports publish on the node's shared address \
+                     the box's declared ingress publishes on the 127.0.0.1 interim \
                      until the publish-surface walk lands"
                 );
-                None
             }
             crate::net::dns::LoopbackGrant::RangeAbsent => {
                 tracing::warn!(
                     session_id = %record.id,
                     session_name = name,
                     action = "loopback-range-absent",
-                    "the reserved local range is absent on this host; \
-                     the box's ports publish on the node's shared address"
+                    "the reserved local range is absent on this host's publish \
+                     surface; the box's declared ingress publishes on the \
+                     127.0.0.1 interim"
                 );
-                None
             }
             crate::net::dns::LoopbackGrant::RecordUnavailable => {
                 tracing::warn!(
@@ -972,11 +1250,11 @@ impl Session {
                     session_name = name,
                     action = "loopback-record-unavailable",
                     "the answerer's lease record could not be read or written; \
-                     the box's ports publish on the node's shared address"
+                     the box's declared ingress has no address to publish at"
                 );
-                None
             }
         }
+        granted.publishable_address()
     }
 
     /// Returns a destroyed box's host loopback address to the host's pool
@@ -984,12 +1262,13 @@ impl Session {
     /// [`Self::lease_loopback_address`] that named the grant — with the one
     /// info line per release naming the box and the address.
     ///
-    /// The answer is the record's, not the registry's: a box that published
-    /// on the node's shared address holds no grant, and a box that holds one
-    /// gets exactly that address back — even a box whose publish was lost to
-    /// a restart leaves its grant here, so the record never outlives the
-    /// session it names. No line at all — and no change — for a namespace
-    /// the record does not name.
+    /// The answer is the record's, not the registry's: a box that holds a
+    /// grant gets exactly that address back — even a box whose publish was
+    /// lost to a restart leaves its grant here, so the record never outlives
+    /// the session it names. No line at all — and no change — for a
+    /// namespace the record does not name. A box whose address was handed
+    /// from the host side (T66) never drew from this pool, so its record
+    /// names no namespace and this is the no-op half for it.
     #[cfg(target_os = "linux")]
     fn release_loopback_address(&self, record: &Record, name: &str) {
         let namespace = crate::net::dns::LeaseNamespace::Box { session: record.id };
@@ -1045,14 +1324,15 @@ impl Session {
     ///
     /// The registry's lock is never held across the answerer's record — the
     /// same rule the grant path's [`Self::lease_loopback_address`] ask
-    /// follows: the release is a synchronous read-modify-write of the record
-    /// under its lock file, and this daemon's registry is what every DNS
-    /// answer it serves reads, so no answer waits behind a destroyed box's
-    /// release. The registry's rows go first, under the write lock alone,
-    /// and the release runs after it is dropped — which is also the safe
-    /// half of that order: while the record still names the grant, no other
-    /// box can be handed the address, so there is no moment where the
-    /// registry answers an address the pool already holds free.
+    /// follows: the release is
+    /// a synchronous read-modify-write of the record under its lock file,
+    /// and this daemon's registry is what every DNS answer it serves reads,
+    /// so no answer waits behind a destroyed box's release. The registry's
+    /// rows go first, under the write lock alone, and the release runs after
+    /// it is dropped — which is also the safe half of that order: while the
+    /// record still names the grant, no other box can be handed the
+    /// address, so there is no moment where the registry answers an address
+    /// the pool already holds free.
     #[cfg(target_os = "linux")]
     async fn deregister_hostname(&self, for_good: bool) {
         let record = self.record.record().await.unwrap();
@@ -1313,6 +1593,20 @@ impl Session {
             }
             SessionMessage::GetComposition(r) => {
                 let _ = r.send(self.composition());
+            }
+            SessionMessage::ExposeDynamic { port, reply } => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
+                let _ = reply.send(self.expose_dynamic(port).await);
+            }
+            SessionMessage::LiveIngress(r) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
+                let _ = r.send(self.live_ingress_snapshot());
             }
             SessionMessage::GetRecord(r) => {
                 let _ = r.send(self.record.record().await.unwrap());
@@ -1734,8 +2028,10 @@ impl Session {
                 let mut record = record;
                 record.status = SessionStatus::Active;
                 self.record.write(record.clone()).await?;
+                // The box's first finalize: the one registration that may
+                // wait for the range verdict (NET-123 §7.1).
                 #[cfg(target_os = "linux")]
-                self.register_hostname(&record).await;
+                self.register_hostname(&record, true).await;
                 Ok(ran)
             }
             SessionStatus::Pending => Err(std::io::Error::new(
@@ -1862,6 +2158,165 @@ impl Session {
         }
     }
 
+    /// Publishes `port` for this box at runtime (NET-043): the request a
+    /// process inside the box sends with its own `min net expose`, decided
+    /// against the box's `dynamic_ingress` setting and — when it allows —
+    /// bound on the switch and recorded as a live mapping (NET-044), which is
+    /// what `min session policy` lists beside the declaration.
+    ///
+    /// One info line per request, naming the box, the port, the decision its
+    /// `dynamic_ingress` setting made, and the outcome, so a diagnostics
+    /// bundle's daemon log tail carries every expose request with what became
+    /// of it.
+    async fn expose_dynamic(
+        &mut self,
+        port: u16,
+    ) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
+        let record = match self.record.record().await {
+            Ok(record) => record,
+            Err(e) => return Err(crate::net::policy::ExposeFailure::Publish { port, source: e }),
+        };
+        let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
+        // The setting the request is evaluated against (NET-043), spelled the
+        // way the record carries it: the deny-all default for a box that
+        // declared nothing.
+        let decision = record
+            .policy
+            .ingress
+            .as_ref()
+            .and_then(|ingress| ingress.dynamic_ingress)
+            .unwrap_or(sessions::DynamicIngress::Deny);
+        let outcome = self.publish_exposed_port(&record, port).await;
+        match &outcome {
+            Ok(mapping) => tracing::info!(
+                name = %box_name,
+                port,
+                decision = %decision,
+                outcome = "published",
+                local = %mapping.local,
+                "dynamic ingress expose"
+            ),
+            Err(crate::net::policy::ExposeFailure::Refused(refusal)) => tracing::info!(
+                name = %box_name,
+                port,
+                decision = %decision,
+                outcome = "refused",
+                reason = %refusal,
+                "dynamic ingress expose"
+            ),
+            Err(crate::net::policy::ExposeFailure::Publish { source, .. }) => tracing::info!(
+                name = %box_name,
+                port,
+                decision = %decision,
+                outcome = "publish failed",
+                reason = %source,
+                "dynamic ingress expose"
+            ),
+        }
+        outcome
+    }
+
+    /// The publish half of [`Session::expose_dynamic`], run once the request's
+    /// decision is known for the log. Everything the box can refuse without
+    /// asking the switch runs first — the policy decision (NET-043), the
+    /// live-duplicate check, and the address pair the publish needs — so a
+    /// refused request is refused with nothing bound and nothing asked
+    /// (NET-047). Only then is the switch asked to bind, and the forwarder is
+    /// recorded only once it accepted.
+    async fn publish_exposed_port(
+        &mut self,
+        record: &Record,
+        port: u16,
+    ) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
+        use crate::net::policy::{
+            ExposeFailure, ExposeRefusal, dynamic_ingress_decision, expose_dynamic,
+        };
+
+        // The box's own setting decides first (NET-043), whatever asked: the
+        // deny-all default when nothing was declared, and `ask` failing
+        // closed with nobody attached to answer (NET-045's prompt is the
+        // sibling path).
+        dynamic_ingress_decision(record.policy.ingress.as_ref(), port)
+            .map_err(ExposeFailure::Refused)?;
+
+        // The port is published already, live, by this box: a second request
+        // for it would double-bind the same address, so it is refused as the
+        // duplicate it is.
+        if self
+            .live_ingress
+            .iter()
+            .any(|live| live.mapping.internal_port == port)
+        {
+            return Err(ExposeFailure::Refused(ExposeRefusal::AlreadyPublished(
+                port,
+            )));
+        }
+
+        // The publish rides the address pair a VM host's registration handed
+        // the box (T66): the loopback address its declaration publishes on,
+        // and the switch address its forwards deliver to. A box nobody handed
+        // a pair — a native host's self-allocated box, whose lease the
+        // registry holds but keeps private — has nowhere to publish, and the
+        // daemon has no default of its own to stand in with (NET-010), so
+        // the request is refused rather than bound at an address nobody
+        // chose for this box.
+        let Some(addresses) = record.box_addresses else {
+            return Err(ExposeFailure::Refused(ExposeRefusal::NoPublishedAddress));
+        };
+
+        let control = self.switch_control().await;
+        let forwarder = match expose_dynamic(
+            &control,
+            addresses.loopback_address,
+            addresses.switch_address,
+            port,
+            sessions::IpProto::Tcp,
+            None,
+        )
+        .await
+        {
+            Ok(forwarder) => forwarder,
+            Err(source) => return Err(ExposeFailure::Publish { port, source }),
+        };
+        // Recorded only now, with the switch's acceptance in hand: a publish
+        // that failed leaves nothing in the list (NET-047), so the rows the
+        // policy surfaces read never name a port the switch is not holding.
+        let mapping = minimald_rpc::LiveMapping {
+            local: forwarder.local().to_string(),
+            internal_port: forwarder.internal_port(),
+            proto: sessions::IpProto::Tcp,
+        };
+        self.live_ingress.push(LiveIngressForward {
+            forwarder,
+            mapping: mapping.clone(),
+        });
+        Ok(mapping)
+    }
+
+    /// The switch's control channel, read off the daemon's shared switch under
+    /// a lock held only for the two sync reads — never across the publish it
+    /// feeds.
+    async fn switch_control(&self) -> crate::net::policy::ControlChannel {
+        let switch = self.net_switch.lock().await;
+        match switch.transport() {
+            crate::net::SwitchTransport::LocalSpawn => {
+                crate::net::policy::ControlChannel::Unix(switch.control_socket())
+            }
+            crate::net::SwitchTransport::HostShuttle { cid, port } => {
+                crate::net::policy::ControlChannel::Vsock { cid, port }
+            }
+        }
+    }
+
+    /// The live dynamic-ingress mappings, in publish order — the rows
+    /// `min session policy` lists beside the declaration (NET-044).
+    fn live_ingress_snapshot(&self) -> Vec<minimald_rpc::LiveMapping> {
+        self.live_ingress
+            .iter()
+            .map(|live| live.mapping.clone())
+            .collect()
+    }
+
     /// Tears down any runtime objects, such as the host or side ops. Shutdown
     /// of these objects is complete once awaited.
     ///
@@ -1875,6 +2330,18 @@ impl Session {
         // `Destroy` — come through here.
         for forward in std::mem::take(&mut self.forwards) {
             forward.abort();
+        }
+
+        // The ports the box published at runtime go with it too (NET-044):
+        // unbind each forward the switch accepted, so a box that stops leaves
+        // no live publish behind. Best-effort, like the declared forwards'
+        // teardown — `remove_ingress` logs a failed unexpose and moves on,
+        // since there is no caller left to propagate to.
+        let live = std::mem::take(&mut self.live_ingress);
+        if !live.is_empty() {
+            let control = self.switch_control().await;
+            let forwarders: Vec<_> = live.iter().map(|l| l.forwarder.clone()).collect();
+            crate::net::policy::remove_ingress(&control, &forwarders).await;
         }
 
         let inner = match &mut self.inner {
@@ -1903,6 +2370,18 @@ impl Session {
     async fn rename(&mut self, new_name: String) -> Result<(), std::io::Error> {
         let record = self.record.record().await?;
 
+        // Renaming to the name the session already has is an error, not a
+        // no-op: `save` deliberately treats same-id same-name as a no-op (a
+        // status promotion re-saves an unchanged name), so without this guard
+        // a rename-to-self would silently succeed and report a rename that
+        // did not happen.
+        if record.name.as_deref() == Some(new_name.as_str()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("session is already named `{new_name}`"),
+            ));
+        }
+
         // Withdraw the route under the pre-rename name before the record
         // mutates; re-register under the new name afterwards. Both calls
         // gate on this session actually owning a route, so a Draft/NoNet
@@ -1911,18 +2390,34 @@ impl Session {
         #[cfg(target_os = "linux")]
         self.deregister_hostname(false).await;
         let mut new_record = record.clone();
-        new_record.name = Some(new_name);
+        new_record.name = Some(new_name.clone());
         let written = self.record.write(new_record.clone()).await;
 
         // Re-register whichever name stuck (the new one on success, the old
         // one if the write was refused) so a failed rename never strands the
         // session without a route.
         #[cfg(target_os = "linux")]
-        self.register_hostname(match &written {
-            Ok(_) => &new_record,
-            Err(_) => &record,
-        })
+        self.register_hostname(
+            match &written {
+                Ok(_) => &new_record,
+                Err(_) => &record,
+            },
+            false,
+        )
         .await;
+
+        // Forward the new name to the running host so the shell's
+        // `$MINIMAL_SESSION_NAME` is republished through the per-attach
+        // environment channel. Best-effort: the record-side rename has
+        // already succeeded, and a dead host drops the message silently.
+        if written.is_ok()
+            && let SessionInner::Active {
+                host: Some((host, _)),
+                ..
+            } = &self.inner
+        {
+            host.rename(new_name).await;
+        }
 
         written
     }
@@ -2685,6 +3180,13 @@ impl Session {
             session: session.downgrade(),
             // What this launch is for; see [`Session::launch_host`].
             for_hooks,
+            // The classifier tree the privileged step installs natively and
+            // the guest's own boot mounts; see the field's doc.
+            classifier_root: std::path::PathBuf::from(sandbox2::classifier::TREE_ROOT),
+            // The mount table the launch's classifier facts answer over is
+            // the daemon's own, read live on every launch; see the field's
+            // doc.
+            classifier_mountinfo: None,
         })
     }
 
@@ -3087,6 +3589,60 @@ impl SessionHandle {
         })
     }
 
+    /// Publishes `port` for this box at runtime (NET-043) — the request the
+    /// in-box `min net expose` sends, decided against the box's
+    /// `dynamic_ingress` setting. Answers with the published mapping, or the
+    /// typed reason the request was refused. A dead actor lands on the
+    /// publish-failure arm: the box that would own the mapping is gone, so no
+    /// publish could be made.
+    pub(crate) async fn expose_dynamic(
+        &self,
+        port: u16,
+    ) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the actor may already be gone; the recv below reports that"
+        )]
+        let _ = self
+            .0
+            .send(SessionMessage::ExposeDynamic { port, reply: send })
+            .await;
+        match recv.await {
+            Ok(reply) => reply,
+            Err(_) => Err(crate::net::policy::ExposeFailure::Publish {
+                port,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "session actor is gone",
+                ),
+            }),
+        }
+    }
+
+    /// The live dynamic-ingress mappings this box published at runtime
+    /// (NET-044) — the rows `min session policy` lists. Empty for a box that
+    /// published none. A dead actor maps to `NotConnected`.
+    pub(crate) async fn live_ingress(
+        &self,
+    ) -> Result<Vec<minimald_rpc::LiveMapping>, std::io::Error> {
+        let (send, recv) = oneshot::channel();
+        // Ignore send errors - the recv will also fail.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the actor may already be gone; the recv below reports that"
+        )]
+        let _ = self.0.send(SessionMessage::LiveIngress(send)).await;
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "a closed oneshot carries no cause beyond the actor being gone"
+        )]
+        recv.await.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "session actor is gone")
+        })
+    }
+
     /// Whether this daemon opted out of the deny-all egress default
     /// (NET-077), for the task path's effective-egress resolution. A dead
     /// actor maps to `NotConnected`.
@@ -3345,6 +3901,30 @@ impl WeakSessionHandle {
         // Drop the only strong sender so `upgrade()` returns `None`.
         drop(tx);
         Self(weak)
+    }
+}
+
+/// The write-lock promotion of a registration headed for the interim: the
+/// hand to publish instead of `127.0.0.1` when the verdict now vouches for
+/// it, or `None` to keep `published` as it stands. Called under the
+/// registry's write lock, so the verdict and the name are read together
+/// with the publish that follows. Only a publish standing at the interim
+/// with a hand behind it moves, and never over a name another session holds.
+fn promote_interim_to_hand(
+    reg: &crate::net::dns::HostnameRegistry,
+    book: &crate::net::dns::LoopbackLeaseBook,
+    session_id: sessions::SessionId,
+    name: &str,
+    published: Option<std::net::Ipv4Addr>,
+    handed: Option<std::net::Ipv4Addr>,
+) -> Option<std::net::Ipv4Addr> {
+    match (published, handed) {
+        (Some(std::net::Ipv4Addr::LOCALHOST), Some(hand))
+            if book.vouches_for(hand) && !reg.name_held_by_another(session_id, name) =>
+        {
+            Some(hand)
+        }
+        _ => None,
     }
 }
 
