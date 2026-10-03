@@ -12,13 +12,19 @@ name: macOS queue janitor
 #
 # All the logic lives in scripts/cancel-stale-queue-runs.sh so it can be run
 # and tested outside CI; this workflow is the triggers and the token.
+#
+# No merge_group trigger: a merge_group run takes its workflow definition from
+# the group commit, so a queued change could rewrite this job while it holds
+# actions:write. Every trigger below runs main's definition and main's script.
 
 on:
-    # Every group build or rebuild, which is exactly when orphans appear.
-    merge_group:
-        branches: ["main"]
+    # A new ci-macos.yml run is requested, which is exactly when a group
+    # rebuild leaves the previous group's run orphaned.
+    workflow_run:
+        workflows: ["CI (macOS)"]
+        types: [requested]
     schedule:
-        # Backstop for rebuilds that start no new janitor run.
+        # Backstop for a rebuild whose orphan outlives the request above.
         - cron: "*/10 * * * *"
     workflow_dispatch:
         inputs:
@@ -41,7 +47,11 @@ jobs:
     reap:
         runs-on: ubuntu-latest
         timeout-minutes: 5
-        if: github.event_name == 'workflow_dispatch' || github.repository == 'gominimal/minimal'
+        # Only a requested merge-queue run can orphan another; skip the rest.
+        if: >-
+            github.event_name == 'workflow_dispatch' ||
+            (github.repository == 'gominimal/minimal' &&
+             (github.event_name != 'workflow_run' || github.event.workflow_run.event == 'merge_group'))
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
@@ -50,7 +60,7 @@ jobs:
               env:
                   GH_TOKEN: ${{ github.token }}
                   REPO: ${{ github.repository }}
-                  # merge_group and schedule runs always execute; a manual
+                  # workflow_run and schedule runs always execute; a manual
                   # dispatch honours the checkbox (default: dry run).
                   EXECUTE: ${{ github.event_name != 'workflow_dispatch' || inputs.execute }}
               run: |

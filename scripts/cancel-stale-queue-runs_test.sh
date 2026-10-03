@@ -21,8 +21,9 @@ root="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-janitortest)"
 trap 'rm -rf "$root"' EXIT
 
 # The stub serves runs-<status>.jsonl for a run listing, queue.json for the
-# GraphQL query (exit 1 when queue.fail exists), and records each cancelled
-# run id in cancelled.
+# GraphQL query (exit 1 when queue.fail exists), refuses a cancel with the
+# message in cancel-err-<id> when that file exists, and records each
+# cancelled run id in cancelled.
 stub="$root/gh"
 cat >"$stub" <<'STUB'
 #!/usr/bin/env bash
@@ -34,7 +35,9 @@ case "$args" in
         [ -e "$d/queue.fail" ] && exit 1
         cat "$d/queue.json" ;;
     *"-X POST"*"/cancel"*)
-        id="${args##*/runs/}"; echo "${id%%/cancel*}" >>"$d/cancelled" ;;
+        id="${args##*/runs/}"; id="${id%%/cancel*}"
+        if [ -f "$d/cancel-err-$id" ]; then cat "$d/cancel-err-$id" >&2; exit 1; fi
+        echo "$id" >>"$d/cancelled" ;;
     *"/runs?"*)
         status="${args##*status=}"; status="${status%%&*}"
         [ -f "$d/runs-$status.jsonl" ] && cat "$d/runs-$status.jsonl"
@@ -110,8 +113,31 @@ else
     bad "dry run: cancels '$(cancelled)', output: $out"
 fi
 
-# 4–7. A failed, errored, null or truncated queue answer cancels nothing.
-for kind in fail errors null truncated; do
+# 4. A run that finished before its cancel (HTTP 409) is not a failure.
+fresh
+{ run_obj 10 aaa "$Q/pr-10-x"; run_obj 11 bbb "$Q/pr-11-y"; } >"$STUB_DIR/runs-queued.jsonl"
+queue
+echo "gh: Cannot cancel a workflow run that is completed. (HTTP 409)" >"$STUB_DIR/cancel-err-10"
+if out="$(janitor --execute)" && [ "$(cancelled)" = "11" ] && grep -q 'already finished: 10' <<<"$out"; then
+    ok "a run that already finished is reported and the janitor exits 0"
+else
+    bad "409 case: cancels '$(cancelled)', output: $out"
+fi
+
+# 5. Any other refused cancel still lets the rest run, then fails the run.
+fresh
+{ run_obj 12 aaa "$Q/pr-12-x"; run_obj 13 bbb "$Q/pr-13-y"; } >"$STUB_DIR/runs-queued.jsonl"
+queue
+echo "gh: Resource not accessible by integration (HTTP 403)" >"$STUB_DIR/cancel-err-12"
+if ! janitor --execute >/dev/null && [ "$(cancelled)" = "13" ]; then
+    ok "a refused cancel (403) exits non-zero after cancelling the rest"
+else
+    bad "403 case: cancels '$(cancelled)'"
+fi
+
+# 6–10. A failed, errored, null, truncated or head-less queue answer cancels
+#       nothing.
+for kind in fail errors null truncated headless; do
     fresh
     run_obj 9 aaa "$Q/pr-9-x" >"$STUB_DIR/runs-queued.jsonl"
     case "$kind" in
@@ -119,6 +145,7 @@ for kind in fail errors null truncated; do
         errors)    echo '{"errors":[{"message":"nope"}],"data":null}' >"$STUB_DIR/queue.json" ;;
         null)      echo '{"data":{"repository":{"mergeQueue":null}}}' >"$STUB_DIR/queue.json" ;;
         truncated) echo '{"data":{"repository":{"mergeQueue":{"entries":{"pageInfo":{"hasNextPage":true},"nodes":[]}}}}}' >"$STUB_DIR/queue.json" ;;
+        headless)  echo '{"data":{"repository":{"mergeQueue":{"entries":{"pageInfo":{"hasNextPage":false},"nodes":[{"headCommit":null}]}}}}}' >"$STUB_DIR/queue.json" ;;
     esac
     if ! janitor --execute >/dev/null && [ -z "$(cancelled)" ]; then
         ok "the $kind queue answer exits non-zero and cancels nothing"

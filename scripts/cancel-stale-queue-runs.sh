@@ -21,10 +21,13 @@
 # SAFETY:
 #   * DRY-RUN BY DEFAULT — prints what it would cancel; changes nothing until
 #     you pass --execute.
-#   * A failed or null merge-queue query (or a truncated entry list) aborts
-#     before anything is cancelled: an empty live set is never inferred from
-#     an error. A genuinely empty queue (no entries) is valid and makes every
-#     listed group run stale.
+#   * A failed or null merge-queue query, a truncated entry list, or an entry
+#     without a head commit aborts before anything is cancelled: a live set
+#     is never inferred from an error. A genuinely empty queue (no entries)
+#     is valid and makes every listed group run stale.
+#   * A cancel refused for any reason but "already finished" (HTTP 409) does
+#     not stop the remaining cancels, but the script then exits non-zero, so
+#     a token without actions:write shows as a red run, not a green one.
 #
 # Usage:
 #   scripts/cancel-stale-queue-runs.sh [options]
@@ -110,6 +113,7 @@ live_json="$(jq -c '
     if (.errors // []) | length > 0 then error("graphql errors: \(.errors | map(.message) | join("; "))")
     elif .data.repository.mergeQueue == null then error("mergeQueue is null")
     elif .data.repository.mergeQueue.entries.pageInfo.hasNextPage then error("entry list truncated")
+    elif any(.data.repository.mergeQueue.entries.nodes[]; .headCommit.oid == null) then error("an entry has no head commit")
     else [.data.repository.mergeQueue.entries.nodes[].headCommit.oid]
     end' <<<"$queue_raw")" \
     || die "unusable merge-queue response; cancelling nothing"
@@ -117,6 +121,7 @@ live_json="$(jq -c '
 # 3. Decide and act: one line per run.
 cancelled=0
 kept=0
+finished=0
 failed=0
 while IFS=$'\t' read -r verdict id sha branch; do
     if [ "$verdict" = keep ]; then
@@ -125,13 +130,17 @@ while IFS=$'\t' read -r verdict id sha branch; do
     elif [ "$EXECUTE" -eq 0 ]; then
         printf 'would cancel: %s %s %s\n' "$id" "$sha" "$branch"
         cancelled=$((cancelled + 1))
-    elif "$GH" api -X POST "repos/$REPO/actions/runs/$id/cancel" >/dev/null; then
+    elif err="$("$GH" api -X POST "repos/$REPO/actions/runs/$id/cancel" 2>&1 >/dev/null)"; then
         printf 'cancelled: %s %s %s\n' "$id" "$sha" "$branch"
         cancelled=$((cancelled + 1))
+    elif [[ "$err" == *"HTTP 409"* ]]; then
+        # The run finished between listing and cancelling: nothing to do.
+        printf 'already finished: %s %s %s\n' "$id" "$sha" "$branch"
+        finished=$((finished + 1))
     else
-        # Usually the run finished between listing and cancelling (HTTP 409);
-        # a warning, not a reason to skip the remaining runs.
-        printf 'cancel failed: %s %s %s\n' "$id" "$sha" "$branch" >&2
+        # Anything else (403 without actions:write, 404, 429) means orphans
+        # stay on the runner: keep going, then fail the run so it shows.
+        printf 'cancel failed: %s %s %s: %s\n' "$id" "$sha" "$branch" "$err" >&2
         failed=$((failed + 1))
     fi
 done < <(jq -r --argjson live "$live_json" \
@@ -140,7 +149,7 @@ done < <(jq -r --argjson live "$live_json" \
 
 verb="would cancel"
 [ "$EXECUTE" -eq 1 ] && verb="cancelled"
-printf 'cancel-stale-queue-runs: %s %d stale %s run(s); kept %d live; %d cancel(s) failed; live queue entries: %d\n' \
-    "$verb" "$cancelled" "$WORKFLOW" "$kept" "$failed" "$(jq length <<<"$live_json")" >&2
+printf 'cancel-stale-queue-runs: %s %d stale %s run(s); kept %d live; %d already finished; %d cancel(s) failed; live queue entries: %d\n' \
+    "$verb" "$cancelled" "$WORKFLOW" "$kept" "$finished" "$failed" "$(jq length <<<"$live_json")" >&2
 [ "$EXECUTE" -eq 0 ] && printf 'cancel-stale-queue-runs: dry-run — re-run with --execute to cancel\n' >&2
-exit 0
+[ "$failed" -eq 0 ] || die "$failed cancel(s) failed"
