@@ -36,14 +36,15 @@
 //! feed and the switch-side writer drains, so no box's flood grows the
 //! daemon's memory — the excess is dropped, never queued — and every refusal
 //! goes through the **shared** bounded, rate-limited audit
-//! ([`switch::refusal::RefusalEmitter`], one per source, one line when a
-//! window opens and one when its quota is spent), so the flooder degrades to
-//! the timeout the reset replaced while nobody else does. The resets
-//! themselves are built by the shared crate ([`switch::refusal`]) from state
-//! the gate holds ([`SessionGate::refuse_tcp_segment`]): a bare SYN is
-//! answered the way a kernel refuses a connection, and a connection the gate
-//! ended is reset from the sequence pair it tracked — never from the numbers
-//! an arriving segment claims, and always addressed to that segment's source.
+//! ([`switch::refusal::RefusalEmitter`], one line per source per window, said
+//! at the window's first refusal and carrying the refusals that window saw),
+//! so the flooder degrades to the timeout the reset replaced while nobody
+//! else does. The resets themselves are built by the shared crate
+//! ([`switch::refusal`]) from state the gate holds
+//! ([`SessionGate::refuse_tcp_segment`]): a bare SYN is answered the way a
+//! kernel refuses a connection, and a connection the gate ended is reset from
+//! the sequence pair it tracked — never from the numbers an arriving segment
+//! claims, and always addressed to that segment's source.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Read, Write};
@@ -1000,9 +1001,9 @@ pub struct SessionGate {
     /// answers goes through ([`refusal::RefusalEmitter`]): a reply is written
     /// for a source only while it has window quota left, so a box flooding
     /// SYNs at this box's ports cannot spend the daemon's memory or the reset
-    /// channel on its own refusals, and the lines it says — one when a
-    /// window opens, one when its quota is spent — are the one format every
-    /// leg's log tail carries.
+    /// channel on its own refusals, and the line it says — its window's one,
+    /// at the window's first refusal, carrying the refusals that window saw —
+    /// is the one format every leg's log tail carries.
     refusals: refusal::RefusalEmitter,
     /// The resets this gate's legs synthesize — a refused SYN's (NET-014), a
     /// revoked port's, a revocation's terminations — handed to the egress leg
@@ -1268,11 +1269,10 @@ impl SessionGate {
     ///   audit every refusal on every leg goes through): a source that has
     ///   spent its window's quota gets no more until the window rolls, so one
     ///   box's flood cannot spend the gate's resets on itself. The flooder
-    ///   degrades to a timeout; nobody else does. The audit says its line
-    ///   when a source's window opens and when its quota is spent — the one
-    ///   format, carrying the count of replies written to that source this
-    ///   window — so the daemon's log tail reads a refusal exactly like the
-    ///   VM host's does.
+    ///   degrades to a timeout; nobody else does. The audit says its window's
+    ///   one line — at the window's first refusal, carrying the refusals that
+    ///   window saw — so the daemon's log tail reads a refusal exactly like
+    ///   the stack peer's does.
     /// - the **channel's bound** ([`RESET_CHANNEL_CAPACITY`]): a send past it is
     ///   dropped rather than queued, so no burst of refusals grows the
     ///   daemon's memory.
@@ -1282,21 +1282,25 @@ impl SessionGate {
     /// holds, never from numbers the arriving segment carries:
     ///
     /// - a bare SYN is answered with RST|ACK from sequence zero, acknowledging
-    ///   the SYN — `SYN.seq + 1` — the kernel's own connection-refused shape,
-    ///   which a connecting peer's half-open socket reads as the refusal it is.
+    ///   the SYN — `SYN.seq + its data + 1` (RFC 793 §3.4 counts both) — the
+    ///   kernel's own connection-refused shape, which a connecting peer's
+    ///   half-open socket reads as the refusal it is.
     /// - a segment of an established connection is answered only when the gate
     ///   holds that connection's tail — the revocation's terminated table — and
     ///   then from the sequence pair it tracked, which is in the peer's window
     ///   by construction. A segment of a flow the gate holds **nothing** for is
-    ///   answered with no reset at all — and spends nothing: the arriving
-    ///   segment's own sequence numbers are its sender's claim, and a spoofed
-    ///   one would let any box make this box emit a reset carrying an
-    ///   attacker-chosen sequence to a spoofed victim. The reset is always
-    ///   addressed to the frame's source (the builder swaps the observed
-    ///   packet's own addresses), so a refusal can never be steered at a third
-    ///   party.
-    /// - a segment that is itself a reset is answered with nothing, before any
-    ///   quota is spent: answering a reset with a reset is the one exchange
+    ///   answered with no reset at all — and spends no reply quota: the
+    ///   arriving segment's own sequence numbers are its sender's claim, and a
+    ///   spoofed one would let any box make this box emit a reset carrying an
+    ///   attacker-chosen sequence to a spoofed victim. Its refusal is still
+    ///   the audit's — the line is said through the shared emitter whether or
+    ///   not a reset frame is written, so a revoked port's refusal never goes
+    ///   quiet — but it writes nothing back and burns none of the source's
+    ///   quota. The reset is always addressed to the frame's source (the
+    ///   builder swaps the observed packet's own addresses), so a refusal can
+    ///   never be steered at a third party.
+    /// - a segment that is itself a reset is answered with nothing, before the
+    ///   audit is reached: answering a reset with a reset is the one exchange
     ///   RFC 793 forbids outright, and the ended connection's stragglers are
     ///   exactly that — resets, ACKs and FINs a peer's already-closed socket
     ///   sends into a flow the gate has ended. Charging them against the
@@ -1310,9 +1314,10 @@ impl SessionGate {
         if pkt.carries_reset() {
             return false;
         }
-        // Build before charging: a segment the gate can build nothing for is
-        // answered with nothing, and a refusal that writes no reply spends no
-        // quota and says no line.
+        // Build before charging: a segment the gate can build nothing for — a
+        // flow the gate holds no tail for, whose numbers are its sender's
+        // claim — is answered with nothing on the wire, but its refusal is
+        // still the audit's below, so the line is said for it too.
         let reset = if pkt.is_bare_syn() {
             refusal::refused_tcp_reset(frame, pkt)
         } else {
@@ -1327,28 +1332,30 @@ impl SessionGate {
                 .filter(|(seen, _)| Instant::now().duration_since(*seen) < TERMINATED_FLOW_TTL)
                 .map(|(_, tail)| rst_from_flow(tail))
         };
-        let Some(reset) = reset else {
-            return false;
-        };
-        // The shared audit: bounded per source, one line when a window opens
-        // and one when its quota is spent.
-        match self.refusals.refuse(
+        // The shared audit: bounded per source, its window's one line — said
+        // whether or not there is a reply to write, while the reply itself is
+        // written only when one was built and the source's quota owes it.
+        let outcome = self.refusals.refuse(
             &refusal::Refusal {
                 class,
                 source: *pkt.src.ip(),
                 address: *pkt.dst.ip(),
                 about: refusal::About::Port(pkt.dst.port()),
             },
+            reset.is_some(),
             Instant::now(),
-        ) {
+        );
+        if let refusal::Outcome::Emit(line) = &outcome {
+            tracing::warn!("{line}");
+        }
+        match outcome {
+            // Past the quota: the source's refusals to lose are its own.
             refusal::Outcome::Suppressed => false,
-            refusal::Outcome::Quiet => {
+            refusal::Outcome::Quiet | refusal::Outcome::Emit(_) => {
+                let Some(reset) = reset else {
+                    return false;
+                };
                 self.send_reset(reset);
-                true
-            }
-            refusal::Outcome::Emit(line) => {
-                self.send_reset(reset);
-                tracing::warn!("{line}");
                 true
             }
         }
@@ -1967,7 +1974,10 @@ fn rst_from_flow(tail: &InboundFlowTail) -> Vec<u8> {
             refusal::seq_acknowledging(tail.seq, tail.payload_len, tail.flags),
         )
     } else {
-        (0, refusal::seq_acknowledging(tail.seq, 0, tail.flags))
+        (
+            0,
+            refusal::seq_acknowledging(tail.seq, tail.payload_len, tail.flags),
+        )
     };
     refusal::tcp_reset_frame(
         tail.src_mac,
@@ -2115,9 +2125,10 @@ where
             && gate.port_revoked(pkt.dst.port())
         {
             // The shared refusal audit says its line inside the refusal —
-            // the one format every leg's log tail carries, when the source's
-            // window opens and when its quota is spent — so this arm says
-            // nothing of its own.
+            // the one format every leg's log tail carries, the window's one
+            // line at its first refusal — whether the gate built a reset for
+            // the segment or not, so a revoked port's refusals never go
+            // quiet. This arm says nothing of its own.
             gate.refuse_tcp_segment(&frame[..n], pkt, refusal::REVOKED_PORT);
             continue;
         }
@@ -3019,8 +3030,8 @@ pub(crate) mod tests {
 
         // The refusal says its line — the one shared format every leg's log
         // tail carries (the diagnostics bundle's): the rule, the address
-        // that refused, the port, the reason, the peer, and the count of
-        // replies written to that source this window.
+        // that refused, the port, the reason, the peer, and the refusals
+        // that source's window has seen.
         let logged = capture.contents();
         assert!(
             logged.contains(
@@ -3035,13 +3046,117 @@ pub(crate) mod tests {
         );
     }
 
-    /// The native relay leg answers through the shared builder: the reset the
-    /// relay writes for one refused SYN is byte-for-byte the frame
-    /// `switch::refusal` assembles for the same frame — the answer every leg
-    /// writes, compared against the builder and not against itself. The
-    /// native path is this one — the host-side UDS attachment — but both
-    /// attachment paths funnel into the one `spawn_relay`, so the wire this
-    /// test reads is the wire the in-VM vsock path rides too.
+    /// NET-121: a revoked ingress port's refusal is logged through the shared
+    /// emitter on **both** of its halves. One half a reset answers — a peer's
+    /// SYN to the port the revocation closed, refused on the spot, forwarder
+    /// or no forwarder — and one half nothing answers: a segment of a flow
+    /// the gate holds no tail for, a spoofed one, which writes no reset by
+    /// design and must not go quiet either. The line is the shared audit's
+    /// whether or not a reset frame is written, so the log tail names every
+    /// refusal, and the wire stays silent exactly where no reply exists to
+    /// write.
+    #[tokio::test]
+    async fn revoked_port_refusal_is_logged() {
+        let capture = crate::test_harness::captured_log();
+        let policy = declared_ingress_80();
+        let mut harness = spawn_test_relay_with(&policy, |gate| {
+            gate.revoke_port(80);
+        });
+
+        // The peer's SYN to the revoked port: answered with a reset on the
+        // switch side, the kernel's own connection-refused shape for that
+        // port.
+        let syn = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 80);
+        let mut framed = Vec::with_capacity(2 + syn.len());
+        framed.extend_from_slice(&(syn.len() as u16).to_le_bytes());
+        framed.extend_from_slice(&syn);
+        harness.switch.write_all(&framed).await.unwrap();
+
+        let reset = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("a revoked port is refused at once")
+            .expect("the switch side stays open");
+        let answered = parse_ipv4_l4(&reset).expect("the reset parses");
+        assert_eq!(*answered.src.ip(), LEASE, "the reset speaks for the box");
+        assert_eq!(
+            answered.src.port(),
+            80,
+            "for the port whose published ingress was revoked"
+        );
+        assert_eq!(*answered.dst.ip(), PEER, "addressed to the connecting peer");
+        assert_eq!(answered.dst.port(), 40000, "at the port the SYN came from");
+        assert_eq!(
+            answered.tcp_flags,
+            refusal::TCP_RST | refusal::TCP_ACK,
+            "RST|ACK: a refusal, not an acceptance"
+        );
+        assert_eq!(answered.seq, 0, "a refusal to a bare SYN resets from zero");
+        assert_eq!(answered.ack, 1, "acknowledging the SYN and its weight");
+        assert_tcp_checksum_verifies_on_the_wire(&reset);
+
+        // The answered refusal says its line, in the one shared format.
+        let logged = capture.contents();
+        assert!(
+            logged.contains(
+                "rule_matched=\"revoked ingress port\" address=100.64.0.9 port=80 \
+                 reason=\"the port's published ingress was revoked\" source=100.64.0.5 refusals=1"
+            ),
+            "the answered refusal's audit line, in the one shared format: {logged}"
+        );
+
+        // The refusal no reset can answer: a segment of a flow the gate holds
+        // nothing for — a spoofed one, whose numbers are its sender's claim —
+        // writes no reset by design, forwards nothing either, and still says
+        // its line through the shared emitter.
+        let spoofed = tcp_segment_with_numbers(ACK, OTHER_PEER, 80, 0xdead_beef, 0xfeed_face);
+        let mut framed = Vec::with_capacity(2 + spoofed.len());
+        framed.extend_from_slice(&(spoofed.len() as u16).to_le_bytes());
+        framed.extend_from_slice(&spoofed);
+        harness.switch.write_all(&framed).await.unwrap();
+        // Give the relay its moment, then both ends must be silent: no reset
+        // was built for the spoofed flow, and the revoked port forwards
+        // nothing toward the box either.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        set_nonblocking(harness.box_end.as_raw_fd()).unwrap();
+        let mut probe = [0u8; 1];
+        let read = harness.box_end.read(&mut probe);
+        assert!(
+            matches!(read, Err(ref e) if e.kind() == io::ErrorKind::WouldBlock),
+            "nothing is forwarded to the box: got {read:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), read_framed(&mut harness.switch))
+                .await
+                .is_err(),
+            "no reset is built for a flow the gate holds nothing for"
+        );
+        let logged = capture.contents();
+        assert!(
+            logged.contains(
+                "rule_matched=\"revoked ingress port\" address=100.64.0.9 port=80 \
+                 reason=\"the port's published ingress was revoked\" source=100.64.0.6 refusals=1"
+            ),
+            "a refusal that writes no reset is still the shared audit's — its \
+             line is said: {logged}"
+        );
+    }
+
+    /// The native relay leg answers through the shared builder: a refused SYN
+    /// rides the native attachment — the host-side UDS one, the harness's
+    /// duplex standing in for its upgraded control socket — through the whole
+    /// relay ([`spawn_relay`]: framing, parse, the refusal arms, the gate, the
+    /// writer), and the reset this test captures is the bytes the leg put on
+    /// the wire, read back rather than taken from the builder's return value.
+    /// Those bytes are asserted byte-for-byte against the frame
+    /// `switch::refusal` assembles for the same SYN — and against the wire's
+    /// own oracle ([`assert_reset_refuses`]: the refusal's addressing, flags,
+    /// acknowledgement arithmetic and checksum, spelled out here rather than
+    /// inherited from the builder) — so the leg is proved on the bytes it
+    /// writes, not on its own delegate's. Both attachment paths funnel into
+    /// the one [`spawn_relay`], so the loop this drives is the in-VM one too;
+    /// the leg that is native-only is the wire under it, and the box end
+    /// staying silent is the other half of a refusal: the gate answers for
+    /// the box, and the box's kernel never sees the connection.
     #[tokio::test]
     async fn native_relay_refusal_matches_the_shared_builder() {
         let policy = declared_ingress_80();
@@ -3064,13 +3179,32 @@ pub(crate) mod tests {
             reset, shared,
             "the relay's reset is the shared builder's, byte for byte"
         );
+        assert_reset_refuses(&reset, &syn);
+        // The refusal forwards nothing: the reset is the leg's whole answer,
+        // and the box's kernel never sees the connection to refuse itself.
+        set_nonblocking(harness.box_end.as_raw_fd()).unwrap();
+        let mut probe = [0u8; 1];
+        let read = harness.box_end.read(&mut probe);
+        assert!(
+            matches!(read, Err(ref e) if e.kind() == io::ErrorKind::WouldBlock),
+            "nothing is forwarded to the box: got {read:?}"
+        );
     }
 
-    /// The in-VM gate leg answers through the shared builder: the decision
-    /// unit both attachment paths run — [`SessionGate::refuse_tcp_segment`],
-    /// the gate the VM's pid-1 relay consults over vsock — builds the reset
-    /// the shared crate assembles for the same frame, byte for byte, so the
-    /// native relay's wire above and this one are one answer by construction.
+    /// The in-VM gate leg answers through the shared builder: the unit the
+    /// in-guest relay consults — [`SessionGate::refuse_tcp_segment`], whose
+    /// reset channel the VM's pid-1 relay drains onto its vsock wire — is
+    /// driven here for a refused SYN, and the bytes this test captures are the
+    /// ones that leg writes, read off the channel rather than taken from the
+    /// builder's return value. They are asserted byte-for-byte against the
+    /// frame `switch::refusal` assembles for the same SYN — and, because a
+    /// bare SYN's reset is the builder's own answer delegated, against the
+    /// wire's oracle too ([`assert_reset_refuses`]), so the equality is
+    /// carried by assertions the delegation cannot satisfy on its own: the
+    /// leg's written bytes must be a refusal for *that* SYN — the tuples
+    /// swapped, RST|ACK, the acknowledgement counting the SYN's weight, a
+    /// checksum the peer's kernel verifies — and must be the one frame the
+    /// leg writes for it.
     #[test]
     fn in_vm_gate_refusal_matches_the_shared_builder() {
         let gate = SessionGate::for_session(
@@ -3085,16 +3219,24 @@ pub(crate) mod tests {
 
         let syn = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 9999);
         let segment = parse_ipv4_l4(&syn).expect("the SYN parses");
-        assert!(gate.refuse_tcp_segment(&syn, &segment, refusal::UNPUBLISHED_PORT));
+        assert!(
+            gate.refuse_tcp_segment(&syn, &segment, refusal::UNPUBLISHED_PORT),
+            "the gate leg refuses the SYN to the unpublished port"
+        );
         let reset = resets
             .try_recv()
             .expect("the gate answers the refused SYN at once");
+        assert!(
+            resets.try_recv().is_err(),
+            "the leg writes exactly one frame for one refused SYN"
+        );
         let shared = refusal::refused_tcp_reset(&syn, &segment)
             .expect("the shared builder refuses a bare SYN");
         assert_eq!(
             reset, shared,
             "the gate's reset is the shared builder's, byte for byte"
         );
+        assert_reset_refuses(&reset, &syn);
     }
 
     /// Verifies `frame`'s TCP checksum the way the receiving kernel does —
@@ -3468,10 +3610,10 @@ pub(crate) mod tests {
         );
         assert!(box_resets.try_recv().is_err(), "and none toward the box");
 
-        // And it charges no quota: the same source's resets arrive in
+        // And it never reaches the audit: the same source's resets arrive in
         // numbers no window would answer, and the source is still owed every
-        // refusal it had — the next SYN is answered, and no quota line was
-        // ever spent on the resets that came first.
+        // refusal it had — the next SYN is answered, and none of the resets
+        // that came first was ever counted against it.
         for seq in 0..refusal::REFUSALS_PER_WINDOW + 8 {
             let flood = tcp_segment_with_numbers(RST | ACK, PEER, 80, 1001 + seq, 5001);
             let flood_pkt = parse_ipv4_l4(&flood).expect("the reset parses");
@@ -3495,7 +3637,7 @@ pub(crate) mod tests {
             !capture
                 .contents()
                 .contains(&format!("refusals={}", refusal::REFUSALS_PER_WINDOW)),
-            "no quota was ever spent on the resets: {}",
+            "no refusals of the resets were ever counted against the source: {}",
             capture.contents()
         );
     }
@@ -3533,10 +3675,11 @@ pub(crate) mod tests {
     /// The shared refusal audit, wired into the gate: one source spends its
     /// window's quota and then waits for the window to roll — degrading
     /// alone, while a second source in the same window is still answered —
-    /// and the window's lines are the shared format, said once when it opens
-    /// and once when its quota is spent, never one per refusal.
+    /// and the window says its one line, at its first refusal, carrying the
+    /// refusals it saw: the opening refusal's `1`, and the closed window's
+    /// real count when the next one opens. Never one line per refusal.
     #[test]
-    fn the_shared_quota_spends_per_source_and_says_the_windows_two_lines() {
+    fn the_shared_quota_spends_per_source_and_says_the_windows_count() {
         let capture = crate::test_harness::captured_log();
         let mut gate = SessionGate::for_session(
             LEASE.to_string(),
@@ -3567,7 +3710,9 @@ pub(crate) mod tests {
         }
         assert_eq!(answered, 4, "the window opens with its whole quota");
         // Past the quota the flooder waits for the window to roll — nothing
-        // is answered, nothing is queued, nothing is said.
+        // is answered, nothing is queued, and the window stays at its one
+        // line: the refusals still count, silently, for the count the next
+        // window's line carries.
         for _ in 0..4 {
             assert!(
                 !refused_syn(&gate, PEER),
@@ -3581,19 +3726,19 @@ pub(crate) mod tests {
         assert_eq!(
             capture
                 .contents()
-                .matches("source=100.64.0.5 refusals=1")
+                .matches("source=100.64.0.5 refusals=")
                 .count(),
             1,
-            "the window's opening line: {}",
+            "the window's one line so far, at its first refusal: {}",
             capture.contents()
         );
         assert_eq!(
             capture
                 .contents()
-                .matches("source=100.64.0.5 refusals=4")
+                .matches("source=100.64.0.5 refusals=1")
                 .count(),
             1,
-            "the line for the refusal that spent the quota: {}",
+            "the opening refusal's line: {}",
             capture.contents()
         );
 
@@ -3611,21 +3756,33 @@ pub(crate) mod tests {
             capture.contents()
         );
 
-        // The window rolls and the flooder's quota returns with it.
+        // The window rolls and the flooder's quota returns with it — and the
+        // new window's opening line carries the count the spent one saw:
+        // four answered, four suppressed.
         std::thread::sleep(Duration::from_millis(60));
         assert!(
             refused_syn(&gate, PEER),
             "a new window opens the flooder's quota again"
         );
         assert!(resets.try_recv().is_ok());
-        // Two lines for the spent window, one for the window after it, and
-        // not one per refusal anywhere.
+        assert_eq!(
+            capture
+                .contents()
+                .matches("source=100.64.0.5 refusals=8")
+                .count(),
+            1,
+            "the rolled window's line carries the refusals it saw: {}",
+            capture.contents()
+        );
+        // Two lines for the source across two windows — the second window's
+        // own count comes with its own roll — and not one per refusal
+        // anywhere.
         assert_eq!(
             capture
                 .contents()
                 .matches("source=100.64.0.5 refusals=")
                 .count(),
-            3,
+            2,
             "the flooder's lines are the window's, not the refusals': {}",
             capture.contents()
         );
@@ -3636,7 +3793,7 @@ pub(crate) mod tests {
     /// quota is spent and then degrades to the timeout the reset replaced —
     /// while another peer's connection in the same window is still refused at
     /// once, so the flood costs its source alone. The flood's window says its
-    /// two lines: the one that opened it and the one that spent it.
+    /// one line, at the first refusal that opened it.
     #[tokio::test]
     async fn refused_resets_are_budgeted_per_source() {
         let capture = crate::test_harness::captured_log();
@@ -3692,19 +3849,17 @@ pub(crate) mod tests {
                 .matches("source=100.64.0.5 refusals=1\n")
                 .count(),
             1,
-            "the flood's window says its opening line: {}",
+            "the flood's window says its one line, at the first refusal: {}",
             capture.contents()
         );
         assert_eq!(
             capture
                 .contents()
-                .matches(&format!(
-                    "source=100.64.0.5 refusals={}\n",
-                    refusal::REFUSALS_PER_WINDOW
-                ))
+                .matches("source=100.64.0.5 refusals=")
                 .count(),
             1,
-            "and the line for the refusal that spent the quota: {}",
+            "and no second one while the window stands — the flood's \
+             refusals count, they do not speak: {}",
             capture.contents()
         );
     }
@@ -4014,8 +4169,8 @@ pub(crate) mod tests {
             "port=9999",
             // The refusal is the target's own, through the shared refusal
             // audit: the line names the address that refused, the port, the
-            // reason, the source box that came, and the count of replies
-            // written to that source this window.
+            // reason, the source box that came, and the refusals that
+            // source's window has seen.
             "rule_matched=\"no ingress mapping\" address=100.64.0.11 port=9999",
             "reason=\"no listener is published for the port\"",
             "source=100.64.0.12 refusals=1",
