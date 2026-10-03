@@ -149,10 +149,11 @@ impl ListenPlan {
 /// The plans launches have built and hosts have not taken: the handoff from
 /// a session's launcher (which holds the lease, the switch and the gate the
 /// attach registered) to the host about to run the box, keyed by the
-/// session id both hold. A launch stages its plan as its last act, the host
-/// takes it as its first — [`Host::build`](crate::session_host::Host::build)
-/// — so the plan never rides a struct every launcher would have to name,
-/// and a mock launch that stages nothing starts no watcher at all.
+/// session id both hold and pinned to the spawn the launch ran. A launch
+/// stages its plan as its last act, the host takes it as its first —
+/// [`Host::build`](crate::session_host::Host::build) — so the plan never
+/// rides a struct every launcher would have to name, and a mock launch that
+/// stages nothing starts no watcher at all.
 ///
 /// The take is destructive on purpose: a plan belongs to the one host that
 /// runs its box, and a reattach's launch stages a fresh one. The build that
@@ -164,16 +165,37 @@ impl ListenPlan {
 /// outlives the build it was staged for, so the table is bounded by the
 /// host builds in flight — never grown one abandoned launch at a time over
 /// the daemon's life.
-static STAGED_PLANS: LazyLock<Mutex<HashMap<SessionId, ListenPlan>>> =
+///
+/// The entry carries the spawn it was staged for, and a take names the spawn
+/// it runs, so a respawn of the same session can never read the spawn before
+/// it: a plan is only ever taken by the box it was staged for, and one whose
+/// spawn has gone is refused — dropped, and said — rather than handed to the
+/// respawn to publish on a lease, an address and a gate the dead spawn's
+/// attach already tore down.
+static STAGED_PLANS: LazyLock<Mutex<HashMap<SessionId, StagedListenPlan>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Leaves the plan a launch built for the host about to run its box,
-/// replacing any a cancelled build left behind.
-pub(crate) fn stage_listen_plan(session_id: SessionId, plan: ListenPlan) {
+/// One plan in the table: the launch's plan, and the container supervisor —
+/// the spawn — the launch ran it for. The spawn is the plan's own identity
+/// the session id alone cannot give: a session respawns under the same id,
+/// and only the spawn tells this launch's plan from the one the spawn
+/// before it might still have left.
+struct StagedListenPlan {
+    /// The container supervisor this plan was staged for — the same PID the
+    /// host that takes it reports as its box's.
+    spawn: u32,
+    /// The plan itself.
+    plan: ListenPlan,
+}
+
+/// Leaves the plan a launch built for the host about to run its box, pinned
+/// to the spawn — the container supervisor — that launch runs, replacing
+/// any a cancelled build left behind.
+pub(crate) fn stage_listen_plan(session_id: SessionId, spawn: u32, plan: ListenPlan) {
     STAGED_PLANS
         .lock()
         .expect("staged listen-plan lock poisoned")
-        .insert(session_id, plan);
+        .insert(session_id, StagedListenPlan { spawn, plan });
 }
 
 /// Clears the table's entry for a launch that staged no plan — the box has
@@ -193,12 +215,29 @@ pub(crate) fn clear_listen_plan(session_id: SessionId) {
 
 /// Takes the plan staged for `session_id` — once, so the host that runs the
 /// box owns its box's publications and a second host cannot stop its
-/// watcher.
-pub(crate) fn take_listen_plan(session_id: SessionId) -> Option<ListenPlan> {
-    STAGED_PLANS
+/// watcher — and only for the spawn it was staged for: the host names the
+/// container supervisor its own launch runs, so a respawn under the same
+/// session id reads only the plan its own launch staged. A plan staged for
+/// a spawn that is not the caller's is refused — the entry is dropped, and
+/// the refusal said — so the respawn fails closed (no watcher, nothing
+/// published by listening) rather than publishing on a dead spawn's lease,
+/// address and gate.
+pub(crate) fn take_listen_plan(session_id: SessionId, spawn: u32) -> Option<ListenPlan> {
+    let staged = STAGED_PLANS
         .lock()
         .expect("staged listen-plan lock poisoned")
-        .remove(&session_id)
+        .remove(&session_id)?;
+    if staged.spawn != spawn {
+        tracing::warn!(
+            session = %staged.plan.box_name,
+            session_id = %session_id,
+            spawn,
+            staged_for = staged.spawn,
+            "discarded a listen plan staged for an earlier spawn of this session"
+        );
+        return None;
+    }
+    Some(staged.plan)
 }
 
 /// The hold the host build that could take a session's plan has on it: the
@@ -2190,6 +2229,10 @@ mod tests {
     fn a_launch_that_stages_no_plan_clears_the_one_before_it() {
         let cleared = SessionId::parse_str("00000000-0000-0000-0000-00000000a5c1").unwrap();
         let kept = SessionId::parse_str("00000000-0000-0000-0000-00000000a5c2").unwrap();
+        // The container supervisors the two launches run — the spawns their
+        // hosts' takes name.
+        let cleared_spawn = 4201;
+        let kept_spawn = 4202;
         let gate = Arc::new(SessionGate::for_session(
             "listen-box".into(),
             LEASE,
@@ -2205,18 +2248,18 @@ mod tests {
                 Arc::clone(&gate),
             )
         };
-        stage_listen_plan(cleared, plan());
-        stage_listen_plan(kept, plan());
+        stage_listen_plan(cleared, cleared_spawn, plan());
+        stage_listen_plan(kept, kept_spawn, plan());
 
         // The new path: a launch that stages nothing removes what its
         // session still holds.
         clear_listen_plan(cleared);
         assert!(
-            take_listen_plan(cleared).is_none(),
+            take_listen_plan(cleared, cleared_spawn).is_none(),
             "the cancelled launch's plan is gone, so no later host takes it"
         );
         assert!(
-            take_listen_plan(kept).is_some(),
+            take_listen_plan(kept, kept_spawn).is_some(),
             "the plan nobody cleared is still there to take"
         );
     }
@@ -2233,6 +2276,9 @@ mod tests {
     fn no_staged_plan_outlives_the_build_that_could_take_it() {
         let cancelled = SessionId::parse_str("00000000-0000-0000-0000-00000000a5c3").unwrap();
         let taken = SessionId::parse_str("00000000-0000-0000-0000-00000000a5c4").unwrap();
+        // The spawns the two launches run.
+        let cancelled_spawn = 4203;
+        let taken_spawn = 4204;
         let gate = Arc::new(SessionGate::for_session(
             "listen-box".into(),
             LEASE,
@@ -2253,36 +2299,159 @@ mod tests {
         // no host ever comes for it, and the build's own end clears it —
         // not the next launch for the session, which may never come.
         let guard = StagedPlanGuard::armed_for(cancelled);
-        stage_listen_plan(cancelled, plan());
+        stage_listen_plan(cancelled, cancelled_spawn, plan());
         drop(guard);
         assert!(
-            take_listen_plan(cancelled).is_none(),
+            take_listen_plan(cancelled, cancelled_spawn).is_none(),
             "a plan no build took leaves the table with the build that could have"
         );
 
         // A build abandoned before its launch reached the staging step
         // clears the orphan an earlier cancelled launch left behind: a
         // later host must never take a plan whose attach is already gone.
-        stage_listen_plan(cancelled, plan());
+        stage_listen_plan(cancelled, cancelled_spawn, plan());
         drop(StagedPlanGuard::armed_for(cancelled));
         assert!(
-            take_listen_plan(cancelled).is_none(),
+            take_listen_plan(cancelled, cancelled_spawn).is_none(),
             "the next build clears an earlier launch's orphan"
         );
 
         // The build that takes its plan: the guard disarms at the take,
         // and the take's own destructiveness is what emptied the table —
         // no second host takes what the first now runs its watcher on.
-        stage_listen_plan(taken, plan());
+        stage_listen_plan(taken, taken_spawn, plan());
         let guard = StagedPlanGuard::armed_for(taken);
         assert!(
-            take_listen_plan(taken).is_some(),
+            take_listen_plan(taken, taken_spawn).is_some(),
             "the plan a launch staged is there for its host build to take"
         );
         guard.taken();
         assert!(
-            take_listen_plan(taken).is_none(),
+            take_listen_plan(taken, taken_spawn).is_none(),
             "the take is destructive: the plan went with the host that took it"
+        );
+    }
+
+    /// Every failed or aborted launch leaves no plan behind: the build that
+    /// could have taken it arms its guard before it launches, and a build
+    /// that ends without a take — a launch that errored out, an attach
+    /// abandoned with its launch in flight — clears the entry as it ends.
+    /// The clear is the whole entry, so no spawn's take can read it back:
+    /// a plan whose build is gone serves nobody, whichever of the session's
+    /// spawns staged it.
+    #[test]
+    fn a_failed_launch_leaves_no_staged_plan() {
+        let session = SessionId::parse_str("00000000-0000-0000-0000-00000000a5c5").unwrap();
+        // The spawn a cancelled launch before the failed one ran, and the
+        // spawn the failing launch itself was to run.
+        let orphan_spawn = 4205;
+        let failed_spawn = 4206;
+        let gate = Arc::new(SessionGate::for_session(
+            "listen-box".into(),
+            LEASE,
+            &permit_policy(8080),
+            SwitchSubnet::default(),
+        ));
+        let plan = || {
+            ListenPlan::new(
+                "listen-box".into(),
+                LEASE,
+                PUBLISHED,
+                ControlChannel::Unix(PathBuf::from("/nowhere")),
+                Arc::clone(&gate),
+            )
+        };
+
+        // The cancelled launch's plan is in the table when the box's next
+        // host build arms its guard and launches.
+        stage_listen_plan(session, orphan_spawn, plan());
+        let guard = StagedPlanGuard::armed_for(session);
+
+        // The launch fails: no `Ok(Launched)`, no take. The build's own end
+        // — its guard's drop — is the clear, and it takes the orphan with
+        // it, so even the spawn that staged it cannot read it back.
+        drop(guard);
+        assert!(
+            take_listen_plan(session, orphan_spawn).is_none(),
+            "a failed build clears the table's whole entry: the cancelled \
+             launch's plan is not waiting for a spawn-matched take"
+        );
+        assert!(
+            take_listen_plan(session, failed_spawn).is_none(),
+            "the failed launch staged nothing of its own"
+        );
+    }
+
+    /// A respawn under the same session id reads only the plan its own
+    /// launch staged. The take names the spawn it runs, so an entry the
+    /// spawn before it left is refused — dropped, and said — rather than
+    /// handed to the respawn to publish on a dead spawn's lease, address
+    /// and gate: the respawn fails closed, its ports unpublished by
+    /// listening, which is the safe side of the two.
+    #[test]
+    fn a_respawn_never_reads_the_previous_spawns_plan() {
+        let session = SessionId::parse_str("00000000-0000-0000-0000-00000000a5c6").unwrap();
+        // The two spawns of one session id: the box's first life, and the
+        // respawn that follows it.
+        let first = 4207;
+        let second = 4208;
+        let gate = Arc::new(SessionGate::for_session(
+            "listen-box".into(),
+            LEASE,
+            &permit_policy(8080),
+            SwitchSubnet::default(),
+        ));
+        let plan = || {
+            ListenPlan::new(
+                "listen-box".into(),
+                LEASE,
+                PUBLISHED,
+                ControlChannel::Unix(PathBuf::from("/nowhere")),
+                Arc::clone(&gate),
+            )
+        };
+
+        // The first spawn staged its plan and never handed its box to a
+        // host: its attach is gone, and with it the lease, the address and
+        // the gate the plan names.
+        stage_listen_plan(session, first, plan());
+
+        // The session respawns under the same id: the new launch runs a
+        // new container supervisor, and its host build's take names that
+        // spawn — so the stale plan is refused, said, and dropped.
+        let (lines, _guard) = captured_lines();
+        assert!(
+            take_listen_plan(session, second).is_none(),
+            "the respawn never reads the previous spawn's plan"
+        );
+        let log = lines.contents();
+        let refused = lines_saying(&log, "discarded a listen plan staged for an earlier spawn");
+        assert_eq!(
+            refused.len(),
+            1,
+            "the refusal is said, so a stale plan never leaves silently: {log}"
+        );
+        assert!(
+            refused[0].contains(&format!("spawn={second}")),
+            "the line names the spawn that refused it: {}",
+            refused[0]
+        );
+        assert!(
+            refused[0].contains(&format!("staged_for={first}")),
+            "the line names the spawn the plan was staged for: {}",
+            refused[0]
+        );
+        assert!(
+            take_listen_plan(session, first).is_none(),
+            "the refused entry is dropped, not left for a third spawn to find"
+        );
+
+        // The respawn's own launch stages its own plan, and its take reads
+        // it: the key was built not to disturb the happy path.
+        stage_listen_plan(session, second, plan());
+        assert!(
+            take_listen_plan(session, second).is_some(),
+            "a plan is there for the spawn that staged it"
         );
     }
 

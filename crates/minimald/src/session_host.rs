@@ -3666,6 +3666,7 @@ impl SessionLauncher for SandboxLauncher {
             };
             crate::net::listeners::stage_listen_plan(
                 session_id,
+                process.get_mut().id(),
                 crate::net::listeners::ListenPlan::new(
                     session_label,
                     lease,
@@ -4176,14 +4177,23 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         // PID it holds and the watcher asks on every poll until the box's
         // program is there to be found (the module's nothing-is-one-shot
         // contract, held of its start).
-        let listen_watcher = crate::net::listeners::take_listen_plan(session_id).map(|plan| {
-            crate::net::listeners::ListenWatcher::start(
-                plan,
-                crate::net::listeners::Leader::Pending {
-                    container_pid: process.container_pid(),
+        //
+        // The take names the spawn this build runs — the container
+        // supervisor the launch handed it — so the plan it reads is the one
+        // its own launch staged: a respawn under the same session id never
+        // reads the spawn before it, whose lease, published address and
+        // gate its attach already tore down.
+        let listen_watcher =
+            crate::net::listeners::take_listen_plan(session_id, process.container_pid()).map(
+                |plan| {
+                    crate::net::listeners::ListenWatcher::start(
+                        plan,
+                        crate::net::listeners::Leader::Pending {
+                            container_pid: process.container_pid(),
+                        },
+                    )
                 },
-            )
-        });
+            );
         // The plan is the watcher's now — or there never was one — and the
         // table's entry went with the take, so this build's own end has
         // nothing left to clear.
