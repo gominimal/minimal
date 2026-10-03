@@ -4902,7 +4902,7 @@ async fn register_hostname_promotes_an_interim_to_its_vouched_hand() {
 /// tests below pin the decision and the publish it leads to, not the
 /// plumbing around them. `mode: None` is the deny-all default a box that
 /// declared nothing runs under.
-fn dynamic_ingress_session_req(
+pub(crate) fn dynamic_ingress_session_req(
     name: &str,
     switch: std::net::Ipv4Addr,
     loopback: std::net::Ipv4Addr,
@@ -4928,7 +4928,7 @@ fn dynamic_ingress_session_req(
 
 /// Drives Create → ConfigureLoadout → FinalizeSession for a
 /// [`dynamic_ingress_session_req`] box and returns its id.
-async fn finalize_dynamic_ingress_session(
+pub(crate) async fn finalize_dynamic_ingress_session(
     client: &mut TestClient,
     name: &str,
     switch: std::net::Ipv4Addr,
@@ -5007,7 +5007,7 @@ async fn read_control_request(stream: &mut tokio::net::UnixStream) -> Option<Str
 /// harness never spawns a real forwarder, so binding here is what puts a
 /// control channel behind the publish verbs — a 500 answers the way the real
 /// forwarder answers a bind it cannot make.
-async fn fake_forwarder(
+pub(crate) async fn fake_forwarder(
     sock: std::path::PathBuf,
     status: u16,
 ) -> (

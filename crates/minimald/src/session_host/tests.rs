@@ -3,6 +3,9 @@ use paths::DaemonAbsPath;
 use super::*;
 use std::time::Duration;
 
+use crate::session::tests::{fake_forwarder, finalize_dynamic_ingress_session};
+use crate::test_harness::{TestServer, captured_log};
+
 const DEFAULT_SIZE: WinSize = WinSize {
     rows: 24,
     cols: 80,
@@ -3442,4 +3445,389 @@ fn a_guests_placed_unenforced_host_address_box_advises_at_its_start() {
         "a placed box on a host that decided per box runs enforced"
     );
     assert!(!super::advises_unenforced_placement(enforced));
+}
+
+// ---------------------------------------------------------------------------
+// The runtime port-publish ask (NET-045) and the decision log (NET-046)
+// ---------------------------------------------------------------------------
+
+/// The state the ask tests' boxes publish at, mirroring the session tests'
+/// dynamic-ingress boxes: an own-address box whose creator handed it the
+/// address pair a publish needs, with the switch lease the publish rides.
+const ASK_SWITCH: std::net::Ipv4Addr = std::net::Ipv4Addr::new(100, 64, 128, 21);
+const ASK_LOOPBACK: std::net::Ipv4Addr = std::net::Ipv4Addr::new(127, 0, 64, 21);
+
+/// Finalizes one dynamic-ingress box and returns its id alongside a handle to
+/// its session actor, which is what a runtime port-publish request reaches.
+async fn dynamic_ingress_box(
+    server: &TestServer,
+    client: &mut crate::test_harness::TestClient,
+    name: &str,
+    mode: Option<sessions::DynamicIngress>,
+    range: Option<(u16, u16)>,
+) -> (sessions::SessionId, crate::session::SessionHandle) {
+    let id =
+        finalize_dynamic_ingress_session(client, name, ASK_SWITCH, ASK_LOOPBACK, mode, range).await;
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(id))
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("the {name} box should resolve"));
+    (id, handle)
+}
+
+/// The daemon's local decision log (NET-046) as parsed records, in the order
+/// the decisions were made. Only the decisions the test drove are there: a
+/// harness server's state dir starts empty.
+async fn audit_records(state_dir: &DaemonAbsPath) -> Vec<serde_json_lenient::Value> {
+    let logged = tokio::fs::read_to_string(crate::audit::log_path(
+        state_dir.as_utf8_path().as_std_path(),
+    ))
+    .await
+    .expect("a decision should have been audited");
+    logged
+        .lines()
+        .map(|line| {
+            serde_json_lenient::from_str(line)
+                .unwrap_or_else(|e| panic!("one audit line is one record: {e} in {logged}"))
+        })
+        .collect()
+}
+
+/// Reads the attached client's channel until the ask dialog renders, then
+/// answers it the way the shell-exit prompt's tests do: a down-arrow off the
+/// highlighted deny, then Enter. Returns everything the dialog rendered, so a
+/// test can assert the lead-in named the box and the port.
+async fn answer_ask_on(channel: &mut russh::Channel<russh::client::Msg>, accept: bool) -> Vec<u8> {
+    let mut seen = Vec::new();
+    let drained = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Data { data }) => {
+                    seen.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&seen).contains(ASK_PROMPT) {
+                        // Deny stands highlighted, so accepting moves once
+                        // and confirms; denying — or refusing — confirms the
+                        // highlighted deny as it is.
+                        let keys = if accept {
+                            b"\x1b[B\r".to_vec()
+                        } else {
+                            b"\r".to_vec()
+                        };
+                        channel.data_bytes(keys).await.unwrap();
+                        return;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("the channel closed before the ask dialog rendered"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        drained.is_ok(),
+        "the ask dialog never rendered: {}",
+        String::from_utf8_lossy(&seen),
+    );
+    seen
+}
+
+/// NET-045: a runtime port-publish request a box decided `ask` reaches the
+/// human attached to it — the dialog renders on their terminal with the box
+/// and the port named — and the answer they give is the answer the request
+/// gets: an allow publishes, and the publish that follows is the one an
+/// `allow` box's request takes. The prompt says its own line in the daemon
+/// log, and the decision it produced lands in the local audit log (NET-046)
+/// naming who decided it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_ask_prompts_attached_human() {
+    let capture = captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (web, handle) = dynamic_ingress_box(
+        &server,
+        &mut client,
+        "web",
+        Some(sessions::DynamicIngress::Ask),
+        Some((3000, 3999)),
+    )
+    .await;
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    // Attach the human the ask will be routed to, and prove the binding is
+    // live before asking: the mock shell's echo round-trips through it.
+    let mut channel = client.open_shell(web).await;
+    channel.data_bytes(b"hello\n".to_vec()).await.unwrap();
+    let mut live = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Data { data }) => {
+                    live.extend_from_slice(&data);
+                    if String::from_utf8_lossy(&live).contains("got:hello") {
+                        return;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("the channel closed before the shell came up"),
+            }
+        }
+    })
+    .await
+    .expect("the attached shell should echo within the bound");
+
+    // Ask off the test's own task: the reply waits on the human.
+    let asked = tokio::spawn(async move { handle.expose_dynamic(3000).await });
+
+    let rendered = answer_ask_on(&mut channel, true).await;
+    let rendered = String::from_utf8_lossy(&rendered);
+    assert!(
+        rendered.contains("web asks to publish port 3000"),
+        "the dialog's lead-in names the box and the port: {rendered}"
+    );
+
+    let mapping = tokio::time::timeout(Duration::from_secs(30), asked)
+        .await
+        .expect("the ask should be answered once the human answers")
+        .expect("the spawned request should not panic")
+        .expect("the human's allow publishes the port");
+    assert_eq!(
+        mapping,
+        minimald_rpc::LiveMapping {
+            local: format!("{}:3000", ASK_LOOPBACK),
+            internal_port: 3000,
+            proto: sessions::IpProto::Tcp,
+        },
+        "the publish the human allowed is the one an allow box's takes"
+    );
+    forwarder.abort();
+    {
+        let served = served.lock().expect("served lock");
+        assert_eq!(
+            served.len(),
+            1,
+            "the allowed ask publishes exactly once: {served:?}"
+        );
+        assert!(
+            served[0].starts_with("POST /services/forwarder/expose "),
+            "the allowed ask rides the forwarder's expose verb: {served:?}"
+        );
+    }
+
+    // One line for the prompt, and the decision's own line, in the daemon log
+    // the diagnostics bundle ships.
+    let log = capture.contents();
+    assert!(
+        log.contains("asking the attached client to allow a runtime port publish"),
+        "the prompt the human saw says its line: {log}"
+    );
+    assert!(
+        log.contains("the attached client answered the runtime port publish ask"),
+        "the answer says its line: {log}"
+    );
+
+    // And one audit record for the decision, naming who made it (NET-046).
+    let records = audit_records(&server.state.minimal_state_dir().await).await;
+    assert_eq!(records.len(), 1, "one ask is one decision: {records:?}");
+    assert_eq!(records[0]["box"], "web");
+    assert_eq!(records[0]["port"], 3000);
+    assert_eq!(records[0]["decision"], "ask");
+    assert_eq!(
+        records[0]["decided_by"], "attached-human",
+        "the human's answer is the decision: {records:?}"
+    );
+    assert_eq!(records[0]["outcome"], "published");
+    assert!(records[0].get("reason").is_none());
+}
+
+/// NET-045's unwanted branch: a box decided `ask` with nobody attached — no
+/// client ever bound, so no human to render the dialog to — is refused with
+/// the typed error that says nobody is attached to answer, the switch is
+/// asked nothing at all, and both facts land in the log and the audit record
+/// like every other decision (NET-046).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_ask_without_client_refused() {
+    let capture = captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (_web, handle) = dynamic_ingress_box(
+        &server,
+        &mut client,
+        "web",
+        Some(sessions::DynamicIngress::Ask),
+        Some((3000, 3999)),
+    )
+    .await;
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, served) = fake_forwarder(sock, 200).await;
+
+    // Nobody ever attaches: no binding to render the dialog, and the request
+    // is refused rather than parked on a human who is not there.
+    let refused = tokio::time::timeout(Duration::from_secs(30), handle.expose_dynamic(3000))
+        .await
+        .expect("an ask nobody can answer must be refused, not parked")
+        .expect_err("nobody being attached fails the ask closed");
+    match refused {
+        crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::AskNeedsAnswer,
+        ) => {}
+        other => panic!("the refusal is the typed nobody-is-attached error: {other:?}"),
+    }
+    forwarder.abort();
+    assert!(
+        served.lock().expect("served lock").is_empty(),
+        "a refused request asks the switch nothing"
+    );
+
+    // The refusal for want of a client says its line, carrying the typed
+    // reason the in-box caller read.
+    let log = capture.contents();
+    assert!(
+        log.contains("dynamic ingress is set to ask and nobody is attached to answer"),
+        "the refusal names why, with the typed error's own words: {log}"
+    );
+    assert!(
+        log.contains("outcome=\"refused\"") && log.contains("decided_by=daemon"),
+        "the refusal is logged as the daemon's fail-closed decision: {log}"
+    );
+
+    // And the decision is audited (NET-046): the daemon decided it, because
+    // there was no human to.
+    let records = audit_records(&server.state.minimal_state_dir().await).await;
+    assert_eq!(records.len(), 1, "one request is one decision: {records:?}");
+    assert_eq!(records[0]["box"], "web");
+    assert_eq!(records[0]["port"], 3000);
+    assert_eq!(records[0]["decision"], "ask");
+    assert_eq!(records[0]["decided_by"], "daemon");
+    assert_eq!(records[0]["outcome"], "refused");
+    assert_eq!(
+        records[0]["reason"], "dynamic ingress is set to ask and nobody is attached to answer",
+        "the audit record carries the typed error the caller read: {records:?}"
+    );
+}
+
+/// NET-046: on the un-enrolled host, every dynamic ingress decision lands in
+/// the local audit log — the publish an allowing box made and the refusal the
+/// deny-all default answered an un-enrolled box with alike — each as one
+/// parseable record naming the box, the port, the decision, who decided it,
+/// and the outcome, so the log reads without the session it was about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expose_unenrolled_decision_audited() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let (_web, web_handle) = dynamic_ingress_box(
+        &server,
+        &mut client,
+        "web",
+        Some(sessions::DynamicIngress::Allow),
+        Some((3000, 3999)),
+    )
+    .await;
+    let (_db, db_handle) = dynamic_ingress_box(
+        &server,
+        &mut client,
+        "db",
+        // Declared nothing: the deny-all default the un-enrolled box runs
+        // under, which is what "un-enrolled" means for a decision's sake.
+        None,
+        None,
+    )
+    .await;
+    let sock = web_handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    let (forwarder, _served) = fake_forwarder(sock, 200).await;
+
+    web_handle
+        .expose_dynamic(3000)
+        .await
+        .expect("the allowing box publishes");
+    match db_handle.expose_dynamic(3000).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::DeniedByPolicy,
+        )) => {}
+        other => panic!("the deny-all default refuses the request: {other:?}"),
+    }
+    forwarder.abort();
+
+    let records = audit_records(&server.state.minimal_state_dir().await).await;
+    assert_eq!(records.len(), 2, "each decision is one record: {records:?}");
+    assert_eq!(records[0]["box"], "web");
+    assert_eq!(records[0]["port"], 3000);
+    assert_eq!(records[0]["decision"], "allow");
+    assert_eq!(records[0]["decided_by"], "box-policy");
+    assert_eq!(records[0]["outcome"], "published");
+    assert!(
+        records[0].get("reason").is_none(),
+        "a publish has no refusal to name: {records:?}"
+    );
+    assert_eq!(records[1]["box"], "db");
+    assert_eq!(records[1]["port"], 3000);
+    assert_eq!(records[1]["decision"], "deny");
+    assert_eq!(records[1]["decided_by"], "box-policy");
+    assert_eq!(records[1]["outcome"], "refused");
+    assert_eq!(
+        records[1]["reason"], "dynamic ingress is denied for this box",
+        "the refusal carries the typed error's own words: {records:?}"
+    );
+}
+
+/// The host-level half of NET-045's no-client case: an ask reaching a host
+/// nobody is bound to answers no-one rather than parking — the dialog has no
+/// terminal to render on — which is the fail-closed answer the session turns
+/// into the typed nobody-is-attached refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ask_expose_without_a_binding_answers_no_one() {
+    let (host, handle) = Host::build(
+        MockLauncher::default(),
+        HostParams {
+            name: "test-session".to_string(),
+            username: "user".to_string(),
+            paths: test_paths(),
+            sz: DEFAULT_SIZE,
+            // No channel and no binding: the host is up, but nobody is
+            // attached to it.
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            session_id: sessions::SessionId::nil(),
+            composition: None,
+            connection_env: ConnectionEnv::new(),
+            #[cfg(target_os = "linux")]
+            name_marker: None,
+        },
+    )
+    .await
+    .expect("failed to build host");
+    let task = tokio::spawn(host.mainloop());
+
+    let answer = tokio::time::timeout(Duration::from_secs(5), handle.ask_expose(3000))
+        .await
+        .expect("an ask with nobody attached must answer, not park on a dialog nobody can see");
+    assert_eq!(
+        answer, None,
+        "no binding means nobody is attached to answer the ask"
+    );
+
+    let _ = handle.kill(false).await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
 }
