@@ -1688,6 +1688,11 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   # Set before the install, so a death between its nft transaction and its
   # last note still leaves the teardown a table to remove.
   NET080_CLASSIFIER_INSTALLED=1
+  # The installer's notes are captured as this lane's user, not as root:
+  # $WORK is the lane's own work dir, which root need not and must not own,
+  # so the redirects staying the caller's is the intent, and sudo's
+  # privilege ends at the script it runs.
+  # shellcheck disable=SC2024
   if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" \
       --cohort-address "$net080_src" --node-plane-address "$net080_src" \
       >"$WORK/net080-install.out" 2>"$WORK/net080-install.err"; then
@@ -1750,6 +1755,10 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
     echo "::error::expected exactly one $min_daemon under this account to place in its leaf, found: ${net080_daemons:-none}"
     fail
   fi
+  # The placement's notes are captured as this lane's user, for the same
+  # reason as the install's above: $WORK is the lane's own work dir, so the
+  # redirects staying the caller's is the intent.
+  # shellcheck disable=SC2024
   if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --pid "$net080_pid" \
       >"$WORK/net080-place.out" 2>"$WORK/net080-place.err"; then
     echo "::error::the installer's --pid step could not place $min_daemon $net080_pid in its leaf"
