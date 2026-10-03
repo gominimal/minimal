@@ -167,11 +167,11 @@ json-subscriber = "0.3"
 libc = "0.2"
 lzma-rs = "0.3"
 
-# Tracked as a git rev, not the crates.io release: crates.io lags master by a
-# long way (0.18.0 is the newest published, and master has moved well past it).
-# Bump the rev to pick up upstream fixes; revisit crates.io only once its
-# releases catch up. Current rev is master @ 2026-08-03.
-nickel-lang-core = { git = "https://github.com/nickel-lang/nickel.git", rev = "21decd294fe404d67d1545d11563016af6ea4090", default-features = false, features = ["format"] }
+# From crates.io, not a git rev: the published nickel-lang-parser ships its
+# LALRPOP grammar pre-generated, while a git checkout regenerates it in the
+# build script on every cold build (minutes, far longer under emulated cross
+# builds). Prefer waiting for a release over pinning a git rev again.
+nickel-lang-core = { version = "0.19", default-features = false, features = ["format"] }
 
 opentelemetry-semantic-conventions = "0.33"
 # `socket` + `time`: the guest's vsock timekeep listener binds an AF_VSOCK

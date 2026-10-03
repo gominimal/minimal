@@ -105,13 +105,19 @@ jobs:
               # target/ cache routinely exceed the ~14 GB free on a fresh
               # GitHub-hosted Ubuntu runner. `remove_tool_cache: true`
               # reclaims /opt/hostedtoolcache (~14 GB); the dtolnay Toolchain
-              # step below reinstalls the Rust toolchain we actually need.
+              # step below reinstalls the Rust toolchain we actually need. The
+              # Android SDK is removed by the next step instead.
               uses: endersonmenezes/free-disk-space@2a22f8c59cae9cddae7194b33e6b92d023b2b4b8 # v4.0.0
               with:
-                  remove_android: true
+                  remove_android: false
                   remove_dotnet: true
                   remove_haskell: true
                   remove_tool_cache: true
+            - name: Remove the Android SDK in the background
+              # ~11 GB in many small files: deleting it in the foreground costs
+              # 50-130 s. Detached, it finishes while the toolchain installs and
+              # the cache restores, before the build needs the space.
+              run: setsid nohup sudo rm -rf /usr/local/lib/android >/dev/null 2>&1 &
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
               with:
                   persist-credentials: false
