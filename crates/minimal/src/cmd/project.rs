@@ -16,6 +16,18 @@ pub(crate) fn project_has_mfile(project_path: &camino::Utf8Path) -> bool {
     )
 }
 
+/// Whether `--sync none` will silently discard a project config: true when a
+/// `minimal.toml` is found walking up from `dir`. The notice is only worth
+/// printing when there is a config to lose, so this mirrors
+/// [`project_has_mfile`]'s "any outcome other than NotFound counts as
+/// present" rule, but walks up the tree the way [`resolve_upload_root`] does.
+pub(crate) fn sync_none_drops_project_config(dir: &camino::Utf8Path) -> bool {
+    !matches!(
+        mfile::File::from_dir_recursive(dir.as_std_path()),
+        Err(mfile::Error::NotFound)
+    )
+}
+
 /// Offer to initialize a `minimal.toml` at the project path when it has
 /// none, on the way into an activation or a `min add`.
 ///

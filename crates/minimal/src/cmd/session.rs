@@ -859,7 +859,19 @@ pub(crate) async fn activate_session(
     // the daemon then composes against an empty workspace and the
     // caller is on their own for getting files there.
     match sync_mode {
-        SyncMode::None => {}
+        SyncMode::None => {
+            // `--sync none` skips the upload, so the daemon composes against
+            // an empty workspace and the project's `minimal.toml` — packages,
+            // vars, patches, hooks — is silently dropped. Say so when there
+            // is a config to lose, so the default-config session is not a
+            // surprise.
+            if sync_none_drops_project_config(&utf8_path) {
+                eprintln!(
+                    "--sync none: this project's minimal.toml is not sent; the session uses a \
+                     default configuration (its packages, vars, patches and hooks are not applied)"
+                );
+            }
+        }
         SyncMode::Tarball if skip_empty_or_home => {
             // An empty directory has nothing to sync, and `$HOME` is far
             // too much to ship on a stray confirmation keypress — and if
