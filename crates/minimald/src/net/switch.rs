@@ -5011,11 +5011,10 @@ pub(crate) mod tests {
         // nothing but the frames the next steps watch for: a reset from
         // the box's refused port back to the client, the one frame a
         // refused connect writes, never a record.
-        let reset =
-            tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
-                .await
-                .expect("the refused connect is answered, not timed out")
-                .expect("the switch side stays open");
+        let reset = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the refused connect is answered, not timed out")
+            .expect("the switch side stays open");
         assert_eq!(reset[47], 0x14, "RST|ACK: the client's refusal");
         assert_eq!(records(&harness), 1, "a refused connect recorded nothing");
 
