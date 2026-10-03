@@ -2870,7 +2870,7 @@ fn write_resolv_conf(rootfs: &Path, resolver: &network::Resolver) -> Result<(), 
 /// rootfs is a hardlink farm over the package cache, and an in-place append
 /// would write through the link into the cached package.
 ///
-/// With `strip_ipv6` set (the kernel has no IPv6 stack, see
+/// With `strip_ipv6` set (no IPv6 address in the daemon's namespace, see
 /// [`ipv6_disabled`]), the shipped IPv6 entries are dropped first, even when
 /// the plan carries no entries of its own: a VM guest boots with
 /// `ipv6.disable=1`, but its base image's `/etc/hosts` still maps `localhost`
@@ -2917,9 +2917,13 @@ fn write_hosts(rootfs: &Path, hosts: &[network::HostEntry], strip_ipv6: bool) ->
     fs::write(&etc_hosts, body).map_err(|e| Error::IO("writing /etc/hosts", etc_hosts, e))
 }
 
-/// Whether the kernel has no IPv6 stack.  On Linux this is signalled by an
-/// absent or empty `/proc/net/if_inet6`; on other platforms IPv6 is always
-/// assumed available (the caller is Linux-only in practice).
+/// Whether the daemon's own network namespace has no IPv6 address configured.
+/// On Linux this is read from `/proc/net/if_inet6`: the file is absent when the
+/// kernel booted with `ipv6.disable=1`, and empty when IPv6 is compiled in but
+/// turned off by sysctl (`net.ipv6.conf.all.disable_ipv6=1`). An unreadable
+/// `/proc` also counts as disabled on purpose, since stripping only drops the
+/// `::1` lines and keeps the IPv4 `localhost` mapping. On other platforms IPv6
+/// is always assumed available (the caller is Linux-only in practice).
 fn ipv6_disabled() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -3313,9 +3317,9 @@ mod tests {
     }
 
     /// A VM guest boots with `ipv6.disable=1`, but its base image's
-    /// `/etc/hosts` still ships IPv6 entries.  Stripping them keeps resolvers
+    /// `/etc/hosts` still ships IPv6 entries. Stripping them keeps resolvers
     /// from handing out `::1` for `localhost`, which makes programs fail with
-    /// `EAFNOSUPPORT`.  IPv4 entries, comments, and blank lines survive.
+    /// `EAFNOSUPPORT`. IPv4 entries, comments, and blank lines survive.
     #[test]
     fn strip_ipv6_hosts_entries_drops_only_ipv6() {
         let shipped = "\
