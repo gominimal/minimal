@@ -1874,7 +1874,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2898,7 +2898,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -4425,8 +4425,9 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nickel-lang-core"
-version = "0.17.0"
-source = "git+https://github.com/nickel-lang/nickel.git?rev=21decd294fe404d67d1545d11563016af6ea4090#21decd294fe404d67d1545d11563016af6ea4090"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e4244c23b4a1a6df8e32683371142760b22bc79d63e8106e9671db9d66e6411"
 dependencies = [
  "base64 0.22.1",
  "bumpalo",
@@ -4446,7 +4447,6 @@ dependencies = [
  "nickel-lang-vector",
  "once_cell",
  "ouroboros",
- "paste",
  "pretty",
  "regex",
  "saphyr-parser 0.0.6",
@@ -4470,8 +4470,9 @@ dependencies = [
 
 [[package]]
 name = "nickel-lang-parser"
-version = "0.2.0"
-source = "git+https://github.com/nickel-lang/nickel.git?rev=21decd294fe404d67d1545d11563016af6ea4090#21decd294fe404d67d1545d11563016af6ea4090"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0dde78e0119c1e9cc8b4feb0b6d195b44a11be5fc82aac7b391ef28b949c538a"
 dependencies = [
  "bumpalo",
  "codespan",
@@ -4495,8 +4496,9 @@ dependencies = [
 
 [[package]]
 name = "nickel-lang-vector"
-version = "0.1.0"
-source = "git+https://github.com/nickel-lang/nickel.git?rev=21decd294fe404d67d1545d11563016af6ea4090#21decd294fe404d67d1545d11563016af6ea4090"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36f243832286908d8873add24a905d6732ffabd6cfb2bf74cb18d667e892e279"
 dependencies = [
  "imbl-sized-chunks",
  "serde",
@@ -4939,9 +4941,9 @@ dependencies = [
 
 [[package]]
 name = "pageant"
-version = "0.2.1"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f3a5ae18f65a85c67a77d18d42d3606c07948e3c17c1e5f74852b26589e88a5"
+checksum = "6d8eab09a361a4afe0b1668be978cd97e4f052e927a92b0b608cf902965d49ce"
 dependencies = [
  "base16ct",
  "byteorder",
@@ -5672,7 +5674,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6266,7 +6268,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6324,7 +6326,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7262,10 +7264,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8442,7 +8444,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

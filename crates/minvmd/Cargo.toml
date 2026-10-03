@@ -1,5 +1,6 @@
 [package]
 name = "minvmd"
+description = "Host daemon that boots Linux microVMs via libkrun and bridges host UDS to in-VM vsock."
 rust-version.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -49,7 +50,12 @@ mlog.workspace = true
 switch = { workspace = true, features = ["stack-peer"] }
 # The DNS wire format the host zone answerer (`net::answerer`) decodes
 # queries and encodes replies in — the same library the native daemon's
-# answerer uses, so the two agree on the wire by construction.
+# answerer uses, so the two agree on the wire by construction. Also the DNS
+# wire parsing for the host-side DNS admission table (`net::dns_pins`,
+# NET-081 deciding NET-066/067 outside the VM): the replies the gate's
+# ingress leg observes on their way to a box are pinned only by reading
+# them. The same parser minimald's in-VM gate reads, so both legs pin from
+# the same wire.
 hickory-proto.workspace = true
 # Async gvproxy switch supervision in `net`: the background exit-detection task
 # and the async `stop()` teardown run on the tokio runtime the networking layer
@@ -68,6 +74,10 @@ camino.workspace = true
 serial_test.workspace = true
 tempfile.workspace = true
 russh-sftp.workspace = true
+# The Box Egress Proxy stand-in acceptor's tests drive the delivery against a
+# real registry (`bep_stub`, NET-132) on the switch crate's channel-wired
+# lane and box-side client — the same `test_util` the pool's own tests use.
+switch = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
