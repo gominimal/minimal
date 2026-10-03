@@ -1,5 +1,6 @@
 [package]
 name = "minimal"
+description = "The min CLI: sessions, tasks, loadouts, packages, networking, diagnostics and project setup, over SSH to minimald, auto-spawning minvmd where the daemon lives in a microVM."
 rust-version.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -45,6 +46,7 @@ camino.workspace = true
 chrono.workspace = true
 diagnostics.workspace = true
 dirs.workspace = true
+hex.workspace = true
 nix.workspace = true
 mctx.workspace = true
 mfile.workspace = true
@@ -53,10 +55,19 @@ minimal-tui.workspace = true
 minimald-rpc.workspace = true
 op.workspace = true
 paths.workspace = true
+# `min diag upload` hands a bundle to the diag portal: two requests, HTTPS.
+reqwest.workspace = true
 russh.workspace = true
 serde.workspace = true
 serde_json_lenient.workspace = true
+sha2.workspace = true
 sessions.workspace = true
+# The reserved local range the resolver advisory's bind probe reads. Owned by
+# the zero-dependency `switch` crate — the same constant the daemon's DNS zone
+# re-exports and publishes per-box addresses from — so the CLI's probe and the
+# daemon's publish agree by construction instead of drifting between two
+# copies of the /24. Not the daemon crate: the CLI keeps depending on none.
+switch.workspace = true
 # Staging for the `min bug` volume fallback: `debugfs -c` rdumps the guest's
 # /logs into a temp dir before the readable files are tail-capped into the
 # bundle.
@@ -69,6 +80,9 @@ toml.workspace = true
 toml_edit.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Parsing the diag portal's endpoint to check its scheme before the
+# upload puts a bearer token on the wire.
+url.workspace = true
 version.workspace = true
 
 # default-features = false drops minvmd's `libkrun` feature: the CLI only uses
@@ -84,3 +98,6 @@ minimald = { path = "../minimald", features = ["test-support"] }
 # `test-util` (not in tokio's `full`) for `#[tokio::test(start_paused = true)]`:
 # lets the client's handshake-deadline test elapse in virtual time.
 tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

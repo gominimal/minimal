@@ -1,5 +1,6 @@
 [package]
 name = "mfile"
+description = "Finding and reading the minimal.toml file."
 version = "0.0.1"
 rust-version.workspace = true
 license.workspace = true
@@ -21,3 +22,6 @@ serde.workspace = true
 toml.workspace = true
 shlex.workspace = true
 tracing.workspace = true
+
+[lints]
+workspace = true

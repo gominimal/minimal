@@ -22,3 +22,12 @@ __pycache__/
 # Pinned gvproxy switch binary fetched by scripts/fetch-gvproxy.sh for the
 # netns proofs; never committed.
 /gvproxy
+
+# Vale prose-linting: synced packages and sync-generated config are rebuilt by
+# `vale sync`; the project vocabulary and the first-party inventory style are
+# tracked.
+/styles/*
+!/styles/config/
+/styles/config/*
+!/styles/config/vocabularies/
+!/styles/inventory/

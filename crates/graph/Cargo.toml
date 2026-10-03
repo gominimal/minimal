@@ -1,5 +1,6 @@
 [package]
 name = "graph"
+description = "The in-memory, semantic dependency graph; the planner module orders builds."
 version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
@@ -34,3 +35,6 @@ arbitrary = { workspace = true, optional = true }
 [features]
 # Exposes `Graph::fuzz_roundtrip` for crates/graph/fuzz. Not for production use.
 fuzzing = ["dep:arbitrary"]
+
+[lints]
+workspace = true

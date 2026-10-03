@@ -901,11 +901,11 @@ mod tests {
             "127.0.0.1 answers"
         );
         assert!(
-            is_host_answerable(Ipv4Addr::new(127, 64, 0, 1), &node),
+            is_host_answerable(Ipv4Addr::new(127, 0, 64, 1), &node),
             "the reserved local range answers"
         );
         assert!(
-            !is_host_answerable(Ipv4Addr::new(127, 64, 1, 0), &node),
+            !is_host_answerable(Ipv4Addr::new(127, 0, 65, 0), &node),
             "the reserved range is a /24; past it, nothing answers"
         );
         assert!(

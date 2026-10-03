@@ -1,5 +1,6 @@
 [package]
 name = "checkouts"
+description = "Git repository checkout management for source operations (upstream layers at pinned versions)."
 version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
@@ -19,3 +20,6 @@ common.workspace = true
 mfile.workspace = true
 
 rand.workspace = true
+
+[lints]
+workspace = true

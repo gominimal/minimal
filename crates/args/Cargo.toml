@@ -1,5 +1,6 @@
 [package]
 name = "args"
+description = "Types for the argument schema of tasks and sideload parameters."
 version = "0.0.1"
 rust-version.workspace = true
 license.workspace = true
@@ -15,3 +16,6 @@ toml.workspace = true
 
 [dev-dependencies]
 indoc.workspace = true
+
+[lints]
+workspace = true

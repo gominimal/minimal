@@ -1,5 +1,6 @@
 [package]
 name = "mlog"
+description = "JSON file-log layer both minimald and minvmd write through; one definition of the on-disk log format."
 version = "0.0.1"
 rust-version.workspace = true
 license.workspace = true
@@ -16,3 +17,6 @@ version.workspace = true
 
 [dev-dependencies]
 serde_json_lenient.workspace = true
+
+[lints]
+workspace = true

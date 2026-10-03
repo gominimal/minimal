@@ -139,27 +139,69 @@ impl Exec for TaskExec {
     }
 }
 
-/// The network a task gets: the provider for its session's mode (017-005).
-/// Shared by the two ways a task starts — over an exec channel here, and from
-/// inside the session (`env::SessionChannel::run_task`).
+/// The network a task gets: the provider for its session's mode (017-005),
+/// carrying the session's *effective* egress (NET-074) — a task in an
+/// own-address session runs under whatever the session's own gate enforces:
+/// the deny-all default once it is in force, the shipped allow-all while it
+/// is only announced — and none of its ingress. Shared by the two ways a
+/// task starts — over an exec channel here, and from inside the session
+/// (`env::SessionChannel::run_task`).
 ///
 /// The mode, not the identity: an own-IP task is a second PTask beside the
 /// session's, on the same switch at the same time, so it registers under its
 /// own name and carries none of the session's ingress — forwards a task
 /// applied would come down again at its teardown. It carries no registry
 /// handle either: a task owns no proxy route of its own, so no lease is ever
-/// reported for it.
+/// reported for it. `phase` is the rollout phase to resolve the egress under
+/// — both callers pass [`sessions::EGRESS_DEFAULT_PHASE`], the phase this
+/// build ships, while the tests pass the phase by name so the posture the
+/// rollout ends at stays proven while the default is only announced
+/// (NET-076) — and `deny_all_opt_out` is the daemon's opt-out (NET-077),
+/// read through the session handle so a task resolves its egress exactly as
+/// the launcher did.
+///
+/// A gate is attached only where that egress has rules to enforce: the
+/// deny-all section the in-force default resolves an absent declaration to,
+/// or the box's own declaration. An absent section — the allow-all the
+/// announced phase and the opt-out both leave in place — passes `None`, as
+/// every task did before the deny-all default: a gate with no ingress
+/// declaration blocks a task's *inbound* too (`allowed`/`udp_allowed` empty),
+/// so attaching one where nothing needs gating would change behaviour an
+/// announcement is not allowed to.
 pub(crate) fn task_network(
     record: &sessions::Record,
     switch: &std::sync::Arc<tokio::sync::Mutex<crate::net::SwitchClient>>,
+    phase: sessions::EgressDefaultPhase,
+    deny_all_opt_out: bool,
 ) -> std::sync::Arc<dyn sandbox2::Network> {
     let id = record.id.to_string();
     let session = record.name.as_deref().unwrap_or(&id);
+    let egress = crate::session::effective_egress_section(
+        &record.policy,
+        record.network,
+        phase,
+        deny_all_opt_out,
+    );
     crate::net::provider::network_for(
         record.network,
         switch,
         &format!("{session}-task"),
+        egress.map(|section| sessions::SessionPolicy::new(Some(section), None)),
         None,
+        // Deliberately not the record's handed addresses (T66): the task's
+        // sandbox is not the box the registration named — attaching it at the
+        // session box's address would key its frames to the session's row.
+        // A task's sandbox self-allocates, as it always has.
+        //
+        // The interim, stated plainly: task sandboxes self-allocate from the
+        // daemon's reserve — the plan run's lower half
+        // (`crate::net::self_allocation_run`) — until the task registering
+        // every live box host-side (NET-138) retires self-allocation, after
+        // which no daemon-side draw happens once a control socket exists.
+        // The VM host daemon hands registered boxes only from the run above
+        // the reserve, so the two allocators cannot meet; the daemon-side
+        // refusals (`IpAllocator::hand`) stay the guard against a pair that
+        // disagrees about the split.
         None,
     )
 }
@@ -266,7 +308,12 @@ async fn task_producer(
             task.vars
                 .insert(name.clone(), mfile::EnvVarValue::Value(value.clone()));
         }
-        let network = task_network(&session.record().await?, &session.net_switch().await?);
+        let network = task_network(
+            &session.record().await?,
+            &session.net_switch().await?,
+            sessions::EGRESS_DEFAULT_PHASE,
+            session.deny_all_opt_out().await?,
+        );
         // A task's `~/` resolves against the session's home, the same
         // directory the interactive session sees at `/home`. The daemon's own
         // ambient home is `/` inside the guest, and expanding against that
@@ -607,6 +654,11 @@ pub struct TokioExec {
     pub argv: String,
     pub cwd: DaemonAbsPath,
     pub env: BTreeMap<String, String>,
+    /// Environment variables to strip from the child process. Used to
+    /// keep Git repository-location variables inherited from the daemon
+    /// from redirecting `git init` / `git upload-pack` away from the
+    /// session workspace.
+    pub drop_env: BTreeSet<String>,
 }
 
 impl Exec for TokioExec {
@@ -623,10 +675,36 @@ impl Exec for TokioExec {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
+            for name in &self.drop_env {
+                cmd.env_remove(name);
+            }
             cmd.spawn().map(TokioProcess)
         })
         .boxed()
     }
+}
+
+/// Git environment variables that relocate a repository away from the
+/// process working directory. Inheriting any of these from the daemon
+/// would make `git init` / `git upload-pack` target a repository other
+/// than the session workspace, so they are stripped from the child
+/// process.
+fn git_repo_location_env() -> BTreeSet<String> {
+    [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_QUARANTINE_PATH",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 /// What to run inside the session, and whether a shell stands between the
@@ -1208,6 +1286,8 @@ where
 ///  * `git-receive-pack min://<session ID>` - handles a git receive-pack, routing
 ///    with the trailing session ID. Matched before the vocabulary below, and
 ///    not part of it: git speaks the pack protocol, not exec requests.
+///  * `git-upload-pack min://<session ID>` - handles a git upload-pack, routing
+///    with the trailing session ID the same way.
 ///  * a [`minimald_rpc::exec::ExecRequest`], which is where the rest of the
 ///    vocabulary is defined. The daemon-serviced forms — `min://task/run`,
 ///    `min://package/build` and `min://check` — are each routed via a
@@ -1242,6 +1322,10 @@ pub(crate) async fn handle_exec(
 
     if let Some(ident) = argv.strip_prefix("git-receive-pack min://") {
         return handle_git_receive(ident, serv, conn, id, session, channel, config).await;
+    }
+
+    if let Some(ident) = argv.strip_prefix("git-upload-pack min://") {
+        return handle_git_upload(ident, serv, conn, id, session, channel, config).await;
     }
 
     if config.pty.is_some() {
@@ -1751,11 +1835,12 @@ async fn handle_git_receive(
             // the first push to populate. Create an empty git
             // repo, and make sure its configured to checkout
             // the ref it recieves.
-            let res = tokio::process::Command::new("git")
-                .arg("init")
-                .current_dir(paths.working.as_utf8_path())
-                .output()
-                .await;
+            let mut init = tokio::process::Command::new("git");
+            init.arg("init").current_dir(paths.working.as_utf8_path());
+            for name in git_repo_location_env() {
+                init.env_remove(name);
+            }
+            let res = init.output().await;
             if let Err(e) = res {
                 tracing::warn!(error = %e, "git init failed");
                 channel.close().await.unwrap();
@@ -1835,10 +1920,101 @@ async fn handle_git_receive(
                 ),
                 cwd: paths.working,
                 env: BTreeMap::new(),
+                drop_env: git_repo_location_env(),
             },
         };
         exec_task.run(channel).await;
         drop(hooks_tmp);
+    });
+
+    Ok(())
+}
+
+async fn handle_git_upload(
+    ident: &str,
+    serv: ServerStateHandle,
+    conn: ConnectionHandle,
+    id: ChannelId,
+    session: &mut Session,
+    channel: Channel<Msg>,
+    config: ChannelConfig,
+) -> Result<(), ConnectionError> {
+    let session_pred = {
+        match config.env_vars.get(MINIMAL_SESSION_ID_ENV) {
+            Some(id_str) => match SessionId::parse_str(id_str) {
+                Ok(id) => SessionKeyPredicate::Id(id),
+                Err(_e) => {
+                    tracing::warn!(
+                        value = %id_str,
+                        "git-upload-pack rejected on channel {id}: {MINIMAL_SESSION_ID_ENV} is not a uuid",
+                    );
+                    session.channel_failure(id)?;
+                    return Ok(());
+                }
+            },
+            None => match SessionId::parse_str(ident) {
+                Ok(id) => SessionKeyPredicate::Id(id),
+                Err(_e) => SessionKeyPredicate::Name(ident.to_string()),
+            },
+        }
+    };
+
+    let mngr = serv.sessions_manager().await;
+    let session_handle = match mngr.get_session(session_pred).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            tracing::warn!("git-upload-pack rejected: unknown session");
+            session.channel_failure(id)?;
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "git-upload-pack rejected: lookup failed");
+            session.channel_failure(id)?;
+            return Ok(());
+        }
+    };
+    session.channel_success(id)?;
+
+    spawn(async move {
+        let paths = match session_handle.paths().await {
+            Ok(paths) => paths,
+            Err(e) => {
+                tracing::warn!(error = %e, "git-upload-pack aborted: session is gone");
+                let _ = channel.close().await;
+                return;
+            }
+        };
+
+        let dotgit_dir = paths.working.as_utf8_path().join(".git");
+        if let Ok(false) = tokio::fs::try_exists(&dotgit_dir).await {
+            // A read-only request (ls-remote, fetch, clone) must not create
+            // a repository in the session workspace: `git init` would write
+            // a `.git` directory as the daemon user on an operation the
+            // client believes is read-only, and would turn an
+            // uploaded/generated workspace into a repo with an unborn
+            // branch. Reject instead of initializing.
+            let msg = "minimald: session has no repository yet\n";
+            tracing::warn!("git-upload-pack rejected: session has no repository");
+            let _ = channel.extended_data(1, msg.as_bytes()).await;
+            let _ = channel.exit_status(1).await;
+            let _ = channel.eof().await;
+            let _ = channel.close().await;
+            return;
+        }
+
+        let exec_task = ExecTask {
+            conn,
+            serv,
+            session: session_handle,
+            channel_id: id,
+            exec: TokioExec {
+                argv: "git upload-pack .".to_string(),
+                cwd: paths.working,
+                env: BTreeMap::new(),
+                drop_env: git_repo_location_env(),
+            },
+        };
+        exec_task.run(channel).await;
     });
 
     Ok(())
@@ -2008,6 +2184,7 @@ mod tests {
             project_path: paths::HostAbsPath::try_new("/tmp/project").unwrap(),
             network: mode,
             policy: sessions::SessionPolicy::default(),
+            box_addresses: None,
             status: sessions::SessionStatus::Active,
             hooks_enabled: true,
             attrs: Default::default(),
@@ -2030,17 +2207,27 @@ mod tests {
                 }),
         ));
 
-        let host = super::task_network(&record_with(sessions::NetworkMode::HostNet), &switch);
+        let host = super::task_network(
+            &record_with(sessions::NetworkMode::HostNet),
+            &switch,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        );
         assert!(!host.plan().await.unwrap().isolates_netns());
 
-        let no_net = super::task_network(&record_with(sessions::NetworkMode::NoNet), &switch);
+        let no_net = super::task_network(
+            &record_with(sessions::NetworkMode::NoNet),
+            &switch,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        );
         let plan = no_net.plan().await.unwrap();
         assert!(plan.isolates_netns() && plan.tap().is_none());
 
         let mut record = record_with(sessions::NetworkMode::OwnIp);
         record.name = Some("web".to_string());
         record.policy.ingress = Some(sessions::IngressPolicy::default());
-        let own_ip = super::task_network(&record, &switch);
+        let own_ip = super::task_network(&record, &switch, sessions::EGRESS_DEFAULT_PHASE, false);
         let plan = own_ip.plan().await.unwrap();
         assert!(
             plan.isolates_netns(),
@@ -2050,18 +2237,161 @@ mod tests {
             plan.resolver(),
             sandbox2::Resolver::Nameservers(_)
         ));
-        // Its own identity on the switch, and none of the session's policy:
-        // the session's PTask is attached at the same time.
+        // Its own identity on the switch, and the session's *effective*
+        // egress (NET-074) — resolved under the phase this build ships, so
+        // the same rules the session's own gate enforces, whatever the
+        // rollout leaves in force — but none of its ingress, because the
+        // session's PTask is attached at the same time. The gate exists only
+        // where that egress has rules, so the answer follows the shipped
+        // phase rather than a literal a cutover would invalidate.
+        let gated = crate::session::effective_egress_section(
+            &record.policy,
+            record.network,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        )
+        .is_some();
         let described = format!("{own_ip:?}");
         assert!(
-            described.contains("\"web-task\"") && described.contains("has_policy: false"),
+            described.contains("\"web-task\"")
+                && described.contains(&format!("has_policy: {gated}")),
             "got {described}"
         );
         own_ip.abandon().await;
 
         // No name: the session id, rather than an empty hostname.
-        let unnamed = super::task_network(&record_with(sessions::NetworkMode::OwnIp), &switch);
+        let unnamed = super::task_network(
+            &record_with(sessions::NetworkMode::OwnIp),
+            &switch,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        );
         assert!(format!("{unnamed:?}").contains(&sessions::SessionId::nil().to_string()));
+    }
+
+    /// NET-074/NET-076/NET-077 for the task path: a task runs under the same
+    /// egress default its session does, and nothing else changes with it. A
+    /// gate is attached only where the effective egress has rules to enforce,
+    /// because a gate with no ingress declaration blocks a task's *inbound*
+    /// too — so under Announced, with no opt-out, a bare own-address task
+    /// attaches ungated exactly as every task did before the deny-all
+    /// default: the announcement may change nothing yet. Under InForce the
+    /// same bare box's task carries the deny-all gate.
+    ///
+    /// What the announcement defers is the *default* for a box that declared
+    /// nothing. A box that declared an `egress` section is enforced on its
+    /// session's own PTask in every phase, so a task in such a session
+    /// carries that declaration's gate even now, under the phase this build
+    /// ships — the same inbound posture the in-force case below already
+    /// accepts: a task PTask holds no ingress of its own, so its gate
+    /// default-blocks unsolicited inbound.
+    ///
+    /// The phase is passed by name, not read from the shipped constant, so
+    /// the in-force posture stays proven while the default is only
+    /// announced. `own_ip_default_deny_all` proves what the deny-all section
+    /// itself enforces.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_task_gate_follows_the_egress_default() {
+        use std::sync::Arc;
+
+        let switch = Arc::new(tokio::sync::Mutex::new(
+            crate::net::SwitchClient::new("/usr/bin/gvproxy", "/run/minimal/gvproxy")
+                .with_transport(crate::net::SwitchTransport::HostShuttle {
+                    cid: crate::net::VSOCK_HOST_CID,
+                    port: crate::net::VSOCK_GVPROXY_SHUTTLE_PORT,
+                }),
+        ));
+        // A bare own-address box: no egress declaration, so its egress is
+        // whatever the default resolves for an absent one.
+        let record = record_with(sessions::NetworkMode::OwnIp);
+
+        // Announced, no opt-out: an absent section still allows all, so the
+        // task gets no gate at all — its inbound stays as open as it was
+        // before the default was announced.
+        assert_eq!(
+            crate::session::effective_egress_section(
+                &record.policy,
+                record.network,
+                sessions::EgressDefaultPhase::Announced,
+                false,
+            ),
+            None,
+            "an announced default resolves an absent section to allow-all"
+        );
+        let announced = super::task_network(
+            &record,
+            &switch,
+            sessions::EgressDefaultPhase::Announced,
+            false,
+        );
+        assert!(
+            format!("{announced:?}").contains("has_policy: false"),
+            "an announced default gates nothing: {announced:?}"
+        );
+
+        // In force, no opt-out: the same absent section is the deny-all one,
+        // and the task carries the gate built from it.
+        assert_eq!(
+            crate::session::effective_egress_section(
+                &record.policy,
+                record.network,
+                sessions::EgressDefaultPhase::InForce,
+                false,
+            ),
+            Some(sessions::EgressPolicy::deny_all()),
+            "the in-force default resolves an absent section to deny-all"
+        );
+        let in_force = super::task_network(
+            &record,
+            &switch,
+            sessions::EgressDefaultPhase::InForce,
+            false,
+        );
+        assert!(
+            format!("{in_force:?}").contains("has_policy: true"),
+            "the in-force default gates a bare box's task: {in_force:?}"
+        );
+
+        // A box that *declared* an egress section is the other case where
+        // the task path attaches a gate, and the announcement does not defer
+        // it: the declaration is enforced on the session's own PTask in every
+        // phase, so a task in that session resolves the same section its
+        // session's gate did — the declaration verbatim, not the deny-all
+        // section and not nothing — even under the phase this build ships.
+        let section = sessions::EgressPolicy {
+            allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+            ..sessions::EgressPolicy::default()
+        };
+        let mut declared_record = record_with(sessions::NetworkMode::OwnIp);
+        declared_record.policy.egress = Some(section.clone());
+        for phase in [
+            sessions::EgressDefaultPhase::Announced,
+            sessions::EgressDefaultPhase::InForce,
+        ] {
+            assert_eq!(
+                crate::session::effective_egress_section(
+                    &declared_record.policy,
+                    declared_record.network,
+                    phase,
+                    false,
+                ),
+                Some(section.clone()),
+                "a declared egress section reaches the task's gate verbatim \
+                 while the default is {phase:?}",
+            );
+        }
+        let declared = super::task_network(
+            &declared_record,
+            &switch,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        );
+        assert!(
+            format!("{declared:?}").contains("has_policy: true"),
+            "a declared egress section gates the task under the shipped \
+             phase too: {declared:?}"
+        );
     }
 
     /// 017-005. An own-IP task whose attach is refused stops with the

@@ -48,6 +48,7 @@ fn ls_shows_shared_resource_pool() {
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
+        answerer_bound: false,
         resource_pool: Some(ResourcePool {
             cpu_cores: 8,
             memory_bytes: 16 * 1024 * 1024 * 1024,
@@ -70,6 +71,7 @@ fn ls_shows_shared_resource_pool() {
             json: false,
         },
         &resp,
+        None,
     )
     .unwrap();
 
@@ -86,6 +88,7 @@ fn ls_table_exposes_project_path_and_status() {
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
+        answerer_bound: false,
         resource_pool: None,
         sessions: vec![minimald_rpc::ListSessionsEntry {
             id: SessionId::nil(),
@@ -105,6 +108,7 @@ fn ls_table_exposes_project_path_and_status() {
             json: false,
         },
         &resp,
+        None,
     )
     .unwrap();
 
@@ -136,6 +140,7 @@ async fn ls_empty() {
             json: false,
         },
         &resp,
+        None,
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
@@ -157,6 +162,7 @@ async fn ls_raw_empty() {
             json: false,
         },
         &resp,
+        None,
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
@@ -181,6 +187,7 @@ async fn ls_json_empty() {
             json: true,
         },
         &resp,
+        None,
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
@@ -210,6 +217,7 @@ async fn ls_json_with_sessions() {
             json: true,
         },
         &resp,
+        None,
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
@@ -242,6 +250,7 @@ async fn ls_raw_with_sessions() {
             json: false,
         },
         &resp,
+        None,
     )
     .unwrap();
     let text = String::from_utf8(out).unwrap();
@@ -800,10 +809,11 @@ async fn session_policy_succeeds() {
 /// `min session policy` shows the effective egress rules (NET-061): the four
 /// egress fields the session was activated with, each unset dimension
 /// resolved to its default instead of a bare `null`. The policy is stored
-/// through the daemon and fetched the way the command fetches it;
-/// `format_policy` is the rendering the command prints. The same egress on a
-/// host-address box is still shown, but with no ingress block, and a none
-/// box shows no blocks at all — just the note the TUI shows in their place.
+/// through the daemon and fetched the way the command fetches it — the
+/// effective-policy RPC (NET-074) — and `format_policy` is the rendering the
+/// command prints. The same egress on a host-address box is still shown,
+/// but with no ingress block, and a none box shows no blocks at all — just
+/// the note the TUI shows in their place.
 #[tokio::test]
 async fn policy_shows_effective_egress() {
     let (daemon, args) = setup().await;
@@ -822,23 +832,25 @@ async fn policy_shows_effective_egress() {
     .await;
 
     let mut client = connect_daemon(&args).await.unwrap();
-    use minimald_rpc::{GetSessionPolicy, GetSessionPolicyRequest};
+    use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
     let resp = client
-        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(session_id))
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(session_id))
         .await
         .unwrap();
     let policy = match resp {
         minimald_rpc::Errorable::Ok(policy) => policy,
-        minimald_rpc::Errorable::Err { error } => panic!("GetSessionPolicy failed: {error}"),
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
     };
     assert_eq!(
         policy.egress,
-        Some(egress.clone()),
+        sessions::EffectiveEgress::Declared(egress.clone()),
         "the stored egress must survive the record round trip"
     );
 
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -870,15 +882,17 @@ async fn policy_shows_effective_egress() {
     )
     .await;
     let resp = client
-        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(host_id))
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(host_id))
         .await
         .unwrap();
     let policy = match resp {
         minimald_rpc::Errorable::Ok(policy) => policy,
-        minimald_rpc::Errorable::Err { error } => panic!("GetSessionPolicy failed: {error}"),
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
     };
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -901,20 +915,431 @@ async fn policy_shows_effective_egress() {
     )
     .await;
     let resp = client
-        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(none_id))
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(none_id))
         .await
         .unwrap();
     let policy = match resp {
         minimald_rpc::Errorable::Ok(policy) => policy,
-        minimald_rpc::Errorable::Err { error } => panic!("GetSessionPolicy failed: {error}"),
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
     };
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::NoNet).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::NoNet, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert_eq!(
         text, "No network policy (NoNet)\n",
         "a none session prints the note in place of both blocks:\n{text}"
     );
+}
+
+/// `min session policy` shows the default in force for a bare own-address
+/// box (NET-075): the deny-all egress the daemon's gate enforces once the
+/// default is in force (NET-074), rendered the way the command renders it —
+/// with the phase passed explicitly, because this build ships the default as
+/// announced (NET-076), so the deny-all rendering is proven against the
+/// in-force resolution the rollout ends at, while the wire reply is asserted
+/// against the phase this build ships. A declared section still reads as its
+/// own rules, and the default is scoped to own-address boxes — a bare
+/// host-address box keeps the shipped allow-all, because the deny-all is a
+/// gate on the session's own address, not on its host's namespace.
+#[tokio::test]
+async fn policy_shows_deny_all_default() {
+    let (daemon, args) = setup().await;
+    let bare_id = create_session_with_policy(
+        &daemon,
+        "bare-own-ip",
+        sessions::NetworkMode::OwnIp,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
+    let resp = client
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(bare_id))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
+    };
+    // Over the wire, the daemon answers the resolution the phase this build
+    // ships leaves in force — announced, so a bare box still allows all
+    // (NET-076), and the command's data path carries that answer.
+    assert_eq!(
+        policy.egress,
+        sessions::effective_egress(
+            None,
+            sessions::NetworkMode::OwnIp,
+            sessions::EGRESS_DEFAULT_PHASE,
+            false,
+        ),
+        "the daemon must answer the shipped phase's resolution for a bare box"
+    );
+
+    // The default's own posture, with the phase passed explicitly: once in
+    // force, a bare own-address box resolves to deny-all, and the command's
+    // renderer prints it as that — and nothing else.
+    let in_force = sessions::EffectiveSessionPolicy {
+        egress: sessions::effective_egress(
+            None,
+            sessions::NetworkMode::OwnIp,
+            sessions::EgressDefaultPhase::InForce,
+            false,
+        ),
+        ingress: None,
+    };
+    assert_eq!(
+        in_force.egress,
+        sessions::EffectiveEgress::DenyAll,
+        "the in-force default for a bare own-address box is deny-all"
+    );
+    let mut out = Vec::new();
+    format_policy(&mut out, &in_force, sessions::NetworkMode::OwnIp, None).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("egress\n  deny all\n"),
+        "a bare own-address box must print deny-all once in force:\n{text}"
+    );
+    assert!(
+        !text.contains("allow all"),
+        "deny-all must not also print the allow-all row:\n{text}"
+    );
+
+    // The strict policy is untouched: the box declared nothing, and the
+    // record still holds that absence — only the effective view carries the
+    // default. `min session policy` shows the effective rules; the strict
+    // shape stays what the session was activated with.
+    use minimald_rpc::{GetSessionPolicy, GetSessionPolicyRequest};
+    let strict = client
+        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Id(bare_id))
+        .await
+        .unwrap();
+    match strict {
+        minimald_rpc::Errorable::Ok(strict) => assert_eq!(
+            strict.egress, None,
+            "the stored policy must keep the absence the box declared"
+        ),
+        minimald_rpc::Errorable::Err { error } => panic!("GetSessionPolicy failed: {error}"),
+    }
+
+    // The default is scoped to own-address boxes (NET-074): a bare
+    // host-address session shares its host's namespace and the gate has no
+    // own address to hold, so it keeps the shipped allow-all.
+    let host_id = create_session_with_policy(
+        &daemon,
+        "bare-host-net",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+    let resp = client
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(host_id))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
+    };
+    assert_eq!(policy.egress, sessions::EffectiveEgress::AllowAll);
+    let mut out = Vec::new();
+    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet, None).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("egress\n  allow all\n"),
+        "a bare host-address box keeps the shipped allow-all:\n{text}"
+    );
+}
+
+/// `min session policy` shows the node-plane baseline set beside the box's
+/// rules (NET-130): the helper's built-in enumeration of the categories the
+/// in-VM daemon's own traffic may reach, one row per category, on an
+/// own-address box, headed by the posture the host-side gate decides the
+/// daemon's own fetches under — announced, the shipped posture, the run
+/// path's allow-all interim node row still decides those fetches, so the
+/// rows are what the set will bound, not what bounds them today; in force,
+/// it decides them whatever the box's own declaration resolves to. The set
+/// is shown where the fabric the helper gates is named — the microVM
+/// backend's plan — and nowhere it is not: a host-address box shares its
+/// host's namespace and has no switch fabric, and a backend with no
+/// host-side helper beside its switch (the native daemon's own per-daemon
+/// switch, a plan the reply does not carry) names no fabric either, so the
+/// block is left out there rather than printed from a plan the session does
+/// not attach to.
+#[test]
+fn policy_shows_baseline_set() {
+    // The deny-all resolution the rollout ends at (NET-075), rendered the
+    // way the command renders it: the box's own rules, and the helper's
+    // enumeration beside them — the microVM backend's fabric, the plan the
+    // helper's run path builds its registry and this set from.
+    let deny_all = sessions::EffectiveSessionPolicy {
+        egress: sessions::effective_egress(
+            None,
+            sessions::NetworkMode::OwnIp,
+            sessions::EgressDefaultPhase::InForce,
+            false,
+        ),
+        ingress: None,
+    };
+    let fabric = switch::SwitchSubnet::default();
+    let mut out = Vec::new();
+    format_policy(
+        &mut out,
+        &deny_all,
+        sessions::NetworkMode::OwnIp,
+        Some(fabric),
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("egress\n  deny all\n"),
+        "the box's own rules are shown:\n{text}"
+    );
+    // The posture is spelled beside the set, the way the daemon's start-up
+    // line spells it. The shipped posture is announced — the run path's
+    // allow-all interim node row still decides the daemon's own fetches — so
+    // the display must not present the rows as what bounds them. The flip of
+    // `NODE_BASELINE_PHASE` updates this assertion with the rest of the
+    // cutover.
+    assert!(
+        text.contains(
+            "node-plane baseline set (helper enumeration) — announced (node row's allow-all interim)"
+        ),
+        "the helper's baseline set is shown beside the box's rules, headed by the \
+         gate's announced posture:\n{text}"
+    );
+
+    // The rows are the enumeration the helper carries, one per category —
+    // the set the host-side gate decides the daemon's own frames by once the
+    // baseline is in force.
+    let baseline = minvmd::net::NodePlaneBaseline::built_in(fabric);
+    let rendered_baseline = baseline
+        .entries()
+        .iter()
+        .map(|entry| {
+            format!(
+                "  {}  {}",
+                entry.category().as_str(),
+                entry.endpoints().join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains(&rendered_baseline),
+        "the baseline rows are the enumeration's entries, one per category:\n{text}"
+    );
+    // Beside, not instead: the egress block comes first, the baseline set
+    // after it, the ingress block last.
+    let egress_at = text.find("egress").expect("the egress block renders");
+    let baseline_at = text
+        .find("node-plane baseline set")
+        .expect("the baseline set renders");
+    let ingress_at = text.find("ingress").expect("the ingress block renders");
+    assert!(
+        egress_at < baseline_at && baseline_at < ingress_at,
+        "the baseline set renders beside the rules, between egress and ingress:\n{text}"
+    );
+
+    // A host-address box has no switch fabric, so the baseline set has
+    // nothing to describe there — even with a fabric named.
+    let mut out = Vec::new();
+    format_policy(
+        &mut out,
+        &deny_all,
+        sessions::NetworkMode::HostNet,
+        Some(fabric),
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        !text.contains("node-plane baseline set"),
+        "a host-address box carries no baseline set:\n{text}"
+    );
+
+    // A backend with no helper beside its switch — the native daemon's own
+    // per-daemon switch, a plan the reply does not carry — names no fabric,
+    // and the set is left out rather than printed from the microVM plan the
+    // session does not attach to.
+    let mut out = Vec::new();
+    format_policy(&mut out, &deny_all, sessions::NetworkMode::OwnIp, None).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        !text.contains("node-plane baseline set"),
+        "an unnamed fabric carries no baseline set:\n{text}"
+    );
+}
+
+/// While the deny-all egress default is announced but not yet in force,
+/// `min session activate` prints the coming change (NET-076) — what turns
+/// for a bare own-address box, and how to keep the shipped default. Driven
+/// through the compiled binary so the assertion is on what the user actually
+/// sees; the phase this build ships is announced, so the notice is the
+/// shipped path, and its scoping is exercised with it: a bare own-address
+/// activate prints, a host-address one (a box the change does not reach)
+/// does not, and a daemon that opted out (NET-077 — a deployment the change
+/// is not coming for, and one that has already taken the remedy the notice
+/// names) is not announced at either. The other phase is gated by
+/// construction — once the default is in force the change is no longer
+/// coming, and the notice is `None`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn deny_all_announcement_printed() {
+    let (_daemon, args) = setup().await;
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+
+    // The shipped path: activating a bare own-address box succeeds and
+    // prints the notice — the change, its scope, and the way to keep the
+    // default.
+    let own_ip = run_min(
+        &args,
+        &[
+            "session",
+            "activate",
+            project.path().to_str().unwrap(),
+            "--name",
+            "notice-own-ip",
+            "--network",
+            "own_ip",
+            "--sync",
+            "tarball",
+            "--no-prompt",
+        ],
+    )
+    .await;
+    assert!(
+        own_ip.status.success(),
+        "activating a bare own-address box must succeed, but the binary \
+         exited {}:\n{}",
+        own_ip.status,
+        String::from_utf8_lossy(&own_ip.stderr),
+    );
+    let own_ip_stderr = String::from_utf8_lossy(&own_ip.stderr).into_owned();
+    assert!(
+        own_ip_stderr.contains("Heads-up: the next release denies all external reach"),
+        "activating a bare own-address box must print the coming change:\n{own_ip_stderr}"
+    );
+    assert!(
+        own_ip_stderr.contains("own-address"),
+        "the notice must scope the change to own-address sessions:\n{own_ip_stderr}"
+    );
+    assert!(
+        own_ip_stderr.contains("--egress-deny-all-opt-out"),
+        "the notice must say how to keep the shipped default:\n{own_ip_stderr}"
+    );
+
+    // Scoped to the boxes the change would reach: a host-address box
+    // shares its host's namespace and owns no address to deny from, so
+    // its activate announces nothing.
+    let host_net_stderr = run_min_stderr(
+        &args,
+        &[
+            "session",
+            "activate",
+            project.path().to_str().unwrap(),
+            "--name",
+            "notice-host-net",
+            "--network",
+            "host_ip",
+            "--sync",
+            "tarball",
+            "--no-prompt",
+        ],
+    )
+    .await;
+    assert!(
+        !host_net_stderr.contains("Heads-up"),
+        "a host-address box the change does not reach must not be announced \
+         at:\n{host_net_stderr}"
+    );
+
+    // And scoped to the daemons the change is coming for: an opted-out
+    // daemon (NET-077) has already chosen to keep the shipped default —
+    // the exact remedy this notice names — so announcing at it would tell
+    // it to do what it has done. The opt-out is the daemon's own fact, so
+    // this half runs against a second daemon started with the flag.
+    let (_opted_out, opted_out_args, _opted_out_dir) = setup_opted_out().await;
+    let opted_out = run_min(
+        &opted_out_args,
+        &[
+            "session",
+            "activate",
+            project.path().to_str().unwrap(),
+            "--name",
+            "notice-opted-out",
+            "--network",
+            "own_ip",
+            "--sync",
+            "tarball",
+            "--no-prompt",
+        ],
+    )
+    .await;
+    assert!(
+        opted_out.status.success(),
+        "activating a bare own-address box must still succeed on an opted-out \
+         daemon, but the binary exited {}:\n{}",
+        opted_out.status,
+        String::from_utf8_lossy(&opted_out.stderr),
+    );
+    let opted_out_stderr = String::from_utf8_lossy(&opted_out.stderr).into_owned();
+    assert!(
+        !opted_out_stderr.contains("Heads-up"),
+        "a daemon that has already taken the notice's remedy must not be \
+         told to take it:\n{opted_out_stderr}"
+    );
+
+    // The other phase, gated by construction: once the default is in
+    // force the change is no longer coming, and nothing prints.
+    assert!(
+        deny_all_default_notice(sessions::EgressDefaultPhase::InForce).is_none(),
+        "the notice must not print once the default is in force"
+    );
+}
+
+/// [`setup`] on a daemon that opted out of the deny-all egress default
+/// (NET-077): the same UDS-listening harness server, but one whose boxes
+/// with no `egress` section keep the shipped allow-all. Only the
+/// announcement test needs a daemon with the other rollout posture, so the
+/// builder stays here beside it rather than in the shared harness.
+///
+/// The caller must keep both returned values alive for as long as it talks
+/// to the daemon: the server owns the daemon's state, the tempdir the
+/// socket path lives in.
+#[cfg(target_os = "linux")]
+async fn setup_opted_out() -> (
+    minimald::test_harness::TestServer,
+    GlobalArgs,
+    tempfile::TempDir,
+) {
+    let server = minimald::test_harness::TestServer::new_opted_out_in(
+        tempfile::TempDir::new().expect("the harness's tempdir for the opted-out daemon"),
+    )
+    .await;
+    let temp = tempfile::TempDir::new().expect("a tempdir for the client side of the test");
+    let sock_dir = temp.path().join("providers/local-minimald0");
+    std::fs::create_dir_all(&sock_dir).expect("the provider socket dir is a fresh tempdir path");
+    server.listen_on_uds(&sock_dir.join("ssh.sock")).await;
+    let args = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(temp.path().to_path_buf()),
+        config_dir: None,
+        provider: None,
+        no_input: false,
+        vm: None,
+    };
+    (server, args, temp)
 }
 
 // --- hostname routing warning (NET-020/NET-021/NET-022) ---
@@ -927,7 +1352,8 @@ async fn policy_shows_effective_egress() {
 /// Runs the compiled `min` with the harness daemon's `--minimal-dir`, an empty
 /// `--config-dir` (the developer's own loadouts and policy stay out of the
 /// run), and `--no-input`, plus `extra` as the command, and returns its
-/// captured output.
+/// captured output. The tempdir holding that `--config-dir` lives until the
+/// function returns, so it outlives the child it is spelled into.
 #[cfg(target_os = "linux")]
 async fn run_min(args: &GlobalArgs, extra: &[&str]) -> std::process::Output {
     let minimal_dir = args
@@ -935,11 +1361,13 @@ async fn run_min(args: &GlobalArgs, extra: &[&str]) -> std::process::Output {
         .as_ref()
         .expect("setup points at a tempdir");
     let config_dir = tempfile::TempDir::new().unwrap();
-    tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"));
+    command
         .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
         .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
         .arg("--no-input")
-        .args(extra)
+        .args(extra);
+    command
         .output()
         .await
         .expect("the min binary should be invocable")
@@ -1186,6 +1614,196 @@ async fn min_prints_discovered_proxy_port() {
     );
 }
 
+/// NET-018: `min ls` and `min session activate` report which surface a
+/// `*.min.internal` name resolves through, decided in the one function both
+/// verbs share — the three facts: this host's resolver hook routing the
+/// zone to the answerer (with no stub-bypass blocker making that hook
+/// configuration no host process consults), the daemon's answerer bound,
+/// and the reserved local range present on this host's loopback. With the
+/// answerer bound and no hook (this host), both verbs must name the
+/// *proxy* as the live surface and print the NET-122 advisory beside it;
+/// with the hook and the range present too, the same decision says native
+/// and the advisory goes quiet.
+///
+/// The daemon's half is brought up the way its start path brings it — the
+/// proxy and the answerer driven to serving on OS-selected ports — and the
+/// reply is checked first, as the field, not as the wording. The native arm
+/// cannot be driven through the binary hermetically: the blocker reads
+/// `/etc/resolv.conf` and the `hosts:` chain directly, host files no PATH
+/// stand-in can stand in for, so what a stand-in `resolvectl` proves
+/// depends on the host it runs on. The decision is pure, so its table —
+/// the native arm, and the dead-hook case that must not print native on a
+/// hook no host process consults — lives beside the function in
+/// `resolver`'s tests, where every arm runs on every host. `resolver`'s own
+/// Linux test `activate_and_ls_report_native_surface_verdict_on_host` runs
+/// the positive arm against a real host loopback, where the range always
+/// reads present, and shares this test's name so the verify line runs both.
+///
+/// The positive arm's *words* run here as the in-process arm: the binary
+/// cannot reach them on this host, because the verdict reads the host's own
+/// resolver files, which no test may rewrite — so the native verdict is fed
+/// straight to the formatter `cmd_ls` prints from, over this daemon's live
+/// reply, and what a host whose three facts all hold is told is asserted
+/// all the same.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn activate_and_ls_report_native_surface() {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use minimald::server::{
+        RetryBackoff, retry_hostname_proxy_until_serving, retry_zone_answerer_until_serving,
+    };
+    use minimald_rpc::ListSessions;
+
+    let (daemon, args) = setup().await;
+    let compressed = RetryBackoff::new(
+        std::time::Duration::from_millis(5),
+        std::time::Duration::from_millis(40),
+    );
+    tokio::join!(
+        retry_hostname_proxy_until_serving(
+            daemon.server.state.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            compressed,
+        ),
+        retry_zone_answerer_until_serving(
+            daemon.server.state.clone(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            compressed,
+        ),
+    );
+
+    // The daemon's half, deployed and reported: the reply says the answerer
+    // is bound — the one fact that is the daemon's to know — and carries
+    // the port the proxy's half of the line names, and the port a hook
+    // would have to route to.
+    let mut client = connect_daemon(&args).await.unwrap();
+    let resp = client.oneshot_rpc::<ListSessions>(()).await.unwrap();
+    let port = resp
+        .hostname_proxy_port
+        .expect("the proxy must report the port it landed on");
+    let _answerer_port = resp
+        .zone_answerer_port
+        .expect("the answerer must report the port it landed on");
+    assert!(
+        resp.answerer_bound,
+        "a daemon whose answerer serves reports it bound"
+    );
+
+    // The host's half, absent: NET-018's WHERE is the host's — a daemon
+    // inside a VM-backed host's guest cannot speak for the host's resolver,
+    // and this host's own reads say nothing routes the zone to the answerer
+    // — so both verbs name the proxy as the live surface, with where it
+    // serves, and neither prints the native words.
+    let out = run_min(&args, &["ls"]).await;
+    let ls_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        ls_stdout.contains("NAME SURFACE:    the hostname proxy is the live name surface"),
+        "`min ls` must report the proxy as the live surface on a hook-less host, got: {ls_stdout}"
+    );
+    assert!(
+        ls_stdout.contains(&format!("routes through it on 127.0.0.1:{port}")),
+        "the surface line must name where the proxy serves: {ls_stdout}"
+    );
+    assert!(
+        !ls_stdout.contains("native DNS is the live name surface"),
+        "a host with no hook must not be told native DNS is live: {ls_stdout}"
+    );
+
+    // `min session activate`, at the moment the user is about to rely on the
+    // names — and before the upload and the loadout, so the line is not lost
+    // above a failed activate's output. The advisory rides beside the line
+    // (NET-122): this host cannot resolve the zone natively, so the session
+    // start must say what is missing — the exact command to run, or the
+    // host fact that makes one dead — and never a prompt.
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+    let activate_stderr = run_min_stderr(
+        &args,
+        &[
+            "session",
+            "activate",
+            project.path().to_str().unwrap(),
+            "--name",
+            "native-surface",
+            "--sync",
+            "tarball",
+            "--no-prompt",
+        ],
+    )
+    .await;
+    assert!(
+        activate_stderr.contains("the hostname proxy is the live name surface"),
+        "activate must report the proxy as the live surface on a hook-less host, got: {activate_stderr}"
+    );
+    assert!(
+        activate_stderr.contains(&format!("routes through it on 127.0.0.1:{port}")),
+        "activate's line must name where the proxy serves: {activate_stderr}"
+    );
+    assert!(
+        !activate_stderr.contains("native DNS is the live name surface"),
+        "a host with no hook must not be told native DNS is live: {activate_stderr}"
+    );
+    assert!(
+        activate_stderr.contains("note:"),
+        "activate must print the naming advisory beside the surface line, got: {activate_stderr}"
+    );
+    assert!(
+        activate_stderr.contains("Configure the host's resolver for the zone")
+            || activate_stderr.contains("bypass systemd-resolved"),
+        "the advisory names what is missing — the command to run, or the host fact that \
+         makes one dead: {activate_stderr}"
+    );
+
+    // The positive arm, in process (see the test's doc): the native verdict
+    // fed to the formatter `cmd_ls` prints through, over this daemon's live
+    // reply — which carries the real proxy port the line's second half
+    // names. A host whose three facts all hold is told native DNS is the
+    // live surface, the proxy's half stays beside it (NET-019), and the
+    // NET-122 advisory a native host no longer needs does not ride it.
+    let mut native_out = Vec::new();
+    format_ls(
+        &mut native_out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+        Some(resolver::LiveSurface::Native),
+    )
+    .unwrap();
+    let native_ls = String::from_utf8(native_out).unwrap();
+    assert!(
+        native_ls.contains("NAME SURFACE:    native DNS is the live name surface"),
+        "`min ls` must say native DNS is the live surface when the three facts hold, got: \
+         {native_ls}"
+    );
+    assert!(
+        native_ls.contains(&format!(
+            "the hostname proxy still serves on 127.0.0.1:{port}"
+        )),
+        "the native arm keeps the proxy's half beside it (NET-019): {native_ls}"
+    );
+    assert!(
+        !native_ls.contains("note:") && !native_ls.contains("Configure the host's resolver"),
+        "a host the verdict calls native is a configured one: no advisory rides its list, \
+         got: {native_ls}"
+    );
+    // And the words are activate's: one function renders the line for both
+    // verbs, so the native words `min ls` printed are the words the session
+    // start prints at the moment the user relies on the names.
+    let activate_words = resolver::name_surface_line(resolver::LiveSurface::Native, Some(port));
+    assert!(
+        native_ls.contains(&activate_words),
+        "`min ls` and activate print the same native words: {native_ls} vs {activate_words}"
+    );
+}
+
 // --- retired surfaces (NET-109 / NET-110) ---
 
 /// No build of the daemon carries the retired mTLS reverse proxy, its
@@ -1292,6 +1910,7 @@ fn session_list_decodes_without_mtls_field() {
         hostname_routing_unavailable: None,
         hostname_proxy_port: None,
         zone_answerer_port: None,
+        answerer_bound: false,
         resource_pool: None,
         sessions: vec![],
     };
@@ -1331,6 +1950,7 @@ async fn create_pending_session(daemon: &common::TestDaemon, name: &str) -> Sess
         project_path: paths::HostAbsPath::try_new(project_path).unwrap(),
         network: sessions::NetworkMode::NoNet,
         policy: Default::default(),
+        box_addresses: None,
         hooks_enabled: true,
         attrs: Default::default(),
     };
@@ -1404,6 +2024,7 @@ async fn create_session_with(
         project_path,
         network,
         policy,
+        box_addresses: None,
         hooks_enabled: true,
         attrs: Default::default(),
     };
@@ -1705,4 +2326,86 @@ async fn net_forward_closes_with_session() {
         .expect("the forward task must not panic")
         .expect("the forward must exit cleanly");
     echo.abort();
+}
+
+// --- task run stdin pipe (gominimal/inbox#746) ---
+
+/// `min task run` must exit once the task exits, even when its stdin is a
+/// pipe whose writer stays open. The old bridge pumped stdin through
+/// `tokio::io::stdin()`, a blocking `read(0)` parked on tokio's blocking
+/// pool that `pump.abort()` cannot interrupt — so a held-open pipe kept the
+/// runtime alive forever after the task's exit status arrived. Driven
+/// through the compiled binary with the write end deliberately held open,
+/// so the assertion is on the process actually terminating.
+///
+/// Linux-only for the same reason as [`run_min`]: the spawned binary resolves
+/// the native `local-minimald` provider socket, which the harness daemon
+/// serves on a UDS; macOS resolves `local-minvmd` instead.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn task_run_exits_with_held_open_stdin_pipe() {
+    let (_daemon, args) = setup().await;
+    let minimal_dir = args
+        .minimal_dir
+        .as_ref()
+        .expect("setup points at a tempdir");
+
+    // A VCS root so the headless upload gate passes, and a declared echo
+    // task that exits on its own without reading stdin.
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "[tasks.e2e-echo]\necho = \"TASK_RUN_STDIN_OK\"\n",
+    )
+    .unwrap();
+
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["-C".as_ref(), project.path().as_os_str()])
+        .args(["task", "run", "e2e-echo"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the min binary should be invocable");
+
+    // Hold the write end open for the whole run: this is the pipe whose
+    // writer "stays open" in the report. Dropping it would EOF the child's
+    // stdin and mask the hang.
+    let _held_stdin = child.stdin.take().expect("stdin is piped");
+
+    let status = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait())
+        .await
+        .expect("min task run must exit even though its stdin pipe stays open")
+        .expect("waiting for min task run");
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(
+        &mut child.stdout.take().expect("stdout is piped"),
+        &mut stdout,
+    )
+    .await
+    .unwrap();
+    tokio::io::AsyncReadExt::read_to_end(
+        &mut child.stderr.take().expect("stderr is piped"),
+        &mut stderr,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        status.success(),
+        "task run must exit 0: stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&stdout).contains("TASK_RUN_STDIN_OK"),
+        "task output must stream back: stdout={}",
+        String::from_utf8_lossy(&stdout)
+    );
 }

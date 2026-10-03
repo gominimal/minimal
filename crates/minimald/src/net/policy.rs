@@ -98,16 +98,29 @@ fn protocol_str(proto: IpProto) -> &'static str {
 }
 
 /// Builds the [`ExposeRequest`] that forwards `mapping`'s host-side
-/// `external_port` to `ptask_ip:internal_port` on the switch.
+/// `external_port` — published at `published`, the host loopback address the
+/// box's declaration is published on (NET-010) — to `ptask_ip:internal_port`
+/// on the switch.
 ///
-/// The `local` host is `127.0.0.1` so the forward binds host loopback only: a
-/// process *on the host* reaches the port (R2.3), while the spec's "no external
-/// exposure by default" keeps it off the LAN. The `remote` targets the PTask's
-/// allocated switch address.
+/// The `local` host is a loopback address so the forward binds host loopback
+/// only: a process *on the host* reaches the port (R2.3), while the spec's "no
+/// external exposure by default" keeps it off the LAN. It is the box's **own**
+/// address, not `127.0.0.1`, wherever the reserved local range gave it one, so
+/// two boxes naming the same port both publish — on their own addresses, at
+/// their own port numbers (NET-010). A box that shares an address with another
+/// and names a port it names too collides there; the collision is intrinsic to
+/// the mode, so it is *reported* by the registry's publish — never translated
+/// away here: neither port number is remapped (NET-129).
+///
+/// The `remote` targets the PTask's allocated switch address.
 #[must_use]
-pub fn expose_request(mapping: &PortMapping, ptask_ip: Ipv4Addr) -> ExposeRequest {
+pub fn expose_request(
+    mapping: &PortMapping,
+    published: Ipv4Addr,
+    ptask_ip: Ipv4Addr,
+) -> ExposeRequest {
     ExposeRequest {
-        local: format!("127.0.0.1:{}", mapping.external_port),
+        local: format!("{published}:{}", mapping.external_port),
         remote: format!("{ptask_ip}:{}", mapping.internal_port),
         protocol: protocol_str(mapping.proto).to_string(),
     }
@@ -121,8 +134,31 @@ pub struct ExposedMapping {
     protocol: String,
 }
 
+impl ExposedMapping {
+    /// The `host:port` the forward is bound on — the address the switch is
+    /// actually holding, spelled exactly as its expose request named it. A
+    /// caller reporting a publish (the per-mapping info line in
+    /// `finish_own_ip_attach`) reads this instead of re-deriving the address
+    /// from the request, so the report cannot claim a host a forward is not
+    /// published on.
+    #[must_use]
+    pub fn local(&self) -> &str {
+        &self.local
+    }
+
+    /// [`Self::local`] split into the host address and port to report. `None`
+    /// when `local` is not a `host:port` pair with a numeric port — a shape
+    /// [`expose_request`], its only builder, never produces.
+    #[must_use]
+    pub fn host_port(&self) -> Option<(&str, u16)> {
+        let (host, port) = self.local.rsplit_once(':')?;
+        Some((host, port.parse().ok()?))
+    }
+}
+
 /// Exposes every static port mapping in `ingress` on the switch's `control_sock`
-/// forwarding to `ptask_ip`, returning a handle per exposed forward for teardown
+/// at `published` — the box's own host loopback address (NET-010) — forwarding
+/// to `ptask_ip`, returning a handle per exposed forward for teardown
 /// (R2.3, R2.4-static). The dynamic range, if any, is not applied here — dynamic
 /// port-mapping is split to #553.
 ///
@@ -135,12 +171,13 @@ pub struct ExposedMapping {
 /// Returns the I/O error from the first failing `expose` call (after rollback).
 pub async fn apply_ingress(
     control: &ControlChannel,
+    published: Ipv4Addr,
     ptask_ip: Ipv4Addr,
     ingress: &IngressPolicy,
 ) -> io::Result<Vec<ExposedMapping>> {
     let mut exposed: Vec<ExposedMapping> = Vec::with_capacity(ingress.port_mappings.len());
     for mapping in &ingress.port_mappings {
-        let req = expose_request(mapping, ptask_ip);
+        let req = expose_request(mapping, published, ptask_ip);
         match post_json(control, "/services/forwarder/expose", &req).await {
             Ok(()) => exposed.push(ExposedMapping {
                 local: req.local,
@@ -175,6 +212,118 @@ pub async fn remove_ingress(control: &ControlChannel, exposed: &[ExposedMapping]
             );
         }
     }
+}
+
+/// NET-123's bind probe, conducted through the forwarder that will publish:
+/// the same whole-range walk as the local bind probe in `switch::loopback`,
+/// one [`ExposeRequest`] per address of the reserved local range, each
+/// released by its unexpose the moment it answers, classified exactly as the
+/// local probe classifies its binds — every address bound reads the range
+/// present; the first refusal names the first missing alias; anything that
+/// is not a bind — a refused request, a stall, an unreachable control
+/// channel — reads absent, never present.
+///
+/// Why a second probe beside the local one: an own-address box's declared
+/// ports are bound by the **forwarder**, not by the daemon. On a native host
+/// the daemon spawns that forwarder itself, so its own loopback is the
+/// publish surface and the local probe is the honest one. On a microVM host
+/// the forwarder is the host gvproxy `minvmd` owns, so the publish surface is
+/// the *host's* loopback — a machine the daemon inside the guest cannot see,
+/// and whose verdict its own `lo` would lie about, since a Linux guest
+/// carries the whole `127/8` regardless of what the host carries. The only
+/// thing that can measure a bind there is the bind itself, so the probe rides
+/// the same control channel the publishes ride and asks the forwarder to do
+/// the binding.
+///
+/// Side-effect-free in the same sense the local probe is: every round ends
+/// with the unexpose that releases it, and the probe accepts no connection,
+/// so its `remote` — never dialed — is a placeholder. Only the host's
+/// loopback is asked anything, and only whether an address binds.
+pub(crate) async fn probe_publish_surface(
+    control: &ControlChannel,
+) -> ::switch::loopback::RangeProbe {
+    probe_publish_surface_within(control, RANGE_PROBE_BUDGET, RANGE_PROBE_REQUEST_BUDGET).await
+}
+
+/// [`probe_publish_surface`] with the walk's two budgets injected, so the
+/// overrun arm and the stalled-round arm are testable at numbers a test can
+/// afford: `budget` bounds the whole walk, `request` one request/response
+/// round of it.
+async fn probe_publish_surface_within(
+    control: &ControlChannel,
+    budget: Duration,
+    request: Duration,
+) -> ::switch::loopback::RangeProbe {
+    let mut probe = ::switch::loopback::RangeProbe::failed_to_run();
+    let hosts: Vec<Ipv4Addr> = ::switch::loopback::range_hosts().collect();
+    let walk = tokio::time::timeout(budget, async {
+        for address in &hosts {
+            probe.probed += 1;
+            let expose = ExposeRequest {
+                local: format!("{address}:{RANGE_PROBE_PORT}"),
+                remote: format!("{}:1", Ipv4Addr::LOCALHOST),
+                protocol: "tcp".to_string(),
+            };
+            match post_json_within(control, "/services/forwarder/expose", &expose, request).await {
+                Ok(()) => {
+                    probe.bound += 1;
+                    let unexpose = UnexposeRequest {
+                        local: expose.local,
+                        protocol: expose.protocol,
+                    };
+                    if let Err(error) = post_json_within(
+                        control,
+                        "/services/forwarder/unexpose",
+                        &unexpose,
+                        request,
+                    )
+                    .await
+                    {
+                        // Best-effort, like teardown's: a probe round left
+                        // bound holds one obscure port at one address, while
+                        // a walk that stopped here would leave the range
+                        // unread — the worse leak by far.
+                        tracing::warn!(
+                            local = %unexpose.local,
+                            error = %error,
+                            "releasing the loopback range probe's forwarder bind failed",
+                        );
+                    }
+                }
+                Err(error) => {
+                    probe.first_failure.get_or_insert((*address, error.kind()));
+                    if error.kind() == io::ErrorKind::TimedOut {
+                        // A control channel that does not answer is not a
+                        // fact about the host's loopback at all, so the walk
+                        // stops rather than spend the rest of its budget
+                        // re-asking a dead one. The verdict is fixed either
+                        // way: this round never bound, and one missing
+                        // address is the whole range's answer.
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    if walk.is_err() && probe.probed < hosts.len() {
+        // The walk outran its budget mid-range: read it as the local probe
+        // reads a partial alias set, never as present. Widening the probed
+        // count to the whole range makes `present` demand every address it
+        // never reached, and the address whose round the budget expired
+        // inside is named as the record's first failure — where the vouching
+        // stopped.
+        let stuck = hosts
+            .get(probe.probed.saturating_sub(1))
+            .copied()
+            .or_else(|| hosts.first().copied())
+            .expect("the reserved range's usable-host list is never empty");
+        probe.probed = hosts.len();
+        probe
+            .first_failure
+            .get_or_insert((stuck, io::ErrorKind::TimedOut));
+    }
+    probe
 }
 
 /// A gvproxy DNS zone-add request body for `POST /services/dns/add`
@@ -261,6 +410,20 @@ pub(crate) async fn post_json<T: Serialize>(
     path: &str,
     body: &T,
 ) -> io::Result<()> {
+    post_json_within(control, path, body, GVPROXY_CONTROL_TIMEOUT).await
+}
+
+/// [`post_json`] with the exchange's bound injected: the publish verbs run at
+/// [`GVPROXY_CONTROL_TIMEOUT`], while the range probe's walk runs at its own
+/// tighter [`RANGE_PROBE_REQUEST_BUDGET`] — one round per address of the range
+/// is not a launch-path request to a live box, and a channel that cannot answer
+/// one round in that bound is not a fact about the host's loopback either way.
+pub(crate) async fn post_json_within<T: Serialize>(
+    control: &ControlChannel,
+    path: &str,
+    body: &T,
+    timeout: Duration,
+) -> io::Result<()> {
     let body = serde_json_lenient::to_vec(body).map_err(io::Error::other)?;
     let mut request = Vec::with_capacity(128 + body.len());
     // HTTP/1.1 keep-alive (no `Connection: close`): gvproxy must respond *without*
@@ -281,7 +444,7 @@ pub(crate) async fn post_json<T: Serialize>(
     // stalls must not hang the launch or teardown path indefinitely. The control
     // socket is local (DM2) or the host gvproxy over vsock (DM1/3/4); both speak
     // the same HTTP/1.0 request/response on a fresh connection.
-    let response = tokio::time::timeout(GVPROXY_CONTROL_TIMEOUT, async {
+    let response = tokio::time::timeout(timeout, async {
         match control {
             ControlChannel::Unix(sock) => {
                 exchange(UnixStream::connect(sock).await?, &request).await
@@ -296,7 +459,7 @@ pub(crate) async fn post_json<T: Serialize>(
     .map_err(|_| {
         io::Error::new(
             io::ErrorKind::TimedOut,
-            format!("gvproxy {path} control request timed out after {GVPROXY_CONTROL_TIMEOUT:?}"),
+            format!("gvproxy {path} control request timed out after {timeout:?}"),
         )
     })??;
 
@@ -428,6 +591,36 @@ const GVPROXY_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 /// streams without closing inside the [`GVPROXY_CONTROL_TIMEOUT`] window.
 const MAX_CONTROL_RESPONSE: u64 = 64 * 1024;
 
+/// The port the forwarder-conducted range probe binds each address of the
+/// reserved local range at while asking the host whether the range is
+/// publishable (NET-123): fixed and deliberately obscure, so no box's
+/// declaration is likely to name it, and released by the unexpose that ends
+/// each probe round before the next address takes it. Exactly one daemon
+/// probes a given forwarder — the one that publishes through it, and a host
+/// gvproxy has one of those (the second-daemon-on-a-host shape is native,
+/// where the local bind probe runs instead) — so no concurrent walk can
+/// collide on it.
+const RANGE_PROBE_PORT: u16 = 21064;
+
+/// Upper bound on the whole forwarder-conducted range walk — the backstop for
+/// the one pathology the per-request [`GVPROXY_CONTROL_TIMEOUT`] cannot
+/// price: a forwarder that keeps answering, but slowly, once per address
+/// across the range. A walk that outruns it is read exactly as it stopped:
+/// the addresses it never reached are the ones it cannot vouch for, so the
+/// range reads absent, the interim.
+const RANGE_PROBE_BUDGET: Duration = Duration::from_secs(20);
+
+/// Upper bound on **one** request/response round of the forwarder-conducted
+/// range walk — tighter than the [`GVPROXY_CONTROL_TIMEOUT`] the publish verbs
+/// run under, because the probe is a walk, two rounds per address of the range
+/// on one channel, and a round that does not answer inside this bound is a
+/// channel with no fact to give about the host's loopback: the walk stops there
+/// and the range reads absent, the interim. A forwarder that answers at all
+/// answers in milliseconds — a bind and its release — so the bound costs a live
+/// host nothing, while a stalled one is read for what it is a second rather
+/// than after the publish verbs' five.
+const RANGE_PROBE_REQUEST_BUDGET: Duration = Duration::from_secs(1);
+
 /// Minimum gap between emitted policy-violation warnings: one minute, matching
 /// R2.2's "first drop per PTask per rule per minute" rate-limit window, so a
 /// flood of dropped frames cannot spam the log.
@@ -527,7 +720,10 @@ impl fmt::Display for Proto {
 /// single drop, and a box hitting several rules in the same minute is still
 /// heard once per rule. The relay's egress enforcement
 /// ([`switch`](super::switch)) and its ingress counterpart share one limiter
-/// per session gate, each under its own rule key.
+/// per session gate, each under its own rule key — with the one exception
+/// that a DNS refusal adds the refused name to its key
+/// ([`warn_dns_refusal`](Self::warn_dns_refusal)), because its requirement
+/// is the name and the answer per refusal.
 #[derive(Debug, Default)]
 pub struct PolicyWarnLimiter {
     last: Mutex<HashMap<String, HashMap<String, Instant>>>,
@@ -598,6 +794,40 @@ impl PolicyWarnLimiter {
             false
         }
     }
+
+    /// Emits a rate-limited `tracing::warn!` for a DNS answer the rebinding
+    /// intersection refused (NET-067): an address a name the box's policy
+    /// allowed resolved into the box's `deny_subnets` or the infrastructure
+    /// deny set, and so is never admitted — the name and the answer, the two
+    /// things the spec requires the refusal to carry.
+    ///
+    /// Rate-limited per **box, name and rule**, not per box and rule like
+    /// [`warn`](Self::warn): the requirement is the name and the answer per
+    /// refusal, so a second refused name inside the interval is its own line
+    /// rather than silenced by the first's, while a burst of the *same*
+    /// name's refusals stays one line per rule. The limiter's key is built
+    /// from both, and the `rule_matched` field it logs is the rule alone.
+    pub fn warn_dns_refusal(
+        &self,
+        session_id: &str,
+        name: &str,
+        answer: Ipv4Addr,
+        rule_matched: &str,
+    ) -> bool {
+        let key = format!("{rule_matched}:{name}");
+        if self.should_warn_at(session_id, &key, Instant::now()) {
+            tracing::warn!(
+                session_id,
+                name,
+                %answer,
+                rule_matched,
+                "an allowed name resolved into a refused range"
+            );
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -622,14 +852,16 @@ mod tests {
     #[test]
     fn expose_request_maps_host_port_to_ptask_ip() {
         // R2.3/R2.4-static: external_port forwards to the PTask's switch IP on
-        // internal_port; the local host is loopback so only the host can connect.
+        // internal_port; the local host is the box's own loopback address
+        // (NET-010) so only the host can connect.
         let mapping = PortMapping {
             external_port: 18080,
             internal_port: 80,
             proto: IpProto::Tcp,
         };
-        let req = expose_request(&mapping, Ipv4Addr::new(100, 64, 0, 2));
-        assert_eq!(req.local, "127.0.0.1:18080");
+        let published = Ipv4Addr::new(127, 0, 64, 9);
+        let req = expose_request(&mapping, published, Ipv4Addr::new(100, 64, 0, 2));
+        assert_eq!(req.local, "127.0.64.9:18080");
         assert_eq!(req.remote, "100.64.0.2:80");
         assert_eq!(req.protocol, "tcp");
     }
@@ -641,7 +873,9 @@ mod tests {
             internal_port: 53,
             proto: IpProto::Udp,
         };
-        let req = expose_request(&mapping, Ipv4Addr::new(100, 64, 0, 7));
+        // A box with no address of its own publishes on the node's shared
+        // one, still at its own port numbers (NET-123's interim, NET-129).
+        let req = expose_request(&mapping, Ipv4Addr::LOCALHOST, Ipv4Addr::new(100, 64, 0, 7));
         let json = serde_json_lenient::to_string(&req).unwrap();
         assert!(json.contains("\"local\":\"127.0.0.1:5353\""), "got: {json}");
         assert!(json.contains("\"remote\":\"100.64.0.7:53\""), "got: {json}");
@@ -780,5 +1014,393 @@ mod tests {
         assert_eq!(parse_status_code(&resp).unwrap(), 200);
         assert_eq!(body_after_headers(&resp), b"WEB_OK");
         drop(server.await.unwrap());
+    }
+
+    // ---- NET-123's forwarder-conducted range probe -----------------------
+    mod forwarder_probe {
+        use std::collections::HashMap;
+        use std::io;
+        use std::net::Ipv4Addr;
+        use std::path::PathBuf;
+        use std::time::Duration;
+
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::{UnixListener, UnixStream};
+        use tokio::sync::mpsc;
+
+        use super::super::{
+            ControlChannel, GVPROXY_CONTROL_TIMEOUT, RANGE_PROBE_BUDGET, RANGE_PROBE_PORT,
+            RANGE_PROBE_REQUEST_BUDGET, UnexposeRequest, post_json, probe_publish_surface,
+            probe_publish_surface_within,
+        };
+
+        /// Reads one control request off `sock`: its head up to the
+        /// end-of-head marker, then exactly its `Content-Length` body — the
+        /// mirror of `post_json`'s keep-alive framing, so the fake forwarder
+        /// never blocks reading past what the probe sent.
+        async fn read_request(sock: &mut UnixStream) -> Vec<u8> {
+            let mut buf = Vec::with_capacity(256);
+            let mut scratch = [0u8; 512];
+            let head_end = loop {
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4) {
+                    break i;
+                }
+                let n = sock
+                    .read(&mut scratch)
+                    .await
+                    .expect("the fake forwarder must receive the request head");
+                assert!(n > 0, "the probe closed before sending its head");
+                buf.extend_from_slice(&scratch[..n]);
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+            let len: usize = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            while buf.len() < head_end + len {
+                let n = sock
+                    .read(&mut scratch)
+                    .await
+                    .expect("the fake forwarder must receive the request body");
+                assert!(n > 0, "the probe closed mid-body");
+                buf.extend_from_slice(&scratch[..n]);
+            }
+            buf[head_end..head_end + len].to_vec()
+        }
+
+        /// The `local` address a request body names, for the decide closure.
+        fn local_of(body: &[u8]) -> String {
+            let text = String::from_utf8_lossy(body);
+            text.split("\"local\":\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or_default()
+                .to_string()
+        }
+
+        /// Serves a gvproxy-shaped control channel at `path`: every request
+        /// is read in full, then answered with the status `decide` picks for
+        /// the `local` address its body names — the stand-in for the host
+        /// gvproxy whose loopback carries only the aliases `decide` accepts,
+        /// where a bind on a missing alias is answered `500` the way the real
+        /// forwarder answers an `EADDRNOTAVAIL`. `delay` parks each answer,
+        /// for the one test that needs a forwarder slower than its budget.
+        /// Every round's `local` is handed to the returned receiver; the
+        /// returned handle aborts the server when the test is done with it.
+        fn spawn_forwarder_answering(
+            path: PathBuf,
+            delay: Duration,
+            decide: impl Fn(&str) -> u16 + Send + Sync + 'static,
+        ) -> (tokio::task::JoinHandle<()>, mpsc::Receiver<String>) {
+            let listener = UnixListener::bind(&path).unwrap();
+            let (tx, rx) = mpsc::channel(512);
+            let decide = std::sync::Arc::new(decide);
+            let handle = tokio::spawn(async move {
+                // Sequential on purpose: the probe is a walk, one request per
+                // address, so one connection served at a time is its shape.
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let body = read_request(&mut sock).await;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let local = local_of(&body);
+                    let status = decide(&local);
+                    let reason = if status == 200 {
+                        "OK"
+                    } else {
+                        "Internal Server Error"
+                    };
+                    sock.write_all(
+                        format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n")
+                            .as_bytes(),
+                    )
+                    .await
+                    .expect("the fake forwarder must answer");
+                    if tx.send(local).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            (handle, rx)
+        }
+
+        /// A host gvproxy that binds every address of the reserved range —
+        /// the Linux host of the KVM lane, whose `lo` owns all of `127/8` —
+        /// so the daemon behind it reads the range present and grants
+        /// per-box addresses: the whole range walked, every round released
+        /// behind the walk, every address asked at the probe's fixed port.
+        #[tokio::test]
+        async fn reads_the_range_present_when_every_expose_binds() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let (forwarder, mut asked) =
+                spawn_forwarder_answering(sock.clone(), Duration::ZERO, |_| 200);
+            let probe = probe_publish_surface(&ControlChannel::Unix(sock)).await;
+            forwarder.abort();
+
+            assert_eq!(
+                probe.probed,
+                254,
+                "the walk covers every usable host: {}",
+                probe.summary()
+            );
+            assert!(
+                probe.present(),
+                "a forwarder that binds every address vouches for the range: {}",
+                probe.summary()
+            );
+            assert_eq!(probe.first_failure, None);
+            assert_eq!(probe.surface(), "reserved-range");
+
+            // One expose and one unexpose per address: the bind is released
+            // the moment it answers, so the probe leaves nothing bound.
+            let mut rounds: HashMap<String, usize> = HashMap::new();
+            let mut requests = 0usize;
+            while let Some(local) = asked.recv().await {
+                requests += 1;
+                *rounds.entry(local).or_default() += 1;
+            }
+            assert_eq!(
+                rounds.len(),
+                254,
+                "every address of the range was asked, at the probe port: {requests} requests"
+            );
+            assert!(
+                rounds.values().all(|&seen| seen == 2),
+                "every bound round was released by its unexpose: {rounds:?}"
+            );
+            let round = |addr: std::net::Ipv4Addr| format!("{addr}:{RANGE_PROBE_PORT}");
+            assert_eq!(rounds.get(&round(Ipv4Addr::new(127, 0, 64, 1))), Some(&2));
+            assert_eq!(rounds.get(&round(Ipv4Addr::new(127, 0, 64, 254))), Some(&2));
+            assert!(
+                rounds
+                    .keys()
+                    .all(|local| local.ends_with(&format!(":{RANGE_PROBE_PORT}"))),
+                "every round asked at the probe's fixed port: {rounds:?}"
+            );
+        }
+
+        /// The stock macOS host's shape (`docs/spikes/2026-09-22-macos-loopback-alias.md`):
+        /// every bind on the range refused, so every expose is answered `500`
+        /// — the range reads absent and the daemon behind that forwarder
+        /// publishes on the `127.0.0.1` interim, the state that keeps an
+        /// own-address box's activate from failing on a host whose `lo0`
+        /// carries no alias yet.
+        #[tokio::test]
+        async fn reads_the_range_absent_when_the_host_refuses_every_bind() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let (forwarder, _asked) =
+                spawn_forwarder_answering(sock.clone(), Duration::ZERO, |_| 500);
+            let probe = probe_publish_surface(&ControlChannel::Unix(sock)).await;
+            forwarder.abort();
+
+            assert_eq!(probe.probed, 254, "{}", probe.summary());
+            assert_eq!(probe.bound, 0);
+            assert!(!probe.present());
+            assert!(probe.interim());
+            assert_eq!(probe.surface(), "127.0.0.1-interim");
+            // The refused request comes back as gvproxy's folded error, whose
+            // kind is `Other` — the address is the record's, never guessed.
+            assert_eq!(
+                probe.first_failure,
+                Some((Ipv4Addr::new(127, 0, 64, 1), io::ErrorKind::Other))
+            );
+        }
+
+        /// A *partial* alias set must read absent, exactly as the local
+        /// probe's does: the addresses the allocator could still hand out are
+        /// the missing ones, and a fetch aimed at one hangs rather than
+        /// refusing.
+        #[tokio::test]
+        async fn reads_a_partial_range_absent() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let (forwarder, _asked) =
+                spawn_forwarder_answering(sock.clone(), Duration::ZERO, |local| {
+                    if local.starts_with("127.0.64.100:") {
+                        500
+                    } else {
+                        200
+                    }
+                });
+            let probe = probe_publish_surface(&ControlChannel::Unix(sock)).await;
+            forwarder.abort();
+
+            assert_eq!(probe.probed, 254, "{}", probe.summary());
+            assert_eq!(probe.bound, 253);
+            assert!(!probe.present(), "one missing alias fails the whole range");
+            assert!(
+                probe.interim(),
+                "a partially-aliased host publishes on the interim"
+            );
+            assert_eq!(
+                probe.first_failure.map(|(addr, _)| addr),
+                Some(Ipv4Addr::new(127, 0, 64, 100))
+            );
+        }
+
+        /// A control channel with nothing listening — a shuttle bridged to
+        /// a gvproxy that is not up — is not a fact about the host's loopback
+        /// at all, and reads absent: an unreadable publish surface never
+        /// vouches for an address.
+        #[tokio::test]
+        async fn reads_an_unreachable_forwarder_absent() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let probe =
+                probe_publish_surface(&ControlChannel::Unix(dir.path().join("absent.sock"))).await;
+
+            assert_eq!(probe.probed, 254, "{}", probe.summary());
+            assert_eq!(probe.bound, 0);
+            assert!(!probe.present());
+            assert!(probe.interim());
+            assert_eq!(
+                probe.first_failure,
+                Some((Ipv4Addr::new(127, 0, 64, 1), io::ErrorKind::NotFound)),
+                "the first refusal names the first address, never a made-up one"
+            );
+        }
+
+        /// A walk that outruns its budget is read as it stopped: the addresses
+        /// it never reached are the ones it cannot vouch for, so the probed
+        /// count is widened to the whole range — `present` then demands every
+        /// address — and the record names where the vouching stopped.
+        #[tokio::test]
+        async fn reads_a_walk_that_outran_its_budget_absent() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            // A forwarder slower than the budget: every answer parks long
+            // past it, so the walk cannot get past its first round.
+            let (forwarder, _asked) =
+                spawn_forwarder_answering(sock.clone(), Duration::from_millis(50), |_| 200);
+            let probe = probe_publish_surface_within(
+                &ControlChannel::Unix(sock),
+                Duration::from_millis(1),
+                RANGE_PROBE_REQUEST_BUDGET,
+            )
+            .await;
+            forwarder.abort();
+
+            assert_eq!(
+                probe.probed, 254,
+                "an overran walk is widened to the whole range, so `present` \
+                 demands every address it never reached"
+            );
+            assert!(
+                !probe.present(),
+                "a walk that did not finish may not vouch for the range: {}",
+                probe.summary()
+            );
+            assert!(probe.interim());
+            assert_eq!(
+                probe.first_failure,
+                Some((Ipv4Addr::new(127, 0, 64, 1), io::ErrorKind::TimedOut)),
+                "the address whose round the budget expired inside is the record's"
+            );
+        }
+
+        /// A forwarder that parks its answer stalls one *round* of the walk,
+        /// and the walk reads that round at its own bound — not at the publish
+        /// verbs' [`GVPROXY_CONTROL_TIMEOUT`] — stopping at the first address
+        /// with the channel's own `TimedOut`, which is not a fact about the
+        /// host's loopback and so never a bind refusal the range is read from.
+        /// The budget stays the walk's whole one, so what is exercised here is
+        /// the round bound alone.
+        #[tokio::test]
+        async fn a_stalled_round_costs_the_walk_only_its_own_bound() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            // Parks far past the round's bound and far inside the publish
+            // verbs' one, so only the round bound can cut the walk short.
+            let (forwarder, _asked) =
+                spawn_forwarder_answering(sock.clone(), Duration::from_millis(60), |_| 200);
+            let probe = probe_publish_surface_within(
+                &ControlChannel::Unix(sock),
+                RANGE_PROBE_BUDGET,
+                Duration::from_millis(1),
+            )
+            .await;
+            forwarder.abort();
+
+            assert_eq!(probe.probed, 1, "{}", probe.summary());
+            assert_eq!(probe.bound, 0);
+            assert!(!probe.present());
+            assert!(probe.interim());
+            assert_eq!(
+                probe.first_failure,
+                Some((Ipv4Addr::new(127, 0, 64, 1), io::ErrorKind::TimedOut)),
+                "the stalled round is the channel's own timeout, never a bind refusal"
+            );
+        }
+
+        /// The round bound the stalled round above is read at: at most a
+        /// second, and always tighter than the publish verbs'
+        /// [`GVPROXY_CONTROL_TIMEOUT`]. The walk is two rounds per address of
+        /// the range on one channel, so a channel that cannot answer one round
+        /// in a second is one the walk stops asking — while the launch and
+        /// teardown verbs keep their own, roomier bound.
+        #[test]
+        fn the_walks_round_bound_is_tighter_than_the_publish_verbs() {
+            assert!(
+                RANGE_PROBE_REQUEST_BUDGET <= Duration::from_secs(1),
+                "the walk's round bound is {RANGE_PROBE_REQUEST_BUDGET:?}"
+            );
+            assert!(
+                RANGE_PROBE_REQUEST_BUDGET < GVPROXY_CONTROL_TIMEOUT,
+                "the walk never inherits the publish verbs' bound"
+            );
+        }
+
+        /// The probe's request shape is the forwarder's own: an expose whose
+        /// `local` is the address under test at the probe port, and an
+        /// unexpose naming exactly the bind it released — the same verbs the
+        /// publishes ride, with a `remote` the probe never dials.
+        #[tokio::test]
+        async fn exposes_and_releases_the_probe_binds_over_the_control_channel() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let sock = dir.path().join("gvproxy.sock");
+            let (forwarder, mut asked) =
+                spawn_forwarder_answering(sock.clone(), Duration::ZERO, |_| 200);
+            // One round only: bind the range's first address, release it.
+            let expose = super::super::ExposeRequest {
+                local: format!("127.0.64.1:{RANGE_PROBE_PORT}"),
+                remote: "127.0.0.1:1".to_string(),
+                protocol: "tcp".to_string(),
+            };
+            post_json(
+                &ControlChannel::Unix(sock.clone()),
+                "/services/forwarder/expose",
+                &expose,
+            )
+            .await
+            .expect("the fake forwarder must bind the probe address");
+            let asked_expose = asked.recv().await.expect("the round's expose was recorded");
+            let unexpose = UnexposeRequest {
+                local: expose.local.clone(),
+                protocol: expose.protocol,
+            };
+            post_json(
+                &ControlChannel::Unix(sock),
+                "/services/forwarder/unexpose",
+                &unexpose,
+            )
+            .await
+            .expect("the fake forwarder must release the probe bind");
+            let asked_unexpose = asked
+                .recv()
+                .await
+                .expect("the round's unexpose was recorded");
+            forwarder.abort();
+
+            assert_eq!(asked_expose, format!("127.0.64.1:{RANGE_PROBE_PORT}"));
+            assert_eq!(asked_unexpose, asked_expose);
+        }
     }
 }

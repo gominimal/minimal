@@ -16,7 +16,7 @@
 //! refactored out of it: a few duplicated lines of glue keep
 //! `cmd_activate`'s diff at zero.
 
-use std::io::IsTerminal as _;
+use std::io::{IsTerminal as _, Read as _};
 
 use anyhow::{Context as _, bail};
 use tokio::io::AsyncWriteExt as _;
@@ -445,14 +445,14 @@ fn arm_task_run_interrupt(
 ///
 /// stdin is pumped into the channel only when it is NOT a terminal: a piped
 /// stdin EOFs and half-closes the channel like the git helper's does, but a
-/// terminal stdin never EOFs — and tokio's stdin is an uncancellable
-/// blocking read that would hold the runtime open after the task exits — so
-/// a terminal caller half-closes immediately and a stdin-reading task sees
-/// EOF instead of hanging. The upshot: tasks run non-interactively; stdin
-/// content reaches the task only when piped. That is not just the tokio
-/// constraint — the daemon's exec channel has no PTY (only the shell path
-/// does), so interactive tasks are structurally unsupported here anyway;
-/// interactive work belongs in `min session attach`.
+/// terminal stdin never EOFs — and a blocking stdin read cannot be
+/// cancelled once the task exits — so a terminal caller half-closes
+/// immediately and a stdin-reading task sees EOF instead of hanging. The
+/// upshot: tasks run non-interactively; stdin content reaches the task only
+/// when piped. That is not just the cancellation constraint — the daemon's
+/// exec channel has no PTY (only the shell path does), so interactive tasks
+/// are structurally unsupported here anyway; interactive work belongs in
+/// `min session attach`.
 async fn bridge_exec(
     mut channel: russh::Channel<russh::client::Msg>,
 ) -> Result<Option<u32>, anyhow::Error> {
@@ -461,12 +461,35 @@ async fn bridge_exec(
         None
     } else {
         let mut to_channel = channel.make_writer();
+        // Read stdin on a detached thread, not `tokio::io::stdin()`: the
+        // latter parks a blocking `read(0)` on tokio's blocking pool, which
+        // `pump.abort()` cannot interrupt — so a piped stdin whose writer
+        // stays open would hold the runtime open forever after the task
+        // exits. A detached thread is abandoned on exit instead of awaited.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 8192];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
         // Both results are deliberately dropped: the remote side may close
         // the channel before consuming all our input, and that surfaces
         // through the channel loop below, not here.
         Some(tokio::spawn(async move {
-            let mut stdin = tokio::io::stdin();
-            let _ = tokio::io::copy(&mut stdin, &mut to_channel).await;
+            while let Some(chunk) = rx.recv().await {
+                if to_channel.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
             let _ = to_channel.shutdown().await;
         }))
     };
@@ -597,6 +620,7 @@ pub async fn cmd_task_run(global: &GlobalArgs, args: TaskRunArgs) -> Result<(), 
         project_path: abs_path.clone(),
         network: sessions::NetworkMode::HostNet,
         policy: sessions::SessionPolicy::default(),
+        box_addresses: None,
         // Same default as an activate with no flags, matching the
         // loadout handling below. `min task run` has no `--no-hooks` of
         // its own; a `--keep` session is attachable later, so its hooks
@@ -1552,5 +1576,109 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("unknown task 'deploy'"), "got: {msg}");
         assert!(msg.contains("declared tasks: build"), "got: {msg}");
+    }
+
+    /// `cmd_task_run` resolves a task's `env_vars` against the invoking
+    /// shell *before* it ever touches the daemon. With an empty policy and
+    /// no terminal, a declared `{ inherit = true }` variable is refused by
+    /// the non-interactive hook, so the run fails client-side — naming the
+    /// task, the count, and the policy file to edit — with no session
+    /// created and no daemon required. This pins the policy-rejection leg
+    /// of the entry path; the daemon-backed run/finalize legs need a live
+    /// daemon and are covered by the session e2e, not a unit test.
+    #[tokio::test]
+    async fn cmd_task_run_refuses_an_unapproved_inherited_var_client_side() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            b"[tasks.build]\nexec = 'true'\nenv_vars.ZZ_TASK_TOKEN = { inherit = true }\n",
+        )
+        .unwrap();
+
+        // An empty `[vars]` policy, isolated from the developer's real
+        // config, so the variable is always unapproved and the run always
+        // reaches the refusal asserted below rather than the inherited
+        // lookup a permissive developer policy would allow.
+        let config = tempfile::tempdir().unwrap();
+        let minimal_dir = config.path().join("minimal");
+        std::fs::create_dir_all(&minimal_dir).unwrap();
+        std::fs::write(minimal_dir.join("user_policy.toml"), "[vars]\n").unwrap();
+
+        let global = GlobalArgs {
+            repo_dir: Some(project.path().to_path_buf()),
+            config_dir: Some(config.path().to_path_buf()),
+            no_input: true,
+            ..Default::default()
+        };
+        let args = TaskRunArgs {
+            task: "build".into(),
+            path: None,
+            keep: false,
+        };
+
+        let err = cmd_task_run(&global, args)
+            .await
+            .expect_err("an unapproved inherited variable must be refused before the daemon");
+        let msg = err.to_string();
+        assert!(msg.contains("task 'build'"), "names the task: {msg}");
+        assert!(
+            msg.contains("1 environment variable"),
+            "names the count: {msg}"
+        );
+        assert!(
+            msg.contains("policy does not allow"),
+            "names the gate: {msg}"
+        );
+    }
+
+    /// `cmd_task_run` resolves a task's `env_vars` against the invoking
+    /// shell *before* it ever touches the daemon: an `{ inherit = true }`
+    /// variable the policy allows but that is not set in this shell fails
+    /// client-side — naming the task, the variable, and the fix — with no
+    /// session created and no daemon required. This pins the unset-inherited
+    /// leg of the entry path; the daemon-backed run/finalize legs need a
+    /// live daemon and are covered by the session e2e, not a unit test.
+    #[tokio::test]
+    async fn cmd_task_run_rejects_an_unset_inherited_var_client_side() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(mfile::MFILE_NAME),
+            b"[tasks.build]\nexec = 'true'\nenv_vars.ZZ_MINIMAL_TASK_RUN_UNSET_INHERITED = { inherit = true }\n",
+        )
+        .unwrap();
+
+        // A policy that allows the variable, so the gate does not refuse it
+        // and the unset-inherited lookup is what fails.
+        let config = tempfile::tempdir().unwrap();
+        let minimal_dir = config.path().join("minimal");
+        std::fs::create_dir_all(&minimal_dir).unwrap();
+        std::fs::write(
+            minimal_dir.join("user_policy.toml"),
+            "[vars]\nallow = [\"ZZ_MINIMAL_TASK_RUN_UNSET_INHERITED\"]\n",
+        )
+        .unwrap();
+
+        let global = GlobalArgs {
+            repo_dir: Some(project.path().to_path_buf()),
+            config_dir: Some(config.path().to_path_buf()),
+            no_input: true,
+            ..Default::default()
+        };
+        let args = TaskRunArgs {
+            task: "build".into(),
+            path: None,
+            keep: false,
+        };
+
+        let err = cmd_task_run(&global, args)
+            .await
+            .expect_err("an unset inherited variable must be rejected before the daemon");
+        let msg = err.to_string();
+        assert!(msg.contains("task 'build'"), "names the task: {msg}");
+        assert!(
+            msg.contains("ZZ_MINIMAL_TASK_RUN_UNSET_INHERITED"),
+            "names the variable: {msg}"
+        );
+        assert!(msg.contains("export it"), "names the fix: {msg}");
     }
 }

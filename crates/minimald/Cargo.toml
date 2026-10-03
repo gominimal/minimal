@@ -1,5 +1,6 @@
 [package]
 name = "minimald"
+description = "The session daemon: a russh SSH server that dispatches to per-subsystem mailbox actors (session manager, one actor per session, the session host, maintenance), owns the gvproxy switch, DNS and hostname proxy for own-address boxes, and runs as pid-1 inside the minvmd microVM."
 rust-version.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -101,3 +102,6 @@ proptest.workspace = true
 # The guest (initramfs pid-1) boot path is Linux-only.
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock.workspace = true
+
+[lints]
+workspace = true
