@@ -294,6 +294,17 @@ error: the following required arguments were not provided:
 Usage: mip run greeter --name <name> --greeting <greeting>
 ```
 
+`min task run` takes the same flags after the task name:
+
+```shell
+$> min task run greeter --name Alice --greeting hi
+```
+
+`min task run` reads its own options (`--path`, `--keep`, `--help`) before the task's. To pass a
+task argument with one of those names, put it after `--`, as in
+`min task run deploy -- --path prod`. The project directory is the `--path` option, not a
+positional argument.
+
 Each argument's datatype may be:
 
 - a scalar: `"string"`, `"number"`, or `"boolean"` (alias `"bool"`);
