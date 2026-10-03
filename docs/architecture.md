@@ -192,39 +192,26 @@ Notable crates, in roughly the order the build pipeline drives them:
 
 ## 3. Crate map
 
-| Crate | Area | Role |
-|---|---|---|
-| `args` | build | Types for the argument schema of tasks and sideload parameters. |
-| `async-dialog` | session | Interactive terminal prompts over any async reader/writer (no TTY required). |
-| `check` | build | `mip check` linting of `minimal.toml`, packages, profiles, and stacks. |
-| `checkouts` | build | Git repository checkout management for source operations (upstream layers at pinned versions). |
-| `common` | shared | Common types and utilities (e.g. `SpecHash`) used across the codebase. |
-| `decode` | build | Evaluates a Nickel config layer into in-memory packages/profiles/stacks. |
-| `diagnostics` | shared | App-agnostic machinery for diagnostic support bundles. |
-| `graph` | build | The in-memory, semantic dependency graph; the `planner` module orders builds. |
-| `lcache` | build | Local cache of built artifacts, keyed by `SpecHash`. |
-| `mctx` | shared | Top-level 'minimal context' API tying configuration, decoding, graph, and cache together. |
-| `mfile` | build | Finding and reading the `minimal.toml` file. |
-| `minimal` | session | The `min` session CLI, which pairs with and talks to `minimald`. |
-| `minimal-client` | session | SSH client transport to `minimald` over the UDS bridge, shared by `min` and the TUI. |
-| `minimal-tui` | session | `min dash`: the session-manager TUI (ratatui/crossterm, Elm-style loop). |
-| `minimald` | session | The session daemon: an SSH server hosting sessions and task/sandbox executions. |
-| `minimald-rpc` | session | Wire contract for `minimald`'s oneshot SSH RPCs and for the exec channel's request vocabulary. |
-| `minvmd` | session | Host daemon that boots Linux microVMs via libkrun and bridges host UDS to in-VM vsock. |
-| `mip` | build | The Minimal package/build CLI. |
-| `mlog` | shared | JSON file-log layer both `minimald` and `minvmd` write through; one definition of the on-disk log format. |
-| `op` | build | Complex operations over the graph and packages (builds, cache object construction). |
-| `orchestrator` | build | Runtime orchestration of builds behind a pluggable `Backend`. |
-| `ot` | shared | Operation tracking for progress rendering (render-agnostic core + drivers). |
-| `paths` | shared | Realm-tagged path types distinguishing host, sandbox, and daemon filesystems. |
-| `rcache` | build | Remote cache: fetch/upload build artifacts over the network. |
-| `remote-client` | build | Client for the Remote Execution Service, driving remote builds against the graph. |
-| `remote-proto` | build | Protobuf / wire types for the Remote Execution Service (RES). |
-| `sandbox2` | build | The low-level sandbox implementation (Linux user + mount namespaces). |
-| `sessions` | session | Session primitives: lifecycle hooks, loadouts, and the composition pipeline. |
-| `stdlib` | build | The embedded Minimal standard library. |
-| `switch` | session | gvproxy-switch primitives: subnet arithmetic, MAC derivation, vsock constants, config rendering. |
-| `version` | shared | Shared build-time version identity for `min`, `mip`, `minimald`, and `minvmd`. |
+`just crates` prints each workspace crate with the description from its
+`Cargo.toml`. Each crate declares its description in its own manifest, so the
+list cannot drift, and this section does not repeat it. It groups the crates by
+plane instead, which no manifest records.
+
+**build** covers config evaluation, the dependency graph, the caches, and build
+execution:
+
+`args`, `check`, `checkouts`, `decode`, `graph`, `lcache`, `mfile`, `mip`, `op`,
+`orchestrator`, `rcache`, `remote-client`, `remote-proto`, `sandbox2`, `stdlib`
+
+**session** covers the CLIs and daemons behind a running session, on the host
+and inside the microVM:
+
+`async-dialog`, `minimal`, `minimal-client`, `minimal-tui`, `minimald`,
+`minimald-rpc`, `minvmd`, `sessions`, `switch`
+
+**shared** covers the utilities the other planes draw on:
+
+`common`, `diagnostics`, `mctx`, `mlog`, `ot`, `paths`, `version`
 
 ## 4. Cache & hashing
 

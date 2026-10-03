@@ -265,6 +265,28 @@ pub struct ListSessionsResponse {
     /// the field, or while the answerer has not come up yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone_answerer_port: Option<u16>,
+    /// Whether this daemon's box-zone answerer is bound in its own namespace
+    /// — the one fact about the name surfaces this daemon can know (NET-018):
+    /// with it the zone *can* be answered natively, without it the hostname
+    /// proxy is the only surface that answers at all.
+    ///
+    /// It says no more than that, on purpose. The daemon probes nothing
+    /// beyond itself for this field: the reserved range's presence on the
+    /// loopback *it* sits on is the guest's on a VM-backed host, where it
+    /// always reads present, so it is the wrong fact rather than an
+    /// incomplete one; and whether the *host's* resolver is pointed at
+    /// [`Self::zone_answerer_port`] is not a thing a daemon inside the guest
+    /// can see at all. The client decides which surface is live from this
+    /// fact plus the two it reads on the host itself (the resolver hook, the
+    /// range on the host's own loopback), so no verb ever prints this field
+    /// as the surface on a host whose resolver it cannot speak for.
+    ///
+    /// `false` is the default, so a daemon that predates the field reports
+    /// the read that changes nothing: an older daemon's silence is not
+    /// evidence its answerer serves, and a client that assumed it would name
+    /// native DNS on a host that may not have one.
+    #[serde(default)]
+    pub answerer_bound: bool,
 }
 
 impl OneshotSshRpc for ListSessions {
@@ -623,6 +645,13 @@ pub struct CreateSessionResponse {
     /// `None` prints the notice exactly as this reply's older readers did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_all_opt_out: Option<bool>,
+    /// Whether this daemon's box-zone answerer is bound in its own namespace
+    /// — see [`ListSessionsResponse::answerer_bound`] for what that fact
+    /// does and does not say. Carried on the activation reply, beside the
+    /// answerer's port it is the answerer's own half of, because activation
+    /// is where the user is about to rely on the names the surface answers.
+    #[serde(default)]
+    pub answerer_bound: bool,
 }
 
 impl OneshotSshRpc for CreateSession {
@@ -1623,7 +1652,16 @@ mod tests {
             // prints on it (NET-123) must not be able to silently drop off.
             interim_loopback: true,
             deny_all_opt_out: None,
+            // So does the answerer's half of the name-surface report: the
+            // line `min session activate` prints from it (NET-018) must not
+            // be able to silently drop off.
+            answerer_bound: true,
         };
+        let json = serde_json_lenient::to_string(&resp).expect("serializes");
+        assert!(
+            json.contains(r#""answerer_bound":true"#),
+            "a daemon whose answerer is bound must say so on the wire, got: {json}",
+        );
         assert_eq!(round_trip(&resp), resp);
     }
 
@@ -1642,6 +1680,7 @@ mod tests {
             hostname_proxy_port: None,
             zone_answerer_port: None,
             interim_loopback: false,
+            answerer_bound: false,
         };
         let json = serde_json_lenient::to_string(&opted_out).expect("serializes");
         assert!(
@@ -1669,6 +1708,11 @@ mod tests {
     /// `deny_all_opt_out` rides the same reply and reads the same way — absent
     /// from a daemon that predates it, which is a daemon that cannot have
     /// opted out (NET-077), so the client prints the notice it always did.
+    /// `answerer_bound` rides the same replies and reads the same way — absent
+    /// from a daemon that predates it, which decodes as `false`, the read that
+    /// changes nothing: an older daemon's silence is not evidence its
+    /// answerer serves, and a client that assumed it would name native DNS on
+    /// a host that may not have one (NET-018).
     #[test]
     fn responses_predating_hostname_routing_field_decode_as_absent() {
         let list: ListSessionsResponse =
@@ -1677,6 +1721,7 @@ mod tests {
         assert!(list.hostname_routing_unavailable.is_none());
         assert!(list.hostname_proxy_port.is_none());
         assert!(list.zone_answerer_port.is_none());
+        assert!(!list.answerer_bound);
 
         let create: Errorable<CreateSessionResponse> = serde_json_lenient::from_str(
             r#"{"id":"00000000-0000-0000-0000-000000000001","daemon_version":"0.5.0"}"#,
@@ -1693,6 +1738,7 @@ mod tests {
                 // on the flag.
                 assert!(!c.interim_loopback);
                 assert!(c.deny_all_opt_out.is_none());
+                assert!(!c.answerer_bound);
             }
             Errorable::Err { error } => panic!("expected Ok, got {error}"),
         }
@@ -1708,6 +1754,7 @@ mod tests {
             hostname_routing_unavailable: None,
             hostname_proxy_port: None,
             zone_answerer_port: None,
+            answerer_bound: false,
             resource_pool: None,
             sessions: vec![],
         };
@@ -1743,6 +1790,16 @@ mod tests {
         let json = serde_json_lenient::to_string(&discovered).expect("serializes");
         let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
         assert_eq!(back.hostname_proxy_port, Some(41234));
+
+        // The list reply carries the answerer's half the same way (NET-018):
+        // `min ls` reads it off this reply, not the activation one.
+        let bound = ListSessionsResponse {
+            answerer_bound: true,
+            ..resp.clone()
+        };
+        let json = serde_json_lenient::to_string(&bound).expect("serializes");
+        let back: ListSessionsResponse = serde_json_lenient::from_str(&json).expect("round trips");
+        assert!(back.answerer_bound);
     }
 
     /// The reply a daemon that predates `daemon_version` sends must still

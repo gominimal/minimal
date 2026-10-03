@@ -1,5 +1,6 @@
 [package]
 name = "async-dialog"
+description = "Interactive terminal prompts over any async reader/writer (no TTY required)."
 rust-version.workspace = true
 version = "0.0.1"
 edition.workspace = true

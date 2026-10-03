@@ -657,18 +657,106 @@ pub(crate) async fn activate_session(
         created.hostname_routing_unavailable.as_deref(),
         "min session activate",
     );
+    // The other routing fact the create reply carries: the port this daemon's
+    // hostnames route through, printed where the session started — the same
+    // fact `min ls` prints on its routing line. NET-026's discovery on this
+    // surface; and the report a port has to carry when it is *not* the one the
+    // recipes assume — a VM whose host port the host already held walked to
+    // one of its own (NET-059), a native daemon whose default was busy asked
+    // the OS for a free one (NET-025) — so a walked port is never a log line
+    // alone. Absent while the proxy is still coming up, or from a daemon that
+    // predates the field: nothing to print for it then, exactly as in `min
+    // ls`.
+    if let Some(port) = created.hostname_proxy_port {
+        eprintln!(
+            "{}",
+            hostname_proxy_start_line(hostname_proxy_start_vm(global), port)
+        );
+    }
     // NET-122/NET-123: the naming advisory, printed once per session start —
     // after the create, and re-surfaced when the daemon reports this session
     // at the 127.0.0.1 interim because its session-start bind probe found
     // the reserved range absent. It only ever names the command that
     // points the host's resolver at the answerer; running it (and any
     // privilege prompt it carries) is the user's act, never the session
-    // start's.
-    if let Some(advisory) =
-        crate::resolver::session_advisory(created.zone_answerer_port, created.interim_loopback)
-            .await
-    {
-        eprintln!("{advisory}");
+    // start's. One read of this host's resolver state decides both this and
+    // the surface verdict below it, so the two lines cannot disagree about
+    // one host.
+    //
+    // Both lines are the answerer's port's to print: the advisory has no
+    // command to name without one, the verdict no answerer whose surface to
+    // decide, so a create that reports none — the answerer still coming up,
+    // or a daemon that predates the field — prints neither and reads
+    // nothing. That keeps the no-port activate the zero-cost start it was
+    // before either line read this host: the detection below is two
+    // `resolvectl` queries under a five-second bound, and a wedged
+    // systemd-resolved must not be waited out for lines that cannot print
+    // from it.
+    if let Some(answerer_port) = created.zone_answerer_port {
+        let detection = crate::resolver::session_detection().await;
+        // NET-018: name the live surface at the moment the user is about to
+        // rely on the names — decided in the one function both verbs share
+        // (`resolver`), from the same detection the advisory reads: this
+        // host's hook (and the stub-bypass blocker that says whether its
+        // lookups consult what the hook configures), the daemon's
+        // answerer-bound report, and the reserved range on this host's own
+        // loopback. Decided before the advisory prints only so the range
+        // its read holds can be the advisory's too — one probe, one host —
+        // while the printed order stays the advisory's and then the
+        // surface's. `None` — the answerer not bound — prints nothing: no
+        // native surface to name, and the ports and the advisory have told
+        // the proxy's story. The proxy's half is said with the native arm
+        // either way (NET-019): the `HTTP(S)_PROXY` recipes this activation
+        // prints keep working beside native DNS, so nothing already
+        // captured goes stale.
+        let surface_verdict = crate::resolver::live_name_surface_with_range_at(
+            &detection,
+            Some(answerer_port),
+            created.answerer_bound,
+        )
+        .await;
+        // The advisory shares that verdict's range read: the daemon's
+        // interim flag is not this host's range fact — on a VM-backed host
+        // it reads the guest's loopback, which always carries the range —
+        // so a hook that routes over a loopback that lacks the range is
+        // told the range is what is missing, not left with a silent
+        // advisory beside a verdict that names the proxy for exactly that.
+        let name_advisory = crate::resolver::session_advisory_at(
+            &detection,
+            Some(answerer_port),
+            created.interim_loopback,
+            surface_verdict
+                .as_ref()
+                .and_then(|verdict| verdict.range_present),
+        );
+        if let Some(advisory) = &name_advisory {
+            eprintln!("{advisory}");
+        }
+        if let Some(verdict) = surface_verdict {
+            // The host-side record of that verdict, the half the daemon's own
+            // log cannot make: a daemon can name only the answerer *it* binds
+            // (see the daemon's `log_live_name_surface`), so the surface this
+            // host's own reads decided — and the three facts behind it, with
+            // the range as the one fact only this read holds — is logged here,
+            // at the start that printed it, beside the daemon's line. `min`
+            // filters at `warn` unless `RUST_LOG` is set, so the line is visible
+            // under `RUST_LOG=info`. Logged, never printed: the line
+            // below is the user's. `min ls` does not log its verdict — a list
+            // re-reads the host every run, and the record that matters is the
+            // one at the starts that rely on the names.
+            tracing::info!(
+                surface = ?verdict.surface,
+                hook_routes = detection.0.routes(answerer_port),
+                blocker = ?detection.1,
+                answerer_bound = created.answerer_bound,
+                range_present = ?verdict.range_present,
+                "session start decided the live name surface for this host"
+            );
+            eprintln!(
+                "{}",
+                crate::resolver::name_surface_line(verdict.surface, created.hostname_proxy_port)
+            );
+        }
     }
     let id = created.id;
 
@@ -1056,6 +1144,13 @@ pub(crate) async fn activate_session(
 /// working directory (or the only existing session), opening an interactive
 /// picker when the choice is ambiguous; see [`attach::resolve_for_attach`]
 /// and [`resolve_smart_attach`].
+///
+/// When `args.session` names a box, the name alone decides where to look
+/// (NET-058): the selected VM's daemon first — the common case costs nothing
+/// beyond the one lookup it always made — and, when that daemon does not know
+/// the name, [`attach::resolve_box_vm`] resolves the VM that owns it across
+/// every VM's socket, so no global flag is needed to reach a box on another
+/// VM.
 pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
 
@@ -1070,16 +1165,17 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
     // named, this path creates one, and a skewed activation is #1251 exactly.
     // Both arms below gate on the build the daemon reports on the lookup they
     // were already making, so the gate costs no round trip of its own.
-    let (id, name) = match args.session {
+    let (id, name, sock) = match args.session {
         Some(ref s) => {
-            let r = resolve_session_version_gated(&mut client, s).await?;
-            (r.id, r.name)
+            let (record, sock) =
+                resolve_attach_target_version_gated(global, &mut client, sock, s).await?;
+            (record.id, record.name, sock)
         }
         None => match resolve_smart_attach(
             &list_sessions_version_gated(&mut client).await?.sessions,
             global,
         )? {
-            SmartAttach::Attach(entry) => (entry.id, entry.name),
+            SmartAttach::Attach(entry) => (entry.id, entry.name, sock),
             SmartAttach::CreateForCwd => return activate_new_for_attach(global).await,
             SmartAttach::NoSessions => {
                 bail!("no sessions exist; use 'min session activate' to create one")
@@ -1094,6 +1190,49 @@ pub async fn cmd_attach(global: &GlobalArgs, args: AttachArgs) -> Result<(), any
     );
 
     session_via_ssh(&sock, id, None, global.config_dir.as_deref()).await
+}
+
+/// Resolve a named attach target to its record and the socket the hand-off
+/// runs over — the target `min session attach` lands in when the name alone
+/// decides where to look (NET-058).
+///
+/// The selected VM's daemon is asked first (`client`, reached over `sock`):
+/// the common case — a box on the VM the operator is already on — costs
+/// nothing beyond the one lookup the command always made, and its answer is
+/// gated on the reply that lookup was already making. When that daemon does
+/// not know the name, [`attach::resolve_box_vm`] resolves the VM that owns it
+/// across every VM's socket, so no global flag is needed to reach a box on
+/// another VM — the resolution gates the owning daemon on the very reply that
+/// named the box, so a skewed VM cannot be reached through it. Nothing found
+/// anywhere returns the selected VM's own error — the "no session found" it
+/// computed, or its skew — as the more useful of the two answers.
+pub(crate) async fn resolve_attach_target_version_gated(
+    global: &GlobalArgs,
+    client: &mut client::Client,
+    sock: std::path::PathBuf,
+    name: &str,
+) -> Result<(sessions::Record, std::path::PathBuf), anyhow::Error> {
+    match resolve_session_version_gated(client, name).await {
+        Ok(record) => Ok((record, sock)),
+        Err(selected) => match attach::resolve_box_vm(global, name).await? {
+            Some(resolved) => {
+                // The operator never chose the VM the way they chose the
+                // session, so tell them which one they're landing in.
+                if should_announce_session(global) {
+                    eprintln!(
+                        "Attaching to session {} on VM {}",
+                        session_announce_label(
+                            &resolved.record.id,
+                            resolved.record.name.as_deref()
+                        ),
+                        resolved.vm
+                    );
+                }
+                Ok((resolved.record, resolved.sock))
+            }
+            None => Err(selected),
+        },
+    }
 }
 
 /// Executes a command in an existing session.
