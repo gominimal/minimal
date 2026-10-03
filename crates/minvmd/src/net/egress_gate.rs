@@ -31,12 +31,17 @@
 //! the gvproxy upgrade head verbatim, then relays both ways: guest → switch
 //! through the verdict, per source address; switch → guest applied to nothing
 //! — ingress policy is the *target* box's and is decided in the guest, so
-//! NET-081 is an egress requirement — but *read* on the way through for one
-//! class of frame: a DNS reply the switch returned toward a box, which the
+//! NET-081 is an egress requirement — but *read* on the way through for two
+//! classes of frame: a DNS reply the switch returned toward a box, which the
 //! host-side DNS admission table ([`crate::net::dns_pins`]) pins from, so the
 //! answers that decide a DNS box's undeclared destinations are the ones the
-//! box's own lookups received. Every frame still flows onward verbatim;
-//! observation is a read, never a hold.
+//! box's own lookups received; and the TCP dial the switch's forwarder sends
+//! to a row's admitted port, which the forwarder flow table
+//! ([`ForwarderFlows`]) records, so the reply the box sends back on that
+//! connection — the one box-to-gateway frame a published port carries — is
+//! admitted by the control-surface check as the exact reverse tuple of the
+//! connection the host itself opened. Every frame still flows onward
+//! verbatim; observation is a read, never a hold.
 //!
 //! The socket is not the shuttle's alone. gvproxy's switch socket is one
 //! listener carrying two protocols, and the guest daemon uses both over the
@@ -108,7 +113,12 @@
 //! the DNS admission table decides against the answers its own lookups
 //! received — reaches none of it by name either: the answers are refused
 //! before they can become pins, and the infrastructure drop is the host's
-//! own, whatever the row.
+//! own, whatever the row. The control-surface refusal carries two
+//! exceptions, each exactly sized: TCP or UDP to the resolver's port, and
+//! the reverse tuple of a live recorded forwarder flow — a frame the box
+//! initiates to the gateway, at an admitted port or any other, is refused
+//! either way, and both exceptions still fall through to the decision
+//! behind them.
 //!
 //! Fail-closed faces the guest; the gate itself is what the host is left
 //! holding, so it stays up where it can. An accept failure the host can ride
@@ -122,6 +132,7 @@
 //! rather than let one guest pin host resources without one.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::Ipv4Addr;
@@ -328,31 +339,91 @@ const DROP_WARN_MAX_TRACKED_PAIRS: usize = 1024;
 const UNKNOWN_SOURCE_RULE: &str = "egress-unknown-source";
 
 /// The rule name for a frame headed to the switch's own address — the plan's
-/// gateway — that is not a resolver query: TCP or UDP to the resolver's port
-/// is the one carve-out the frame rules admit there, and everything else —
-/// any other port, any other protocol, ICMP included — points at the switch
-/// itself. The switch's control surface is not a destination a box's egress
-/// rules decide (design §4.1, §7.1): whatever a box's rules allow, nothing at
-/// the gateway answers a box but its resolver — a box's admitted ports are
-/// its own ingress, reached on its own address, never a flow to the gateway —
-/// so the frame is refused before any row or phase is consulted, in force in
-/// every phase, and no interim and no row can ever admit it.
+/// gateway — that is neither a resolver query nor the reply half of a
+/// connection the switch's forwarder opened: TCP or UDP to the resolver's
+/// port is the one carve-out the frame rules admit there by address and
+/// port, the exact reverse tuple of a live recorded forwarder flow
+/// ([`ForwarderFlows`]) the one they admit by connection, and everything
+/// else — any other port, any other protocol, ICMP included — points at the
+/// switch itself. The switch's control surface is not a destination a box's
+/// egress rules decide (design §4.1, §7.1): whatever a box's rules allow,
+/// nothing at the gateway answers a box but its resolver and the forwarded
+/// connections the host itself opened. A box's admitted ports are its own
+/// ingress, reached on its own address, and the only traffic they carry
+/// toward the gateway is the reply half of such a connection — admitted by
+/// the flow table's record alone, never by the port — so a frame the box
+/// sends to the gateway on its own, from an admitted port or any other, is
+/// refused before any row or phase is consulted, in force in every phase,
+/// and no interim and no row can ever admit it.
 const SWITCH_CONTROL_RULE: &str = "egress-switch-control-surface";
 
 /// The port the resolver carve-out is keyed to at the gateway (NET-079):
 /// DNS, over UDP or TCP (a query falls back to TCP on truncation, so the
 /// carve-out is by address and port, not protocol). The switch's
-/// control-surface refusal excepts the resolver's port and nothing else: a
-/// frame that falls past the exception is still decided by the row or the
-/// phase behind it, so the exception admits nothing on its own — a deny-all
-/// box's resolver frame to the gateway is refused by its row as it would be
-/// anywhere else.
+/// control-surface refusal excepts the resolver's port, the forwarder flow
+/// table's recorded tuples, and nothing else: a frame that falls past both
+/// exceptions is still decided by the row or the phase behind it, so each
+/// admits nothing on its own — a deny-all box's resolver frame to the
+/// gateway is refused by its row as it would be anywhere else.
 const RESOLVER_PORT: u16 = 53;
 
 /// The two IPv4 protocols a resolver query travels over: UDP, and TCP when
 /// the answer is truncated. A frame to the gateway in any other protocol has
 /// no resolver to be headed for, whatever its L4 bytes say.
 const RESOLVER_PROTOCOLS: [u8; 2] = [6, 17];
+
+/// The wire the forwarder flow table reads — the gate's own copy of the
+/// three facts [`dns_pins`] keeps privately for the DNS legs, spelled here
+/// because the forwarder legs are this module's and the two read the same
+/// frames in the same shapes.
+///
+/// The Ethernet header length, in bytes.
+const ETH_HDR: usize = 14;
+/// The EtherType an Ethernet II frame carries when what it frames is IPv4.
+const ETHERTYPE_IPV4: u16 = 0x0800;
+/// TCP's IPv4 protocol number: the one transport a forwarder flow is.
+const IPPROTO_TCP: u8 = 6;
+/// TCP SYN: a connection's opening segment, the one flag a dial announces
+/// itself by — the record's trigger, and no other frame's.
+const TCP_SYN: u8 = 0x02;
+/// TCP FIN: a half-close — either side's own end of its use of the flow.
+const TCP_FIN: u8 = 0x01;
+/// TCP RST: an abortive end of the flow.
+const TCP_RST: u8 = 0x04;
+
+/// How long a recorded forwarder flow lives past the last frame that rode
+/// it: the bound that ends an entry when no close ever came — the
+/// connection the switch's forwarder opened died with the host process
+/// that held it, and nothing inside the VM can end it, so the record must.
+/// The clock is the box's own reply traffic: any frame the row sends back
+/// on the recorded tuple refreshes the entry, and TCP keeps an honest
+/// forwarded connection fed in both directions — its ACKs alone — so an
+/// entry idle past this bound belongs to a connection nothing is using.
+/// The bound sits far past a forwarded connection's honest silent gaps,
+/// and the cost of being wrong is one stale connection's stall, never a
+/// standing grant: the entry's admission is the exact tuple alone.
+const FORWARDER_FLOW_IDLE_CAP: Duration = Duration::from_secs(5 * 60);
+
+/// How many live forwarder flows the table will hold at once. The entries
+/// are the connections the host's own switch opened to published ports —
+/// one per open host-side connection through a forwarder — so the bound is
+/// a memory ceiling on the host's own behaviour, sized far past any honest
+/// host's need while a flood of host connections still cannot grow the
+/// host daemon's memory past it. Past the bound the table refuses a new
+/// flow — fail closed, never evicting a live one — after first reclaiming
+/// the entries idleness has already ended, so a full table is full of live
+/// flows and not of stale ones it never swept.
+const MAX_FORWARDER_FLOWS: usize = 1024;
+
+/// How often the cap's reclaim of idle entries may run: at most once per
+/// second, never once per dial — the reclaim walks every entry the table
+/// holds, and a flood of dials must not turn the cap into a walk per dial.
+const FORWARDER_FLOW_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often a table at its bound may say so: at most one `warn` line per
+/// minute, so a host holding the ledger at its bound stays readable instead
+/// of writing a line per connection it refuses.
+const FORWARDER_FLOW_CAP_LINE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The rule name for a frame headed into the infrastructure deny set (design
 /// §5.3, NET-067) as a host frame rule: the set applies to every box-plane
@@ -836,12 +907,20 @@ impl EgressGate {
         // not of the connection that carried it — the publish and the
         // teardown that retracts it arrive on different connections.
         let forwards = Arc::new(PublishedForwards::new());
+        // One forwarder flow ledger for the whole gate, beside them: the
+        // connections the switch's forwarder opens are facts of the host's
+        // own dialing, not of the guest connection their replies ride — the
+        // dial arrives on the switch side and the reply on the guest side of
+        // the same relay, and a shuttle reconnect between the two must not
+        // lose the record the reply is admitted by.
+        let flows = ForwarderFlows::new();
         Ok(Self {
             accept: tokio::spawn(accept_loop(
                 listener,
                 switch_sock,
                 table,
                 pins,
+                flows,
                 baseline,
                 limiter,
                 forwards,
@@ -954,15 +1033,17 @@ impl AcceptFailure {
 #[expect(
     clippy::too_many_arguments,
     reason = "the source, the switch socket, the table, the DNS admission table, the \
-              baseline, the limiter, the publish ledger, the bound and the phase are \
-              each a distinct input to every relay the loop spawns; grouping them \
-              would name the bundle without naming the members"
+              forwarder flow table, the baseline, the limiter, the publish ledger, \
+              the bound and the phase are each a distinct input to every relay the \
+              loop spawns; grouping them would name the bundle without naming the \
+              members"
 )]
 async fn accept_loop<A: GuestSource>(
     mut source: A,
     switch_sock: PathBuf,
     table: BoxTable,
     pins: dns_pins::DnsPins,
+    flows: ForwarderFlows,
     baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
     forwards: Arc<PublishedForwards>,
@@ -1029,6 +1110,7 @@ async fn accept_loop<A: GuestSource>(
             switch_sock.clone(),
             table.clone(),
             pins.clone(),
+            flows.clone(),
             baseline.clone(),
             Arc::clone(&limiter),
             Arc::clone(&forwards),
@@ -1055,16 +1137,18 @@ async fn accept_loop<A: GuestSource>(
 /// [`EgressGate::spawn_with_phase`].
 #[expect(
     clippy::too_many_arguments,
-    reason = "the two sockets, the table, the DNS admission table, the baseline, the \
-              limiter, the publish ledger, the drain bound and the phase are each a \
-              distinct input to what one connection does; grouping them would name \
-              the bundle without naming the members"
+    reason = "the two sockets, the table, the DNS admission table, the forwarder \
+              flow table, the baseline, the limiter, the publish ledger, the drain \
+              bound and the phase are each a distinct input to what one \
+              connection does; grouping them would name the bundle without \
+              naming the members"
 )]
 async fn serve_connection(
     mut guest: UnixStream,
     switch_sock: PathBuf,
     table: BoxTable,
     pins: dns_pins::DnsPins,
+    flows: ForwarderFlows,
     baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
     forwards: Arc<PublishedForwards>,
@@ -1151,6 +1235,7 @@ async fn serve_connection(
                 guest_tx,
                 table,
                 pins,
+                flows,
                 baseline,
                 limiter,
                 phase,
@@ -1196,15 +1281,19 @@ fn refuse_head(limiter: &DropLimiter, refused: &RefusedHead) {
 /// the frame verdict, per source address; ingress (switch → guest) applied to
 /// nothing — the gate's job is the egress direction, and what a box may
 /// receive is the target's ingress policy, decided in the guest where its
-/// declarations are enforced — but read on the way through for the one frame
-/// class the host's own decision is made from: the DNS replies the switch
-/// returns toward a box, which [`crate::net::dns_pins`] pins from
+/// declarations are enforced — but read on the way through for the two frame
+/// classes the host's own decision is made from: the DNS replies the switch
+/// returns toward a box, which [`crate::net::dns_pins`] pins from, and the
+/// TCP dials the switch's forwarder sends to a row's admitted port, which the
+/// forwarder flow table ([`ForwarderFlows`]) records so the box's reply on
+/// that connection passes the control-surface check
 /// ([`relay_switch_frames_to_guest`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "the relay's full state in one place: both directions' halves, the \
-              deciding table, the DNS admission table and the node-plane baseline \
-              set, the limiter, and the phase — splitting it would hide one of them"
+              deciding table, the DNS admission table, the forwarder flow table \
+              and the node-plane baseline set, the limiter, and the phase — \
+              splitting it would hide one of them"
 )]
 async fn relay_frames(
     guest: Prefixed<OwnedReadHalf>,
@@ -1213,6 +1302,7 @@ async fn relay_frames(
     guest_tx: OwnedWriteHalf,
     table: BoxTable,
     pins: dns_pins::DnsPins,
+    flows: ForwarderFlows,
     baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
     phase: UnregisteredSourcePhase,
@@ -1222,9 +1312,12 @@ async fn relay_frames(
         guest_tx,
         table.clone(),
         pins.clone(),
+        flows.clone(),
         Arc::clone(&limiter),
     ));
-    let egress = relay_guest_to_switch(guest, switch_tx, table, pins, baseline, limiter, phase);
+    let egress = relay_guest_to_switch(
+        guest, switch_tx, table, pins, flows, baseline, limiter, phase,
+    );
     tokio::pin!(egress);
     // The two legs race, because neither can see the other's end. The egress
     // leg blocks on the guest, which has no reason to speak while it is idle,
@@ -2258,6 +2351,7 @@ async fn relay_switch_frames_to_guest(
     mut guest: OwnedWriteHalf,
     table: BoxTable,
     pins: dns_pins::DnsPins,
+    flows: ForwarderFlows,
     limiter: Arc<DropLimiter>,
 ) -> io::Result<()> {
     let mut len_buf = [0u8; 2];
@@ -2291,6 +2385,20 @@ async fn relay_switch_frames_to_guest(
         {
             pins.observe_reply(&table, &pkt, datagram, &limiter, Instant::now());
         }
+        // The forwarder flow table's other half: the switch's own dials to a
+        // published port announce themselves as TCP SYNs from the gateway to
+        // a row's admitted port, and the reply the box sends back on that
+        // connection is the one box-to-gateway frame the gate must carry — so
+        // the dial is recorded here, from its SYN alone, and the close the
+        // gateway sends for it ends the record. The pre-check is the DNS
+        // leg's own shape: a few comparisons before the bounds-checked parse,
+        // because every frame toward the guest passes this leg and the
+        // forwarded dial is the rare frame among them.
+        if is_ipv4_tcp(&frame[..n])
+            && let Some(pkt) = dns_pins::parse_ipv4_l4(&frame[..n])
+        {
+            flows.observe_gateway_dial(&table, &pkt, Instant::now());
+        }
         // One combined write keeps the length prefix and the frame together
         // even if the guest closes between two writes.
         let mut framed = Vec::with_capacity(2 + n);
@@ -2305,13 +2413,22 @@ async fn relay_switch_frames_to_guest(
 /// the relay's exit: whichever way the relay ended — the guest's clean
 /// close, an error on either end, or a frame claim the gate refused — the
 /// addresses it carried go to the table as a withdrawal report **and** to
-/// the DNS admission table as a retire, and the relay's outcome is passed
-/// through.
+/// the DNS admission table as a retire **and** to the forwarder flow table
+/// as one, and the relay's outcome is passed through.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the relay's own inputs, one per parameter — the two sockets, the \
+              table, the DNS admission table, the forwarder flow table, the \
+              baseline, the limiter and the phase are each a distinct input to \
+              the attribution below; grouping them would name the bundle \
+              without naming the members"
+)]
 async fn relay_guest_to_switch(
     mut guest: Prefixed<OwnedReadHalf>,
     mut switch: OwnedWriteHalf,
     table: BoxTable,
     pins: dns_pins::DnsPins,
+    flows: ForwarderFlows,
     baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
     phase: UnregisteredSourcePhase,
@@ -2326,6 +2443,7 @@ async fn relay_guest_to_switch(
         &mut switch,
         &table,
         &pins,
+        &flows,
         &baseline,
         &limiter,
         phase,
@@ -2349,6 +2467,12 @@ async fn relay_guest_to_switch(
     // control request is the daemon's own client's shape, and constant churn
     // is not box end.
     pins.retire(&attributed);
+    // The forwarder flows the same rows' published ports earned go with
+    // them: the withdrawal ends the grants the host's dials made, so the
+    // next reply frame — from the row's box or anything wearing its address
+    // — is the control-surface refusal's again, and a re-attachment starts
+    // fail-closed, until the host dials its published port afresh.
+    flows.retire(&attributed);
     table.report_withdrawals(std::mem::take(&mut attributed));
     outcome
 }
@@ -2367,16 +2491,17 @@ async fn relay_guest_to_switch(
 )]
 #[expect(
     clippy::too_many_arguments,
-    reason = "the two socket halves, the table, the DNS admission table, the baseline, the \
-              limiter, the phase and the attribution are each a distinct input to every \
-              frame the loop decides; grouping them would name the bundle without naming \
-              the members"
+    reason = "the two socket halves, the table, the DNS admission table, the forwarder \
+              flow table, the baseline, the limiter, the phase and the attribution \
+              are each a distinct input to every frame the loop decides; grouping \
+              them would name the bundle without naming the members"
 )]
 async fn relay_frames_to_switch(
     guest: &mut Prefixed<OwnedReadHalf>,
     switch: &mut OwnedWriteHalf,
     table: &BoxTable,
     pins: &dns_pins::DnsPins,
+    flows: &ForwarderFlows,
     baseline: &NodePlaneBaseline,
     limiter: &DropLimiter,
     phase: UnregisteredSourcePhase,
@@ -2418,21 +2543,22 @@ async fn relay_frames_to_switch(
         // the table's parse supplies them — the same allocation-free,
         // bounds-checked read the in-VM relay's is.
         let l4 = dns_pins::parse_ipv4_l4(&frame[..n]);
-        let admitted = match gate_verdict(&summary, l4.as_ref(), table, baseline, pins, phase) {
-            Ok(admitted) => admitted,
-            Err(GateDrop::SwitchControlSurface { src, dst_port }) => {
-                limiter.warn_switch_surface(src, dst_port);
-                continue;
-            }
-            Err(GateDrop::Infrastructure { src, dst, dst_port }) => {
-                limiter.warn_infrastructure(src, dst, dst_port);
-                continue;
-            }
-            Err(dropped) => {
-                limiter.emit(summary.source(), dropped.rule());
-                continue;
-            }
-        };
+        let admitted =
+            match gate_verdict(&summary, l4.as_ref(), table, baseline, pins, flows, phase) {
+                Ok(admitted) => admitted,
+                Err(GateDrop::SwitchControlSurface { src, dst_port }) => {
+                    limiter.warn_switch_surface(src, dst_port);
+                    continue;
+                }
+                Err(GateDrop::Infrastructure { src, dst, dst_port }) => {
+                    limiter.warn_infrastructure(src, dst, dst_port);
+                    continue;
+                }
+                Err(dropped) => {
+                    limiter.emit(summary.source(), dropped.rule());
+                    continue;
+                }
+            };
         // The interim's admit is the one admission that owes a line: no row
         // bounded this frame, and the host must be able to see that it passed.
         if let GateAdmit::Unregistered { src } = admitted {
@@ -2467,6 +2593,20 @@ async fn relay_frames_to_switch(
         framed.extend_from_slice(&(n as u16).to_le_bytes());
         framed.extend_from_slice(&frame[..n]);
         switch.write_all(&framed).await?;
+        // The flow's own end, from the row's side: a FIN or RST the box sent
+        // to the gateway on a recorded tuple ends the entry, so the close
+        // either half of the connection makes releases the record the dial
+        // filled. Only an admitted frame ends it — the FIN is the box's own
+        // traffic on the flow, decided by the same verdict as every other
+        // frame, and one the gate refused never reached the switch to close
+        // anything — which is why this sits after the write.
+        if let Some(l4) = l4.as_ref()
+            && l4.proto == IPPROTO_TCP
+            && summary.destination() == Some(table.gateway())
+            && l4.tcp_flags & (TCP_FIN | TCP_RST) != 0
+        {
+            flows.end(ForwarderFlow::reply(l4));
+        }
         // The reply matching's other half: the box's own DNS query, one the
         // gate just admitted to the switch, is recorded as that box's
         // outstanding question, so the reply that answers it is the only kind
@@ -2637,22 +2777,24 @@ enum GateAdmit {
 ///
 /// Two destinations no row decides either, in every phase. The switch's own
 /// address ([`SWITCH_CONTROL_RULE`]) is refused for everything but TCP or UDP
-/// to the resolver's port, before the row's decision and the interim. And the
-/// §5.3 infrastructure deny set ([`INFRASTRUCTURE_RULE`]) is refused for
-/// every row, between the source's routing and the row's own rules: the set
-/// applies to every box-plane packet, CIDR-admitted direct-IP flows included,
-/// so a row's `allow_subnets` admits nothing in it — RFC 1918 under an
-/// explicit allowance excepted — and the pin arm a name-declaring row earns
-/// for its undeclared destinations never reaches it. The order is the
-/// contract: control surface, then the source (a baseline-decided node
-/// frame, a row, or the phase's unknown-source decision), then the
-/// infrastructure set, then the row's rules, then the pin arm.
+/// to the resolver's port and the reverse tuple of a live recorded forwarder
+/// flow, before the row's decision and the interim. And the §5.3
+/// infrastructure deny set ([`INFRASTRUCTURE_RULE`]) is refused for every
+/// row, between the source's routing and the row's own rules: the set applies
+/// to every box-plane packet, CIDR-admitted direct-IP flows included, so a
+/// row's `allow_subnets` admits nothing in it — RFC 1918 under an explicit
+/// allowance excepted — and the pin arm a name-declaring row earns for its
+/// undeclared destinations never reaches it. The order is the contract:
+/// control surface, then the source (a baseline-decided node frame, a row,
+/// or the phase's unknown-source decision), then the infrastructure set,
+/// then the row's rules, then the pin arm.
 fn gate_verdict(
     summary: &FrameSummary,
     l4: Option<&dns_pins::L4Packet>,
     table: &BoxTable,
     baseline: &NodePlaneBaseline,
     pins: &dns_pins::DnsPins,
+    flows: &ForwarderFlows,
     phase: UnregisteredSourcePhase,
 ) -> Result<GateAdmit, GateDrop> {
     let Some(src) = summary.source() else {
@@ -2673,26 +2815,33 @@ fn gate_verdict(
     // box's egress rules decide (design §4.1, §7.1). Every frame from a box
     // to the gateway — the address the resolver answers at, and the one
     // gvproxy's API listens on — is refused unless it is TCP or UDP to the
-    // resolver's port, whatever the rows and the phase would say about the
-    // rest of the frame: any other port, and any other protocol (ICMP has no
-    // port to carve out by), points at the switch itself. A row's admitted
-    // ports are no exception — they are the box's own ingress, what others
-    // reach on the box's address through the switch's forwarders, and no
-    // box-to-gateway flow at them exists. The check sits before the row's
-    // decision and before the interim, so no allow-all row and no announced
-    // concession can admit a frame at the switch's own address, and it reads
-    // no phase at all, so it binds unchanged when the per-box default binds.
-    // The resolver carve-out falls through to the decision behind this check
-    // — the row's own rules or the phase — which still decides it, so the
-    // carve-out admits exactly what it admitted before, and the refusal adds
-    // a ceiling without moving any floor.
+    // resolver's port, or the reply half of a connection the switch's
+    // forwarder opened to a row's admitted port, whatever the rows and the
+    // phase would say about the rest of the frame: any other port, and any
+    // other protocol (ICMP has no port to carve out by), points at the
+    // switch itself. A row's admitted ports are the box's own ingress — what
+    // others reach on the box's address through the switch's forwarders — and
+    // the one box-to-gateway flow they carry is exactly that reply half,
+    // admitted by the forwarder flow table's record of the dial alone, never
+    // by the port: a frame the box initiates to the gateway, from an
+    // admitted port or any other, has no record to match and stays refused.
+    // The check sits before the row's decision and before the interim, so no
+    // allow-all row and no announced concession can admit a frame at the
+    // switch's own address, and it reads no phase at all, so it binds
+    // unchanged when the per-box default binds. Both carve-outs fall through
+    // to the decision behind this check — the row's own rules or the phase —
+    // which still decides them, so the resolver carve-out admits exactly
+    // what it admitted before, the forwarder reply exactly what its row
+    // already admits its own frames by, and the refusal adds a ceiling
+    // without moving any floor.
     if summary.destination() == Some(table.gateway()) {
         let dst_port = summary.destination_port();
         let resolver_query = summary
             .protocol()
             .is_some_and(|proto| RESOLVER_PROTOCOLS.contains(&proto))
             && dst_port == RESOLVER_PORT;
-        if !resolver_query {
+        let forwarder_reply = l4.is_some_and(|l4| flows.admits_reply(l4, table, Instant::now()));
+        if !resolver_query && !forwarder_reply {
             return Err(GateDrop::SwitchControlSurface { src, dst_port });
         }
     }
@@ -2778,8 +2927,9 @@ fn gate_verdict(
 /// Why the gate dropped a frame: the shared verdict's reason, or one of the
 /// three classes the host table adds — a source address no published
 /// namespace holds (NET-081's failure case), a frame the switch's own address
-/// would have received on a port nothing published answers, and a frame
-/// headed into the infrastructure deny set.
+/// would have received that neither the resolver's port nor the reply half of
+/// a recorded forwarder flow names, and a frame headed into the infrastructure
+/// deny set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateDrop {
     /// The shared frame verdict dropped it: the namespace's own rules, its
@@ -2790,9 +2940,11 @@ enum GateDrop {
         /// The source address no namespace holds.
         src: [u8; 4],
     },
-    /// The frame named the switch's own address and was not a TCP or UDP
-    /// query to the resolver's port: the switch's control surface is not a
-    /// destination a box's egress rules decide ([`SWITCH_CONTROL_RULE`]).
+    /// The frame named the switch's own address and was neither a TCP or UDP
+    /// query to the resolver's port nor the reply half of a connection the
+    /// switch's forwarder opened to an admitted port: the switch's control
+    /// surface is not a destination a box's egress rules decide
+    /// ([`SWITCH_CONTROL_RULE`]).
     SwitchControlSurface {
         /// The source address the frame wore.
         src: [u8; 4],
@@ -3121,6 +3273,389 @@ impl DropLimiter {
                 true
             }
         }
+    }
+}
+
+/// Whether an Ethernet frame's IPv4 protocol byte says TCP — the ingress
+/// leg's pre-check before the forwarder flow table's parse, the same shape
+/// and reason [`dns_pins::is_ipv4_udp`] keeps: the EtherType and the one
+/// protocol byte, nothing else, so the frames the table can never observe —
+/// most of a box's downloads — cost a few comparisons instead of the
+/// bounds-checked parse. A frame that says TCP here is still parsed and
+/// length-checked before the table reads a word of it.
+fn is_ipv4_tcp(frame: &[u8]) -> bool {
+    frame
+        .get(12..14)
+        .is_some_and(|ether| *ether == ETHERTYPE_IPV4.to_be_bytes())
+        && frame
+            .get(ETH_HDR + 9)
+            .is_some_and(|proto| *proto == IPPROTO_TCP)
+}
+
+/// The identity of one connection the switch's forwarder opened to a
+/// published port — the exact 5-tuple the record keys and the reply must
+/// name in reverse: the gateway address the forwarder dialed from with its
+/// ephemeral source port, the row's address it dialed, and the admitted port
+/// it dialed at, over TCP — the one transport a forwarder flow is, so the
+/// protocol is the key's shape, not a field of it.
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+struct ForwarderFlow {
+    /// The plan's gateway — the address gvproxy's forwarder dials from, and
+    /// the one the control-surface refusal is keyed to.
+    gateway: [u8; 4],
+    /// The ephemeral port the forwarder's dial left from.
+    gateway_port: u16,
+    /// The published namespace's row the dial reached.
+    row: [u8; 4],
+    /// The port the dial reached — one of the row's admitted set at the
+    /// moment the record was made.
+    row_port: u16,
+}
+
+impl fmt::Display for ForwarderFlow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Spelled in the dial's direction — the direction the record was
+        // made in — so a line naming a flow names the connection it is.
+        write!(
+            f,
+            "{}:{} -> {}:{}",
+            Ipv4Addr::from(self.gateway),
+            self.gateway_port,
+            Ipv4Addr::from(self.row),
+            self.row_port
+        )
+    }
+}
+
+impl ForwarderFlow {
+    /// The flow a gateway-to-row dial names, read off the SYN the ingress
+    /// leg observed: the gateway's half the frame's source, the row's half
+    /// its destination.
+    fn dial(l4: &dns_pins::L4Packet) -> Self {
+        Self {
+            gateway: l4.src.ip().octets(),
+            gateway_port: l4.src.port(),
+            row: l4.dst.ip().octets(),
+            row_port: l4.dst.port(),
+        }
+    }
+
+    /// The flow a row's reply names in reverse: the gateway's half the
+    /// frame's destination — the exact tuple a recorded entry must match
+    /// for the reply to pass the control-surface check.
+    fn reply(l4: &dns_pins::L4Packet) -> Self {
+        Self {
+            gateway: l4.dst.ip().octets(),
+            gateway_port: l4.dst.port(),
+            row: l4.src.ip().octets(),
+            row_port: l4.src.port(),
+        }
+    }
+}
+
+/// The shared state behind every [`ForwarderFlows`] clone: the flows with
+/// their idle clocks, beside the cap's own two rate-limit instants, so the
+/// cap's work is claimed under the lock its insert already holds — the
+/// discipline [`dns_pins`]'s flow table keeps for its own bounds.
+struct ForwarderTable {
+    /// The recorded flows, each with the instant its last frame rode it
+    /// (the idle bound's clock).
+    flows: HashMap<ForwarderFlow, Instant>,
+    /// The instant of the last cap reclaim, `None` before the first: a
+    /// reclaim runs at most once per [`FORWARDER_FLOW_SWEEP_INTERVAL`],
+    /// never once per dial.
+    last_sweep: Option<Instant>,
+    /// The instant of the last at-cap `warn` line, `None` before the first:
+    /// the line is written at most once per
+    /// [`FORWARDER_FLOW_CAP_LINE_INTERVAL`].
+    last_cap_line: Option<Instant>,
+}
+
+impl ForwarderTable {
+    /// An empty table, before any forwarded connection was opened.
+    fn new() -> Self {
+        Self {
+            flows: HashMap::new(),
+            last_sweep: None,
+            last_cap_line: None,
+        }
+    }
+
+    /// Whether the cap's reclaim may run at `now`: at most once per
+    /// second, never once per dial — the reclaim walks every entry the
+    /// table holds, and under a flood of dials that is the difference
+    /// between bounded work and a walk per dial.
+    fn sweep_due(&self, now: Instant) -> bool {
+        self.last_sweep
+            .is_none_or(|at| now.duration_since(at) >= FORWARDER_FLOW_SWEEP_INTERVAL)
+    }
+
+    /// Ends `flow` by idleness and says so — the one `debug` line per flow
+    /// that expires, wherever the expiry was found: the lookup that found
+    /// the entry idle, or the cap's reclaim that swept it.
+    fn expire(&mut self, flow: ForwarderFlow) {
+        self.flows.remove(&flow);
+        tracing::debug!(flow = %flow, "forwarder flow expired; the gate refuses its replies again");
+    }
+
+    /// Claims the at-cap `warn` line for `now`: `true` exactly when no line
+    /// was written inside the last [`FORWARDER_FLOW_CAP_LINE_INTERVAL`],
+    /// recording this instant either way — the check-and-spend happens
+    /// under the table's lock, so two dials racing at the cap still write
+    /// at most one line per interval.
+    fn claim_cap_line(&mut self, now: Instant) -> bool {
+        let due = self
+            .last_cap_line
+            .is_none_or(|at| now.duration_since(at) >= FORWARDER_FLOW_CAP_LINE_INTERVAL);
+        if due {
+            self.last_cap_line = Some(now);
+        }
+        due
+    }
+}
+
+/// The gate's ledger of live forwarder flows (NET-081): one entry per
+/// connection the switch's forwarder opened to a published port, recorded
+/// by the ingress leg from the dial's SYN alone — a gateway-to-row TCP SYN
+/// whose destination port the row's admitted set held at that moment, never
+/// adopted from anything later in a stream — and consulted by the frame
+/// verdict's control-surface arm for exactly one class of frame: the box's
+/// reply on such a connection, admitted only as the exact reverse tuple of
+/// a live recorded flow, never by port. An entry ends on either side's FIN
+/// or RST, on the idle bound, and on revocation — a port leaving its row's
+/// admitted set, or the row's withdrawal with its shuttle connection — so
+/// the grant is the connection's, and nothing the box sends to the gateway
+/// on its own is ever admitted by it. Bounded and fail closed: past
+/// [`MAX_FORWARDER_FLOWS`] a new flow is refused rather than a live one
+/// evicted, and the refusal says so at the cap line's cadence.
+///
+/// Cheap to clone: every clone shares the same entries, and the handles the
+/// gate's two legs and its verdict hold are the one table. The table bound
+/// travels with the handle as a field, not a constant, only so the proofs
+/// can shrink it ([`Self::shrink_cap`]) — the production construction passes
+/// the constant's own value, and nothing outside the tests ever changes it.
+/// The idle bound stays a constant's: a recorded flow's end is proved by the
+/// clock arithmetic of an instant past it, never by a test waiting it out.
+#[derive(Clone)]
+struct ForwarderFlows {
+    /// The flows, their idle clocks and the cap's rate-limit instants.
+    inner: Arc<Mutex<ForwarderTable>>,
+    /// The idle bound on a recorded flow — a constant's value, held as a
+    /// field only so one comparison serves both halves of the ledger.
+    idle_cap: Duration,
+    /// The bound on the table itself, a test seam for the cap's proofs.
+    cap: usize,
+}
+
+impl ForwarderFlows {
+    /// An empty ledger, before any forwarded connection was opened: both
+    /// bounds at the constants' own values.
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ForwarderTable::new())),
+            idle_cap: FORWARDER_FLOW_IDLE_CAP,
+            cap: MAX_FORWARDER_FLOWS,
+        }
+    }
+
+    /// Records the flow a dial opened, or refreshes the one already
+    /// recorded: `false` exactly when the table was full of live flows and
+    /// refused the record — fail closed, evicting nothing, so the refusal
+    /// costs the new connection its replies and no old one its own.
+    fn record(&self, flow: ForwarderFlow, now: Instant) -> bool {
+        let mut table = self
+            .inner
+            .lock()
+            .expect("the forwarder flow table's lock is held only across this record");
+        // The same dial again — a retransmitted SYN, or the connection the
+        // entry already names: refresh its clock and be done.
+        if let Some(seen) = table.flows.get_mut(&flow) {
+            *seen = now;
+            return true;
+        }
+        // At the bound, first reclaim what idleness has already ended: the
+        // bound is on live flows, not on the table's high-water mark, so a
+        // table the sweep empties is not full. The sweep runs at most once
+        // per second, so a flood of dials buys one walk per second, not
+        // one per dial.
+        if table.flows.len() >= self.cap && table.sweep_due(now) {
+            let expired: Vec<ForwarderFlow> = table
+                .flows
+                .iter()
+                .filter(|(_, seen)| now.duration_since(**seen) >= self.idle_cap)
+                .map(|(flow, _)| *flow)
+                .collect();
+            for flow in expired {
+                table.expire(flow);
+            }
+            table.last_sweep = Some(now);
+        }
+        if table.flows.len() >= self.cap {
+            if table.claim_cap_line(now) {
+                tracing::warn!(
+                    live = table.flows.len(),
+                    max = self.cap,
+                    flow = %flow,
+                    "refused a new forwarder flow at the ledger's bound; the box's reply to it will be dropped",
+                );
+            }
+            return false;
+        }
+        table.flows.insert(flow, now);
+        // The one `debug` line per recorded flow: the record's own record,
+        // read at the cadence the daemon's filter is asked for when a
+        // forwarded connection is the thing under diagnosis.
+        tracing::debug!(flow = %flow, "forwarder flow recorded; the gate admits its replies by the tuple");
+        true
+    }
+
+    /// Whether a frame the box sent to the gateway is the reply half of a
+    /// recorded forwarder flow — TCP, the exact reverse tuple of a live
+    /// entry, from a row that still holds the entry's port in its admitted
+    /// set — refreshing the entry it admits. `false` for anything else: no
+    /// entry for the tuple, an entry idle past the bound (ended here, with
+    /// its line), an entry whose row no longer admits its port (ended
+    /// here: the revocation's present tense, so a port that left the row's
+    /// set drops the next reply frame, not the next sweep), or any frame
+    /// that is not TCP — UDP is out of the record's scope, and the
+    /// resolver's carve-out is the UDP half's own answer at the gateway.
+    fn admits_reply(&self, l4: &dns_pins::L4Packet, table: &BoxTable, now: Instant) -> bool {
+        if l4.proto != IPPROTO_TCP {
+            return false;
+        }
+        let flow = ForwarderFlow::reply(l4);
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("the forwarder flow table's lock is held only across this lookup");
+        match inner.flows.get(&flow) {
+            Some(seen) if now.duration_since(*seen) >= self.idle_cap => {
+                inner.expire(flow);
+                false
+            }
+            Some(_)
+                if !table
+                    .by_source(flow.row)
+                    .is_some_and(|record| record.admitted_ports().contains(&flow.row_port)) =>
+            {
+                // Live but revoked: the row at the flow's address no longer
+                // holds the port — a re-registration dropped it, or the row
+                // is gone entirely — so the entry ends with the grant, and
+                // the reply is the control-surface refusal's again.
+                inner.flows.remove(&flow);
+                false
+            }
+            // The exact reverse tuple of a live recorded flow: admitted,
+            // with the entry's clock refreshed — the box's own reply traffic
+            // is what keeps the entry from idleness.
+            Some(_) => {
+                inner.flows.insert(flow, now);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Ends the flow `flow`, if the table holds it: a FIN or RST one side
+    /// of the connection sent, so the close releases the record the dial
+    /// filled. Silent, by design — the record and the expiry are the two
+    /// lines a flow's life owes the log; the close is its normal end.
+    fn end(&self, flow: ForwarderFlow) {
+        self.inner
+            .lock()
+            .expect("the forwarder flow table's lock is held only across this end")
+            .flows
+            .remove(&flow);
+    }
+
+    /// Ends every flow a row in `sources` earned — the row's withdrawal,
+    /// filed beside the withdrawal report and the pins' retire when the
+    /// connection that carried the row's traffic ends: the grants a
+    /// withdrawn row's dials made go with the row, so a re-attachment
+    /// starts fail-closed and the next reply frame wearing its address is
+    /// the control-surface refusal's again.
+    fn retire(&self, sources: &[[u8; 4]]) {
+        if sources.is_empty() {
+            return;
+        }
+        self.inner
+            .lock()
+            .expect("the forwarder flow table's lock is held only across this retire")
+            .flows
+            .retain(|flow, _| !sources.contains(&flow.row));
+    }
+
+    /// How many flows the table holds live at `now` — the gauge of live
+    /// forwarder flows, the ledger's own observability beside the gate's
+    /// drop counters: entries idle past the bound are not live, whether or
+    /// not a lookup has ended them yet. Test-facing today, like the DNS
+    /// table's counters — the counter is maintained at the record and the
+    /// expiry in every build, and the status surface that would read it
+    /// needs a control verb, a follow-up.
+    #[cfg(test)]
+    #[must_use]
+    fn live(&self, now: Instant) -> usize {
+        self.inner
+            .lock()
+            .expect("the forwarder flow table's lock is held only across this read")
+            .flows
+            .values()
+            .filter(|seen| now.duration_since(**seen) < self.idle_cap)
+            .count()
+    }
+
+    /// The ingress leg's half of the ledger: the frame the switch sent
+    /// toward the guest, read for the one class of frame the ledger is
+    /// filled from and for the close of a flow it already holds. Everything
+    /// else is left alone: a frame from any source but the gateway is not
+    /// the switch's forwarder, a mid-stream frame adopts nothing (the
+    /// record is the dial's SYN alone), and a SYN to a port its row does
+    /// not admit — or to an address no row holds — records nothing, so the
+    /// box's reply to it never leaves the VM.
+    fn observe_gateway_dial(&self, table: &BoxTable, l4: &dns_pins::L4Packet, now: Instant) {
+        // Only the gateway's own dials: the address the switch's forwarder
+        // dials from, and the one the control-surface refusal is keyed to.
+        // Anything else — a sibling box reaching a box, the resolver
+        // answering over TCP — is not a forwarded connection, and the table
+        // reads no further word of it.
+        if l4.src.ip().octets() != table.gateway() {
+            return;
+        }
+        // The close comes before the record: a FIN or RST the gateway sent
+        // ends the entry the connection's tuple names, and a SYN carrying
+        // either is a close exactly where a connect could be misread into
+        // one.
+        if l4.tcp_flags & (TCP_FIN | TCP_RST) != 0 {
+            self.end(ForwarderFlow::dial(l4));
+            return;
+        }
+        // No adoption mid-stream: the record is the SYN's alone, so an
+        // established connection's data — or a bare ACK on a tuple the
+        // table has never seen — records nothing, and the box's reply to
+        // it stays the refusal's.
+        if l4.tcp_flags & TCP_SYN == 0 {
+            return;
+        }
+        // The row and its port, at the moment the dial arrived: a published
+        // namespace's row whose admitted set holds the port the dial
+        // reached — the same facts the publish half applies, read here
+        // because this is the host's own dial to a port the host published.
+        let Some(record) = table.by_source(l4.dst.ip().octets()) else {
+            return;
+        };
+        if !record.admitted_ports().contains(&l4.dst.port()) {
+            return;
+        }
+        self.record(ForwarderFlow::dial(l4), now);
+    }
+
+    /// Shrinks the table bound — a test hook for the proofs of the cap
+    /// itself: the shipped bound is far past what a test fills, and the
+    /// cap's own proofs read it from the refusal and the line, not from a
+    /// thousand records.
+    #[cfg(test)]
+    fn shrink_cap(&mut self, cap: usize) {
+        self.cap = cap;
     }
 }
 
@@ -3757,12 +4292,13 @@ mod tests {
     };
     use super::{
         AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb, DROP_WARN_MAX_TRACKED_PAIRS,
-        DROP_WARN_MIN_INTERVAL, DropLimiter, EgressGate, GateAdmit, GateDrop, GuestSource,
+        DROP_WARN_MIN_INTERVAL, DropLimiter, EgressGate, FORWARDER_FLOW_CAP_LINE_INTERVAL,
+        FORWARDER_FLOW_IDLE_CAP, ForwarderFlow, ForwarderFlows, GateAdmit, GateDrop, GuestSource,
         GuestSpeak, HANDSHAKE_TIMEOUT, MALFORMED_PUBLISH_RULE, MAX_HEAD, MAX_LIVE_RELAYS,
-        MAX_NAMED_TARGET, PublishedForwards, Record, UNDECLARED_PUBLISH_RECORD_RULE,
-        UNDECLARED_RETRACT_RULE, UNREGISTERED_PUBLISH_RULE, UNREGISTERED_SOURCE_PHASE,
-        UNREGISTERED_SOURCE_RULE, UnregisteredSourcePhase, WarnDecision, accept_loop, dns_pins,
-        gate_verdict, max_frame, render_record, serve_connection,
+        MAX_NAMED_TARGET, PublishedForwards, Record, TCP_FIN, TCP_RST, TCP_SYN,
+        UNDECLARED_PUBLISH_RECORD_RULE, UNDECLARED_RETRACT_RULE, UNREGISTERED_PUBLISH_RULE,
+        UNREGISTERED_SOURCE_PHASE, UNREGISTERED_SOURCE_RULE, UnregisteredSourcePhase, WarnDecision,
+        accept_loop, dns_pins, gate_verdict, max_frame, render_record, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
     use crate::net::baseline::{BaselineCategory, NodeBaselinePhase, NodePlaneBaseline};
@@ -3976,6 +4512,826 @@ mod tests {
             logged.contains("port=443"),
             "the drop line carries the port the frame named, got: {logged}"
         );
+    }
+
+    /// NET-059's one box-to-gateway flow, through the control-surface check:
+    /// the reply half of a connection the switch's forwarder opened to a row's
+    /// admitted port, admitted by the forwarder flow table's record of the
+    /// dial — its exact 5-tuple in reverse — and never by the port. The node
+    /// row stands in for the shape the proof runs through
+    /// ([`BoxRegistry::register_node_namespace`], the published hostname
+    /// proxy): allow-all egress, so the fall-through behind the carve-out is
+    /// the row's own admit. A declared-subnets row pins the other half of the
+    /// carve-out's size: the record lifts the control-surface refusal and
+    /// nothing else, so the row still decides the reply, exactly as the in-VM
+    /// verdict already refused it before it could ever reach the host.
+    #[test]
+    fn gate_verdict_admits_forwarder_reply_from_admitted_port() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654, 7656);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let flows = ForwarderFlows::new();
+        let gateway = SUBNET.gateway();
+        let node = SUBNET.daemon_ip();
+        let now = Instant::now();
+
+        // The forwarder's dial — the SYN the ingress leg reads the record
+        // from, a gateway-to-row TCP SYN to a port the row's admitted set
+        // holds — and the reply the box sends back on that connection: the
+        // node's proxy answering the host's own request.
+        let dial = dns_pins::tests::tcp_frame(gateway, 51000, node, 7654, TCP_SYN);
+        let dial_l4 = dns_pins::parse_ipv4_l4(&dial).expect("the dial parses as IPv4 TCP");
+        flows.observe_gateway_dial(&table, &dial_l4, now);
+        let reply = dns_pins::tests::tcp_frame(node, 7654, gateway, 51000, 0x10);
+        let reply_l4 = dns_pins::parse_ipv4_l4(&reply).expect("the reply parses as IPv4 TCP");
+        let reply_summary = sessions::core::egress::summarize(&reply);
+        assert_eq!(
+            gate_verdict(
+                &reply_summary,
+                Some(&reply_l4),
+                &table,
+                &baseline,
+                &pins,
+                &flows,
+                UNREGISTERED_SOURCE_PHASE
+            ),
+            Ok(GateAdmit::Row),
+            "the reply to the forwarder's dial is admitted — past the \
+             control-surface check by the recorded tuple, then by the node \
+             row's own rules"
+        );
+
+        // Never by port: the same row's other admitted port, the answerer's,
+        // carries no record — the reply half of a connection that never
+        // happened is the control-surface refusal's.
+        let other_admitted = dns_pins::tests::tcp_frame(node, 7656, gateway, 51000, 0x10);
+        let other_l4 = dns_pins::parse_ipv4_l4(&other_admitted).expect("the frame parses");
+        let other_summary = sessions::core::egress::summarize(&other_admitted);
+        assert_eq!(
+            gate_verdict(
+                &other_summary,
+                Some(&other_l4),
+                &table,
+                &baseline,
+                &pins,
+                &flows,
+                UNREGISTERED_SOURCE_PHASE
+            ),
+            Err(GateDrop::SwitchControlSurface {
+                src: node.octets(),
+                dst_port: 51000
+            }),
+            "an admitted port with no recorded dial behind it buys no \
+             box-to-gateway flow"
+        );
+
+        // And not by the tuple's other half either: the gateway port is the
+        // record's, the row port is not.
+        let other_row_port = dns_pins::tests::tcp_frame(node, 7654, gateway, 51001, 0x10);
+        let other_port_l4 = dns_pins::parse_ipv4_l4(&other_row_port).expect("the frame parses");
+        let other_port_summary = sessions::core::egress::summarize(&other_row_port);
+        assert_eq!(
+            gate_verdict(
+                &other_port_summary,
+                Some(&other_port_l4),
+                &table,
+                &baseline,
+                &pins,
+                &flows,
+                UNREGISTERED_SOURCE_PHASE
+            ),
+            Err(GateDrop::SwitchControlSurface {
+                src: node.octets(),
+                dst_port: 51001
+            }),
+            "the record keys the whole tuple; the row port alone never matches"
+        );
+
+        // The carve-out lifts the control-surface refusal and nothing else:
+        // the row's own rules still decide the reply behind it, so a box that
+        // declared its reach — and did not declare the gateway — is refused by
+        // its row, the same refusal its own frames take. The in-VM verdict
+        // refuses such a reply before it ever reaches the host (it has no
+        // forwarder carve-out), so the host agreeing is parity, not a second
+        // opinion.
+        let web = [100, 64, 0, 20];
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(web), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: Some(vec![sessions::IpProto::Tcp]),
+                    allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                    allow_dns_hosts: None,
+                    deny_subnets: None,
+                }),
+        );
+        let web_dial =
+            dns_pins::tests::tcp_frame(gateway, 51000, Ipv4Addr::from(web), 8080, TCP_SYN);
+        let web_dial_l4 = dns_pins::parse_ipv4_l4(&web_dial).expect("the dial parses");
+        flows.observe_gateway_dial(&table, &web_dial_l4, now);
+        let web_reply = dns_pins::tests::tcp_frame(Ipv4Addr::from(web), 8080, gateway, 51000, 0x10);
+        let web_reply_l4 = dns_pins::parse_ipv4_l4(&web_reply).expect("the reply parses");
+        let web_summary = sessions::core::egress::summarize(&web_reply);
+        assert_eq!(
+            gate_verdict(
+                &web_summary,
+                Some(&web_reply_l4),
+                &table,
+                &baseline,
+                &pins,
+                &flows,
+                UNREGISTERED_SOURCE_PHASE
+            ),
+            Err(GateDrop::Verdict(DropReason::UndeclaredSubnet {
+                dst: gateway.octets(),
+                proto: 6,
+            })),
+            "the record passed the control-surface check; the row's own \
+             rules still refused the reply, exactly as they would any other \
+             frame to a destination it did not declare"
+        );
+    }
+
+    /// The other half of the control-surface rule's own text: a frame the
+    /// box sends to the gateway **on its own** — a dial, an established
+    /// connection's data, anything — is refused, whatever port it leaves
+    /// from, its row's admitted ports included. The record is the
+    /// forwarder's dial's alone; nothing the box transmits toward the
+    /// gateway ever fills it, so the row's published ports buy no reach in
+    /// the other direction.
+    #[test]
+    fn gate_verdict_refuses_gateway_dial_from_admitted_port_without_inbound_flow() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
+        registry.register_node_namespace(7654, 7656);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let flows = ForwarderFlows::new();
+        let gateway = SUBNET.gateway();
+        let node = SUBNET.daemon_ip();
+
+        // The box's own dial to the gateway, from the very port it publishes:
+        // the forwarder's dial carried SYN-wise, but dialed by the box, toward
+        // the gateway — no inbound flow behind it, so the refusal's.
+        let box_dial =
+            dns_pins::tests::tcp_frame(Ipv4Addr::from(LEASE), 8080, gateway, 52000, TCP_SYN);
+        let box_dial_l4 = dns_pins::parse_ipv4_l4(&box_dial).expect("the dial parses");
+        let box_dial_summary = sessions::core::egress::summarize(&box_dial);
+        assert_eq!(
+            gate_verdict(
+                &box_dial_summary,
+                Some(&box_dial_l4),
+                &table,
+                &baseline,
+                &pins,
+                &flows,
+                UNREGISTERED_SOURCE_PHASE
+            ),
+            Err(GateDrop::SwitchControlSurface {
+                src: LEASE,
+                dst_port: 52000
+            }),
+            "a box-initiated SYN to the gateway, from its own admitted \
+             port, is the control-surface refusal's"
+        );
+
+        // The node's own, from its published proxy port: the row the
+        // forwarder's dials reach is not an exception to the rule the
+        // forwarder's dials had to be carved out of.
+        let node_dial = dns_pins::tests::tcp_frame(node, 7654, gateway, 52001, TCP_SYN);
+        let node_dial_l4 = dns_pins::parse_ipv4_l4(&node_dial).expect("the dial parses");
+        let node_dial_summary = sessions::core::egress::summarize(&node_dial);
+        assert_eq!(
+            gate_verdict(
+                &node_dial_summary,
+                Some(&node_dial_l4),
+                &table,
+                &baseline,
+                &pins,
+                &flows,
+                UNREGISTERED_SOURCE_PHASE
+            ),
+            Err(GateDrop::SwitchControlSurface {
+                src: node.octets(),
+                dst_port: 52001
+            }),
+            "the node row's own published port is its ingress, not its \
+             reach toward the gateway"
+        );
+
+        // An established-connection shape — a bare ACK, the mid-stream frame
+        // an attacker inside the VM could send to look like a reply — is
+        // refused with the rest: the table holds no record for it to match.
+        let box_ack = dns_pins::tests::tcp_frame(Ipv4Addr::from(LEASE), 8080, gateway, 52000, 0x10);
+        let box_ack_l4 = dns_pins::parse_ipv4_l4(&box_ack).expect("the frame parses");
+        let box_ack_summary = sessions::core::egress::summarize(&box_ack);
+        assert_eq!(
+            gate_verdict(
+                &box_ack_summary,
+                Some(&box_ack_l4),
+                &table,
+                &baseline,
+                &pins,
+                &flows,
+                UNREGISTERED_SOURCE_PHASE
+            ),
+            Err(GateDrop::SwitchControlSurface {
+                src: LEASE,
+                dst_port: 52000
+            }),
+            "no inbound flow stood behind the tuple, so nothing the box \
+             sends to the gateway on it is a reply"
+        );
+
+        // And none of it filled the ledger: the refusals recorded nothing,
+        // so the next frame faces the same empty table.
+        assert_eq!(
+            flows.live(Instant::now()),
+            0,
+            "no box-initiated frame toward the gateway ever filled the \
+             forwarder flow table"
+        );
+    }
+
+    /// A recorded flow's ends and the table's bound ([`ForwarderFlows`]): the
+    /// idle bound ends an entry the same instant a reply lookup finds it
+    /// idle — with its own `debug` line — so the grant is the connection's,
+    /// not a standing fact of the row; and the table's cap is on live flows,
+    /// so the bound's reclaim of idle entries keeps a full table from
+    /// refusing a fresh connection whose place idleness had already freed.
+    /// The gauge of live flows ([`ForwarderFlows::live`]) reads the same
+    /// boundary: an entry idle past the bound is not live, whether or not a
+    /// lookup has ended it yet.
+    #[test]
+    fn forwarder_flow_expires_and_table_is_bounded() {
+        // The capture reads at DEBUG — the harness's reads at INFO and would
+        // never see the two lines a flow's life owes the log.
+        let log = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654, 7656);
+        let table = registry.table();
+        let mut flows = ForwarderFlows::new();
+        let gateway = SUBNET.gateway();
+        let node = SUBNET.daemon_ip();
+        let now = Instant::now();
+
+        // Two dials the forwarder opened, recorded from their SYNs, one
+        // `debug` line each.
+        let mut reply_l4s = Vec::new();
+        for (gateway_port, row_port) in [(51000u16, 7654u16), (51001, 7656)] {
+            let dial = dns_pins::tests::tcp_frame(gateway, gateway_port, node, row_port, TCP_SYN);
+            let dial_l4 = dns_pins::parse_ipv4_l4(&dial).expect("the dial parses");
+            flows.observe_gateway_dial(&table, &dial_l4, now);
+            let reply = dns_pins::tests::tcp_frame(node, row_port, gateway, gateway_port, 0x10);
+            reply_l4s.push(dns_pins::parse_ipv4_l4(&reply).expect("the reply parses"));
+        }
+        assert_eq!(
+            flows.live(now),
+            2,
+            "both recorded flows are live the moment they were recorded"
+        );
+        assert_eq!(
+            log.contents().matches("forwarder flow recorded").count(),
+            2,
+            "one debug line per recorded flow, got: {}",
+            log.contents()
+        );
+
+        // The idle bound: past it, the lookup that finds the entry idle ends
+        // it, with its own line — and the reply is the refusal's again.
+        let later = now + FORWARDER_FLOW_IDLE_CAP + Duration::from_millis(1);
+        assert!(
+            !flows.admits_reply(&reply_l4s[0], &table, later),
+            "past the idle bound the record no longer admits the reply"
+        );
+        assert!(
+            !flows.admits_reply(&reply_l4s[0], &table, later),
+            "the entry ended at the first lookup, not refreshed by it: the \
+             second lookup finds nothing"
+        );
+        assert_eq!(
+            log.contents().matches("forwarder flow expired").count(),
+            1,
+            "one debug line per expired flow, got: {}",
+            log.contents()
+        );
+
+        // The bound is on live flows: the table still holds the second,
+        // idle, entry — and the gauge says so — while the first record's
+        // end left the second nothing to be admitted by.
+        assert_eq!(
+            flows.live(later),
+            0,
+            "the gauge counts live entries only: the idle one the lookup \
+             left behind is not live"
+        );
+        assert!(
+            !flows.admits_reply(&reply_l4s[1], &table, later),
+            "the idle entry past the bound admits no reply either"
+        );
+        assert_eq!(
+            log.contents().matches("forwarder flow expired").count(),
+            2,
+            "each lookup that found an entry idle ended it with its own \
+             line, got: {}",
+            log.contents()
+        );
+
+        // The bound's reclaim: at the cap, a new record first reclaims what
+        // idleness has already ended, so a table full of **idle** entries is
+        // not full — the bound is on live flows. Two dials fill a bound of
+        // two at `now`, age past the bound by `later`, and the third dial's
+        // record is kept: the sweep the bound triggers empties their place
+        // for it, with the same line the lookup's expiry wrote.
+        flows.shrink_cap(2);
+        let mut expired_by_sweep = Vec::new();
+        for gateway_port in [51002u16, 51003] {
+            let dial = dns_pins::tests::tcp_frame(gateway, gateway_port, node, 7654, TCP_SYN);
+            let dial_l4 = dns_pins::parse_ipv4_l4(&dial).expect("the dial parses");
+            flows.observe_gateway_dial(&table, &dial_l4, now);
+            expired_by_sweep.push(dial_l4);
+        }
+        let reclaimed = dns_pins::tests::tcp_frame(gateway, 51004, node, 7654, TCP_SYN);
+        let reclaimed_l4 = dns_pins::parse_ipv4_l4(&reclaimed).expect("the dial parses");
+        flows.observe_gateway_dial(&table, &reclaimed_l4, later);
+        assert_eq!(
+            log.contents().matches("forwarder flow expired").count(),
+            4,
+            "the cap's reclaim ended the two idle entries it swept with the \
+             same line the lookups' expiries did, got: {}",
+            log.contents()
+        );
+        assert_eq!(
+            log.contents().matches("forwarder flow recorded").count(),
+            5,
+            "every record the table kept said so, the reclaimed dial's \
+             among them: two pairs recorded at `now`, the one the reclaim \
+             made room for at `later`, got: {}",
+            log.contents()
+        );
+        let reclaimed_reply = dns_pins::tests::tcp_frame(node, 7654, gateway, 51004, 0x10);
+        let reclaimed_reply_l4 =
+            dns_pins::parse_ipv4_l4(&reclaimed_reply).expect("the reply parses");
+        assert!(
+            flows.admits_reply(&reclaimed_reply_l4, &table, later),
+            "the record the reclaim made room for is live and admits its \
+             reply"
+        );
+        for dial_l4 in expired_by_sweep {
+            let gateway_port = dial_l4.src.port();
+            let reply = dns_pins::tests::tcp_frame(node, 7654, gateway, gateway_port, 0x10);
+            let reply_l4 = dns_pins::parse_ipv4_l4(&reply).expect("the reply parses");
+            assert!(
+                !flows.admits_reply(&reply_l4, &table, later),
+                "the swept entry admits nothing: the bound reclaimed it, \
+                 the lookup that follows refuses its reply"
+            );
+        }
+        assert_eq!(
+            flows.live(later),
+            1,
+            "the bound now holds one live record: the two idle ones were \
+             reclaimed for it"
+        );
+    }
+
+    /// The table's bound fails closed ([`ForwarderFlows::record`]): full of
+    /// **live** flows it refuses a new one rather than evicting any, so the
+    /// refusal costs the new connection its replies and no live one its own;
+    /// and the refusal says so, rate-limited — one `warn` line per interval,
+    /// naming the bound, the live count and the flow it refused — so a host
+    /// holding the ledger at its bound stays readable instead of writing a
+    /// line per connection it refuses.
+    #[test]
+    fn forwarder_flow_table_full_refuses_new_flow() {
+        // The capture reads at the daemon's own filter: the refusal's line
+        // is a `warn`, visible without asking for DEBUG.
+        let log = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654, 7656);
+        let table = registry.table();
+        let mut flows = ForwarderFlows::new();
+        flows.shrink_cap(2);
+        let gateway = SUBNET.gateway();
+        let node = SUBNET.daemon_ip();
+        let now = Instant::now();
+
+        // Two live dials fill the bound.
+        let mut live_flows = Vec::new();
+        for gateway_port in [51000u16, 51001] {
+            let dial = dns_pins::tests::tcp_frame(gateway, gateway_port, node, 7654, TCP_SYN);
+            let dial_l4 = dns_pins::parse_ipv4_l4(&dial).expect("the dial parses");
+            let flow = ForwarderFlow::dial(&dial_l4);
+            assert!(
+                flows.record(flow, now),
+                "the dial's record is kept inside the bound"
+            );
+            live_flows.push((flow, gateway_port));
+        }
+
+        // The third dial's record is refused — the table is full of live
+        // flows, and the refusal evicts none of them.
+        let refused_port = 51002;
+        let refused = dns_pins::tests::tcp_frame(gateway, refused_port, node, 7654, TCP_SYN);
+        let refused_l4 = dns_pins::parse_ipv4_l4(&refused).expect("the dial parses");
+        assert!(
+            !flows.record(ForwarderFlow::dial(&refused_l4), now),
+            "at the bound of live flows the new record is refused, not \
+             squeezed in"
+        );
+
+        // The refusal's cost is the refused connection's alone: its reply is
+        // the control-surface refusal's, while both live records still
+        // admit theirs.
+        let refused_reply = dns_pins::tests::tcp_frame(node, 7654, gateway, refused_port, 0x10);
+        let refused_reply_l4 = dns_pins::parse_ipv4_l4(&refused_reply).expect("the reply parses");
+        assert!(
+            !flows.admits_reply(&refused_reply_l4, &table, now),
+            "the refused flow's reply is dropped with the flow"
+        );
+        for (flow, gateway_port) in live_flows.iter().copied() {
+            assert!(
+                flows.admits_reply(
+                    &dns_pins::parse_ipv4_l4(&dns_pins::tests::tcp_frame(
+                        node,
+                        7654,
+                        gateway,
+                        gateway_port,
+                        0x10
+                    ))
+                    .expect("the reply parses"),
+                    &table,
+                    now
+                ),
+                "the live record {flow} still admits its reply: the bound \
+                 evicted nothing"
+            );
+        }
+
+        // The line the refusal wrote: one `warn`, naming the bound, the live
+        // count and the flow it refused — never one per refusal.
+        let cap_line = "refused a new forwarder flow at the ledger's bound";
+        let logged = log.contents();
+        assert!(
+            logged.contains(cap_line)
+                && logged.contains(&format!("max={}", 2))
+                && logged.contains(&format!("live={}", 2))
+                && logged.contains(&format!("flow={}:{}", gateway, refused_port)),
+            "the at-cap line names the bound, the live count and the refused \
+             flow, got: {logged}"
+        );
+        let refused_fourth = dns_pins::tests::tcp_frame(gateway, 51003, node, 7654, TCP_SYN);
+        let refused_fourth_l4 = dns_pins::parse_ipv4_l4(&refused_fourth).expect("the dial parses");
+        assert!(
+            !flows.record(ForwarderFlow::dial(&refused_fourth_l4), now),
+            "the second at-cap dial is refused with the first"
+        );
+        assert_eq!(
+            log.contents().matches(cap_line).count(),
+            1,
+            "two refusals inside one interval make one line, got: {}",
+            log.contents()
+        );
+
+        // Past the line's interval the next refusal says so again — the rate
+        // limiter bounds the line, it does not silence the state after the
+        // first one.
+        let past_line = now + FORWARDER_FLOW_CAP_LINE_INTERVAL;
+        let refused_fifth = dns_pins::tests::tcp_frame(gateway, 51004, node, 7654, TCP_SYN);
+        let refused_fifth_l4 = dns_pins::parse_ipv4_l4(&refused_fifth).expect("the dial parses");
+        assert!(
+            !flows.record(ForwarderFlow::dial(&refused_fifth_l4), past_line),
+            "the table still full of live flows still refuses"
+        );
+        assert_eq!(
+            log.contents().matches(cap_line).count(),
+            2,
+            "the line is rate-limited, not said once ever, got: {}",
+            log.contents()
+        );
+    }
+
+    /// Revocation ends a recorded flow with the grant ([`ForwarderFlows`]):
+    /// a port leaving its row's admitted set — a re-registration without
+    /// it — or the row's withdrawal ends the entry, so the next reply frame
+    /// wearing the row's address is the control-surface refusal's again,
+    /// the moment the fact it was admitted by is gone, not at the next
+    /// sweep. The drop the relay makes is the verdict's own
+    /// ([`GateDrop::SwitchControlSurface`]), the same one an unsolicited
+    /// frame takes.
+    #[test]
+    fn forwarder_reply_dropped_after_admitted_port_withdrawn() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080, 9090]),
+        );
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let flows = ForwarderFlows::new();
+        let gateway = SUBNET.gateway();
+        let web = Ipv4Addr::from(LEASE);
+        let now = Instant::now();
+
+        // The forwarder's dial to a published port, recorded from its SYN,
+        // and the reply it admits.
+        let dial = dns_pins::tests::tcp_frame(gateway, 51000, web, 8080, TCP_SYN);
+        let dial_l4 = dns_pins::parse_ipv4_l4(&dial).expect("the dial parses");
+        flows.observe_gateway_dial(&table, &dial_l4, now);
+        let reply = dns_pins::tests::tcp_frame(web, 8080, gateway, 51000, 0x10);
+        let reply_l4 = dns_pins::parse_ipv4_l4(&reply).expect("the reply parses");
+        let reply_summary = sessions::core::egress::summarize(&reply);
+        assert_eq!(
+            gate_verdict(
+                &reply_summary,
+                Some(&reply_l4),
+                &table,
+                &baseline,
+                &pins,
+                &flows,
+                UNREGISTERED_SOURCE_PHASE
+            ),
+            Ok(GateAdmit::Row),
+            "the recorded flow admits its reply while the row holds the port"
+        );
+
+        // The port leaves the row's admitted set — the row re-registered
+        // without it, the shape a re-publish of a narrower declaration is.
+        // The grant went with the port: the next reply frame is the refusal's
+        // again, and the entry is gone rather than left to age out.
+        registry.register(
+            BoxRegistration::new("web", web, Ipv4Addr::LOCALHOST).with_admitted_ports([9090]),
+        );
+        assert_eq!(
+            gate_verdict(
+                &reply_summary,
+                Some(&reply_l4),
+                &table,
+                &baseline,
+                &pins,
+                &flows,
+                UNREGISTERED_SOURCE_PHASE
+            ),
+            Err(GateDrop::SwitchControlSurface {
+                src: LEASE,
+                dst_port: 51000
+            }),
+            "the reply is the control-surface refusal's again the moment the \
+             port left the row's admitted set"
+        );
+        assert_eq!(
+            flows.live(now),
+            0,
+            "the revoked entry was purged, not left to age out: the gauge \
+             reads no live grant for the withdrawn port"
+        );
+
+        // The row's withdrawal retires its flows the same way: the ports
+        // back, a fresh dial recorded, and then the row goes — the relay's
+        // own end-of-connection retire ([`ForwarderFlows::retire`]) — and
+        // the grant goes with it.
+        registry.register(
+            BoxRegistration::new("web", web, Ipv4Addr::LOCALHOST).with_admitted_ports([8080, 9090]),
+        );
+        let second_dial = dns_pins::tests::tcp_frame(gateway, 51001, web, 9090, TCP_SYN);
+        let second_dial_l4 = dns_pins::parse_ipv4_l4(&second_dial).expect("the dial parses");
+        flows.observe_gateway_dial(&table, &second_dial_l4, now);
+        let second_reply = dns_pins::tests::tcp_frame(web, 9090, gateway, 51001, 0x10);
+        let second_reply_l4 = dns_pins::parse_ipv4_l4(&second_reply).expect("the reply parses");
+        assert!(
+            flows.admits_reply(&second_reply_l4, &table, now),
+            "the fresh dial's record is live and admits its reply"
+        );
+        flows.retire(&[LEASE]);
+        assert!(
+            !flows.admits_reply(&second_reply_l4, &table, now),
+            "the row's withdrawal ended the grants its dials made"
+        );
+        assert_eq!(
+            flows.live(now),
+            0,
+            "the retire left no live grant for the withdrawn row"
+        );
+    }
+
+    /// No adoption mid-stream ([`ForwarderFlows::observe_gateway_dial`]): the
+    /// record is the dial's SYN alone. An established connection's data — or
+    /// a bare ACK on a tuple the table has never seen — records nothing, so
+    /// the reply the box sends back on it stays the refusal's; a SYN from
+    /// anywhere but the gateway is not the forwarder's dial; a SYN to a port
+    /// the row does not admit, or to an address no row holds, records
+    /// nothing either. And the close the gateway sends ends what the dial
+    /// recorded: FIN or RST, either spelling of the connection's end.
+    #[test]
+    fn forwarder_flow_not_adopted_mid_stream() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654, 7656);
+        let table = registry.table();
+        let flows = ForwarderFlows::new();
+        let gateway = SUBNET.gateway();
+        let node = SUBNET.daemon_ip();
+        let now = Instant::now();
+
+        // Every frame that must not fill the table, each observed exactly as
+        // the ingress leg would observe it.
+        let stray = [100, 64, 0, 99];
+        let non_adoptions = [
+            // Mid-stream: an established connection's data, a bare ACK the
+            // gateway sent to the row's admitted port.
+            (
+                dns_pins::tests::tcp_frame(gateway, 51000, node, 7654, 0x10),
+                "an established connection's frame from the gateway",
+            ),
+            // A SYN from anywhere but the gateway — a sibling box reaching
+            // the row, the resolver answering over TCP — is not the
+            // forwarder.
+            (
+                dns_pins::tests::tcp_frame(Ipv4Addr::from(LEASE), 40000, node, 7654, TCP_SYN),
+                "a SYN from a sibling box's address",
+            ),
+            // A SYN to a port the row does not admit.
+            (
+                dns_pins::tests::tcp_frame(gateway, 51000, node, 7000, TCP_SYN),
+                "a SYN to a port the row does not admit",
+            ),
+            // A SYN to an address no row holds.
+            (
+                dns_pins::tests::tcp_frame(gateway, 51000, Ipv4Addr::from(stray), 7654, TCP_SYN),
+                "a SYN to an address no row holds",
+            ),
+        ];
+        for (frame, what) in non_adoptions {
+            let l4 = dns_pins::parse_ipv4_l4(&frame).expect("the frame parses");
+            flows.observe_gateway_dial(&table, &l4, now);
+            assert_eq!(flows.live(now), 0, "{what} recorded no forwarder flow");
+            let reply = dns_pins::tests::tcp_frame(node, 7654, gateway, 51000, 0x10);
+            let reply_l4 = dns_pins::parse_ipv4_l4(&reply).expect("the reply parses");
+            assert!(
+                !flows.admits_reply(&reply_l4, &table, now),
+                "and no reply on the tuple the {what} named is admitted"
+            );
+        }
+
+        // The control: the dial's own SYN is the one frame that records.
+        let dial = dns_pins::tests::tcp_frame(gateway, 51000, node, 7654, TCP_SYN);
+        let dial_l4 = dns_pins::parse_ipv4_l4(&dial).expect("the dial parses");
+        flows.observe_gateway_dial(&table, &dial_l4, now);
+        assert_eq!(flows.live(now), 1, "the dial's SYN recorded its flow");
+
+        // The close the gateway sends ends it, in either spelling: a FIN
+        // ends one connection, an RST the next.
+        let fin = dns_pins::tests::tcp_frame(gateway, 51000, node, 7654, TCP_FIN);
+        let fin_l4 = dns_pins::parse_ipv4_l4(&fin).expect("the close parses");
+        flows.observe_gateway_dial(&table, &fin_l4, now);
+        assert_eq!(
+            flows.live(now),
+            0,
+            "the gateway's FIN ended the recorded flow"
+        );
+        let dial_again = dns_pins::tests::tcp_frame(gateway, 51001, node, 7656, TCP_SYN);
+        let dial_again_l4 = dns_pins::parse_ipv4_l4(&dial_again).expect("the dial parses");
+        flows.observe_gateway_dial(&table, &dial_again_l4, now);
+        let reset = dns_pins::tests::tcp_frame(gateway, 51001, node, 7656, TCP_RST);
+        let reset_l4 = dns_pins::parse_ipv4_l4(&reset).expect("the close parses");
+        flows.observe_gateway_dial(&table, &reset_l4, now);
+        assert_eq!(
+            flows.live(now),
+            0,
+            "the gateway's RST ended the recorded flow the FIN's way"
+        );
+    }
+
+    /// The proof's own path, end to end through a live relay (NET-059): a
+    /// host request reaches the node's published hostname proxy through the
+    /// switch's forwarder — a dial the switch makes from the gateway to the
+    /// proxy's admitted port — and the proxy's answer is the box-to-gateway
+    /// frame the gate must carry for the request to ever get its reply. The
+    /// dial itself rides the ingress leg unheld; the answer passes the
+    /// control-surface check by the record the dial's SYN filled; a frame
+    /// the node sends to the gateway on its own, from the same published
+    /// port, is still refused; and the connection's own close — the FIN the
+    /// proxy sends back — releases the record, so nothing behind the
+    /// connection outlives it.
+    #[tokio::test]
+    async fn node_proxy_reply_to_forwarder_reaches_switch() {
+        // The run path's own registration: the allow-all node row at the
+        // daemon's address with the two ports the boot line hands the guest
+        // daemon.
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654, 7656);
+        let mut h = gate_over(registry).await;
+        let gateway = SUBNET.gateway();
+        let node = SUBNET.daemon_ip();
+        let ephemeral = 51000;
+
+        // Before any dial: a frame the node sends to the gateway on its own,
+        // from the very port the forwarder will reach, is the control-surface
+        // refusal's — no connection the forwarder opened stands behind it.
+        // The marker behind it proves the gate decided it and that the node
+        // row itself admits the node's frames.
+        let unsolicited = dns_pins::tests::tcp_frame(node, 7654, gateway, ephemeral, 0x10);
+        let marker =
+            dns_pins::tests::tcp_frame(node, 7654, Ipv4Addr::new(203, 0, 113, 7), 8080, 0x10);
+        send_frame(&mut h.guest, &unsolicited).await;
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the node row's own frame to an outside destination arrives; the \
+             unsolicited frame to the gateway does not"
+        );
+        expect_silence(&mut h.switch).await;
+        wait_for_log(&h.log, "egress-switch-control-surface").await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains(&format!("source={}", node))
+                && logged.contains(&format!("port={ephemeral}")),
+            "the drop line names the node's address and the gateway port it \
+             reached for, got: {logged}"
+        );
+
+        // The forwarder's dial: the switch writes the SYN toward the guest,
+        // the ingress leg reads it and records the flow, and the dial
+        // reaches the guest in full.
+        let dial = dns_pins::tests::tcp_frame(gateway, ephemeral, node, 7654, TCP_SYN);
+        send_frame(&mut h.switch, &dial).await;
+        assert_eq!(
+            expect_frame(&mut h.guest).await,
+            dial,
+            "the forwarder's dial reaches the guest, byte for byte"
+        );
+
+        // The proxy's answer — the exact frame that was the refusal's a
+        // moment before — is admitted now, by the record the dial's SYN
+        // filled, and reaches the switch: the host request gets its reply.
+        let answer = dns_pins::tests::tcp_frame(node, 7654, gateway, ephemeral, 0x10);
+        send_frame(&mut h.guest, &answer).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            answer,
+            "the node proxy's reply to the forwarder's connection reaches \
+             the switch, by the recorded tuple"
+        );
+
+        // Never by port: the same published port, a different connection at
+        // the gateway — no record names the tuple, so the frame is the
+        // refusal's, and the limiter holds the second drop to the first's
+        // window, one line per source per rule per interval.
+        let other_tuple = dns_pins::tests::tcp_frame(node, 7654, gateway, 51999, 0x10);
+        let second_marker =
+            dns_pins::tests::tcp_frame(node, 7654, Ipv4Addr::new(203, 0, 113, 7), 8081, 0x10);
+        send_frame(&mut h.guest, &other_tuple).await;
+        send_frame(&mut h.guest, &second_marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            second_marker,
+            "a frame from the same published port on a tuple no record names \
+             never reached the switch; the marker did"
+        );
+        expect_silence(&mut h.switch).await;
+
+        // The connection's close releases the record: the proxy's FIN on the
+        // recorded tuple is admitted — it is the reply half of the flow it
+        // closes — and the frame behind it is the refusal's again.
+        let close = dns_pins::tests::tcp_frame(node, 7654, gateway, ephemeral, TCP_FIN);
+        send_frame(&mut h.guest, &close).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            close,
+            "the close is the connection's own traffic and rides its record"
+        );
+        let after_close = dns_pins::tests::tcp_frame(node, 7654, gateway, ephemeral, 0x10);
+        let third_marker =
+            dns_pins::tests::tcp_frame(node, 7654, Ipv4Addr::new(203, 0, 113, 7), 8082, 0x10);
+        send_frame(&mut h.guest, &after_close).await;
+        send_frame(&mut h.guest, &third_marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            third_marker,
+            "the record ended with the connection: the frame behind the FIN \
+             never reached the switch; the marker did"
+        );
+        expect_silence(&mut h.switch).await;
     }
 
     /// A DNS box's undeclared destinations are decided on the host (NET-081
@@ -6065,6 +7421,7 @@ mod tests {
             switch_sock.clone(),
             table,
             dns_pins::DnsPins::new(SUBNET),
+            ForwarderFlows::new(),
             NodePlaneBaseline::built_in(SUBNET),
             Arc::new(DropLimiter::new()),
             Arc::new(PublishedForwards::new()),
@@ -6150,6 +7507,7 @@ mod tests {
             switch_sock.clone(),
             table,
             dns_pins::DnsPins::new(SUBNET),
+            ForwarderFlows::new(),
             NodePlaneBaseline::built_in(SUBNET),
             Arc::new(DropLimiter::new()),
             Arc::new(PublishedForwards::new()),
@@ -6234,6 +7592,7 @@ mod tests {
                 switch_sock.clone(),
                 table.clone(),
                 dns_pins::DnsPins::new(SUBNET),
+                ForwarderFlows::new(),
                 NodePlaneBaseline::built_in(SUBNET),
                 Arc::new(DropLimiter::new()),
                 Arc::new(PublishedForwards::new()),
@@ -6313,6 +7672,7 @@ mod tests {
             switch_sock.to_path_buf(),
             table.clone(),
             dns_pins::DnsPins::new(SUBNET),
+            ForwarderFlows::new(),
             NodePlaneBaseline::built_in(SUBNET),
             Arc::new(DropLimiter::new()),
             Arc::new(PublishedForwards::new()),
@@ -6565,6 +7925,7 @@ mod tests {
                 switch_sock.clone(),
                 table,
                 dns_pins::DnsPins::new(SUBNET),
+                ForwarderFlows::new(),
                 NodePlaneBaseline::built_in(SUBNET),
                 Arc::new(DropLimiter::new()),
                 Arc::new(PublishedForwards::new()),
@@ -6744,6 +8105,10 @@ mod tests {
         // against: empty, because the row declared no names and no reply has
         // been observed — the arm below stays unreachable for it.
         let pins = dns_pins::DnsPins::new(SUBNET);
+        // The forwarder flow table, empty as the run path hands it: no dial
+        // has been observed, so every gateway-bound frame below is decided
+        // without a recorded flow — the state the refusal's other half pins.
+        let flows = ForwarderFlows::new();
         let summarize = sessions::core::egress::summarize;
 
         // A held source is decided by its rules: the same frame that the
@@ -6756,6 +8121,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
+                &flows,
                 UNREGISTERED_SOURCE_PHASE
             ),
             Ok(GateAdmit::Row)
@@ -6780,6 +8146,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
+                &flows,
                 UNREGISTERED_SOURCE_PHASE
             ),
             Err(GateDrop::Verdict(DropReason::UndeclaredSubnet {
@@ -6801,6 +8168,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
+                &flows,
                 UNREGISTERED_SOURCE_PHASE
             ),
             Err(GateDrop::SwitchControlSurface {
@@ -6815,6 +8183,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
+                &flows,
                 UnregisteredSourcePhase::InForce
             ),
             Err(GateDrop::SwitchControlSurface {
@@ -6839,6 +8208,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
+                &flows,
                 UNREGISTERED_SOURCE_PHASE
             ),
             Err(GateDrop::SwitchControlSurface {
@@ -6857,6 +8227,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
+                &flows,
                 UNREGISTERED_SOURCE_PHASE
             ),
             Ok(GateAdmit::Row)
@@ -6873,6 +8244,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
+                &flows,
                 UNREGISTERED_SOURCE_PHASE
             ),
             Err(GateDrop::SwitchControlSurface {
@@ -6894,6 +8266,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
+                &flows,
                 UnregisteredSourcePhase::Announced
             ),
             Ok(GateAdmit::Unregistered {
@@ -6907,6 +8280,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
+                &flows,
                 UnregisteredSourcePhase::InForce
             ),
             Err(GateDrop::UnknownSource {
@@ -6932,6 +8306,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
+                &flows,
                 UnregisteredSourcePhase::Announced
             ),
             Err(GateDrop::UnknownSource {
@@ -6946,6 +8321,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
+                &flows,
                 UnregisteredSourcePhase::Announced
             ),
             Err(GateDrop::UnknownSource {
@@ -6965,6 +8341,7 @@ mod tests {
                 &empty,
                 &baseline,
                 &pins,
+                &flows,
                 UNREGISTERED_SOURCE_PHASE
             ),
             Err(GateDrop::Verdict(DropReason::Ipv6))
@@ -6977,6 +8354,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
+                &flows,
                 UNREGISTERED_SOURCE_PHASE
             ),
             Err(GateDrop::Verdict(DropReason::Truncated))
@@ -7074,6 +8452,7 @@ mod tests {
             table: &BoxTable,
             baseline: &NodePlaneBaseline,
             pins: &dns_pins::DnsPins,
+            flows: &ForwarderFlows,
             phase: UnregisteredSourcePhase,
             src: [u8; 4],
             proto: u8,
@@ -7081,7 +8460,7 @@ mod tests {
             port: u16,
         ) -> Attempt {
             let frame = sessions::core::egress::summarize(&ipv4_frame(src, proto, dst, port));
-            let verdict = match gate_verdict(&frame, None, table, baseline, pins, phase) {
+            let verdict = match gate_verdict(&frame, None, table, baseline, pins, flows, phase) {
                 Ok(GateAdmit::Baseline) => Verdict::AdmittedByBaseline,
                 Ok(GateAdmit::Row) if src == baseline.node_addr() => Verdict::AdmittedByNodeRow,
                 Ok(GateAdmit::Row) => Verdict::AdmittedByRow,
@@ -7123,6 +8502,11 @@ mod tests {
         // declared a name, so the pin arm is unreachable here and every
         // attempt is decided by the rows, the baseline set and the phase.
         let pins = dns_pins::DnsPins::new(SUBNET);
+        // The forwarder flow table the attempts are decided against: empty —
+        // no row was dialed by the switch's forwarder, so the forwarder-reply
+        // carve-out is unreachable here and every attempt is decided by the
+        // rows, the baseline set and the phase.
+        let flows = ForwarderFlows::new();
         let node = baseline.node_addr();
         let shipped = UNREGISTERED_SOURCE_PHASE;
         let resolver = SUBNET.dns_server().octets();
@@ -7205,7 +8589,9 @@ mod tests {
         ]
         .into_iter()
         .map(|(phase, src, proto, dst, port)| {
-            decide(&table, &baseline, &pins, phase, src, proto, dst, port)
+            decide(
+                &table, &baseline, &pins, &flows, phase, src, proto, dst, port,
+            )
         })
         .collect();
         let in_force_attempts: Vec<Attempt> = [
@@ -7240,6 +8626,7 @@ mod tests {
                 &table,
                 &baseline_in_force,
                 &pins,
+                &flows,
                 phase,
                 src,
                 proto,
@@ -7524,7 +8911,15 @@ mod tests {
         // are what the rows bound, each on its own.
         let spoofed_arp = sessions::core::egress::summarize(&arp_frame(LEASE));
         assert!(matches!(
-            gate_verdict(&spoofed_arp, None, &table, &baseline, &pins, shipped),
+            gate_verdict(
+                &spoofed_arp,
+                None,
+                &table,
+                &baseline,
+                &pins,
+                &flows,
+                shipped
+            ),
             Ok(GateAdmit::Row)
         ));
     }
@@ -7557,6 +8952,8 @@ mod tests {
         // The pin table, empty as the run path hands it: the node row
         // declares no names.
         let pins = dns_pins::DnsPins::new(SUBNET);
+        // The forwarder flow table, empty as the run path hands it.
+        let flows = ForwarderFlows::new();
 
         // A node-plane frame to a destination no category of the enumeration
         // names — the public store the shipped cache URL resolves to. The
@@ -7577,6 +8974,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
+                &flows,
                 UNREGISTERED_SOURCE_PHASE
             ),
             Ok(GateAdmit::Row),
