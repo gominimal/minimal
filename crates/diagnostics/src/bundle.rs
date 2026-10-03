@@ -345,30 +345,26 @@ impl<W: BundleSink> BundleWriter<W> {
 }
 
 /// Runs [`crate::redact::scrub_secrets`] on each line of `input`,
-/// preserving line endings. Returns the original `Vec<u8>` unchanged when
-/// no line was modified.
+/// preserving line endings byte for byte. A line left unchanged is copied
+/// verbatim.
+///
+/// A line that is not valid UTF-8 (a tail cut mid-character, a binary
+/// write) is still scrubbed, through a lossy decoding: if that finds a
+/// credential the lossy, scrubbed line is written, so one bad byte cannot
+/// carry a secret through.
 fn scrub_lines(input: &[u8]) -> Vec<u8> {
-    let text = match std::str::from_utf8(input) {
-        Ok(s) => s,
-        Err(_) => return input.to_vec(),
-    };
     let mut out = Vec::with_capacity(input.len());
-    let mut changed = false;
-    for line in text.lines() {
-        if changed {
-            out.push(b'\n');
+    for line in input.split_inclusive(|&b| b == b'\n') {
+        let body_len = line.strip_suffix(b"\n").map_or(line.len(), <[u8]>::len);
+        let (body, ending) = line.split_at(body_len);
+        let text = String::from_utf8_lossy(body);
+        match crate::redact::scrub_secrets(&text) {
+            std::borrow::Cow::Borrowed(_) => out.extend_from_slice(body),
+            std::borrow::Cow::Owned(scrubbed) => out.extend_from_slice(scrubbed.as_bytes()),
         }
-        let scrubbed = crate::redact::scrub_secrets(line);
-        if scrubbed.as_ref() != line {
-            changed = true;
-        }
-        out.extend_from_slice(scrubbed.as_bytes());
+        out.extend_from_slice(ending);
     }
-    // Preserve trailing newline.
-    if text.ends_with('\n') {
-        out.push(b'\n');
-    }
-    if changed { out } else { input.to_vec() }
+    out
 }
 
 /// Joins a caller-supplied group with a collector's fixed relative path.
@@ -591,6 +587,27 @@ pub(crate) mod tests {
         w.finish(chrono::Utc::now(), std::time::Duration::ZERO)
             .await
             .unwrap();
+    }
+
+    /// Clean lines keep their line endings around a scrubbed one, and a line
+    /// that is not valid UTF-8 is still scrubbed.
+    #[test]
+    fn scrub_lines_keeps_lines_apart_and_scrubs_invalid_utf8() {
+        let input = b"first\r\nsecond\ntoken=abc\nlast";
+        assert_eq!(
+            scrub_lines(input),
+            b"first\r\nsecond\ntoken=<redacted:len=3>\nlast".to_vec()
+        );
+
+        let clean = b"a\n\xff\xfe binary\n";
+        assert_eq!(scrub_lines(clean), clean.to_vec());
+
+        let out = scrub_lines(b"\xffcut password=hunter2\n");
+        assert!(
+            !out.windows(7).any(|w| w == b"hunter2"),
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
     }
 
     #[tokio::test]

@@ -205,6 +205,8 @@ pub fn masked_process_env(is_value_allowed: impl Fn(&str) -> bool) -> BTreeMap<S
 /// - Well-known token prefixes: `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
 ///   `github_pat_`, `sk-`, `xoxa-`, `xoxb-`, `xoxp-`, `AKIA` + 16 hex.
 /// - `key=value` pairs whose key trips [`is_sensitive_key`].
+/// - The value after a long flag whose name trips [`is_sensitive_key`]
+///   (`--password hunter2`).
 ///
 /// The placeholder reuses [`redaction_placeholder`]'s format so every
 /// redacted value in a bundle reads consistently.
@@ -245,106 +247,94 @@ struct CredentialMatch {
     end: usize,
 }
 
-/// Scans `input` for the first credential-shaped token and returns its byte
-/// range, or `None` when the input is clean.
+/// Scans `input` for the leftmost credential-shaped token and returns its
+/// byte range, or `None` when the input is clean.
+///
+/// Every finder is consulted and the leftmost match wins (the longest, on a
+/// tie). [`scrub_secrets`] copies everything before the match verbatim, so
+/// taking the first finder that matches anywhere would let an earlier
+/// credential of a different shape through unscrubbed.
 fn find_next_credential(input: &str) -> Option<CredentialMatch> {
-    // Authorization / Proxy-Authorization header values.
-    if let Some(m) = find_auth_header(input) {
-        return Some(m);
-    }
-    // URL userinfo.
-    if let Some(m) = find_url_userinfo(input) {
-        return Some(m);
-    }
-    // Well-known token shapes.
-    if let Some(m) = find_known_token(input) {
-        return Some(m);
-    }
-    // key=value with a sensitive key.
-    if let Some(m) = find_sensitive_key_value(input) {
-        return Some(m);
-    }
-    None
+    [
+        find_auth_header(input),
+        find_url_userinfo(input),
+        find_known_token(input),
+        find_sensitive_key_value(input),
+        find_sensitive_flag_value(input),
+    ]
+    .into_iter()
+    .flatten()
+    .min_by_key(|m| (m.start, std::cmp::Reverse(m.end)))
+}
+
+/// Length of the token at the start of `s`: it runs to the next whitespace,
+/// quote, or end of input.
+fn token_len(s: &str) -> usize {
+    s.find(|c: char| c.is_whitespace() || c == '\'' || c == '"')
+        .unwrap_or(s.len())
 }
 
 /// Matches `Authorization: <type> <credential>` or
-/// `Proxy-Authorization: <type> <credential>`.
+/// `Proxy-Authorization: <type> <credential>`, at the first header whose
+/// scheme is `Bearer`, `Basic`, or `token`.
 fn find_auth_header(input: &str) -> Option<CredentialMatch> {
+    // ASCII lowercasing keeps byte offsets aligned with `input`.
     let lower = input.to_ascii_lowercase();
-    let header_start = lower.find("authorization:")?;
-    let after_header = header_start + "authorization:".len();
+    lower
+        .match_indices("authorization:")
+        .find_map(|(header_start, header)| {
+            let after_header = header_start + header.len();
+            let rest = &input[after_header..];
+            let rest_lower = &lower[after_header..];
 
-    let rest = &input[after_header..];
-    let rest_lower = &lower[after_header..];
+            // Skip whitespace between `:` and the scheme.
+            let scheme_start = rest.len() - rest.trim_start().len();
+            let scheme_len = ["bearer", "basic", "token"]
+                .into_iter()
+                .find(|s| rest_lower[scheme_start..].starts_with(s))?
+                .len();
 
-    // Skip whitespace between `:` and the scheme.
-    let trimmed = rest.trim_start();
-    let ws_skip = rest.len() - trimmed.len();
-    let scheme_start = ws_skip;
-
-    // Find the auth scheme: Bearer, Basic, or token (case-insensitive).
-    let scheme_len = if rest_lower[scheme_start..].starts_with("bearer") {
-        "bearer".len()
-    } else if rest_lower[scheme_start..].starts_with("basic") {
-        "basic".len()
-    } else if rest_lower[scheme_start..].starts_with("token") {
-        "token".len()
-    } else {
-        return None;
-    };
-
-    let after_scheme = scheme_start + scheme_len;
-    let after_scheme_str = &rest[after_scheme..];
-    let cred = after_scheme_str.trim_start();
-    if cred.is_empty() {
-        return None;
-    }
-    let cred_skip = after_scheme_str.len() - cred.len();
-
-    // The credential runs to the next whitespace, quote, or end of input.
-    let cred_end = cred
-        .find(|c: char| c.is_whitespace() || c == '\'' || c == '"')
-        .unwrap_or(cred.len());
-
-    if cred_end == 0 {
-        return None;
-    }
-
-    Some(CredentialMatch {
-        start: after_header + after_scheme + cred_skip,
-        end: after_header + after_scheme + cred_skip + cred_end,
-    })
+            let after_scheme = scheme_start + scheme_len;
+            let after_scheme_str = &rest[after_scheme..];
+            let cred = after_scheme_str.trim_start();
+            let cred_skip = after_scheme_str.len() - cred.len();
+            let cred_len = token_len(cred);
+            if cred_len == 0 {
+                return None;
+            }
+            let start = after_header + after_scheme + cred_skip;
+            Some(CredentialMatch {
+                start,
+                end: start + cred_len,
+            })
+        })
 }
 
-/// Matches `scheme://user:password@host` — the userinfo portion.
+/// Matches the userinfo of `scheme://user:password@host`.
+///
+/// Every `://` is tried, so a URL without userinfo does not hide a later one
+/// that has it. The userinfo runs to the last `@` before the next whitespace
+/// or quote, so a raw `@` or `/` inside the password cannot cut it short.
 fn find_url_userinfo(input: &str) -> Option<CredentialMatch> {
-    // Find `://` then look for `@` after it, with a `:` between them.
-    // Skip past any leading `<redacted:len=N>` placeholder so we don't
-    // match the `://` inside one.
-    let search_start = if input.starts_with("<redacted:len=") {
-        input.find('>').map_or(0, |i| i + 1)
-    } else {
-        0
-    };
-    let tail = &input[search_start..];
-    let scheme_end = tail.find("://")?;
-    let after_scheme = &tail[scheme_end + 3..];
-    let at_pos = after_scheme.find('@')?;
-    let userinfo = &after_scheme[..at_pos];
-    // Must contain a colon (user:password).
-    if !userinfo.contains(':') {
-        return None;
-    }
-    Some(CredentialMatch {
-        start: search_start + scheme_end + 3,
-        end: search_start + scheme_end + 3 + at_pos,
+    input.match_indices("://").find_map(|(idx, sep)| {
+        let start = idx + sep.len();
+        let word = &input[start..start + token_len(&input[start..])];
+        let at = word.rfind('@')?;
+        // Must contain a colon (user:password).
+        word[..at].contains(':').then_some(CredentialMatch {
+            start,
+            end: start + at,
+        })
     })
 }
 
 /// Matches well-known token shapes: GitHub tokens, OpenAI keys, Slack tokens,
 /// AWS access keys.
+///
+/// A prefix only counts at the start of a word (not preceded by an ASCII
+/// alphanumeric), so `task-runner` is not mistaken for an `sk-` key.
 fn find_known_token(input: &str) -> Option<CredentialMatch> {
-    let prefixes: &[&str] = &[
+    const PREFIXES: &[&str] = &[
         "ghp_",
         "gho_",
         "ghu_",
@@ -356,75 +346,92 @@ fn find_known_token(input: &str) -> Option<CredentialMatch> {
         "xoxb-",
         "xoxp-",
     ];
+    let at_word_start = |pos: usize| {
+        input[..pos]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_alphanumeric())
+    };
 
-    for prefix in prefixes {
-        if let Some(pos) = input.find(prefix) {
-            // The token runs to the next whitespace, quote, or end of input.
-            let rest = &input[pos + prefix.len()..];
-            let token_end = rest
-                .find(|c: char| c.is_whitespace() || c == '\'' || c == '"')
-                .unwrap_or(rest.len());
-            if token_end > 0 {
-                return Some(CredentialMatch {
-                    start: pos,
-                    end: pos + prefix.len() + token_end,
-                });
-            }
-        }
-    }
+    let prefixed = PREFIXES.iter().filter_map(|prefix| {
+        input.match_indices(prefix).find_map(|(pos, _)| {
+            let len = token_len(&input[pos + prefix.len()..]);
+            (at_word_start(pos) && len > 0).then_some(CredentialMatch {
+                start: pos,
+                end: pos + prefix.len() + len,
+            })
+        })
+    });
 
-    // AKIA + 16 uppercase hex chars (AWS access key).
-    if let Some(pos) = input.find("AKIA") {
-        let rest = &input[pos + 4..];
-        if rest.len() >= 16 {
-            let candidate = &rest[..16];
-            if candidate
+    // AKIA + 16 uppercase alphanumerics (AWS access key).
+    let aws = input.match_indices("AKIA").find_map(|(pos, _)| {
+        let key = input.get(pos + 4..pos + 4 + 16)?;
+        (at_word_start(pos)
+            && key
                 .chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-            {
-                return Some(CredentialMatch {
-                    start: pos,
-                    end: pos + 4 + 16,
-                });
-            }
-        }
-    }
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()))
+        .then_some(CredentialMatch {
+            start: pos,
+            end: pos + 4 + 16,
+        })
+    });
 
-    None
+    prefixed.chain(aws).min_by_key(|m| m.start)
 }
 
 /// Matches `key=value` where `key` trips [`is_sensitive_key`].
 fn find_sensitive_key_value(input: &str) -> Option<CredentialMatch> {
-    // Scan for `=` preceded by a key-like token. The key is the run of
-    // non-whitespace immediately before `=`, so `--token=value` and
-    // `token=value` both match.
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if let Some(eq_pos) = bytes[i..].iter().position(|&b| b == b'=') {
-            let eq_idx = i + eq_pos;
-            // Walk back from `=` to the start of the key token.
-            let key_start = input[..eq_idx]
-                .rfind(char::is_whitespace)
-                .map_or(0, |p| p + 1);
-            let key = &input[key_start..eq_idx];
-            if is_sensitive_key(key) {
-                // Value runs to next whitespace, quote, or end.
-                let val_start = eq_idx + 1;
-                let val_rest = &input[val_start..];
-                let val_end = val_rest
-                    .find(|c: char| c.is_whitespace() || c == '\'' || c == '"')
-                    .unwrap_or(val_rest.len());
-                if val_end > 0 {
-                    return Some(CredentialMatch {
-                        start: val_start,
-                        end: val_start + val_end,
-                    });
-                }
-            }
-            i = eq_idx + 1;
-        } else {
-            break;
+    // The key is the run of non-whitespace immediately before `=`, so
+    // `--token=value`, `token=value`, and `GITHUB_TOKEN=value` all match.
+    input.match_indices('=').find_map(|(eq_idx, _)| {
+        // The `=` inside an earlier `<redacted:len=N>` placeholder is not a
+        // pair: matching it would re-redact the length and break idempotence.
+        if input[..eq_idx].ends_with("<redacted:len") {
+            return None;
+        }
+        let key_start = input[..eq_idx]
+            .rfind(char::is_whitespace)
+            .map_or(0, |p| p + 1);
+        if !is_sensitive_key(&input[key_start..eq_idx]) {
+            return None;
+        }
+        let val_start = eq_idx + 1;
+        let val_len = token_len(&input[val_start..]);
+        (val_len > 0).then_some(CredentialMatch {
+            start: val_start,
+            end: val_start + val_len,
+        })
+    })
+}
+
+/// Matches the value after a long flag whose name trips
+/// [`is_sensitive_key`], given as a separate word: `--password hunter2`, or
+/// `"--token","ghp_x"` in a JSON-encoded argv.
+///
+/// Short flags (`-p`) are not matched: a single letter names nothing, and
+/// `-p` is as often a port or a package as a password.
+fn find_sensitive_flag_value(input: &str) -> Option<CredentialMatch> {
+    let is_sep = |c: char| c.is_whitespace() || matches!(c, '\'' | '"' | ',' | '[' | ']');
+    let mut words = input
+        .match_indices(|c: char| !is_sep(c))
+        .map(|(i, _)| i)
+        .filter(|&i| i == 0 || input[..i].ends_with(is_sep))
+        .map(|i| {
+            let len = input[i..].find(is_sep).unwrap_or(input.len() - i);
+            (i, &input[i..i + len])
+        })
+        .peekable();
+    while let Some((_, word)) = words.next() {
+        if !word.starts_with("--") || word.contains('=') || !is_sensitive_key(word) {
+            continue;
+        }
+        if let Some(&(start, value)) = words.peek()
+            && !value.starts_with('-')
+        {
+            return Some(CredentialMatch {
+                start,
+                end: start + value.len(),
+            });
         }
     }
     None
@@ -684,6 +691,60 @@ mod tests {
             assert!(matches!(out, Cow::Borrowed(_)), "{argv} should be borrowed");
             assert_eq!(out, argv);
         }
+    }
+
+    /// The leftmost credential wins whatever its shape: the scrubber copies
+    /// the text before a match verbatim, so a later match of a
+    /// higher-priority shape must not carry an earlier secret through.
+    #[test]
+    fn scrub_masks_every_credential_whatever_their_order() {
+        for (input, secrets) in [
+            (
+                "git clone https://u:pw1@h -H 'Authorization: Bearer abc'",
+                &["pw1", "abc"][..],
+            ),
+            ("sk-AAAA ghp_BBBB", &["AAAA", "BBBB"]),
+            (
+                "password=hunter2 Authorization: Bearer abc",
+                &["hunter2", "abc"],
+            ),
+            ("TOKEN=t0k https://u:pw2@h", &["t0k", "pw2"]),
+            ("https://user@h https://u:pw4@h2", &["pw4"]),
+            ("https://u:p/w@d@h/x", &["p/w@d"]),
+            ("AKIAnotakey AKIAIOSFODNN7EXAMPLE", &["IOSFODNN7EXAMPLE"]),
+        ] {
+            let out = scrub_secrets(input);
+            for secret in secrets {
+                assert!(!out.contains(secret), "{input:?} leaked {secret:?}: {out}");
+            }
+        }
+    }
+
+    #[test]
+    fn scrub_masks_env_style_pair() {
+        let out = scrub_secrets(r#"min://argv ["sh","-c","GITHUB_TOKEN=abc run"]"#);
+        assert_eq!(
+            out,
+            r#"min://argv ["sh","-c","GITHUB_TOKEN=<redacted:len=3> run"]"#
+        );
+    }
+
+    #[test]
+    fn scrub_masks_space_separated_flag_value() {
+        assert_eq!(
+            scrub_secrets("login --password hunter2 --verbose"),
+            "login --password <redacted:len=7> --verbose"
+        );
+        assert_eq!(
+            scrub_secrets(r#"min://argv ["gh","--token","sekrit"]"#),
+            r#"min://argv ["gh","--token","<redacted:len=6>"]"#
+        );
+    }
+
+    #[test]
+    fn scrub_leaves_prefix_inside_a_word() {
+        let out = scrub_secrets("cargo test -p task-runner");
+        assert!(matches!(out, Cow::Borrowed(_)), "got {out}");
     }
 
     #[test]
