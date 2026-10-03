@@ -197,6 +197,8 @@ RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
 BEPB_SEED_DIR_A="" # seeded by the proxy-source proof below; removed on teardown
 BEPB_SEED_DIR_B="" # its second box's seed; removed on teardown
+CRED_LANE_SEED_DIR="" # seeded by the credentialed-lane proof below; removed on teardown
+CRED_NO_LANE_SEED_DIR="" # the no-lane proof's seed; removed on teardown
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -532,6 +534,10 @@ teardown() {
   # trap is the one place that always sees them.
   [ -n "$BEPB_SEED_DIR_A" ] && rm -rf "$BEPB_SEED_DIR_A"
   [ -n "$BEPB_SEED_DIR_B" ] && rm -rf "$BEPB_SEED_DIR_B"
+  # The credentialed-lane proofs' seeds, same reasoning: the trap is the one
+  # place that always sees them.
+  [ -n "$CRED_LANE_SEED_DIR" ] && rm -rf "$CRED_LANE_SEED_DIR"
+  [ -n "$CRED_NO_LANE_SEED_DIR" ] && rm -rf "$CRED_NO_LANE_SEED_DIR"
   # The forward holds the laptop-side listener; INT is the documented stop,
   # KILL the backstop so a hung relay cannot outlive the run.
   if [ -n "$RETIRED_FWD_PID" ]; then
@@ -6218,6 +6224,377 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
   echo "::endgroup::"
 }
 
+# ---------------------------------------------------------------------------
+# The proxy is a credentialed lane's infrastructure (NET-134): the one
+# host-side destination a box reaches by DECLARING the upstream, never by
+# allowing its address. Two cases below prove the two halves on the real
+# host-side gate, from inside a real box:
+#
+#   * deny_all_box_reaches_proxy_and_no_other_host_port — a deny-all box
+#     that declared the lane reaches the proxy's acceptor on its listener
+#     port, and nothing else on the host answers it.
+#   * box_without_credentialed_lane_cannot_reach_proxy — a box with no
+#     lane, allow-all rules included so only the lane's absence can refuse
+#     the address, has every frame to the proxy's address dropped at the
+#     gate: the connect runs out its window with no reset, and the daemon's
+#     log says so, one rate-limited line per refused frame naming the box.
+#
+# Both gate on MINVMD_GVPROXY_BIN like the switch cases above: without a
+# switch there is no gate to observe, and the case prints what it cannot
+# assert and returns 0.
+#
+# The host daemon's log is the sink the gate's lines land in, and the
+# helpers below read it the way the proxy-source case does: newest file
+# first (the daemon rotates daily), scoped to the lines the running case's
+# daemon added since the case's own snapshot, so an unscoped grep cannot
+# read an earlier case's daemon's identical lines.
+cred_host_log() {
+  find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
+    | sort -r | head -n1
+}
+cred_case_log() {
+  local f
+  f="$(cred_host_log)"
+  [ -n "$f" ] || return 0
+  if [ "$f" = "$CRED_LOG0" ] && [ "${CRED_LOG0_LINES:-0}" -gt 0 ]; then
+    tail -n +"$((CRED_LOG0_LINES + 1))" "$f" 2>/dev/null
+  else
+    # A rotation mid-case: the newest file postdates the snapshot, so every
+    # line in it is this case's.
+    cat "$f" 2>/dev/null
+  fi
+}
+cred_host_log_tail() {
+  local f
+  f="$(cred_host_log)"
+  if [ -n "$f" ]; then
+    echo "--- minvmd log ($f) tail ---"
+    tail -60 "$f" 2>/dev/null || true
+  else
+    echo "--- minvmd log: none (no minvmd.log* under $XDG_STATE_HOME/minimal/logs) ---"
+  fi
+}
+# Both cases read their daemon's INFO records — the registration line each
+# box's activation files, and (for the lane case) the acceptor's and the
+# switch's — which the lane's default filter drops for minvmd's own
+# modules. Widen it for the case's daemon only, as the proxy-source case
+# does, and restore it on every exit so no later case inherits it.
+cred_rust_log0="${RUST_LOG:-}"
+cred_begin() {
+  mnl stop --force >/dev/null 2>&1 || true
+  if [ -n "$E2E_VM" ]; then
+    minvmd stop >/dev/null 2>&1 || true
+  fi
+  export RUST_LOG="warn,minimald::exec=info,minvmd=info"
+  CRED_LOG0="$(cred_host_log)"
+  CRED_LOG0_LINES=0
+  if [ -n "$CRED_LOG0" ]; then
+    CRED_LOG0_LINES="$(wc -l <"$CRED_LOG0" 2>/dev/null)" || CRED_LOG0_LINES=0
+  fi
+}
+cred_restore() {
+  if [ -n "${CRED_STUB:-}" ]; then
+    unset MINVMD_BEP_STUB CRED_STUB
+  fi
+  if [ -n "$cred_rust_log0" ]; then
+    export RUST_LOG="$cred_rust_log0"
+  else
+    unset RUST_LOG
+  fi
+}
+cred_fail() {
+  cred_restore
+  cred_host_log_tail
+  fail
+}
+# Waits for this case's daemon's log to name `box` registered, the fact the
+# gate decides a row by: an unregistered box's frame to the proxy's address
+# is the unregistered-source drop, not the lane's, so the registration must
+# be asserted before either case reads its own probes as proving anything
+# about lanes.
+cred_wait_registered() {
+  local box="$1" name="$2" seen=0 wait=0
+  while [ "$wait" -le 10 ]; do
+    if cred_case_log | grep 'registered box with the VM host daemon' | grep -q "$name"; then
+      seen=1
+      break
+    fi
+    wait=$((wait + 1))
+    sleep 1
+  done
+  if [ "$seen" -ne 1 ]; then
+    echo "::error::$box never registered with the VM host daemon — no row in the host-side table, so no lane is asserted by the probes below. This case's registration lines say:"
+    cred_case_log | grep -e 'registered box with the VM host daemon' -e 'box registration' | tail -n5 | sed 's/^/  /'
+    cred_fail
+  fi
+}
+# Reads a box's switch address the way the cases above do: a session rootfs
+# has no iproute2, so every local address is read from /proc/net/fib_trie
+# and parsed here on the host.
+cred_box_ip() {
+  local sid="$1" out="$2" err="$3"
+  if ! mnl session exec "$sid" sh -c 'cat /proc/net/fib_trie' >"$out" 2>"$err"; then
+    echo "::error::could not read /proc/net/fib_trie from $sid"
+    cat "$err" 2>/dev/null || true
+    cred_fail
+  fi
+  awk '/\|--/ { addr = $2 }
+       /\/32 host LOCAL/ && addr !~ /^127\./ { print addr; exit }' "$out"
+}
+
+# The lane's half: a box that declared a credentialed upstream reaches the
+# proxy's acceptor under rules that deny everything — the one destination
+# its rules never decide — and no other host address or port answers it.
+# The acceptor is the stand-in the daemon binds under MINVMD_BEP_STUB (the
+# proxy document is a later task; NET-132 set the stand-in up to answer one
+# line naming the source it was presented from), so this case restarts the
+# daemon carrying the flag, exactly as the proxy-source case does.
+proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
+  echo "::group::a deny-all box on a credentialed lane reaches the proxy and no other host port (NET-134)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "deny_all_box_reaches_proxy_and_no_other_host_port SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  cred_begin
+  export MINVMD_BEP_STUB=1
+  CRED_STUB=1
+
+  local proxy_ip proxy_port host_alias lane_sid lane_ip sock sock_wait
+  proxy_ip="100.64.255.252"
+  proxy_port="8118"
+  host_alias="100.64.255.253"
+
+  CRED_LANE_SEED_DIR="$(hook_mktemp /tmp/mnlcredl.XXXXXX)"
+  hook_seed_preamble > "$CRED_LANE_SEED_DIR/minimal.toml"
+  mkdir "$CRED_LANE_SEED_DIR/.git"
+
+  # Deny-all over the lane: the declaration carries both the 0.0.0.0/0 deny
+  # and the credentialed upstream, the two spellings that make the proxy the
+  # box's ONLY reachable destination — the row would deny the proxy's
+  # address like any other, so whatever reaches it reaches it as the lane's
+  # infrastructure.
+  lane_sid="$(cd "$CRED_LANE_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-cred-lane --network own_ip \
+    --deny-subnets 0.0.0.0/0 \
+    --credentialed-upstream \
+    2>"$WORK/cred-lane.err")" || {
+    echo "::error::'min session activate --network own_ip --deny-subnets 0.0.0.0/0 --credentialed-upstream' failed for the credentialed-lane case"
+    cat "$WORK/cred-lane.err" 2>/dev/null || true
+    cred_fail
+  }
+  lane_sid="$(printf '%s\n' "$lane_sid" | tail -n1 | tr -d '\r')"
+  cred_wait_registered "the deny-all lane box" "e2e-cred-lane"
+
+  # The stand-in's socket, the flag's receipt on the filesystem: assert it
+  # before any probe, so a daemon that came up without the flag fails here
+  # naming the cause instead of in a blank probe answer below.
+  sock="$XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-bep.sock"
+  sock_wait=0
+  until [ -S "$sock" ]; do
+    sock_wait=$((sock_wait + 1))
+    if [ "$sock_wait" -gt 15 ]; then
+      echo "::error::the host daemon bound no stand-in socket at $sock — this case's activation autospawned a daemon that did not carry MINVMD_BEP_STUB"
+      cred_fail
+    fi
+    sleep 1
+  done
+
+  lane_ip="$(cred_box_ip "$lane_sid" "$WORK/cred-lane-fib.out" "$WORK/cred-lane-fib.err")"
+  if [ -z "$lane_ip" ]; then
+    echo "::error::could not determine the deny-all lane box's switch address from /proc/net/fib_trie"
+    echo "--- fib_trie ---"; cat "$WORK/cred-lane-fib.out" 2>/dev/null || true
+    cred_fail
+  fi
+
+  mnl session exec "$lane_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 || {
+    echo "::error::the session has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"
+    cred_fail
+  }
+
+  # The positive probe first, so the negatives below are read against a
+  # fabric it just proved alive: the connection to the proxy's address on
+  # its listener port is delivered to the stand-in, whose one answer line
+  # travels back to the box naming the source it was presented from (the
+  # same probe shape the proxy-source case reads). socat's left address is
+  # an empty pipe and `-t 10` holds the connection open for the answer.
+  mnl session exec "$lane_sid" \
+    "printf '' | /usr/bin/socat -t 10 - TCP:$proxy_ip:$proxy_port,connect-timeout=15" \
+    >"$WORK/cred-lane-answer.out" 2>"$WORK/cred-lane-answer.err" || {
+    echo "::error::the deny-all lane box's connection to the proxy's address did not complete"
+    cat "$WORK/cred-lane-answer.err" 2>/dev/null || true
+    cred_fail
+  }
+  if ! grep -q -- "source=$lane_ip:" "$WORK/cred-lane-answer.out"; then
+    echo "::error::the acceptor did not see the deny-all lane box's connection from its own switch address ($lane_ip)"
+    echo "--- answer ---"; cat "$WORK/cred-lane-answer.out" 2>/dev/null || true
+    echo "--- stderr ---"; cat "$WORK/cred-lane-answer.err" 2>/dev/null || true
+    cred_fail
+  fi
+  if ! grep -q -- "destination=$proxy_ip:$proxy_port" "$WORK/cred-lane-answer.out"; then
+    echo "::error::the acceptor's answer does not name the proxy's address as the destination"
+    echo "--- answer ---"; cat "$WORK/cred-lane-answer.out" 2>/dev/null || true
+    cred_fail
+  fi
+
+  # And no other host port: the same box, the same socat, at the host alias
+  # — the host's own address on the switch — on the proxy's port and on
+  # another. Its own 0.0.0.0/0 deny drops each frame at the gate, exactly
+  # as it would without the lane; the marker-after-refusal order proves each
+  # was decided, and the positive probe above already proved the fabric, so
+  # silence here is the rules holding, not a dead network.
+  for refused_port in 8118 443; do
+    mnl session exec "$lane_sid" \
+      "/usr/bin/socat /dev/null TCP:$host_alias:$refused_port,connect-timeout=8" \
+      >/dev/null 2>"$WORK/cred-lane-refused-$refused_port.err" && {
+      echo "::error::the deny-all lane box reached the host alias at port $refused_port — the lane must add reach at the proxy's address and nowhere else"
+      cat "$WORK/cred-lane-refused-$refused_port.err" 2>/dev/null || true
+      cred_fail
+    }
+    if grep -q 'Connection refused' "$WORK/cred-lane-refused-$refused_port.err" 2>/dev/null; then
+      echo "::error::the deny-all lane box's connection to the host alias at port $refused_port was reset, not dropped — its 0.0.0.0/0 deny did not hold"
+      cat "$WORK/cred-lane-refused-$refused_port.err" 2>/dev/null || true
+      cred_fail
+    fi
+  done
+
+  mnl session destroy --force "$lane_sid" >/dev/null 2>&1 || true
+  rm -rf "$CRED_LANE_SEED_DIR"
+  CRED_LANE_SEED_DIR=""
+  cred_restore
+  echo "a deny-all box on a credentialed lane reaches the proxy and no other host port OK (from $lane_ip to $proxy_ip:$proxy_port)"
+  echo "::endgroup::"
+}
+
+# The refusal's half: a box with NO lane — allow-all rules, so nothing but
+# the lane's absence can refuse the proxy's address — gets silence at the
+# proxy's address and one rate-limited warn line in the daemon's log, the
+# box and the reason named. The control runs first: the same box's probe to
+# the host alias is reset by the host's own stack, which proves the fabric
+# and the gate are answering this box, so the silence at the proxy's
+# address is the lane's, not weather.
+proof_box_without_credentialed_lane_cannot_reach_proxy() {
+  echo "::group::a box without a credentialed lane cannot reach the proxy's address (NET-134)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "box_without_credentialed_lane_cannot_reach_proxy SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  cred_begin
+
+  local proxy_ip proxy_port host_alias nolane_sid nolane_ip start_ms elapsed_ms warn_wait warn_lines
+  proxy_ip="100.64.255.252"
+  proxy_port="8118"
+  host_alias="100.64.255.253"
+
+  CRED_NO_LANE_SEED_DIR="$(hook_mktemp /tmp/mnlcredn.XXXXXX)"
+  hook_seed_preamble > "$CRED_NO_LANE_SEED_DIR/minimal.toml"
+  mkdir "$CRED_NO_LANE_SEED_DIR/.git"
+
+  # No lane and no rules: the allow-all default. Any rules at all would
+  # give the refusal a second author; this box's declaration is empty, so
+  # the only thing that can refuse the proxy's address is the lane's
+  # absence.
+  nolane_sid="$(cd "$CRED_NO_LANE_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-cred-nolane --network own_ip 2>"$WORK/cred-nolane.err")" || {
+    echo "::error::'min session activate --network own_ip' failed for the no-lane case"
+    cat "$WORK/cred-nolane.err" 2>/dev/null || true
+    cred_fail
+  }
+  nolane_sid="$(printf '%s\n' "$nolane_sid" | tail -n1 | tr -d '\r')"
+  cred_wait_registered "the no-lane box" "e2e-cred-nolane"
+
+  nolane_ip="$(cred_box_ip "$nolane_sid" "$WORK/cred-nolane-fib.out" "$WORK/cred-nolane-fib.err")"
+  if [ -z "$nolane_ip" ]; then
+    echo "::error::could not determine the no-lane box's switch address from /proc/net/fib_trie"
+    echo "--- fib_trie ---"; cat "$WORK/cred-nolane-fib.out" 2>/dev/null || true
+    cred_fail
+  fi
+
+  mnl session exec "$nolane_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 || {
+    echo "::error::the session has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"
+    cred_fail
+  }
+
+  # The control: the host alias — the host's own address on the switch — is
+  # inside the box's own block, so an allow-all row's frame reaches the
+  # host's stack and is reset by it. A reset here proves resolution, the
+  # fabric and the gate are all live for this box; the proxy's address is
+  # one address away with a whole different answer.
+  mnl session exec "$nolane_sid" \
+    "/usr/bin/socat /dev/null TCP:$host_alias:$proxy_port,connect-timeout=8" \
+    >/dev/null 2>"$WORK/cred-nolane-control.err"
+  if ! grep -q 'Connection refused' "$WORK/cred-nolane-control.err" 2>/dev/null; then
+    echo "::error::the control probe to the host alias was not reset — the fabric or the gate is not answering this box, so the silence at the proxy's address below would prove nothing. Control stderr:"
+    cat "$WORK/cred-nolane-control.err" 2>/dev/null || true
+    cred_fail
+  fi
+
+  # The probe: to the proxy's address, on the proxy's listener port. The
+  # gate drops the SYN (and every retransmit the box's kernel sends inside
+  # the window) — a drop is not a reset (NET-062), so the connect runs out
+  # its timeout with no answer at all.
+  start_ms="$(now_ms)"
+  mnl session exec "$nolane_sid" \
+    "/usr/bin/socat /dev/null TCP:$proxy_ip:$proxy_port,connect-timeout=15" \
+    >/dev/null 2>"$WORK/cred-nolane-probe.err" && {
+    echo "::error::a box without a credentialed lane completed a connection to the proxy's address $proxy_ip:$proxy_port"
+    cat "$WORK/cred-nolane-probe.err" 2>/dev/null || true
+    cred_fail
+  }
+  elapsed_ms=$(( $(now_ms) - start_ms ))
+  if grep -q 'Connection refused' "$WORK/cred-nolane-probe.err" 2>/dev/null; then
+    echo "::error::the no-lane box's connection to the proxy's address was reset — the frame reached the host's stack, so the gate did not drop it as the lane's absence demands"
+    cat "$WORK/cred-nolane-probe.err" 2>/dev/null || true
+    cred_fail
+  fi
+  if [ "$elapsed_ms" -lt 5000 ]; then
+    echo "::error::the no-lane box's connection to the proxy's address failed in ${elapsed_ms}ms — a fast failure with no reset is neither weather (the control above was reset through the same fabric) nor the silent drop being asserted"
+    cat "$WORK/cred-nolane-probe.err" 2>/dev/null || true
+    cred_fail
+  fi
+
+  # The warn the observability contract asks for: the daemon's log carries
+  # the refused frame, naming the box and the reason — one rate-limited
+  # line per source per rule per interval, so the probe's retransmits (five
+  # or more SYNs inside the window) must have produced exactly one line,
+  # not one per frame.
+  warn_wait=0
+  while [ "$warn_wait" -le 10 ]; do
+    if cred_case_log | grep -q -- "egress-uncredentialed-proxy-destination"; then
+      break
+    fi
+    warn_wait=$((warn_wait + 1))
+    sleep 1
+  done
+  if ! cred_case_log | grep -q -- "egress-uncredentialed-proxy-destination"; then
+    echo "::error::the daemon's log never named the refused frame to the proxy's address (waited ${warn_wait}s among this case's lines for the rule 'egress-uncredentialed-proxy-destination')"
+    echo "the control was reset through the same fabric ${elapsed_ms}ms before, so the drop happened and only its line is missing"
+    cred_host_log_tail
+    cred_fail
+  fi
+  if ! cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | grep -q -- "source=$nolane_ip"; then
+    echo "::error::the proxy-lane drop line does not name the no-lane box's own address ($nolane_ip) as the source"
+    cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | tail -n5 | sed 's/^/  /'
+    cred_fail
+  fi
+  warn_lines="$(cred_case_log | grep -c -- "egress-uncredentialed-proxy-destination")"
+  if [ "$warn_lines" -ne 1 ]; then
+    echo "::error::$warn_lines proxy-lane drop lines for one source inside one interval — the warn must be rate-limited to one line per source per rule per interval"
+    cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | tail -n8 | sed 's/^/  /'
+    cred_fail
+  fi
+
+  mnl session destroy --force "$nolane_sid" >/dev/null 2>&1 || true
+  rm -rf "$CRED_NO_LANE_SEED_DIR"
+  CRED_NO_LANE_SEED_DIR=""
+  cred_restore
+  echo "a box without a credentialed lane cannot reach the proxy's address OK (control reset at the host alias, silence at $proxy_ip:$proxy_port for ${elapsed_ms}ms, one warn line from $nolane_ip)"
+  echo "::endgroup::"
+}
+
 # Ordered LAST in the whole-lane run on purpose: it restarts the daemon (see
 # the RUST_LOG note inside) and nothing after it depends on the one before.
 proof_min_internal_names_through_proxy() {
@@ -8338,6 +8715,8 @@ case "${1:-}" in
     proof_switch_steers_proxy_mac_frames_to_the_host_stack
     proof_switch_answers_no_arp_for_the_proxy_address
     proof_proxy_sees_each_vm_box_by_its_switch_address
+    proof_deny_all_box_reaches_proxy_and_no_other_host_port
+    proof_box_without_credentialed_lane_cannot_reach_proxy
     ;;
   lifecycle | session_exec | session_rename | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
@@ -8348,7 +8727,9 @@ case "${1:-}" in
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes \
     | switch_steers_proxy_mac_frames_to_the_host_stack | switch_answers_no_arp_for_the_proxy_address \
-    | proxy_sees_each_vm_box_by_its_switch_address)
+    | proxy_sees_each_vm_box_by_its_switch_address \
+    | deny_all_box_reaches_proxy_and_no_other_host_port \
+    | box_without_credentialed_lane_cannot_reach_proxy)
     "proof_$1"
     ;;
   *)
@@ -8364,6 +8745,8 @@ case "${1:-}" in
     echo "         min_internal_names_through_proxy proxy_refuses_like_direct retired_surfaces_gone"
     echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
     echo "         proxy_sees_each_vm_box_by_its_switch_address"
+    echo "         deny_all_box_reaches_proxy_and_no_other_host_port"
+    echo "         box_without_credentialed_lane_cannot_reach_proxy"
     exit 2
     ;;
 esac
