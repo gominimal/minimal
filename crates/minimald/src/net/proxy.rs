@@ -368,10 +368,6 @@ enum RequestKind {
 struct ParsedRequest<'a> {
     kind: RequestKind,
     authority: &'a str,
-    /// `true` when the request line carried an absolute-form target
-    /// (`GET http://host/path HTTP/1.1`). The `Forward` replay path
-    /// rewrites it to origin-form before forwarding to the upstream.
-    absolute_form: bool,
 }
 
 /// Handles one client connection over any byte stream: read its request head,
@@ -444,7 +440,6 @@ where
         return write_status(&mut client, "502 Bad Gateway").await;
     };
     let kind = request.kind;
-    let absolute_form = request.absolute_form;
     let port = port.unwrap_or(DEFAULT_UPSTREAM_PORT);
 
     // Who the request came from (NET-070): a peer at a live box's switch lease
@@ -524,16 +519,19 @@ where
         // offer is stripped first, so the request is routed as the HTTP/1.1
         // request it is and the upstream cannot answer a protocol switch the
         // proxy cannot splice (NET-135). An absolute-form request target is
-        // rewritten to origin-form first (RFC 9112 §3.2.2): the upstream is
-        // an origin server, and many reject the absolute URI verbatim.
+        // rewritten to origin-form first, with `Host:` set to its authority
+        // (RFC 9112 §3.2.2): the upstream is an origin server, and many reject
+        // the absolute URI verbatim.
+        //
+        // Only this first request is rewritten: after the replay the
+        // connection is spliced as raw bytes, so a later request a keep-alive
+        // client sends on the same proxy connection reaches this upstream
+        // verbatim — still absolute-form, and even when it names another
+        // host. Rewriting every request would mean parsing the stream.
         RequestKind::Forward => {
             let head = strip_h2c_upgrade(&head);
-            if absolute_form {
-                let head = rewrite_absolute_form(&head);
-                upstream.write_all(&head).await?;
-            } else {
-                upstream.write_all(&head).await?;
-            }
+            let head = rewrite_absolute_form(&head);
+            upstream.write_all(&head).await?;
         }
     }
 
@@ -543,7 +541,8 @@ where
 
 /// Parses the authority to route to out of a buffered HTTP request head. A
 /// `CONNECT` request carries the authority in its request line; any other method
-/// carries it in the `Host:` header (matched case-insensitively). Returns `None`
+/// carries it in an absolute-form target's URI authority when it has one, and
+/// otherwise in the `Host:` header (matched case-insensitively). Returns `None`
 /// for a head with no usable authority.
 fn parse_request(head: &[u8]) -> Option<ParsedRequest<'_>> {
     let text = std::str::from_utf8(head).ok()?;
@@ -557,7 +556,6 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest<'_>> {
         return Some(ParsedRequest {
             kind: RequestKind::Connect,
             authority,
-            absolute_form: false,
         });
     }
 
@@ -565,12 +563,7 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest<'_>> {
     // carries a full URI (`GET http://host:port/path HTTP/1.1`). The URI
     // authority takes precedence over any `Host:` header (RFC 9112 §3.2.3).
     let path = parts.next()?;
-    let (authority_from_uri, absolute_form) = match split_absolute_form(path) {
-        Some((authority, _)) => (Some(authority), true),
-        None => (None, false),
-    };
-
-    let authority = if let Some(auth) = authority_from_uri {
+    let authority = if let Some((auth, _)) = split_absolute_form(path) {
         auth
     } else {
         lines.find_map(|line| {
@@ -583,7 +576,6 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest<'_>> {
     Some(ParsedRequest {
         kind: RequestKind::Forward,
         authority,
-        absolute_form,
     })
 }
 
@@ -671,23 +663,35 @@ fn strip_h2c_upgrade(head: &[u8]) -> Cow<'_, [u8]> {
 }
 
 /// Splits an absolute-form request target (`http://authority/path?query`)
-/// into its authority and the rest, or `None` for any other form. The
-/// authority ends at the first `/`, `?`, or `#` (RFC 3986 §3.2); the rest
-/// keeps the path and query, minus any fragment, which is never sent.
+/// into its authority and the rest, or `None` for any other form. The scheme
+/// matches case-insensitively (RFC 3986 §3.1). The authority ends at the first
+/// `/`, `?`, or `#` (RFC 3986 §3.2) and is returned as `host[:port]`, without
+/// any `userinfo@`; the rest keeps the path and query, minus any fragment,
+/// which is never sent.
 fn split_absolute_form(target: &str) -> Option<(&str, &str)> {
-    let rest = target
-        .strip_prefix("http://")
-        .or_else(|| target.strip_prefix("https://"))?;
+    let rest = ["http://", "https://"].into_iter().find_map(|scheme| {
+        target
+            .get(..scheme.len())
+            .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
+            .and_then(|_| target.get(scheme.len()..))
+    })?;
     let rest = rest.split_once('#').map_or(rest, |(before, _)| before);
     let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
-    Some(rest.split_at(authority_end))
+    let (authority, rest) = rest.split_at(authority_end);
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    Some((authority, rest))
 }
 
 /// Rewrites an absolute-form request line to origin-form (RFC 9112 §3.2.2):
 /// `GET http://host:port/path?query HTTP/1.1` becomes `GET /path?query HTTP/1.1`.
-/// The scheme and authority are dropped; the path (and any query) is kept, so
-/// the upstream origin server receives the form it expects. Only the request
-/// line changes — headers and any buffered body bytes pass through verbatim.
+/// The scheme and authority are dropped from the line; the path (and any query)
+/// is kept, so the upstream origin server receives the form it expects. The
+/// received `Host:` header is replaced by one carrying the target's authority,
+/// added when the request had none (RFC 9112 §3.2.2), so the upstream sees the
+/// host the request was routed to. Every other header and any buffered body
+/// bytes pass through verbatim. A head with any other target is returned as is.
 fn rewrite_absolute_form(head: &[u8]) -> Cow<'_, [u8]> {
     let head_end = head
         .windows(4)
@@ -710,7 +714,7 @@ fn rewrite_absolute_form(head: &[u8]) -> Cow<'_, [u8]> {
         return Cow::Borrowed(head);
     };
 
-    let Some((_, origin_target)) = split_absolute_form(target) else {
+    let Some((authority, origin_target)) = split_absolute_form(target) else {
         return Cow::Borrowed(head);
     };
 
@@ -724,7 +728,15 @@ fn rewrite_absolute_form(head: &[u8]) -> Cow<'_, [u8]> {
     out.extend_from_slice(origin_target.as_bytes());
     out.push(b' ');
     out.extend_from_slice(version.as_bytes());
-    out.extend_from_slice(&headers[request_line_end + 1..]);
+    out.extend_from_slice(b"Host: ");
+    out.extend_from_slice(authority.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    for line in head_lines(&headers[request_line_end + 1..]) {
+        if header_parts(line).is_some_and(|(name, _)| is_header(name, b"host")) {
+            continue; // Replaced by the target's authority above.
+        }
+        out.extend_from_slice(line);
+    }
     out.extend_from_slice(rest);
     Cow::Owned(out)
 }
@@ -1536,22 +1548,27 @@ mod tests {
         let parsed =
             parse_request(b"GET http://web.min.internal?next=/a HTTP/1.1\r\nHost: x\r\n\r\n")
                 .unwrap();
-        assert!(parsed.absolute_form);
         assert_eq!(parsed.authority, "web.min.internal");
+        // The scheme matches case-insensitively, and userinfo is not routed on.
+        let parsed =
+            parse_request(b"GET HTTP://u:p@web.min.internal:81/p HTTP/1.1\r\n\r\n").unwrap();
+        assert_eq!(parsed.authority, "web.min.internal:81");
 
         let rewrite =
             |head: &[u8]| String::from_utf8(rewrite_absolute_form(head).into_owned()).unwrap();
         assert_eq!(
-            rewrite(b"GET http://web.min.internal:8080/p?q=1#frag HTTP/1.1\r\nHost: x\r\n\r\nbody"),
-            "GET /p?q=1 HTTP/1.1\r\nHost: x\r\n\r\nbody"
+            rewrite(
+                b"GET http://web.min.internal:8080/p?q=1#frag HTTP/1.1\r\nA: 1\r\nhost: x\r\n\r\nbody"
+            ),
+            "GET /p?q=1 HTTP/1.1\r\nHost: web.min.internal:8080\r\nA: 1\r\n\r\nbody"
         );
         assert_eq!(
             rewrite(b"GET http://web.min.internal?next=/a HTTP/1.1\r\n\r\n"),
-            "GET /?next=/a HTTP/1.1\r\n\r\n"
+            "GET /?next=/a HTTP/1.1\r\nHost: web.min.internal\r\n\r\n"
         );
         assert_eq!(
-            rewrite(b"GET http://web.min.internal HTTP/1.1\r\n\r\n"),
-            "GET / HTTP/1.1\r\n\r\n"
+            rewrite(b"GET Http://web.min.internal HTTP/1.0\r\n\r\n"),
+            "GET / HTTP/1.0\r\nHost: web.min.internal\r\n\r\n"
         );
         assert_eq!(
             rewrite(b"GET /already HTTP/1.1\r\n\r\n"),
@@ -1622,7 +1639,7 @@ mod tests {
     /// `host_header_routes_through_proxy_then_not_found_after_deregister`, which
     /// only exercises an origin-form (`GET /`) target.
     #[tokio::test]
-    async fn forward_proxy_replays_absolute_form_target_to_upstream() {
+    async fn forward_proxy_rewrites_absolute_form_target_to_origin_form() {
         // A backend that records the request head it received, then answers 200.
         let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
@@ -1673,8 +1690,8 @@ mod tests {
 
     /// An absolute-form request whose URI authority differs from the `Host:`
     /// header routes by the URI authority (RFC 9112 §3.2.3). The `Host:`
-    /// header is ignored for routing, and the upstream receives the origin-form
-    /// request line.
+    /// header is ignored for routing and replaced in the forwarded head by the
+    /// URI authority, and the upstream receives the origin-form request line.
     #[tokio::test]
     async fn absolute_form_uri_authority_overrides_host_header() {
         let backend = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -1727,6 +1744,14 @@ mod tests {
         assert!(
             upstream_head.starts_with("GET /data HTTP/1.1"),
             "expected origin-form target, got: {upstream_head}"
+        );
+        assert!(
+            upstream_head.contains(&format!("\r\nHost: real.min.internal:{backend_port}\r\n")),
+            "expected Host: replaced by the URI authority, got: {upstream_head}"
+        );
+        assert!(
+            !upstream_head.contains("other.min.internal"),
+            "expected the received Host: dropped, got: {upstream_head}"
         );
     }
 
