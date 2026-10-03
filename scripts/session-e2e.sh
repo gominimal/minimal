@@ -109,6 +109,13 @@
 #   native_resolution_without_proxy_env
 #                                    NET-009/122/123: the advisory, the probe,
 #                                    and host-OS resolution with no proxies
+#   local_range_reserved_by_privileged_step
+#                                    NET-123's macOS half: the advisory's one
+#                                    command installs the boot-time range unit;
+#                                    custody, the probe reading present, the
+#                                    job enabled for boot, and the re-apply a
+#                                    boot performs (no Linux lane runs it —
+#                                    Linux takes no range step)
 #   hostnames_recover_and_two_daemons_route NET-020..027 warning, recovery,
 #                                   two daemons on one machine routing
 #   retired_surfaces_gone            NET-109/110: the retired surfaces are gone,
@@ -166,6 +173,9 @@ SKIP_SEED_DIR="" # seeded by the skip-lane scaffold proof below; removed on tear
 OWNIP_SEED_DIR="" # seeded by the own-IP proof below; removed on teardown
 NATIVE_SEED_DIR="" # seeded by the native-resolution proof below; removed on teardown
 NATIVE_REVERT_LINK="" # the link that proof pointed the host resolver at; reverted on teardown
+RANGE_SEED_DIR="" # seeded by the local-range proof below; removed on teardown
+RANGE_INSTALLED="" # set when that proof ran its command; gates the unit teardown
+RANGE_RESOLVER_BEFORE="" # the resolver file's prior bytes, when it had any; restored on teardown
 PROXY_SEED_DIR="" # seeded by the min.internal proxy proof; removed on teardown
 PROXY_OWN_SEED_DIR="" # its own-address box's seed; removed on teardown
 PROXY_HOST_DIR="" # the host-loopback dir that proof serves; removed on teardown
@@ -434,6 +444,11 @@ teardown() {
   [ -n "$SKIP_SEED_DIR" ] && rm -rf "$SKIP_SEED_DIR"
   [ -n "$OWNIP_SEED_DIR" ] && rm -rf "$OWNIP_SEED_DIR"
   [ -n "$NATIVE_SEED_DIR" ] && rm -rf "$NATIVE_SEED_DIR"
+  [ -n "$RANGE_SEED_DIR" ] && rm -rf "$RANGE_SEED_DIR"
+  # The local-range proof installs a real LaunchDaemon on the macOS host;
+  # a run that died between its install and its own cleanup must not leave
+  # it behind — the same reasoning as the native link revert below.
+  range_teardown_unit
   # The native-resolution proof points the HOST resolver at the daemon's
   # answerer; a run that died between that and its own revert must not leave
   # the change behind. `resolvectl revert` restores the link's DNS state and
@@ -3731,6 +3746,322 @@ fi
 #     check below still runs there, and passing it is the assertion that
 #     the quiet was right.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# NET-123's macOS half: the advisory's one privileged command installs the
+# boot-time unit that reserves the local range (design §7.1) — the same
+# `sudo sh -c` that writes the resolver file, so both halves of the host's
+# configuration land in one elevation, never two commands the user runs
+# separately.
+#
+# The proof runs the exact command the advisory printed — the bytes a user
+# would have copied off the terminal, including the two files' bodies riding
+# inside it as quoted heredocs — and then asserts what the spec promises:
+# both files root-owned at their exact modes, the plist's ProgramArguments
+# naming the root-owned program, the whole reserved range present on this
+# host's lo0, a session started afterwards with no advisory and no interim
+# (the CLI's own host-side probe is the one that read absent before, and
+# native DNS live after, which it is only over a present range), the job
+# loaded in the system domain with RunAtLoad and not disabled for boot — and
+# the re-apply a boot performs, shown by kickstarting the unit once the
+# aliases are removed. A real reboot stays a manual check, recorded in the
+# PR body; this is everything short of it.
+#
+# This case is the macOS lane's alone: Linux needs no range step — the whole
+# 127/8 binds on `lo` — so no Linux lane runs it, and when it cannot install
+# a LaunchDaemon it fails rather than self-skips, so the pin is never silent.
+proof_local_range_reserved_by_privileged_step() {
+  echo "::group::local range reserved by the advisory's privileged step (NET-123, macOS)"
+  if [ "$(uname -s)" != Darwin ]; then
+    echo "::error::the local-range case is the macOS lane's — Linux takes no range step (the whole 127/8 binds on lo), and a run that cannot install a LaunchDaemon fails rather than self-skips, so the pin is never silent"
+    fail
+  fi
+  if ! command -v launchctl >/dev/null 2>&1 || ! sudo -n true >/dev/null 2>&1; then
+    echo "::error::this macOS host cannot install the range unit (needs launchctl and passwordless sudo); the case fails rather than self-skips, so the pin is never silent"
+    fail
+  fi
+
+  RANGE_LABEL="dev.minimal.local-range"
+  RANGE_PROGRAM_PATH="/Library/PrivilegedHelperTools/$RANGE_LABEL"
+  RANGE_PLIST_PATH="/Library/LaunchDaemons/$RANGE_LABEL.plist"
+  RANGE_NAME="e2e-local-range"
+
+  # A prior run killed past its own EXIT trap (a SIGKILL'd runner) can leave
+  # the unit installed, and a host with the unit already installed gets no
+  # advisory at all — its quiet state is the spec's success state — so this
+  # proof could never start from its premise. Remove it first: the unit is
+  # this command's own artifact (the teardown removes it on every clean run
+  # for the same reason the native proof's teardown removes its link), and a
+  # leftover is exactly the state the teardown exists to undo. The aliases
+  # go with it, so the post-command count below proves the command applied
+  # them, not that a dead run left them behind.
+  if [ -e "$RANGE_PLIST_PATH" ] || [ -e "$RANGE_PROGRAM_PATH" ]; then
+    echo "removing a leftover range unit from a prior run, so this proof starts from the advisory's own premise"
+    range_remove_unit
+  fi
+
+  RANGE_SEED_DIR="$(hook_mktemp /tmp/mnlrr.XXXXXX)"
+  hook_seed_preamble > "$RANGE_SEED_DIR/minimal.toml"
+  mkdir "$RANGE_SEED_DIR/.git"
+
+  # Warm the daemon until its answerer is on record: the advisory's command
+  # points the host's resolver at that port, so it must exist before the
+  # command runs (the same warm the native-resolution proof uses).
+  range_port=""
+  for _ in $(seq 1 40); do
+    range_port="$(mnl ls 2>/dev/null \
+      | sed -n 's/^ZONE ANSWERER: *listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | head -n1)"
+    [ -n "$range_port" ] && break
+    sleep 0.25
+  done
+  if [ -z "$range_port" ]; then
+    echo "::error::the daemon's zone answerer never came up (no ZONE ANSWERER line in min ls)"
+    fail
+  fi
+
+  # The activate that renders the advisory. On a host whose range is not
+  # installed the note names the missing range and the command that fixes
+  # it; the point of the case is that this one command fixes both halves.
+  range_err="$WORK/range-activate.err"
+  range_sid="$(cd "$RANGE_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$RANGE_NAME" 2>"$range_err")" || {
+    echo "::error::'min session activate' for the local-range proof failed"
+    echo "--- stderr ---"; cat "$range_err" 2>/dev/null || true
+    fail
+  }
+  echo "activated $RANGE_NAME ($(printf '%s' "$range_sid" | tail -n1 | tr -d '\r')); answerer on 127.0.0.1:$range_port"
+
+  # The command the advisory named, exactly as a user would have copied it:
+  # on macOS it spans several lines, because the two files' bytes ride
+  # inside it as quoted heredocs, so the extraction runs from the
+  # de-indented `sudo` line to the closing quote.
+  range_cmd="$(awk -v lead="Configure the host's resolver and reserve the local range with:" -v q="'" '
+    index($0, lead) > 0 { started = 1; next }
+    started && !first { sub(/^  /, ""); first = 1 }
+    started { print; if (substr($0, length($0), 1) == q) exit }
+  ' "$range_err")"
+  case "$range_cmd" in
+    "sudo sh -c '"*) ;;
+    *)
+      echo "::error::no range-reserving advisory on the activate's stderr (got: '$range_cmd')"
+      echo "  (the lead-in must say the command configures the resolver and reserves the range)"
+      echo "--- activate stderr ---"; cat "$range_err" 2>/dev/null || true
+      fail
+      ;;
+  esac
+  # The command the lead-in promised: one elevation for the resolver and the
+  # range together, carrying both files' bytes and the boot step.
+  case "$range_cmd" in
+    *"$RANGE_PROGRAM_PATH"*) ;;
+    *)
+      echo "::error::the advisory's command does not name the range program's path ($RANGE_PROGRAM_PATH)"
+      echo "--- command ---"; printf '%s\n' "$range_cmd"
+      fail
+      ;;
+  esac
+  case "$range_cmd" in
+    *"$RANGE_PLIST_PATH"*) ;;
+    *)
+      echo "::error::the advisory's command does not name the range plist's path ($RANGE_PLIST_PATH)"
+      echo "--- command ---"; printf '%s\n' "$range_cmd"
+      fail
+      ;;
+  esac
+  case "$range_cmd" in
+    *"launchctl bootout system/$RANGE_LABEL"* | *"launchctl bootstrap system $RANGE_PLIST_PATH"*) ;;
+    *)
+      echo "::error::the advisory's command does not load the unit (bootout, then bootstrap)"
+      echo "--- command ---"; printf '%s\n' "$range_cmd"
+      fail
+      ;;
+  esac
+  range_sudos="$(printf '%s\n' "$range_cmd" | grep -c -- sudo)"
+  if [ "$range_sudos" != 1 ]; then
+    echo "::error::the command is not one privilege elevation ($range_sudos 'sudo's) — the user must never run two commands"
+    echo "--- command ---"; printf '%s\n' "$range_cmd"
+    fail
+  fi
+
+  # The resolver file this command overwrites, backed up so every exit path
+  # leaves the host as it found it — the teardown restores it too.
+  if [ -f /etc/resolver/min.internal ]; then
+    RANGE_RESOLVER_BEFORE="$WORK/range-resolver.before"
+    cp /etc/resolver/min.internal "$RANGE_RESOLVER_BEFORE"
+  fi
+
+  # Run the exact command the advisory printed — verbatim, as the user would
+  # have. Passwordless sudo was the gate at the top, so it cannot prompt.
+  RANGE_INSTALLED=yes
+  if ! sh -c "$range_cmd" >"$WORK/range-cmd.out" 2>"$WORK/range-cmd.err"; then
+    echo "::error::the advisory's command did not run"
+    echo "--- command (first and last lines) ---"
+    printf '%s\n' "$range_cmd" | sed -n '1p;$p'
+    echo "--- output ---"; cat "$WORK/range-cmd.out" "$WORK/range-cmd.err" 2>/dev/null || true
+    fail
+  fi
+  echo "ran the advisory's command: resolver file and range unit, one sudo"
+
+  # Custody, the facts the CLI's own detection checks: both files root-owned
+  # at their exact modes, the directories the command made root's, and the
+  # plist naming the root-owned program.
+  range_prog_stat="$(stat -f '%u %Lp' "$RANGE_PROGRAM_PATH" 2>/dev/null || true)"
+  range_plist_stat="$(stat -f '%u %Lp' "$RANGE_PLIST_PATH" 2>/dev/null || true)"
+  if [ "$range_prog_stat" != "0 755" ] || [ "$range_plist_stat" != "0 644" ]; then
+    echo "::error::the range unit's files are not root-owned at their modes (program: '$range_prog_stat', plist: '$range_plist_stat')"
+    fail
+  fi
+  for range_dir in /Library/PrivilegedHelperTools /Library/LaunchDaemons; do
+    case "$(stat -f '%u' "$range_dir" 2>/dev/null || true)" in
+      0) ;;
+      *)
+        echo "::error::$range_dir is not root-owned — the unit's path fails its own custody walk"
+        fail
+        ;;
+    esac
+  done
+  range_plist_prog="$(plutil -extract ProgramArguments.0 raw -o - "$RANGE_PLIST_PATH" 2>/dev/null || true)"
+  if [ "$range_plist_prog" != "$RANGE_PROGRAM_PATH" ]; then
+    echo "::error::the plist does not name the root-owned program (ProgramArguments[0]: '$range_plist_prog')"
+    fail
+  fi
+  echo "custody holds: both files root-owned at 0755/0644, the plist runs the root-owned program"
+
+  # The range on this host's loopback — the spike's own check, 254 aliases,
+  # one per usable host address of the /24: the addresses the daemon's
+  # session-start probe and the CLI's host-side one read.
+  range_aliases="$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')"
+  if [ "$range_aliases" != 254 ]; then
+    echo "::error::the range step did not apply the whole reserved range ($range_aliases of 254 aliases on lo0)"
+    fail
+  fi
+  echo "the reserved range is present on lo0: $range_aliases aliases"
+
+  # The probe that read absent before the command: the CLI reads the range on
+  # the host it runs on, and on this host the range is now installed — so the
+  # advisory that named the missing range is gone entirely, and the surface
+  # verdict a start prints beside it reads Native, which it does only when
+  # the host's own loopback carries the range (the daemon's interim flag
+  # alone cannot say so on a VM-backed target, whose guest always carries it).
+  range2_err="$WORK/range-activate2.err"
+  (cd "$RANGE_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$RANGE_NAME-2" 2>"$range2_err") >/dev/null || {
+    echo "::error::the activate after the range step failed"
+    echo "--- stderr ---"; cat "$range2_err" 2>/dev/null || true
+    fail
+  }
+  if grep -q -- '^note:' "$range2_err" || grep -qi -- interim "$range2_err"; then
+    echo "::error::an advisory still prints after the range step ran — the host probe did not read present, or custody does not hold"
+    echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
+    fail
+  fi
+  if ! grep -q -- 'native DNS is the live name surface' "$range2_err"; then
+    echo "::error::a session started after the range step does not read native DNS as its live surface (the host probe must read present)"
+    echo "--- second activate stderr ---"; cat "$range2_err" 2>/dev/null || true
+    fail
+  fi
+  echo "session after the range step: no advisory, no interim, native DNS live — the probe reads present"
+
+  # The unit, loaded in the system domain: launchd holds the job (RunAtLoad,
+  # no KeepAlive — a job that exits stays loaded, unlike the spike's
+  # LaunchOnlyOnce shape), it is enabled for boot, and the program it runs
+  # is the root-owned copy — the same fact the CLI's custody check reads.
+  range_print="$(launchctl print "system/$RANGE_LABEL" 2>/dev/null || true)"
+  if [ -z "$range_print" ] || printf '%s' "$range_print" | grep -q 'Could not find service'; then
+    echo "::error::the range unit is not loaded in the system domain"
+    launchctl print "system/$RANGE_LABEL" 2>&1 || true
+    fail
+  fi
+  if ! printf '%s' "$range_print" | grep -q -- "program = $RANGE_PROGRAM_PATH"; then
+    echo "::error::the loaded job does not name the root-owned program (launchctl print:)"
+    printf '%s\n' "$range_print" | head -40
+    fail
+  fi
+  if ! printf '%s' "$range_print" | grep -qi -- 'runatload = true'; then
+    echo "::error::the loaded job is not RunAtLoad — the range would not re-apply at boot"
+    printf '%s\n' "$range_print" | head -40
+    fail
+  fi
+  # The disabled table's rows read `label => bool`, so the boolean is the
+  # third field; a label with no row is enabled too. Read under sudo: the
+  # system domain's table is root's to list, and the gate above proved
+  # passwordless sudo.
+  range_disabled="$(sudo launchctl print-disabled system 2>/dev/null \
+    | awk -v l="$RANGE_LABEL" '$1 == l { print $3 }')"
+  case "${range_disabled:-}" in
+    "" | false) ;;
+    *)
+      echo "::error::the range unit is disabled for boot (launchctl print-disabled: $range_disabled)"
+      fail
+      ;;
+  esac
+  echo "the unit is loaded (RunAtLoad, program = the root-owned copy) and enabled for boot"
+
+  # The re-apply a boot performs: the aliases removed, then the unit
+  # kickstarted as a boot's load would run it — the range comes back with no
+  # user action, which is the half of "at every boot" a reboot alone could
+  # prove further.
+  for n in $(seq 1 254); do
+    sudo ifconfig lo0 -alias 127.0.64."$n" >/dev/null 2>&1 || true
+  done
+  range_gone="$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')"
+  if [ "$range_gone" != 0 ]; then
+    echo "::error::removing the aliases left $range_gone behind on lo0"
+    fail
+  fi
+  if ! sudo launchctl kickstart "system/$RANGE_LABEL"; then
+    echo "::error::kickstarting the range unit failed — the re-apply a boot performs could not be shown"
+    fail
+  fi
+  range_back=0
+  for _ in $(seq 1 20); do
+    range_back="$(ifconfig lo0 2>/dev/null | grep -c -- '127\.0\.64\.')"
+    [ "$range_back" = 254 ] && break
+    sleep 0.5
+  done
+  if [ "$range_back" != 254 ]; then
+    echo "::error::the kickstarted unit re-applied only $range_back of 254 aliases — the range would not come back at boot"
+    fail
+  fi
+  echo "kickstart re-applied the range with no user action, as a boot's load would"
+
+  # Cleanup: the unit booted out, both files removed, the aliases removed,
+  # the resolver file restored to what this host had before the command (or
+  # removed when the command created it) — so the soak's next iteration finds
+  # the host as this one did. The teardown repeats this wherever a proof dies.
+  range_teardown_unit
+  echo "local range reserved by the privileged step OK (unit installed, custody held, probe present, boot re-apply shown, host restored)"
+  echo "::endgroup::"
+}
+
+# Remove the range unit from this host, idempotently and best-effort: the
+# job booted out, both files gone, the aliases the program applied gone with
+# them. Nothing here can fail the run it serves — every later read either
+# re-does it (the proof's command installs fresh bytes) or asserts a state
+# this removal makes reachable (the advisory over a host with no unit).
+range_remove_unit() {
+  sudo launchctl bootout "system/dev.minimal.local-range" >/dev/null 2>&1 || true
+  sudo rm -f "/Library/PrivilegedHelperTools/dev.minimal.local-range" \
+    "/Library/LaunchDaemons/dev.minimal.local-range.plist" >/dev/null 2>&1 || true
+  for n in $(seq 1 254); do
+    sudo ifconfig lo0 -alias 127.0.64."$n" >/dev/null 2>&1 || true
+  done
+}
+
+# Undo the local-range proof's host changes, wherever it died: the unit
+# removed (the function above) and the resolver file restored to its prior
+# bytes (or removed when the command created it). A no-op until the proof
+# ran its command, so the teardown below can call it unconditionally.
+range_teardown_unit() {
+  [ -n "${RANGE_INSTALLED:-}" ] || return 0
+  range_remove_unit
+  if [ -n "${RANGE_RESOLVER_BEFORE:-}" ]; then
+    sudo cp "$RANGE_RESOLVER_BEFORE" /etc/resolver/min.internal
+  else
+    sudo rm -f /etc/resolver/min.internal
+  fi
+  RANGE_INSTALLED=""
+}
+
 proof_native_resolution_without_proxy_env() {
   echo "::group::native min.internal resolution with no proxy settings (NET-009, NET-122, NET-123)"
 
@@ -3800,8 +4131,12 @@ proof_native_resolution_without_proxy_env() {
   echo "activated $NATIVE_NAME ($native_sid); answerer on 127.0.0.1:$native_port"
 
   # The command the advisory named: the line after its lead-in, de-indented —
-  # exactly what a user would have copied off the terminal.
-  native_cmd="$(grep -A1 -F -- "Configure the host's resolver for the zone with:" \
+  # exactly what a user would have copied off the terminal. The lead-in's
+  # shared prefix matches both platforms' wording ("…for the zone with:" on
+  # Linux, "…and reserve the local range with:" on macOS, whose command
+  # carries the range step NET-123 folds into it); the range-reserving case
+  # below extracts the multi-line command whole.
+  native_cmd="$(grep -A1 -F -- "Configure the host's resolver" \
     "$native_err" 2>/dev/null | tail -n1 | sed 's/^  //')"
 
   if [ -n "$native_cmd" ]; then
@@ -7008,6 +7343,15 @@ case "${1:-}" in
     proof_fresh_linux_kvm_activate_local_minvmd
     proof_fresh_arm64_kvm_activate_local_minvmd
     proof_linux_stock_install_runs_vm_boxes
+    # The local-range proof is the macOS lane's alone — Linux takes no range
+    # step (the whole 127/8 binds on lo), so a Linux lane does not run it from
+    # the whole-lane order; named by name it fails rather than self-skips, so
+    # the pin is never silent (see its own head for what it proves).
+    if [ "$(uname -s)" = Darwin ]; then
+      proof_local_range_reserved_by_privileged_step
+    else
+      echo "local range reserved by the privileged step SKIPPED (macOS lane only: Linux takes no range step)"
+    fi
     proof_native_resolution_without_proxy_env
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
@@ -7019,6 +7363,7 @@ case "${1:-}" in
   lifecycle | session_exec | session_outbound_request | own_ip | own_ip_egress_declared_and_enforced | task_run | hooks \
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
     | network_posture_from_stock_install | native_resolution_without_proxy_env \
+    | local_range_reserved_by_privileged_step \
     | hostnames_recover_and_two_daemons_route \
     | min_internal_names_through_proxy | proxy_refuses_like_direct | retired_surfaces_gone \
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
@@ -7032,6 +7377,7 @@ case "${1:-}" in
     echo "  cases: lifecycle session_exec session_outbound_request own_ip own_ip_egress_declared_and_enforced task_run hooks"
     echo "         skip_scaffold sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
     echo "         network_posture_from_stock_install native_resolution_without_proxy_env"
+    echo "         local_range_reserved_by_privileged_step"
     echo "         fresh_linux_kvm_activate_local_minvmd fresh_arm64_kvm_activate_local_minvmd"
     echo "         linux_stock_install_runs_vm_boxes"
     echo "         hostnames_recover_and_two_daemons_route"

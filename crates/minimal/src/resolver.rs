@@ -1883,13 +1883,25 @@ mod tests {
         let mut components = Vec::new();
         for path in [RANGE_PROGRAM_PATH, RANGE_PLIST_PATH] {
             for component in path_components(path) {
-                components.push((component, FileCustody { owner: 0, mode: 0o755 }));
+                components.push((
+                    component,
+                    FileCustody {
+                        owner: 0,
+                        mode: 0o755,
+                    },
+                ));
             }
         }
         RangeFacts {
             components,
-            program: Some(FileCustody { owner: 0, mode: 0o755 }),
-            plist: Some(FileCustody { owner: 0, mode: 0o644 }),
+            program: Some(FileCustody {
+                owner: 0,
+                mode: 0o755,
+            }),
+            plist: Some(FileCustody {
+                owner: 0,
+                mode: 0o644,
+            }),
             plist_program: Some(RANGE_PROGRAM_PATH.to_string()),
             loaded_program: Some(RANGE_PROGRAM_PATH.to_string()),
         }
@@ -1928,8 +1940,15 @@ mod tests {
         let port = 15353;
         // An unconfigured host is advised, with the exact command to run.
         let unconfigured = Hook::absent("test", "no hook for the zone");
-        let advisory = advisory_at(&unconfigured, port, false, None, &range_step_on_this_os(), None)
-            .expect("an unconfigured host must be advised");
+        let advisory = advisory_at(
+            &unconfigured,
+            port,
+            false,
+            None,
+            &range_step_on_this_os(),
+            None,
+        )
+        .expect("an unconfigured host must be advised");
         for marker in command_markers(port) {
             assert!(
                 advisory.contains(&marker),
@@ -1946,8 +1965,15 @@ mod tests {
         // fact holds.
         let configured = Hook::configured("test", Some(port), "routes the zone");
         assert!(
-            advisory_at(&configured, port, false, Some(true), &range_step_on_this_os(), None)
-                .is_none(),
+            advisory_at(
+                &configured,
+                port,
+                false,
+                Some(true),
+                &range_step_on_this_os(),
+                None
+            )
+            .is_none(),
             "a configured host must not be re-advised"
         );
 
@@ -1965,8 +1991,15 @@ mod tests {
 
         // NET-123's interim arm: a session published at the 127.0.0.1
         // interim re-surfaces the advisory even when the hook routes.
-        let interim = advisory_at(&configured, port, true, None, &range_step_on_this_os(), None)
-            .expect("the interim must re-surface the advisory");
+        let interim = advisory_at(
+            &configured,
+            port,
+            true,
+            None,
+            &range_step_on_this_os(),
+            None,
+        )
+        .expect("the interim must re-surface the advisory");
         assert!(
             interim.contains("127.0.0.1 interim"),
             "the interim advisory must name the interim: {interim}"
@@ -2431,7 +2464,10 @@ mod tests {
             bootout_at < bootstrap_at,
             "the old unit is booted out before the new one loads: {command}"
         );
-        assert!(command.ends_with('\''), "the load is the last step: {command}");
+        assert!(
+            command.ends_with('\''),
+            "the load is the last step: {command}"
+        );
         // And the resolver step is still NET-122's: the same file, the same
         // port, in the same one command — the range step stands beside it,
         // not in front of it.
@@ -2520,16 +2556,25 @@ mod tests {
         // The program a user owns, however it reads otherwise: custody
         // fails, naming the file and the ownership it read.
         let mut facts = root_owned_facts();
-        facts.program = Some(FileCustody { owner: 501, mode: 0o755 });
+        facts.program = Some(FileCustody {
+            owner: 501,
+            mode: 0o755,
+        });
         let step = range_step_over(&facts);
         assert_eq!(step.state, RangeStepState::CustodyFailed);
         let check = step.failed_check.as_deref().expect("the check is named");
         assert!(check.contains(RANGE_PROGRAM_PATH), "{check}");
-        assert!(check.contains("uid 501"), "the check names the owner it read: {check}");
+        assert!(
+            check.contains("uid 501"),
+            "the check names the owner it read: {check}"
+        );
 
         // Group-writable is not root's alone, whoever owns it.
         let mut facts = root_owned_facts();
-        facts.plist = Some(FileCustody { owner: 0, mode: 0o666 });
+        facts.plist = Some(FileCustody {
+            owner: 0,
+            mode: 0o666,
+        });
         let step = range_step_over(&facts);
         assert_eq!(step.state, RangeStepState::CustodyFailed);
         let check = step.failed_check.as_deref().expect("the check is named");
@@ -2628,7 +2673,10 @@ mod tests {
             .iter_mut()
             .find(|(path, _)| path == "/Library/PrivilegedHelperTools")
             .expect("the component is on the walk");
-        tampered.1 = FileCustody { owner: 501, mode: 0o755 };
+        tampered.1 = FileCustody {
+            owner: 501,
+            mode: 0o755,
+        };
         let step = range_step_over(&facts);
         assert_eq!(step.state, RangeStepState::CustodyFailed);
         let check = step.failed_check.as_deref().expect("the check is named");
@@ -2694,8 +2742,15 @@ mod tests {
         // The host the command leaves behind: quiet — the probe present,
         // custody holding.
         assert!(
-            advisory_at(&configured, port, false, Some(true), &installed_range_step(), None)
-                .is_none(),
+            advisory_at(
+                &configured,
+                port,
+                false,
+                Some(true),
+                &installed_range_step(),
+                None
+            )
+            .is_none(),
             "custody holding over a present range is the quiet arm's whole condition"
         );
         // Custody failing on the same host: the advisory re-surfaces,
@@ -2716,8 +2771,7 @@ mod tests {
             "the advisory says the custody verdict: {advisory}"
         );
         assert!(
-            advisory
-                .contains("Configure the host's resolver and reserve the local range with:"),
+            advisory.contains("Configure the host's resolver and reserve the local range with:"),
             "and names the command that reinstalls both files: {advisory}"
         );
         // The same failure under the interim: the interim is said, and the
@@ -2725,7 +2779,10 @@ mod tests {
         // the unit is not root's.
         let interim = advisory_at(&configured, port, true, None, &failed, None)
             .expect("the interim re-surfaces the advisory");
-        assert!(interim.contains(check), "the check is said under the interim too: {interim}");
+        assert!(
+            interim.contains(check),
+            "the check is said under the interim too: {interim}"
+        );
         // And an absent unit over a probe that reads present: the aliases
         // without the boot step behind them are a range the next boot
         // removes, not a host with nothing left to say.
@@ -2780,8 +2837,15 @@ mod tests {
             "the Linux quiet arm is unchanged by the range step"
         );
         let unconfigured = Hook::absent("test", "no hook for the zone");
-        let advisory = advisory_at(&unconfigured, port, false, None, &RangeStep::not_needed(), None)
-            .expect("an unconfigured Linux host is advised");
+        let advisory = advisory_at(
+            &unconfigured,
+            port,
+            false,
+            None,
+            &RangeStep::not_needed(),
+            None,
+        )
+        .expect("an unconfigured Linux host is advised");
         assert!(
             advisory.contains("Configure the host's resolver for the zone with:"),
             "the lead-in names the resolver alone: {advisory}"
@@ -2890,8 +2954,7 @@ mod tests {
             "the macOS interim fact names the command that ends it: {interim}"
         );
         assert!(
-            interim
-                .contains("Configure the host's resolver and reserve the local range with:"),
+            interim.contains("Configure the host's resolver and reserve the local range with:"),
             "and the lead-in says what the command now does: {interim}"
         );
         // The Linux arm: the same fact, no claim about a step the command
