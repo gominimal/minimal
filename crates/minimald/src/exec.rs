@@ -2809,15 +2809,16 @@ mod tests {
             process,
             MockEndpoints {
                 stdin_reader: _stdin_reader,
-                stdout_writer,
-                stderr_writer,
+                // Held, never written: a silent child keeps its stdio
+                // open. Dropping them would let output EOF end the loop
+                // before the client-loss branch wins the `select!`.
+                stdout_writer: _stdout_writer,
+                stderr_writer: _stderr_writer,
                 ctrl,
             },
         ) = build_mock();
         // A silent child: nothing on stdout or stderr, and it never
         // exits on its own.
-        drop(stdout_writer);
-        drop(stderr_writer);
 
         // SSH stdin closed: bridge sees EOF immediately.
         let (closed_stdin_w, mut bridge_stdin) = duplex(64);
