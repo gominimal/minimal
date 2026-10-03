@@ -164,6 +164,10 @@ fn log_session_contents(
 
 enum BindingMsg {
     Stdin(Vec<u8>),
+    /// The session was renamed while this binding is attached, so the archive
+    /// the shell-exit prompt's save-then-delete lane writes carries the new
+    /// name rather than the one cloned in at [`Binding::spawn`].
+    Rename(String),
     /// The session process ended, so the binding should tear down and raise the
     /// shell-exit prompt. See [`TeardownCause`] for what the binding surfaces.
     ///
@@ -554,6 +558,7 @@ impl Binding {
                                 () = self.shed.cancelled() => break MainloopExitReason::Shed,
                             }
                         },
+                        BindingMsg::Rename(name) => self.name = name,
                         BindingMsg::TeardownDueToProcessExit { cause, unwind_codes } => {
                             // Before the notices below and before the
                             // shell-exit prompt further down: both render into
@@ -4189,6 +4194,12 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     Message::Rename(new_name) if new_name == self.session_name => {}
                     Message::Rename(new_name) => {
                         self.session_name = new_name.clone();
+                        // The attached binding cloned the old name at spawn
+                        // for its save-then-delete archive; best-effort, since
+                        // the next attach clones the new one anyway.
+                        if let Some((tx, ..)) = self.remote.as_ref() {
+                            let _ = tx.try_send(BindingMsg::Rename(new_name.clone()));
+                        }
                         // The shell's `environ` is frozen at launch, so the
                         // new name reaches it the same way `TERM` does: by
                         // republishing through the per-attach environment
