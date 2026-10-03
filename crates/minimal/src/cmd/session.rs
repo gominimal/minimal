@@ -1544,6 +1544,35 @@ pub async fn cmd_session_policy(
         .await
         .context("GetEffectiveSessionPolicy RPC failed")?;
 
+    // The ports the box published at runtime, listed beside the declaration
+    // (NET-044) — the rows that make a `min net expose` visible rather than
+    // only permitted. Built here rather than through a `SessionLookup`
+    // conversion for the same reason the effective lookup above is: the
+    // request types stay the rpc crate's, where the wire contract lives. A
+    // view of live state, not a fact the listing stands on, so it degrades
+    // rather than fails: against a daemon that cannot serve it — an older
+    // build without the subsystem, a session mid-teardown — the declaration
+    // still prints, with a warning that the live rows are unavailable rather
+    // than a claim that nothing is published.
+    let live_lookup = match SessionLookup::parse(&args.session) {
+        SessionLookup::Id(id) => minimald_rpc::GetLiveIngressRequest::Id(id),
+        SessionLookup::Name(n) => minimald_rpc::GetLiveIngressRequest::Name(n),
+    };
+    let live = match client
+        .oneshot_rpc::<minimald_rpc::GetLiveIngress>(live_lookup)
+        .await
+    {
+        Ok(minimald_rpc::Errorable::Ok(live)) => live,
+        Ok(minimald_rpc::Errorable::Err { error }) => {
+            eprintln!("warning: live port mappings are unavailable: {error}");
+            Vec::new()
+        }
+        Err(error) => {
+            eprintln!("warning: live port mappings are unavailable: {error:#}");
+            Vec::new()
+        }
+    };
+
     match resp {
         minimald_rpc::Errorable::Ok(policy) => {
             // The fabric the display builds the baseline set from: the
@@ -1564,6 +1593,7 @@ pub async fn cmd_session_policy(
                 .then_some(switch::SwitchSubnet::default());
             let mut out = std::io::stdout();
             format_policy(&mut out, &policy, record.network, fabric)?;
+            write_live_ingress(&mut out, &live)?;
             out.flush().context("Failed to write policy")?;
             Ok(())
         }
@@ -1750,6 +1780,36 @@ pub fn format_policy(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// The ports the box published at runtime, listed beside the declaration
+/// (NET-044): one row a publish — the address its forward is bound on, and
+/// the in-box port it forwards to — shaped like the declared mapping rows
+/// above it, so the two read as one surface: what the box declared, and what
+/// it went on to publish. A box that published nothing prints no section: an
+/// empty header would claim a distinction between "nothing published" and
+/// "nothing publishable" the listing has no way to draw — the declaration
+/// above already says what is permitted, and silence says the box used none
+/// of it.
+///
+/// Shared by `min session policy`'s printer and the tests that pin the
+/// rendering, the way [`format_policy`] is.
+pub fn write_live_ingress(
+    out: &mut impl std::io::Write,
+    live: &[minimald_rpc::LiveMapping],
+) -> Result<(), anyhow::Error> {
+    if live.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "live ingress (published at runtime)")?;
+    for mapping in live {
+        writeln!(
+            out,
+            "  {}  {} → :{}",
+            mapping.proto, mapping.local, mapping.internal_port
+        )?;
     }
     Ok(())
 }
@@ -2660,6 +2720,80 @@ mod tests {
             classifier_advisory_start_line(&pre_field).is_none(),
             "a daemon that predates the field carries no advisory, so its \
              start prints none"
+        );
+    }
+
+    /// NET-044: the ports a box published at runtime are listed beside the
+    /// declaration — one row a publish, naming the bound address and the
+    /// in-box port — and a box that published nothing prints no live section
+    /// at all, so the declaration stands alone rather than beside an empty
+    /// header.
+    #[test]
+    fn policy_shows_live_mappings() {
+        let live = vec![minimald_rpc::LiveMapping {
+            local: "127.0.64.21:3000".to_string(),
+            internal_port: 3000,
+            proto: IpProto::Tcp,
+        }];
+
+        // Beside the declaration: the declared dynamic surface first, then
+        // the publish that used it.
+        let policy = EffectiveSessionPolicy {
+            egress: EffectiveEgress::AllowAll,
+            ingress: Some(IngressPolicy {
+                port_mappings: vec![],
+                dynamic_allowed_range: Some((3000, 3999)),
+                dynamic_ingress: Some(DynamicIngress::Allow),
+            }),
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None).unwrap();
+        write_live_ingress(&mut out, &live).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        let (declared, live_rows) = rendered
+            .split_once("live ingress (published at runtime)\n")
+            .expect("the live section follows the declaration");
+        assert!(
+            declared.contains("  dynamic ports  3000–3999"),
+            "the declared dynamic surface still renders: {rendered}"
+        );
+        assert!(
+            live_rows.contains("  tcp  127.0.64.21:3000 → :3000\n"),
+            "the live mapping names its bound address and in-box port: {rendered}"
+        );
+
+        // Every publish gets its row, in publish order.
+        let mut out = Vec::new();
+        write_live_ingress(
+            &mut out,
+            &[
+                minimald_rpc::LiveMapping {
+                    local: "127.0.64.21:3000".to_string(),
+                    internal_port: 3000,
+                    proto: IpProto::Tcp,
+                },
+                minimald_rpc::LiveMapping {
+                    local: "127.0.64.21:5353".to_string(),
+                    internal_port: 5353,
+                    proto: IpProto::Udp,
+                },
+            ],
+        )
+        .unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  tcp  127.0.64.21:3000 → :3000\n")
+                && rendered.contains("  udp  127.0.64.21:5353 → :5353\n"),
+            "one row a publish: {rendered}"
+        );
+
+        // Nothing published: no section, not an empty header.
+        let mut out = Vec::new();
+        write_live_ingress(&mut out, &[]).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "",
+            "a box that published nothing prints no live section"
         );
     }
 

@@ -1050,6 +1050,66 @@ impl OneshotSshRpc for GetEffectiveSessionPolicy {
     type Response = Errorable<EffectiveSessionPolicy>;
 }
 
+/// One live dynamic-ingress mapping (NET-044): a port a process inside the box
+/// published at runtime with the box's own `min net expose`, held from the
+/// publish until the box stops.
+///
+/// Not a [`PortMapping`]: a declaration names what a box *may* publish, and
+/// this is what it *did* — the mapping's `local` is a full `host:port` on the
+/// box's own published address (NET-010), not an external port number to bind
+/// wherever the publish surface happens to stand, so the row a client renders
+/// can name the address a connection actually reaches.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveMapping {
+    /// The host-side `host:port` the forward is published on, spelled as the
+    /// switch bound it.
+    pub local: String,
+    /// The port inside the box the forward delivers to.
+    pub internal_port: u16,
+    /// The transport the forward carries.
+    pub proto: IpProto,
+}
+
+impl LiveMapping {
+    /// The `host:port` pair a client renders, split — `None` when `local` is
+    /// not a `host:port` pair with a numeric port, a shape the daemon never
+    /// publishes.
+    #[must_use]
+    pub fn host_port(&self) -> Option<(&str, u16)> {
+        let (host, port) = self.local.rsplit_once(':')?;
+        Some((host, port.parse().ok()?))
+    }
+}
+
+/// An RPC to read the live dynamic-ingress mappings a session's box published
+/// at runtime (NET-044) — the rows `min session policy` lists beside the
+/// declaration, which is what makes a publish visible rather than only
+/// permitted.
+///
+/// A separate response rather than a field on [`EffectiveSessionPolicy`], for
+/// the same reason the effective halves are separate from the strict
+/// [`SessionPolicy`] at all: the declaration is a fact about the launch, and
+/// these are facts about the running box. They are also the live actor's own
+/// state — a box that is not running holds none — so this resolves the session
+/// where [`GetSessionPolicy`] and [`GetEffectiveSessionPolicy`] read the
+/// record.
+pub struct GetLiveIngress;
+
+/// Request for the [`GetLiveIngress`] RPC: the same lookup as
+/// [`GetSessionPolicyRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GetLiveIngressRequest {
+    Name(String),
+    Id(SessionId),
+}
+
+impl OneshotSshRpc for GetLiveIngress {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetLiveIngress");
+    type Request<'a> = GetLiveIngressRequest;
+    type Response = Errorable<Vec<LiveMapping>>;
+}
+
 /// An RPC to list the lifecycle hooks composed into a session, and where
 /// each was declared.
 ///
@@ -1557,6 +1617,49 @@ mod tests {
                 ingress: None
             })
         );
+    }
+
+    /// The live-ingress response (NET-044) round-trips, and — because it rides
+    /// an untagged `Errorable` — the daemon's `{"error":"..."}` reply for an
+    /// unknown session must still decode as `Err` rather than as an empty
+    /// mapping list, which would read as "the box published nothing" for a box
+    /// that does not exist.
+    #[test]
+    fn live_ingress_response_round_trips_and_decodes_daemon_error() {
+        let live = vec![
+            LiveMapping {
+                local: "127.0.64.2:3000".to_string(),
+                internal_port: 3000,
+                proto: IpProto::Tcp,
+            },
+            LiveMapping {
+                local: "127.0.64.2:5353".to_string(),
+                internal_port: 5353,
+                proto: IpProto::Udp,
+            },
+        ];
+        assert_eq!(
+            round_trip(&Errorable::Ok(live.clone())),
+            Errorable::Ok(live)
+        );
+
+        let decoded: Errorable<Vec<LiveMapping>> =
+            serde_json_lenient::from_str(r#"{"error":"no session found"}"#).expect("deserialize");
+        assert_eq!(
+            decoded,
+            Errorable::Err {
+                error: "no session found".to_string()
+            },
+            "a daemon error must not decode as an empty mapping list"
+        );
+
+        // The split a renderer reads: `local` is a `host:port` pair.
+        let mapping = LiveMapping {
+            local: "127.0.64.2:3000".to_string(),
+            internal_port: 3000,
+            proto: IpProto::Tcp,
+        };
+        assert_eq!(mapping.host_port(), Some(("127.0.64.2", 3000)));
     }
 
     /// `SessionDelta` distinguishes proven-clean VCS state, the
