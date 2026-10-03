@@ -1538,18 +1538,28 @@ pub fn declared_request_ports(policy: Option<&sessions::SessionPolicy>) -> BTree
 /// session's egress declaration cannot mean one thing on the switch and
 /// another through the proxy (NET-071). `lease` is the box's address on that
 /// switch, compiled into the rules as the one source its frames may carry
-/// (NET-084).
+/// (NET-084). A session that declared a credentialed upstream (NET-134)
+/// carries its lane too: the Box Egress Proxy's address on `subnet`, so the
+/// relay — the first leg a box's frame must clear, before it ever reaches
+/// the shared switch — admits the proxy's listener beside the rules exactly
+/// as the host-side gate on the far side does, and a deny-all box that
+/// declared the lane reaches the proxy's acceptor while the same rules hold
+/// everything else, the listener's port and protocol included.
 #[must_use]
 pub fn compiled_egress(
     policy: Option<&sessions::SessionPolicy>,
     subnet: SwitchSubnet,
     lease: Ipv4Addr,
 ) -> egress::EgressRules {
-    egress::EgressRules::from_policy(
+    let rules = egress::EgressRules::from_policy(
         policy.and_then(|policy| policy.egress.as_ref()),
         subnet.dns_server().octets(),
         lease.octets(),
-    )
+    );
+    match policy.is_some_and(|policy| policy.credentialed_upstream.is_some()) {
+        true => rules.with_credentialed_upstream(subnet.box_egress_proxy_address().octets()),
+        false => rules,
+    }
 }
 
 /// The egress verdict a direct TCP connection from a box whose own frames are
@@ -1564,8 +1574,11 @@ pub fn compiled_egress(
 /// NET-062..064 tier requires, and reusing it verbatim is what keeps exactly
 /// one admit-or-drop function in the tree. The rules are address- and
 /// protocol-shaped — never port-shaped, the resolver carve-out aside, which a
-/// TCP frame cannot match — so the port names the connection without
-/// changing the verdict.
+/// TCP frame cannot match, and the credentialed lane's one listener aside
+/// (NET-134: a lane's proxy is admitted as the (address, port, protocol)
+/// triple, so a TCP frame to the proxy's address carries the port the
+/// verdict reads) — so the port names the connection without changing the
+/// verdict anywhere else.
 ///
 /// The synthesized frame carries the rules' own lease as its source (NET-084):
 /// it stands for a frame the box itself put on the wire, so the verdict's
@@ -2587,6 +2600,7 @@ pub(crate) mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         };
         let gate = SessionGate::for_session(
             "100.64.0.9".into(),
@@ -2752,6 +2766,7 @@ pub(crate) mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         };
         let gate =
             SessionGate::for_session(LEASE.to_string(), LEASE, &policy, SwitchSubnet::default());
@@ -2968,6 +2983,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -3015,6 +3031,120 @@ pub(crate) mod tests {
             .expect("the relay survives a dropped frame")
             .expect("the switch side stays open");
         assert_eq!(next, sentinel);
+    }
+
+    /// NET-134 on the relay leg, the first of the two a box's frame must
+    /// clear to reach the Box Egress Proxy's listener: a deny-all box that
+    /// declared a credentialed upstream has its frame to the proxy's
+    /// listener forwarded to the switch — where the host-side gate's lane
+    /// arm decides it on the far side — while the same rules hold every
+    /// other destination, the other ports and protocols at the proxy's own
+    /// address included, and the host alias on the same switch, dropped
+    /// and unanswered. Without the declaration the same rules drop the
+    /// listener's frame too: the lane is granted by the declaration alone,
+    /// and the refusal a lane-less box meets at the listener is the
+    /// host-side gate's, never a substitute the rules make.
+    #[tokio::test]
+    async fn compiled_egress_carries_the_credentialed_lane() {
+        // The address the lane admits is the switch's own Box Egress Proxy
+        // address (`broadcast - 3` of the default /16), the one the e2e
+        // cases probe — read from the subnet, not restated as its own
+        // constant beside the assert that pins it.
+        let proxy = SwitchSubnet::default().box_egress_proxy_address();
+        assert_eq!(proxy, Ipv4Addr::new(100, 64, 255, 252));
+        // Deny-all, spelled the way the activating client's
+        // `--deny-subnets 0.0.0.0/0` compiles: one declared dimension that
+        // denies every IPv4 destination.
+        let deny_all = sessions::SessionPolicy {
+            egress: Some(sessions::EgressPolicy {
+                allow_protocols: None,
+                allow_subnets: None,
+                allow_dns_hosts: None,
+                deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+            }),
+            ingress: None,
+            credentialed_upstream: Some(sessions::CredentialedUpstream {}),
+        };
+        let mut harness = spawn_test_relay(&deny_all);
+
+        // The lane's half: the frame to the proxy's listener is forwarded
+        // verbatim, whatever the deny-all says about the address — the
+        // relay's own pin of the listener's port, the number the host-side
+        // listener actually listens on (the e2e case connects through the
+        // real one and is where the two spellings of the number are proved
+        // to agree).
+        let listener = egress::PROXY_LISTENER_PORT;
+        let to_proxy = egress_tcp_frame(LEASE, proxy, listener);
+        harness.box_end.write_all(&to_proxy).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the lane's frame is forwarded")
+            .expect("the switch side stays open");
+        assert_eq!(
+            first, to_proxy,
+            "a frame to the proxy's listener is forwarded beside the deny-all"
+        );
+
+        // The lane admits the listener, not the address: TCP to another
+        // port at the proxy's address and UDP to the listener's own port
+        // both fall to the rules, which deny them, so only the ARP sentinel
+        // behind them comes through.
+        let other_port = egress_tcp_frame(LEASE, proxy, 443);
+        let other_proto = udp_frame(LEASE, 40000, proxy, listener);
+        let sentinel = arp_frame(LEASE);
+        harness.box_end.write_all(&other_port).unwrap();
+        harness.box_end.write_all(&other_proto).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, sentinel,
+            "the lane holds everything at the proxy's address but the listener"
+        );
+
+        // And nowhere else: the same box's frame to the host alias drops
+        // without an answer — the ARP sentinel behind it is the one thing
+        // that comes through, and nothing is written back toward the box.
+        let refused = egress_tcp_frame(LEASE, SwitchSubnet::default().host_alias(), listener);
+        harness.box_end.write_all(&refused).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, sentinel,
+            "the deny-all holds everywhere but the proxy's listener"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        set_nonblocking(harness.box_end.as_raw_fd()).unwrap();
+        let mut probe = [0u8; 1];
+        let read = harness.box_end.read(&mut probe);
+        assert!(
+            matches!(read, Err(ref e) if e.kind() == io::ErrorKind::WouldBlock),
+            "a frame the rules refuse is dropped, not reset: got {read:?}"
+        );
+
+        // The declaration is the only thing that opens the listener: the
+        // same deny-all without a lane drops the listener's frame the same
+        // way, so it never reaches the host gate that would refuse it.
+        let unlaned = sessions::SessionPolicy {
+            credentialed_upstream: None,
+            ..deny_all.clone()
+        };
+        let mut harness = spawn_test_relay(&unlaned);
+        harness.box_end.write_all(&to_proxy).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            first, sentinel,
+            "without the declaration the proxy's listener is any other destination"
+        );
     }
 
     /// NET-062's warning: every drop is logged once per box per rule per
@@ -3104,6 +3234,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         };
         let mut harness = spawn_test_relay(&policy);
 
@@ -3134,6 +3265,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         };
         let mut harness = spawn_test_relay(&policy);
         let peer = Ipv4Addr::new(10, 1, 2, 3);
@@ -3201,6 +3333,7 @@ pub(crate) mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         };
         let mut harness = spawn_test_relay(&policy);
 
@@ -3406,6 +3539,7 @@ pub(crate) mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -3817,6 +3951,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -3834,6 +3969,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -3853,6 +3989,7 @@ pub(crate) mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
             }),
+            credentialed_upstream: None,
         }
     }
 

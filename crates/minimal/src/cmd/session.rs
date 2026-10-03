@@ -295,6 +295,7 @@ async fn register_box_for_activation(
             })
             .unwrap_or_default(),
         egress: policy.egress.clone(),
+        credentialed_upstream: policy.credentialed_upstream.clone(),
     };
     let registration = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
@@ -413,6 +414,13 @@ pub(crate) async fn activate_session(
             dynamic_allowed_range: None,
             dynamic_ingress: None,
         }),
+        // NET-134: the lane is the box's own declaration, never a default —
+        // a box that did not ask for a credentialed upstream keeps every
+        // frame it sends to the proxy's address refused at the host-side
+        // gate, whatever its egress rules say.
+        credentialed_upstream: args
+            .credentialed_upstream
+            .then(sessions::CredentialedUpstream::default),
     };
 
     // A session with no `--name` still deserves a typable handle, so mint
@@ -1459,6 +1467,7 @@ pub(crate) async fn activate_new_for_attach(global: &GlobalArgs) -> Result<(), a
             allow_dns_hosts: Vec::new(),
             allow_protocols: Vec::new(),
             deny_subnets: Vec::new(),
+            credentialed_upstream: false,
             loadout: Vec::new(),
             no_loadouts: false,
             no_hooks: false,
@@ -2796,6 +2805,7 @@ mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
             }),
+            credentialed_upstream: None,
         };
 
         // The successful shape, driven the way the activation drives it:
@@ -2896,6 +2906,7 @@ mod tests {
                 name: "db".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
+                credentialed_upstream: None,
             },
         )
         .await

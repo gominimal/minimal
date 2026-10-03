@@ -64,10 +64,13 @@ type Rows = BTreeMap<[u8; 4], Arc<BoxRecord>>;
 /// One published namespace's row in the host-side table. Of what it holds,
 /// two dimensions decide a frame from this namespace's address: its switch
 /// address, the lease the shared verdict checks every frame's source against
-/// (NET-084), and its compiled egress rules — beside which the one dimension
-/// the frame rules cannot carry travels in the row too: the DNS hosts its
-/// declaration named ([`Self::allow_dns_hosts`]), for the gate's DNS admission
-/// table to pin the row's destinations from. The rest — its name
+/// (NET-084), and its compiled egress rules — beside which the dimensions
+/// the frame rules cannot carry travel in the row too: the DNS hosts its
+/// declaration named ([`Self::allow_dns_hosts`]), for the gate's DNS
+/// admission table to pin the row's destinations from, and whether its box
+/// declared a credentialed upstream
+/// ([`Self::declares_credentialed_upstream`], NET-134), for the gate to
+/// admit the proxy's address by. The rest — its name
 /// (diagnostics), its loopback address, the ports it admitted, the names it
 /// declared — is the declaration itself, carried for the host-side paths that
 /// attach and name the namespace, and for the publish half of the gate, which
@@ -84,6 +87,7 @@ pub struct BoxRecord {
     egress: EgressRules,
     resolves_names: bool,
     dns_hosts: Vec<String>,
+    credentialed_upstream: bool,
 }
 
 impl BoxRecord {
@@ -179,6 +183,24 @@ impl BoxRecord {
     pub fn allow_dns_hosts(&self) -> &[String] {
         &self.dns_hosts
     }
+
+    /// Whether this box's declaration named a credentialed upstream
+    /// (NET-134): `true` marks the Box Egress Proxy's listener as this
+    /// box's infrastructure — the one destination its compiled frame rules
+    /// never decide, because the credentials the proxy redeems are the
+    /// lane's own and no egress rule of the box's says anything about them.
+    /// `false`, the absent declaration, is no lane: the proxy's address
+    /// stays under the box-to-host default-deny like any other host-side
+    /// destination, whatever the box's rules would allow.
+    ///
+    /// The gate reads this beside the row's rules ([`crate::net::egress_gate`]),
+    /// never through them: the declaration is a fact about the box, reduced
+    /// from the session policy's own field at registration — nothing the
+    /// guest says can add a lane to a row behind the gate's back.
+    #[must_use]
+    pub fn declares_credentialed_upstream(&self) -> bool {
+        self.credentialed_upstream
+    }
 }
 
 /// A namespace's declaration as it arrives on the host, before any frame
@@ -193,6 +215,7 @@ pub struct BoxRegistration {
     admitted_ports: Vec<u16>,
     declared_names: Vec<String>,
     egress: Option<EgressPolicy>,
+    credentialed_upstream: Option<sessions::CredentialedUpstream>,
 }
 
 impl BoxRegistration {
@@ -209,6 +232,7 @@ impl BoxRegistration {
             admitted_ports: Vec::new(),
             declared_names: Vec::new(),
             egress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -240,6 +264,21 @@ impl BoxRegistration {
         self.egress = Some(policy);
         self
     }
+
+    /// The namespace's declaration of a credentialed upstream (NET-134):
+    /// `Some` marks the Box Egress Proxy's listener as this box's
+    /// infrastructure, so the gate admits its address beside — never
+    /// through — whatever egress rules the declaration also carries. The
+    /// declaration is reduced to a lane in the row; its own content is the
+    /// proxy document's to extend, so nothing of it is retained here.
+    #[must_use]
+    pub fn with_credentialed_upstream(
+        mut self,
+        declaration: sessions::CredentialedUpstream,
+    ) -> Self {
+        self.credentialed_upstream = Some(declaration);
+        self
+    }
 }
 
 /// A box declaration as the activating client carries it over the host's
@@ -259,6 +298,13 @@ pub struct ClientBoxSpec {
     /// the allow-all default, the same meaning the create request's absent
     /// policy carries.
     pub egress: Option<EgressPolicy>,
+    /// The box's declaration of a credentialed upstream (NET-134), carried
+    /// from the session's policy: `Some` makes the Box Egress Proxy's
+    /// listener this box's infrastructure — reachable whatever the egress
+    /// rules say — while `None` is no lane, and the proxy's address stays
+    /// refused under the box-to-host default-deny. The one field a client
+    /// that predates NET-134 sends absent, every time.
+    pub credentialed_upstream: Option<sessions::CredentialedUpstream>,
 }
 
 /// The run of `subnet`'s address plan the host hands registered boxes from:
@@ -512,6 +558,11 @@ impl BoxRegistry {
             ),
             resolves_names,
             dns_hosts,
+            // NET-134: the lane is the one egress dimension that compiles
+            // to nothing in the frame rules — a declaration, not a rule —
+            // so it travels in the row itself, reduced to the fact the
+            // gate reads beside those rules.
+            credentialed_upstream: registration.credentialed_upstream.is_some(),
             switch_addr: registration.switch_addr,
             loopback_addr: registration.loopback_addr,
             admitted_ports: registration.admitted_ports,
@@ -531,7 +582,12 @@ impl BoxRegistry {
         if let Some(attachments) = &self.attachments
             && record.switch_addr != self.subnet.daemon_ip()
         {
-            attachments.issue(record.name(), record.switch_addr, record.loopback_addr);
+            attachments.issue(
+                record.name(),
+                record.switch_addr,
+                record.loopback_addr,
+                record.declares_credentialed_upstream(),
+            );
         }
         self.rows
             .write()
@@ -635,6 +691,9 @@ impl BoxRegistry {
             .with_admitted_ports(spec.ingress_ports);
         if let Some(policy) = spec.egress {
             registration = registration.with_egress_policy(policy);
+        }
+        if let Some(declaration) = spec.credentialed_upstream {
+            registration = registration.with_credentialed_upstream(declaration);
         }
         Ok(self.register(registration))
     }
@@ -1202,6 +1261,7 @@ mod tests {
                 name: "web".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
+                credentialed_upstream: None,
             })
             .expect("the default plan has hand-out addresses");
         assert_eq!(
@@ -1228,6 +1288,7 @@ mod tests {
                 name: "web".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
+                credentialed_upstream: None,
             })
             .expect("the carved subnet has hand-out addresses");
         assert_eq!(
@@ -1241,6 +1302,7 @@ mod tests {
                     name: format!("box{index}"),
                     ingress_ports: Vec::new(),
                     egress: None,
+                    credentialed_upstream: None,
                 })
                 .expect("the slice holds 32 published addresses");
         }
@@ -1251,6 +1313,7 @@ mod tests {
                         name: "late".to_string(),
                         ingress_ports: Vec::new(),
                         egress: None,
+                        credentialed_upstream: None,
                     }),
                     Err(AllocationError::LoopbackExhausted)
                 ),

@@ -2930,6 +2930,7 @@ mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
             }),
+            credentialed_upstream: None,
         };
 
         // The registry, as the session actor and the attach path fill it: the
@@ -3268,6 +3269,7 @@ mod tests {
                         dynamic_ingress: None,
                     }
                 }),
+                credentialed_upstream: None,
             };
             // The registry, as the session actor and the attach path fill it
             // for each mode. Loopback stands in for the target's lease.
@@ -3321,6 +3323,7 @@ mod tests {
                     &SessionPolicy {
                         egress: Some(stance_egress(stance)),
                         ingress: None,
+                        credentialed_upstream: None,
                     },
                     subnet,
                 );
@@ -3430,6 +3433,7 @@ mod tests {
         let policy = SessionPolicy {
             egress: None,
             ingress: None,
+            credentialed_upstream: None,
         };
         // The direct half: the relay's own gate for that declaration refuses
         // every new inbound connection — the own-IP default-block posture.
@@ -4359,6 +4363,7 @@ mod tests {
                 ..EgressPolicy::default()
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -4371,6 +4376,7 @@ mod tests {
                 ..EgressPolicy::default()
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 }
