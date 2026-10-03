@@ -870,6 +870,15 @@ struct SpoofedFlow {
 const TCP_SYN: u8 = 0x02;
 const TCP_PSH: u8 = 0x08;
 const TCP_ACK: u8 = 0x10;
+/// The spoofed flow's initial sequence number. The SYN carries it; the ACK
+/// and the marker's push go out at the next sequence number, and the switch
+/// acknowledges the marker at that number plus the marker's length — one
+/// constant, so the push and the acknowledgement the flow waits for cannot
+/// drift apart.
+const SPOOF_ISN: u32 = 0x0050_1001;
+/// How often the flow resends the marker's push while it waits for the
+/// switch to acknowledge it.
+const SPOOF_RESEND: Duration = Duration::from_millis(500);
 const ETHERTYPE_IPV4: [u8; 2] = [0x08, 0x00];
 const ETHERTYPE_ARP: [u8; 2] = [0x08, 0x06];
 const ARP_REQUEST: u16 = 1;
@@ -1070,14 +1079,16 @@ fn read_exact_until(
 }
 
 /// What one frame off the gate is to the spoofed flow: the ARP request for
-/// the address the flow wears, the SYN-ACK answering the flow's SYN, or
-/// nothing the flow cares about.
+/// the address the flow wears, the SYN-ACK answering the flow's SYN, a bare
+/// ACK on the flow's connection, or nothing the flow cares about.
 enum Incoming {
     /// `(requester MAC, requester IP, requested IP)`: an ARP request the flow
     /// answers when it names the address the flow wears.
     ArpRequest([u8; 6], Ipv4Addr, Ipv4Addr),
     /// The SYN-ACK's sequence number: the handshake's second leg arrived.
     SynAck(u32),
+    /// A bare ACK's acknowledgement number, in the flow's own sequence space.
+    Ack(u32),
 }
 
 fn classify(frame: &[u8], flow: &SpoofedFlow) -> Option<Incoming> {
@@ -1125,21 +1136,109 @@ fn classify(frame: &[u8], flow: &SpoofedFlow) -> Option<Incoming> {
         return None;
     }
     let flags = frame[l4 + 13];
-    if flags & TCP_SYN == 0 || flags & TCP_ACK == 0 {
+    if flags & TCP_ACK == 0 {
         return None;
     }
-    let synack_seq =
-        u32::from_be_bytes([frame[l4 + 4], frame[l4 + 5], frame[l4 + 6], frame[l4 + 7]]);
-    Some(Incoming::SynAck(synack_seq))
+    if flags & TCP_SYN != 0 {
+        let synack_seq =
+            u32::from_be_bytes([frame[l4 + 4], frame[l4 + 5], frame[l4 + 6], frame[l4 + 7]]);
+        return Some(Incoming::SynAck(synack_seq));
+    }
+    let src_port = u16::from_be_bytes([frame[l4], frame[l4 + 1]]);
+    if src_port != flow.dst_port {
+        return None;
+    }
+    let ack = u32::from_be_bytes([frame[l4 + 8], frame[l4 + 9], frame[l4 + 10], frame[l4 + 11]]);
+    Some(Incoming::Ack(ack))
+}
+
+/// Whether the switch acknowledged every byte of the marker's push.
+enum MarkerAck {
+    Acked,
+    /// Why not: no acknowledgement within the deadline, or the gate
+    /// connection failed while the flow waited for one.
+    NotAcked(String),
+}
+
+impl std::fmt::Display for MarkerAck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Acked => f.write_str("the switch acknowledged every byte of the marker"),
+            Self::NotAcked(why) => write!(f, "the switch never acknowledged the marker ({why})"),
+        }
+    }
+}
+
+/// `seq` is at or past `target` in TCP's wrapping sequence space.
+fn seq_at_or_past(seq: u32, target: u32) -> bool {
+    seq.wrapping_sub(target) < 0x8000_0000
+}
+
+/// Holds the flow open after the marker's push until the switch acknowledges
+/// all of it, resending the push every [`SPOOF_RESEND`] — what any TCP sender
+/// does. Returning on the push and dropping the socket instead lost the
+/// marker to any frame lost in the relay's or the switch's teardown of the
+/// connection, with nothing to say where. The answer splits the two: a marker
+/// acknowledged but never at the listener was lost past the switch's stack;
+/// one never acknowledged was lost before it.
+fn await_marker_ack(
+    sock: &mut UnixStream,
+    flow: &SpoofedFlow,
+    push: &[u8],
+    deadline: Duration,
+) -> MarkerAck {
+    let Ok(marker_len) = u32::try_from(flow.marker.len()) else {
+        return MarkerAck::NotAcked("the marker is longer than a sequence space".to_string());
+    };
+    let want = SPOOF_ISN.wrapping_add(1).wrapping_add(marker_len);
+    let end = Instant::now() + deadline;
+    let mut next_resend = Instant::now() + SPOOF_RESEND;
+    loop {
+        let now = Instant::now();
+        if now >= end {
+            return MarkerAck::NotAcked(format!("no acknowledgement within {deadline:?}"));
+        }
+        if now >= next_resend {
+            if let Err(e) = write_frame(sock, push) {
+                return MarkerAck::NotAcked(format!("resending the push failed: {e}"));
+            }
+            next_resend = now + SPOOF_RESEND;
+        }
+        let frame = match read_frame(sock, next_resend.min(end)) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => continue,
+            Err(e) => return MarkerAck::NotAcked(e),
+        };
+        match classify(&frame, flow) {
+            Some(Incoming::Ack(ack)) if seq_at_or_past(ack, want) => return MarkerAck::Acked,
+            // The switch may resolve the flow's address again before its
+            // acknowledgement can leave; the claim still has to answer.
+            Some(Incoming::ArpRequest(requester_mac, requester_ip, requested_ip))
+                if requested_ip == flow.src =>
+            {
+                let reply = arp_reply(requester_mac, flow.src, requester_ip, flow.src_mac);
+                if let Err(e) = write_frame(sock, &reply) {
+                    return MarkerAck::NotAcked(format!("writing the ARP answer failed: {e}"));
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Drives one spoofed flow at the gate's landing edge: the `/connect` upgrade
 /// head, a SYN wearing the flow's source, the ARP answer claiming that source
 /// for the flow's MAC (both the pre-emptive claim and the answer to whatever
 /// request the switch's neighbor resolution sends), and on the SYN-ACK the
-/// ACK and the marker-carrying push. `Ok(())` is the handshake completing;
-/// whether the marker then reaches the host listener is the caller's record.
-fn spoofed_flow(gate_sock: &Path, flow: &SpoofedFlow, deadline: Duration) -> Result<(), String> {
+/// ACK and the marker-carrying push, held open until the switch acknowledges
+/// the marker ([`await_marker_ack`]). `Ok` is the handshake completing,
+/// carrying whether the marker was acknowledged; whether the marker then
+/// reaches the host listener is the caller's record.
+fn spoofed_flow(
+    gate_sock: &Path,
+    flow: &SpoofedFlow,
+    deadline: Duration,
+) -> Result<MarkerAck, String> {
     let mut sock =
         UnixStream::connect(gate_sock).map_err(|e| format!("connect to gate socket: {e}"))?;
     sock.set_read_timeout(Some(Duration::from_millis(200)))
@@ -1174,7 +1273,7 @@ fn spoofed_flow(gate_sock: &Path, flow: &SpoofedFlow, deadline: Duration) -> Res
                 flow.src_port,
                 flow.dst,
                 flow.dst_port,
-                0x0050_1001,
+                SPOOF_ISN,
                 0,
                 TCP_SYN,
                 &[],
@@ -1205,7 +1304,7 @@ fn spoofed_flow(gate_sock: &Path, flow: &SpoofedFlow, deadline: Duration) -> Res
                     flow.src_port,
                     flow.dst,
                     flow.dst_port,
-                    0x0050_1002,
+                    SPOOF_ISN.wrapping_add(1),
                     synack_seq.wrapping_add(1),
                     TCP_ACK,
                     &[],
@@ -1217,15 +1316,16 @@ fn spoofed_flow(gate_sock: &Path, flow: &SpoofedFlow, deadline: Duration) -> Res
                     flow.src_port,
                     flow.dst,
                     flow.dst_port,
-                    0x0050_1002,
+                    SPOOF_ISN.wrapping_add(1),
                     synack_seq.wrapping_add(1),
                     TCP_PSH | TCP_ACK,
                     flow.marker.as_bytes(),
                 );
                 write_frame(&mut sock, &push).map_err(|e| format!("write push: {e}"))?;
-                return Ok(());
+                return Ok(await_marker_ack(&mut sock, flow, &push, deadline));
             }
-            None => {}
+            // A bare ACK before the SYN-ACK answers nothing this flow sent.
+            Some(Incoming::Ack(_)) | None => {}
         }
     }
 }
@@ -1601,12 +1701,12 @@ async fn vm_escape_bounded_to_resident_union() {
         // When the flip lands this arm strengthens instead of breaking: the
         // Err arm becomes the in-force verdict, recorded like any other.
         let verdict = match spoofed_flow(&guest.gate_sock, &flow, FLOW_DEADLINE) {
-            Ok(()) => {
+            Ok(marker_ack) => {
                 assert!(
                     listener.wait_for(&flow.marker, Duration::from_secs(10)),
                     "the spoofed flow from {src} completed its handshake but its \
-                     marker never reached the host listener; the listener saw: \
-                     {}; the gate said: {}",
+                     marker never reached the host listener; {marker_ack}; the \
+                     listener saw: {}; the gate said: {}",
                     listener.report(),
                     gate_account(&guest)
                 );
@@ -1667,7 +1767,7 @@ async fn vm_escape_bounded_to_resident_union() {
         marker: "spoof-203.0.113.7-arrived".to_string(),
     };
     let verdict = match spoofed_flow(&guest.gate_sock, &flow, DROP_DEADLINE) {
-        Ok(()) => panic!(
+        Ok(_) => panic!(
             "vm_escape_integration: a spoofed source outside the plan's lease \
              block ({outside_plan}) completed a flow; the gate must refuse it"
         ),
