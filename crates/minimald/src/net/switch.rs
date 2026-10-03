@@ -739,6 +739,7 @@ fn drop_transport(reason: &DropReason) -> Proto {
         DropReason::UndeclaredFamily(_) | DropReason::Truncated => Proto::None,
         DropReason::UndeclaredProtocol { proto }
         | DropReason::DeniedSubnet { proto, .. }
+        | DropReason::UncredentialedProxyDestination { proto, .. }
         | DropReason::UndeclaredSubnet { proto, .. } => Proto::from_ipv4_number(*proto),
     }
 }
@@ -1538,13 +1539,18 @@ pub fn declared_request_ports(policy: Option<&sessions::SessionPolicy>) -> BTree
 /// session's egress declaration cannot mean one thing on the switch and
 /// another through the proxy (NET-071). `lease` is the box's address on that
 /// switch, compiled into the rules as the one source its frames may carry
-/// (NET-084). A session that declared a credentialed upstream (NET-134)
-/// carries its lane too: the Box Egress Proxy's address on `subnet`, so the
-/// relay — the first leg a box's frame must clear, before it ever reaches
-/// the shared switch — admits the proxy's listener beside the rules exactly
-/// as the host-side gate on the far side does, and a deny-all box that
-/// declared the lane reaches the proxy's acceptor while the same rules hold
-/// everything else, the listener's port and protocol included.
+/// (NET-084). The Box Egress Proxy's address on `subnet` is compiled in for
+/// every session, lane or no lane (NET-134): a session that declared a
+/// credentialed upstream carries its lane with it, so the relay — the first
+/// leg a box's frame must clear, before it ever reaches the shared switch —
+/// admits the proxy's listener beside the rules exactly as the host-side gate
+/// on the far side does, and a deny-all box that declared the lane reaches
+/// the proxy's acceptor while the same rules hold everything else, the
+/// listener's port and protocol included; a session that declared none
+/// carries the address alone, so the relay drops every other frame to it
+/// ahead of the rules — the address is infrastructure no egress rule opens,
+/// and a node-local proxy can run on a host where no gate stands beside the
+/// relay to refuse it.
 #[must_use]
 pub fn compiled_egress(
     policy: Option<&sessions::SessionPolicy>,
@@ -1556,9 +1562,10 @@ pub fn compiled_egress(
         subnet.dns_server().octets(),
         lease.octets(),
     );
+    let proxy = subnet.box_egress_proxy_address().octets();
     match policy.is_some_and(|policy| policy.credentialed_upstream.is_some()) {
-        true => rules.with_credentialed_upstream(subnet.box_egress_proxy_address().octets()),
-        false => rules,
+        true => rules.with_credentialed_upstream(proxy),
+        false => rules.with_box_egress_proxy(proxy),
     }
 }
 
@@ -3087,8 +3094,8 @@ pub(crate) mod tests {
 
         // The lane admits the listener, not the address: TCP to another
         // port at the proxy's address and UDP to the listener's own port
-        // both fall to the rules, which deny them, so only the ARP sentinel
-        // behind them comes through.
+        // are the address's own drop, ahead of the rules — which deny them
+        // here anyway — so only the ARP sentinel behind them comes through.
         let other_port = egress_tcp_frame(LEASE, proxy, 443);
         let other_proto = udp_frame(LEASE, 40000, proxy, listener);
         let sentinel = arp_frame(LEASE);
@@ -3144,6 +3151,30 @@ pub(crate) mod tests {
         assert_eq!(
             first, sentinel,
             "without the declaration the proxy's listener is any other destination"
+        );
+
+        // And the address is carried for a lane-less box too, so the relay
+        // drops at it ahead of the rules, whatever they would say about it:
+        // an allow-all box — the absent egress section's default, the
+        // posture that would otherwise reach anything — has its frame to
+        // another port at the proxy's address dropped, while its listener
+        // triple still crosses, the one frame to the address the
+        // host-side gate's default-deny and the proxy's acceptor refuse.
+        let allow_all = sessions::SessionPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let mut harness = spawn_test_relay(&allow_all);
+        harness.box_end.write_all(&other_port).unwrap();
+        harness.box_end.write_all(&to_proxy).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the listener's frame")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, to_proxy,
+            "an allow-all box's frame to another port at the proxy's address is the relay's own drop; its listener triple crosses"
         );
     }
 
