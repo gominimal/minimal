@@ -6815,6 +6815,17 @@ proof_own_ip_deny_all_box_answers_published_port() {
     return 0
   fi
 
+  # The box opens /dev/net/tun for its in-namespace tap; without the device
+  # its session program cannot spawn, and a host that is itself a sandbox
+  # cannot mknod one either. Skip rather than fail: the failure would say
+  # nothing about this branch, and the native CI lane — where the tap root
+  # integration harness already builds a tap — runs the case for real.
+  if [ ! -c /dev/net/tun ]; then
+    echo "deny-all answer proof SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+    echo "::endgroup::"
+    return 0
+  fi
+
   # The names, ports and markers. Ports are fixed on purpose — the execs that
   # start and probe each responder must agree — and clear of every band the
   # proofs around this one use (18080-18088, 19090/19091).
