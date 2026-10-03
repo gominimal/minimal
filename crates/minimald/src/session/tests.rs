@@ -1823,8 +1823,17 @@ async fn rename_session_republishes_minimal_session_name() {
         .await;
     assert_eq!(resp, Errorable::Ok(RenameSessionResponse));
 
-    // The republished attach-env now carries the new name.
-    let renamed = published_attach_env(&server, session_id).await;
+    // The republished attach-env now carries the new name. The RPC returns
+    // once the rename is queued to the host, which publishes afterwards, so
+    // poll for the write rather than reading once.
+    let mut renamed = String::new();
+    for _ in 0..50 {
+        renamed = published_attach_env(&server, session_id).await;
+        if renamed.contains("export MINIMAL_SESSION_NAME='renamed'") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     assert!(
         renamed.contains("export MINIMAL_SESSION_NAME='renamed'"),
         "the attach-env should carry the new name after rename; got: {renamed:?}"

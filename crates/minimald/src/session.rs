@@ -1928,14 +1928,13 @@ impl Session {
         // `$MINIMAL_SESSION_NAME` is republished through the per-attach
         // environment channel. Best-effort: the record-side rename has
         // already succeeded, and a dead host drops the message silently.
-        if let Ok(_) = &written {
-            if let SessionInner::Active {
+        if written.is_ok()
+            && let SessionInner::Active {
                 host: Some((host, _)),
                 ..
             } = &self.inner
-            {
-                host.rename(new_name).await;
-            }
+        {
+            host.rename(new_name).await;
         }
 
         written

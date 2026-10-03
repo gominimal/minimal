@@ -4185,6 +4185,8 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
                     Message::Attach(channel, sz, connection, keys) => {
                         self.attach(channel, sz, false, connection, keys).await;
                     }
+                    // Unchanged name: nothing to republish.
+                    Message::Rename(new_name) if new_name == self.session_name => {}
                     Message::Rename(new_name) => {
                         self.session_name = new_name.clone();
                         // The shell's `environ` is frozen at launch, so the
