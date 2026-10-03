@@ -12,7 +12,9 @@
 //! that reclaims gigabytes inside the VM reclaims nothing the user can see on
 //! their disk. So every clean that ran is followed by an `FITRIM`
 //! ([`guest::trim_state_volume`](crate::guest::trim_state_volume)), which is
-//! what actually punches the freed extents out of the image.
+//! what actually punches the freed extents out of the image. Blocks the
+//! sessions themselves free between cleans would otherwise wait out the whole
+//! [`CLEAN_INTERVAL`], so the trim also runs alone every [`TRIM_INTERVAL`].
 //!
 //! Cleaning is an actor, not a bare timer, because there is more than one way
 //! to ask for one: the periodic tick, and anything that wants a clean *now*.
@@ -88,6 +90,9 @@ struct Maintenance {
     receiver: mpsc::Receiver<MaintenanceMessage>,
     /// The server shutdown token; ends the loop between cleans.
     shutdown: CancellationToken,
+    /// How many times the standalone trim arm has fired, for the timer test.
+    #[cfg(test)]
+    standalone_trims: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Maintenance {
@@ -141,6 +146,9 @@ impl Maintenance {
                     next_trim = Instant::now() + TRIM_INTERVAL;
                 }
                 () = tokio::time::sleep_until(next_trim) => {
+                    #[cfg(test)]
+                    self.standalone_trims
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     trim_state_volume_if_mounted(&self.state).await;
                     next_trim = Instant::now() + TRIM_INTERVAL;
                 }
@@ -215,6 +223,8 @@ pub(crate) fn spawn(state: ServerStateHandle, shutdown: CancellationToken) -> Ma
         state,
         receiver,
         shutdown,
+        #[cfg(test)]
+        standalone_trims: Default::default(),
     };
     let abort = tokio::spawn(actor.mainloop()).abort_handle();
 
@@ -301,7 +311,7 @@ async fn clean(
     }
 }
 
-/// Hand the blocks the clean just freed back to the host image — the trim half
+/// Hand the blocks the guest has freed back to the host image — the trim half
 /// of the module doc. No-op unless the boot path actually mounted a data volume
 /// at the state dir, which in practice means the microVM: a native daemon's
 /// state dir is a directory on the user's own filesystem, not this daemon's to
@@ -312,7 +322,7 @@ async fn clean(
 /// still has a correct cache. `Unsupported` is the ordinary case for a
 /// filesystem or block driver without discard (a native-Linux `minimald` run
 /// with a state volume, a virtio-blk without `discard` negotiated), and would
-/// otherwise warn every [`CLEAN_INTERVAL`] forever, so it logs at debug.
+/// otherwise warn every [`TRIM_INTERVAL`] forever, so it logs at debug.
 ///
 /// Deliberately unbounded, unlike the shutdown quiesce's 10 s ceiling. A
 /// requesting client does wait on this — [`MaintenanceHandle::clean_now`]
@@ -480,30 +490,42 @@ mod tests {
         assert_eq!(cache.iter_entries().count(), 0);
     }
 
-    /// The standalone trim timer fires independently of the clean timer. With
-    /// the clock paused, advancing time by [`TRIM_INTERVAL`] triggers the trim
-    /// arm without a clean having run. The trim itself is a no-op in test (no
-    /// real mount), but the timer firing proves the arm is reachable.
-    #[cfg(target_os = "linux")]
+    /// The standalone trim arm fires on its own cadence, not only behind a
+    /// clean. `STARTUP_DELAY` equals `TRIM_INTERVAL`, so the startup clean wins
+    /// the biased select first and resets the trim deadline; the trim arm must
+    /// then fire twice before the next clean is due. The state volume is
+    /// not mounted, so the trim itself is a no-op and touches no real disk.
     #[tokio::test(start_paused = true)]
     async fn trim_timer_fires_independently_of_clean() {
         let dir = TempDir::new().unwrap();
-        let mut config = crate::server::test_config(dir.path());
-        // Pretend the state volume is mounted so the trim path is taken.
-        config.state_volume_mounted = true;
-        let state = ServerStateHandle::new(config, None).await.unwrap();
-        let maintenance = spawn(state.clone(), CancellationToken::new());
+        let state = ServerStateHandle::new(crate::server::test_config(dir.path()), None)
+            .await
+            .unwrap();
+        let (_sender, receiver) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let standalone_trims = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let actor = Maintenance {
+            state,
+            receiver,
+            shutdown: shutdown.clone(),
+            standalone_trims: standalone_trims.clone(),
+        };
+        let task = tokio::spawn(actor.mainloop());
 
-        // Advance past the trim interval. The clean timer is still far away
-        // (STARTUP_DELAY = 5 min, CLEAN_INTERVAL = 6 h), so only the trim
-        // arm should fire.
-        tokio::time::advance(TRIM_INTERVAL).await;
-        // Let the spawned task run the trim arm.
-        tokio::task::yield_now().await;
+        // The paused clock auto-advances while the runtime is idle, so this
+        // walks virtual time forward until the arm has fired twice. The next
+        // clean is due a full `CLEAN_INTERVAL` after the startup one, so
+        // firing within that window is firing on the trim's own cadence.
+        let fired_twice = async {
+            while standalone_trims.load(std::sync::atomic::Ordering::Relaxed) < 2 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        };
+        tokio::time::timeout(CLEAN_INTERVAL, fired_twice)
+            .await
+            .expect("standalone trim fired twice before the next clean was due");
 
-        // The trim arm ran and rescheduled itself. The actor is still alive
-        // (the handle is not disconnected), which is the proof the trim arm
-        // completed without panicking.
-        let _ = maintenance; // keep alive
+        shutdown.cancel();
+        task.await.unwrap();
     }
 }
