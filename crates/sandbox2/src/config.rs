@@ -1,5 +1,6 @@
 use crate::network::{NetPlan, Network};
 use crate::{Error, Sandbox};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::hash::Hash;
@@ -727,10 +728,68 @@ impl Config {
             .daemon_id
             .clone()
             .unwrap_or_else(|| std::process::id().to_string());
+
+        // The box's env socket lives at
+        // <base_dir>/<name>-<timestamp>-<attempt>-<id>/run/minenv_sock.
+        // `sockaddr_un::sun_path` holds 107 usable bytes; a long session
+        // or task name can push the path past that and the bind fails with
+        // EINVAL. Truncate the name to fit, appending a short hash of the
+        // full name so two long names that share a prefix still get
+        // distinct directories.
+        const SUN_PATH_MAX: usize = 107;
+        // The attempt counter runs 0..=20, so reserve its widest spelling.
+        let suffix = format!("-{timestamp}-20-{id}/run/minenv_sock");
+        let base_len = base_dir.as_ref().as_os_str().len();
+        let overhead = 1 + suffix.len(); // '/' separator + suffix
+        let name_budget = SUN_PATH_MAX.saturating_sub(base_len + overhead);
+        let name = if name_budget == 0 {
+            return Err(Error::IO(
+                "create sandbox directory",
+                base_dir.as_ref().to_path_buf(),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "base directory path is {base_len} bytes, leaving no \
+                         room for a box name under the {SUN_PATH_MAX}-byte \
+                         AF_UNIX path limit"
+                    ),
+                ),
+            ));
+        } else if self.name.len() > name_budget {
+            let mut hasher = Sha256::new();
+            hasher.update(self.name.as_bytes());
+            let hash_hex = hex::encode(hasher.finalize());
+            let hash_suffix = &hash_hex[..8];
+            // Reserve room for the hash suffix plus a '-' separator.
+            let keep = name_budget.saturating_sub(1 + hash_suffix.len());
+            if keep == 0 {
+                return Err(Error::IO(
+                    "create sandbox directory",
+                    base_dir.as_ref().to_path_buf(),
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "base directory path is {base_len} bytes, leaving \
+                             no room for a box name under the \
+                             {SUN_PATH_MAX}-byte AF_UNIX path limit"
+                        ),
+                    ),
+                ));
+            }
+            // Cut at a char boundary so the truncated name stays valid UTF-8.
+            let mut end = keep;
+            while end > 0 && !self.name.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}-{}", &self.name[..end], hash_suffix)
+        } else {
+            self.name.clone()
+        };
+
         let build_base_dir = {
             let mut attempt = 0u32;
             loop {
-                let dir_name = format!("{}-{}-{}-{}", self.name, timestamp, attempt, id);
+                let dir_name = format!("{}-{}-{}-{}", name, timestamp, attempt, id);
 
                 let candidate_dir = base_dir.as_ref().join(dir_name);
                 match fs::create_dir(&candidate_dir) {

@@ -4120,6 +4120,46 @@ mod tests {
             .expect("minenv_sock should be connectable after a bound-dir Sandbox::new");
     }
 
+    /// A long session or task name must not cause `Sandbox::new` to fail
+    /// because the minenv socket path exceeds the 107-byte `sun_path` limit.
+    /// The fix truncates the name in `Config::build` and appends a short hash
+    /// for uniqueness, so the resulting socket path fits.
+    #[test]
+    fn sandbox_new_truncates_long_name_to_fit_sun_path() {
+        use std::os::unix::net::UnixStream;
+        let (_tmp, base) = make_base_with_synth();
+        let long_name = "a".repeat(200);
+        let config = Config::new(&long_name);
+        let sandbox = Sandbox::new(base, config, ()).unwrap();
+        let sock = sandbox.base_dir.join("run").join("minenv_sock");
+        // The socket path must not exceed 107 bytes.
+        let sock_path = sock.to_string_lossy();
+        assert!(
+            sock_path.len() <= SUN_PATH_MAX,
+            "socket path {sock_path} is {} bytes, must be ≤ {SUN_PATH_MAX}",
+            sock_path.len()
+        );
+        UnixStream::connect(&sock).expect("minenv_sock should be connectable with a long name");
+    }
+
+    /// Two long names that share a long common prefix must produce distinct
+    /// box directories — the hash suffix prevents collisions.
+    #[test]
+    fn sandbox_new_long_names_with_common_prefix_are_distinct() {
+        let (_tmp_a, base_a) = make_base_with_synth();
+        let (_tmp_b, base_b) = make_base_with_synth();
+        let prefix = "a".repeat(100);
+        let name_a = format!("{prefix}-alpha");
+        let name_b = format!("{prefix}-beta");
+        let sandbox_a = Sandbox::new(base_a, Config::new(&name_a), ()).unwrap();
+        let sandbox_b = Sandbox::new(base_b, Config::new(&name_b), ()).unwrap();
+        assert_ne!(
+            sandbox_a.base_dir.file_name(),
+            sandbox_b.base_dir.file_name(),
+            "long names sharing a prefix must get distinct box directory names"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // NET-079: each host-address box in its own classifier leaf, kept there.
     // ---------------------------------------------------------------------
