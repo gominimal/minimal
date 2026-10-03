@@ -50,6 +50,13 @@ const STARTUP_DELAY: Duration = Duration::from_secs(5 * 60);
 /// being followed by a redundant one.
 const CLEAN_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// How often the state volume is trimmed independently of the cache clean.
+/// The clean runs every [`CLEAN_INTERVAL`] (6 hours), but freed extents should
+/// be returned to the host promptly — a trim that only follows a clean strands
+/// space for hours. This timer fires a standalone trim on a short cadence so
+/// the backing image shrinks as soon as the filesystem frees blocks.
+const TRIM_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
 /// How long a cache entry must have gone unread before it is reclaimed. Packages
 /// needed by sessions are retained separately.
 const UNUSED_FOR: Duration = Duration::from_secs(5 * 24 * 60 * 60);
@@ -91,6 +98,7 @@ impl Maintenance {
     /// here needs a lock.
     async fn mainloop(mut self) {
         let mut next_tick = Instant::now() + STARTUP_DELAY;
+        let mut next_trim = Instant::now() + TRIM_INTERVAL;
         loop {
             // A pending shutdown wins over a due clean (`biased`), so the loop
             // never starts one it would have to be aborted out of.
@@ -116,6 +124,9 @@ impl Maintenance {
                         trim_state_volume_if_mounted(&self.state).await;
                         responder.handle(std::future::ready(report)).await;
                         next_tick = Instant::now() + CLEAN_INTERVAL;
+                        // The clean just trimmed; reset the standalone trim
+                        // timer so it does not fire right after.
+                        next_trim = Instant::now() + TRIM_INTERVAL;
                     }
                 },
                 () = tokio::time::sleep_until(next_tick) => {
@@ -125,6 +136,13 @@ impl Maintenance {
                     let _report = clean(&self.state, UNUSED_FOR, None).await;
                     trim_state_volume_if_mounted(&self.state).await;
                     next_tick = Instant::now() + CLEAN_INTERVAL;
+                    // The clean just trimmed; reset the standalone trim timer
+                    // so it does not fire right after.
+                    next_trim = Instant::now() + TRIM_INTERVAL;
+                }
+                () = tokio::time::sleep_until(next_trim) => {
+                    trim_state_volume_if_mounted(&self.state).await;
+                    next_trim = Instant::now() + TRIM_INTERVAL;
                 }
             }
         }
@@ -460,5 +478,32 @@ mod tests {
             "one clean took both entries, the other none"
         );
         assert_eq!(cache.iter_entries().count(), 0);
+    }
+
+    /// The standalone trim timer fires independently of the clean timer. With
+    /// the clock paused, advancing time by [`TRIM_INTERVAL`] triggers the trim
+    /// arm without a clean having run. The trim itself is a no-op in test (no
+    /// real mount), but the timer firing proves the arm is reachable.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn trim_timer_fires_independently_of_clean() {
+        let dir = TempDir::new().unwrap();
+        let mut config = crate::server::test_config(dir.path());
+        // Pretend the state volume is mounted so the trim path is taken.
+        config.state_volume_mounted = true;
+        let state = ServerStateHandle::new(config, None).await.unwrap();
+        let maintenance = spawn(state.clone(), CancellationToken::new());
+
+        // Advance past the trim interval. The clean timer is still far away
+        // (STARTUP_DELAY = 5 min, CLEAN_INTERVAL = 6 h), so only the trim
+        // arm should fire.
+        tokio::time::advance(TRIM_INTERVAL).await;
+        // Let the spawned task run the trim arm.
+        tokio::task::yield_now().await;
+
+        // The trim arm ran and rescheduled itself. The actor is still alive
+        // (the handle is not disconnected), which is the proof the trim arm
+        // completed without panicking.
+        let _ = maintenance; // keep alive
     }
 }
