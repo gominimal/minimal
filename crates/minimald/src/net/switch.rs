@@ -665,12 +665,15 @@ where
             reject.emit(&reason);
             continue;
         }
-        // NET-004: the literal host address still routes — the switch's `nat`
-        // table maps it to the host's loopback — but the relay says, once per
-        // interval, that `host.min.internal` is the name to use instead. This
-        // sits ahead of the egress verdict so a frame the verdict drops still
-        // produces the notice: the deprecation is about the destination, not
-        // about whether the box's policy admits it.
+        // NET-004: on a box relay the literal host address is default-deny —
+        // the shared verdict below drops every frame to it — but the relay
+        // still says, once per interval, that a frame went to it. The notice
+        // reports the address only: a frame does not carry the name it was
+        // resolved from, so a frame sent via `host.min.internal` that resolved
+        // to the same address notices too. This sits ahead of the egress
+        // verdict so a frame the verdict drops still produces the notice: the
+        // deprecation is about the destination, not about whether the box's
+        // policy admits it.
         if let Some(notice) = &notice
             && is_legacy_host_literal(&buf[..n], notice.alias)
         {
@@ -827,9 +830,10 @@ pub(crate) const HOST_MIN_INTERNAL: &str = "host.min.internal";
 const LEGACY_HOST_RULE: &str = "legacy-host-literal";
 
 /// True when an Ethernet II frame is an IPv4 packet addressed to `alias` —
-/// NET-004's deprecated literal host address, the address the switch's `nat`
-/// table maps to the host's loopback. Any protocol counts: the notice is about
-/// the destination address, not the transport.
+/// NET-004's deprecated literal host address, default-deny on a box relay.
+/// Any protocol counts: the notice is about the destination address, not the
+/// transport, and not the name the address was resolved from, which a frame
+/// does not carry.
 fn is_legacy_host_literal(frame: &[u8], alias: Ipv4Addr) -> bool {
     // EtherType at 12..14; the IPv4 destination address at 14+16..14+20.
     frame.len() >= ETH_HDR + 20
@@ -840,7 +844,7 @@ fn is_legacy_host_literal(frame: &[u8], alias: Ipv4Addr) -> bool {
 /// Emits NET-004's deprecation notice on the egress relay leg: when a session
 /// box sends frames to the literal host-alias address, the relay says so —
 /// rate-limited, naming the box and [`HOST_MIN_INTERNAL`] — instead of letting
-/// the connection pass silently on an address the code should not keep using.
+/// the verdict drop them silently.
 struct LegacyHostNotice {
     /// The box's switch IP — the relay gate's `session_id` label, the same
     /// identity the policy warnings name.

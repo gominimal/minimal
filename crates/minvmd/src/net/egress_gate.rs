@@ -406,7 +406,7 @@ const INFRASTRUCTURE_RULE: &str = "egress-infrastructure-destination";
 /// decide different things and the rebinding intersection relies on its own
 /// shape: that set names the gateway's two addresses as `/32`s (here the
 /// gateway is the control-surface rule's, [`SWITCH_CONTROL_RULE`], and the
-/// host alias is default-deny under this rule), refuses or admits
+/// host alias is default-deny under this rule for a box row), refuses or admits
 /// the whole fabric plane by whether the name is a box-zone name (a frame has
 /// no name, and the plane's one admitted slice is the node's own block), and
 /// keeps its ranges private. The constants overlap without coinciding: the
@@ -447,7 +447,8 @@ static INFRASTRUCTURE_RANGES: LazyLock<InfrastructureRanges> = LazyLock::new(|| 
 
 /// Whether `dst` lies in the infrastructure deny set as the host frame rule
 /// holds it ([`INFRASTRUCTURE_RULE`]): a fixed range; the host alias, which
-/// is default-deny at every port (design §7.1, NET-062); the fabric plane
+/// is default-deny at every port for a box row (design §7.1, NET-062) when
+/// `refuse_host_alias` says so; the fabric plane
 /// outside `own_block`, the subnet the gate's rows live in — a frame to a
 /// sibling or to the daemon inside the node's own block is local reach,
 /// decided by the row's CIDR rules and the target's ingress, never by this
@@ -465,10 +466,20 @@ static INFRASTRUCTURE_RANGES: LazyLock<InfrastructureRanges> = LazyLock::new(|| 
 /// is the refusal: a developer who wants a box to reach the LAN says so by
 /// allowing the range, so neither a name rule nor a pin can become a way
 /// around leaving it undeclared.
+///
+/// `refuse_host_alias` is `false` for the node namespace's row alone: the
+/// interim node row, keyed to the daemon's own address, carries the frames
+/// of every box that shares the guest root namespace (a host-address box,
+/// the default network mode), and those reach the host alias as own-block
+/// local reach until the in-force baseline, which names the alias as its
+/// registry and cache endpoint, decides the node plane instead. This
+/// mirrors the shared verdict, whose own-address refusal is attached to box
+/// relays only, never to the daemon relay.
 fn infrastructure_destination(
     dst: [u8; 4],
     own_block: SwitchSubnet,
     allow: Option<&[Ipv4Cidr]>,
+    refuse_host_alias: bool,
 ) -> bool {
     let ranges = &*INFRASTRUCTURE_RANGES;
     if ranges.fixed.iter().any(|cidr| cidr.contains(dst)) {
@@ -478,7 +489,7 @@ fn infrastructure_destination(
     // the host only through a declared exposure, never by addressing the
     // alias directly, so the alias is refused under this rule at every port
     // whatever the row's rules would say about it.
-    if dst == own_block.host_alias().octets() {
+    if refuse_host_alias && dst == own_block.host_alias().octets() {
         return true;
     }
     let in_own_block = (u32::from_be_bytes(dst) & u32::from(own_block.netmask()))
@@ -3625,8 +3636,19 @@ fn gate_verdict(
     // now — the source check above returns before any other source — so the
     // set applies to every box-plane packet, and no row's rules concede the
     // fabric.
+    // The host-alias refusal is a box row's alone: the node namespace's
+    // row, keyed to the daemon's own address, carries the host-address
+    // boxes' frames, whose `host.min.internal` resolves to the alias, and
+    // keeps own-block local reach to it until the in-force baseline (which
+    // returned above) decides the node plane.
+    let box_row = src != table.subnet().daemon_ip().octets();
     if let Some(dst) = summary.destination()
-        && infrastructure_destination(dst, table.subnet(), record.egress().allow_subnets())
+        && infrastructure_destination(
+            dst,
+            table.subnet(),
+            record.egress().allow_subnets(),
+            box_row,
+        )
     {
         return Err(GateDrop::Infrastructure {
             src,
@@ -7662,6 +7684,8 @@ mod tests {
             "port=443",
             "source=100.64.0.10",
             "destination=100.64.255.254",
+            "source=100.64.0.11",
+            "destination=169.254.169.254",
             "source=100.64.0.12",
             "destination=100.65.0.9",
             "port=80",
@@ -11125,6 +11149,59 @@ mod tests {
             Ok(GateAdmit::Row),
             "announced, the interim node row decides the node plane's frames — \
              never the baseline set"
+        );
+    }
+
+    /// The host alias's default-deny is a box row's alone (design §7.1,
+    /// NET-062). Announced, the interim node row at the daemon's address
+    /// carries the frames of every box sharing the guest root namespace — a
+    /// host-address box, the default network mode, whose `host.min.internal`
+    /// resolves to the alias — so a node-plane frame to the alias is
+    /// own-block local reach the row admits, while the same frame from a box
+    /// lease, even an allow-all one, is the infrastructure drop.
+    #[test]
+    fn host_alias_refused_for_box_rows_but_not_the_announced_node_row() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        registry.register(
+            BoxRegistration::new("bare", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        assert_eq!(baseline.phase(), NodeBaselinePhase::Announced);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let summarize = sessions::core::egress::summarize;
+        let alias = SUBNET.host_alias().octets();
+
+        let node_frame = summarize(&ipv4_frame(SUBNET.daemon_ip().octets(), 6, alias, 18081));
+        assert_eq!(
+            gate_verdict(
+                &node_frame,
+                None,
+                &table,
+                &baseline,
+                &pins,
+                &ReplyTables::new()
+            ),
+            Ok(GateAdmit::Row),
+            "the announced node row keeps own-block reach to the host alias"
+        );
+
+        let box_frame = summarize(&ipv4_frame(LEASE, 6, alias, 18081));
+        assert!(
+            matches!(
+                gate_verdict(
+                    &box_frame,
+                    None,
+                    &table,
+                    &baseline,
+                    &pins,
+                    &ReplyTables::new()
+                ),
+                Err(GateDrop::Infrastructure { dst, .. }) if dst == alias
+            ),
+            "a box row's frame to the host alias is the infrastructure drop"
         );
     }
 
