@@ -11113,7 +11113,7 @@ proof_escape_reaches_only_declared_union() {
   # global left behind here would shadow that case's next read with a stale
   # esu_ session id if the two cases ever run in the same shell again.
   local esu_box="" sid_var="" esu_set="" esu_between=""
-  local esu_prior=0 esu_phase=""
+  local esu_prior=0
   echo "::group::escape into the VM reaches only the declared union (NET-085)"
 
   if [ "$min_daemon" != minvmd ] && [ -z "$E2E_VM" ]; then
@@ -11293,13 +11293,14 @@ ESU_LISTENER_EOF
   esu_gate_lines() {
     # The gate's own lines for one source under one rule, this case's lines
     # only; $3, when given, pins the destination inside the grep: the gate's
-    # infrastructure lines carry the destination they refused, so a line
-    # another flow's frame wrote under the same source and rule cannot stand
-    # in for the arm's. (The undeclared-subnet and unknown-source lines carry
-    # no destination — DropLimiter::emit in crates/minvmd/src/net/egress_gate.rs
-    # writes source and rule only — so the arms that read those use
-    # esu_wait_new_gate_line's window discipline below instead.) Prints them
-    # oldest first, none when this case's daemon wrote none.
+    # infrastructure and undeclared-subnet lines carry the destination they
+    # refused, so a line another flow's frame wrote under the same source and
+    # rule cannot stand in for the arm's. (The unknown-source and
+    # unregistered-source lines carry no destination — DropLimiter::emit in
+    # crates/minvmd/src/net/egress_gate.rs writes source and rule only — so
+    # the arms that read those address a source no other arm wears instead,
+    # with esu_wait_new_gate_line's window discipline where one is shared.)
+    # Prints them oldest first, none when this case's daemon wrote none.
     local lines
     lines="$(esu_case_log | grep -F "\"source\":\"$1\"" \
       | grep -F "\"rule_matched\":\"$2\"")"
@@ -11889,42 +11890,32 @@ source=$esu_ip_b (box B's own probe) destination=$esu_alias:$ESU_LISTEN_PORT ver
   echo "positive controls OK: both boxes' own declared traffic reached the listener through the fabric"
 
   # ---- the arms, each a fresh connection at the gate's landing edge ---------
-  # The made-up in-plan lease first — the spoofer's liveness bracket, and the
-  # one arm that claims the address it wears (no row holds it, so its
-  # connection's end has nothing to withdraw). Flip-stable: the shipped
-  # interim admits it and names it; the per-box default refuses it and names
-  # it. Either way the case pins whichever happened.
+  # The made-up in-plan lease first, toward the baseline set's own
+  # destination — the one arm that claims the address it wears (no row holds
+  # it, so its connection's end has nothing to withdraw). An address inside
+  # the plan's lease run that no row holds never leaves the VM, toward every
+  # destination the baseline set's own included, whatever the egress
+  # default's phase (NET-085): the gate drops it under its own rule
+  # (egress-unregistered-source), and the drop's line names the source — the
+  # receipt this arm reads for the frames the spoofer spoke.
   esu_run_spoofer madeup 100.64.0.99 "$esu_alias" esu-spoof-madeup-arrived 10 yes
   case "$esu_out" in
-    outcome=completed*)
-      esu_wait_marker esu-spoof-madeup-arrived 40 || {
-        echo "::error::the made-up lease's flow completed its handshake but its marker never reached the host listener"
-        esu_fail
-      }
-      esu_wait_gate_line 100.64.0.99 egress-unregistered-source >/dev/null || {
-        echo "::error::the gate admitted the made-up lease without its interim line naming the source"
-        esu_fail
-      }
-      esu_rows="$esu_rows
-source=100.64.0.99 destination=$esu_alias:$ESU_LISTEN_PORT verdict=reached the listener (the shipped interim's admit, its egress-unregistered-source line naming the source; the per-box default's flip turns this into an unknown-source drop)"
-      ;;
-    outcome=refused*)
-      if grep -q -- esu-spoof-madeup-arrived "$esu_listener_log"; then
-        echo "::error::the made-up lease's flow was refused at the gate, but its marker reached the host listener"
-        esu_fail
-      fi
-      esu_wait_gate_line 100.64.0.99 egress-unknown-source >/dev/null || {
-        echo "::error::the gate refused the made-up lease without its unknown-source line naming the source"
-        esu_fail
-      }
-      esu_rows="$esu_rows
-source=100.64.0.99 destination=$esu_alias:$ESU_LISTEN_PORT verdict=refused at the gate (the per-box default in force: silence, and the egress-unknown-source line)"
-      ;;
+    outcome=refused*) : ;;
     *)
-      echo "::error::the made-up-lease arm reported neither a completed flow nor a refusal: $esu_out"
+      echo "::error::the made-up lease's flow was not refused at the gate: $esu_out — an in-plan address no row holds must never leave the VM (NET-085)"
       esu_fail
       ;;
   esac
+  if grep -q -- esu-spoof-madeup-arrived "$esu_listener_log"; then
+    echo "::error::the made-up lease's flow was refused at the gate, but its marker reached the host listener"
+    esu_fail
+  fi
+  esu_wait_gate_line 100.64.0.99 egress-unregistered-source >/dev/null || {
+    echo "::error::the gate dropped the made-up lease without its unregistered-source line naming the source"
+    esu_fail
+  }
+  esu_rows="$esu_rows
+source=100.64.0.99 destination=$esu_alias:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unregistered-source — an in-plan lease no row holds, dropped toward the baseline set's own destination)"
 
   # Box A's address toward box B's private half — inside the union, outside
   # the row that holds the worn address: the gate's infrastructure rule
@@ -11955,15 +11946,13 @@ source=100.64.0.99 destination=$esu_alias:$ESU_LISTEN_PORT verdict=refused at th
 source=$esu_ip_a destination=192.168.77.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-infrastructure-destination — box B's declared half, which box A's row does not cover)"
 
   # Box A's address toward a destination no resident box declared — beyond
-  # the whole union: the row's own rules refuse it. The undeclared-subnet
-  # line names only the source and the rule (DropLimiter::emit writes no
-  # destination on it), so this arm cannot pin the destination inside the
-  # grep the way the cross arms do; it pins the line to the arm's own window
-  # instead: the count before the arm must grow, so a line box A's own
-  # traffic wrote earlier cannot pass for the spoof's — and if the gate's
-  # rate-limit window for this pair was already spent, the arm fails by name
-  # rather than reading the earlier frame's line as its proof.
-  esu_prior="$(esu_gate_lines "$esu_ip_a" egress-undeclared-subnet | wc -l)"
+  # the whole union: the row's own rules refuse it, and the undeclared-subnet
+  # line names the destination address and port it refused beside the source
+  # and the rule, so this arm pins the destination inside the wait the way
+  # the cross arms do: a line box A's own traffic wrote under the same rule
+  # names a different destination and cannot pass for this arm's, and a line
+  # that predates the arm cannot either (the window discipline below).
+  esu_prior="$(esu_gate_lines "$esu_ip_a" egress-undeclared-subnet 198.51.100.7 | wc -l)"
   esu_run_spoofer beyond-a "$esu_ip_a" 198.51.100.7 esu-spoof-beyond-a 3 no
   case "$esu_out" in
     outcome=refused*) : ;;
@@ -11976,82 +11965,47 @@ source=$esu_ip_a destination=192.168.77.7:$ESU_LISTEN_PORT verdict=refused at th
     echo "::error::a refused spoof from box A's address still left a marker at the host listener"
     esu_fail
   fi
-  # The undeclared-subnet line carries no destination, so this arm counts new
-  # lines for box A's source. Box A must stay idle apart from the spoofer for
-  # the whole arm: do not add workload to box A here, or its own traffic could
-  # account for the line (T89 #1925 pins the destination instead).
-  esu_wait_new_gate_line "$esu_ip_a" egress-undeclared-subnet "" "$esu_prior" >/dev/null || {
-    echo "::error::the gate refused box A's address toward 198.51.100.7 without its undeclared-subnet line naming the source ($esu_prior such line(s) existed before the arm)"
+  esu_line="$(esu_wait_new_gate_line "$esu_ip_a" egress-undeclared-subnet \
+    198.51.100.7 "$esu_prior")" || {
+    echo "::error::the gate refused box A's address toward 198.51.100.7 without its undeclared-subnet line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
     esu_fail
   }
   esu_rows="$esu_rows
 source=$esu_ip_a destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-undeclared-subnet — beyond the resident union, refused by box A's own rules)"
 
-  # The same far-side destination, worn by a made-up in-plan lease — the one
-  # arm this case must not overclaim. The shipped interim
-  # (crates/minvmd/src/net/egress_gate.rs, UNREGISTERED_SOURCE_PHASE =
-  # Announced) admits an in-plan source no row holds to every destination, so
-  # this flow is ADMITTED past the union under the current posture: the known
-  # interim gap, asserted as the admit it is, never counted as bounded, and
-  # open on T89 (gominimal/minimal#1925), the task that drops a source no box
-  # holds. The arm is keyed to the phase this case's own gate names on its
-  # start-up line (`unregistered_in_plan_sources`), so it flips with the
-  # phase rather than following whichever line it happens to see:
+  # The same far-side destination, worn by a made-up in-plan lease: the
+  # union's bound covers the address an escapee forges too, not only the
+  # resident boxes' (NET-085, design §4.3 rule 0). A lease inside the plan's
+  # run that no row holds is dropped under the gate's unregistered rule,
+  # toward the union's far side like every other destination, whatever the
+  # egress default's phase — no phase reaches the frame-level decision any
+  # more, so this arm keys to none.
   #
-  #   * Announced ("admitted-in-plan"): the gate's interim admit line
-  #     (egress-unregistered-source) must name the source, and no unknown-source
-  #     drop may — a drop here means the gate moved without its phase, and the
-  #     arm says so instead of passing;
-  #   * enforced ("dropped"): the gate's drop line (egress-unknown-source) must
-  #     name the source, no admit line may, and the marker must be absent from
-  #     the host listener.
-  #
-  # 198.51.100.7 is TEST-NET-2, unreachable past the switch, so the spoofer's
-  # outcome line (a plain timeout under either posture) is not what this arm
-  # reads. A fresh made-up address, not the alias arm's 100.64.0.99, so its
-  # line is its own: the gate rate-limits one line per source per rule per
-  # interval.
-  esu_phase="$(esu_case_log 2>/dev/null | grep -F 'host-side egress gate listening' \
-    | sed -n 's/.*"unregistered_in_plan_sources":"\([^"]*\)".*/\1/p' | tail -n1)"
-  case "$esu_phase" in
-    admitted-in-plan*) esu_phase=announced ;;
-    dropped*) esu_phase=enforced ;;
+  # 198.51.100.7 is TEST-NET-2, unreachable past the switch, so the
+  # spoofer's outcome line (a plain timeout: no SYN-ACK, whether the gate
+  # dropped the SYN or nothing answered it) is not what this arm reads — the
+  # gate's own drop line is. A fresh made-up address, not the alias arm's
+  # 100.64.0.99, so its line is its own: the gate rate-limits one line per
+  # source per rule per interval.
+  esu_run_spoofer madeup-beyond 100.64.0.98 198.51.100.7 esu-spoof-madeup-beyond 3 yes
+  case "$esu_out" in
+    outcome=refused*) : ;;
     *)
-      echo "::error::this case's gate wrote no start-up line naming its unregistered-source phase (read: '$esu_phase'), so the made-up-lease arm toward 198.51.100.7 cannot be keyed to it"
+      echo "::error::the made-up lease's flow toward the union's far side was not refused at the gate: $esu_out — an in-plan address no row holds must never leave the VM (NET-085)"
       esu_fail
       ;;
   esac
-  echo "the gate's unregistered-source phase, from its own start-up line: $esu_phase"
-  esu_run_spoofer madeup-beyond 100.64.0.98 198.51.100.7 esu-spoof-madeup-beyond 3 yes
-  if [ "$esu_phase" = announced ]; then
-    esu_line="$(esu_wait_gate_line 100.64.0.98 egress-unregistered-source)" || {
-      echo "::error::the gate runs the Announced phase but wrote no interim admit line (egress-unregistered-source) for the made-up lease toward 198.51.100.7"
-      esu_fail
-    }
-    if esu_gate_line 100.64.0.98 egress-unknown-source >/dev/null; then
-      echo "::error::the gate runs the Announced phase but dropped the made-up lease as an unknown source — the drop moved without the phase; flip this arm with it (T89, gominimal/minimal#1925)"
-      esu_fail
-    fi
-    echo "KNOWN INTERIM GAP (T89, gominimal/minimal#1925): under the shipped Announced phase the made-up in-plan lease's flow toward the union's far side passed the gate: $esu_line"
-    esu_rows="$esu_rows
-source=100.64.0.98 destination=198.51.100.7:$ESU_LISTEN_PORT verdict=admitted past the union by the shipped Announced phase (egress-unregistered-source names the source — the known interim gap: an in-plan lease no row holds is admitted to every destination until T89, gominimal/minimal#1925, drops it; asserted as the admit it is, not counted as bounded)"
-  else
-    esu_line="$(esu_wait_gate_line 100.64.0.98 egress-unknown-source)" || {
-      echo "::error::the gate runs the enforced phase but wrote no drop line (egress-unknown-source) for the made-up lease toward 198.51.100.7"
-      esu_fail
-    }
-    if esu_gate_line 100.64.0.98 egress-unregistered-source >/dev/null; then
-      echo "::error::the gate runs the enforced phase but still admitted the made-up lease under the interim (egress-unregistered-source)"
-      esu_fail
-    fi
-    if grep -q -- esu-spoof-madeup-beyond "$esu_listener_log"; then
-      echo "::error::the gate dropped the made-up lease toward 198.51.100.7, but its marker reached the host listener"
-      esu_fail
-    fi
-    echo "the made-up lease's flow toward the union's far side was dropped under the enforced phase: $esu_line"
-    esu_rows="$esu_rows
-source=100.64.0.98 destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unknown-source names the source, no marker — the enforced phase: no in-plan lease reaches past the union)"
+  if grep -q -- esu-spoof-madeup-beyond "$esu_listener_log"; then
+    echo "::error::the gate dropped the made-up lease toward 198.51.100.7, but its marker reached the host listener"
+    esu_fail
   fi
+  esu_line="$(esu_wait_gate_line 100.64.0.98 egress-unregistered-source)" || {
+    echo "::error::the gate dropped the made-up lease toward 198.51.100.7 without its unregistered-source line naming the source"
+    esu_fail
+  }
+  echo "the made-up lease's flow toward the union's far side was dropped at the gate: $esu_line"
+  esu_rows="$esu_rows
+source=100.64.0.98 destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unregistered-source names the source, no marker — an in-plan lease no row holds never reaches past the union)"
 
   # Box B's address toward box A's private half: the same refusal, worn from
   # the other side — whichever box's address the spoofer wears, its own row is
@@ -12121,12 +12075,7 @@ source=203.0.113.7 destination=$esu_alias:$ESU_LISTEN_PORT verdict=refused at th
   rm -rf "$ESU_A_SEED_DIR" "$ESU_B_SEED_DIR"
   ESU_A_SEED_DIR=""
   ESU_B_SEED_DIR=""
-  if [ "$esu_phase" = announced ]; then
-    esu_line="under the shipped Announced phase a made-up in-plan lease no row holds is admitted past the union, the known interim gap this case does not claim as bounded"
-  else
-    esu_line="under the enforced phase the made-up in-plan lease was dropped too, but this case still claims only the resident-address bound"
-  fi
-  echo "escape reaches only the declared union OK, for resident-address spoofing only (spoofing a resident box's address reaches only the declared union plus the baseline set: each resident-address spoof was refused at the host-side gate beyond its own row's declaration, both boxes hold neither CAP_NET_RAW nor CAP_NET_ADMIN, no IPv6 route in the guest, the baseline set beside the rules). NET-085 stays open on T89 (gominimal/minimal#1925): $esu_line"
+  echo "escape reaches only the declared union OK (an escapee wearing any in-plan address — a resident box's own, or a made-up lease no row holds — reaches only the union of the resident boxes' declared egress plus the baseline set: each resident-address spoof was refused at the host-side gate beyond its own row's declaration, and each made-up lease was dropped under the gate's unregistered rule toward the baseline set's own destination and the union's far side alike, whatever the egress default's phase; both boxes hold neither CAP_NET_RAW nor CAP_NET_ADMIN, no IPv6 route in the guest, the baseline set beside the rules). NET-085"
   echo "::endgroup::"
 }
 

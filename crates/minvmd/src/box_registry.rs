@@ -684,15 +684,13 @@ impl BoxRegistry {
     /// no rules are decided by it: withdrawing is how the host retires a
     /// namespace's declaration, never a way to leave its address attributed.
     ///
-    /// What the address's frames do next is the phase's to say
-    /// ([`crate::net::egress_gate`]): under the per-box default they are
-    /// dropped as any other unknown source's (NET-081's failure case), while
-    /// the announced interim this build ships — which keeps own-address boxes
-    /// alive until the creator-side registration (T66, #1711) supplies their
-    /// rows — admits an address inside the plan's lease block, so a
-    /// withdrawal inside that block costs the address no reach until the
-    /// default binds. The row is gone either way, and a re-registration starts
-    /// from the newest declaration.
+    /// What the address's frames do next is unconditional
+    /// ([`crate::net::egress_gate`]): an address inside the plan's lease block
+    /// is an unregistered source the gate drops (NET-085), so a withdrawal
+    /// inside that block ends the address's reach at once, and outside it the
+    /// frames were already an unknown source's refusal (NET-081's failure
+    /// case). The row is gone either way, and a re-registration starts from
+    /// the newest declaration.
     pub fn withdraw(&self, switch_addr: Ipv4Addr) -> Option<Arc<BoxRecord>> {
         // The box's end is observed here — the drainer's arrival of the
         // relay's report — so the withdrawal's own line measures itself
@@ -751,12 +749,11 @@ impl BoxRegistry {
     /// address starts clean.
     ///
     /// While a row this registration filled stands, the box's frames are
-    /// decided by its rules; what a box with **no** row runs as — one whose
-    /// registration never reached the daemon, or whose row was withdrawn —
-    /// is the gate's announced unregistered-source interim, and putting the
-    /// per-box default that eventually refuses it in force is the flip that
-    /// lands with the last row source (T66's follow-up), not a change this
-    /// registration makes.
+    /// decided by its rules; a box with **no** row — one whose registration
+    /// never reached the daemon, or whose row was withdrawn — is an
+    /// unregistered source the gate drops unconditionally (NET-085), so no
+    /// flip that lands with the last row source (T66's follow-up) changes
+    /// it, and this registration makes none.
     ///
     /// The box's id is always minted here, for this creation
     /// ([`crate::bep_attach::mint_box_id`]): a spec carries none, so no
@@ -1232,16 +1229,15 @@ impl BoxTable {
     /// one set whose rows the host-side creator will supply (T66's registration
     /// path). The run spans both of the plan's sub-runs — the daemon's
     /// self-allocation reserve included, because a task sandbox holds a
-    /// reserve address and stays an unregistered source the interim admits;
-    /// the host hands registered boxes only from the upper half
+    /// reserve address and stays an unregistered source; the host hands
+    /// registered boxes only from the upper half
     /// (`hand_out_run`). The subnet's own infrastructure sits outside that
     /// run: the gateway the resolver carve-out is keyed to, the host alias,
     /// and the guest daemon's own tap, which the registry publishes a row for
-    /// itself. The announced interim the gate ships admits an unregistered
-    /// source only here, so no amount of it can borrow the plan's
-    /// infrastructure as a source; the per-box default that replaces the
-    /// interim admits nothing, and this predicate is what keeps the
-    /// difference between them one address range wide.
+    /// itself. The gate's unregistered drop (NET-085) refuses a source only
+    /// from here, so no amount of it can borrow the plan's infrastructure as
+    /// a source, and this predicate is what keeps that drop and the
+    /// unknown-source refusal one address range apart.
     #[must_use]
     pub fn is_allocatable(&self, src: [u8; 4]) -> bool {
         let addr = u32::from(Ipv4Addr::from(src));
@@ -1885,9 +1881,9 @@ mod tests {
         // could lease, a frame carrying the node namespace's own address, and
         // an ARP announcing a foreign address. The gate decides each against
         // the table — the undeclared frame by its row's own rules, the
-        // made-up lease by the announced interim, the node's by its row, and
-        // the foreign ARP by rule 0 — and the marker after them proves the
-        // whole lot was decided before the comparison.
+        // made-up lease by the unregistered drop (NET-085), the node's by
+        // its row, and the foreign ARP by rule 0 — and the marker after them
+        // proves the whole lot was decided before the comparison.
         let undeclared = ipv4_frame(lease, 6, [203, 0, 113, 7], 443);
         let unknown = ipv4_frame([100, 64, 0, 99], 6, [10, 1, 2, 3], 80);
         let node_frame = ipv4_frame(SUBNET.daemon_ip().octets(), 6, [10, 1, 2, 3], 80);
@@ -1897,17 +1893,10 @@ mod tests {
             send_frame(&mut harness.guest, frame).await;
         }
         send_frame(&mut harness.guest, &marker).await;
-        // What the gate admitted, in order: the made-up lease — admitted by
-        // the announced interim, which is what keeps an own-address box whose
-        // row no creator has supplied yet on the wire — then the node
-        // namespace's frame, then the published box's marker. The undeclared
-        // frame and the foreign ARP are simply absent.
-        assert_eq!(
-            expect_frame(&mut harness.switch).await,
-            unknown,
-            "the announced interim admits an in-plan lease no row holds, until \
-             T66 (#1711) supplies the creator-side rows"
-        );
+        // What the gate admitted, in order: the node namespace's frame, then
+        // the published box's marker. The undeclared frame, the foreign ARP,
+        // and the made-up lease — the in-plan address no row holds — are
+        // simply absent.
         assert_eq!(
             expect_frame(&mut harness.switch).await,
             node_frame,
@@ -1937,8 +1926,8 @@ mod tests {
         );
         assert!(
             harness.table.by_source([100, 64, 0, 99]).is_none(),
-            "the guest's made-up address published no row — the interim that \
-             admitted its frame published nothing either"
+            "the guest's made-up address published no row — the drop that \
+             refused its frame published nothing either"
         );
     }
 
@@ -2119,14 +2108,10 @@ mod tests {
             send_frame(&mut harness.guest, frame).await;
         }
         send_frame(&mut harness.guest, &marker).await;
-        // What the gate admitted, in order — the made-up lease by the
-        // announced interim, the node namespace's frame by its own row,
-        // and the published box's marker: everything was decided.
-        assert_eq!(
-            expect_frame(&mut harness.switch).await,
-            unknown,
-            "the announced interim admits an in-plan lease no row holds"
-        );
+        // What the gate admitted, in order — the node namespace's frame by
+        // its own row, and the published box's marker: everything was
+        // decided. The undeclared frame, the foreign ARP, and the made-up
+        // lease — the in-plan address no row holds — are simply absent.
         assert_eq!(
             expect_frame(&mut harness.switch).await,
             node_frame,
@@ -2153,8 +2138,8 @@ mod tests {
         );
         assert!(
             attachments.by_source([100, 64, 0, 99]).is_none(),
-            "the guest's made-up address bought no attachment — the interim \
-             that admitted its frame attached nothing either"
+            "the guest's made-up address bought no attachment — the drop \
+             that refused its frame attached nothing either"
         );
     }
 

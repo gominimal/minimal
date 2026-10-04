@@ -340,6 +340,20 @@ async fn serve_create_session(
             // mode, because the reads answer over what the launch recorded
             // and must not be handed one by whoever activated.
             let in_microvm = s.in_microvm().await;
+            // NET-081's host-table rule: on a VM-backed node a box's
+            // addresses are allocated host-side and handed in, so an
+            // own-address create that carries none is refused here, before
+            // any record exists, rather than started as a box whose every
+            // frame the host gate drops.
+            if let Err(refused) = refuse_unhanded_vm_box(
+                in_microvm,
+                req.config.network,
+                req.config.box_addresses.as_ref(),
+            ) {
+                return Ok(Errorable::Err {
+                    error: refused.to_string(),
+                });
+            }
             let fact = crate::session_host::host_ip_enforcement_fact();
             let classifier_cause = fact.cause;
             let classifier_advisory =
@@ -506,6 +520,31 @@ fn classifier_advisory_text(cause: classifier::Cause, guest: bool) -> String {
         advisory.push('.');
     }
     advisory
+}
+
+/// The refusal an own-address create gets on a VM-backed node when it
+/// carries no handed addresses (NET-081): the VM host allocates every
+/// box-plane address and hands it in through the registration its control
+/// socket serves, so the guest never mints one — a box created without a
+/// row would start with every frame dropped at the host gate as an
+/// unregistered source (NET-085), a box that is silently dark. `in_microvm`
+/// is the daemon's own [`crate::server::Config::in_microvm`]. A native node
+/// keeps NET-010's own allocator, and a box that is not own-address has no
+/// box-plane address to hand. Pure over its inputs, so the gate is pinned
+/// where it is written.
+fn refuse_unhanded_vm_box(
+    in_microvm: bool,
+    network: minimald_rpc::NetworkMode,
+    box_addresses: Option<&sessions::BoxAddresses>,
+) -> std::io::Result<()> {
+    if in_microvm && network == minimald_rpc::NetworkMode::OwnIp && box_addresses.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "box not registered with the VM host (no handed addresses); register \
+             through minvmd's control socket first",
+        ));
+    }
+    Ok(())
 }
 
 /// The advisory a create owes the start it answers (NET-079): only when both
@@ -4757,6 +4796,44 @@ mod tests {
             None,
             "the own-address arm stays the gate's own too, guest or not"
         );
+    }
+
+    /// NET-081's host-table rule at the create: on a VM-backed node an
+    /// own-address create that carries no handed addresses is refused with
+    /// `InvalidInput`, naming the registration the client skipped, because
+    /// the guest never mints a box-plane address and a box with no host row
+    /// would start silently dark (NET-085). Pinned pure over the create's
+    /// gate: the test harness builds native daemons only. A handed create
+    /// passes, a native own-address create keeps NET-010's own allocator,
+    /// and a box that is not own-address has nothing to hand.
+    #[test]
+    fn vm_backed_create_without_handed_addresses_is_refused() {
+        let refused = super::refuse_unhanded_vm_box(true, NetworkMode::OwnIp, None)
+            .expect_err("a VM-backed own-address create with no handed addresses");
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            refused.to_string(),
+            "box not registered with the VM host (no handed addresses); register \
+             through minvmd's control socket first"
+        );
+        let handed = sessions::BoxAddresses {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
+            loopback_address: std::net::Ipv4Addr::new(127, 0, 0, 2),
+        };
+        assert!(
+            super::refuse_unhanded_vm_box(true, NetworkMode::OwnIp, Some(&handed)).is_ok(),
+            "a VM-backed create carrying the host's handed addresses passes"
+        );
+        assert!(
+            super::refuse_unhanded_vm_box(false, NetworkMode::OwnIp, None).is_ok(),
+            "a native own-address create keeps its own allocator (NET-010)"
+        );
+        for network in [NetworkMode::HostNet, NetworkMode::NoNet] {
+            assert!(
+                super::refuse_unhanded_vm_box(true, network, None).is_ok(),
+                "a VM-backed {network:?} create has no box-plane address to hand"
+            );
+        }
     }
 
     /// The advisory over the two probe causes (NET-079), pinned pure: no
