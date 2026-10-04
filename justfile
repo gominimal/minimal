@@ -131,7 +131,7 @@ initramfs-nodocker:
 # Build minvmd (debug); codesign is the last touch.
 [macos]
 minvmd-build:
-    cargo build -p minvmd --bin minvmd --locked
+    cargo build -p minvmd --bin minvmd --bin min-answerer --locked
     codesign --entitlements crates/minvmd/minvmd.entitlements --force -s - {{minvmd-bin}}
 
 # The same target and linkage the release ships, so the dev stack exercises
@@ -142,7 +142,7 @@ minvmd-build:
 [linux]
 minvmd-build: libkrun-static
     MINVMD_REQUIRE_LIBKRUN=static LIBKRUN_PREFIX="{{krun-static}}" \
-      cargo build -p minvmd --bin minvmd --locked --target {{musl-target}}
+      cargo build -p minvmd --bin minvmd --bin min-answerer --locked --target {{musl-target}}
 
 # Build the `min` CLI.
 minimal-cli:
