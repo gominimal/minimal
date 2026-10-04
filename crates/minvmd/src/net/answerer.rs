@@ -1496,6 +1496,36 @@ fn read_line_resumable(
 /// timeout the caller set, or the error that says it did not come. A
 /// reply is a single write on the other side, so a fresh buffer per read
 /// is all a reply ever needs.
+/// How long the uid gate waits for a refused peer's hello before it
+/// answers: the hello is read only so the reply is not written into a
+/// connection the peer is still writing to, never to act on it.
+const FOREIGN_PEER_HELLO_WAIT: Duration = Duration::from_secs(1);
+
+/// Answers a peer the uid gate refused with a one-line reason, so the
+/// operator behind it reads why rather than a bare closed channel: the
+/// service is one operator's (design §7.1 keeps multi-user hosts out of
+/// the profile), and another operator's daemons are turned away here. Its
+/// hello is drained unread, on a thread of its own, so a foreign peer that
+/// never writes cannot stall the gate's accept loop.
+fn refuse_foreign_peer(mut stream: UnixStream, peer_uid: u32, service_uid: u32) {
+    let spawned = std::thread::Builder::new()
+        .name("minvmd-zone-refuse".to_string())
+        .spawn(move || {
+            let _ = stream.set_read_timeout(Some(FOREIGN_PEER_HELLO_WAIT));
+            let _ = read_reply_line(&mut stream);
+            let reply = RegistrationReply::refused(format!(
+                "the host answerer service serves uid {service_uid}; this operator \
+                 (uid {peer_uid}) is refused: multi-operator hosts are not supported"
+            ));
+            if let Err(error) = write_reply(&mut stream, &reply) {
+                tracing::debug!(component = COMPONENT, %error, "foreign peer refusal failed");
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::debug!(component = COMPONENT, %error, "could not answer a foreign peer");
+    }
+}
+
 fn read_reply_line(stream: &mut UnixStream) -> io::Result<Option<String>> {
     let mut partial = Vec::new();
     read_line_resumable(stream, &mut partial)
@@ -1726,6 +1756,7 @@ fn serve_channel(
                             "refused an answerer channel connection from a foreign uid; \
                              only the uid this answerer serves may publish rows"
                         );
+                        refuse_foreign_peer(stream, uid, expected_uid);
                     }
                     Err(error) => {
                         tracing::debug!(
@@ -4640,16 +4671,25 @@ mod tests {
             })
             .expect("the gate's thread spawns");
 
-        // The foreign peer's publish is refused: the connection gets no ack —
-        // it closes — so the client's hello fails one way or another.
+        // The foreign peer's publish is refused, and the refusal names its
+        // cause: the uid the service serves, and the peer's own.
         let refused = connect_and_publish(
             &channel,
             "vm-a",
             vec![published_row("web-a", Ipv4Addr::new(127, 0, 64, 9))],
         );
+        let Err(refused) = refused else {
+            panic!("a channel peer with a foreign uid is refused");
+        };
+        // SAFETY: geteuid only reads the process's own uid.
+        let peer_uid = unsafe { libc::geteuid() };
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        let reason = refused.to_string();
         assert!(
-            refused.is_err(),
-            "a channel peer with a foreign uid is refused"
+            reason.contains(&format!("serves uid {expected_uid}"))
+                && reason.contains(&format!("(uid {peer_uid}) is refused"))
+                && reason.contains("multi-operator hosts are not supported"),
+            "the refusal names both uids and why: {reason}"
         );
 
         // And nothing it sent was held: the gate refused the peer before a
