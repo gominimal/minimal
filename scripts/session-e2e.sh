@@ -15598,12 +15598,19 @@ proof_two_named_vms_on_one_machine() {
   # The host port one VM's hostname proxy published, read from a `min ls`
   # listing's discovery line: `HOSTNAME PROXY:  <vm> listening on
   # 127.0.0.1:<port>`. awk's field compare, not a substring: the VM column
-  # is padded, and one VM's name can be a prefix of another's.
+  # is padded, and one VM's name can be a prefix of another's. A listing
+  # with only one VM up has no VM column (`HOSTNAME PROXY:  listening on
+  # 127.0.0.1:<port>`); every caller scopes `min ls` with `--vm`, so that
+  # row is the named VM's own.
   two_vm_ls_proxy_port() {
     printf '%s\n' "${2:-}" | awk -v vm="$1" \
-      '$1 == "HOSTNAME" && $2 == "PROXY:" && $3 == vm {
+      '$1 == "HOSTNAME" && $2 == "PROXY:" && $3 == vm && $4 == "listening" {
          sub(/^127\.0\.0\.1:/, "", $6); print $6; exit
-       }'
+       }
+       $1 == "HOSTNAME" && $2 == "PROXY:" && $3 == "listening" {
+         sub(/^127\.0\.0\.1:/, "", $5); single = $5
+       }
+       END { if (single != "") print single }' | head -n1
   }
 
   # One request from the HOST through one VM's published proxy port — the
