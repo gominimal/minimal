@@ -9066,6 +9066,89 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
 }
 
 # ---------------------------------------------------------------------------
+# One A query to the host's own zone answerer, shared by the proofs whose
+# host legs connect at a box's published address. That address, which the
+# host-side forwarders bind, is the A record the answerer returns for the
+# box's name (NET-010/NET-127) — so a leg asks for it at the answerer's own
+# port, straight, with no OS resolver hook involved (`dig @127.0.0.1 -p
+# <port> <name> +short`'s question, asked with python3, which every lane
+# this script runs on already owes the pty driver; `dig` itself is no
+# lane's declared dependency). One datagram out, one reply back, and the A
+# record's four bytes on stdout; nothing on stdout and a nonzero exit when
+# the answerer holds no address for the name, with the reason on stderr for
+# the skip line that names it.
+zone_answerer_a() { # $1 = the answerer's port, $2 = the name to ask for
+  python3 - "$1" "$2" <<'PY'
+import socket
+import struct
+import sys
+
+port, name = int(sys.argv[1]), sys.argv[2]
+if not 0 < port < 65536 or not name:
+    print("no answerer port or name to ask for", file=sys.stderr)
+    sys.exit(2)
+# One A query: a header with recursion desired and one question, the name
+# as length-prefixed labels, type A, class IN.
+qname = b"".join(
+    bytes([len(label)]) + label.encode() for label in name.split(".") if label
+) + b"\x00"
+query = struct.pack(">HHHHHH", 0x5A5A, 0x0100, 1, 0, 0, 0)
+query += qname + struct.pack(">HH", 1, 1)
+try:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(2.0)
+        sock.sendto(query, ("127.0.0.1", port))
+        reply = sock.recv(4096)
+except OSError as error:
+    print(f"no reply from the zone answerer: {error}", file=sys.stderr)
+    sys.exit(1)
+if len(reply) < 12:
+    print("the answerer's reply is shorter than a DNS header", file=sys.stderr)
+    sys.exit(1)
+_, flags, questions, answers, _, _ = struct.unpack_from(">HHHHHH", reply, 0)
+rcode = flags & 0xF
+if rcode != 0:
+    print(f"the answerer replied rcode {rcode}", file=sys.stderr)
+    sys.exit(1)
+if answers == 0:
+    print("no answer records", file=sys.stderr)
+    sys.exit(1)
+
+
+def skip_name(buf, offset):
+    """The offset just past one name, compression pointers included."""
+    while offset < len(buf):
+        length = buf[offset]
+        if (length & 0xC0) == 0xC0:
+            return offset + 2
+        offset += 1
+        if length == 0:
+            return offset
+        offset += length
+    raise ValueError("a name runs past the reply")
+
+
+try:
+    offset = skip_name(reply, 12) + 4  # the question's name, type, class
+    for _ in range(answers):
+        offset = skip_name(reply, offset)
+        rtype, _, _, rdlen = struct.unpack_from(">HHIH", reply, offset)
+        if offset + 10 + rdlen > len(reply):
+            raise ValueError("an answer runs past the reply")
+        rdata = reply[offset + 10 : offset + 10 + rdlen]
+        offset += 10 + rdlen
+        if rtype == 1 and rdlen == 4:
+            print(".".join(str(byte) for byte in rdata))
+            sys.exit(0)
+except (ValueError, struct.error) as error:
+    print(f"the answerer's reply does not parse: {error}", file=sys.stderr)
+    sys.exit(1)
+print("no A record among the answer's records", file=sys.stderr)
+sys.exit(1)
+PY
+}
+
+# ---------------------------------------------------------------------------
 # NET-014 on the VM-backed host: a connection to a port a box has not
 # published is refused within 5 s, never timed out. The github-only case
 # above holds the connect-time conjunction's shape — its unpublished-port
@@ -9248,87 +9331,6 @@ proof_unpublished_port_refused_on_vm_host() {
     fi
   }
 
-  # The host address leg's address, from the host's own zone answerer: the
-  # address the box's declaration publishes at, which the host-side
-  # forwarders bind, is the A record the answerer returns for the box's
-  # name (NET-010/NET-127) — so the leg asks for it at the answerer's own
-  # port, straight, with no OS resolver hook involved (`dig @127.0.0.1 -p
-  # <port> <name> +short`'s question, asked with python3, which every lane
-  # this script runs on already owes the pty driver above; `dig` itself is
-  # no lane's declared dependency). One datagram out, one reply back, and
-  # the A record's four bytes on stdout; nothing on stdout and a nonzero
-  # exit when the answerer holds no address for the name, with the reason
-  # on stderr for the skip line that names it.
-  upr_answerer_a() {
-    python3 - "$1" "$2" <<'PY'
-import socket
-import struct
-import sys
-
-port, name = int(sys.argv[1]), sys.argv[2]
-if not 0 < port < 65536 or not name:
-    print("no answerer port or name to ask for", file=sys.stderr)
-    sys.exit(2)
-# One A query: a header with recursion desired and one question, the name
-# as length-prefixed labels, type A, class IN.
-qname = b"".join(
-    bytes([len(label)]) + label.encode() for label in name.split(".") if label
-) + b"\x00"
-query = struct.pack(">HHHHHH", 0x5A5A, 0x0100, 1, 0, 0, 0)
-query += qname + struct.pack(">HH", 1, 1)
-try:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.settimeout(2.0)
-        sock.sendto(query, ("127.0.0.1", port))
-        reply = sock.recv(4096)
-except OSError as error:
-    print(f"no reply from the zone answerer: {error}", file=sys.stderr)
-    sys.exit(1)
-if len(reply) < 12:
-    print("the answerer's reply is shorter than a DNS header", file=sys.stderr)
-    sys.exit(1)
-_, flags, questions, answers, _, _ = struct.unpack_from(">HHHHHH", reply, 0)
-rcode = flags & 0xF
-if rcode != 0:
-    print(f"the answerer replied rcode {rcode}", file=sys.stderr)
-    sys.exit(1)
-if answers == 0:
-    print("no answer records", file=sys.stderr)
-    sys.exit(1)
-
-
-def skip_name(buf, offset):
-    """The offset just past one name, compression pointers included."""
-    while offset < len(buf):
-        length = buf[offset]
-        if (length & 0xC0) == 0xC0:
-            return offset + 2
-        offset += 1
-        if length == 0:
-            return offset
-        offset += length
-    raise ValueError("a name runs past the reply")
-
-
-try:
-    offset = skip_name(reply, 12) + 4  # the question's name, type, class
-    for _ in range(answers):
-        offset = skip_name(reply, offset)
-        rtype, _, _, rdlen = struct.unpack_from(">HHIH", reply, offset)
-        if offset + 10 + rdlen > len(reply):
-            raise ValueError("an answer runs past the reply")
-        rdata = reply[offset + 10 : offset + 10 + rdlen]
-        offset += 10 + rdlen
-        if rtype == 1 and rdlen == 4:
-            print(".".join(str(byte) for byte in rdata))
-            sys.exit(0)
-except (ValueError, struct.error) as error:
-    print(f"the answerer's reply does not parse: {error}", file=sys.stderr)
-    sys.exit(1)
-print("no A record among the answer's records", file=sys.stderr)
-sys.exit(1)
-PY
-  }
 
   # The host address leg below connects by the box's PUBLISHED ADDRESS, and
   # the only in-tree word for that address is the registration record the
@@ -9511,7 +9513,7 @@ PY
   # The address this leg connects at is the one the host's own zone
   # answerer returns for the box's name — the address the box's declaration
   # publishes at, which the host-side forwarders bind — asked for straight
-  # at the answerer's port (upr_answerer_a above), so no OS resolver hook is
+  # at the answerer's port (zone_answerer_a above), so no OS resolver hook is
   # needed: a VM's daemon reports the port it bound, which is the one the VM
   # host handed it and the host's forwarder publishes at 127.0.0.1. The
   # registry's own record above names a different, unbound address (#1908),
@@ -9535,7 +9537,7 @@ PY
   if [ -z "$upr_ans_port" ]; then
     upr_addr_leg="skipped (no zone answerer on record for this VM host: 'min ls' carries no ZONE ANSWERER line, so the host's own word for where the box is published cannot be asked for)"
     echo "host address leg: SKIPPED ($upr_addr_leg)"
-  elif ! upr_ans_addr="$(upr_answerer_a "$upr_ans_port" \
+  elif ! upr_ans_addr="$(zone_answerer_a "$upr_ans_port" \
        "$upr_t_name.min.internal" 2>"$WORK/upr-ans.err")"; then
     upr_addr_leg="skipped (the zone answerer at 127.0.0.1:$upr_ans_port has no published address for $upr_t_name.min.internal: $(tr '\n' ' ' < "$WORK/upr-ans.err" 2>/dev/null))"
     echo "host address leg: SKIPPED ($upr_addr_leg)"
@@ -14673,78 +14675,6 @@ proof_listen_published_port_reaches_peer_and_host() {
     printf '%s\n' "$lp_ans_ls" | grep -F 'ZONE ANSWERER' | sed 's/^/  /' || true
   fi
 
-  # The address the host probe connects at: the host's own zone answerer's
-  # A record for the box's name — one datagram out, one reply back (the
-  # unpublished-port proof's own helper verbatim, python3 on every lane this
-  # script runs on; `dig` is no lane's declared dependency).
-  lp_answerer_a() {
-    python3 - "$1" "$2" <<'PY'
-import socket
-import struct
-import sys
-
-port, name = int(sys.argv[1]), sys.argv[2]
-if not 0 < port < 65536 or not name:
-    print("no answerer port or name to ask for", file=sys.stderr)
-    sys.exit(2)
-qname = b"".join(
-    bytes([len(label)]) + label.encode() for label in name.split(".") if label
-) + b"\x00"
-query = struct.pack(">HHHHHH", 0x5A5A, 0x0100, 1, 0, 0, 0)
-query += qname + struct.pack(">HH", 1, 1)
-try:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.settimeout(2.0)
-        sock.sendto(query, ("127.0.0.1", port))
-        reply = sock.recv(4096)
-except OSError as error:
-    print(f"no reply from the zone answerer: {error}", file=sys.stderr)
-    sys.exit(1)
-if len(reply) < 12:
-    print("the answerer's reply is shorter than a DNS header", file=sys.stderr)
-    sys.exit(1)
-_, flags, questions, answers, _, _ = struct.unpack_from(">HHHHHH", reply, 0)
-rcode = flags & 0xF
-if rcode != 0:
-    print(f"the answerer replied rcode {rcode}", file=sys.stderr)
-    sys.exit(1)
-if answers == 0:
-    print("no answer records", file=sys.stderr)
-    sys.exit(1)
-
-
-def skip_name(buf, offset):
-    """The offset just past one name, compression pointers included."""
-    while offset < len(buf):
-        length = buf[offset]
-        if (length & 0xC0) == 0xC0:
-            return offset + 2
-        offset += 1
-        if length == 0:
-            return offset
-        offset += length
-    raise ValueError("a name runs past the reply")
-
-
-try:
-    offset = skip_name(reply, 12) + 4
-    for _ in range(answers):
-        offset = skip_name(reply, offset)
-        rtype, _, _, rdlen = struct.unpack_from(">HHIH", reply, offset)
-        if offset + 10 + rdlen > len(reply):
-            raise ValueError("an answer runs past the reply")
-        rdata = reply[offset + 10 : offset + 10 + rdlen]
-        offset += 10 + rdlen
-        if rtype == 1 and rdlen == 4:
-            print(".".join(str(byte) for byte in rdata))
-            sys.exit(0)
-except (ValueError, struct.error) as error:
-    print(f"the answerer's reply does not parse: {error}", file=sys.stderr)
-    sys.exit(1)
-print("no A record among the answer's records", file=sys.stderr)
-sys.exit(1)
-PY
-  }
   # WHERE-gated like the answerer's port above it: without the box's
   # published address there is no route for the host legs to connect at, and
   # the case says so — the peer legs below still run, because the fabric they
@@ -14752,7 +14682,7 @@ PY
   lp_addr=""
   if [ -n "$lp_ans_port" ]; then
     for _ in $(seq 1 40); do
-      lp_addr="$(lp_answerer_a "$lp_ans_port" "$lp_target_name.min.internal" \
+      lp_addr="$(zone_answerer_a "$lp_ans_port" "$lp_target_name.min.internal" \
         2>"$WORK/lp-ans.err" || true)"
       [ -n "$lp_addr" ] && break
       sleep 0.25
