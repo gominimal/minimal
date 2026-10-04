@@ -466,6 +466,21 @@ impl ServerState {
         // The subnet this daemon's switch carries — decided by who owns the
         // gvproxy it attaches to; see [`switch_subnet_for`].
         let switch_subnet = switch_subnet_for(config.in_microvm, slice_octet);
+        // The port the hostname proxy's first bind asks for — the configured
+        // (in a microVM, the host-handed) port, or the documented default —
+        // is the node address's interim opening in every box's own-address
+        // set (design §7.1). The OS-picks `0` names no port, so no opening.
+        #[cfg(target_os = "linux")]
+        let hostname_proxy_port = Some(
+            ProxyPort::from_config(
+                config.hostname_proxy_port,
+                crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
+            )
+            .first_port(),
+        )
+        .filter(|port| *port != 0);
+        #[cfg(not(target_os = "linux"))]
+        let hostname_proxy_port = None;
         let net_switch = Arc::new(Mutex::new(
             crate::net::SwitchClient::with_subnet(
                 config.gvproxy_bin_path(),
@@ -480,7 +495,8 @@ impl ServerState {
             // DNS registrations carry the instance id as their host label,
             // so a second daemon on the same host registers its own names
             // instead of overwriting the first's records (NET-027).
-            .with_host_id(daemon_id.clone()),
+            .with_host_id(daemon_id.clone())
+            .with_hostname_proxy_port(hostname_proxy_port),
         ));
         // One line at daemon start naming the switch subnet this instance's
         // boxes lease on and the pool its published addresses are granted

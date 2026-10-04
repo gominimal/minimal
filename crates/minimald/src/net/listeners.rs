@@ -1150,6 +1150,7 @@ mod tests {
             LEASE,
             policy,
             SwitchSubnet::default(),
+            None,
         ));
         let plan = ListenPlan::new(
             "listen-box".into(),
@@ -2243,6 +2244,7 @@ mod tests {
             LEASE,
             &permit_policy(8080),
             SwitchSubnet::default(),
+            None,
         ));
         let plan = || {
             ListenPlan::new(
@@ -2289,6 +2291,7 @@ mod tests {
             LEASE,
             &permit_policy(8080),
             SwitchSubnet::default(),
+            None,
         ));
         let plan = || {
             ListenPlan::new(
@@ -2356,6 +2359,7 @@ mod tests {
             LEASE,
             &permit_policy(8080),
             SwitchSubnet::default(),
+            None,
         ));
         let plan = || {
             ListenPlan::new(
@@ -2405,6 +2409,7 @@ mod tests {
             LEASE,
             &permit_policy(8080),
             SwitchSubnet::default(),
+            None,
         ));
         let plan = || {
             ListenPlan::new(
@@ -2647,6 +2652,7 @@ mod tests {
             STANDIN_LEASE,
             &permit_policy(port),
             SwitchSubnet::default(),
+            None,
         ));
         let watcher = ListenWatcher::start(
             ListenPlan::new(

@@ -169,7 +169,7 @@ impl ProxyListener {
 /// proxy's address are handed.
 ///
 /// The set subtracts those addresses from whatever the box's CIDR
-/// dimensions admit, with three port-scoped openings, and no others:
+/// dimensions admit, with these port-scoped openings, and no others:
 ///
 /// * **The resolver's port on the gateway** (NET-079): TCP or UDP to
 ///   [`DNS_PORT`] falls through to the box's own rules, which still decide
@@ -193,10 +193,18 @@ impl ProxyListener {
 ///   reach within an exposure but never open the alias by themselves;
 ///   every other port at the alias is the set's drop. With no exposure
 ///   configured the alias has no opening at all, at any port.
+/// * **Interim: the hostname proxy's port on the node address**, TCP
+///   only, falling through to the box's own rules. The opening exists only
+///   while the interim `:7654` Host-header proxy is served there (design
+///   §7.1), and it retires with that proxy. It grants nothing beyond the
+///   caller's own direct reach: the proxy checks every request against the
+///   caller's rules (NET-070/071 parity). The accepted exposure is the
+///   proxy's request parser, reachable by any box whose rules admit the
+///   node address, bounded by its HTTP/1.1-only parsing (design §5.7).
+///   With no proxy port compiled in there is no opening.
 ///
-/// The node address has no opening: nothing a box runs names a service it
-/// is owed there, and the daemon's own plane is not a destination a box's
-/// declaration could admit.
+/// Every other port at the node address is the set's drop: the daemon's
+/// own plane is not a destination a box's declaration could admit.
 ///
 /// Attached by [`EgressRules::with_switch_own_addresses`] and absent from
 /// [`EgressRules::new`], so a rule set compiled without it — the VM host's
@@ -212,8 +220,8 @@ pub struct SwitchOwnAddresses {
     /// default-deny: reached only at the exposures the host configures,
     /// as local reach under the box's rules there.
     host_alias: [u8; 4],
-    /// The node address — the daemon's own address on the switch, with no
-    /// opening: the machine's plane, never a box's destination.
+    /// The node address — the daemon's own address on the switch: the
+    /// machine's plane, opened only at the interim hostname proxy's port.
     node: [u8; 4],
     /// The Box Egress Proxy's peer address (NET-134): the one member the
     /// listener arms decide when the rules carry a listener, and the set's
@@ -223,6 +231,10 @@ pub struct SwitchOwnAddresses {
     /// the alias's only openings. Empty — the shape every compile builds
     /// today — leaves the alias with no opening, dropped at every port.
     host_exposure_ports: Vec<u16>,
+    /// Interim: the port the hostname proxy listens on at the node address,
+    /// the node's one opening (TCP only) while that proxy is served.
+    /// `None` leaves the node address with no opening.
+    hostname_proxy_port: Option<u16>,
 }
 
 impl SwitchOwnAddresses {
@@ -237,6 +249,7 @@ impl SwitchOwnAddresses {
             node,
             bep_peer,
             host_exposure_ports: Vec::new(),
+            hostname_proxy_port: None,
         }
     }
 
@@ -251,11 +264,23 @@ impl SwitchOwnAddresses {
         self
     }
 
+    /// Interim: the hostname proxy's listen port on the node address, the
+    /// node's one opening — TCP to exactly this port falls through to the
+    /// box's own rules, and every other frame to the node address is still
+    /// the set's drop. It exists only while the interim `:7654` Host-header
+    /// proxy is served (design §7.1) and retires with it; see
+    /// [`SwitchOwnAddresses`] for the exposure it accepts.
+    #[must_use]
+    pub fn with_hostname_proxy_port(mut self, port: u16) -> Self {
+        self.hostname_proxy_port = Some(port);
+        self
+    }
+
     /// Why the switch's own addresses drop this frame, when they do: the
     /// infrastructure deny set's own drop (design §5.3), ahead of the
     /// box's rules and naming the address the frame reached for — the
-    /// gateway outside the resolver's port, the node address at every
-    /// port, the proxy's peer when no listener was compiled to open it,
+    /// gateway outside the resolver's port, the node address outside the
+    /// interim hostname proxy's port, the proxy's peer when no listener was compiled to open it,
     /// and the host alias outside the exposures the host configured.
     /// `None` when the frame sits at one of the openings, whose frames
     /// fall through to the box's own rules to decide.
@@ -278,7 +303,10 @@ impl SwitchOwnAddresses {
                 (proto == IPPROTO_TCP || proto == IPPROTO_UDP) && dst_port == DNS_PORT;
             (!resolver_query).then_some(reason)
         } else if dst == self.node {
-            Some(reason)
+            // Interim: the hostname proxy's port over TCP, the proxy's own
+            // protocol, is the node's one opening while that proxy is served.
+            let hostname_proxy = proto == IPPROTO_TCP && self.hostname_proxy_port == Some(dst_port);
+            (!hostname_proxy).then_some(reason)
         } else if dst == self.bep_peer
             && listener.is_none_or(|listener| listener.addr != self.bep_peer)
         {
@@ -837,7 +865,9 @@ impl EgressRules {
     /// proxy's listener for a box on a credentialed lane, and the host's
     /// configured exposures over the alias, reached as local reach under
     /// the box's own rules. The alias is default-deny: with no exposure
-    /// configured it has no opening.
+    /// configured it has no opening. While the interim hostname proxy is
+    /// served, its TCP port on the node address is a fourth, interim
+    /// opening ([`SwitchOwnAddresses::with_hostname_proxy_port`]).
     ///
     /// The relay leg of a frame's path out of a VM is the leg a native
     /// host runs alone, so the set is the relay's own here: no box
@@ -953,7 +983,8 @@ pub enum DropReason {
     /// The destination is one of the switch's own addresses the rules
     /// carry (NET-062's sub-clause, design §5.3's infrastructure deny
     /// set): the machine's control surface — the gateway outside the
-    /// resolver's port, the node address, the proxy's peer when no
+    /// resolver's port, the node address outside the interim hostname
+    /// proxy's port, the proxy's peer when no
     /// listener opened it, the host alias outside the exposures the host
     /// configured — dropped ahead of the box's rules, whatever its
     /// `allow_subnets` would admit at the address, under the rule string
@@ -1067,7 +1098,7 @@ pub fn proxy_lane_admits(declared: bool, listener: ProxyListener, summary: &Fram
 /// dropped at every frame the lane did not admit, ahead of the rules,
 /// laned or not, so no open dimension ever opens it and a lane-less box
 /// reaches no listener either; the switch's own addresses are then
-/// subtracted from what the dimensions below admit, outside the three
+/// subtracted from what the dimensions below admit, outside the
 /// port-scoped openings that fall through to them (NET-062's sub-clause);
 /// `deny_subnets` then carves
 /// out of what the allows admit; and a drop never depends on the rule
@@ -1149,7 +1180,7 @@ fn verdict_ipv4(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
     // the infrastructure deny set, design §5.3 — subtracted from whatever
     // the dimensions below would admit, decided ahead of them so that no
     // open `allow_subnets` and no DNS pin turns the machine's control
-    // surface back into a destination. The three openings fall through to
+    // surface back into a destination. The openings fall through to
     // those same dimensions: the resolver's port on the gateway (the UDP
     // carve-out above has already admitted the query under any
     // declaration, and a TCP query keeps the verdict its rules give it),
@@ -1157,7 +1188,8 @@ fn verdict_ipv4(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
     // above, which every rule set carrying a listener has already decided
     // the peer address by), and the host alias at the exposures the host
     // configured, reached as local reach under the box's rules — the alias
-    // is default-deny, so with none configured it drops at every port. A
+    // is default-deny, so with none configured it drops at every port —
+    // and, interim, the hostname proxy's TCP port on the node address. A
     // drop here is a drop, never a reset: the verdict answers the relay,
     // which writes nothing back toward the box.
     if let Some(own) = &rules.switch_own
@@ -2661,9 +2693,10 @@ mod tests {
                 }),
                 "{label}: ICMP at the gateway is the set's drop with the rest"
             );
-            // The node address: the daemon's own address on the switch, with
-            // no opening to fall through to.
-            let node_ssh = ipv4_frame(IPPROTO_TCP, NODE, 7654);
+            // The node address: the daemon's own address on the switch, at a
+            // port outside the interim hostname proxy's opening (pinned by
+            // the next test but one).
+            let node_ssh = ipv4_frame(IPPROTO_TCP, NODE, 22);
             assert_eq!(
                 verdict(&summarize(&node_ssh), rules),
                 FrameVerdict::Drop(DropReason::InfrastructureDestination {
@@ -2840,6 +2873,64 @@ mod tests {
                 &deny_all_exposed
             ),
             "but adds no floor: the deny-all box's rules still refuse the exposure"
+        );
+    }
+
+    /// Interim: the hostname proxy's port on the node address is the node's
+    /// one opening while the `:7654` Host-header proxy is served (design
+    /// §7.1). TCP to exactly that port falls through to the box's own rules
+    /// — an allow-all box reaches it, a deny-all box is refused by its own
+    /// rules — and every other port, UDP to the same port, and the same
+    /// port on a set compiled with no proxy port are the set's drop.
+    #[test]
+    fn switch_address_hostname_proxy_opening_is_interim() {
+        const HOSTNAME_PROXY_PORT: u16 = 7654;
+        let with_proxy = own_addresses().with_hostname_proxy_port(HOSTNAME_PROXY_PORT);
+        let allow_all = EgressRules::from_policy(None, RESOLVER, LEASE)
+            .with_switch_own_addresses(with_proxy.clone());
+        let deny_all_set = deny_all().with_switch_own_addresses(with_proxy);
+        let node_drop =
+            |proto| FrameVerdict::Drop(DropReason::InfrastructureDestination { dst: NODE, proto });
+
+        assert!(
+            admits(
+                &ipv4_frame(IPPROTO_TCP, NODE, HOSTNAME_PROXY_PORT),
+                &allow_all
+            ),
+            "an allow-all box reaches the hostname proxy's port on the node"
+        );
+        assert_eq!(
+            verdict(&summarize(&ipv4_frame(IPPROTO_TCP, NODE, 7655)), &allow_all),
+            node_drop(IPPROTO_TCP),
+            "and nothing else at the node address"
+        );
+        assert_eq!(
+            verdict(
+                &summarize(&ipv4_frame(IPPROTO_UDP, NODE, HOSTNAME_PROXY_PORT)),
+                &allow_all
+            ),
+            node_drop(IPPROTO_UDP),
+            "the opening is TCP only: UDP to the proxy's port is the set's drop"
+        );
+        assert_eq!(
+            verdict(
+                &summarize(&ipv4_frame(IPPROTO_TCP, NODE, HOSTNAME_PROXY_PORT)),
+                &deny_all_set
+            ),
+            FrameVerdict::Drop(DropReason::UndeclaredProtocol { proto: IPPROTO_TCP }),
+            "a deny-all box is refused at the proxy's port by its own rules, not the set"
+        );
+
+        // No proxy port compiled in: the node address has no opening.
+        let no_proxy = EgressRules::from_policy(None, RESOLVER, LEASE)
+            .with_switch_own_addresses(own_addresses());
+        assert_eq!(
+            verdict(
+                &summarize(&ipv4_frame(IPPROTO_TCP, NODE, HOSTNAME_PROXY_PORT)),
+                &no_proxy
+            ),
+            node_drop(IPPROTO_TCP),
+            "with no proxy port the node address drops at the proxy's port too"
         );
     }
 

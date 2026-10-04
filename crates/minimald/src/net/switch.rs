@@ -1135,7 +1135,8 @@ impl SessionGate {
     /// the relay is attached to — whose gateway is the resolver the egress
     /// carve-out is keyed to (NET-079). `lease` is the box's address on that
     /// switch, compiled into its egress rules as the one source its frames may
-    /// carry (NET-084). A session with no declared ingress denies every new
+    /// carry (NET-084), and `hostname_proxy_port` the node address's interim
+    /// opening ([`compiled_egress`]). A session with no declared ingress denies every new
     /// inbound connection/datagram while still receiving replies to its own
     /// egress; one with no declared egress allows all (the shipped default,
     /// until NET-074's deny-all default is in force).
@@ -1145,11 +1146,12 @@ impl SessionGate {
         lease: Ipv4Addr,
         policy: &sessions::SessionPolicy,
         subnet: SwitchSubnet,
+        hostname_proxy_port: Option<u16>,
     ) -> Self {
         // The one egress compilation this box's frames are decided by, shared
         // with the DNS gate below — so a name's admission and a frame's
         // verdict can never disagree about what the box declared.
-        let rules = compiled_egress(Some(policy), subnet, lease);
+        let rules = compiled_egress(Some(policy), subnet, lease, hostname_proxy_port);
         let infrastructure = egress::InfrastructureDenySet::new(
             subnet.dns_server().octets(),
             subnet.host_alias().octets(),
@@ -2100,12 +2102,19 @@ pub fn declared_request_ports(policy: Option<&sessions::SessionPolicy>) -> BTree
 /// sub-clause): the gateway, the host alias, the node address and the BEP
 /// peer `subnet` names, handed to the verdict so the relay — the only leg a
 /// native host runs — subtracts them from whatever the box's
-/// `egress.allow_subnets` admits, outside the three port-scoped openings
+/// `egress.allow_subnets` admits, outside the port-scoped openings
 /// the sub-clause lists (the resolver's port on the gateway, the proxy's
 /// listener on a credentialed lane, and the host's configured exposures over
 /// the host alias). The alias is default-deny (design §7.1): no host exposure
 /// is configured anywhere today, so the set is handed with none and the
-/// alias has no opening. The same compilation is the hostname proxy's
+/// alias has no opening. Interim: `hostname_proxy_port`, the port this
+/// daemon's hostname proxy listens on, is the node address's one opening (TCP
+/// only, falling through to the box's rules) while the `:7654` Host-header
+/// proxy is served (design §7.1); it retires with that proxy. The proxy grants
+/// nothing beyond the caller's own direct reach (NET-070/071 parity), and the
+/// exposure accepted is its HTTP/1.1-only request parser (design §5.7),
+/// reachable by any box whose rules admit the node address. `None` leaves the
+/// node with no opening. The same compilation is the hostname proxy's
 /// caller check, so no reach the relay would refuse can be asked of the
 /// proxy instead (NET-071).
 #[must_use]
@@ -2113,6 +2122,7 @@ pub fn compiled_egress(
     policy: Option<&sessions::SessionPolicy>,
     subnet: SwitchSubnet,
     lease: Ipv4Addr,
+    hostname_proxy_port: Option<u16>,
 ) -> egress::EgressRules {
     let rules = egress::EgressRules::from_policy(
         policy.and_then(|policy| policy.egress.as_ref()),
@@ -2124,12 +2134,16 @@ pub fn compiled_egress(
         true => rules.with_credentialed_upstream(proxy),
         false => rules.with_box_egress_proxy(proxy),
     };
-    rules.with_switch_own_addresses(egress::SwitchOwnAddresses::new(
+    let own = egress::SwitchOwnAddresses::new(
         subnet.gateway().octets(),
         subnet.host_alias().octets(),
         subnet.daemon_ip().octets(),
         proxy,
-    ))
+    );
+    rules.with_switch_own_addresses(match hostname_proxy_port {
+        Some(port) => own.with_hostname_proxy_port(port),
+        None => own,
+    })
 }
 
 /// The egress verdict a direct TCP connection from a box whose own frames are
@@ -2975,6 +2989,7 @@ pub(crate) mod tests {
             Ipv4Addr::new(100, 64, 0, 9),
             &policy,
             SwitchSubnet::default(),
+            None,
         );
         assert!(!gate.admits_tcp(9999), "nothing is published yet");
         // The declared port is admitted by its declaration alone.
@@ -3085,6 +3100,7 @@ pub(crate) mod tests {
             Ipv4Addr::new(100, 64, 0, 9),
             &policy,
             SwitchSubnet::default(),
+            None,
         );
         assert!(gate.allowed.contains(&80)); // TCP internal port
         assert!(!gate.allowed.contains(&53)); // the UDP mapping is not a TCP port
@@ -3097,6 +3113,7 @@ pub(crate) mod tests {
             Ipv4Addr::new(100, 64, 0, 9),
             &sessions::SessionPolicy::default(),
             SwitchSubnet::default(),
+            None,
         );
         assert!(empty.allowed.is_empty() && empty.udp_allowed.is_empty());
     }
@@ -3246,8 +3263,13 @@ pub(crate) mod tests {
             egress: None,
             credentialed_upstream: None,
         };
-        let gate =
-            SessionGate::for_session(LEASE.to_string(), LEASE, &policy, SwitchSubnet::default());
+        let gate = SessionGate::for_session(
+            LEASE.to_string(),
+            LEASE,
+            &policy,
+            SwitchSubnet::default(),
+            None,
+        );
         // New TCP connection to an undeclared port -> dropped, tagged Tcp.
         let tcp = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 9999);
         assert_eq!(
@@ -3336,7 +3358,13 @@ pub(crate) mod tests {
         let (sock_rx, sock_tx) = tokio::io::split(relay_side);
         let gate = policy
             .map(|policy| {
-                SessionGate::for_session(lease.to_string(), lease, policy, SwitchSubnet::default())
+                SessionGate::for_session(
+                    lease.to_string(),
+                    lease,
+                    policy,
+                    SwitchSubnet::default(),
+                    None,
+                )
             })
             .map(|mut gate| {
                 configure(&mut gate);
@@ -3520,15 +3548,16 @@ pub(crate) mod tests {
     /// NET-062's sub-clause on the native relay — the only leg a native
     /// host runs, with no minvmd gate beside it: a box whose
     /// `egress.allow_subnets` cover the whole switch subnet still cannot
-    /// open a flow to the switch's own addresses outside the three
-    /// port-scoped openings. The gateway outside the resolver's port and
-    /// the node address at every port never reach the switch, dropped
+    /// open a flow to the switch's own addresses outside the port-scoped
+    /// openings. The gateway outside the resolver's port and the node
+    /// address outside the hostname proxy's port never reach the switch, dropped
     /// silently (never reset) and named by the rate-limited warn line under
     /// the infrastructure deny set's own rule; the peer's listener is the
     /// lane's opening, already pinned lane-less above. The host alias is
     /// default-deny except configured host exposures (design §7.1), and none
     /// is configured, so it drops with them under the same rule. The
-    /// resolver's port on the gateway still forwards.
+    /// resolver's port on the gateway still forwards, and so does the
+    /// interim hostname proxy's TCP port on the node address.
     #[tokio::test]
     async fn native_relay_drops_flows_to_switch_addresses() {
         let capture = crate::test_harness::captured_log();
@@ -3556,13 +3585,26 @@ pub(crate) mod tests {
             ingress: None,
             credentialed_upstream: None,
         };
-        let mut harness = spawn_test_relay(&covering);
+        // The gate is compiled with the hostname proxy's port the daemon
+        // asks for when none is pinned — the node address's interim opening.
+        let proxy_port = crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT;
+        let mut harness = spawn_test_relay_with(&covering, |gate| {
+            *gate = SessionGate::for_session(
+                LEASE.to_string(),
+                LEASE,
+                &covering,
+                subnet,
+                Some(proxy_port),
+            );
+        });
 
-        // The opening forwards, verbatim: the resolver's port on the
-        // gateway over UDP and TCP alike.
+        // The openings forward, verbatim: the resolver's port on the
+        // gateway over UDP and TCP alike, and — interim — the hostname
+        // proxy's TCP port on the node address.
         let openings = [
             udp_frame(LEASE, 40000, gateway, 53),
             egress_tcp_frame(LEASE, gateway, 53),
+            egress_tcp_frame(LEASE, node, proxy_port),
         ];
         for frame in &openings {
             harness.box_end.write_all(frame).unwrap();
@@ -3578,11 +3620,11 @@ pub(crate) mod tests {
         }
 
         // The box reaches for the switch's own control surface — the
-        // gateway on another port, the node address at the daemon's own
-        // port, and the host alias with no exposure configured — then ARP
-        // as the sentinel: nothing before it arrives.
+        // gateway on another port, the node address outside the hostname
+        // proxy's port, and the host alias with no exposure configured —
+        // then ARP as the sentinel: nothing before it arrives.
         let api = egress_tcp_frame(LEASE, gateway, 443);
-        let node_ssh = egress_tcp_frame(LEASE, node, 7654);
+        let node_ssh = egress_tcp_frame(LEASE, node, 22);
         let to_alias = egress_tcp_frame(LEASE, alias, 18081);
         let sentinel = arp_frame(LEASE);
         harness.box_end.write_all(&api).unwrap();
@@ -4372,6 +4414,7 @@ pub(crate) mod tests {
             LEASE,
             &declared_ingress_80(),
             SwitchSubnet::default(),
+            None,
         );
         let mut resets = gate
             .take_resets()
@@ -4651,6 +4694,7 @@ pub(crate) mod tests {
             LEASE,
             &declared_ingress_80(),
             SwitchSubnet::default(),
+            None,
         );
         let mut resets = gate
             .take_resets()
@@ -4737,6 +4781,7 @@ pub(crate) mod tests {
             LEASE,
             &declared_ingress_80(),
             SwitchSubnet::default(),
+            None,
         );
         let mut resets = gate
             .take_resets()
@@ -4815,6 +4860,7 @@ pub(crate) mod tests {
             LEASE,
             &declared_ingress_80(),
             SwitchSubnet::default(),
+            None,
         );
         let mut resets = gate
             .take_resets()
@@ -4847,6 +4893,7 @@ pub(crate) mod tests {
             LEASE,
             &declared_ingress_80(),
             SwitchSubnet::default(),
+            None,
         );
         // The shared emitter, with a small quota and a window short enough to
         // watch roll inside a test: the same audit, tightened for the proof.
@@ -5467,6 +5514,7 @@ pub(crate) mod tests {
             Ipv4Addr::new(100, 64, 0, 9),
             &sessions::SessionPolicy::default(),
             SwitchSubnet::default(),
+            None,
         );
         let notice = LegacyHostNotice::for_gate(&gate, SwitchSubnet::default());
         assert_eq!(notice.alias, alias, "the notice watches the switch's alias");
@@ -5481,6 +5529,7 @@ pub(crate) mod tests {
                 Ipv4Addr::new(10, 0, 0, 9),
                 &sessions::SessionPolicy::default(),
                 custom,
+                None,
             ),
             custom,
         );
@@ -5533,6 +5582,7 @@ pub(crate) mod tests {
             Ipv4Addr::new(100, 64, 0, 10),
             &sessions::SessionPolicy::default(),
             SwitchSubnet::default(),
+            None,
         );
         assert!(gate.limiter.should_warn_at(
             "100.64.0.10",
