@@ -12496,11 +12496,19 @@ proof_two_named_vms_on_one_machine() {
     find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
       | sort | tail -n1
   }
+  # $1 is the snapshot's file and $2 its line count. A rotation since the
+  # snapshot puts this run's lines in two files: the snapshot file's tail,
+  # then the whole newer one.
   two_vm_log_since() {
     local f
     f="$(two_vm_minvmd_log)"
     [ -n "$f" ] || return 0
-    tail -n "+$(($1 + 1))" "$f"
+    if [ "$f" = "$1" ]; then
+      tail -n "+$(($2 + 1))" "$f"
+      return 0
+    fi
+    if [ -n "$1" ]; then tail -n "+$(($2 + 1))" "$1" 2>/dev/null; fi
+    cat "$f" 2>/dev/null
   }
 
   # Diagnostic capture only — never an assertion, never a failure. Each VM's
@@ -12938,9 +12946,9 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   tw_rec_a=""
   tw_rec_b=""
   for _ in $(seq 1 40); do
-    [ -n "$tw_rec_a" ] || tw_rec_a="$(two_vm_log_since "$tw_log_lines" \
+    [ -n "$tw_rec_a" ] || tw_rec_a="$(two_vm_log_since "$tw_log" "$tw_log_lines" \
       | grep -F -- '"vm":"default"' | grep -F -- 'starting VM' | tail -n1 || true)"
-    [ -n "$tw_rec_b" ] || tw_rec_b="$(two_vm_log_since "$tw_log_lines" \
+    [ -n "$tw_rec_b" ] || tw_rec_b="$(two_vm_log_since "$tw_log" "$tw_log_lines" \
       | grep -F -- "\"vm\":\"$tw_name\"" | grep -F -- 'starting VM' | tail -n1 || true)"
     [ -n "$tw_rec_a" ] && [ -n "$tw_rec_b" ] && break
     sleep 0.5
