@@ -3375,7 +3375,13 @@ const CLOSURE_REPORT_WATCH: std::time::Duration = std::time::Duration::from_secs
 /// the line settles the box's fate: `true` for a `failed` line, which the
 /// closure writes on its way to `_exit(127)` and nothing follows; `false`
 /// for a `cover` line, which it writes while still heading for its exec.
+/// A cover line may carry a refused devpts remount after a `; `, since the
+/// report holds one line; each part is said on its own.
 fn say_closure_line(line: &str, session: &str) -> bool {
+    if let Some((cover, devpts)) = line.split_once("; ") {
+        let settled = say_closure_line(cover, session);
+        return say_closure_line(devpts, session) || settled;
+    }
     if line == "cover cgroup2" {
         tracing::info!(
             session = %session,
@@ -3403,6 +3409,15 @@ fn say_closure_line(line: &str, session: &str) -> bool {
             cover = "tmpfs-fallback",
             "the box's classifier cover was forced onto its recorded \
              fallback — a launch in a test posture, never a production one",
+        );
+    } else if let Some(rest) = line.strip_prefix("devpts max=") {
+        let (max, errno) = rest.rsplit_once(" errno ").unwrap_or((rest, "unreported"));
+        tracing::warn!(
+            session = %session,
+            max,
+            errno,
+            "remounting the box's /dev/pts with a per-instance max failed; \
+             the box runs on the shared PTY pool",
         );
     } else if let Some(errno) = line.strip_prefix("lo-down errno ") {
         tracing::warn!(
