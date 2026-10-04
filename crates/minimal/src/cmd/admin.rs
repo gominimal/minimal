@@ -17,11 +17,33 @@ pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyho
         }
     };
 
-    let stream = tokio::net::UnixStream::connect(&socket_path)
-        .await
-        .with_context(|| format!("connect to {}", socket_path))?;
+    let stream = connect_with_retry(&socket_path).await?;
 
     proxy_bridge(stream, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+/// Connect to the daemon UDS, retrying a bounded number of times when the
+/// connect is refused.
+///
+/// A burst of concurrent `min session exec` invocations can overflow the
+/// daemon's accept backlog, so a single refused connect must not fail the
+/// proxy outright. Retry only on `ConnectionRefused`; a `NotFound` (no
+/// socket file) means the daemon is not running and fails immediately.
+async fn connect_with_retry(socket_path: &str) -> Result<tokio::net::UnixStream, anyhow::Error> {
+    let mut last_err = None;
+    for _ in 0..client::CONNECT_RETRIES {
+        match tokio::net::UnixStream::connect(socket_path).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                last_err = Some(err);
+                tokio::time::sleep(client::CONNECT_RETRY_DELAY).await;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("connect to {}", socket_path));
+            }
+        }
+    }
+    Err(last_err.unwrap()).with_context(|| format!("connect to {}", socket_path))
 }
 
 /// Bridge proxy stdio to the daemon socket until either side closes.
@@ -281,4 +303,65 @@ pub async fn cmd_version(global: &GlobalArgs) -> Result<(), anyhow::Error> {
     println!("Stdlib: {}", resp.stdlib_version);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refused connect is retried: a listener that comes up after the first
+    /// attempt is still reached, so a burst of concurrent proxies that
+    /// overflows the daemon's accept backlog does not fail spuriously.
+    #[tokio::test]
+    async fn connect_with_retry_reaches_a_late_listener() {
+        let dir = tempfile::tempdir().expect("a temp dir for the socket");
+        let sock = dir.path().join("daemon.sock");
+        let sock_path = sock.to_str().unwrap().to_string();
+
+        // A stale socket file: the listener died and left its path behind, so
+        // connects are refused until a new listener takes the path.
+        let stale = std::os::unix::net::UnixListener::bind(&sock).expect("stale bind");
+        drop(stale);
+
+        // A listener comes up after the first refused attempt, exercising the
+        // retry path.
+        let bind_sock = sock.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            std::fs::remove_file(&bind_sock).expect("remove the stale socket");
+            let _listener = tokio::net::UnixListener::bind(&bind_sock).expect("late bind");
+            // Hold the listener open until the connect lands.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+
+        let stream = connect_with_retry(&sock_path)
+            .await
+            .expect("a late-bound listener must be reached by retry");
+        drop(stream);
+    }
+
+    /// A missing socket path fails immediately: `NotFound` is not retried, so
+    /// a proxy against a daemon that is not running does not hang for the
+    /// full retry window.
+    #[tokio::test]
+    async fn connect_with_retry_fails_fast_on_missing_socket() {
+        let dir = tempfile::tempdir().expect("a temp dir for the socket");
+        let sock_path = dir.path().join("no-daemon.sock");
+        let sock_path = sock_path.to_str().unwrap().to_string();
+
+        let started = std::time::Instant::now();
+        let err = connect_with_retry(&sock_path)
+            .await
+            .expect_err("a missing socket must fail");
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.to_string().contains("connect to"),
+            "the error must name the socket path: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "a missing socket must not be retried ({elapsed:?})"
+        );
+    }
 }
