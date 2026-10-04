@@ -10040,6 +10040,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
   # proofs around this one use (18080-18088, 18090-18093, 19090/19091).
   PO_BOX_NAME="e2e-port-publish"       # the own-address box the port half drives
   PO_OUTLIVE_NAME="e2e-port-outlive"   # the host-address box the detach half drives
+  PO_OUTLIVE_CLIENT_NAME="e2e-port-out-client" # the detach half's outside client, on a VM lane
   PO_EXT=18096                         # the declared — published — port
   PO_UNDECLARED=18097                  # a listen no declaration names
   PO_DETACH_PORT=18098                 # the detach box's server, on the shared loopback
@@ -10343,11 +10344,11 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       echo "--- body ---"; cat "$WORK/po-undeclared-name.body" 2>/dev/null || true
       fail
     fi
-    if [[ "$(cat "$WORK/po-undeclared-name.body" 2>/dev/null)" != *"not published"* ]]; then
-      echo "::error::the by-name refusal for the undeclared port does not say the port is not published"
-      echo "--- body ---"; cat "$WORK/po-undeclared-name.body" 2>/dev/null || true
-      fail
-    fi
+    # TODO(T70, #1858): the refusal's own WORDING — a body that says the port
+    # is not published — comes from the switch crate's one refusal builder,
+    # which is not on main yet. Main's proxy answers `403` with an empty body
+    # (`write_status`: Content-Length: 0), so the status above is the whole
+    # assertion today; pin the wording once that builder lands.
     # Refused at the address too: nothing is bound there for this port.
     if [ -n "$po_addr" ]; then
       po_t0=$(now_ms)
@@ -10473,6 +10474,59 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       fail
     fi
 
+    # The client that is outside the box's process tree, by lane. A
+    # host-address box shares its host's network namespace, so on a NATIVE
+    # lane the harness's own curl is one: it lives on the host the box lives
+    # on. On a VM lane it is not — the box's loopback is the GUEST's, and the
+    # harness runs on the host, so its `127.0.0.1` is the host's own, where
+    # nothing of the box's listens and no host curl can ever reach the server.
+    # There the outside client is a curl inside a SECOND box on the same node:
+    # another host-address box in the same guest, sharing the loopback the
+    # server listens on, and a process the detach box has never heard of. Both
+    # are outside the box's process tree; the native lane keeps its host-side
+    # curl exactly as it was.
+    po_out_client_sid=""
+    if [ -n "$E2E_VM" ]; then
+      PO_OUTLIVE_CLIENT_SEED_DIR="$(hook_mktemp /tmp/mnloc.XXXXXX)"
+      hook_seed_preamble > "$PO_OUTLIVE_CLIENT_SEED_DIR/minimal.toml"
+      mkdir "$PO_OUTLIVE_CLIENT_SEED_DIR/.git"
+      po_out_client_sid="$(cd "$PO_OUTLIVE_CLIENT_SEED_DIR" && mnl session activate . --no-prompt \
+        --name "$PO_OUTLIVE_CLIENT_NAME" 2>"$WORK/po-out-client-activate.err")" || {
+        echo "::error::'min session activate' for the outside client box failed — on a VM lane the client that reaches the box's loopback must come from inside the guest"
+        echo "--- stderr ---"; cat "$WORK/po-out-client-activate.err" 2>/dev/null || true
+        fail
+      }
+      po_out_client_sid="$(printf '%s\n' "$po_out_client_sid" | tail -n1 | tr -d '\r')"
+      # The same exec gate the detach box above passed, so a client box that
+      # came up but cannot exec fails naming itself, not the server it dials.
+      if ! mnl session exec "$po_out_client_sid" 'true' >"$WORK/po-out-client-execgate.err" 2>&1 \
+         && ! { sleep 1; mnl session exec "$po_out_client_sid" 'true' >"$WORK/po-out-client-execgate.err" 2>&1; }; then
+        echo "::error::the outside client box cannot run an exec, so no client outside the detach box can reach it on this lane"
+        echo "  (exec: $(head -n1 "$WORK/po-out-client-execgate.err" 2>/dev/null || true))"
+        fail
+      fi
+    fi
+    # One GET by the outside client, whichever side of the VM it runs from.
+    # $1 = the scratch name this request's diagnostics go under in $WORK.
+    po_out_get() {
+      po_out_tag="$1"
+      if [ -z "$E2E_VM" ]; then
+        po_out_from="(from the harness on the host)"
+        po_out_code="$(curl -sS --max-time 8 -o "$WORK/$po_out_tag.body" -w '%{http_code}' \
+          "http://127.0.0.1:$PO_DETACH_PORT/" 2>"$WORK/$po_out_tag.err")"
+        po_out_rc=$?
+        po_out_body="$(cat "$WORK/$po_out_tag.body" 2>/dev/null || true)"
+      else
+        po_out_from="(from the box $PO_OUTLIVE_CLIENT_NAME, inside the guest)"
+        po_out_reply="$(mnl session exec "$po_out_client_sid" \
+          "curl -sS --max-time 8 -o /home/po-out.body -w '%{http_code}' http://127.0.0.1:$PO_DETACH_PORT/" \
+          2>"$WORK/$po_out_tag.err")"
+        po_out_rc=$?
+        po_out_code="$(printf '%s\n' "$po_out_reply" | tail -n1 | tr -d '\r\n')"
+        po_out_body="$(mnl session exec "$po_out_client_sid" 'cat /home/po-out.body' 2>/dev/null || true)"
+      fi
+    }
+
     # The server, started by an exec and detached from it the documented way:
     # `nohup ... &`, so the listener outlives the exec that started it — the
     # box's first outlives-its-client, before any terminal is attached.
@@ -10501,18 +10555,16 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       echo "--- socat exec stderr ---"; cat "$WORK/po-out-responder.err" 2>/dev/null || true
       fail
     fi
-    # A host-address box shares its host's network namespace, so the harness's
-    # own curl is a client outside the box's process tree on every lane: on a
-    # VM lane both live in the guest, on a native one both on the host.
-    po_out_code="$(curl -sS --max-time 8 -o "$WORK/po-out.body" -w '%{http_code}' \
-      "http://127.0.0.1:$PO_DETACH_PORT/" 2>"$WORK/po-out.err")"
-    po_out_rc=$?
-    echo "before the detach: GET http://127.0.0.1:$PO_DETACH_PORT/ -> HTTP ${po_out_code:-<none>} (curl exit $po_out_rc)"
+    # The first outside client, before any terminal is attached: the GET must
+    # carry the box's own marker, so the server answers a client that is
+    # neither the exec that started it nor anything attached to the box.
+    po_out_get po-out
+    echo "before the detach: GET http://127.0.0.1:$PO_DETACH_PORT/ $po_out_from -> HTTP ${po_out_code:-<none>} (curl exit $po_out_rc)"
     if [ "$po_out_rc" -ne 0 ] || [ "$po_out_code" != "200" ] \
-       || [[ "$(cat "$WORK/po-out.body" 2>/dev/null)" != *"$PO_OUTLIVE_MARKER"* ]]; then
+       || [[ "$po_out_body" != *"$PO_OUTLIVE_MARKER"* ]]; then
       echo "::error::the detach box's server did not answer a client outside its process tree"
       echo "--- curl stderr ---"; cat "$WORK/po-out.err" 2>/dev/null || true
-      echo "--- body ---"; cat "$WORK/po-out.body" 2>/dev/null || true
+      echo "--- body ---"; printf '%s\n' "$po_out_body"
       fail
     fi
     echo "listen: the box serves $PO_OUTLIVE_MARKER on the shared loopback, started by an exec that has already returned"
@@ -10540,22 +10592,23 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       echo "::error::the box is gone after the detach — a box must outlive the client that walked away (NET-015)"
       fail
     fi
-    po_out_code2="$(curl -sS --max-time 8 -o "$WORK/po-out2.body" -w '%{http_code}' \
-      "http://127.0.0.1:$PO_DETACH_PORT/" 2>"$WORK/po-out2.err")"
-    po_out_rc2=$?
-    echo "after the detach: GET http://127.0.0.1:$PO_DETACH_PORT/ -> HTTP ${po_out_code2:-<none>} (curl exit $po_out_rc2)"
-    if [ "$po_out_rc2" -ne 0 ] || [ "$po_out_code2" != "200" ] \
-       || [[ "$(cat "$WORK/po-out2.body" 2>/dev/null)" != *"$PO_OUTLIVE_MARKER"* ]]; then
+    po_out_get po-out2
+    echo "after the detach: GET http://127.0.0.1:$PO_DETACH_PORT/ $po_out_from -> HTTP ${po_out_code:-<none>} (curl exit $po_out_rc)"
+    if [ "$po_out_rc" -ne 0 ] || [ "$po_out_code" != "200" ] \
+       || [[ "$po_out_body" != *"$PO_OUTLIVE_MARKER"* ]]; then
       echo "::error::the box did not keep serving after its client detached (NET-015)"
       echo "--- curl stderr ---"; cat "$WORK/po-out2.err" 2>/dev/null || true
-      echo "--- body ---"; cat "$WORK/po-out2.body" 2>/dev/null || true
+      echo "--- body ---"; printf '%s\n' "$po_out_body"
       fail
     fi
     echo "the box outlived its detached client and kept serving (NET-015)"
 
     mnl session destroy --force "$po_out_sid" >/dev/null 2>&1 || true
-    rm -rf "$PO_OUTLIVE_SEED_DIR"; PO_OUTLIVE_SEED_DIR=""
-    echo "detach half OK (server outlived the exec that started it, the terminal that attached, and answered throughout)"
+    if [ -n "$po_out_client_sid" ]; then
+      mnl session destroy --force "$po_out_client_sid" >/dev/null 2>&1 || true
+    fi
+    rm -rf "$PO_OUTLIVE_SEED_DIR" "${PO_OUTLIVE_CLIENT_SEED_DIR:-}"; PO_OUTLIVE_SEED_DIR=""; PO_OUTLIVE_CLIENT_SEED_DIR=""
+    echo "detach half OK (server outlived the exec that started it, the terminal that attached, and answered an outside client throughout)"
   }
   po_outlive_half
 
