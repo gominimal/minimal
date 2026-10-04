@@ -15600,14 +15600,15 @@ proof_two_named_vms_on_one_machine() {
   # 127.0.0.1:<port>`. awk's field compare, not a substring: the VM column
   # is padded, and one VM's name can be a prefix of another's. A listing
   # with only one VM up has no VM column (`HOSTNAME PROXY:  listening on
-  # 127.0.0.1:<port>`); every caller scopes `min ls` with `--vm`, so that
-  # row is the named VM's own.
+  # 127.0.0.1:<port>`); that row is read only when $3 is `scoped` — the
+  # caller listed with `--vm $1`, so the lone row is that VM's own. An
+  # unscoped listing's lone row belongs to whichever VM is up.
   two_vm_ls_proxy_port() {
-    printf '%s\n' "${2:-}" | awk -v vm="$1" \
+    printf '%s\n' "${2:-}" | awk -v vm="$1" -v scoped="${3:-}" \
       '$1 == "HOSTNAME" && $2 == "PROXY:" && $3 == vm && $4 == "listening" {
          sub(/^127\.0\.0\.1:/, "", $6); print $6; exit
        }
-       $1 == "HOSTNAME" && $2 == "PROXY:" && $3 == "listening" {
+       scoped == "scoped" && $1 == "HOSTNAME" && $2 == "PROXY:" && $3 == "listening" {
          sub(/^127\.0\.0\.1:/, "", $5); single = $5
        }
        END { if (single != "") print single }' | head -n1
@@ -16385,7 +16386,7 @@ while True:
   tw_redrawn=""
   for _ in $(seq 1 60); do
     # `--vm`: a bare `min ls` would autospawn the stopped default VM.
-    tw_redrawn="$(two_vm_ls_proxy_port "$tw_name" "$(two_vm_mn ls 2>/dev/null || true)")"
+    tw_redrawn="$(two_vm_ls_proxy_port "$tw_name" "$(two_vm_mn ls 2>/dev/null || true)" scoped)"
     [ -n "$tw_redrawn" ] && break
     sleep 1
   done
