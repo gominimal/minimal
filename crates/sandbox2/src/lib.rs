@@ -397,6 +397,10 @@ pub struct Container {
     /// confined-families one), shared by every container running under that
     /// seal; nothing is leaked per sandbox.
     socket_family_filter: &'static SocketFamilyFilter,
+    /// Whether the launch unshares a fresh network namespace for the box, so
+    /// its pre-exec closure brings that namespace's `lo` up.  A box sharing
+    /// the host's (or VM's) namespace leaves its `lo` alone.
+    fresh_netns: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -455,6 +459,7 @@ impl Container {
             &self.container,
             &mut command,
             self.socket_family_filter,
+            self.fresh_netns,
             sandbox.config.classifier_leaf.clone(),
             sandbox.config.force_cover_fallback,
         )?;
@@ -1158,6 +1163,7 @@ fn install_box_credentials(
     container: &hakoniwa::Container,
     command: &mut hakoniwa::Command,
     socket_family_filter: &'static SocketFamilyFilter,
+    fresh_netns: bool,
     classifier_leaf: Option<config::ClassifierLeaf>,
     force_cover_fallback: bool,
 ) -> Result<(), Error> {
@@ -1204,6 +1210,7 @@ fn install_box_credentials(
                 &program,
                 &args,
                 socket_family_filter,
+                fresh_netns,
                 classifier_join.as_deref(),
                 force_cover_fallback,
                 closure_report.as_deref(),
@@ -1241,14 +1248,34 @@ fn install_box_credentials(
 /// the daemon says so when the report never appears.
 #[cfg(target_os = "linux")]
 fn write_closure_report(report: Option<&Path>, line: &str) {
+    replace_closure_report(report, &format!("{line}\n"));
+}
+
+/// Adds a line to the closure report below whatever it already holds, for a
+/// finding that must not replace the cover line before it: a `lo-down` line
+/// leaves the closure heading for its exec just as a cover line does, so the
+/// daemon reads both.  A later [`write_closure_report`] (a `failed` line)
+/// still replaces everything, which is the line worth reading then.
+#[cfg(target_os = "linux")]
+fn append_closure_report(report: Option<&Path>, line: &str) {
+    let Some(path) = report else { return };
+    let mut content = std::fs::read_to_string(path).unwrap_or_default();
+    content.push_str(line);
+    content.push('\n');
+    replace_closure_report(report, &content);
+}
+
+/// Replaces the closure report with `content` atomically (see
+/// [`write_closure_report`]).
+#[cfg(target_os = "linux")]
+fn replace_closure_report(report: Option<&Path>, content: &str) {
     let Some(report) = report else { return };
     let name = report
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("closure-report");
     let temp = report.with_file_name(format!("{name}.tmp{}", std::process::id()));
-    let written =
-        std::fs::write(&temp, format!("{line}\n")).and_then(|()| std::fs::rename(&temp, report));
+    let written = std::fs::write(&temp, content).and_then(|()| std::fs::rename(&temp, report));
     // A rename that failed leaves the line nowhere — the state the daemon's
     // watch already names — so the temp never lingers either.
     if written.is_err() {
@@ -1287,15 +1314,16 @@ fn set_box_cover_marker(cover: &'static str) {
 /// no provider to do that — so the pre-exec closure does it here, before
 /// the socket-family filter is installed (the `AF_INET` socket the ioctl
 /// needs would be refused by the filter).  Best-effort: a none box whose
-/// `lo` stays down still runs, just without loopback.
+/// `lo` stays down still runs, just without loopback; the caller reports the
+/// error so the daemon can warn.
 #[cfg(target_os = "linux")]
-fn bring_lo_up() {
+fn bring_lo_up() -> std::io::Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     // SAFETY: socket(2) with valid arguments; async-signal-safe.
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     if fd < 0 {
-        return;
+        return Err(std::io::Error::last_os_error());
     }
     // SAFETY: fd is a fresh, valid, owned socket fd.
     let sock = unsafe { OwnedFd::from_raw_fd(fd) };
@@ -1328,17 +1356,21 @@ fn bring_lo_up() {
         )
     } < 0
     {
-        return;
+        return Err(std::io::Error::last_os_error());
     }
     flags.flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
     // SAFETY: fd open; ifreq sized for the flags ioctls.
-    unsafe {
+    if unsafe {
         libc::ioctl(
             fd,
             libc::SIOCSIFFLAGS as _,
             std::ptr::from_mut(&mut flags).cast::<libc::c_void>(),
-        );
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
     }
+    Ok(())
 }
 
 /// The body of the launch closure in [`install_box_credentials`]: place the
@@ -1355,6 +1387,7 @@ fn exec_box_program(
     program: &str,
     args: &[String],
     socket_family_filter: &'static SocketFamilyFilter,
+    fresh_netns: bool,
     classifier_join: Option<&Path>,
     force_cover_fallback: bool,
     closure_report: Option<&Path>,
@@ -1461,9 +1494,17 @@ fn exec_box_program(
     // Bring loopback up before taking the box credentials: the ioctl needs
     // CAP_NET_ADMIN, which `assume_box_credentials` drops from the bounding
     // set.  A none box has no provider to do this from outside; the networked
-    // path does it in `switch.rs:207`.  Best-effort: a box whose lo stays
-    // down still runs, just without loopback.
-    bring_lo_up();
+    // path does it in `switch.rs:207`.  Only in a fresh namespace of the
+    // box's own: a box sharing the host's (or VM's) leaves that `lo` alone.
+    // Best-effort: a box whose lo stays down still runs, just without
+    // loopback, and the failure is appended to the closure report, which
+    // the daemon logs at warn.
+    if fresh_netns && let Err(e) = bring_lo_up() {
+        append_closure_report(
+            closure_report,
+            &format!("lo-down errno {}", e.raw_os_error().unwrap_or(0)),
+        );
+    }
     // SAFETY: `assume_box_credentials` is async-signal-safe; this is the
     // pre-exec moment it is for, with the namespace built and CAP_SETPCAP in
     // it still held.
@@ -1859,7 +1900,11 @@ impl<C: Channel> Sandbox<C> {
         // so a process in any box could still reach the host over vsock.  The
         // seal is an allowlist: the `none` plan's seal admits the families its
         // own network namespace confines (unix, inet, inet6, netlink), so the
-        // box can use its own loopback, and every other plan's seal adds
+        // box can use its own loopback — but only when `isolate` says this
+        // launch unshares that namespace (hakoniwa fails the spawn if the
+        // unshare fails), and AF_UNIX alone otherwise, so a none box never
+        // holds inet sockets in a namespace that is not its own
+        // (`SocketSeal::in_netns`).  Every other plan's seal adds
         // AF_PACKET (refused by the missing CAP_NET_RAW no box holds, per
         // NET-083, not by this filter).  A family that reaches past the
         // namespace is refused in every box.  The filter is installed in the
@@ -1871,7 +1916,7 @@ impl<C: Channel> Sandbox<C> {
         // ABI, or x32, dies with SIGSYS on its first syscall.
         #[cfg(target_os = "linux")]
         let socket_family_filter = {
-            let filter = socket_family_filter_for_plan(plan);
+            let filter = socket_family_filter_for_plan(plan, isolate);
             tracing::info!(
                 network_plan = %plan,
                 socket_seal = %filter.seal,
@@ -2088,6 +2133,7 @@ impl<C: Channel> Sandbox<C> {
         Ok(Container {
             container,
             socket_family_filter,
+            fresh_netns: isolate,
         })
     }
 
@@ -2873,6 +2919,7 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
             libc::AF_INET6 as u32,
             libc::AF_NETLINK as u32,
         ],
+        network::SocketSeal::UnixOnly => &[libc::AF_UNIX as u32],
         network::SocketSeal::ConfinedFamilies => &[
             libc::AF_UNIX as u32,
             libc::AF_INET as u32,
@@ -3011,6 +3058,7 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
         seal,
         refused_families: match seal {
             network::SocketSeal::Full => "every family but unix, inet, inet6, netlink",
+            network::SocketSeal::UnixOnly => "every family but unix",
             network::SocketSeal::ConfinedFamilies => {
                 "every family but unix, inet, inet6, netlink, packet"
             }
@@ -3082,15 +3130,39 @@ pub fn socket_family_filter_for_confined_families() -> &'static SocketFamilyFilt
     FILTER.get_or_init(|| build_socket_family_filter(network::SocketSeal::ConfinedFamilies))
 }
 
-/// The socket-family filter a box runs under, decided by its plan: the full
-/// `none` seal for [`NetPlan::none`], the confined-families seal for every
-/// other plan.
+/// Returns a pointer to the built-in unix-only socket-family filter: it
+/// admits `AF_UNIX` alone and refuses everything else with `EAFNOSUPPORT`.
+/// The fail-closed seal a `none` box runs under wherever it is not in a
+/// fresh network namespace of its own (see [`SocketSeal::in_netns`]).
 #[cfg(target_os = "linux")]
-fn socket_family_filter_for_plan(plan: &network::NetPlan) -> &'static SocketFamilyFilter {
-    match plan.seal() {
+#[must_use]
+pub fn socket_family_filter_for_unix_only() -> &'static SocketFamilyFilter {
+    static FILTER: std::sync::OnceLock<SocketFamilyFilter> = std::sync::OnceLock::new();
+    FILTER.get_or_init(|| build_socket_family_filter(network::SocketSeal::UnixOnly))
+}
+
+/// Returns a pointer to the built-in socket-family filter for `seal`.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn socket_family_filter_for_seal(seal: network::SocketSeal) -> &'static SocketFamilyFilter {
+    match seal {
         network::SocketSeal::Full => socket_family_filter_for_none_box(),
+        network::SocketSeal::UnixOnly => socket_family_filter_for_unix_only(),
         network::SocketSeal::ConfinedFamilies => socket_family_filter_for_confined_families(),
     }
+}
+
+/// The socket-family filter a box runs under, decided by its plan and by
+/// whether the launch unshares a fresh network namespace for it: the full
+/// `none` seal for [`NetPlan::none`] in that namespace, the unix-only seal
+/// for a `none` plan without one (fail closed, [`SocketSeal::in_netns`]),
+/// and the confined-families seal for every other plan.
+#[cfg(target_os = "linux")]
+fn socket_family_filter_for_plan(
+    plan: &network::NetPlan,
+    fresh_netns: bool,
+) -> &'static SocketFamilyFilter {
+    socket_family_filter_for_seal(plan.seal().in_netns(fresh_netns))
 }
 
 /// Puts the plan's resolver into `<rootfs>/etc/resolv.conf`. The host's is
@@ -4096,6 +4168,88 @@ ff02::2\tip6-allrouters
         );
     }
 
+    /// The fail-closed gate on the none seal: it admits inet and netlink only
+    /// because the box's own fresh network namespace confines them, so
+    /// wherever the box is not in one it falls back to `AF_UNIX` alone, and
+    /// no other seal moves.
+    #[test]
+    fn none_seal_relaxes_only_inside_a_fresh_netns() {
+        use network::SocketSeal;
+        assert_eq!(SocketSeal::Full.in_netns(true), SocketSeal::Full);
+        assert_eq!(
+            SocketSeal::Full.in_netns(false),
+            SocketSeal::UnixOnly,
+            "a none box outside a fresh netns must keep the unix-only seal"
+        );
+        for fresh in [true, false] {
+            assert_eq!(
+                SocketSeal::ConfinedFamilies.in_netns(fresh),
+                SocketSeal::ConfinedFamilies
+            );
+            assert_eq!(SocketSeal::UnixOnly.in_netns(fresh), SocketSeal::UnixOnly);
+        }
+        assert_eq!(SocketSeal::UnixOnly.to_string(), "unix-only");
+    }
+
+    /// The gate as the launch applies it: the filter a none plan gets with
+    /// no fresh netns refuses inet, inet6 and netlink and admits unix alone;
+    /// inside one, the relaxed none seal admits them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn none_plan_without_fresh_netns_gets_the_unix_only_filter() {
+        let plan = network::NetPlan::none();
+        let refuse = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
+
+        let gated = socket_family_filter_for_plan(&plan, false);
+        assert_eq!(gated.seal, network::SocketSeal::UnixOnly);
+        assert_eq!(gated.refused_families, "every family but unix");
+        let run = |family: i32| {
+            run_seccomp_program(
+                &gated.program,
+                libc::SYS_socket as u32,
+                AUDIT_ARCH,
+                family as u32,
+            )
+        };
+        assert_eq!(run(libc::AF_UNIX), libc::SECCOMP_RET_ALLOW);
+        for family in [
+            libc::AF_INET,
+            libc::AF_INET6,
+            libc::AF_NETLINK,
+            libc::AF_VSOCK,
+        ] {
+            assert_eq!(
+                run(family),
+                refuse,
+                "family {family} must be refused outside a fresh netns"
+            );
+        }
+
+        let relaxed = socket_family_filter_for_plan(&plan, true);
+        assert_eq!(relaxed.seal, network::SocketSeal::Full);
+        let run = |family: i32| {
+            run_seccomp_program(
+                &relaxed.program,
+                libc::SYS_socket as u32,
+                AUDIT_ARCH,
+                family as u32,
+            )
+        };
+        for family in [
+            libc::AF_UNIX,
+            libc::AF_INET,
+            libc::AF_INET6,
+            libc::AF_NETLINK,
+        ] {
+            assert_eq!(
+                run(family),
+                libc::SECCOMP_RET_ALLOW,
+                "family {family} must be admitted inside the box's fresh netns"
+            );
+        }
+        assert_eq!(run(libc::AF_VSOCK), refuse);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn none_plan_refuses_vsock_family() {
@@ -4317,7 +4471,7 @@ ff02::2\tip6-allrouters
         for (name, plan, seal) in plans {
             assert_eq!(plan.to_string(), name, "the plan under test");
             assert_eq!(plan.seal(), seal, "plan {name} must run under its seal");
-            let filter = socket_family_filter_for_plan(&plan);
+            let filter = socket_family_filter_for_plan(&plan, plan.isolates_netns());
             assert_eq!(
                 filter.seal, seal,
                 "plan {name}: the seal selects the filter"

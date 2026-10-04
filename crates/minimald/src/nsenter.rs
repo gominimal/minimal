@@ -425,7 +425,10 @@ impl Injection {
     /// Mark this injection as entering a none box, so the shim reinstalls the
     /// none plan's full socket-family seal — every family but the ones the
     /// box's own network namespace confines (`AF_UNIX`, `AF_INET`,
-    /// `AF_INET6`, `AF_NETLINK`) — after joining the namespaces.
+    /// `AF_INET6`, `AF_NETLINK`) — after joining the namespaces.  That seal
+    /// applies only when the injection joins the box's own network namespace;
+    /// one that does not falls back to `AF_UNIX` alone
+    /// ([`injection_socket_filter`]).
     ///
     /// Every injection is sealed: without this marker the shim reinstalls the
     /// confined-families seal, the one every networked box launches under,
@@ -513,11 +516,7 @@ impl Injection {
         // restated here, so the log names exactly what the shim installs; the
         // shim itself has no tracing subscriber — it is the daemon re-exec'd
         // before its runtime is built.
-        let seal = if self.seal_none_box {
-            sandbox2::socket_family_filter_for_none_box().seal
-        } else {
-            sandbox2::socket_family_filter_for_confined_families().seal
-        };
+        let seal = injection_socket_filter(self.seal_none_box, &namespaces).seal;
         tracing::debug!(
             leader_pid = self.leader_pid,
             program = %self.program.to_string_lossy(),
@@ -584,8 +583,9 @@ pub struct ShimArgs {
     chdir: Option<PathBuf>,
 
     /// When present, the target session is a none box and the shim must
-    /// re-install its full socket-family seal — every family but `AF_UNIX` —
-    /// after joining the namespaces. When absent the shim re-installs the
+    /// re-install its full socket-family seal after joining the namespaces —
+    /// unix, inet, inet6 and netlink admitted when the join enters the box's
+    /// own network namespace, `AF_UNIX` alone when it does not. When absent the shim re-installs the
     /// confined-families seal, the one every other box launches under, which
     /// admits the families the box's namespace confines and refuses the
     /// rest.  Either way the filter is inherited by children of the filtered
@@ -710,13 +710,10 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     // Resolved here, before the fork: building the filter allocates, and the
     // first `OnceLock` access is what builds it. Only the `&'static` result
     // crosses into the child. Every injection is sealed — the none box's
-    // full seal, or the confined-families seal every other box launches
+    // full seal (unix-only unless the join entered the box's own network
+    // namespace), or the confined-families seal every other box launches
     // under.
-    let socket_family_filter = if args.seal_none_box {
-        sandbox2::socket_family_filter_for_none_box()
-    } else {
-        sandbox2::socket_family_filter_for_confined_families()
-    };
+    let socket_family_filter = injection_socket_filter(args.seal_none_box, &args.join);
 
     // SAFETY: the closures run in the forked child between `fork` and `exec`,
     // where only async-signal-safe calls are legal. `prctl` and the raw
@@ -791,9 +788,54 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
         .unwrap_or(1))
 }
 
+/// The socket-family filter an injected process installs after joining a
+/// box.  A none box's relaxed seal admits inet and netlink only because the
+/// box's own network namespace confines them, so it applies only when the
+/// join enters that namespace (`join` names `Net`); an injection that stays
+/// in the daemon's namespace gets the unix-only seal instead, fail closed
+/// ([`sandbox2::SocketSeal::in_netns`]).
+fn injection_socket_filter(
+    seal_none_box: bool,
+    join: &[Namespace],
+) -> &'static sandbox2::SocketFamilyFilter {
+    if seal_none_box {
+        let joins_box_netns = join.contains(&Namespace::Net);
+        sandbox2::socket_family_filter_for_seal(
+            sandbox2::SocketSeal::Full.in_netns(joins_box_netns),
+        )
+    } else {
+        sandbox2::socket_family_filter_for_confined_families()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fail-closed gate on the injection path: a none-box injection
+    /// gets the relaxed none seal only when it joins the box's network
+    /// namespace, and the unix-only seal when the join set leaves `Net` out.
+    #[test]
+    fn none_injection_relaxes_only_when_joining_the_box_netns() {
+        use sandbox2::SocketSeal;
+        let with_net = [Namespace::User, Namespace::Mnt, Namespace::Net];
+        let without_net = [Namespace::User, Namespace::Mnt];
+        assert_eq!(
+            injection_socket_filter(true, &with_net).seal,
+            SocketSeal::Full
+        );
+        assert_eq!(
+            injection_socket_filter(true, &without_net).seal,
+            SocketSeal::UnixOnly,
+            "a none-box injection outside the box's netns must keep the unix-only seal"
+        );
+        for join in [&with_net[..], &without_net[..]] {
+            assert_eq!(
+                injection_socket_filter(false, join).seal,
+                SocketSeal::ConfinedFamilies
+            );
+        }
+    }
 
     /// A process whose only child is known: `sh` prints the PID of the
     /// background `sleep` it forked, so the expected answer arrives on stdout

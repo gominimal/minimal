@@ -2293,6 +2293,11 @@ fn a_failed_closure_line_settles_the_boxs_fate_a_cover_line_does_not() {
          so the fate is known and the tree is owed its removal"
     );
     assert!(
+        !super::say_closure_line("lo-down errno 1", "a session"),
+        "a box whose loopback stayed down still heads for its exec — the \
+         warn is the whole of it"
+    );
+    assert!(
         !super::say_closure_line("a line this daemon does not read", "a session"),
         "an unknown line settles nothing: the watch owes the file to the end \
          of its window"
@@ -2347,6 +2352,31 @@ async fn the_closure_report_is_removed_only_once_the_boxs_fate_is_known() {
         !covered.exists(),
         "the watch's window is the fate known by default: the removal is \
          owed at the end of it, and only then"
+    );
+}
+
+/// The closure report is read line by line: a `lo-down` line the closure
+/// appended below its cover line is said in its own right, and a terminal
+/// line behind it still settles the box's fate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_line_of_a_multi_line_closure_report_is_read() {
+    let dir = tempfile::tempdir().expect("a temp dir for the closure report");
+    let report = dir.path().join("a-closure-with-two-findings");
+    std::fs::write(
+        &report,
+        "cover cgroup2\nlo-down errno 1\nfailed exec /bin/sh errno 2\n",
+    )
+    .expect("the closure's lines");
+    super::report_box_closure(
+        report.clone(),
+        "a session".to_string(),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        !report.exists(),
+        "the failed line on the report's last line settles the fate on the \
+         first read, which only a line-by-line read reaches"
     );
 }
 
