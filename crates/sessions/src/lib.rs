@@ -647,6 +647,8 @@ fn is_valid_dns_host(s: &str) -> bool {
 /// bits set. `10.0.0.1/8` normalizes to `10.0.0.0/8`; `10.0.0.0/8` is
 /// already normalized and yields `None`, so callers can print a notice only
 /// when the user's string is read as a different network than they wrote.
+/// IPv6 prefixes also yield `None`: the egress rules compile only IPv4
+/// subnets, so an IPv6 entry is never read as any network.
 #[must_use]
 pub fn normalized_cidr(s: &str) -> Option<String> {
     let (addr, prefix) = s.split_once('/')?;
@@ -668,21 +670,7 @@ pub fn normalized_cidr(s: &str) -> Option<String> {
             }
             std::net::IpAddr::V4(std::net::Ipv4Addr::from(masked))
         }
-        std::net::IpAddr::V6(v6) => {
-            if prefix > 128 {
-                return None;
-            }
-            let mask = if prefix == 0 {
-                0
-            } else {
-                u128::MAX << (128 - prefix)
-            };
-            let masked = u128::from(v6) & mask;
-            if masked == u128::from(v6) {
-                return None;
-            }
-            std::net::IpAddr::V6(std::net::Ipv6Addr::from(masked))
-        }
+        std::net::IpAddr::V6(_) => return None,
     };
     Some(format!("{normalized}/{prefix}"))
 }
@@ -1585,7 +1573,7 @@ mod tests {
             Some("10.0.0.0/8".to_string())
         );
         assert_eq!(normalized_cidr("10.0.0.0/8"), None);
-        assert_eq!(normalized_cidr("fd00::1/8"), Some("fd00::/8".to_string()));
+        assert_eq!(normalized_cidr("fd00::1/8"), None);
         assert_eq!(normalized_cidr("fd00::/8"), None);
         assert_eq!(normalized_cidr("not-a-cidr"), None);
     }
