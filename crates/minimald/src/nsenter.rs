@@ -261,16 +261,6 @@ pub enum NsenterError {
         source: std::io::Error,
     },
 
-    /// The injected program could not be started. `ENOMEM` from the fork means
-    /// the sandbox's PID namespace has no live init left to reparent to — the
-    /// session shell exited while we were joining.
-    #[error("spawning {program:?} inside the session")]
-    Spawn {
-        program: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
     /// The shim could not reap the process it started.
     #[error("waiting for {program:?} inside the session")]
     Wait {
@@ -623,8 +613,9 @@ pub struct ShimArgs {
 ///
 /// [`NsenterError::JoinDenyLeaf`] if the box is deny-all and its classifier
 /// leaf cannot be joined, [`NsenterError::Setns`] if the namespaces cannot be
-/// joined, and [`NsenterError::Spawn`] if the program cannot be started inside
-/// them.
+/// joined, and [`NsenterError::Wait`] if the started program cannot be reaped.
+/// A program that cannot be started is reported on stderr and returned as the
+/// shell's exit code (127/126) rather than as an error.
 pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     // SAFETY: `command_in_session` placed a pidfd on this descriptor and it
     // survived the exec; nothing else in this freshly-exec'd process owns it.
@@ -771,10 +762,14 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     }
 
     let program = PathBuf::from(program);
-    let mut child = cmd.spawn().map_err(|source| NsenterError::Spawn {
-        program: program.clone(),
-        source,
-    })?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(source) => {
+            let (code, msg) = spawn_failure_code_and_message(&source);
+            eprintln!("{program}: {msg}", program = program.display());
+            return Ok(code);
+        }
+    };
     let status = child.wait().map_err(|source| NsenterError::Wait {
         program: program.clone(),
         source,
@@ -786,6 +781,21 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
         .code()
         .or_else(|| status.signal().map(|sig| 128 + sig))
         .unwrap_or(1))
+}
+
+/// Maps a failed `spawn` to the shell's exit-code and message conventions:
+/// `ENOENT` is "command not found" (127), `EACCES` is "permission denied"
+/// (126), and anything else — `ENOEXEC` included — is "cannot execute" (126).
+///
+/// The message is the plain text a shell would print, without the debug
+/// wrapper `main` adds to [`NsenterError`] — a script must be able to tell
+/// "not found" from the command's own failure.
+fn spawn_failure_code_and_message(source: &std::io::Error) -> (i32, String) {
+    match source.kind() {
+        std::io::ErrorKind::NotFound => (127, "command not found".to_string()),
+        std::io::ErrorKind::PermissionDenied => (126, "permission denied".to_string()),
+        _ => (126, format!("cannot execute: {source}")),
+    }
 }
 
 /// The socket-family filter an injected process installs after joining a
@@ -811,6 +821,33 @@ fn injection_socket_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed spawn maps to the shell's exit-code and message conventions:
+    /// `ENOENT` is "command not found" (127), `EACCES` is "permission denied"
+    /// (126), and anything else — `ENOEXEC` included — is "cannot execute"
+    /// (126).
+    #[test]
+    fn spawn_failures_map_to_shell_exit_codes_and_messages() {
+        let not_found = std::io::Error::from_raw_os_error(libc::ENOENT);
+        let (code, msg) = spawn_failure_code_and_message(&not_found);
+        assert_eq!(code, 127);
+        assert_eq!(msg, "command not found");
+
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
+        let (code, msg) = spawn_failure_code_and_message(&denied);
+        assert_eq!(code, 126);
+        assert_eq!(msg, "permission denied");
+
+        let no_exec = std::io::Error::from_raw_os_error(libc::ENOEXEC);
+        let (code, msg) = spawn_failure_code_and_message(&no_exec);
+        assert_eq!(code, 126);
+        assert!(msg.starts_with("cannot execute: "), "got {msg:?}");
+
+        let other = std::io::Error::from_raw_os_error(libc::ENOMEM);
+        let (code, msg) = spawn_failure_code_and_message(&other);
+        assert_eq!(code, 126);
+        assert!(msg.starts_with("cannot execute: "), "got {msg:?}");
+    }
 
     /// The fail-closed gate on the injection path: a none-box injection
     /// gets the relaxed none seal only when it joins the box's network
