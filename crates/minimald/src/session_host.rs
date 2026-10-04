@@ -3454,19 +3454,17 @@ async fn create_session_leaf(
             }
             // One info line per host-address box launch naming its classifier
             // identity (NET-079's observability): the subtree its declaration
-            // picked, and the leaf that verdict placed it in. The outcome
-            // the launch records is the record line's to carry — it is
-            // session-attributed and spells `per_box` for every placement,
-            // while this line says where the leaf is; what this line adds
-            // is whether this host can decide per box, the fresh fact this
-            // launch's probe just read from the table's effect, which the
-            // prose below names for the box a placement put in a leaf
-            // whose table is not deciding.
+            // picked, the leaf that verdict placed it in, and whether this
+            // host can decide per box — the fresh fact this launch's probe
+            // just read from the table's effect. A leaf placed on a host
+            // whose table is not loaded decides nothing while looking
+            // decided, so the line never says `per_box` for one.
             if can_decide_per_box {
                 tracing::info!(
                     session = session_name,
                     classifier = verdict.dir_name(),
                     leaf = %leaf.display(),
+                    host_ip_enforcement = %HostIpEnforcement::PerBox.machine_str(),
                     "the host-address box's egress verdict is decided on its \
                      classifier leaf, in the {} subtree",
                     verdict.dir_name()
@@ -3476,6 +3474,7 @@ async fn create_session_leaf(
                     session = session_name,
                     classifier = verdict.dir_name(),
                     leaf = %leaf.display(),
+                    host_ip_enforcement = %HostIpEnforcement::None.machine_str(),
                     "the host-address box's leaf is placed in the {} subtree, \
                      but this host's classifier table is not loaded, so its \
                      egress verdict is not decided per box",
