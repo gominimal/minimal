@@ -5608,6 +5608,10 @@ pub(crate) mod tests {
     async fn dropped_frame_to_the_literal_still_notices() {
         let capture = crate::test_harness::captured_log();
         let alias = SwitchSubnet::default().host_alias();
+        // A lease no other test uses: under libtest every test shares the
+        // captured log, and other relays at [`LEASE`] reach for the literal
+        // too, so only a lease of this test's own ties the line to its frame.
+        let lease = Ipv4Addr::new(100, 64, 0, 77);
         // Deny-all: the frame to the literal is dropped by the verdict, so
         // only the notice (and the ARP sentinel behind it) is observable.
         let deny_all = sessions::SessionPolicy {
@@ -5620,10 +5624,10 @@ pub(crate) mod tests {
             ingress: None,
             credentialed_upstream: None,
         };
-        let mut harness = spawn_test_relay(&deny_all);
+        let mut harness = spawn_relay_for(lease, Some(&deny_all), |_| {});
 
-        let to_literal = egress_tcp_frame(LEASE, alias, 80);
-        let sentinel = arp_frame(LEASE);
+        let to_literal = egress_tcp_frame(lease, alias, 80);
+        let sentinel = arp_frame(lease);
         harness.box_end.write_all(&to_literal).unwrap();
         harness.box_end.write_all(&sentinel).unwrap();
         let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
@@ -5643,7 +5647,7 @@ pub(crate) mod tests {
             "a dropped frame to the literal still notices: {logged}"
         );
         for expected in [
-            "session=100.64.0.9",
+            "session=100.64.0.77",
             "deprecated=100.64.255.254",
             "replacement=\"host.min.internal\"",
         ] {
