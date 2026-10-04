@@ -2352,7 +2352,7 @@ fn published_inside(body: &[u8]) -> Option<u16> {
 /// `None` for a body that does not parse or a protocol the client does not
 /// spell — one the decision already refused, which is never applied.
 fn published_protocol(body: &[u8]) -> Option<u8> {
-    let protocol = serde_json_lenient::from_slice::<UnexposeBody>(body)
+    let protocol = serde_json_lenient::from_slice::<ExposeBody>(body)
         .ok()?
         .protocol;
     match protocol.as_str() {
