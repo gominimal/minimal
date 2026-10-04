@@ -998,12 +998,12 @@ pub(crate) async fn activate_session(
     // for this same create, and the start all say the same thing. The
     // advisory names the cause, the state it leaves the box in, and, when
     // the missing privileged step is the cause, the exact command that
-    // installs it; it is never a prompt (see
-    // [`write_classifier_advisory`]). Printed after the session exists
-    // and before the work on it, like the notice below it, so a host that
-    // cannot decide per box is named at the start that runs there and not
-    // only in a log the person was not reading.
-    write_classifier_advisory(&mut std::io::stderr(), &created)?;
+    // installs it; it is never a prompt, and never load-bearing for the
+    // start either (see [`print_classifier_advisory`]). Printed after the
+    // session exists and before the work on it, like the notice below it,
+    // so a host that cannot decide per box is named at the start that
+    // runs there and not only in a log the person was not reading.
+    print_classifier_advisory(&mut std::io::stderr(), &created);
 
     // The coming-change notice (NET-076), printed while the deny-all egress
     // default is announced but not yet in force. Scoped to the box it would
@@ -1916,6 +1916,26 @@ pub fn write_classifier_advisory(
         writeln!(out, "{advisory}")?;
     }
     Ok(())
+}
+
+/// [`write_classifier_advisory`] as the start drives it: the render over
+/// the person's own stderr, best-effort. The advisory qualifies a session
+/// the daemon has already created — it never gates one — so a note that
+/// cannot print must not fail the activation that carried it: a stderr
+/// closed by the person running the start, or a reader gone before the
+/// note landed (the broken pipe `min version | head -1` taught this CLI
+/// to expect), is the person's pipe to manage, and the write's error is
+/// logged and left, never propagated — the activation goes on to the
+/// session's work the way it already does for a reply that carries no
+/// advisory at all. Logged at `debug`, because a person whose stderr
+/// cannot take the note cannot read a louder line about it either.
+pub fn print_classifier_advisory(
+    out: &mut impl std::io::Write,
+    created: &minimald_rpc::CreateSessionResponse,
+) {
+    if let Err(error) = write_classifier_advisory(out, created) {
+        tracing::debug!(%error, "the classifier advisory did not print");
+    }
 }
 
 /// Render a session's effective policy as its rules: the egress the gate
@@ -3040,7 +3060,9 @@ mod tests {
                  per box: the classifier's privileged step is not installed on this \
                  host. While it cannot, its host-address boxes run unenforced — \
                  whatever the boxes' declarations say. Install the classifier's \
-                 privileged step with:\n  sudo scripts/install-host-classifier.sh \
+                 privileged step with:\n  run: curl -fsSLO \
+                 https://raw.githubusercontent.com/gominimal/minimal/main/scripts/\
+                 install-host-classifier.sh && sudo bash ./install-host-classifier.sh \
                  --user runner --cohort-address 10.0.0.0/16 --node-plane-address \
                  10.0.1.0/24",
             ),
@@ -3061,8 +3083,10 @@ mod tests {
         );
         assert!(
             rendered.ends_with(
-                "  sudo scripts/install-host-classifier.sh --user runner \
-                 --cohort-address 10.0.0.0/16 --node-plane-address 10.0.1.0/24\n"
+                "  run: curl -fsSLO https://raw.githubusercontent.com/gominimal/\
+                 minimal/main/scripts/install-host-classifier.sh && sudo bash \
+                 ./install-host-classifier.sh --user runner --cohort-address \
+                 10.0.0.0/16 --node-plane-address 10.0.1.0/24\n"
             ),
             "the missing privileged step is the cause, so the render carries \
              the exact command that installs it, on the last line with \
@@ -3127,6 +3151,57 @@ mod tests {
              start prints none, got: {:?}",
             String::from_utf8_lossy(&out)
         );
+    }
+
+    /// A writer whose reader has gone away, as a piped stderr whose tool
+    /// exited — or a closed one (`2>&-`) — leaves the start's stderr: the
+    /// broken pipe `min version | head -1` taught this CLI to expect.
+    struct ClosedPipe;
+
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// NET-079: the advisory's print is best-effort, never load-bearing.
+    /// The note qualifies a session the daemon has already created — it
+    /// never gates one — so a start whose stderr cannot take it goes on
+    /// to the session's work instead of failing over a line it could not
+    /// say. The `?` this replaced made the note's own write failure the
+    /// activation's error, after the create it follows had already made
+    /// the session.
+    #[test]
+    fn classifier_advisory_print_is_best_effort() {
+        let step_missing = create_reply(
+            Some(
+                "note: this host cannot decide a host-address box's egress verdict \
+                 per box: the classifier's privileged step is not installed on this \
+                 host. While it cannot, its host-address boxes run unenforced.",
+            ),
+            Some("none"),
+        );
+
+        // A writer that takes the note gets the render's own bytes — the
+        // delegation is the whole print, so the start's line is the one the
+        // tests above pinned.
+        let mut printed = Vec::new();
+        print_classifier_advisory(&mut printed, &step_missing);
+        let mut rendered = Vec::new();
+        write_classifier_advisory(&mut rendered, &step_missing).unwrap();
+        assert_eq!(
+            printed, rendered,
+            "the print must carry exactly the bytes the render writes"
+        );
+
+        // A writer whose reader is gone is logged and left: the print
+        // returns — no panic, no error for the start to fail on — the same
+        // way a reply that carries no advisory prints nothing and goes on.
+        print_classifier_advisory(&mut ClosedPipe, &step_missing);
     }
 
     /// NET-044: the ports a box published at runtime are listed beside the
