@@ -16316,8 +16316,34 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
     minvmd status --json 2>&1 || true
     fail
   fi
+  # Which VM drew 7654 depends on boot order — the named VM can hold it
+  # while the default VM serves on another port — and a stopped VM's
+  # forwarder releases its port a moment after the stop returns. Wait for
+  # the port itself to be bindable rather than trust either VM's state.
+  # Both binds set SO_REUSEADDR: the proxy served on the port seconds ago,
+  # and its TIME_WAIT connections would refuse a plain bind on Linux for up
+  # to a minute, while a live listener still refuses this one.
+  tw_free=""
+  for _ in $(seq 1 60); do
+    if python3 -c 'import socket,sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(1)' "$tw_held" 2>/dev/null; then
+      tw_free=1
+      break
+    fi
+    sleep 1
+  done
+  if [ -z "$tw_free" ]; then
+    echo "::error::127.0.0.1:$tw_held stayed busy for 60 s after both VMs stopped — the held-port beats need it free of minimal; its holder:"
+    { ss -ltnp 2>/dev/null || lsof -nP -iTCP:"$tw_held" -sTCP:LISTEN 2>/dev/null; } \
+      | grep -F -- ":$tw_held" || true
+    fail
+  fi
   python3 -c 'import socket,sys,time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", int(sys.argv[1])))
 s.listen(1)
 print("held", flush=True)
