@@ -7136,6 +7136,47 @@ proof_box_name_resolves_natively_without_proxy() {
 # Every host change — the units, the program copy, the channel socket, the
 # resolver link (Linux) or file (macOS), the second node — is undone here
 # and again by the EXIT trap, so the shared runner is left as found.
+# Makes the min-answerer program findable for this run: beside `min` or on
+# PATH already, or built by `just answerer-build` (else that recipe's own
+# cargo line) and staged on PATH. A lane that can do neither fails: the
+# case must prove the handover there, never record it as not run.
+asr_answerer_ready() {
+  local min_dir built
+  min_dir="$(dirname -- "$(command -v min)")"
+  if [ -x "$min_dir/min-answerer" ]; then
+    echo "min-answerer: beside min at $min_dir/min-answerer"
+    return 0
+  fi
+  if command -v min-answerer >/dev/null 2>&1; then
+    echo "min-answerer: on PATH at $(command -v min-answerer)"
+    return 0
+  fi
+  echo "min-answerer is not beside min or on PATH; building it (just answerer-build)"
+  if command -v just >/dev/null 2>&1; then
+    (cd "$ROOT" && just answerer-build) >"$WORK/answerer-build.log" 2>&1 || {
+      echo "::error::'just answerer-build' failed"; tail -20 "$WORK/answerer-build.log"; fail; }
+  elif command -v cargo >/dev/null 2>&1; then
+    (cd "$ROOT" && cargo build -p min-answerer --locked) >"$WORK/answerer-build.log" 2>&1 || {
+      echo "::error::'cargo build -p min-answerer --locked' failed"; tail -20 "$WORK/answerer-build.log"; fail; }
+  else
+    echo "::error::this lane has no min-answerer and neither just nor cargo to build it; the handover cannot be proved"
+    fail
+  fi
+  built="${CARGO_TARGET_DIR:-$ROOT/target}/debug/min-answerer"
+  if [ ! -x "$built" ]; then
+    echo "::error::the answerer build left no program at $built"
+    fail
+  fi
+  # Staged alone: target/debug also holds a min and a minvmd this run must
+  # not pick up in place of the lane's own.
+  mkdir -p "$WORK/answerer-bin"
+  cp "$built" "$WORK/answerer-bin/min-answerer"
+  # shellcheck disable=SC2031 # other proofs change PATH in their own subshells; this runs in the main shell
+  PATH="$WORK/answerer-bin:$PATH"
+  export PATH
+  echo "min-answerer: built and staged at $WORK/answerer-bin/min-answerer"
+}
+
 proof_answerer_survives_session_stop() {
   if [ -z "$E2E_VM" ]; then
     echo "answerer survives session stop SKIPPED (native lane: the answerer host service is a VM-backed host's, and a native daemon's advisory omits the step)"
@@ -7321,6 +7362,13 @@ for row in json.load(open(sys.argv[1])):
     fail
   }
 
+  # The advisory's command copies the min-answerer program found beside
+  # min or on PATH; a lane whose testbed carries only min and minvmd has
+  # none, and its advisory then omits the step. Build it here, through
+  # `just answerer-build` — its own invocation, never beside -p minvmd (the
+  # libkrun feature would unify in) — or that recipe's exact cargo line
+  # where just is absent, and put it on PATH for this run.
+  asr_answerer_ready
   ASR_SEED_DIR="$(hook_mktemp /tmp/mnlasr.XXXXXX)"
   hook_seed_preamble > "$ASR_SEED_DIR/minimal.toml"
   mkdir "$ASR_SEED_DIR/.git"
@@ -7351,6 +7399,48 @@ for row in json.load(open(sys.argv[1])):
     echo "::error::node A's zone dump holds no live row for e2e-asr-a.min.internal"
     fail
   fi
+  asr_expect_a e2e-asr-a.min.internal "$asr_a_ip"
+
+  # ---- 1b. node B, another state dir, publishes into A's interim ---------
+  # The interim channel is the operator's, whatever the state dir (NET-081:
+  # a second helper writes into it over the same channel instead of
+  # binding), so node B finds A's interim and publishes there: no
+  # collision on the hook port, and its box is handed its address by A's
+  # interim from the one book.
+  local asr_b_sid asr_b_err="$WORK/asr-b-activate.err" asr_b_ip
+  asr_b_sid="$(asr_activate mnl2 e2e-asr-b "$asr_b_err")" || fail
+  if ! asr_wait_more "$ASR_STATE2_DIR" 'another VM host daemon holding the port (the single-operator interim)' 0; then
+    echo "::error::node B never published into node A's interim over the per-user channel"
+    asr_dump_log "$ASR_STATE2_DIR"
+    fail
+  fi
+  if [ "$(asr_count "$ASR_STATE2_DIR" 'holds the host loopback')" != 0 ]; then
+    echo "::error::node B hosted an answerer of its own beside A's interim"
+    asr_dump_log "$ASR_STATE2_DIR"
+    fail
+  fi
+  asr_b_ip="$(asr_zone_address "$ASR_STATE2_DIR" e2e-asr-b.min.internal)"
+  if [ -z "$asr_b_ip" ]; then
+    echo "::error::node B's zone dump holds no live row for e2e-asr-b.min.internal"
+    fail
+  fi
+  echo "1b. node B (state dir $ASR_STATE2_DIR) publishes into node A's interim"
+  # Box addresses are host-global (design §7.1): the answerer handed the
+  # two state dirs' boxes distinct addresses, both from .2 up.
+  if [ "$asr_a_ip" = "$asr_b_ip" ]; then
+    echo "::error::node A's and node B's boxes share the address $asr_a_ip — box addresses must be allocated host-wide"
+    fail
+  fi
+  for asr_ip in "$asr_a_ip" "$asr_b_ip"; do
+    case "${asr_ip##*.}" in
+      0 | 1 | 255 | '' | *[!0-9]*)
+        echo "::error::a box was handed $asr_ip, outside the box address range .2-.254"
+        fail
+        ;;
+    esac
+  done
+  echo "  distinct box addresses: e2e-asr-a $asr_a_ip, e2e-asr-b $asr_b_ip"
+  asr_expect_a e2e-asr-b.min.internal "$asr_b_ip"
   asr_expect_a e2e-asr-a.min.internal "$asr_a_ip"
 
   # ---- 2. the advisory hands the port to the service -----------------------
@@ -7463,40 +7553,20 @@ for row in json.load(open(sys.argv[1])):
       ;;
   esac
 
-  # ---- 3. node B publishes over the one channel ------------------------------
-  local asr_b_sid asr_b_err="$WORK/asr-b-activate.err" asr_b_ip
-  asr_b_sid="$(asr_activate mnl2 e2e-asr-b "$asr_b_err")" || fail
+  # ---- 3. node B follows the handover onto the service ----------------------
+  # B's connection to A's interim closed with the release; with the marker
+  # now present it reconnects to the machine-global channel only.
   if ! asr_wait_more "$ASR_STATE2_DIR" 'the manager-held answerer service' 0; then
-    echo "::error::node B never published to the manager-held answerer service"
+    echo "::error::node B never re-published to the manager-held answerer service after the handover"
     asr_dump_log "$ASR_STATE2_DIR"
     fail
   fi
   if [ "$(asr_count "$ASR_STATE2_DIR" 'holds the host loopback')" != 0 ]; then
-    echo "::error::node B hosted the answerer itself with the service installed"
+    echo "::error::node B hosted the answerer itself"
     asr_dump_log "$ASR_STATE2_DIR"
     fail
   fi
-  asr_b_ip="$(asr_zone_address "$ASR_STATE2_DIR" e2e-asr-b.min.internal)"
-  if [ -z "$asr_b_ip" ]; then
-    echo "::error::node B's zone dump holds no live row for e2e-asr-b.min.internal"
-    fail
-  fi
-  echo "3. node B (state dir $ASR_STATE2_DIR) publishes to the service"
-  # Box addresses are host-global (design §7.1): the answerer handed the
-  # two state dirs' boxes distinct addresses, both from .2 up.
-  if [ "$asr_a_ip" = "$asr_b_ip" ]; then
-    echo "::error::node A's and node B's boxes share the address $asr_a_ip — box addresses must be allocated host-wide"
-    fail
-  fi
-  for asr_ip in "$asr_a_ip" "$asr_b_ip"; do
-    case "${asr_ip##*.}" in
-      0 | 1 | 255 | '' | *[!0-9]*)
-        echo "::error::a box was handed $asr_ip, outside the box address range .2-.254"
-        fail
-        ;;
-    esac
-  done
-  echo "  distinct box addresses: e2e-asr-a $asr_a_ip, e2e-asr-b $asr_b_ip"
+  echo "3. node B (state dir $ASR_STATE2_DIR) followed the handover and publishes to the service"
   asr_expect_a e2e-asr-b.min.internal "$asr_b_ip"
   asr_expect_a e2e-asr-a.min.internal "$asr_a_ip"
 
