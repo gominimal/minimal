@@ -818,7 +818,8 @@ async fn create_rejects_bad_dynamic_range() {
 /// text's deny-all line carry the resolved key too, so a parser of either
 /// surface answers "which stance does this box run under" without
 /// defaulting a null itself. An explicit `deny` reads the same, through
-/// the declared kind.
+/// the declared kind, minus the absent setting's `(default)` mark and with
+/// `dynamic_ingress_source` `declared` rather than `default`.
 #[tokio::test]
 async fn policy_shows_resolved_dynamic_ingress() {
     let (daemon, args) = setup().await;
@@ -895,9 +896,15 @@ async fn policy_shows_resolved_dynamic_ingress() {
         let mut out = Vec::new();
         format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp, None, None).unwrap();
         let text = String::from_utf8(out).unwrap();
+        let row = if declared {
+            format!("  dynamic ingress  {mode}\n")
+        } else {
+            format!("  dynamic ingress  {mode} (default)\n")
+        };
         assert!(
-            text.contains(&format!("  dynamic ingress  {mode}")),
-            "{name}: the resolved stance must show in the text:\n{text}"
+            text.contains(&row),
+            "{name}: the resolved stance, marked (default) only when absent, must show in \
+             the text:\n{text}"
         );
         if let Some((lo, hi)) = range {
             assert!(
@@ -921,6 +928,11 @@ async fn policy_shows_resolved_dynamic_ingress() {
             ingress["dynamic_ingress"],
             mode.to_string(),
             "{name}: the resolved stance must show in the document:\n{document}"
+        );
+        assert_eq!(
+            ingress["dynamic_ingress_source"],
+            if declared { "declared" } else { "default" },
+            "{name}: the stance's source must show in the document:\n{document}"
         );
         if declared {
             assert_eq!(

@@ -2247,12 +2247,16 @@ pub fn format_policy(
         // reads which stance a box runs under — silence would read as
         // "unset" where there is no unset, only deny. The static half
         // keeps its own deny-all line: it describes the declared mappings,
-        // not the dynamic stance.
-        let dynamic_ingress = effective
+        // not the dynamic stance. An absent setting carries the `(default)`
+        // mark the egress row uses, so it never reads as an explicit deny.
+        let dynamic_ingress = match effective
             .ingress
             .as_ref()
             .and_then(|ingress| ingress.dynamic_ingress)
-            .unwrap_or(sessions::DynamicIngress::Deny);
+        {
+            Some(mode) => mode.to_string(),
+            None => format!("{} (default)", sessions::DynamicIngress::Deny),
+        };
         let dynamic_range = effective
             .ingress
             .as_ref()
@@ -2351,6 +2355,9 @@ enum PolicyIngressJson<'a> {
         /// The dynamic stance the box runs under, resolved — deny, the
         /// evaluation an absent setting takes (NET-043).
         dynamic_ingress: sessions::DynamicIngress,
+        /// Always `default` here: a box that declared a stance is
+        /// `declared`, whatever the stance.
+        dynamic_ingress_source: &'static str,
     },
     /// The declared policy, carried as the wire's own shape.
     Declared(PolicyDeclaredIngressJson<'a>),
@@ -2365,6 +2372,7 @@ impl<'a> PolicyIngressJson<'a> {
         match policy {
             None => Self::DenyAll {
                 dynamic_ingress: sessions::DynamicIngress::Deny,
+                dynamic_ingress_source: "default",
             },
             Some(ingress)
                 if ingress.port_mappings.is_empty()
@@ -2373,6 +2381,7 @@ impl<'a> PolicyIngressJson<'a> {
             {
                 Self::DenyAll {
                     dynamic_ingress: sessions::DynamicIngress::Deny,
+                    dynamic_ingress_source: "default",
                 }
             }
             Some(ingress) => Self::Declared(PolicyDeclaredIngressJson {
@@ -2381,6 +2390,11 @@ impl<'a> PolicyIngressJson<'a> {
                 dynamic_ingress: ingress
                     .dynamic_ingress
                     .unwrap_or(sessions::DynamicIngress::Deny),
+                dynamic_ingress_source: if ingress.dynamic_ingress.is_some() {
+                    "declared"
+                } else {
+                    "default"
+                },
             }),
         }
     }
@@ -2394,6 +2408,10 @@ struct PolicyDeclaredIngressJson<'a> {
     port_mappings: &'a [sessions::PortMapping],
     dynamic_allowed_range: Option<(u16, u16)>,
     dynamic_ingress: sessions::DynamicIngress,
+    /// `declared` when the box set a stance, `default` when the resolved
+    /// deny is the absent setting's — the text rendering's `(default)` mark,
+    /// as a field, the way the egress block's `source` carries it.
+    dynamic_ingress_source: &'static str,
 }
 
 /// The egress block as the document carries it: the posture the gate
