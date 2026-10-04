@@ -9197,6 +9197,7 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
     return 0
   fi
 
+  local probe_start_ms probe_ms
   cred_begin
   export MINVMD_BEP_STUB=1
   CRED_STUB=1
@@ -9289,6 +9290,7 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
   # positive probe above already proved the fabric alive, so the silence
   # here is the rules holding, not a dead network.
   for refused_port in 8118 443; do
+    probe_start_ms="$(now_ms)"
     mnl session exec "$lane_sid" \
       "/usr/bin/socat /dev/null TCP:$host_alias:$refused_port,connect-timeout=8" \
       >/dev/null 2>"$WORK/cred-lane-refused-$refused_port.err" && {
@@ -9296,8 +9298,14 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
       cat "$WORK/cred-lane-refused-$refused_port.err" 2>/dev/null || true
       cred_fail
     }
-    if grep -q 'Connection refused' "$WORK/cred-lane-refused-$refused_port.err" 2>/dev/null; then
-      echo "::error::the deny-all lane box's connection to the host alias at port $refused_port was reset, not dropped — its 0.0.0.0/0 deny did not hold"
+    probe_ms=$(( $(now_ms) - probe_start_ms ))
+    if grep -qE 'Connection refused|No route to host|unreachable' "$WORK/cred-lane-refused-$refused_port.err" 2>/dev/null; then
+      echo "::error::the deny-all lane box's connection to the host alias at port $refused_port was actively rejected, not dropped — its 0.0.0.0/0 deny did not hold"
+      cat "$WORK/cred-lane-refused-$refused_port.err" 2>/dev/null || true
+      cred_fail
+    fi
+    if [ "$probe_ms" -lt 5000 ]; then
+      echo "::error::the deny-all lane box's connection to the host alias at port $refused_port failed in ${probe_ms}ms — a fast failure is a reject, not the silent drop being asserted"
       cat "$WORK/cred-lane-refused-$refused_port.err" 2>/dev/null || true
       cred_fail
     fi
@@ -9310,6 +9318,7 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
   # the address), so the connect runs out its window with no reset, exactly
   # as the host alias did. The lane's narrowing, pinned end to end: what
   # the declaration opened is the proxy's listener, not its address.
+  probe_start_ms="$(now_ms)"
   mnl session exec "$lane_sid" \
     "/usr/bin/socat /dev/null TCP:$proxy_ip:443,connect-timeout=8" \
     >/dev/null 2>"$WORK/cred-lane-other-port.err" && {
@@ -9317,8 +9326,14 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
     cat "$WORK/cred-lane-other-port.err" 2>/dev/null || true
     cred_fail
   }
-  if grep -q 'Connection refused' "$WORK/cred-lane-other-port.err" 2>/dev/null; then
-    echo "::error::the deny-all lane box's connection to the proxy's address at port 443 was reset, not dropped — a port the lane never opened is the box's own rules' to decide, on both legs"
+  probe_ms=$(( $(now_ms) - probe_start_ms ))
+  if grep -qE 'Connection refused|No route to host|unreachable' "$WORK/cred-lane-other-port.err" 2>/dev/null; then
+    echo "::error::the deny-all lane box's connection to the proxy's address at port 443 was actively rejected, not dropped — a port the lane never opened is the box's own rules' to decide, on both legs"
+    cat "$WORK/cred-lane-other-port.err" 2>/dev/null || true
+    cred_fail
+  fi
+  if [ "$probe_ms" -lt 5000 ]; then
+    echo "::error::the deny-all lane box's connection to the proxy's address at port 443 failed in ${probe_ms}ms — a fast failure is a reject, not the silent drop being asserted"
     cat "$WORK/cred-lane-other-port.err" 2>/dev/null || true
     cred_fail
   fi
