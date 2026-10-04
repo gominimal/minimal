@@ -470,15 +470,14 @@ impl ServerState {
         // (in a microVM, the host-handed) port, or the documented default —
         // is the node address's interim opening in every box's own-address
         // set (design §7.1). The OS-picks `0` names no port, so no opening.
+        // An OS-picked port the bind lands on instead is not opened; the
+        // proxy warns when it serves there (see gominimal/minimal#1952).
         #[cfg(target_os = "linux")]
-        let hostname_proxy_port = Some(
-            ProxyPort::from_config(
-                config.hostname_proxy_port,
-                crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
-            )
-            .first_port(),
+        let hostname_proxy_port = ProxyPort::from_config(
+            config.hostname_proxy_port,
+            crate::net::proxy::DEFAULT_EGRESS_PROXY_PORT,
         )
-        .filter(|port| *port != 0);
+        .opening_port();
         #[cfg(not(target_os = "linux"))]
         let hostname_proxy_port = None;
         let net_switch = Arc::new(Mutex::new(
@@ -1394,6 +1393,14 @@ impl ProxyPort {
         }
     }
 
+    /// The port every box's own-address set opens at the node address for
+    /// the interim hostname proxy (design §7.1): the first bind's port, or
+    /// `None` for the OS-picks `0`, which names no port before the bind.
+    #[must_use]
+    fn opening_port(self) -> Option<u16> {
+        Some(self.first_port()).filter(|port| *port != 0)
+    }
+
     /// Whether a failed bind should fall back to asking the OS for a free
     /// port: only the default-then-select choice — a pinned port's failure
     /// is the operator's to clear, and moving the listener would be the
@@ -1544,7 +1551,7 @@ impl HostProxyStartup {
         reported_port: u16,
     ) {
         match self {
-            Self::Egress { .. } => {
+            Self::Egress { port, .. } => {
                 tracing::info!(
                     component = self.component(),
                     port = bound_port,
@@ -1553,10 +1560,32 @@ impl HostProxyStartup {
                     "hostname proxy is serving on its {} port",
                     source.as_str()
                 );
+                warn_if_proxy_opening_missed(port.opening_port(), bound_port);
                 state.set_hostname_proxy_port(reported_port).await;
             }
         }
     }
+}
+
+/// Warns, once at the proxy's startup, when the port it bound is not the
+/// port every box's own-address set opens at the node address (the
+/// interim opening, design §7.1): an unpinned daemon that found the default
+/// busy and took an OS-picked port, or a pinned `0`. Boxes on the switch
+/// then cannot reach the proxy at all. Returns whether it warned.
+#[cfg(target_os = "linux")]
+fn warn_if_proxy_opening_missed(opening: Option<u16>, bound_port: u16) -> bool {
+    if opening == Some(bound_port) {
+        return false;
+    }
+    let opening = opening.map_or_else(|| "none".to_string(), |port| port.to_string());
+    tracing::warn!(
+        bound_port,
+        opening_port = %opening,
+        "hostname proxy bound port {bound_port} but the switch opening is at port \
+         {opening}: own-address boxes cannot reach the hostname proxy; pin \
+         hostname_proxy_port"
+    );
+    true
 }
 
 /// Drives the hostname-routing proxy (the B5 egress proxy — the listener
@@ -2388,6 +2417,32 @@ mod tests {
     /// A `Config` backed by a fresh tempdir, mirroring `TestServer::new`.
     fn test_config(dir: &TempDir) -> Config {
         super::test_config(dir.path())
+    }
+
+    /// The interim node-address opening is compiled at the port the
+    /// proxy's first bind asks for; when the bind lands elsewhere (an
+    /// OS-picked port), the daemon says so once, naming both ports and the
+    /// consequence, and says nothing when the ports agree
+    /// (gominimal/minimal#1952).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proxy_opening_mismatch_warns_once_naming_both_ports() {
+        let capture = crate::test_harness::captured_log();
+        let line = "hostname proxy bound port 41913 but the switch opening is at port 7654: \
+                    own-address boxes cannot reach the hostname proxy; pin hostname_proxy_port";
+
+        assert!(!warn_if_proxy_opening_missed(Some(7654), 7654));
+        assert!(
+            !capture
+                .contents()
+                .contains("the switch opening is at port 7654"),
+            "equal ports say nothing"
+        );
+
+        assert!(warn_if_proxy_opening_missed(Some(7654), 41913));
+        let logged = capture.contents();
+        assert_eq!(logged.matches(line).count(), 1, "one line: {logged}");
+        assert!(logged.contains("WARN"), "a warn line: {logged}");
     }
 
     /// The volume-log release must run exactly once no matter how many
