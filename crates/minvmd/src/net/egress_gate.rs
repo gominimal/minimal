@@ -6311,8 +6311,8 @@ mod tests {
     /// declaration opens the proxy's listener, not the proxy's address, so a
     /// frame to another port at the address — and a frame in another protocol
     /// to the listener's own port — is not the listener the lane admitted.
-    /// These frames are the box's own rules' to decide, and a deny-all box's
-    /// rules decide them dropped under the same proxy rule the lane-less
+    /// The lane arm drops these frames before the row's own rules run,
+    /// whatever those rules are, under the same proxy rule the lane-less
     /// box's frames take: the lane added one listener and no address, so
     /// nothing else at the host-gateway side of the switch opened. The drop
     /// is not a reset (NET-062), and the warn line names the box by its row's
