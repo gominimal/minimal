@@ -1062,6 +1062,7 @@ mod tests {
                     name: "web".to_string(),
                     ingress_ports: Vec::new(),
                     egress: None,
+                    credentialed_upstream: None,
                 },
             )
             .expect("a registration still answers around the read"),

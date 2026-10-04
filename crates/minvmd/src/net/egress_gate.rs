@@ -6495,7 +6495,7 @@ mod tests {
     #[test]
     fn baseline_set_never_admits_the_proxy_address() {
         let registry = BoxRegistry::new(SUBNET);
-        registry.register_node_namespace(7654, 7656);
+        registry.register_node_namespace(7654);
         let table = registry.table();
         let baseline = NodePlaneBaseline::built_in(SUBNET);
         let pins = dns_pins::DnsPins::new(SUBNET);
