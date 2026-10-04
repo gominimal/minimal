@@ -1308,13 +1308,13 @@ impl BoxRegistry {
             .rows
             .read()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
-        let record =
-            rows.get(&switch_addr.octets())
-                .ok_or(PortReportRefusal::NoRow {
-                    switch_addr,
-                    port,
-                    proto,
-                })?;
+        let record = rows
+            .get(&switch_addr.octets())
+            .ok_or(PortReportRefusal::NoRow {
+                switch_addr,
+                port,
+                proto,
+            })?;
         let name = record.name().to_string();
         match record.dynamic_ingress() {
             DynamicIngress::Deny => {
