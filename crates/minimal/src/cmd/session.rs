@@ -4111,6 +4111,7 @@ mod tests {
             sock_path.clone(),
             registry.clone(),
             minvmd::net::answerer::AnswererStatus::starting(),
+            minvmd::control::ProxyPublishStatus::default(),
         )
         .expect("the control server binds its socket");
         let global = GlobalArgs {
