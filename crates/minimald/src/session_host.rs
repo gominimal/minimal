@@ -4623,6 +4623,15 @@ impl MockLauncher {
             ..Default::default()
         }
     }
+
+    /// This mock with `net_guard` attached as well, so a test can observe
+    /// the teardown of a host-address box's launch.
+    pub(crate) fn and_net_guard(self, net_guard: Box<dyn sandbox2::NetGuard>) -> Self {
+        Self {
+            net_guard: Some(net_guard),
+            ..self
+        }
+    }
 }
 
 #[cfg(test)]

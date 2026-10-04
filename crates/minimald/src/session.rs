@@ -3173,6 +3173,12 @@ impl Session {
         };
         let mut record = self.record.record().await?;
         record.host_ip_enforcement = Some(enforcement);
+        #[cfg(test)]
+        if launch_record_seam::write_fails(self.record.id()) {
+            return Err(std::io::Error::other(
+                "the test seam failed this session's launch-record write",
+            ));
+        }
         self.record.write(record).await?;
         // NET-079's observability: one info line per host-address box launch,
         // carrying what this launch recorded in the machine spelling every
@@ -3666,9 +3672,14 @@ impl Session {
             } else {
                 minimald_rpc::HostIpEnforcement::None
             };
-            Ok(session_host::MockLauncher::with_host_ip_enforcement(
-                placement,
-            ))
+            let launcher = session_host::MockLauncher::with_host_ip_enforcement(placement);
+            // A session whose launch-record write a test fails also carries
+            // the guard that test watches, so the box's teardown is
+            // observable after the launch kills it.
+            Ok(match launch_record_seam::teardown_guard(record.id) {
+                Some(guard) => launcher.and_net_guard(guard),
+                None => launcher,
+            })
         } else {
             Ok(session_host::MockLauncher::default())
         }
@@ -4425,6 +4436,62 @@ fn promote_interim_to_hand(
             Some(hand)
         }
         _ => None,
+    }
+}
+
+/// The test seam for a launch whose outcome cannot be recorded (NET-079):
+/// a test names a session whose launch-record write fails, and gets back
+/// the flag the session's box's network teardown sets — the observable
+/// that the launch killed the box it could not record. Keyed by session
+/// id, so tests running beside each other in one process never fail each
+/// other's writes.
+#[cfg(test)]
+pub(crate) mod launch_record_seam {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use sessions::SessionId;
+
+    static FAILING: Mutex<Option<HashMap<SessionId, Arc<AtomicBool>>>> = Mutex::new(None);
+
+    /// Makes every launch-record write for `id` fail, and returns the flag
+    /// its box's network teardown sets.
+    pub(crate) fn fail_writes_for(id: SessionId) -> Arc<AtomicBool> {
+        let torn_down = Arc::new(AtomicBool::new(false));
+        FAILING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, Arc::clone(&torn_down));
+        torn_down
+    }
+
+    pub(super) fn write_fails(id: &SessionId) -> bool {
+        FAILING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|failing| failing.contains_key(id))
+    }
+
+    pub(super) fn teardown_guard(id: SessionId) -> Option<Box<dyn sandbox2::NetGuard>> {
+        let failing = FAILING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let torn_down = Arc::clone(failing.as_ref()?.get(&id)?);
+        Some(Box::new(TeardownFlag(torn_down)))
+    }
+
+    struct TeardownFlag(Arc<AtomicBool>);
+
+    impl sandbox2::NetGuard for TeardownFlag {
+        fn teardown(
+            self: Box<Self>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            self.0.store(true, Ordering::SeqCst);
+            Box::pin(async {})
+        }
     }
 }
 
