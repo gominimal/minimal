@@ -680,39 +680,26 @@ fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
                     use std::os::unix::fs::MetadataExt as _;
                     (metadata.dev(), metadata.ino(), metadata.nlink())
                 };
-                let link_target = if nlink > 1 {
-                    hardlinks.get(&(dev, ino)).cloned()
-                } else {
-                    None
-                };
-
                 // Emit a link entry when this is a later name for an
-                // inode we already archived AND the first path fits the
+                // inode we already archived under a path that fits the
                 // header's link-name field. Otherwise fall through to a
                 // regular entry: the upload must never fail because of a
                 // link.
-                let mut wrote_link = false;
-                if let Some(target) = link_target {
+                if let Some(target) = hard_link_target(hardlinks, (dev, ino), nlink, &archive_path)
+                {
                     let mut header = async_tar::Header::new_gnu();
                     header.set_size(0);
                     header.set_mode(mode);
                     header.set_mtime(mtime);
                     header.set_entry_type(async_tar::EntryType::Link);
-                    if header.set_link_name(&target).is_ok() {
-                        header.set_cksum();
-                        tar.append_data(&mut header, &archive_path, &[][..])
-                            .await
-                            .with_context(|| format!("adding hard link {archive_path}"))?;
-                        wrote_link = true;
-                    }
-                }
-
-                if !wrote_link {
-                    if nlink > 1 {
-                        hardlinks
-                            .entry((dev, ino))
-                            .or_insert_with(|| archive_path.clone());
-                    }
+                    header
+                        .set_link_name(&target)
+                        .with_context(|| format!("setting hard link target {target}"))?;
+                    header.set_cksum();
+                    tar.append_data(&mut header, &archive_path, &[][..])
+                        .await
+                        .with_context(|| format!("adding hard link {archive_path}"))?;
+                } else {
                     let mut header = async_tar::Header::new_gnu();
                     header.set_size(metadata.len());
                     header.set_mode(mode);
@@ -729,6 +716,31 @@ fn add_dir_entries_inner<'a, W: AsyncWrite + Unpin + Send + Sync + 'a>(
 
         Ok(())
     })
+}
+
+/// The earlier archived name a later name of a hard-linked inode links to,
+/// or `None` to archive this name as a regular entry.
+///
+/// A name is linked only when an earlier name for its inode was archived
+/// under a path that fits the tar header's link-name field. Every regular
+/// entry for a multi-link inode becomes the target for the names after it,
+/// so a first path too long to link to is replaced by the next one written.
+fn hard_link_target(
+    hardlinks: &mut HashMap<(u64, u64), String>,
+    key: (u64, u64),
+    nlink: u64,
+    archive_path: &str,
+) -> Option<String> {
+    if nlink <= 1 {
+        return None;
+    }
+    if let Some(target) = hardlinks.get(&key)
+        && async_tar::Header::new_gnu().set_link_name(target).is_ok()
+    {
+        return Some(target.clone());
+    }
+    hardlinks.insert(key, archive_path.to_owned());
+    None
 }
 
 #[cfg(test)]
@@ -1189,27 +1201,53 @@ mod tests {
 
     /// When the first name for a hard-linked inode is too long to fit
     /// the tar header's link-name field, the upload must fall back to a
-    /// regular entry for the later name rather than failing.
+    /// regular entry for the later name rather than failing. Both names are
+    /// too long, so whichever the walk reads first, the second cannot link
+    /// to it and the fallback runs.
     #[tokio::test]
     async fn stream_falls_back_to_regular_entry_when_link_name_too_long() {
         let dir = tempfile::TempDir::new().unwrap();
         // 120 chars: comfortably over the 100-byte link-name field.
-        let long_name = "x".repeat(120);
-        std::fs::write(dir.path().join(&long_name), "body").unwrap();
-        std::fs::hard_link(dir.path().join(&long_name), dir.path().join("short.txt")).unwrap();
+        let first = "x".repeat(120);
+        let second = "y".repeat(120);
+        std::fs::write(dir.path().join(&first), "body").unwrap();
+        std::fs::hard_link(dir.path().join(&first), dir.path().join(&second)).unwrap();
 
         let mut buf = Vec::new();
         stream_tar_zstd(dir.path(), &mut buf).await.unwrap();
 
         let stats = unpack_and_stat(&buf).await;
-        assert!(
-            stats.contains_key(&long_name),
-            "the long first name must be archived"
+        for name in [&first, &second] {
+            let (_, _, nlink) = stats
+                .get(name.as_str())
+                .unwrap_or_else(|| panic!("{name} must be archived"));
+            assert_eq!(
+                *nlink, 1,
+                "{name} must be a regular entry of its own, not a link"
+            );
+        }
+    }
+
+    /// The link-target bookkeeping in a fixed order: a first name too long
+    /// to link to is replaced by the next regular entry, so a third name
+    /// links to the second instead of being copied again. A single-link file
+    /// is never recorded.
+    #[test]
+    fn hard_link_target_replaces_an_unusable_first_name() {
+        let key = (1, 42);
+        let long_name = "x".repeat(120);
+        let mut hardlinks = HashMap::new();
+
+        assert_eq!(hard_link_target(&mut hardlinks, key, 3, &long_name), None);
+        assert_eq!(hard_link_target(&mut hardlinks, key, 3, "a.txt"), None);
+        assert_eq!(
+            hard_link_target(&mut hardlinks, key, 3, "b.txt"),
+            Some("a.txt".to_string())
         );
-        assert!(
-            stats.contains_key("short.txt"),
-            "the later name must be archived as a regular entry"
-        );
+
+        let mut single = HashMap::new();
+        assert_eq!(hard_link_target(&mut single, (1, 7), 1, "c.txt"), None);
+        assert!(single.is_empty());
     }
 
     #[test]
