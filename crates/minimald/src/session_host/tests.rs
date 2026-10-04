@@ -3968,9 +3968,12 @@ async fn dynamic_ingress_box(
     mode: Option<sessions::DynamicIngress>,
     range: Option<(u16, u16)>,
 ) -> (sessions::SessionId, crate::session::SessionHandle) {
+    // The loopback verdict vouches for the handed address, so the registry
+    // publishes the box at it — the address a runtime publish binds at.
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
     let id =
         finalize_dynamic_ingress_session(client, name, ASK_SWITCH, ASK_LOOPBACK, mode, range).await;
-    let manager = server.state.sessions_manager().await;
     let handle = manager
         .get_session(crate::sessions::SessionKeyPredicate::Id(id))
         .await
@@ -4279,6 +4282,7 @@ async fn expose_ask_answered_after_the_stall_bound_publishes() {
             local: format!("{}:3000", ASK_LOOPBACK),
             internal_port: 3000,
             proto: sessions::IpProto::Tcp,
+            pending: Some(false),
         },
         "the publish the human allowed is the one an allow box's takes"
     );
@@ -5127,6 +5131,7 @@ async fn expose_ask_answers_reach_their_own_ask_on_a_shared_port() {
             local: format!("{}:3000", ASK_LOOPBACK),
             internal_port: 3000,
             proto: sessions::IpProto::Tcp,
+            pending: Some(false),
         },
         "the publish is the one an allow box's request takes"
     );
@@ -5281,6 +5286,7 @@ async fn expose_ask_prompts_attached_human() {
             local: format!("{}:3000", ASK_LOOPBACK),
             internal_port: 3000,
             proto: sessions::IpProto::Tcp,
+            pending: Some(false),
         },
         "the publish the human allowed is the one an allow box's takes"
     );
@@ -5423,6 +5429,12 @@ async fn expose_unenrolled_decision_audited() {
         None,
     )
     .await;
+    // A publish needs a box running behind it (NET-047's stopped-box
+    // refusal), so the allowing box launches its host first.
+    web_handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
     let sock = web_handle
         .net_switch()
         .await

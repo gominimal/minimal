@@ -995,10 +995,275 @@ async fn session_policy_succeeds() {
         &args,
         PolicyArgs {
             session: session_id.to_string(),
+            output: None,
         },
     )
     .await
     .unwrap();
+}
+
+/// `min session policy -o json` writes one `min/v1/session-policy` document:
+/// the schema stamp a client checks before anything else, the policy's
+/// blocks as keys, and the live mappings as the wire's own rows with each
+/// one's `pending` state carried (NET-044) — a port published at runtime
+/// that the relay gate has not admitted must not read as reachable to
+/// something parsing the document, and the port the declaration named must
+/// read as the admitted forward it is. Driven through `write_policy_json`,
+/// the renderer the command goes through, with the effective policy fetched
+/// the way the command fetches it (the effective-policy RPC, NET-074) from
+/// a real session that really declares the port that reads `pending:
+/// false` — so the two rows are grounded in a declaration, not in a
+/// hand-built pair.
+#[tokio::test]
+async fn policy_json_carries_schema_and_pending() {
+    let (daemon, args) = setup().await;
+    let session_id = create_session_with_policy(
+        &daemon,
+        "policy-json",
+        sessions::NetworkMode::OwnIp,
+        sessions::SessionPolicy::new(
+            None,
+            Some(sessions::IngressPolicy {
+                port_mappings: vec![sessions::PortMapping {
+                    external_port: 3000,
+                    internal_port: 3000,
+                    proto: sessions::IpProto::Tcp,
+                }],
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+        ),
+    )
+    .await;
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
+    let resp = client
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(session_id))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
+    };
+    assert!(
+        policy
+            .ingress
+            .as_ref()
+            .is_some_and(|ingress| ingress.port_mappings.len() == 1),
+        "the stored declaration must survive the record round trip"
+    );
+
+    // The live rows the way the daemon serves them: a runtime-only port the
+    // declaration never named, beside the declared one.
+    let live = vec![
+        minimald_rpc::LiveMapping {
+            local: "127.0.0.1:3200".to_string(),
+            internal_port: 3200,
+            proto: sessions::IpProto::Tcp,
+            pending: Some(true),
+        },
+        minimald_rpc::LiveMapping {
+            local: "127.0.0.1:3000".to_string(),
+            internal_port: 3000,
+            proto: sessions::IpProto::Tcp,
+            pending: Some(false),
+        },
+    ];
+
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        Ok(live),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        document["schema"], "min/v1/session-policy",
+        "the document must open with the schema stamp:\n{document}"
+    );
+    assert_eq!(
+        document["network"], "own_ip",
+        "the mode names which surface the policy describes:\n{document}"
+    );
+    assert_eq!(
+        document["ingress"]["kind"], "declared",
+        "the declared block is carried as the declaration:\n{document}"
+    );
+    let declared = document["ingress"]["port_mappings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the declared mappings ride as an array: {document}"));
+    assert_eq!(
+        declared[0]["internal_port"].as_u64(),
+        Some(3000),
+        "the declaration the pending rows are measured against:\n{document}"
+    );
+
+    let live_rows = document["live_ingress"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the live mappings ride as an array: {document}"));
+    assert_eq!(live_rows.len(), 2, "every mapping carried: {document}");
+    let pending_of = |port: u16| {
+        live_rows
+            .iter()
+            .find(|row| row["internal_port"].as_u64() == Some(u64::from(port)))
+            .unwrap_or_else(|| panic!("no live row for port {port}: {document}"))["pending"]
+            .clone()
+    };
+    assert_eq!(
+        pending_of(3200).as_bool(),
+        Some(true),
+        "a port the declaration never named is carried as pending:\n{document}"
+    );
+    assert_eq!(
+        pending_of(3000).as_bool(),
+        Some(false),
+        "the port the declaration named is carried as admitted:\n{document}"
+    );
+
+    // A row from a daemon that predates the field — one that carried no
+    // `pending` key — rides the document as `null`, the JSON surface's own
+    // way of saying the state is unknown rather than reachable (NET-044).
+    let pre_field = minimald_rpc::LiveMapping {
+        local: "127.0.0.1:3400".to_string(),
+        internal_port: 3400,
+        proto: sessions::IpProto::Tcp,
+        pending: None,
+    };
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        Ok(vec![pre_field]),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    let rows = document["live_ingress"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the live mappings ride as an array: {document}"));
+    assert_eq!(
+        rows[0]["pending"],
+        Value::Null,
+        "a pre-field row's unknown state rides the document as null, never as a bool:\n{document}"
+    );
+}
+
+/// The `live_ingress` key carries three states a client must be able to tell
+/// apart, because each says a different thing: the rows the daemon served —
+/// an empty list included, which is the claim that the box published
+/// nothing — `null` for the view the daemon could not serve, which is no
+/// claim at all (the box may have published anything, and the run cannot
+/// warn in prose: a `-o json` run's stderr is the error object's alone), and
+/// no key at all for a mode without the surface. A degraded fetch — an
+/// older daemon without the subsystem, a session mid-teardown — is the
+/// middle one, never collapsed into the first.
+#[test]
+fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
+    let policy = sessions::EffectiveSessionPolicy {
+        egress: sessions::EffectiveEgress::AllowAll,
+        ingress: None,
+    };
+
+    // A box that published nothing: the empty list is an authoritative
+    // claim about the box.
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        Ok(Vec::new()),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        document.get("live_ingress"),
+        Some(&Value::Array(Vec::new())),
+        "a served empty view is the box's own claim that it published nothing:\n{document}"
+    );
+
+    // A view the daemon could not serve: `null`, the document's unknown —
+    // present as a key, so it is not the mode's absence either.
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        Err("live port mappings are unavailable: no session found".to_string()),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        document.get("live_ingress"),
+        Some(&Value::Null),
+        "an unavailable live view rides the document as null, never as an empty list:\n{document}"
+    );
+
+    // A mode without the surface: no key at all, a third state again.
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::NoNet,
+        None,
+        Ok(Vec::new()),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        document.get("live_ingress"),
+        None,
+        "a mode without a live-ingress surface leaves the key out entirely:\n{document}"
+    );
+}
+
+/// A `-o json` run that fails answers with the mode's error contract, not a
+/// plain-text line: the failure crosses to `main` as the typed
+/// `MachineModeFailure` — the generic payload every `-o json` command fails
+/// into, which `main`'s machine-mode error emitter (keyed on the output
+/// mode, shared by every command that takes `-o json`) writes as the one
+/// `min/v1/error` object on stderr, its one-object shape pinned by `main`'s
+/// own unit test. A missing session carries the architecture's `not_found`
+/// code — never a policy-specific spelling — with the kind of thing that
+/// was missing, a session, in the message and the hint.
+#[tokio::test]
+async fn policy_json_failure_answers_with_the_error_contract() {
+    let (_daemon, args) = setup().await;
+    let err = cmd_session_policy(
+        &args,
+        PolicyArgs {
+            session: "no-such-session".to_string(),
+            output: Some(PolicyOutputFormat::Json),
+        },
+    )
+    .await
+    .unwrap_err();
+    let failure = err
+        .downcast_ref::<MachineModeFailure>()
+        .expect("the failure crosses as the payload the emitter writes, not a message");
+    assert_eq!(
+        failure.code(),
+        "not_found",
+        "a missing session is the architecture's not-found code: {err:#}"
+    );
+    assert!(
+        failure.message().contains("session"),
+        "the message names the kind of thing that was missing: {}",
+        failure.message()
+    );
+    assert!(
+        failure.hint().contains("session"),
+        "the hint names the kind of thing that was missing: {}",
+        failure.hint()
+    );
 }
 
 /// `min session policy` shows the effective egress rules (NET-061): the four
