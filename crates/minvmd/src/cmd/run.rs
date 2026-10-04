@@ -704,7 +704,11 @@ fn run_foreground() -> Result<()> {
                 crate::net::DEFAULT_DATAPATH_CHECK_INTERVAL,
                 &boxes,
                 wire,
-                bep_box_source(_bep_stub.is_some(), boxes.table()),
+                bep_box_source(
+                    _bep_stub.is_some(),
+                    boxes.table(),
+                    proxy_attachments.clone(),
+                ),
             ) {
                 Ok(gvproxy) => {
                     let subnet = boxes.subnet();
@@ -1033,45 +1037,8 @@ fn run_foreground() -> Result<()> {
     Ok(())
 }
 
-/// The registered boxes a delivered connection is partitioned by
-/// (NET-132): the box rows this supervisor's box table holds — every one
-/// a host-side fact the guest never asserts — polled by the pool every
-/// stack turn, so a row that lands grows its box's share within a turn
-/// and a row that leaves takes its sockets with it. The guest node
-/// namespace's row is not one of them, so it buys no share (see the
-/// [`BepBoxSource`](switch::bep_host::BepBoxSource) impl).
-pub struct RegisteredBoxes {
-    /// The registry's live read-only view: every registration and
-    /// withdrawal the table sees reaches the pool through it.
-    table: crate::box_registry::BoxTable,
-}
-
-impl RegisteredBoxes {
-    /// The source over `table`.
-    pub fn new(table: crate::box_registry::BoxTable) -> Self {
-        Self { table }
-    }
-}
-
-impl switch::bep_host::BepBoxSource for RegisteredBoxes {
-    fn box_switch_addresses(&self) -> Vec<std::net::Ipv4Addr> {
-        // The guest node namespace's row is the VM's own root netns, the
-        // daemon's tap — never a box, and a share in its name would
-        // partition the pool by a row no box ever speaks from. Its
-        // address is fixed, the subnet's daemon address, which sits
-        // outside the hand-out run every client box is allocated from,
-        // so excluding that one address names exactly the node row.
-        let node_addr = self.table.subnet().daemon_ip();
-        self.table
-            .rows()
-            .iter()
-            .map(|row| row.switch_addr())
-            .filter(|addr| *addr != node_addr)
-            .collect()
-    }
-}
-
 /// The box source the peer's pool is partitioned by: the table's box rows
+/// with their attachments — [`crate::box_registry::RegisteredBoxes`] —
 /// when a stand-in acceptor actually bound at the wire's path, and
 /// [`switch::bep_host::NoBoxes`] — no row, no share, no socket — when one
 /// did not.
@@ -1091,9 +1058,13 @@ impl switch::bep_host::BepBoxSource for RegisteredBoxes {
 fn bep_box_source(
     stand_in_bound: bool,
     table: crate::box_registry::BoxTable,
+    attachments: crate::bep_attach::Attachments,
 ) -> std::sync::Arc<dyn switch::bep_host::BepBoxSource> {
     if stand_in_bound {
-        std::sync::Arc::new(RegisteredBoxes::new(table))
+        std::sync::Arc::new(crate::box_registry::RegisteredBoxes::new(
+            table,
+            attachments,
+        ))
     } else {
         std::sync::Arc::new(switch::bep_host::NoBoxes)
     }
@@ -2501,7 +2472,9 @@ mod tests {
     #[tokio::test]
     async fn production_wiring_leaves_pool_len_zero_with_rows_registered() {
         let subnet = switch::SwitchSubnet::default();
-        let registry = crate::box_registry::BoxRegistry::new(subnet);
+        let attachments = crate::bep_attach::Attachments::new();
+        let registry = crate::box_registry::BoxRegistry::new(subnet)
+            .feeding_proxy_attachments(attachments.clone());
         registry.register_node_namespace(7654);
         registry
             .register_client_box(crate::box_registry::ClientBoxSpec {
@@ -2524,7 +2497,7 @@ mod tests {
         let mut lane = switch::bep_host::test_util::TestLane::new(
             subnet,
             wire.clone(),
-            super::bep_box_source(false, registry.table()),
+            super::bep_box_source(false, registry.table(), attachments.clone()),
         );
         for _ in 0..2 {
             lane.step().await;
@@ -2540,7 +2513,7 @@ mod tests {
         let mut stub_lane = switch::bep_host::test_util::TestLane::new(
             subnet,
             wire,
-            super::bep_box_source(true, registry.table()),
+            super::bep_box_source(true, registry.table(), attachments),
         );
         for _ in 0..2 {
             stub_lane.step().await;
