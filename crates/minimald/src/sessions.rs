@@ -2471,11 +2471,10 @@ pub(crate) mod tests {
     /// nowhere (yet), and the session persists `Active` on the
     /// empty-contribution fast path.
     ///
-    /// The graph-resolution outcome isn't observed by the test —
-    /// depending on how `Graph::new_from_chain` handles a bare
-    /// `minimal.toml` in a scratch dir, it may return an empty
-    /// graph or an error. Either branch must leave `CreateSession`
-    /// returning `Ready`; that's the invariant guarded here.
+    /// The bare `minimal.toml` fixture must resolve to a graph:
+    /// a graph-resolution error now fails `configure_loadout`, so
+    /// `CreateSession` returning `Ready` here also proves the
+    /// fixture's graph resolves.
     /// Guards against a regression where the mfile parse or graph
     /// pipeline breaks creation for real projects. Once composition
     /// consumes the parsed mfile + graph, this test evolves.
