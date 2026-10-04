@@ -563,7 +563,8 @@ impl Config {
         // locale knob, no `LC_ALL`) lets a session's composed `env_vars` or a
         // client's forwarded `LANG`/`LC_*` override it. Build/task sandboxes
         // keep the fixed `en_US.utf8` + `LC_ALL` they always had, for output
-        // stability.
+        // stability. glibc normalizes the `UTF-8` codeset to `utf8`, so both
+        // spellings resolve to the same shipped locale.
         if let WdSetup::Session { .. } = &self.wd {
             set("LANG", "en_US.UTF-8");
         } else {

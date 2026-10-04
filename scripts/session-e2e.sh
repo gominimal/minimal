@@ -833,15 +833,19 @@ fi
 # `C.UTF-8` is absent from the session rootfs, so every setlocale caller
 # warned "Cannot set LC_CTYPE to default locale". `en_US.UTF-8` is the
 # canonical alias of the shipped `en_US.utf8`, so `locale` must run clean.
-# shellcheck disable=SC2016 # $LANG must expand in the SESSION's shell, not here.
-lang_out="$(mnl session exec "$sid" 'echo $LANG' 2>"$WORK/exec-lang.err")" || {
-  echo "::error::'min session exec $sid echo \$LANG' failed"
-  echo "--- stderr ---"; cat "$WORK/exec-lang.err" 2>/dev/null || true
-  fail
-}
-if [ "$lang_out" != "en_US.UTF-8" ]; then
-  echo "::error::session LANG is '$lang_out' (expected 'en_US.UTF-8')"
-  fail
+# The equality check pins the uncomposed default, so it runs only when this
+# script seeded the project: a caller's project may compose its own LANG.
+if [ -n "$SEED_DIR" ] || [ -n "$SEEDED_MFILE" ]; then
+  # shellcheck disable=SC2016 # $LANG must expand in the SESSION's shell, not here.
+  lang_out="$(mnl session exec "$sid" 'echo $LANG' 2>"$WORK/exec-lang.err")" || {
+    echo "::error::'min session exec $sid echo \$LANG' failed"
+    echo "--- stderr ---"; cat "$WORK/exec-lang.err" 2>/dev/null || true
+    fail
+  }
+  if [ "$lang_out" != "en_US.UTF-8" ]; then
+    echo "::error::session LANG is '$lang_out' (expected the uncomposed default 'en_US.UTF-8')"
+    fail
+  fi
 fi
 mnl session exec "$sid" 'locale' >"$WORK/exec-locale.out" 2>"$WORK/exec-locale.err" || {
   echo "::error::'min session exec $sid locale' failed"
