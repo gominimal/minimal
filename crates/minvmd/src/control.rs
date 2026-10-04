@@ -195,6 +195,34 @@ fn serve_request(
             let reply = BoxControlReply::Status(answerer.get());
             write_reply(stream, &reply)
         }
+        // The runtime report verbs and the row read are served by their own
+        // halves of this socket (the in-VM daemon's channel, and the host
+        // socket's read-only row verb); an arm here exists only so this
+        // build's dispatch is exhaustive while those halves land.
+        request @ (BoxControlRequest::AdmitPort(_)
+        | BoxControlRequest::WithdrawPort(_)
+        | BoxControlRequest::ReadRow(_)) => {
+            let reply = BoxControlReply::Error {
+                error: format!(
+                    "the VM host daemon does not serve the {:?} verb on this channel",
+                    verb_name(&request)
+                ),
+            };
+            write_reply(stream, &reply)
+        }
+    }
+}
+
+/// The name a refused request's verb carries, for the refusal sentence that
+/// names the verb it will not serve.
+fn verb_name(request: &BoxControlRequest) -> &'static str {
+    match request {
+        BoxControlRequest::Register(_) => "register",
+        BoxControlRequest::Withdraw(_) => "withdraw",
+        BoxControlRequest::AnswererStatus => "answerer status",
+        BoxControlRequest::AdmitPort(_) => "admit port",
+        BoxControlRequest::WithdrawPort(_) => "withdraw port",
+        BoxControlRequest::ReadRow(_) => "read row",
     }
 }
 
@@ -556,6 +584,16 @@ mod tests {
                     "a registration is answered with the registered box, got the status {status:?}"
                 )
             }
+            BoxControlReply::PortReport(report) => {
+                panic!(
+                    "a registration is answered with the registered box, got a port report {report:?}"
+                )
+            }
+            BoxControlReply::Row(row) => {
+                panic!(
+                    "a registration is answered with the registered box, got a row read {row:?}"
+                )
+            }
         }
     }
 
@@ -590,6 +628,8 @@ mod tests {
                         deny_subnets: None,
                     }),
                     credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
                 },
             )
             .expect("first registration is answered"),
@@ -659,6 +699,8 @@ mod tests {
                     ingress_ports: vec![5432],
                     egress: None,
                     credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
                 },
             )
             .expect("second registration is answered"),
@@ -707,6 +749,8 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
                 },
             )
             .expect("server still serves after a refused request"),
@@ -829,6 +873,8 @@ mod tests {
                         deny_subnets: None,
                     }),
                     credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
                 },
             )
             .expect("the registration is answered"),
@@ -866,6 +912,12 @@ mod tests {
             }
             BoxControlReply::Status(status) => {
                 panic!("a withdrawal is answered with the pair, got the status {status:?}")
+            }
+            BoxControlReply::PortReport(report) => {
+                panic!("a withdrawal is answered with the pair, got a port report {report:?}")
+            }
+            BoxControlReply::Row(row) => {
+                panic!("a withdrawal is answered with the pair, got a row read {row:?}")
             }
         }
         assert!(
@@ -909,6 +961,8 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
                 },
             )
             .expect("the marker box is registered"),
@@ -941,6 +995,12 @@ mod tests {
                 }
                 BoxControlReply::Status(status) => {
                     panic!("a withdrawal must be refused, got the status {status:?}")
+                }
+                BoxControlReply::PortReport(report) => {
+                    panic!("a withdrawal must be refused, got a port report {report:?}")
+                }
+                BoxControlReply::Row(row) => {
+                    panic!("a withdrawal must be refused, got a row read {row:?}")
                 }
             }
         }
@@ -979,6 +1039,12 @@ mod tests {
             }
             BoxControlReply::Status(status) => {
                 panic!("a repeat withdrawal echoes the pair, got the status {status:?}")
+            }
+            BoxControlReply::PortReport(report) => {
+                panic!("a repeat withdrawal echoes the pair, got a port report {report:?}")
+            }
+            BoxControlReply::Row(row) => {
+                panic!("a repeat withdrawal echoes the pair, got a row read {row:?}")
             }
         }
 
@@ -1090,6 +1156,8 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
                 },
             )
             .expect("a registration still answers around the read"),

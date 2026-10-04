@@ -143,6 +143,18 @@ async fn register_box_with_vm_host(
                  answerer status {status:?}; the registration did not happen"
             )
         }
+        minimald_rpc::BoxControlReply::PortReport(report) => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with a \
+                 runtime port report {report:?}; the registration did not happen"
+            )
+        }
+        minimald_rpc::BoxControlReply::Row(row) => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with a \
+                 row read {row:?}; the registration did not happen"
+            )
+        }
     }
 }
 
@@ -360,7 +372,26 @@ pub(crate) async fn withdraw_box_row(
                     box = %name,
                     "the VM host daemon answered the box row withdrawal with a \
                      registration; the row stays published"
-                );
+                )
+            }
+            // The report and row-read answers are the same kind of wrong
+            // here: another verb's answer on a wire whose reply shapes are
+            // disjoint — not a pair the row went by.
+            minimald_rpc::BoxControlReply::PortReport(report) => {
+                tracing::warn!(
+                    box = %name,
+                    ?report,
+                    "the VM host daemon answered the box row withdrawal with a \
+                     runtime port report; the row stays published"
+                )
+            }
+            minimald_rpc::BoxControlReply::Row(row) => {
+                tracing::warn!(
+                    box = %name,
+                    ?row,
+                    "the VM host daemon answered the box row withdrawal with a \
+                     row read; the row stays published"
+                )
             }
         },
         Ok(Err(error)) => {
@@ -449,6 +480,8 @@ async fn register_box_for_activation(
             .unwrap_or_default(),
         egress: policy.egress.clone(),
         credentialed_upstream: policy.credentialed_upstream.clone(),
+        dynamic_ingress: None,
+        dynamic_allowed_range: None,
     };
     let registration = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
@@ -4048,6 +4081,8 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
             },
         )
         .await

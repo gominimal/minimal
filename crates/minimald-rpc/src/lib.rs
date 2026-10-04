@@ -575,6 +575,27 @@ pub struct RegisteredBox {
     pub box_id: BoxId,
 }
 
+/// The file name of the VM host daemon's second control socket: the
+/// in-VM daemon's channel, bound beside the host control socket in the
+/// provider's state dir with the same owner-only posture, and served from
+/// the same daemon's own serving loop — the report verbs
+/// ([`BoxControlRequest::AdmitPort`], [`BoxControlRequest::WithdrawPort`])
+/// and nothing else cross it. Both ends derive the path from the one they
+/// already hold: the host binds it beside the control socket it owns
+/// (minvmd's `control.sock`), and the in-VM daemon resolves it beside the
+/// switch control socket its own state dir gave it — the native
+/// development seam, where the guest channel is a sibling file rather than
+/// a bridged vsock port.
+pub const GUEST_CONTROL_SOCK_FILE: &str = "guest-control.sock";
+
+/// The vsock port the VM host daemon serves the in-VM daemon's control
+/// channel on: the in-VM daemon's report channel when it talks to the VM
+/// host over vsock, bridged by the VM host from the guest's AF_VSOCK
+/// connection to the same UDS the native seam opens beside the control
+/// socket. Distinct from the gate shuttle's port: the report channel is the
+/// box control socket's own door, not the egress gate's.
+pub const VSOCK_VM_HOST_CONTROL_PORT: u32 = 1025;
+
 /// The wire types of the VM host daemon's box control socket (T66): the
 /// one door a client has to the host-side box table (NET-138).
 ///
@@ -623,6 +644,24 @@ pub struct RegisterBoxRequest {
     /// nothing, exactly as one that never asked for a lane does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentialed_upstream: Option<CredentialedUpstream>,
+    /// The box's dynamic ingress stance, from the same create inputs the
+    /// session record holds (NET-043): `allow` publishes a runtime port on
+    /// the box's own say-so, `ask` defers to the attached human (NET-045),
+    /// and absent is the deny-all default an unspecified setting means.
+    /// The host row holds the stance so its admission of a runtime port is
+    /// the host's own check against the box's grant — the grant the
+    /// creating client declared, not whatever the box later claims
+    /// (NET-138).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_ingress: Option<DynamicIngress>,
+    /// The inclusive port range the box's dynamic ingress is permitted
+    /// within, from the same create inputs the session record holds
+    /// (NET-047). Absent means the stance's default: an `allow` with no
+    /// range permits nothing, the same meaning the create request's policy
+    /// carries. The host row holds the range beside the stance so an admit
+    /// report outside it is refused on the host's own facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_allowed_range: Option<(u16, u16)>,
 }
 
 /// The withdrawal a destroyed session's client sends for the row its
@@ -655,6 +694,81 @@ pub struct WithdrawBoxRequest {
     pub loopback_address: std::net::Ipv4Addr,
 }
 
+/// Which runtime ingress surface an admit or withdraw report came from
+/// (NET-138's client-recorded half): the expose path's own `allow` decision,
+/// a `yes` the attached human answered an `ask` with (NET-045), or the listen
+/// watcher's publish (NET-016). One word, so the host's log line can name the
+/// reporting source — and so a row that carries `ask` still records the ports
+/// a human answered for, which is the admission the stance was guarding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportSource {
+    /// The box's own `allow` stance decided the publish (`min net expose`).
+    Expose,
+    /// The attached human answered an `ask` with a yes.
+    Ask,
+    /// The listen watcher published a permitted listening port.
+    Listen,
+}
+
+/// The in-VM daemon's report that one port now stands published on the
+/// box's address at runtime (NET-138): the row key, the port, the protocol
+/// — and the reporting source, the one word the host's log line names the
+/// admission by. Fixed and size-bounded on purpose: no names, no lists, no
+/// policy — the host row already holds the grant from the registration, and
+/// this message only names the port it was earned for. The host records the
+/// port in the row only after checking it against the stance and range the
+/// row holds ([`RegisterBoxRequest::dynamic_ingress`],
+/// [`RegisterBoxRequest::dynamic_allowed_range`]), so the admission on a
+/// VM-backed host is the host's own fact, never the box's claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmitPortRequest {
+    /// The box's switch address — the key its row sits at in the host
+    /// table, the address the registration handed back.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The external port the publish stands on.
+    pub port: u16,
+    /// The transport the publish serves. A mapping answers the one protocol
+    /// it was exposed with, so a runtime admission does too.
+    pub protocol: IpProto,
+    /// Which runtime surface earned the admission.
+    pub source: ReportSource,
+}
+
+/// The in-VM daemon's report that one port's runtime admission is over
+/// (NET-138): the same fixed, size-bounded shape as
+/// [`AdmitPortRequest`] — the row key, the port, the protocol and the
+/// reporting source. A withdrawal report is answered `released` whatever the
+/// row holds: the goal state is the port gone from the row, and a port
+/// already gone is the report's success, not its refusal — the row's
+/// withdrawal clears the whole runtime set, so a late or repeated withdrawal
+/// for a row that no longer exists still succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithdrawPortRequest {
+    /// The box's switch address — the key its row sits at in the host
+    /// table, the address the registration handed back.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The external port the admission is over for.
+    pub port: u16,
+    /// The transport the admission served.
+    pub protocol: IpProto,
+    /// Which runtime surface is reporting the withdrawal.
+    pub source: ReportSource,
+}
+
+/// The host-side read of one box's row, keyed by the box's name (NET-138):
+/// the read-only verb of the host control socket. The name resolves to its
+/// live box under the same alias rule the zone answers names by, and when no
+/// box under the name is live the reply reports no row — never a destroyed
+/// box's last row, because withdrawal removed it. The verb changes no state;
+/// its only access control is the socket's owner-only file mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadRowRequest {
+    /// The name the row was registered under — the session name the box
+    /// was created with.
+    pub name: String,
+}
+
 /// The one request line the control socket takes: which verb the client
 /// wants, tagged in the line itself.
 ///
@@ -682,6 +796,22 @@ pub enum BoxControlRequest {
     /// — the read-only verb: no row is touched, no state changes, the reply
     /// is the status the answerer's acquisition last left.
     AnswererStatus,
+    /// Record one runtime admission in the box's row (see
+    /// [`AdmitPortRequest`]) — the in-VM daemon's report, served on the
+    /// in-VM daemon's channel ([`GUEST_CONTROL_SOCK_FILE`],
+    /// [`VSOCK_VM_HOST_CONTROL_PORT`]) rather than the host socket, so the
+    /// host side never takes a box's claim from the registering client's
+    /// own door.
+    AdmitPort(AdmitPortRequest),
+    /// End one runtime admission in the box's row (see
+    /// [`WithdrawPortRequest`]) — the in-VM daemon's report, served beside
+    /// [`Self::AdmitPort`].
+    WithdrawPort(WithdrawPortRequest),
+    /// Read one box's row back (see [`ReadRowRequest`]) — the read-only
+    /// row verb, served on the host socket only: its owner-only file mode
+    /// is its access control, and a host fact read through a guest channel
+    /// would be forgeable from inside the escape boundary.
+    ReadRow(ReadRowRequest),
 }
 
 /// The VM host daemon's answerer status: the state of the machine's
@@ -730,6 +860,68 @@ pub enum ZoneAnswererStatus {
     },
 }
 
+/// The report verbs' answer: one runtime port recorded, or one released
+/// (NET-138). Tagged `outcome` because the two shapes carry the same single
+/// field — the echo of the port the host acted on — and the tag is what
+/// tells the reporting side which happened. A report the host refuses — a
+/// row that holds no such grant, a stance that denies, a port outside the
+/// row's range, the row's cap or its admit rate — is not a shape here: it
+/// is answered [`BoxControlReply::Error`] with a sentence naming why, the
+/// one refusal shape every verb of this socket already shares, and the
+/// reporting side unwinds its publish on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum BoxPortReport {
+    /// The admit report was recorded in the row.
+    Recorded {
+        /// The port the row now holds, echoed from the report.
+        port: u16,
+    },
+    /// The withdraw report was honoured — including for a port the row no
+    /// longer held, since no row holding the port is the report's goal
+    /// state.
+    Released {
+        /// The port the row released, echoed from the report.
+        port: u16,
+    },
+}
+
+/// The read-only row verb's answer (NET-138): the live row the name
+/// resolved to, or no row held. The report and the absence are one shape —
+/// `row: null` — so a client that reads a destroyed box's name can tell the
+/// row is gone from the row's own absence, not from an error it would have
+/// to guess the meaning of.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoxRowReport {
+    /// The live row the name resolved to, or `None` when no box under the
+    /// name is live: a destroyed box's row was withdrawn, not parked.
+    pub row: Option<BoxRow>,
+}
+
+/// One live box's row, as the host-side table holds it (NET-138): the
+/// address the egress gate decides the box's switch requests by, the
+/// egress allow-list its registration derived, and the two port sets the
+/// row's admissions come from — the ones the declaration named and the ones
+/// runtime reporting earned inside the grant the same declaration set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoxRow {
+    /// The box's switch address: the key the row sits at, the address the
+    /// registration handed back and the in-VM daemon reports admissions by.
+    pub switch_address: std::net::Ipv4Addr,
+    /// The row's derived egress allow-list: the destination CIDR prefixes
+    /// its declaration's `allow_subnets` carried, verbatim. `None` is the
+    /// allow-all default — the same meaning the create request's egress
+    /// policy gives an absent field.
+    pub egress_allow_list: Option<Vec<String>>,
+    /// The external ports the declaration admitted, the expanded set the
+    /// registration carried.
+    pub declared_ports: Vec<u16>,
+    /// The ports the box published at runtime inside the grant its row
+    /// holds — the ones admit reports recorded and no withdrawal has ended.
+    /// Ascending, the shape the row stores.
+    pub runtime_ports: Vec<u16>,
+}
+
 /// The addresses a successful registration hands back
 /// ([`sessions::BoxAddresses`]): the box's switch address and its published
 /// loopback address, both allocated on the host from the address plan the
@@ -770,6 +962,14 @@ pub enum BoxControlReply {
     /// The answerer-status read succeeded: the state of the machine's
     /// zone answerer as the daemon holds it ([`ZoneAnswererStatus`]).
     Status(ZoneAnswererStatus),
+    /// A report verb's outcome: one port recorded in a row or released
+    /// from it ([`BoxPortReport`]). A refused report is the
+    /// [`Error`](Self::Error) shape, the one refusal shape every verb
+    /// shares.
+    PortReport(BoxPortReport),
+    /// The read-only row verb's answer: the live row the name resolved to,
+    /// or no row held ([`BoxRowReport`]).
+    Row(BoxRowReport),
 }
 
 /// The request for a [`CreateSession`] RPC.
@@ -2640,5 +2840,198 @@ mod tests {
             }))
         );
         assert_eq!(round_trip(&with), with);
+    }
+
+    /// The runtime admit and withdraw reports cross the box control socket
+    /// as a fixed, size-bounded line: the row key, the port, the protocol
+    /// and the reporting source, and nothing else — no names, no lists, no
+    /// policy, because the row the report lands in already holds the grant
+    /// and the report only names the port it was earned for. The wire shape
+    /// is what bounds it: the tagged request line must carry exactly the
+    /// fields of the report and the verb tag, so a report can never grow a
+    /// variable-length dimension on this wire.
+    ///
+    /// The replies share the socket's one refusal shape — an `error` object
+    /// — while the two outcomes tag themselves, because they carry the same
+    /// single field and only the tag tells recorded from released.
+    #[test]
+    fn box_control_admit_and_withdraw_round_trip() {
+        let switch_address = std::net::Ipv4Addr::new(100, 64, 0, 10);
+
+        for (source, source_name) in [
+            (ReportSource::Expose, "expose"),
+            (ReportSource::Ask, "ask"),
+            (ReportSource::Listen, "listen"),
+        ] {
+            let admit = BoxControlRequest::AdmitPort(AdmitPortRequest {
+                switch_address,
+                port: 3000,
+                protocol: IpProto::Tcp,
+                source,
+            });
+            let line = serde_json_lenient::to_string(&admit).expect("serialize");
+            let decoded: BoxControlRequest =
+                serde_json_lenient::from_str(&line).expect("deserialize");
+            assert_eq!(decoded, admit, "round trip for {source_name}");
+            // The wire shape is contract: the verb tag, the four report
+            // fields, and nothing a fixed message could grow from.
+            assert!(
+                line.contains(r#""verb":"admit_port""#),
+                "the admit report must be tagged: {line}"
+            );
+            for field in [
+                r#""switch_address":"100.64.0.10""#,
+                r#""port":3000"#,
+                r#""protocol":"tcp""#,
+                &format!(r#""source":"{source_name}""#),
+            ] {
+                assert!(line.contains(field), "{source_name} admit line: {line}");
+            }
+            let line_value = serde_json_lenient::from_str::<serde_json_lenient::Value>(&line)
+                .expect("the admit line is JSON");
+            let keys = line_value.as_object().expect("an object line").len();
+            assert_eq!(
+                keys, 5,
+                "a report is five keys — the tag and the four fields: {source_name}: {line}"
+            );
+
+            let withdraw = BoxControlRequest::WithdrawPort(WithdrawPortRequest {
+                switch_address,
+                port: 3000,
+                protocol: IpProto::Tcp,
+                source,
+            });
+            assert_eq!(round_trip(&withdraw), withdraw, "round trip {source_name}");
+            let line = serde_json_lenient::to_string(&withdraw).expect("serialize");
+            assert!(
+                line.contains(r#""verb":"withdraw_port""#),
+                "the withdraw report must be tagged: {line}"
+            );
+        }
+
+        // The outcomes tag themselves: the same echo field, two meanings,
+        // and the untagged reply must never take one for the other.
+        let recorded: BoxControlReply =
+            serde_json_lenient::from_str(r#"{"outcome":"recorded","port":3000}"#)
+                .expect("decode recorded");
+        assert_eq!(
+            recorded,
+            BoxControlReply::PortReport(BoxPortReport::Recorded { port: 3000 })
+        );
+        let released: BoxControlReply =
+            serde_json_lenient::from_str(r#"{"outcome":"released","port":3000}"#)
+                .expect("decode released");
+        assert_eq!(
+            released,
+            BoxControlReply::PortReport(BoxPortReport::Released { port: 3000 })
+        );
+        assert_ne!(recorded, released);
+
+        // A refused report stays the socket's one refusal shape, and it
+        // still decodes — the reporting side reads the sentence and unwinds.
+        let refused: BoxControlReply = serde_json_lenient::from_str(
+            r#"{"error":"the row holds no grant for port 3000"}"#,
+        )
+        .expect("a refused report decodes");
+        assert_eq!(
+            refused,
+            BoxControlReply::Error {
+                error: "the row holds no grant for port 3000".to_string()
+            }
+        );
+
+        // The registration carries the runtime grant the reports are checked
+        // against, and a daemon that predates the fields still parses the
+        // registration: absent is the deny-all default an unspecified
+        // setting means.
+        let mut registration = RegisterBoxRequest {
+            name: "box".to_string(),
+            ingress_ports: vec![80],
+            egress: None,
+            credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
+        };
+        let bare = serde_json_lenient::to_string(&registration).expect("serialize");
+        assert!(
+            !bare.contains("dynamic_ingress") && !bare.contains("dynamic_allowed_range"),
+            "an absent grant is not written for the old daemon to trip on: {bare}"
+        );
+        assert_eq!(
+            serde_json_lenient::from_str::<RegisterBoxRequest>(&bare)
+                .expect("a pre-grant daemon still parses"),
+            registration
+        );
+        registration.dynamic_ingress = Some(DynamicIngress::Ask);
+        registration.dynamic_allowed_range = Some((3000, 3999));
+        assert_eq!(round_trip(&registration), registration);
+    }
+
+    /// The read-only row verb is keyed by the box's name and answered with
+    /// the live row or its absence — one shape either way, so a client
+    /// cannot mistake a withdrawn box for an unreadable one. The row's
+    /// fields are the host's own table facts: the address the gate decides
+    /// by, the derived egress allow-list (`None` the allow-all default),
+    /// and the declared and runtime port sets.
+    #[test]
+    fn box_control_read_row_round_trip() {
+        let request = BoxControlRequest::ReadRow(ReadRowRequest {
+            name: "api".to_string(),
+        });
+        let line = serde_json_lenient::to_string(&request).expect("serialize");
+        assert!(line.contains(r#""verb":"read_row""#), "{line}");
+        assert!(line.contains(r#""name":"api""#), "{line}");
+        assert_eq!(round_trip(&request), request);
+
+        let row = BoxRow {
+            switch_address: std::net::Ipv4Addr::new(100, 64, 0, 10),
+            egress_allow_list: Some(vec!["10.0.0.0/8".to_string()]),
+            declared_ports: vec![80, 443],
+            runtime_ports: vec![3000, 3001],
+        };
+        let held = BoxControlReply::Row(BoxRowReport { row: Some(row.clone()) });
+        assert_eq!(round_trip(&held), held);
+
+        // The line's shape, verbatim: the row's four facts, held.
+        let line = serde_json_lenient::to_string(&held).expect("serialize");
+        assert!(line.contains(r#""switch_address":"100.64.0.10""#), "{line}");
+        assert!(line.contains(r#""egress_allow_list":["10.0.0.0/8"]"#), "{line}");
+        assert!(line.contains(r#""declared_ports":[80,443]"#), "{line}");
+        assert!(line.contains(r#""runtime_ports":[3000,3001]"#), "{line}");
+
+        // A destroyed box's name reports no row — not the row it last had,
+        // and not an error the reader would have to interpret.
+        let gone = BoxControlReply::Row(BoxRowReport { row: None });
+        assert_eq!(
+            round_trip(&gone), gone,
+            "no row held round-trips as the same absence"
+        );
+        let line = serde_json_lenient::to_string(&gone).expect("serialize");
+        assert_eq!(line, r#"{"row":null}"#, "the absence is one flat object: {line}");
+
+        // The untagged reply never mistakes the row report for one of the
+        // earlier variants — every reply is one line, and the line a row
+        // read answers with decodes as the row and nothing else.
+        for (raw, expected) in [
+            (
+                r#"{"row":null}"#,
+                BoxControlReply::Row(BoxRowReport { row: None }),
+            ),
+            (
+                r#"{"row":{"switch_address":"100.64.0.10","egress_allow_list":null,"declared_ports":[],"runtime_ports":[]}}"#,
+                BoxControlReply::Row(BoxRowReport {
+                    row: Some(BoxRow {
+                        switch_address: std::net::Ipv4Addr::new(100, 64, 0, 10),
+                        egress_allow_list: None,
+                        declared_ports: vec![],
+                        runtime_ports: vec![],
+                    })
+                }),
+            ),
+        ] {
+            let decoded: BoxControlReply =
+                serde_json_lenient::from_str(raw).expect("the reply line decodes");
+            assert_eq!(decoded, expected, "raw: {raw}");
+        }
     }
 }
