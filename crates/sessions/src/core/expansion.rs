@@ -519,7 +519,11 @@ fn normalize_path(s: &str) -> Result<String, ExpandError> {
         out.push('/');
     }
     out.push_str(&components.join("/"));
-    if trailing_slash {
+    // Restore the trailing slash only onto a non-empty component list:
+    // `./` normalizes to the empty (current-directory) path, and
+    // pushing `/` onto it would turn a relative source into the
+    // absolute host root.
+    if trailing_slash && !components.is_empty() {
         out.push('/');
     }
     Ok(out)
@@ -1368,6 +1372,33 @@ mod tests {
         assert_eq!(
             expand_with_project_root("config/myrc", vars.as_slice(), "/home/u/proj[1]").unwrap(),
             "/home/u/proj[[]1[]]/config/myrc",
+        );
+    }
+
+    /// `./` names the project root itself. It must resolve under the
+    /// project, never to the host root `/` (which the plain-directory
+    /// rewrite would widen to the whole host filesystem).
+    #[test]
+    fn project_root_dot_slash_resolves_to_project_root() {
+        let vars: [ResolvedVar; 0] = [];
+        for raw in ["./", ".//", "."] {
+            assert_eq!(
+                expand_with_project_root(raw, vars.as_slice(), "/home/u/proj").unwrap(),
+                "/home/u/proj/",
+                "raw: {raw:?}",
+            );
+        }
+    }
+
+    /// Without a project root, `./` stays relative and is rejected
+    /// rather than becoming the absolute host root.
+    #[test]
+    fn dot_slash_without_project_root_is_not_absolute() {
+        let vars: [ResolvedVar; 0] = [];
+        let err = expand("./", &vars).unwrap_err();
+        assert!(
+            matches!(err, ExpandError::NotAbsolute { .. }),
+            "got: {err:?}",
         );
     }
 
