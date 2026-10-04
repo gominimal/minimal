@@ -73,11 +73,65 @@ pub trait PackageSelection {
                 .unwrap()
                 .map(|n| match g.by_name(n) {
                     Some(bsr) => Ok(*bsr),
-                    None => Err(Error::Other(anyhow!("No such package: {}", n))),
+                    None => Err(Error::Other(anyhow!("{}", package_not_found_message(g, n)))),
                 })
                 .collect::<Result<_, _>>()
         }
     }
+}
+
+/// Builds the `No such package` error message, suggesting close package
+/// names when any exist.
+fn package_not_found_message(g: &Graph, input: &str) -> String {
+    let suggestions = package_suggestions(g, input);
+    if suggestions.is_empty() {
+        format!(
+            "No such package: {} (try 'min package search {}')",
+            input, input
+        )
+    } else {
+        format!(
+            "No such package: {} (did you mean: {}?)",
+            input,
+            suggestions.join(", ")
+        )
+    }
+}
+
+/// Collects up to three package names close to `input`, preferring names
+/// that share a prefix with the input before fuzzier matches.
+fn package_suggestions(g: &Graph, input: &str) -> Vec<String> {
+    use common::fuzzy_search::fuzzy_match;
+
+    let input = input.trim().to_lowercase();
+    let mut prefix_of_input: Vec<&str> = Vec::new();
+    let mut input_prefix_of: Vec<&str> = Vec::new();
+    let mut fuzzy: Vec<(&str, common::fuzzy_search::SearchMatch)> = Vec::new();
+
+    for name in g.names() {
+        let lower = name.to_lowercase();
+        if lower == input {
+            continue;
+        }
+        if input.starts_with(&lower) {
+            prefix_of_input.push(name);
+        } else if lower.starts_with(&input) {
+            input_prefix_of.push(name);
+        } else if let Some(m) = fuzzy_match(&input, name) {
+            fuzzy.push((name, m));
+        }
+    }
+
+    prefix_of_input.sort_by_key(|n| (n.len(), *n));
+    input_prefix_of.sort_by_key(|n| (n.len(), *n));
+    fuzzy.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+    let mut candidates: Vec<String> = Vec::with_capacity(3);
+    candidates.extend(prefix_of_input.into_iter().map(str::to_string));
+    candidates.extend(input_prefix_of.into_iter().map(str::to_string));
+    candidates.extend(fuzzy.into_iter().map(|(n, _)| n.to_string()));
+    candidates.truncate(3);
+    candidates
 }
 
 impl PackageSelection for Vec<String> {
@@ -1886,5 +1940,73 @@ mod tests {
                 },]
             );
         });
+    }
+
+    /// Builds a small graph containing `node` and `python` for the
+    /// package-not-found suggestion tests.
+    fn suggestion_graph() -> Graph {
+        let mut opts = decode::LoadOptions::for_test();
+        opts.minimal_lib_path = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../stdlib/minimal-ncl");
+
+        let layer = decode::Layer::new_for_test_with(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+
+                let
+                    node = {
+                        name = \"node\",
+                        build_deps = [],
+                        cmd = \"\",
+                    } | BuildSpec,
+                    python = {
+                        name = \"python\",
+                        build_deps = [],
+                        cmd = \"\",
+                    } | BuildSpec,
+                in
+                [node, python]
+                "
+            }
+            .to_string(),
+            &opts,
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        Graph::new().ingest(layer).unwrap()
+    }
+
+    #[test]
+    fn package_not_found_suggests_prefix_of_input() {
+        let graph = suggestion_graph();
+        let err = vec!["nodejs".to_string()].as_bsrs(&graph).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No such package: nodejs (did you mean: node?)"
+        );
+    }
+
+    #[test]
+    fn package_not_found_suggests_fuzzy_match() {
+        let graph = suggestion_graph();
+        let err = vec!["pyhton".to_string()].as_bsrs(&graph).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No such package: pyhton (did you mean: python?)"
+        );
+    }
+
+    #[test]
+    fn package_not_found_without_candidates_suggests_search() {
+        let graph = suggestion_graph();
+        let err = vec!["zzzz".to_string()].as_bsrs(&graph).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No such package: zzzz (try 'min package search zzzz')"
+        );
     }
 }
