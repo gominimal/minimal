@@ -2776,6 +2776,7 @@ async fn net_forward_announces_the_bound_local_port() {
         .args(["net", "forward", "web", &format!("0:{box_port}")])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .expect("the min binary should be invocable");
 
