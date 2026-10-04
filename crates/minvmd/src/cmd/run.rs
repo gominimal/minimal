@@ -808,6 +808,9 @@ fn run_foreground() -> Result<()> {
     // publish forced. The bound is [`crate::control::PUBLISH_TRIES`], and it
     // is the loop below that counts.
     let mut publish_tries: usize = 0;
+    // The port whose publish the start left unconfirmed (T93), when it did:
+    // the guest's late report, if it ever comes, confirms it after the loop.
+    let mut unconfirmed_port = None;
     loop {
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("__krun-vmm");
@@ -890,17 +893,38 @@ fn run_foreground() -> Result<()> {
         // watch is skipped and the degraded boot's story stays the warn the
         // switch's own absence already logged.
         publish_tries += 1;
-        let outcome = if _gvproxy.is_some() {
-            watch_proxy_publish(node_port.port, &marker_events)
+        let decision = if let Some(gvproxy) = &_gvproxy {
+            // The processes this supervisor spawned for this VM: the switch
+            // that carries the guest's publish to the host's loopback, and
+            // the VMM child. A listener on the port with one of these pids
+            // is this VM's own publish, whatever the report did.
+            let own_pids = [gvproxy.pid(), child_pid];
+            let outcome = watch_proxy_publish(node_port.port, &marker_events, &own_pids);
+            crate::control::decide_publish(!node_port.configured, publish_tries, outcome)
         } else {
             tracing::warn!(
                 port = node_port.port,
                 "no host switch: the hostname proxy cannot publish; the VM boots degraded"
             );
-            crate::control::GuestPublish::NoReport { port_held: false }
+            crate::control::PublishDecision::Up
         };
-        match crate::control::decide_publish(!node_port.configured, publish_tries, outcome) {
+        match decision {
             crate::control::PublishDecision::Up => break,
+            crate::control::PublishDecision::UpUnconfirmed { port } => {
+                // No report, and no holder the host could vouch for: the VM
+                // comes up, and the status read says the publish is
+                // unconfirmed rather than letting the surfaces call it
+                // serving.
+                tracing::warn!(
+                    port,
+                    "the hostname proxy's publish is unconfirmed: no report from the \
+                     guest and no listener this VM's own forwarder holds; the VM comes \
+                     up and its publish is shown as unconfirmed until a report arrives"
+                );
+                proxy_publish.set_unconfirmed(port);
+                unconfirmed_port = Some(port);
+                break;
+            }
             crate::control::PublishDecision::Redraw { port } => {
                 // A drawn port, taken: draw again under the same reservation
                 // discipline and ask the guest to publish again — the fresh
@@ -935,17 +959,54 @@ fn run_foreground() -> Result<()> {
                 crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
                 // The holder by pid and exe when the host can see it, the
                 // decision's generic holder otherwise.
-                let holder = port_holder(port).unwrap_or_else(|| holder.to_string());
+                let holder = port_holder(port)
+                    .map(|(_, holder)| holder)
+                    .unwrap_or_else(|| holder.to_string());
                 let why = match cause {
                     ProxyDownCause::PortHeld => configured_never_redraws(),
                     ProxyDownCause::RedrawsRanOut => {
                         format!("{publish_tries} publish tries exhausted, every drawn port taken")
                     }
+                    // Never a failure's cause: an unconfirmed publish is
+                    // `UpUnconfirmed`, not `FailStart`.
+                    ProxyDownCause::PublishUnconfirmed => "the publish is unconfirmed".to_string(),
                 };
                 tracing::error!(port, %holder, %why, "the VM start failed on the proxy publish");
                 bail!("{}", proxy_port_failure(port, &holder, &why));
             }
         }
+    }
+
+    // T93: an unconfirmed publish stays unconfirmed until the guest's report
+    // says otherwise. The marker channel is the supervisor's to drain from
+    // here on — nothing past the start reads it — so a late serving report
+    // for the port clears the state, and a late refusal says the port is
+    // held after all.
+    if let Some(port) = unconfirmed_port {
+        let proxy_publish = proxy_publish.clone();
+        std::thread::spawn(move || {
+            for event in marker_events {
+                match event {
+                    MarkerEvent::ProxyServing(published) if published == port => {
+                        tracing::info!(
+                            port,
+                            "the guest's late report confirms the hostname proxy's publish"
+                        );
+                        proxy_publish.confirm(port);
+                        return;
+                    }
+                    MarkerEvent::ProxyPortHeld(held) if held == port => {
+                        tracing::warn!(
+                            port,
+                            "the guest's late report says the hostname proxy's port is held"
+                        );
+                        proxy_publish.set_down(port, ProxyDownCause::PortHeld);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        });
     }
 
     // ── Phase 2: Starting → Running (under lock) ────────────────────────────
@@ -1464,6 +1525,7 @@ fn configured_node_port(dir: &std::path::Path, port: u16) -> Result<NodePortAssi
                 SKIP_NODE_RESERVED => "the node's own zone answerer (a reserved port)".to_string(),
                 SKIP_RESERVED_BY_ANOTHER_VM => "another VM's reservation".to_string(),
                 _ => port_holder(port)
+                    .map(|(_, holder)| holder)
                     .unwrap_or_else(|| crate::control::HELD_BY_ANOTHER_PROCESS.to_string()),
             };
             let why = format!("{reason}; {}", configured_never_redraws());
@@ -1512,13 +1574,15 @@ fn proxy_failure_line(log: &str) -> Option<&str> {
     })
 }
 
-/// Who listens on `port` on this host, as `pid <pid> (<exe>)`, when the host
-/// lets this user see it (T93): the start failure names the holder so the
-/// operator knows what to free. `None` when no visible process holds it — a
-/// listener of another user, or a host this cannot read.
+/// Who listens on `port` on this host — its pid, and the holder as
+/// `pid <pid> (<exe>)` — when the host lets this user see it (T93): the
+/// start failure names the holder so the operator knows what to free, and
+/// the publish watch matches the pid against the processes this supervisor
+/// spawned. `None` when no visible process holds it — a listener of another
+/// user, or a host this cannot read.
 #[cfg(target_os = "linux")]
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn port_holder(port: u16) -> Option<String> {
+fn port_holder(port: u16) -> Option<(u32, String)> {
     // The listening sockets on the port, on loopback or the wildcard — the
     // addresses whose holder refuses a bind of 127.0.0.1:<port>.
     const HOLDING_ADDRS: &[&str] = &[
@@ -1575,10 +1639,13 @@ fn port_holder(port: u16) -> Option<String> {
                             .ok()
                             .map(|c| c.trim().to_string())
                     });
-                return Some(match exe {
-                    Some(exe) => format!("pid {pid} ({exe})"),
-                    None => format!("pid {pid}"),
-                });
+                return Some((
+                    pid,
+                    match exe {
+                        Some(exe) => format!("pid {pid} ({exe})"),
+                        None => format!("pid {pid}"),
+                    },
+                ));
             }
         }
     }
@@ -1589,7 +1656,7 @@ fn port_holder(port: u16) -> Option<String> {
 /// procfs, so `lsof` answers, for the processes this user may see.
 #[cfg(target_os = "macos")]
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn port_holder(port: u16) -> Option<String> {
+fn port_holder(port: u16) -> Option<(u32, String)> {
     let output = std::process::Command::new("/usr/sbin/lsof")
         .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpc"])
         .stdin(std::process::Stdio::null())
@@ -1599,25 +1666,26 @@ fn port_holder(port: u16) -> Option<String> {
     lsof_holder(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// The first process in `lsof -Fpc` output, as `pid <pid> (<command>)`.
+/// The first process in `lsof -Fpc` output: its pid, and the holder as
+/// `pid <pid> (<command>)`.
 #[cfg(target_os = "macos")]
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn lsof_holder(output: &str) -> Option<String> {
+fn lsof_holder(output: &str) -> Option<(u32, String)> {
     let mut pid = None;
     for line in output.lines() {
         if let Some(p) = line.strip_prefix('p') {
-            pid = Some(p);
+            pid = p.parse::<u32>().ok();
         } else if let (Some(command), Some(p)) = (line.strip_prefix('c'), pid) {
-            return Some(format!("pid {p} ({command})"));
+            return Some((p, format!("pid {p} ({command})")));
         }
     }
-    pid.map(|p| format!("pid {p}"))
+    pid.map(|p| (p, format!("pid {p}")))
 }
 
 /// No way to name a holder on this host.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn port_holder(_port: u16) -> Option<String> {
+fn port_holder(_port: u16) -> Option<(u32, String)> {
     None
 }
 
@@ -2015,20 +2083,93 @@ fn wait_boot_beacon(
 #[cfg(minvmd_libkrun)]
 const PUBLISH_WATCH_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How much longer the watch waits for the guest's report when the bound
+/// expired with the port answering but its holder unnameable (T93): a short
+/// grace, because ambiguity alone must never redraw, and the report is the
+/// one voice that can settle it.
+#[cfg(minvmd_libkrun)]
+const NO_REPORT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Watches what became of the port this start reserved (T93): the guest's
 /// report — serving, or refused for address-in-use — or, at the bound, the
-/// supervisor's own connect probe of the port. Whichever report arrives is
-/// re-probed host-side and the check logged, so the daemon's log names the
-/// publish outcome the supervisor *checked* for the port, not only the one
-/// the guest claimed; and nothing the guest says changes which port is
-/// reserved — the report names a fact, the reservation is the supervisor's
-/// own and moves only by its own decision.
+/// supervisor's own identification of the port's holder. Whichever report
+/// arrives is re-probed host-side and the check logged, so the daemon's log
+/// names the publish outcome the supervisor *checked* for the port, not only
+/// the one the guest claimed; and nothing the guest says changes which port
+/// is reserved — the report names a fact, the reservation is the
+/// supervisor's own and moves only by its own decision.
+///
+/// With no report at the bound, the holder decides
+/// ([`crate::control::NoReportHolder`]): a listener whose pid is one of
+/// `own_pids` — the processes this supervisor spawned for this VM — is this
+/// VM's own late publish; any other named pid is another process holding
+/// the port; and a listener the host will not name earns a short grace
+/// ([`NO_REPORT_GRACE`]) for the report before the watch calls it unknown.
 #[cfg(minvmd_libkrun)]
 fn watch_proxy_publish(
     port: u16,
     events: &std::sync::mpsc::Receiver<MarkerEvent>,
+    own_pids: &[u32],
 ) -> crate::control::GuestPublish {
-    let deadline = std::time::Instant::now() + PUBLISH_WATCH_BOUND;
+    use crate::control::{GuestPublish, NoReportHolder, classify_no_report_holder};
+    if let Some(reported) = await_publish_report(events, PUBLISH_WATCH_BOUND) {
+        return reported;
+    }
+    let port_answers = loopback_answers(port);
+    let holder_found = if port_answers {
+        port_holder(port)
+    } else {
+        None
+    };
+    let holder = classify_no_report_holder(
+        port_answers,
+        holder_found.as_ref().map(|(pid, _)| *pid),
+        own_pids,
+    );
+    let holder_named = holder_found.as_ref().map(|(_, named)| named.as_str());
+    match holder {
+        NoReportHolder::OwnForwarder => tracing::warn!(
+            port,
+            holder = holder_named.unwrap_or(""),
+            "the guest's publish report was late: this VM's own forwarder holds \
+             the port, so the publish landed"
+        ),
+        NoReportHolder::Foreign => tracing::warn!(
+            port,
+            holder = holder_named.unwrap_or(""),
+            "the publish watch expired without the guest's report and another \
+             process holds the port"
+        ),
+        NoReportHolder::NotAnswering => tracing::warn!(
+            port,
+            "the publish watch expired without the guest's report and nothing \
+             answers on the port"
+        ),
+        NoReportHolder::Unknown => {
+            tracing::warn!(
+                port,
+                grace_secs = NO_REPORT_GRACE.as_secs(),
+                "the publish watch expired without the guest's report and the \
+                 port's holder cannot be named; waiting a short grace for the report"
+            );
+            if let Some(reported) = await_publish_report(events, NO_REPORT_GRACE) {
+                return reported;
+            }
+        }
+    }
+    GuestPublish::NoReport { port, holder }
+}
+
+/// The guest's publish report, if one arrives inside `bound` (T93): serving,
+/// or refused for address-in-use, each re-probed and logged. A beacon inside
+/// the wait is a straggler from a redraw's killed boot — this boot's beacon
+/// is already read — and is skipped. `None` at the bound.
+#[cfg(minvmd_libkrun)]
+fn await_publish_report(
+    events: &std::sync::mpsc::Receiver<MarkerEvent>,
+    bound: std::time::Duration,
+) -> Option<crate::control::GuestPublish> {
+    let deadline = std::time::Instant::now() + bound;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         match events.recv_timeout(remaining) {
@@ -2038,7 +2179,7 @@ fn watch_proxy_publish(
                     port_answers = loopback_answers(published),
                     "the guest published the hostname proxy; re-probed the port"
                 );
-                return crate::control::GuestPublish::Serving { port: published };
+                return Some(crate::control::GuestPublish::Serving { port: published });
             }
             Ok(MarkerEvent::ProxyPortHeld(held)) => {
                 tracing::info!(
@@ -2046,24 +2187,10 @@ fn watch_proxy_publish(
                     port_answers = loopback_answers(held),
                     "the guest's publish was refused for address-in-use; re-probed the port"
                 );
-                return crate::control::GuestPublish::PortHeld { port: held };
+                return Some(crate::control::GuestPublish::PortHeld { port: held });
             }
-            // A beacon inside the watch is a straggler from a redraw's
-            // killed boot: this boot's beacon is already read. Keep waiting
-            // the remaining time.
             Ok(MarkerEvent::Beacon(..)) => continue,
-            Err(_) => {
-                let port_answers = loopback_answers(port);
-                tracing::warn!(
-                    port,
-                    port_answers,
-                    "the publish watch expired without the guest's report; the \
-                     boot proceeds on the probes' own story"
-                );
-                return crate::control::GuestPublish::NoReport {
-                    port_held: port_answers,
-                };
-            }
+            Err(_) => return None,
         }
     }
 }
@@ -2572,8 +2699,8 @@ mod tests {
     #[test]
     fn lsof_output_names_the_holder() {
         assert_eq!(
-            super::lsof_holder("p4242\ncpython3\nf3\n").as_deref(),
-            Some("pid 4242 (python3)")
+            super::lsof_holder("p4242\ncpython3\nf3\n"),
+            Some((4242, "pid 4242 (python3)".to_string()))
         );
         assert_eq!(super::lsof_holder(""), None);
     }

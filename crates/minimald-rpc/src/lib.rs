@@ -747,7 +747,8 @@ pub enum ZoneAnswererStatus {
 /// Why a VM host daemon says its VM's hostname proxy is not serving (T93):
 /// the terminal publish outcomes the supervisor itself reached — the port
 /// it reserved is held by another process on the host, or the draws to find
-/// a free one ran out. A host that merely has no switch to publish through
+/// a free one ran out — or that its publish is unconfirmed, the one
+/// non-terminal state: the VM is up, the publish is not one the host saw. A host that merely has no switch to publish through
 /// says nothing here: that boot's proxy never attempted a publish, and its
 /// story stays the daemon log's, not a cause this status could name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -760,6 +761,13 @@ pub enum ProxyDownCause {
     /// The drawn port's publish tries ran out: every port the reservation
     /// drew was already taken when the guest tried to publish it.
     RedrawsRanOut,
+    /// The VM came up but the guest never reported the publish, and the
+    /// supervisor could not attribute the port to this VM's own forwarder:
+    /// nothing answers on it, or its holder is one the host does not let
+    /// this user see. Not a failure — the VM stays up — but not a publish
+    /// the host can vouch for either, so the surfaces say "unconfirmed"
+    /// rather than "serving" until the guest's late report clears it.
+    PublishUnconfirmed,
 }
 
 /// The addresses a successful registration hands back

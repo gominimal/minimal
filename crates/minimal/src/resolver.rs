@@ -1602,7 +1602,8 @@ pub enum LiveSurface {
     /// The hostname proxy, with the named cause for its *not serving* —
     /// the terminal publish outcome the VM host daemon reports (T93): the
     /// port another process on the host holds, or the redraws that ran
-    /// out. Carries its own port because the status that reported it named
+    /// out — or that its publish is unconfirmed (the VM is up, the publish
+    /// is not one the host saw land). Carries its own port because the status that reported it named
     /// the port the failure is about, which is not the serving port a
     /// reply's discovery field would carry — and names the cause because
     /// "not serving" alone does not tell a user which thing to free.
@@ -2082,6 +2083,16 @@ pub fn name_surface_line(surface: LiveSurface, proxy_port: Option<u16>) -> Strin
                 "the hostname proxy is the live name surface; it is not serving — \
                  its publication was redrawn and the redraws ran out; the last \
                  port was 127.0.0.1:{port}"
+            ),
+            // The VM is up, but the VM host daemon never saw the publish
+            // land: no report from the guest, and no listener on the port
+            // it could attribute to this VM. Said as unconfirmed, never as
+            // serving, until the guest's report clears it.
+            ProxyDownCause::PublishUnconfirmed => format!(
+                "hostname proxy publish unconfirmed · the VM is up, but the VM \
+                 host daemon has not seen the hostname proxy publish on \
+                 127.0.0.1:{port}; names may not route through it until the \
+                 guest reports the publish"
             ),
         },
     }
@@ -2788,6 +2799,36 @@ mod tests {
             vm_host_answerer_line(redrawn),
             None,
             "the answerer row claims nothing the status did not say"
+        );
+    }
+
+    /// T93: a VM whose publish the VM host daemon could not confirm — no
+    /// report from the guest, and no listener on the port it could
+    /// attribute to this VM — is shown as unconfirmed on the NAME SURFACE
+    /// row, never as serving, even beside a serving port the reply carries.
+    #[tokio::test]
+    async fn name_surface_shows_an_unconfirmed_publish_as_unconfirmed() {
+        let unconfirmed = ZoneAnswererStatus::ProxyNotServing {
+            port: 19_917,
+            cause: ProxyDownCause::PublishUnconfirmed,
+        };
+        let line = name_surface_line(
+            vm_host_name_surface(unconfirmed)
+                .await
+                .expect("an unconfirmed publish settles a surface"),
+            Some(19_917),
+        );
+        assert!(
+            line.starts_with("hostname proxy publish unconfirmed"),
+            "the row says the publish is unconfirmed: {line}"
+        );
+        assert!(
+            line.contains("127.0.0.1:19917"),
+            "the row names the port: {line}"
+        );
+        assert!(
+            !line.contains("still serves") && !line.contains("routes through it on"),
+            "an unconfirmed publish must not be said to serve: {line}"
         );
     }
 

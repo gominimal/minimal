@@ -125,15 +125,53 @@ pub(crate) enum GuestPublish {
         /// The port the publish could not take.
         port: u16,
     },
-    /// No report arrived inside the watch: the supervisor's own connect
-    /// probe of the port is the whole outcome. `port_held` says whether
-    /// something answered there — which may be this VM's own publish (the
-    /// report racing the watch's bound) and so is a fact logged, not one
-    /// that fails a start.
+    /// No report arrived inside the watch: the supervisor's own probe of
+    /// the port, and of who holds it, is the whole outcome.
     NoReport {
-        /// Whether the supervisor's connect probe found a listener.
-        port_held: bool,
+        /// The port the watch was about — the one this start reserved.
+        port: u16,
+        /// Who the supervisor found on the port ([`NoReportHolder`]).
+        holder: NoReportHolder,
     },
+}
+
+/// Who the supervisor found on the reserved port when the publish watch
+/// expired without the guest's report (T93) — the identification that lets
+/// a missing report be decided instead of guessed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) enum NoReportHolder {
+    /// The port answers and its holder is a process this supervisor spawned
+    /// for this VM — the forwarder that carries the guest's publish (the
+    /// host switch) or the VMM child — matched by pid: the publish landed
+    /// and only the report was late.
+    OwnForwarder,
+    /// The port answers and its holder is a process this supervisor did not
+    /// spawn: the port is taken exactly as a refused publish says it is.
+    Foreign,
+    /// The port answers but the host would not name its holder (a listener
+    /// of another user, a host this cannot read), and the guest's report did
+    /// not come inside the grace either. Ambiguity alone never redraws.
+    Unknown,
+    /// Nothing answers on the port: no publish the host can see.
+    NotAnswering,
+}
+
+/// [`NoReportHolder`] from the probe's facts: whether the port answered,
+/// the pid of the listener the host named (if it named one), and the pids
+/// this supervisor spawned for this VM.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) fn classify_no_report_holder(
+    answers: bool,
+    holder_pid: Option<u32>,
+    own_pids: &[u32],
+) -> NoReportHolder {
+    match (answers, holder_pid) {
+        (false, _) => NoReportHolder::NotAnswering,
+        (true, Some(pid)) if own_pids.contains(&pid) => NoReportHolder::OwnForwarder,
+        (true, Some(_)) => NoReportHolder::Foreign,
+        (true, None) => NoReportHolder::Unknown,
+    }
 }
 
 /// What the supervisor does with what it learned about the publish (T93):
@@ -142,9 +180,17 @@ pub(crate) enum GuestPublish {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) enum PublishDecision {
-    /// The VM may come up: the proxy published, or nothing the port story
-    /// owns contradicts the boot the diagnostics already carry.
+    /// The VM may come up: the proxy published — the guest said so, or the
+    /// port's holder is this VM's own forwarder.
     Up,
+    /// The VM may come up, but its publish is unconfirmed: no report came
+    /// and the port is either silent or held by a process the host would
+    /// not name. The status read says so ([`ProxyDownCause::PublishUnconfirmed`])
+    /// until the guest's late report clears it.
+    UpUnconfirmed {
+        /// The port whose publish is unconfirmed.
+        port: u16,
+    },
     /// A drawn port with tries left: release the old reservation, draw
     /// again under the same reservation discipline, and ask the guest to
     /// publish again.
@@ -169,42 +215,64 @@ pub(crate) enum PublishDecision {
 /// whether the port was drawn or the operator's pin and how many publish
 /// tries the start has spent.
 ///
-/// The arms, said plainly: a serving publish is [`PublishDecision::Up]
-/// whatever the origin or the count — a boot that landed is a boot that
-/// landed. A port taken is a redraw while the port was drawn and tries
-/// remain ([`PUBLISH_TRIES`]); once they do not, or from the first refusal
-/// of a pin, the start fails naming the port and the holder, because a VM
-/// never stays up with no hostname proxy: a proxyless VM answers nothing
-/// this task's surfaces promise, and the pin's whole point is the operator
-/// named the port. A watch that expired without a report is
-/// [`PublishDecision::Up`] — a degraded boot's publish story is the daemon
-/// log's warn, not a cause the port story can name.
+/// The arms, said plainly:
+///
+/// - The guest reported serving: [`PublishDecision::Up`], whatever the
+///   origin or the count — a boot that landed is a boot that landed.
+/// - The guest reported the port taken, or no report came and the port's
+///   holder is another process ([`NoReportHolder::Foreign`]): a drawn port
+///   redraws while tries remain ([`PUBLISH_TRIES`]) and then fails
+///   [`ProxyDownCause::RedrawsRanOut`]; a pin fails at once,
+///   [`ProxyDownCause::PortHeld`], naming the port and the holder. A VM
+///   never stays up with no hostname proxy: a proxyless VM answers nothing
+///   this task's surfaces promise, and the pin's whole point is the
+///   operator named the port.
+/// - No report came and the port's holder is this VM's own forwarder
+///   ([`NoReportHolder::OwnForwarder`]): the publish landed and the report
+///   was late — [`PublishDecision::Up`].
+/// - No report came and the port's holder could not be named
+///   ([`NoReportHolder::Unknown`], after the watch's grace for the report),
+///   or nothing answers on the port ([`NoReportHolder::NotAnswering`]):
+///   [`PublishDecision::UpUnconfirmed`] — the VM comes up, but its publish
+///   is shown as unconfirmed, never as serving. Ambiguity alone never
+///   redraws.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) fn decide_publish(
     drawn: bool,
     tries_used: usize,
     outcome: GuestPublish,
 ) -> PublishDecision {
-    match outcome {
-        GuestPublish::Serving { .. } | GuestPublish::NoReport { .. } => PublishDecision::Up,
-        GuestPublish::PortHeld { port } => {
-            if !drawn {
-                // The operator's pin never redraws: the first refusal is the
-                // start's, naming the port and the holder.
-                PublishDecision::FailStart {
-                    port,
-                    holder: HELD_BY_ANOTHER_PROCESS,
-                    cause: ProxyDownCause::PortHeld,
-                }
-            } else if tries_used < PUBLISH_TRIES {
-                PublishDecision::Redraw { port }
-            } else {
-                PublishDecision::FailStart {
-                    port,
-                    holder: HELD_BY_ANOTHER_PROCESS,
-                    cause: ProxyDownCause::RedrawsRanOut,
-                }
-            }
+    let port = match outcome {
+        GuestPublish::Serving { .. }
+        | GuestPublish::NoReport {
+            holder: NoReportHolder::OwnForwarder,
+            ..
+        } => return PublishDecision::Up,
+        GuestPublish::NoReport {
+            port,
+            holder: NoReportHolder::Unknown | NoReportHolder::NotAnswering,
+        } => return PublishDecision::UpUnconfirmed { port },
+        GuestPublish::PortHeld { port }
+        | GuestPublish::NoReport {
+            port,
+            holder: NoReportHolder::Foreign,
+        } => port,
+    };
+    if !drawn {
+        // The operator's pin never redraws: the first refusal is the
+        // start's, naming the port and the holder.
+        PublishDecision::FailStart {
+            port,
+            holder: HELD_BY_ANOTHER_PROCESS,
+            cause: ProxyDownCause::PortHeld,
+        }
+    } else if tries_used < PUBLISH_TRIES {
+        PublishDecision::Redraw { port }
+    } else {
+        PublishDecision::FailStart {
+            port,
+            holder: HELD_BY_ANOTHER_PROCESS,
+            cause: ProxyDownCause::RedrawsRanOut,
         }
     }
 }
@@ -213,8 +281,9 @@ pub(crate) fn decide_publish(
 /// CLI's `min ls` row and session-start message read to *name why* the proxy
 /// is not serving, in the same read that already carries the answerer's
 /// state. Held by the supervisor, written when a start fails on the publish
-/// and never cleared: a supervisor that wrote it is a supervisor about to
-/// stop, and the fact outlives it exactly as long as the socket does.
+/// — a supervisor about to stop, whose fact outlives it exactly as long as
+/// the socket does — or when the VM came up with its publish unconfirmed,
+/// the one entry a later report clears ([`Self::confirm`]).
 ///
 /// Shaped like [`AnswererStatus`] — a cloneable cell behind one mutex,
 /// read on the serving thread — because that is the pattern the status
@@ -237,6 +306,26 @@ impl ProxyPublishStatus {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((port, cause));
+    }
+
+    /// Record that the proxy's publish on `port` is unconfirmed: the VM came
+    /// up with no report from the guest and no holder the host could vouch
+    /// for ([`PublishDecision::UpUnconfirmed`]).
+    pub(crate) fn set_unconfirmed(&self, port: u16) {
+        self.set_down(port, ProxyDownCause::PublishUnconfirmed);
+    }
+
+    /// Clear an unconfirmed publish on `port` — the guest's late report said
+    /// it is serving. Any other recorded cause stays: only the state the
+    /// report answers is the report's to clear.
+    pub(crate) fn confirm(&self, port: u16) {
+        let mut cell = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *cell == Some((port, ProxyDownCause::PublishUnconfirmed)) {
+            *cell = None;
+        }
     }
 
     /// The status to serve the read-only verb with: the proxy-down cause
@@ -1382,17 +1471,143 @@ mod tests {
             }
             other => panic!("the draws ran out: the start fails, got {other:?}"),
         }
+    }
 
-        // A watch that expired with nothing answering is up — the degraded
-        // boot's story stays the daemon log's, not this decision's.
+    /// No report, and the port's holder is this VM's own forwarder — the
+    /// pid the supervisor spawned: the publish landed and the report was
+    /// late, so the VM is up, confirmed, whatever the origin or the tries.
+    #[test]
+    fn no_report_with_own_forwarder_holding_is_up() {
+        let own = [4_242, 4_243];
+        let holder = classify_no_report_holder(true, Some(4_243), &own);
+        assert_eq!(holder, NoReportHolder::OwnForwarder);
+        for drawn in [true, false] {
+            for tries_used in 1..=PUBLISH_TRIES {
+                assert_eq!(
+                    decide_publish(
+                        drawn,
+                        tries_used,
+                        GuestPublish::NoReport {
+                            port: 19_913,
+                            holder
+                        }
+                    ),
+                    PublishDecision::Up,
+                    "own forwarder holding is a late report (drawn={drawn}, try {tries_used})"
+                );
+            }
+        }
+    }
+
+    /// No report, and another process holds the port: exactly the refused
+    /// publish's story — a drawn port redraws within the tries and then
+    /// fails with the draws' cause; a pin fails at once, the held port's.
+    #[test]
+    fn no_report_with_foreign_holder_redraws_drawn_and_fails_pinned() {
+        let port = 19_914;
+        let holder = classify_no_report_holder(true, Some(9_999), &[4_242]);
+        assert_eq!(holder, NoReportHolder::Foreign);
+        let outcome = GuestPublish::NoReport { port, holder };
+        for tries_used in 1..PUBLISH_TRIES {
+            assert_eq!(
+                decide_publish(true, tries_used, outcome),
+                PublishDecision::Redraw { port },
+                "a drawn port held by another process redraws at try {tries_used}"
+            );
+        }
         assert_eq!(
-            decide_publish(
-                true,
-                PUBLISH_TRIES,
-                GuestPublish::NoReport { port_held: false }
-            ),
-            PublishDecision::Up,
-            "no report and no listener fails nothing"
+            decide_publish(true, PUBLISH_TRIES, outcome),
+            PublishDecision::FailStart {
+                port,
+                holder: HELD_BY_ANOTHER_PROCESS,
+                cause: ProxyDownCause::RedrawsRanOut,
+            },
+            "the draws run out like a refused publish's"
+        );
+        for tries_used in 1..=PUBLISH_TRIES {
+            assert_eq!(
+                decide_publish(false, tries_used, outcome),
+                PublishDecision::FailStart {
+                    port,
+                    holder: HELD_BY_ANOTHER_PROCESS,
+                    cause: ProxyDownCause::PortHeld,
+                },
+                "a pin held by another process fails at once, at try {tries_used}"
+            );
+        }
+    }
+
+    /// No report and a holder the host would not name, or no listener at
+    /// all: the VM is up, unconfirmed — ambiguity never redraws, never
+    /// fails, and never claims serving.
+    #[test]
+    fn no_report_unknown_or_silent_is_up_unconfirmed() {
+        let port = 19_915;
+        assert_eq!(
+            classify_no_report_holder(true, None, &[4_242]),
+            NoReportHolder::Unknown
+        );
+        assert_eq!(
+            classify_no_report_holder(false, Some(4_242), &[4_242]),
+            NoReportHolder::NotAnswering,
+            "a silent port is not attributed to anyone"
+        );
+        for holder in [NoReportHolder::Unknown, NoReportHolder::NotAnswering] {
+            for drawn in [true, false] {
+                for tries_used in 1..=PUBLISH_TRIES {
+                    assert_eq!(
+                        decide_publish(drawn, tries_used, GuestPublish::NoReport { port, holder }),
+                        PublishDecision::UpUnconfirmed { port },
+                        "{holder:?} is up, unconfirmed (drawn={drawn}, try {tries_used})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The unconfirmed state rides the status read until the guest's late
+    /// report confirms the port, and a confirm never clears a terminal
+    /// cause or another port's state.
+    #[test]
+    fn unconfirmed_publish_rides_the_read_until_confirmed() {
+        let port = 19_916;
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _boxes, answerer, proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        answerer.set(ZoneAnswererStatus::Holder { port: 7_656 });
+        proxy_publish.set_unconfirmed(port);
+        assert_eq!(
+            control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
+            BoxControlReply::Status(ZoneAnswererStatus::ProxyNotServing {
+                port,
+                cause: ProxyDownCause::PublishUnconfirmed,
+            }),
+            "an unconfirmed publish is what the read answers"
+        );
+        proxy_publish.confirm(port + 1);
+        assert_eq!(
+            proxy_publish.down(),
+            Some(ZoneAnswererStatus::ProxyNotServing {
+                port,
+                cause: ProxyDownCause::PublishUnconfirmed,
+            }),
+            "another port's report confirms nothing"
+        );
+        proxy_publish.confirm(port);
+        assert_eq!(
+            control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
+            BoxControlReply::Status(ZoneAnswererStatus::Holder { port: 7_656 }),
+            "the late report clears it; the answerer's state answers again"
+        );
+        proxy_publish.set_down(port, ProxyDownCause::PortHeld);
+        proxy_publish.confirm(port);
+        assert_eq!(
+            proxy_publish.down(),
+            Some(ZoneAnswererStatus::ProxyNotServing {
+                port,
+                cause: ProxyDownCause::PortHeld,
+            }),
+            "a confirm never clears a terminal cause"
         );
     }
 
