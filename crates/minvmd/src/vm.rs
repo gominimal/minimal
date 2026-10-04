@@ -33,20 +33,12 @@ pub const GUEST_LOG_ENV: &str = "RUST_LOG";
 /// read (see `HOSTNAME_PROXY_PORT_TOKEN`).
 pub(crate) const NODE_PROXY_PORT_ENV: &str = "MINVMD_NODE_PROXY_PORT";
 
-/// The environment variable the supervisor hands the VMM child the node's
-/// zone-answerer port in; see [`NODE_PROXY_PORT_ENV`].
-pub(crate) const NODE_ANSWERER_PORT_ENV: &str = "MINVMD_NODE_ANSWERER_PORT";
-
 /// The boot token the node's hostname-proxy port rides to the guest on. The
 /// kernel starts `/init` with an empty environment, so the boot line is the
 /// only vector: unrecognized `KEY=VALUE` tokens reach init as env vars (the
 /// same vector `RUST_LOG` rides), and the guest daemon binds the port as
 /// handed (NET-025).
 const HOSTNAME_PROXY_PORT_TOKEN: &str = "MINIMALD_HOSTNAME_PROXY_PORT";
-
-/// The boot token the node's zone-answerer port rides to the guest on; see
-/// [`HOSTNAME_PROXY_PORT_TOKEN`].
-const ZONE_ANSWERER_PORT_TOKEN: &str = "MINIMALD_ZONE_ANSWERER_PORT";
 
 /// Kernel command line every microVM boots with: the console the guest's
 /// stdout/stderr reaches the host boot log through, and IPv6 disabled (the v1
@@ -262,14 +254,14 @@ impl VmConfig {
         // devtmpfs itself, then mounts the rootfs disk below and chroots into it.
         //
         // The boot line also carries the host's RUST_LOG and the supervisor's
-        // node ports to the guest daemon as environment variables: the kernel
-        // command line is the only vector, since the guest `/init` is minimald
-        // itself and the kernel starts it with an empty environment (see
-        // `kernel_cmdline`). Bound to a local so the &str handed to `set_kernel`
-        // outlives the call.
+        // node proxy port to the guest daemon as environment variables: the
+        // kernel command line is the only vector, since the guest `/init` is
+        // minimald itself and the kernel starts it with an empty environment
+        // (see `kernel_cmdline`). Bound to a local so the &str handed to
+        // `set_kernel` outlives the call.
         let rust_log = std::env::var(GUEST_LOG_ENV).ok();
-        let node_ports = node_ports_from_env()?;
-        let cmdline = kernel_cmdline(rust_log.as_deref(), node_ports);
+        let node_proxy_port = node_proxy_port_from_env()?;
+        let cmdline = kernel_cmdline(rust_log.as_deref(), node_proxy_port);
         // The boot line at info, not debug: the kernel echoes it back as
         // `Kernel command line: …` only once its console is up, and this is
         // the one line that says what the guest was told to boot with — a
@@ -374,7 +366,8 @@ impl VmConfig {
 }
 
 /// Build the guest kernel command line, forwarding `RUST_LOG` when the host has
-/// one worth forwarding and the node ports when the supervisor handed them.
+/// one worth forwarding and the node's proxy port when the supervisor handed
+/// it.
 ///
 /// The microVM's `/init` **is** minimald, so the kernel starts it with an empty
 /// environment — nothing from the host process crosses the VM boundary, and the
@@ -382,9 +375,13 @@ impl VmConfig {
 /// hands init every `KEY=VALUE` boot token it does not recognise itself
 /// (`init/main.c`: `unknown_bootoption` → `envp_init`), so `RUST_LOG=<value>` on
 /// the command line arrives as an environment variable and reaches minimald's
-/// `EnvFilter::try_from_default_env()`, and the node ports arrive the same way
-/// (`node_ports_from_env` reads them from the VMM child's env, where the
-/// supervisor put them — `cmd/run` assigns them before the boot, NET-025).
+/// `EnvFilter::try_from_default_env()`, and the proxy port arrives the same way
+/// (`node_proxy_port_from_env` reads it from the VMM child's env, where the
+/// supervisor put it — `cmd/run` assigns it before the boot, NET-025). The
+/// zone-answerer port is deliberately not handed: on a VM-backed host the
+/// in-VM daemon starts no answerer (NET-138) and the host's answerer serves the
+/// zone, so a token carrying an answerer port would be an admitted port with
+/// nothing behind it.
 ///
 /// Two things a caller setting `RUST_LOG` must know:
 ///
@@ -397,37 +394,36 @@ impl VmConfig {
 ///
 /// The values are injected rather than read from the process environment here,
 /// so this stays pure and unit-testable; the caller passes
-/// `std::env::var(GUEST_LOG_ENV).ok()` and `node_ports_from_env()`. A `RUST_LOG`
-/// value that cannot survive the boot line is skipped (leaving the base line
-/// plus the node ports byte-identical) with a warning, rather than corrupting
-/// the boot: whitespace would be split into separate boot tokens, an empty
-/// value carries nothing, and an over-long one would overrun
-/// [`COMMAND_LINE_SIZE`]. The node ports are never skipped — the guest binds
-/// them as handed — so their tokens count against [`COMMAND_LINE_SIZE`] when
-/// the filter's length is judged. Commas are untouched — `info,russh=debug` is
-/// the normal form.
+/// `std::env::var(GUEST_LOG_ENV).ok()` and `node_proxy_port_from_env()`. A
+/// `RUST_LOG` value that cannot survive the boot line is skipped (leaving the
+/// base line plus the port token byte-identical) with a warning, rather than
+/// corrupting the boot: whitespace would be split into separate boot tokens, an
+/// empty value carries nothing, and an over-long one would overrun
+/// [`COMMAND_LINE_SIZE`]. The port is never skipped — the guest binds it as
+/// handed — so its token counts against [`COMMAND_LINE_SIZE`] when the filter's
+/// length is judged. Commas are untouched — `info,russh=debug` is the normal
+/// form.
 // Only `apply` calls this, and `apply` needs libkrun; without it the crate is a
 // runtime-bailing stub, but the tests below still cover this on every target.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn kernel_cmdline(rust_log: Option<&str>, node_ports: Option<(u16, u16)>) -> Cow<'static, str> {
-    // The ports ride the boot line first: base, then the two port tokens, then
-    // the filter when one is forwarded.
-    let base_with_ports = match node_ports {
-        Some((proxy, answerer)) => Cow::Owned(format!(
-            "{BASE_KERNEL_CMDLINE} {HOSTNAME_PROXY_PORT_TOKEN}={proxy} \
-             {ZONE_ANSWERER_PORT_TOKEN}={answerer}"
+fn kernel_cmdline(rust_log: Option<&str>, proxy_port: Option<u16>) -> Cow<'static, str> {
+    // The port rides the boot line first: base, then the port token, then the
+    // filter when one is forwarded.
+    let base_with_port = match proxy_port {
+        Some(proxy) => Cow::Owned(format!(
+            "{BASE_KERNEL_CMDLINE} {HOSTNAME_PROXY_PORT_TOKEN}={proxy}"
         )),
         None => Cow::Borrowed(BASE_KERNEL_CMDLINE),
     };
 
     let Some(value) = rust_log else {
-        return base_with_ports;
+        return base_with_port;
     };
 
     // `<base-with-ports> RUST_LOG=<value>`: the three extra bytes are the
     // separating space, the `=`, and the NUL the kernel's buffer must also
     // hold.
-    let joined = format!("{base_with_ports} {GUEST_LOG_ENV}={value}");
+    let joined = format!("{base_with_port} {GUEST_LOG_ENV}={value}");
     let rejection = if value.is_empty() {
         Some("value is empty")
     } else if value.contains(char::is_whitespace) {
@@ -447,75 +443,42 @@ fn kernel_cmdline(rust_log: Option<&str>, node_ports: Option<(u16, u16)>) -> Cow
                 "not forwarding the host log filter to the guest; the guest keeps minimald's \
                  default filter",
             );
-            base_with_ports
+            base_with_port
         }
         None => Cow::Owned(joined),
     }
 }
 
-/// Reads the node ports the supervisor handed the VMM child in its env (see
-/// [`NODE_PROXY_PORT_ENV`]). Transport decoding only — the supervisor
-/// resolves the pair once (override or selection, `cmd/run.rs`) and hands
+/// Reads the node's proxy port the supervisor handed the VMM child in its env
+/// (see [`NODE_PROXY_PORT_ENV`]). Transport decoding only — the supervisor
+/// resolves the port once (override or selection, `cmd/run.rs`) and hands
 /// the one resolution down, so anything this decode cannot accept is a boot
 /// error naming the variable and the value, never a silent fallback that
-/// would let the guest select ports different from the ones the node row
-/// registered. `Ok(None)` when both variables are absent — the boot does
+/// would let the guest select a port different from the one the node row
+/// registered. `Ok(None)` when the variable is absent — the boot does
 /// not run under the supervisor, and the guest daemon then selects its own
 /// ports, the pre-handoff behaviour. A `0` passes through: the guest's own
 /// handed-port policy reads it as "select one yourself".
 // Only `apply` calls this; see `kernel_cmdline` for the cfg note.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn node_ports_from_env() -> Result<Option<(u16, u16)>, crate::error::VmError> {
-    let proxy = std::env::var(NODE_PROXY_PORT_ENV).ok();
-    let answerer = std::env::var(NODE_ANSWERER_PORT_ENV).ok();
-    node_ports_from_raw(proxy.as_deref(), answerer.as_deref())
+fn node_proxy_port_from_env() -> Result<Option<u16>, crate::error::VmError> {
+    node_proxy_port_from_raw(std::env::var(NODE_PROXY_PORT_ENV).ok().as_deref())
 }
 
-/// Decodes a handed node-port pair from its raw env values. `Ok(None)` only
-/// when both are absent; the handoff is both-or-neither, so a half-pair, and
-/// a value that does not decode, each fail the boot.
+/// Decodes a handed node proxy port from its raw env value. A value that does
+/// not decode fails the boot naming the variable and the value.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn node_ports_from_raw(
-    proxy: Option<&str>,
-    answerer: Option<&str>,
-) -> Result<Option<(u16, u16)>, crate::error::VmError> {
-    let decode = |name: &str, raw: Option<&str>| -> Result<Option<u16>, crate::error::VmError> {
-        let Some(raw) = raw else {
-            return Ok(None);
-        };
-        match raw.trim().parse::<u16>() {
-            Ok(port) => Ok(Some(port)),
-            Err(_) => Err(crate::error::VmError::Io {
-                source: std::io::Error::other(format!(
-                    "environment variable {name} carries {raw:?}, which is not a port"
-                )),
-            }),
-        }
+fn node_proxy_port_from_raw(proxy: Option<&str>) -> Result<Option<u16>, crate::error::VmError> {
+    let Some(raw) = proxy else {
+        return Ok(None);
     };
-    let proxy = decode(NODE_PROXY_PORT_ENV, proxy)?;
-    let answerer = decode(NODE_ANSWERER_PORT_ENV, answerer)?;
-    match (proxy, answerer) {
-        (None, None) => Ok(None),
-        (Some(proxy), Some(answerer)) => Ok(Some((proxy, answerer))),
-        (Some(_), None) | (None, Some(_)) => {
-            let proxy_set = proxy.is_some();
-            Err(crate::error::VmError::Io {
-                source: std::io::Error::other(format!(
-                    "the node port handoff is half-set: {} is set and {} is absent; \
-                     the handoff is both-or-neither",
-                    if proxy_set {
-                        NODE_PROXY_PORT_ENV
-                    } else {
-                        NODE_ANSWERER_PORT_ENV
-                    },
-                    if proxy_set {
-                        NODE_ANSWERER_PORT_ENV
-                    } else {
-                        NODE_PROXY_PORT_ENV
-                    }
-                )),
-            })
-        }
+    match raw.trim().parse::<u16>() {
+        Ok(port) => Ok(Some(port)),
+        Err(_) => Err(crate::error::VmError::Io {
+            source: std::io::Error::other(format!(
+                "environment variable {NODE_PROXY_PORT_ENV} carries {raw:?}, which is not a port"
+            )),
+        }),
     }
 }
 
@@ -661,54 +624,49 @@ mod tests {
 
     #[test]
     fn node_port_assigned_on_host_and_handed_to_daemon() {
-        // The ports the supervisor handed land on the boot line as the boot
-        // tokens the guest daemon reads, exactly as handed (the kernel hands
-        // unrecognized `KEY=VALUE` tokens to init as env vars).
-        let handed = "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 \
-                      MINIMALD_ZONE_ANSWERER_PORT=7656";
-        assert_eq!(kernel_cmdline(None, Some((7654, 7656))), handed);
+        // The port the supervisor handed lands on the boot line as the boot
+        // token the guest daemon reads, exactly as handed (the kernel hands
+        // unrecognized `KEY=VALUE` tokens to init as env vars). The answerer
+        // port never rides: on a VM-backed host the in-VM daemon starts no
+        // answerer (NET-138), so a token carrying one would be an admitted
+        // port with nothing behind it.
+        let handed = "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654";
+        assert_eq!(kernel_cmdline(None, Some(7654)), handed);
+        assert!(
+            !handed.contains("MINIMALD_ZONE_ANSWERER_PORT"),
+            "the boot line must not carry a zone-answerer port: {handed}"
+        );
 
-        // With both a filter and the ports, the tokens share the line.
+        // With both a filter and the port, the tokens share the line.
         assert_eq!(
-            kernel_cmdline(Some("debug"), Some((7654, 7656))),
-            "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 \
-             MINIMALD_ZONE_ANSWERER_PORT=7656 RUST_LOG=debug"
+            kernel_cmdline(Some("debug"), Some(7654)),
+            "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 RUST_LOG=debug"
         );
 
         // A filter that would push the whole line past the buffer is skipped
-        // while the ports still boot: the line keeps the handed ports and
+        // while the port still boots: the line keeps the handed port and
         // drops the filter, rather than corrupting a token the guest binds.
-        let ports_only = kernel_cmdline(None, Some((7654, 7656)));
-        let oversized = "d".repeat(COMMAND_LINE_SIZE - ports_only.len() - GUEST_LOG_ENV.len() - 1);
+        let port_only = kernel_cmdline(None, Some(7654));
+        let oversized = "d".repeat(COMMAND_LINE_SIZE - port_only.len() - GUEST_LOG_ENV.len() - 1);
         assert_eq!(
-            kernel_cmdline(Some(&oversized), Some((7654, 7656))),
-            ports_only,
-            "an oversized filter is skipped; the handed ports still boot"
+            kernel_cmdline(Some(&oversized), Some(7654)),
+            port_only,
+            "an oversized filter is skipped; the handed port still boots"
         );
 
         // The handoff decode is strict, because the supervisor resolves the
-        // pair once and anything undecodable here would boot the guest onto
-        // ports different from the ones the node row registered: both
-        // variables absent is the pre-handoff boot (no tokens), a complete
-        // pair decodes, and a half-pair or a value that is not a port is a
-        // surfaced error naming the variable and the value.
-        assert_eq!(node_ports_from_raw(None, None).unwrap(), None);
-        assert_eq!(
-            node_ports_from_raw(Some("7654"), Some("7656")).unwrap(),
-            Some((7654, 7656))
-        );
-        let half = node_ports_from_raw(Some("7654"), None)
+        // port once and anything undecodable here would boot the guest onto a
+        // port different from the one the node row registered: the variable
+        // absent is the pre-handoff boot (no token), a value decodes, and a
+        // value that is not a port is a surfaced error naming the variable
+        // and the value.
+        assert_eq!(node_proxy_port_from_raw(None).unwrap(), None);
+        assert_eq!(node_proxy_port_from_raw(Some("7654")).unwrap(), Some(7654));
+        let garbage = node_proxy_port_from_raw(Some("no-port-here"))
             .unwrap_err()
             .to_string();
         assert!(
-            half.contains("half-set") && half.contains(NODE_PROXY_PORT_ENV),
-            "a half-pair names the handoff's shape, got: {half}"
-        );
-        let garbage = node_ports_from_raw(None, Some("no-port-here"))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            garbage.contains(NODE_ANSWERER_PORT_ENV) && garbage.contains("no-port-here"),
+            garbage.contains(NODE_PROXY_PORT_ENV) && garbage.contains("no-port-here"),
             "an undecodable value names the variable and the value, got: {garbage}"
         );
     }
