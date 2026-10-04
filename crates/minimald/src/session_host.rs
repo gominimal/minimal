@@ -4082,7 +4082,17 @@ impl SessionLauncher for SandboxLauncher {
                 decision.can_decide_per_box(),
                 policy.egress.as_ref(),
             ) {
-                let refusal = crate::net::classifier::unenforceable_declaration_words(&rules);
+                // The one typed error the create returns over the same
+                // rules: `InvalidInput`, not an `other` failure, so the
+                // refusal is the same machine-mode failure wherever a
+                // client meets it — the create's RPC arm keys on this
+                // kind, and the kind is what an `io::Error` carries to
+                // whatever downstream reads it. A launch hits the boxes
+                // the create's gate never saw — created before the host
+                // could decide per box, persisted from before the gate
+                // existed — so the two refusals must not read as two
+                // different failures of the same declaration.
+                let refusal = crate::net::classifier::unenforceable_declaration_refusal(&rules);
                 tracing::info!(
                     session = %session_name,
                     network_mode = ?network_mode,
@@ -4091,7 +4101,7 @@ impl SessionLauncher for SandboxLauncher {
                     "refusing a host-address box whose declaration names rules \
                      this host's classifier cannot enforce"
                 );
-                return Err(io::Error::other(refusal));
+                return Err(refusal);
             }
             let leaf = create_session_leaf(
                 &classifier_root,

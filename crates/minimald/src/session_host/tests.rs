@@ -3127,9 +3127,11 @@ async fn a_native_launch_over_either_probe_cause_runs_records_none_and_advises()
 /// there: one predicate, two call sites, and the launch's is what keeps
 /// the box from running placed and looking decided while its rules go
 /// unenforced. Refused *before* the leaf is allocated, so the box never
-/// lands in `boxes/allow`, and the refusal's words are the ones the create
-/// would have said — each rule by the field that names it, and the mode
-/// that enforces them.
+/// lands in `boxes/allow`; the refusal's words are the ones the create
+/// would have said — each rule by the field that names it, the remedy at
+/// the end, and the mode that enforces them — and its error is the
+/// create's own typed one, so the refusal maps to the same machine-mode
+/// code wherever the declaration meets it.
 ///
 /// Driven over a stand-in tree the test builds, so the proof runs
 /// everywhere: the launcher reads the stand-in's root *and* its mount
@@ -3250,8 +3252,8 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
     )
     .await
     .expect("the launch decides within its timeout");
-    let refusal = match refused {
-        Err(e) => e.to_string(),
+    let (refusal, refusal_kind) = match refused {
+        Err(e) => (e.to_string(), e.kind()),
         Ok(launched) => {
             drop(launched);
             panic!(
@@ -3268,6 +3270,22 @@ async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_b
         refusal.contains("own-address boxes enforce them"),
         "the launch's refusal says own-address boxes enforce these rules, \
          the same words the create's would have said: {refusal}"
+    );
+    assert!(
+        refusal.contains("remove these rules"),
+        "the launch's refusal ends with what to do, the same remedy the \
+         create's would have named: {refusal}"
+    );
+    // The refusal the launch returned is the create's own typed error, not
+    // an unspecified failure: the same declaration is the same
+    // machine-mode code wherever a client meets it — the create's RPC
+    // answer keys on this kind, so a box refused at a create and refused
+    // again at a launch reads as one failure, not two.
+    assert_eq!(
+        refusal_kind,
+        std::io::ErrorKind::InvalidInput,
+        "the launch's refusal is typed the way the create's is, so both \
+         map to the same machine-mode code: {refusal}"
     );
 
     // The box never landed in `boxes/allow`: the refusal is before the leaf

@@ -435,10 +435,10 @@ async fn serve_create_session(
                 // arm — a host-address declaration whose rules this host's
                 // classifier cannot enforce is refused at create while the
                 // host decides per box, and its typed error names each
-                // unenforced rule and says own-address boxes enforce them, so
+                // unenforced rule and ends with what to do about them, so
                 // the person who typed the declaration is told which parts
-                // could not be honoured rather than reading a transport
-                // failure off the activate.
+                // could not be honoured — and what to type instead — rather
+                // than reading a transport failure off the activate.
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
                     error: e.to_string(),
                 },
@@ -3911,13 +3911,17 @@ mod tests {
     /// declaration names rules the classifier cannot enforce is refused at
     /// create — before anything is allocated, so no record, no held name,
     /// no actor survives the refusal — and the typed error the client reads
-    /// off the activate names each unenforced rule and says own-address
-    /// boxes enforce them. The daemon logs one info line per refused create
-    /// naming the box, the host's per-box value in the machine spelling, and
-    /// each unenforced rule; the refusal counter counts each one. An
-    /// own-address box's declaration is enforced on the address the box
-    /// holds, so it is never refused on this ground, whatever the host
-    /// decides.
+    /// off the activate names each unenforced rule, says own-address boxes
+    /// enforce them, and ends with what to do about the rules it named. The
+    /// refusal rides this RPC's `InvalidInput` arm — the arm a kind other
+    /// than the typed one never reaches, answering as an internal error
+    /// instead — so the create's refusal is the same machine-mode code the
+    /// launch's identically-typed error carries. The daemon logs one info
+    /// line per refused create naming the box, the host's per-box value in
+    /// the machine spelling, and each unenforced rule; the refusal counter
+    /// counts each one. An own-address box's declaration is enforced on the
+    /// address the box holds, so it is never refused on this ground,
+    /// whatever the host decides.
     // The guard is taken before the server is even built and held across the
     // awaited creates on purpose: the fact is process-global, so under
     // libtest another test's create in the window would answer over it too.
@@ -3952,6 +3956,11 @@ mod tests {
             }),
             None,
         );
+        // The refusal arrives over the RPC's `InvalidInput` arm — the arm
+        // the typed error keys on, where any other kind answers as an
+        // internal error and the call never yields an `Errorable::Err` —
+        // so what the create reads here is the machine-mode code the
+        // launch's identically-typed refusal carries too.
         let error = match client.call::<CreateSession>(&deny_a_range).await {
             Errorable::Err { error } => error,
             other => panic!("a per-box host refuses the denied range, got: {other:?}"),
@@ -3968,6 +3977,16 @@ mod tests {
             error.contains("own-address boxes enforce them"),
             "the refusal says own-address boxes enforce these rules, so the \
              person who typed the declaration is told where they do work: {error}"
+        );
+        // The refusal ends with what to do: remove the rules, declare the
+        // one shape this host's classifier enforces, or take the mode that
+        // enforces them — the words a person reads last are the ones they
+        // can act on.
+        assert!(
+            error.contains("remove these rules")
+                && error.contains("declare deny-all egress")
+                && error.contains("all three allow lists present and empty"),
+            "the refusal names the remedy for the rules it refused: {error}"
         );
 
         let mut allow_a_subnet = req("refused-allow-list", "/uwu");

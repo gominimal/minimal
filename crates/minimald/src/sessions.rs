@@ -1031,7 +1031,7 @@ impl Manager {
             crate::session_host::host_ip_enforcement_fact().can_decide_per_box(),
             config.policy.egress.as_ref(),
         ) {
-            let refusal = crate::net::classifier::unenforceable_declaration_words(&rules);
+            let refusal = crate::net::classifier::unenforceable_declaration_refusal(&rules);
             REFUSED_UNENFORCEABLE_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
                 session_name = ?config.name,
@@ -1042,10 +1042,7 @@ impl Manager {
                 "refused a create whose host-address declaration names rules \
                  this host's classifier cannot enforce"
             );
-            return Err(SessionsError::new(
-                std::io::ErrorKind::InvalidInput,
-                refusal,
-            ));
+            return Err(refusal);
         }
         // Allocate the record up front: `store.create` assigns the id and
         // catches a name collision (`AlreadyExists`) before any actor exists.

@@ -221,9 +221,13 @@ pub(crate) fn refuses_unenforceable_declaration(
 
 /// The refusal's words, spelled once for the two paths that make it: each
 /// unenforced rule by the field that names it, why this host has no rule
-/// for any of them, and the mode that enforces them — the words are the
-/// typed error a client sees, so the create and the launch say the same
-/// thing about the same declaration.
+/// for any of them, and — at the end, where a person still reading is
+/// looking — what to do about it: remove the rules, or declare the one
+/// shape this host's classifier enforces, or take the mode that enforces
+/// them. A refusal that names what it refused without saying how to get
+/// the box running leaves a person with nothing to type, and the words
+/// are the typed error a client sees, so the create and the launch say
+/// the same thing about the same declaration.
 pub(crate) fn unenforceable_declaration_words(rules: &[UnenforceableRule]) -> String {
     let named = rules
         .iter()
@@ -233,10 +237,29 @@ pub(crate) fn unenforceable_declaration_words(rules: &[UnenforceableRule]) -> St
     format!(
         "this host decides a host-address box's egress verdict per box, and \
          its classifier cannot enforce the rules this box's declaration \
-         names: {named} — the per-box verdict the loaded table decides is \
-         deny-all alone (every allow_* list present and empty) or nothing, \
-         so the box was refused rather than run with these rules unenforced; \
-         own-address boxes enforce them (`--network own_ip`)"
+         names: {named} — the host-address classifier enforces only \
+         deny-all until declared address rules are supported, and the \
+         per-box verdict the loaded table decides is deny-all alone \
+         (every allow_* list present and empty) or nothing, so the box \
+         was refused rather than run with these rules unenforced; remove \
+         these rules, or declare deny-all egress instead — the box's \
+         `egress` section, all three allow lists present and empty, and \
+         no deny entries — or run the box with `--network own_ip` \
+         (own-address boxes enforce them)"
+    )
+}
+
+/// The refusal both paths return over these rules (NET-079), typed once:
+/// the create's `InvalidInput` is the launch's too, so the same
+/// declaration's refusal is the same machine-mode failure wherever a
+/// client meets it — at a create, where the RPC's `InvalidInput` arm is
+/// the machine's reading of it, or at a launch, where an `io::Error`'s
+/// kind is the one thing downstream that carries it — and the words both
+/// paths log and print are the one string above.
+pub(crate) fn unenforceable_declaration_refusal(rules: &[UnenforceableRule]) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        unenforceable_declaration_words(rules),
     )
 }
 
@@ -1979,6 +2002,22 @@ mod tests {
             ],
             "the narrowing is named whatever it narrows from"
         );
+        // A present-but-empty allow list names its rule *alone*: with the
+        // other two allow lists absent the declaration is not the deny-all
+        // shape, so the empty list is a narrowing by itself — "refuse
+        // every subnet, allow everything else" — and the classifier has no
+        // verdict for that half of it.
+        let lone_empty_allow_list = sessions::EgressPolicy {
+            allow_subnets: Some(vec![]),
+            ..Default::default()
+        };
+        assert_eq!(
+            unenforceable_rules(Some(&lone_empty_allow_list)),
+            vec![UnenforceableRule::AllowSubnets],
+            "a lone present-but-empty allow list is unenforceable, named \
+             by the field that carries it: it is not the deny-all shape \
+             while the other two allow lists are absent"
+        );
 
         // The words the two refusal paths say name each rule by the field
         // the person typed, and say the mode that enforces them — the
@@ -1994,8 +2033,33 @@ mod tests {
             "the refusal names every rule: {words}"
         );
         assert!(
-            words.contains("--network own_ip"),
+            words.contains("--network own_ip") && words.contains("own-address boxes enforce them"),
             "the refusal says own-address boxes enforce these rules: {words}"
+        );
+        // The words end with what to do: a refusal that names the rules it
+        // refused and stops leaves a person with nothing to type, so the
+        // tail is the remedy — remove these rules, declare the one shape
+        // this host's classifier enforces (spelled by the egress section,
+        // not a flag: the CLI has none that writes an empty list), or take
+        // the mode that enforces them — and the why ahead of it is the
+        // classifier's own limit, the thing a person cannot fix from the
+        // declaration.
+        assert!(
+            words.contains("remove these rules")
+                && words.contains("declare deny-all egress")
+                && words.contains("`egress` section")
+                && words.contains("all three allow lists present and empty")
+                && words.contains("no deny entries")
+                && words.contains(
+                    "the host-address classifier enforces only deny-all \
+                     until declared address rules are supported"
+                ),
+            "the refusal says what to do about the rules it named: {words}"
+        );
+        assert!(
+            words.ends_with("(own-address boxes enforce them)"),
+            "the words end with the remedy, so what a person reads last is \
+             what they can do: {words}"
         );
 
         // The gate folds the host in: a host that decides per box refuses
@@ -2037,6 +2101,38 @@ mod tests {
                 "{why}"
             );
         }
+    }
+
+    /// NET-079: the create and the launch make the one refusal — the same
+    /// typed error over the same rules, not two spellings of one finding —
+    /// so the same declaration's refusal maps to the same machine-mode
+    /// code wherever a client meets it: at a create, whose RPC answer keys
+    /// on the kind, and at a launch, whose `io::Error` carries the kind to
+    /// whatever reads it downstream. An `other` would be an unspecified
+    /// failure — the words identical, the code beneath them not — and a
+    /// declaration refused at a create and refused again at a launch would
+    /// read as two different failures of the same box.
+    #[test]
+    fn unenforceable_declaration_refusal_is_one_typed_error_for_create_and_launch() {
+        let deny_a_range = sessions::EgressPolicy {
+            deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+            ..Default::default()
+        };
+        let rules = unenforceable_rules(Some(&deny_a_range));
+        let refusal = unenforceable_declaration_refusal(&rules);
+        assert_eq!(
+            refusal.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "the refusal the create and the launch both return is the \
+             create's own typed error — the kind its RPC arm keys on — so \
+             the launch's refusal is not an unspecified failure but the \
+             same machine-mode code the create's was"
+        );
+        assert_eq!(
+            refusal.to_string(),
+            unenforceable_declaration_words(&rules),
+            "the typed error carries the one words string both paths say"
+        );
     }
 
     /// NET-079: the declaration that admits no destination — spelled the
