@@ -160,6 +160,14 @@
 #                                    its own box's switch address — two boxes
 #                                    live at once, and each answer names its
 #                                    own box, never the other's
+#   escape_reaches_only_declared_union
+#                                    NET-085 end to end: a root escapee
+#                                    spoofing another box's address at the
+#                                    host-side egress gate reaches nothing
+#                                    beyond the resident union of declared
+#                                    egress plus the baseline set; also
+#                                    pins no CAP_NET_RAW/CAP_NET_ADMIN in
+#                                    a box and no IPv6 route in the guest
 #   daemon_fetch_under_deny_all_host_address_box
 #                                    NET-080 under the loaded classifier table:
 #                                    the privileged step's tree and table
@@ -252,6 +260,10 @@ BOXREG_CTRLC_SEED_DIR="" # its Ctrl-C seed (carries bulk data); removed on teard
 BOXREG_CTRLC_PID="" # its interrupted activate; INT then KILL on teardown
 BEPB_SEED_DIR_A="" # seeded by the proxy-source proof below; removed on teardown
 BEPB_SEED_DIR_B="" # its second box's seed; removed on teardown
+ESU_A_SEED_DIR="" # the escape-union proof's box A seed; removed on teardown
+ESU_B_SEED_DIR="" # its box B seed; removed on teardown
+ESU_LISTENER_PID="" # its host listener; killed on teardown
+ESU_LISTEN_PORT="" # the port the listener binds; this proof's own band
 NET080_SEED_DIR="" # seeded by the daemon-fetch proof below; removed on teardown
 # The classifier tree+table the daemon-fetch proof installs when the lane has
 # none. A run that dies between that install and the proof's own uninstall must
@@ -617,6 +629,13 @@ teardown() {
   # trap is the one place that always sees them.
   [ -n "$BEPB_SEED_DIR_A" ] && rm -rf "$BEPB_SEED_DIR_A"
   [ -n "$BEPB_SEED_DIR_B" ] && rm -rf "$BEPB_SEED_DIR_B"
+  # The escape-union proof's seeds follow the same rule, and its host listener
+  # is a background python the trap must not leave holding the port.
+  [ -n "$ESU_A_SEED_DIR" ] && rm -rf "$ESU_A_SEED_DIR"
+  [ -n "$ESU_B_SEED_DIR" ] && rm -rf "$ESU_B_SEED_DIR"
+  if [ -n "$ESU_LISTENER_PID" ]; then
+    kill "$ESU_LISTENER_PID" 2>/dev/null || true
+  fi
   # The forward holds the laptop-side listener; INT is the documented stop,
   # KILL the backstop so a hung relay cannot outlive the run.
   if [ -n "$RETIRED_FWD_PID" ]; then
@@ -7715,8 +7734,8 @@ proof_switch_answers_no_arp_for_the_proxy_address() {
 # Ordered late in the whole-lane run on purpose: it restarts the daemon (see
 # the RUST_LOG note inside) and nothing after it depends on the one before.
 # The proxy_sees_each_vm_box_by_its_switch_address case, which the dispatch
-# runs after this one, last of all, stops and respawns both daemons for its
-# own filter and stand-in.
+# runs after this one, stops and respawns both daemons for its own filter
+# and stand-in.
 proof_github_only_allowlist() {
   echo "::group::github-only allowlist: toolchain fetches, nothing else, one refused answer, empty lookups, box-zone reach"
 
@@ -8587,7 +8606,7 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
 # other's. Gated on MINVMD_GVPROXY_BIN like the cases above: without a switch
 # there is no delivery to observe.
 #
-# Ordered LAST in the whole-lane run on purpose: it stops the daemon (so the
+# Ordered late in the whole-lane run on purpose: it stops the daemon (so the
 # next activation autospawns one carrying the stand-in's flag) and nothing
 # after it depends on a daemon it did not spawn.
 proof_proxy_sees_each_vm_box_by_its_switch_address() {
@@ -8964,11 +8983,946 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
   echo "::endgroup::"
 }
 
+# NET-085, at the VM boundary, end to end — the bound an escapee meets: a
+# process with root inside the VM spoofing another box's address reaches
+# nothing beyond the resident union of declared egress plus the node-plane
+# baseline set. The escapee's two paths out are both taken here:
+#
+#   * path (a), the guest's own interface, is pinned by its precondition:
+#     no box holds CAP_NET_RAW or CAP_NET_ADMIN (NET-083), read from
+#     /proc/self/status inside each box, so the raw-socket route around the
+#     in-VM relay is gone and whatever the relay forwards is bounded by its
+#     own lease check (NET-084, unit-pinned by `relay_rejects_non_lease_source`
+#     in crates/minimald — the exec surface this script drives cannot inject
+#     a foreign-source frame without the very capability the box lacks, so
+#     the gate below is the other half of that seal).
+#
+#   * path (b), the shuttle connection to the host-side egress gate, is
+#     driven the way the in-crate harness drives it
+#     (crates/minvmd/tests/vm_escape_integration.rs): the case speaks the
+#     shuttle's own protocol at the gate's landing edge — the /connect
+#     upgrade head and length-framed Ethernet frames, the byte stream a root
+#     escapee's connection carries past that edge — wearing each source
+#     address in turn against a host listener the fabric's NAT maps the host
+#     alias to.
+#
+# Two resident boxes with disjoint declared egress bound the union: box A
+# declares 10.0.0.0/8, box B 192.168.0.0/16, and both declare the fabric
+# (100.64.0.0/16), which carries the host alias — inside the union for a
+# box's own address, and the node-plane baseline set's one category-pair
+# (NET-130: the alias is the registry and the cache, shown beside the rules
+# by `min session policy`). The arms:
+#
+#   * each box's own probe to the host alias arrives — the whole chain
+#     working, and the union's fabric half live for a box's own address;
+#   * a made-up in-plan lease — an address the plan could hand out and no
+#     row holds — reaches the alias under the shipped interim, the spoofer's
+#     liveness bracket: its frames traverse the gate, the switch and the NAT
+#     when nothing refuses them, and the gate's interim line names the
+#     source. Recorded the way the in-crate harness records it, so the arm
+#     is flip-stable: when the per-box default binds, the same flow is
+#     refused before any frame leaves the VM and the unknown-source line
+#     names it instead;
+#   * box A's address toward 192.168.77.7, declared only by box B — the
+#     union's other half — is refused: the row that holds the source address
+#     decides, and box A's row does not cover it (the RFC 1918 the
+#     infrastructure set takes where the row's own allow-list does not);
+#   * box B's address toward 10.0.0.7, box A's private half, refused the
+#     same way from the other side;
+#   * box A's address toward 198.51.100.7 — beyond the whole union — is
+#     refused by box A's own rules (egress-undeclared-subnet);
+#   * an address outside the plan's lease block is refused outright
+#     (egress-unknown-source), under either posture: outside the plan there
+#     is no lease to spoof.
+#
+# The refused arms send only the SYN — no ARP claim, no ARP answer — because
+# a claim would ADMIT at the gate (the row that holds the address has no
+# opinion on neighbor resolution) and every admitted frame's source is
+# attributed to the connection that carried it, whose end withdraws the row
+# (NET-133): a drop arm that claimed would retire a live box's row as a side
+# effect. A refused SYN is never attributed; the one arm whose flow
+# completes wears a lease no row holds, so its connection's end has nothing
+# to withdraw.
+#
+# The guest's IPv4 route table is printed as the case's diagnostic (the task
+# names it), and its IPv6 half asserted EMPTY: the guest boots with
+# ipv6.disable=1 (NET-082), so no netns inside it — a box's included — can
+# hold a v6 route. The case stops and respawns the daemon pair (the filter
+# its registration reads need, see below); the dispatch keeps it beside the
+# other VM-daemon cases and ahead of the daemon-fetch case, which respawns
+# the pair again for its own.
+proof_escape_reaches_only_declared_union() {
+  local esu_sid_a="" esu_sid_b="" esu_ip_a="" esu_ip_b=""
+  local esu_rec_a="" esu_rec_b="" esu_out="" esu_rows="" esu_line=""
+  local esu_route="" esu_v6="" esu_cmdline="" esu_policy="" esu_caps=""
+  local esu_log0="" esu_log0_lines=0 esu_alias="100.64.255.254"
+  local esu_gate_sock="" esu_listener_log=""
+  echo "::group::escape into the VM reaches only the declared union (NET-085)"
+
+  if [ "$min_daemon" != minvmd ]; then
+    echo "escape-union proof SKIPPED (this run's daemon is minimald: a native host has no VM boundary for an escapee to cross — the proof runs where the CLI is VM-backed, which macOS is with no flag at all)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "escape-union proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so there is no host-side egress gate to test the bound at)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The two seeds: the disjoint declared egress rides on the box specs — one
+  # private range each, plus the fabric they share, so a box's own probe to
+  # the host alias is inside its own declaration.
+  ESU_A_SEED_DIR="$(hook_mktemp /tmp/mnlesc-a.XXXXXX)"
+  hook_seed_preamble > "$ESU_A_SEED_DIR/minimal.toml"
+  mkdir "$ESU_A_SEED_DIR/.git"
+  ESU_B_SEED_DIR="$(hook_mktemp /tmp/mnlesc-b.XXXXXX)"
+  hook_seed_preamble > "$ESU_B_SEED_DIR/minimal.toml"
+  mkdir "$ESU_B_SEED_DIR/.git"
+
+  # The gate's landing edge: the socket beside the switch socket, where the
+  # guest's relay connections arrive and where this case's spoofer arrives
+  # too. The listener's port is this case's own band, beside the proxy
+  # proof's 18080-18093.
+  esu_gate_sock="$XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-gate.sock"
+  esu_listener_log="$WORK/esu-listener.log"
+  ESU_LISTEN_PORT=18094
+  if python3 -c "import socket; socket.create_connection(('127.0.0.1', $ESU_LISTEN_PORT), 2)" \
+      2>/dev/null; then
+    echo "::error::127.0.0.1:$ESU_LISTEN_PORT already answers on this host; the escape-union proof needs it free for its listener"
+    esu_fail
+  fi
+
+  # The listener: host loopback behind the fabric's NAT (the host alias maps
+  # to 127.0.0.1 for every port), one line per event, flushed as it happens,
+  # so a marker is readable the moment its sender pushed it.
+  cat > "$WORK/esu-listener.py" <<'ESU_LISTENER_EOF'
+"""The host listener the fabric's NAT maps the host alias to.
+
+Every accepted connection is read on its own thread and held open for its
+budget: the NAT dials this listener when the SYN arrives, before the
+handshake it proxies completes, so a connection's clock starts before its
+sender has seen the SYN-ACK it must answer before it can push. Each event is
+appended and flushed as it happens, so a caller can wait for a marker the
+moment its bytes land. stdlib only.
+"""
+import argparse
+import socket
+import threading
+import time
+
+BUDGET = 30.0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--log", required=True)
+    args = parser.parse_args()
+    lock = threading.Lock()
+    started = time.monotonic()
+
+    def log(line):
+        with lock:
+            with open(args.log, "a") as handle:
+                handle.write(line + "\n")
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", args.port))
+    listener.listen(16)
+    listener.settimeout(0.2)
+    log(f"listening on 127.0.0.1:{args.port}")
+
+    def read_connection(conn):
+        at = time.monotonic() - started
+        log(f"accepted at +{at:.1f}s")
+        conn.settimeout(0.2)
+        end = time.monotonic() + BUDGET
+        got = 0
+        while time.monotonic() < end:
+            try:
+                chunk = conn.recv(256)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            got += len(chunk)
+            log("marker " + chunk.decode("utf-8", "replace"))
+            if got >= 256:
+                break
+        log(f"closed at +{time.monotonic() - started:.1f}s after {got} bytes")
+
+    while True:
+        try:
+            conn, _ = listener.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        conn.settimeout(0.2)
+        threading.Thread(target=read_connection, args=(conn,), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()
+ESU_LISTENER_EOF
+  : > "$esu_listener_log"
+  python3 "$WORK/esu-listener.py" --port "$ESU_LISTEN_PORT" --log "$esu_listener_log" \
+    >"$WORK/esu-listener.out" 2>"$WORK/esu-listener.err" &
+  ESU_LISTENER_PID=$!
+  esu_line=""
+  for _ in $(seq 1 40); do
+    esu_line="$(grep '^listening ' "$esu_listener_log" 2>/dev/null)" && break
+    sleep 0.25
+  done
+  if [ -z "$esu_line" ]; then
+    echo "::error::the host listener never came up on 127.0.0.1:$ESU_LISTEN_PORT"
+    cat "$WORK/esu-listener.err" 2>/dev/null || true
+    esu_fail
+  fi
+  echo "host listener: $esu_line (behind the fabric's NAT, which maps $esu_alias to 127.0.0.1)"
+
+  # This case's failures must name the host daemon's own log — the sink the
+  # gate's drop and admit lines land in — scoped to the lines the daemon this
+  # case spawns wrote: the whole run's daemons share the daily-rotated file,
+  # so an unscoped grep reads the earlier cases' daemons too. The same two
+  # helpers the proxy-source case uses.
+  esu_host_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
+      | sort -r | head -n1
+  }
+  esu_case_log() {
+    local f
+    f="$(esu_host_log)"
+    [ -n "$f" ] || return 0
+    if [ "$f" = "$esu_log0" ] && [ "$esu_log0_lines" -gt 0 ]; then
+      tail -n +"$((esu_log0_lines + 1))" "$f" 2>/dev/null
+    else
+      # A rotation mid-case: the newest file postdates the snapshot, so every
+      # line in it is this case's.
+      cat "$f" 2>/dev/null
+    fi
+  }
+  esu_gate_line() {
+    # The gate's own line for one source under one rule, this case's lines
+    # only; prints it, nonzero when this case's daemon wrote none.
+    local line
+    line="$(esu_case_log | grep -F "\"source\":\"$1\"" \
+      | grep -F "\"rule_matched\":\"$2\"" | tail -n1)"
+    [ -n "$line" ] || return 1
+    printf '%s\n' "$line"
+  }
+  esu_wait_gate_line() {
+    for _ in $(seq 1 20); do
+      if esu_line="$(esu_gate_line "$1" "$2")"; then
+        printf '%s\n' "$esu_line"
+        return 0
+      fi
+      sleep 0.25
+    done
+    return 1
+  }
+  esu_wait_marker() {
+    for _ in $(seq 1 "$2"); do
+      grep -q -- "$1" "$esu_listener_log" && return 0
+      sleep 0.25
+    done
+    return 1
+  }
+  # Every failure path below: stop the listener, name its record and the
+  # gate's own lines, then the global diagnostics.
+  esu_fail() {
+    if [ -n "${ESU_LISTENER_PID:-}" ]; then
+      kill "$ESU_LISTENER_PID" 2>/dev/null || true
+      ESU_LISTENER_PID=""
+    fi
+    echo "--- this case's listener record ---"
+    cat "$esu_listener_log" 2>/dev/null || true
+    echo "--- this case's gate lines ---"
+    esu_case_log 2>/dev/null \
+      | grep -e 'egress-unregistered-source' -e 'egress-unknown-source' \
+          -e 'egress-infrastructure-destination' -e 'egress-undeclared-subnet' \
+      || true
+    fail
+  }
+
+  # Snapshot the shared host log before this case's daemon exists — the
+  # activations below autospawn it — so esu_case_log scopes to the lines it
+  # gained from here on.
+  esu_log0="$(esu_host_log)"
+  esu_log0_lines=0
+  if [ -n "$esu_log0" ]; then
+    esu_log0_lines="$(wc -l <"$esu_log0" 2>/dev/null)" || esu_log0_lines=0
+  fi
+
+  # Stop whatever daemon pair is up — the proxy-source case leaves both
+  # running — so the first activation below autospawns a fresh VM host
+  # daemon under the pinned record filter: the registration records this
+  # case reads the box addresses from are INFO, which the lane's default
+  # `warn,minimald::exec=info` filter drops (the daemon inherits RUST_LOG at
+  # autospawn; see the header). The gate's drop lines are WARN and pass
+  # either way.
+  mnl stop --force >/dev/null 2>&1 || true
+  if [ -n "$E2E_VM" ]; then
+    minvmd stop >/dev/null 2>&1 || true
+  fi
+
+  esu_sid_a="$(cd "$ESU_A_SEED_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . \
+    --no-prompt --name e2e-esc-a --network own_ip \
+    --allow-subnets 10.0.0.0/8 --allow-subnets 100.64.0.0/16 \
+    --allow-protocols tcp \
+    2>"$WORK/esu-activate-a.err")" || {
+    echo "::error::box A's activate (--network own_ip, 10.0.0.0/8 and the fabric declared) failed"
+    cat "$WORK/esu-activate-a.err" 2>/dev/null || true
+    esu_fail
+  }
+  esu_sid_a="$(printf '%s\n' "$esu_sid_a" | tail -n1 | tr -d '\r')"
+  if ! printf '%s' "$esu_sid_a" | grep -Eqx \
+    '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+    echo "::error::box A's activate printed no session id: '$esu_sid_a'"
+    cat "$WORK/esu-activate-a.err" 2>/dev/null || true
+    esu_fail
+  fi
+  esu_sid_b="$(cd "$ESU_B_SEED_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . \
+    --no-prompt --name e2e-esc-b --network own_ip \
+    --allow-subnets 192.168.0.0/16 --allow-subnets 100.64.0.0/16 \
+    --allow-protocols tcp \
+    2>"$WORK/esu-activate-b.err")" || {
+    echo "::error::box B's activate (--network own_ip, 192.168.0.0/16 and the fabric declared) failed"
+    cat "$WORK/esu-activate-b.err" 2>/dev/null || true
+    esu_fail
+  }
+  esu_sid_b="$(printf '%s\n' "$esu_sid_b" | tail -n1 | tr -d '\r')"
+  if ! printf '%s' "$esu_sid_b" | grep -Eqx \
+    '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'; then
+    echo "::error::box B's activate printed no session id: '$esu_sid_b'"
+    cat "$WORK/esu-activate-b.err" 2>/dev/null || true
+    esu_fail
+  fi
+
+  # The rows exist: one registration record per box, straight from the VM
+  # host daemon — the daemon's own word that the table holds each box's
+  # address and its declared egress, the row the gate decides a spoofed
+  # frame by. The addresses are read from the records, never assumed: the
+  # fresh VM's registry hands them out.
+  esu_rec_a="" esu_rec_b=""
+  for _ in $(seq 1 40); do
+    if [ -z "$esu_rec_a" ]; then
+      esu_rec_a="$(minvmd_log_lines \
+        'registered box with the VM host daemon; addresses allocated' \
+        | grep -F '"box":"e2e-esc-a"' | tail -n1)"
+    fi
+    if [ -z "$esu_rec_b" ]; then
+      esu_rec_b="$(minvmd_log_lines \
+        'registered box with the VM host daemon; addresses allocated' \
+        | grep -F '"box":"e2e-esc-b"' | tail -n1)"
+    fi
+    [ -n "$esu_rec_a" ] && [ -n "$esu_rec_b" ] && break
+    sleep 0.25
+  done
+  if [ -z "$esu_rec_a" ] || [ -z "$esu_rec_b" ]; then
+    echo "::error::the VM host daemon's log carries no registration record for the escape-union boxes after activate"
+    esu_fail
+  fi
+  esu_ip_a="$(printf '%s\n' "$esu_rec_a" \
+    | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
+  esu_ip_b="$(printf '%s\n' "$esu_rec_b" \
+    | sed -n 's/.*"switch_address":"\([0-9.]*\)".*/\1/p')"
+  if [ -z "$esu_ip_a" ] || [ -z "$esu_ip_b" ]; then
+    echo "::error::a registration record does not name the switch address it allocated (A: $esu_ip_a, B: $esu_ip_b)"
+    esu_fail
+  fi
+  echo "box A: $esu_sid_a at switch address $esu_ip_a (declared 10.0.0.0/8 + the fabric)"
+  echo "box B: $esu_sid_b at switch address $esu_ip_b (declared 192.168.0.0/16 + the fabric)"
+
+  # ---- path (a)'s precondition: the boxes hold no raw-socket capability ---
+  # NET-083 (and the seal NET-084 rides on): the box may not forge frames on
+  # the guest's own interface. Both bounding and effective sets are read —
+  # the bounding set is the one an exec does not clear — and asserted free
+  # of CAP_NET_ADMIN (12) and CAP_NET_RAW (13), 0x3000 both, the same mask
+  # the in-crate harness asserts with.
+  for esu_box in a b; do
+    sid_var="esu_sid_$esu_box"
+    # shellcheck disable=SC2016 # `$k` and `$v` must reach the SESSION's shell unexpanded.
+    if ! esu_caps="$(mnl session exec "${!sid_var}" \
+        'while read -r k v; do case "$k" in CapEff*|CapBnd*) echo "$k $v";; esac; done < /proc/self/status' \
+        2>"$WORK/esu-caps-$esu_box.err")"; then
+      echo "::error::reading box $esu_box's capability sets over exec failed"
+      cat "$WORK/esu-caps-$esu_box.err" 2>/dev/null || true
+      esu_fail
+    fi
+    echo "box $esu_box's capability sets (CAP_NET_ADMIN/CAP_NET_RAW must be clear):"
+    printf '%s\n' "$esu_caps" | sed 's/^/  /'
+    for esu_set in CapEff CapBnd; do
+      esu_line="$(printf '%s\n' "$esu_caps" | tr -d '\r' \
+        | sed -n "s/^$esu_set:[[:space:]]*//p" | head -n1)"
+      if [ -z "$esu_line" ]; then
+        echo "::error::box $esu_box's /proc/self/status carries no $esu_set line"
+        esu_fail
+      fi
+      if ! python3 -c "import sys; sys.exit(0 if int('$esu_line', 16) & 0x3000 == 0 else 1)"; then
+        echo "::error::box $esu_box's $esu_set is '$esu_line' — it holds CAP_NET_ADMIN/CAP_NET_RAW, so the box's own interface offers a raw-socket route the relay cannot bound (NET-083)"
+        esu_fail
+      fi
+    done
+    echo "NET-083 OK: box $esu_box holds neither CAP_NET_RAW nor CAP_NET_ADMIN (path (a)'s raw-socket route is gone)"
+  done
+
+  # ---- the guest's route tables, printed and pinned (NET-082) --------------
+  # /proc/cmdline is the guest's own boot line (global, not per-netns): it
+  # carries ipv6.disable=1, and the empty v6 tables in the box's netns are
+  # what that leaves behind — no netns inside a guest with no v6 stack can
+  # hold a v6 route.
+  for esu_box in a b; do
+    sid_var="esu_sid_$esu_box"
+    if ! esu_cmdline="$(mnl session exec "${!sid_var}" 'cat /proc/cmdline' \
+        2>"$WORK/esu-cmdline-$esu_box.err")"; then
+      echo "::error::reading the guest's kernel command line from box $esu_box failed"
+      cat "$WORK/esu-cmdline-$esu_box.err" 2>/dev/null || true
+      esu_fail
+    fi
+    echo "box $esu_box: the guest's kernel command line:"
+    printf '%s\n' "$esu_cmdline" | sed 's/^/  /'
+    if ! printf '%s' "$esu_cmdline" | grep -q 'ipv6.disable=1'; then
+      echo "::error::the guest's kernel command line does not carry ipv6.disable=1 — the boot the v6-less posture rides on (NET-082)"
+      esu_fail
+    fi
+    if ! esu_route="$(mnl session exec "${!sid_var}" 'cat /proc/net/route' \
+        2>"$WORK/esu-route-$esu_box.err")"; then
+      echo "::error::reading box $esu_box's IPv4 route table failed"
+      cat "$WORK/esu-route-$esu_box.err" 2>/dev/null || true
+      esu_fail
+    fi
+    echo "box $esu_box: the box netns's IPv4 route table:"
+    printf '%s\n' "$esu_route" | sed 's/^/  /'
+    # The v6 read ignores the exit code on purpose: a guest with v6 disabled
+    # may not mount the tables at all, and the assertion is emptiness.
+    esu_v6="$(mnl session exec "${!sid_var}" \
+      'cat /proc/net/if_inet6 2>/dev/null; cat /proc/net/ipv6_route 2>/dev/null' \
+      2>/dev/null || true)"
+    esu_v6="$(printf '%s' "$esu_v6" | tr -d '\r')"
+    if [ -n "$esu_v6" ]; then
+      echo "::error::the box netns holds IPv6 state, but the guest booted with ipv6.disable=1 — no v6 route may appear anywhere in it (NET-082):"
+      printf '%s\n' "$esu_v6" | sed 's/^/  /'
+      esu_fail
+    fi
+    echo "NET-082 OK: box $esu_box's netns holds no IPv6 interface or route (the guest booted with ipv6.disable=1)"
+  done
+
+  # ---- the baseline set beside the effective rules (NET-130) ---------------
+  for esu_box in a b; do
+    sid_var="esu_sid_$esu_box"
+    if ! esu_policy="$(mnl session policy "${!sid_var}" \
+        2>"$WORK/esu-policy-$esu_box.err")"; then
+      echo "::error::'min session policy' failed for box $esu_box"
+      cat "$WORK/esu-policy-$esu_box.err" 2>/dev/null || true
+      esu_fail
+    fi
+    echo "box $esu_box's effective policy (the baseline set beside the rules):"
+    printf '%s\n' "$esu_policy" | sed 's/^/  /'
+    if [ "$esu_box" = a ]; then
+      esu_line='subnets  10.0.0.0/8, 100.64.0.0/16'
+    else
+      esu_line='subnets  192.168.0.0/16, 100.64.0.0/16'
+    fi
+    if ! grep -q -- "$esu_line" <<<"$esu_policy"; then
+      echo "::error::box $esu_box's policy does not show its declared subnets ('$esu_line')"
+      esu_fail
+    fi
+    if ! grep -q 'node-plane baseline set (helper enumeration)' <<<"$esu_policy" \
+      || ! grep -q 'registry  100.64.255.254/32' <<<"$esu_policy" \
+      || ! grep -q 'cache  100.64.255.254/32' <<<"$esu_policy"; then
+      echo "::error::box $esu_box's policy does not show the node-plane baseline set beside its rules (the registry and cache categories at the host alias)"
+      esu_fail
+    fi
+  done
+  echo "NET-130 OK: the baseline set shows beside each box's effective rules"
+
+  # ---- the spoofer: one flow at the gate's landing edge, per arm -----------
+  cat > "$WORK/esu-spoofer.py" <<'ESU_SPOOFER_EOF'
+"""One spoofed flow at the host-side egress gate's landing edge.
+
+Speaks the shuttle's own protocol at the gate socket — the /connect upgrade
+head and length-framed Ethernet frames, the byte stream a root escapee's
+connection carries past that edge — wearing the source address the caller
+names, and drives one TCP flow to the destination: a gratuitous ARP claim for
+the source plus the answer to any ARP request that names it (when --claim
+yes), the SYN, the handshake's last leg on the SYN-ACK, and the marker's
+push, held open and resent until the switch acknowledges every byte of it.
+
+The frames carry real IPv4 and TCP checksums — the switch is the real
+gvproxy, whose stack validates both. Prints exactly one line:
+`outcome=completed ack=yes|no reason=...` when the handshake completed, or
+`outcome=refused reason=...` when no SYN-ACK arrived within the deadline —
+the flow's frames were decided before they left the VM. Exit status 0 either
+way, 1 only when the gate socket itself could not be spoken to. stdlib only.
+"""
+import argparse
+import socket
+import struct
+import sys
+import time
+
+GATE_SHUTTLE_HEAD = b"POST /connect HTTP/1.0\r\nHost: localhost\r\n\r\n"
+TCP_SYN = 0x02
+TCP_PSH = 0x08
+TCP_ACK = 0x10
+SPOOF_ISN = 0x00501001
+SPOOF_RESEND = 0.5
+GATEWAY_MAC = bytes.fromhex("5a94efe40cdd")
+
+
+def octets(ip):
+    return bytes(int(part) for part in ip.split("."))
+
+
+def ip_bytes(ip):
+    """A dotted-quad string or the 4 raw bytes off a frame, as bytes — the
+    ARP answer path hands arp_reply the requester's address straight off the
+    frame it is answering."""
+    if isinstance(ip, (bytes, bytearray)):
+        return bytes(ip)
+    return octets(ip)
+
+
+def mac_for(src):
+    """Locally administered, derived from the worn address."""
+    return bytes([0x02, 0x50, 0x64, 0x00, 0x64, octets(src)[3]])
+
+
+def fold(words):
+    total = sum(words)
+    while total > 0xFFFF:
+        total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+
+def words(blob):
+    if len(blob) % 2:
+        blob += b"\x00"
+    return struct.unpack(f"!{len(blob) // 2}H", blob)
+
+
+def ipv4_checksum(header):
+    return fold(words(header))
+
+
+def tcp_checksum(src, dst, segment):
+    pseudo = octets(src) + octets(dst) + struct.pack("!HH", 6, len(segment))
+    return fold(words(pseudo) + words(segment))
+
+
+def tcp_frame(src_mac, src_ip, src_port, dst_ip, dst_port, seq, ack, flags, payload):
+    segment = (
+        struct.pack("!HHIIBBHHH", src_port, dst_port, seq, ack, 0x50, flags, 0xFFFF, 0, 0)
+        + payload
+    )
+    segment = segment[:16] + struct.pack("!H", tcp_checksum(src_ip, dst_ip, segment)) + segment[18:]
+    header = struct.pack(
+        "!BBHHHBBH4s4s", 0x45, 0x00, 20 + len(segment), 0x0001, 0x0000, 64, 6, 0,
+        octets(src_ip), octets(dst_ip),
+    )
+    header = header[:10] + struct.pack("!H", ipv4_checksum(header)) + header[12:]
+    return GATEWAY_MAC + src_mac + b"\x08\x00" + header + segment
+
+
+def arp_reply(requester_mac, claimed, requester_ip, my_mac):
+    payload = (
+        struct.pack("!HHBBH", 1, 0x0800, 6, 4, 2)
+        + my_mac
+        + ip_bytes(claimed)
+        + requester_mac
+        + ip_bytes(requester_ip)
+    )
+    return requester_mac + my_mac + b"\x08\x06" + payload
+
+
+def write_frame(sock, frame):
+    sock.sendall(struct.pack("<H", len(frame)) + frame)
+
+
+def read_exact(sock, want, deadline):
+    buf = b""
+    while len(buf) < want:
+        if time.monotonic() >= deadline:
+            return None
+        try:
+            chunk = sock.recv(want - len(buf))
+        except socket.timeout:
+            continue
+        if not chunk:
+            raise ConnectionError("the gate closed the connection")
+        buf += chunk
+    return buf
+
+
+def read_frame(sock, deadline):
+    head = read_exact(sock, 2, deadline)
+    if head is None:
+        return None
+    (length,) = struct.unpack("<H", head)
+    if length == 0:
+        return b""
+    return read_exact(sock, length, deadline)
+
+
+def classify(frame, flow):
+    """What one frame off the gate is to the flow: an ARP request for the
+    address it wears, the SYN-ACK answering its SYN, or a bare ACK."""
+    if len(frame) < 14:
+        return None
+    ethertype = frame[12:14]
+    if ethertype == b"\x08\x06":
+        if len(frame) < 42 or struct.unpack("!H", frame[20:22])[0] != 1:
+            return None
+        return ("arp", frame[22:28], frame[28:32], frame[38:42])
+    if ethertype != b"\x08\x00" or len(frame) < 34:
+        return None
+    l4 = 14 + (frame[14] & 0x0F) * 4
+    if len(frame) < l4 + 20 or frame[23] != 6:
+        return None
+    if frame[30:34] != octets(flow["src"]):
+        return None
+    if struct.unpack("!H", frame[l4 + 2 : l4 + 4])[0] != flow["src_port"]:
+        return None
+    flags = frame[l4 + 13]
+    if not flags & TCP_ACK:
+        return None
+    if flags & TCP_SYN:
+        return ("synack", struct.unpack("!I", frame[l4 + 4 : l4 + 8])[0])
+    if struct.unpack("!H", frame[l4 : l4 + 2])[0] != flow["dst_port"]:
+        return None
+    return ("ack", struct.unpack("!I", frame[l4 + 8 : l4 + 12])[0])
+
+
+def seq_at_or_past(seq, target):
+    return (seq - target) & 0xFFFFFFFF < 0x80000000
+
+
+def answer_arp(sock, kind, flow, my_mac):
+    requester_mac, requester_ip, requested_ip = kind[1], kind[2], kind[3]
+    if requested_ip == octets(flow["src"]):
+        write_frame(sock, arp_reply(requester_mac, flow["src"], requester_ip, my_mac))
+
+
+def await_marker_ack(sock, flow, push, deadline_secs, claim):
+    want = (SPOOF_ISN + 1 + len(flow["marker"].encode())) & 0xFFFFFFFF
+    end = time.monotonic() + deadline_secs
+    next_resend = time.monotonic() + SPOOF_RESEND
+    while True:
+        now = time.monotonic()
+        if now >= end:
+            return f"outcome=completed ack=no reason=no acknowledgement within {deadline_secs}s"
+        if now >= next_resend:
+            write_frame(sock, push)
+            next_resend = now + SPOOF_RESEND
+        frame = read_frame(sock, min(next_resend, end))
+        if frame is None:
+            continue
+        kind = classify(frame, flow)
+        if kind is None:
+            continue
+        if kind[0] == "ack" and seq_at_or_past(kind[1], want):
+            return "outcome=completed ack=yes reason=the switch acknowledged every byte of the marker"
+        if kind[0] == "arp" and claim:
+            answer_arp(sock, kind, flow, mac_for(flow["src"]))
+
+
+def spoofed_flow(sock, flow, deadline_secs, claim):
+    my_mac = mac_for(flow["src"])
+    end = time.monotonic() + deadline_secs
+    sent_syn = False
+    while True:
+        if time.monotonic() >= end:
+            return (
+                f"outcome=refused reason=no SYN-ACK for spoofed source {flow['src']} "
+                f"within {deadline_secs}s; the flow's frames were decided before they left the VM"
+            )
+        if claim:
+            write_frame(sock, arp_reply(my_mac, flow["src"], flow["dst"], my_mac))
+        if not sent_syn:
+            write_frame(
+                sock,
+                tcp_frame(my_mac, flow["src"], flow["src_port"], flow["dst"],
+                          flow["dst_port"], SPOOF_ISN, 0, TCP_SYN, b""),
+            )
+            sent_syn = True
+        frame = read_frame(sock, end)
+        if frame is None:
+            continue
+        kind = classify(frame, flow)
+        if kind is None:
+            continue
+        if kind[0] == "arp":
+            if claim:
+                answer_arp(sock, kind, flow, my_mac)
+        elif kind[0] == "synack":
+            seq = (SPOOF_ISN + 1) & 0xFFFFFFFF
+            ackno = (kind[1] + 1) & 0xFFFFFFFF
+            write_frame(sock, tcp_frame(my_mac, flow["src"], flow["src_port"],
+                                        flow["dst"], flow["dst_port"], seq, ackno,
+                                        TCP_ACK, b""))
+            push = tcp_frame(my_mac, flow["src"], flow["src_port"], flow["dst"],
+                             flow["dst_port"], seq, ackno, TCP_PSH | TCP_ACK,
+                             flow["marker"].encode())
+            write_frame(sock, push)
+            return await_marker_ack(sock, flow, push, deadline_secs, claim)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gate", required=True)
+    parser.add_argument("--src", required=True)
+    parser.add_argument("--dst", required=True)
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--marker", required=True)
+    parser.add_argument("--deadline", type=float, required=True)
+    parser.add_argument("--claim", choices=["yes", "no"], default="yes")
+    args = parser.parse_args()
+    flow = {
+        "src": args.src,
+        "dst": args.dst,
+        "dst_port": args.port,
+        "src_port": 40000 + octets(args.src)[3],
+        "marker": args.marker,
+    }
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(0.2)
+    try:
+        sock.connect(args.gate)
+        sock.sendall(GATE_SHUTTLE_HEAD)
+        outcome = spoofed_flow(sock, flow, args.deadline, args.claim == "yes")
+    except (OSError, ConnectionError) as error:
+        print(f"outcome=error reason={error}")
+        return 1
+    finally:
+        sock.close()
+    print(outcome)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+ESU_SPOOFER_EOF
+  # One arm: run the spoofer, leave its one outcome line in esu_out.
+  esu_run_spoofer() {
+    # LABEL SRC DST MARKER DEADLINE CLAIM
+    esu_out=""
+    local label="$1" src="$2" dst="$3" marker="$4" deadline="$5" claim="$6"
+    if ! esu_out="$(python3 "$WORK/esu-spoofer.py" --gate "$esu_gate_sock" \
+        --src "$src" --dst "$dst" --port "$ESU_LISTEN_PORT" --marker "$marker" \
+        --deadline "$deadline" --claim "$claim" \
+        2>"$WORK/esu-spoof-$label.err")"; then
+      echo "::error::the $label arm's spoofer could not speak to the gate at $esu_gate_sock"
+      cat "$WORK/esu-spoof-$label.err" 2>/dev/null || true
+      esu_fail
+    fi
+    printf 'spoofer %s: %s\n' "$label" "$esu_out"
+  }
+  if [ ! -S "$esu_gate_sock" ]; then
+    echo "::error::the egress gate's socket is not where this case expects it ($esu_gate_sock) — the VM host daemon did not stand the gate up"
+    esu_fail
+  fi
+
+  # ---- the positive controls: each box's own declared traffic arrives ------
+  # socat is a launcher baseline package every box ships at /usr/bin, and the
+  # form the other proofs' in-box probes use; `-u` sends stdin one way and
+  # exits at its EOF, without waiting for the peer's.
+  esu_probe() {
+    # SID MARKER LABEL
+    mnl session exec "$1" \
+      "echo $2 | /usr/bin/socat -u - TCP:$esu_alias:$ESU_LISTEN_PORT,connect-timeout=20" \
+      >"$WORK/esu-probe-$3.out" 2>"$WORK/esu-probe-$3.err" || {
+      echo "::error::box $3's own probe to $esu_alias:$ESU_LISTEN_PORT failed (its declared fabric half)"
+      cat "$WORK/esu-probe-$3.err" 2>/dev/null || true
+      esu_fail
+    }
+  }
+  for esu_box in a b; do
+    sid_var="esu_sid_$esu_box"
+    mnl session exec "${!sid_var}" 'test -x /usr/bin/socat' >/dev/null 2>&1 \
+      || { echo "::error::box $esu_box has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"; esu_fail; }
+  done
+  esu_probe "$esu_sid_a" esu-own-a-reached a
+  esu_probe "$esu_sid_b" esu-own-b-reached b
+  esu_wait_marker esu-own-a-reached 40 || {
+    echo "::error::box A's own declared traffic never reached the host listener — the chain this case reads its verdicts through is down"
+    esu_fail
+  }
+  esu_wait_marker esu-own-b-reached 40 || {
+    echo "::error::box B's own declared traffic never reached the host listener — the chain this case reads its verdicts through is down"
+    esu_fail
+  }
+  esu_rows="$esu_rows
+source=$esu_ip_a (box A's own probe) destination=$esu_alias:$ESU_LISTEN_PORT verdict=arrived (positive control: the box's own declared traffic)"
+  esu_rows="$esu_rows
+source=$esu_ip_b (box B's own probe) destination=$esu_alias:$ESU_LISTEN_PORT verdict=arrived (positive control: the box's own declared traffic)"
+  echo "positive controls OK: both boxes' own declared traffic reached the listener through the fabric"
+
+  # ---- the arms, each a fresh connection at the gate's landing edge ---------
+  # The made-up in-plan lease first — the spoofer's liveness bracket, and the
+  # one arm that claims the address it wears (no row holds it, so its
+  # connection's end has nothing to withdraw). Flip-stable: the shipped
+  # interim admits it and names it; the per-box default refuses it and names
+  # it. Either way the case pins whichever happened.
+  esu_run_spoofer madeup 100.64.0.99 "$esu_alias" esu-spoof-madeup-arrived 10 yes
+  case "$esu_out" in
+    outcome=completed*)
+      esu_wait_marker esu-spoof-madeup-arrived 40 || {
+        echo "::error::the made-up lease's flow completed its handshake but its marker never reached the host listener"
+        esu_fail
+      }
+      esu_wait_gate_line 100.64.0.99 egress-unregistered-source >/dev/null || {
+        echo "::error::the gate admitted the made-up lease without its interim line naming the source"
+        esu_fail
+      }
+      esu_rows="$esu_rows
+source=100.64.0.99 destination=$esu_alias:$ESU_LISTEN_PORT verdict=reached the listener (the shipped interim's admit, its egress-unregistered-source line naming the source; the per-box default's flip turns this into an unknown-source drop)"
+      ;;
+    outcome=refused*)
+      if grep -q -- esu-spoof-madeup-arrived "$esu_listener_log"; then
+        echo "::error::the made-up lease's flow was refused at the gate, but its marker reached the host listener"
+        esu_fail
+      fi
+      esu_wait_gate_line 100.64.0.99 egress-unknown-source >/dev/null || {
+        echo "::error::the gate refused the made-up lease without its unknown-source line naming the source"
+        esu_fail
+      }
+      esu_rows="$esu_rows
+source=100.64.0.99 destination=$esu_alias:$ESU_LISTEN_PORT verdict=refused at the gate (the per-box default in force: silence, and the egress-unknown-source line)"
+      ;;
+    *)
+      echo "::error::the made-up-lease arm reported neither a completed flow nor a refusal: $esu_out"
+      esu_fail
+      ;;
+  esac
+
+  # Box A's address toward box B's private half — inside the union, outside
+  # the row that holds the worn address: the gate's infrastructure rule
+  # refuses it, and its line names both the source and the destination.
+  esu_run_spoofer cross-a "$esu_ip_a" 192.168.77.7 esu-spoof-cross-a 3 no
+  case "$esu_out" in
+    outcome=refused*) : ;;
+    *)
+      echo "::error::the spoofer wearing box A's address completed a flow to 192.168.77.7 — box B's declared half must be refused for a source box A's row holds"
+      esu_fail
+      ;;
+  esac
+  if grep -q -- esu-spoof-cross-a "$esu_listener_log"; then
+    echo "::error::a refused spoof from box A's address still left a marker at the host listener"
+    esu_fail
+  fi
+  esu_line="$(esu_wait_gate_line "$esu_ip_a" egress-infrastructure-destination)" || {
+    echo "::error::the gate refused box A's address toward 192.168.77.7 without its infrastructure line naming the source"
+    esu_fail
+  }
+  if ! printf '%s' "$esu_line" | grep -q '"destination":"192.168.77.7"'; then
+    echo "::error::the gate's infrastructure line for box A's address does not name the destination it refused: $esu_line"
+    esu_fail
+  fi
+  esu_rows="$esu_rows
+source=$esu_ip_a destination=192.168.77.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-infrastructure-destination — box B's declared half, which box A's row does not cover)"
+
+  # Box A's address toward a destination no resident box declared — beyond
+  # the whole union: the row's own rules refuse it.
+  esu_run_spoofer beyond-a "$esu_ip_a" 198.51.100.7 esu-spoof-beyond-a 3 no
+  case "$esu_out" in
+    outcome=refused*) : ;;
+    *)
+      echo "::error::the spoofer wearing box A's address completed a flow to 198.51.100.7 — beyond the resident union"
+      esu_fail
+      ;;
+  esac
+  if grep -q -- esu-spoof-beyond-a "$esu_listener_log"; then
+    echo "::error::a refused spoof from box A's address still left a marker at the host listener"
+    esu_fail
+  fi
+  esu_wait_gate_line "$esu_ip_a" egress-undeclared-subnet >/dev/null || {
+    echo "::error::the gate refused box A's address toward 198.51.100.7 without its undeclared-subnet line naming the source"
+    esu_fail
+  }
+  esu_rows="$esu_rows
+source=$esu_ip_a destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-undeclared-subnet — beyond the resident union, refused by box A's own rules)"
+
+  # Box B's address toward box A's private half: the same refusal, worn from
+  # the other side — whichever box's address the spoofer wears, its own row is
+  # the one that decides.
+  esu_run_spoofer cross-b "$esu_ip_b" 10.0.0.7 esu-spoof-cross-b 3 no
+  case "$esu_out" in
+    outcome=refused*) : ;;
+    *)
+      echo "::error::the spoofer wearing box B's address completed a flow to 10.0.0.7 — box A's declared half must be refused for a source box B's row holds"
+      esu_fail
+      ;;
+  esac
+  if grep -q -- esu-spoof-cross-b "$esu_listener_log"; then
+    echo "::error::a refused spoof from box B's address still left a marker at the host listener"
+    esu_fail
+  fi
+  esu_line="$(esu_wait_gate_line "$esu_ip_b" egress-infrastructure-destination)" || {
+    echo "::error::the gate refused box B's address toward 10.0.0.7 without its infrastructure line naming the source"
+    esu_fail
+  }
+  if ! printf '%s' "$esu_line" | grep -q '"destination":"10.0.0.7"'; then
+    echo "::error::the gate's infrastructure line for box B's address does not name the destination it refused: $esu_line"
+    esu_fail
+  fi
+  esu_rows="$esu_rows
+source=$esu_ip_b destination=10.0.0.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-infrastructure-destination — box A's declared half, which box B's row does not cover)"
+
+  # An address outside the plan's lease block: refused outright, under either
+  # posture — outside the plan there is no lease to spoof.
+  esu_run_spoofer outside 203.0.113.7 "$esu_alias" esu-spoof-outside 3 no
+  case "$esu_out" in
+    outcome=refused*) : ;;
+    *)
+      echo "::error::a source outside the plan's lease block (203.0.113.7) completed a flow — the gate must refuse it"
+      esu_fail
+      ;;
+  esac
+  if grep -q -- esu-spoof-outside "$esu_listener_log"; then
+    echo "::error::a source outside the plan's lease block left a marker at the host listener"
+    esu_fail
+  fi
+  esu_wait_gate_line 203.0.113.7 egress-unknown-source >/dev/null || {
+    echo "::error::the gate dropped the out-of-plan source without its unknown-source line naming it"
+    esu_fail
+  }
+  esu_rows="$esu_rows
+source=203.0.113.7 destination=$esu_alias:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unknown-source — outside the plan there is no lease to spoof)"
+
+  # ---- the record: each attempt with the gate's verdict beside it ----------
+  echo "the attempts against the resident union, each with the gate's verdict:"
+  printf '%s\n' "$esu_rows" | sed '/^$/d; s/^/  /'
+  echo "the host-side gate's own lines from this case:"
+  esu_case_log 2>/dev/null \
+    | grep -e 'egress-unregistered-source' -e 'egress-unknown-source' \
+        -e 'egress-infrastructure-destination' -e 'egress-undeclared-subnet' \
+    | sed 's/^/  /' || true
+  echo "--- the listener's record ---"
+  sed 's/^/  /' "$esu_listener_log"
+
+  mnl session destroy --force "$esu_sid_a" >"$WORK/esu-destroy-a.out" 2>"$WORK/esu-destroy-a.err" \
+    || { echo "::error::destroying box A failed"; cat "$WORK/esu-destroy-a.err" 2>/dev/null || true; esu_fail; }
+  mnl session destroy --force "$esu_sid_b" >"$WORK/esu-destroy-b.out" 2>"$WORK/esu-destroy-b.err" \
+    || { echo "::error::destroying box B failed"; cat "$WORK/esu-destroy-b.err" 2>/dev/null || true; esu_fail; }
+  kill "$ESU_LISTENER_PID" 2>/dev/null || true
+  ESU_LISTENER_PID=""
+  rm -rf "$ESU_A_SEED_DIR" "$ESU_B_SEED_DIR"
+  ESU_A_SEED_DIR=""
+  ESU_B_SEED_DIR=""
+  echo "escape reaches only the declared union OK (the spoofed resident addresses were refused beyond their own rows' declarations, the made-up lease is the interim's one admit and says so, both boxes lack CAP_NET_RAW/CAP_NET_ADMIN, no IPv6 route in the guest, the baseline set beside the rules)"
+  echo "::endgroup::"
+}
+
 # Ordered late in the whole-lane run on purpose: it restarts the daemon (see
 # the RUST_LOG note inside) and nothing after it depends on the one before.
 # The github_only_allowlist case, which the dispatch runs after this one,
-# restarts the daemon again for its own filter, and the proxy-source case,
-# last of all, stops and respawns both daemons for its own.
+# restarts the daemon again for its own filter, and the proxy-source case
+# stops and respawns both daemons for its own.
 proof_min_internal_names_through_proxy() {
   echo "::group::min.internal names through the hostname proxy (NET-001..NET-004)"
 
@@ -11555,6 +12509,12 @@ case "${1:-}" in
     proof_switch_answers_no_arp_for_the_proxy_address
     proof_github_only_allowlist
     proof_proxy_sees_each_vm_box_by_its_switch_address
+    # Runs after the proxy-source proof and ahead of the daemon-fetch proof
+    # on purpose: it stops the daemon pair and autospawns a fresh VM host
+    # daemon under its own record filter (the registration records it reads
+    # are INFO, which the lane's default filter drops), and the daemon-fetch
+    # proof respawns the pair again for its own needs.
+    proof_escape_reaches_only_declared_union
     # Last on purpose: the daemon-fetch proof installs a host classifier
     # tree and table (its own, removed before it returns) and stops the
     # daemon to place a fresh one inside the tree, so nothing after it may
@@ -11575,6 +12535,7 @@ case "${1:-}" in
     | linux_stock_install_runs_vm_boxes \
     | switch_steers_proxy_mac_frames_to_the_host_stack | switch_answers_no_arp_for_the_proxy_address \
     | github_only_allowlist | proxy_sees_each_vm_box_by_its_switch_address \
+    | escape_reaches_only_declared_union \
     | daemon_fetch_under_deny_all_host_address_box)
     "proof_$1"
     ;;
@@ -11595,6 +12556,7 @@ case "${1:-}" in
     echo "         proxy_refuses_like_direct retired_surfaces_gone"
     echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
     echo "         github_only_allowlist proxy_sees_each_vm_box_by_its_switch_address"
+    echo "         escape_reaches_only_declared_union"
     echo "         daemon_fetch_under_deny_all_host_address_box"
     exit 2
     ;;
