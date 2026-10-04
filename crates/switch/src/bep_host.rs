@@ -1560,16 +1560,21 @@ impl BepStack {
             address: Ipv4Addr::from(u32::from_be_bytes(self.host.ip().octets())),
             about: refusal::About::Port(PROXY_PORT),
         };
-        // A reset is always written for this one — the abort below is it —
-        // so the refusal counts against the source's quota like the
-        // pre-screen's do.
-        if let refusal::Outcome::Emit(line) =
-            self.refusals
-                .refuse(&refusal, true, std::time::Instant::now())
+        // The abort is this refusal's reply, so it is charged to the
+        // source's quota like the pre-screen's reset: a source that has
+        // spent its window gets no reset, and its slot goes back to the pool
+        // without one, as `refuse_syn` drops its reply.
+        match self
+            .refusals
+            .refuse(&refusal, true, std::time::Instant::now())
         {
-            tracing::warn!("{line}");
+            refusal::Outcome::Suppressed => self.retire_slot(idx),
+            refusal::Outcome::Quiet => self.abort_slot(idx),
+            refusal::Outcome::Emit(line) => {
+                self.abort_slot(idx);
+                tracing::warn!("{line}");
+            }
         }
-        self.abort_slot(idx);
     }
 
     /// One slot's socket's remote endpoint, if it is carrying a connection.
