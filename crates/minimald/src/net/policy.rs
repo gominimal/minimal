@@ -495,8 +495,10 @@ pub enum ExposeRefusal {
     /// forward bound for the lease it would name would answer for nothing.
     /// Starting the box again is what fixes it.
     NotRunning,
-    /// The port is published already, live, by this box.
-    AlreadyPublished(u16),
+    /// The port is held already by this box's other runtime surface — the
+    /// reservation or publication that holds it, whichever surface that
+    /// is, named by the owner the loser is refused with.
+    AlreadyPublished { port: u16, owner: super::listeners::PublicationOwner },
 }
 
 impl fmt::Display for ExposeRefusal {
@@ -529,9 +531,11 @@ impl fmt::Display for ExposeRefusal {
             Self::NotRunning => {
                 write!(f, "this box is not running; start the box and try again")
             }
-            Self::AlreadyPublished(port) => {
-                write!(f, "port {port} is published already by this box")
-            }
+            Self::AlreadyPublished { port, owner } => write!(
+                f,
+                "port {port} is published already by this box ({})",
+                owner.as_str()
+            ),
         }
     }
 }

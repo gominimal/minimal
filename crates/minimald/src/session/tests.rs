@@ -5188,6 +5188,98 @@ async fn scripted_forwarder(
     (server, served)
 }
 
+/// What the gated stand-in below answers one request with.
+#[derive(Clone)]
+enum GateAnswer {
+    /// Answer the request with this status, the way [`scripted_forwarder`]
+    /// answers its script's.
+    With(u16),
+    /// Record the request but hold the answer — the connection stays open,
+    /// the client stays awaiting its bind — until the test's gate counter
+    /// passes the held answers the stand-in has already resolved, then
+    /// answer with this status. A bind the stand-in holds is a bind the
+    /// reserving surface is in flight across: the window in which the
+    /// other surface must lose to the reservation, never to the switch.
+    Held(u16),
+}
+
+/// [`scripted_forwarder`], with [`GateAnswer::Held`] answers a test times
+/// itself: the stand-in serves one request per connection, recording each,
+/// and a held answer is not sent until the test advances the returned gate
+/// past the held answers it has already resolved — first held answer waits
+/// for the counter to pass 0, the second for it to pass 1, and so on, so
+/// sequential phases each open and close one in-flight bind of their own.
+/// Returns the server, the record of every request it served, and the
+/// gate a test advances to resolve the holds.
+async fn gated_forwarder(
+    sock: std::path::PathBuf,
+    script: Vec<GateAnswer>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::sync::watch::Sender<u64>,
+) {
+    use tokio::io::AsyncWriteExt;
+    if let Some(parent) = sock.parent() {
+        std::fs::create_dir_all(parent).expect("create the switch state dir");
+    }
+    let listener = tokio::net::UnixListener::bind(&sock).expect("bind the control socket");
+    let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = served.clone();
+    let (gate_tx, mut gate_rx) = tokio::sync::watch::channel(0u64);
+    let server = tokio::spawn(async move {
+        let mut script: std::collections::VecDeque<GateAnswer> = script.into();
+        // The last answer answers anything past the script, so a stand-in
+        // scripted for four requests still answers a fifth.
+        let last = script.back().cloned().unwrap_or(GateAnswer::With(500));
+        // Sequential on purpose: the publish verbs open a fresh connection
+        // per request, so one connection served at a time is their shape —
+        // and one held request at a time is the gate's, so each hold is
+        // resolved before the next request is even read.
+        let mut held: u64 = 0;
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Some(request) = read_control_request(&mut stream).await else {
+                continue;
+            };
+            recorded.lock().expect("served lock").push(request);
+            let status = match script.pop_front().unwrap_or_else(|| last.clone()) {
+                GateAnswer::With(status) => status,
+                GateAnswer::Held(status) => {
+                    // This is held request number `held + 1`: it waits for
+                    // the gate to pass the `held` resolved before it. A
+                    // dropped gate (the test gone) answers rather than
+                    // parks the stand-in forever.
+                    while *gate_rx.borrow() <= held {
+                        if gate_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                    held += 1;
+                    status
+                }
+            };
+            let reason = if (200..300).contains(&status) {
+                "OK"
+            } else {
+                "Internal Server Error"
+            };
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "the answer's fate is not what the stand-in records; the request is"
+            )]
+            let _ = stream
+                .write_all(
+                    format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                )
+                .await;
+        }
+    });
+    (server, served, gate_tx)
+}
+
 /// NET-043: a port-publish request from inside a box is decided against the
 /// box's own `dynamic_ingress` setting, on the local daemon — the un-enrolled
 /// host's shape, where the same daemon that owns the switch answers the box
@@ -5358,7 +5450,10 @@ async fn expose_allow_publishes_and_lists() {
     // double-bind the same address, so it is refused as the duplicate it is.
     match handle.expose_dynamic(3000).await {
         Err(crate::net::policy::ExposeFailure::Refused(
-            crate::net::policy::ExposeRefusal::AlreadyPublished(3000),
+            crate::net::policy::ExposeRefusal::AlreadyPublished {
+                port: 3000,
+                owner: crate::net::listeners::PublicationOwner::Expose,
+            },
         )) => {}
         other => panic!("a second request for a live port is a duplicate: {other:?}"),
     }
@@ -6393,7 +6488,10 @@ async fn expose_logs_every_path() {
         .expect("the allowed port publishes");
     match web_handle.expose_dynamic(3000).await {
         Err(crate::net::policy::ExposeFailure::Refused(
-            crate::net::policy::ExposeRefusal::AlreadyPublished(3000),
+            crate::net::policy::ExposeRefusal::AlreadyPublished {
+                port: 3000,
+                owner: crate::net::listeners::PublicationOwner::Expose,
+            },
         )) => {}
         other => panic!("the second request for a live port is a duplicate: {other:?}"),
     }
@@ -6625,6 +6723,40 @@ async fn box_with_listen_plan(
     std::sync::Arc<crate::net::switch::SessionGate>,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 ) {
+    let (handle, gate, served, _gate, _id) = box_with_scripted_plan(
+        client,
+        manager,
+        name,
+        switch,
+        loopback,
+        range,
+        vec![GateAnswer::With(200)],
+    )
+    .await;
+    (handle, gate, served)
+}
+
+/// [`box_with_listen_plan`], over a gated stand-in: the forwarder bound
+/// before the launch answers each request with the next answer of
+/// `script` — held answers wait on the gate a test advances, so a test can
+/// hold one surface's bind in flight while the other races it for the port
+/// — and the box's session id comes back with it, so a test can reach the
+/// publication set its launch is running on through the seam.
+async fn box_with_scripted_plan(
+    client: &mut TestClient,
+    manager: &crate::sessions::ManagerHandle,
+    name: &str,
+    switch: std::net::Ipv4Addr,
+    loopback: std::net::Ipv4Addr,
+    range: (u16, u16),
+    script: Vec<GateAnswer>,
+) -> (
+    crate::session::SessionHandle,
+    std::sync::Arc<crate::net::switch::SessionGate>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::sync::watch::Sender<u64>,
+    sessions::SessionId,
+) {
     // The hand vouched for, so the registry publishes the loopback hand's
     // address: both surfaces' forwards bind at the address the box's name
     // answers at, exactly as they do for a production box.
@@ -6652,7 +6784,7 @@ async fn box_with_listen_plan(
         .lock()
         .await
         .control_socket();
-    let (_forwarder, served) = fake_forwarder(sock.clone(), 200).await;
+    let (_forwarder, served, gate_sender) = gated_forwarder(sock.clone(), script).await;
     // The plan a real launch gathers itself, seeded into this one: the facts
     // a box's host builds its watcher from, riding the mock's `Launched` the
     // way a real launch's plan rides its own.
@@ -6675,7 +6807,7 @@ async fn box_with_listen_plan(
         .ensure_host("tester".to_string())
         .await
         .expect("the box launches its host");
-    (handle, gate, served)
+    (handle, gate, served, gate_sender, id)
 }
 
 /// NET-047, the port one surface already holds: whichever of the box's two
@@ -6721,7 +6853,10 @@ async fn listen_publish_and_runtime_expose_never_double_bind() {
     // switch — the one request so far is the watcher's own publish.
     match handle.expose_dynamic(listen_port).await {
         Err(crate::net::policy::ExposeFailure::Refused(
-            crate::net::policy::ExposeRefusal::AlreadyPublished(asked),
+            crate::net::policy::ExposeRefusal::AlreadyPublished {
+                port: asked,
+                owner: crate::net::listeners::PublicationOwner::Listen,
+            },
         )) => assert_eq!(asked, listen_port),
         other => panic!("a port the watcher published is a typed duplicate: {other:?}"),
     }
@@ -6876,7 +7011,7 @@ async fn listen_publish_and_runtime_expose_never_double_bind() {
     assert!(
         refusal_line.contains("owner=listen")
             && refusal_line.contains(&format!(
-                "reason=port {listen_port} is published already by this box"
+                "reason=port {listen_port} is published already by this box (listen)"
             )),
         "the refusal names the owner that holds the port and the reason it \
          gave: {refusal_line}"
@@ -6929,7 +7064,10 @@ async fn expose_on_listen_published_port_is_already_published() {
     soon(|| gate.admits_tcp(port)).await;
     match handle.expose_dynamic(port).await {
         Err(crate::net::policy::ExposeFailure::Refused(
-            crate::net::policy::ExposeRefusal::AlreadyPublished(asked),
+            crate::net::policy::ExposeRefusal::AlreadyPublished {
+                port: asked,
+                owner: crate::net::listeners::PublicationOwner::Listen,
+            },
         )) => assert_eq!(asked, port),
         other => panic!("the runtime expose is refused as the duplicate it is: {other:?}"),
     }
@@ -6963,7 +7101,7 @@ async fn expose_on_listen_published_port_is_already_published() {
         refusal.contains(&format!("port={port}"))
             && refusal.contains("owner=listen")
             && refusal.contains(&format!(
-                "reason=port {port} is published already by this box"
+                "reason=port {port} is published already by this box (listen)"
             )),
         "the refusal names the port, the owner holding it, and the reason: {refusal}"
     );
@@ -7152,7 +7290,10 @@ async fn listen_plan_travels_in_launched() {
     // same one the watcher wrote, and answers the typed duplicate.
     match seeded.expose_dynamic(seeded_port).await {
         Err(crate::net::policy::ExposeFailure::Refused(
-            crate::net::policy::ExposeRefusal::AlreadyPublished(asked),
+            crate::net::policy::ExposeRefusal::AlreadyPublished {
+                port: asked,
+                owner: crate::net::listeners::PublicationOwner::Listen,
+            },
         )) => assert_eq!(asked, seeded_port),
         other => panic!("the seeded box's two surfaces read one set: {other:?}"),
     }
@@ -7198,4 +7339,626 @@ async fn listen_plan_travels_in_launched() {
     bare.stop().await;
     drop(seeded_socket);
     drop(bare_socket);
+}
+
+/// NET-047's race, both orders, closed by the reservation: the box's two
+/// runtime surfaces reach one port together and the port is bound once, by
+/// whichever surface's reservation won. The loser is answered before it
+/// asks the switch anything — the expose with the typed already-published
+/// refusal naming the owner that holds the port, the watcher with the
+/// settle-and-skip that names it — never a switch error, never a retry
+/// under backoff. A winner whose bind the switch refuses releases its
+/// reservation, so the other surface's next observation publishes the port
+/// normally; and none of it lets a listener the box's ingress does not
+/// permit ride on any publication (NET-016): the watcher leaves such a
+/// port unpublished, and nothing asks the switch for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_expose_and_listen_publish_bind_once() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    // Four ports, drawn and sorted so the smallest sits outside the range
+    // the other three make: the box's own process holds that one from
+    // before the launch, and the box's ingress does not permit it — the
+    // port no surface may publish. The three in range stay free until each
+    // phase binds its own listener on them.
+    let mut probes: Vec<std::net::TcpListener> =
+        (0..4).map(|_| listening_socket()).collect();
+    probes.sort_by_key(port_of);
+    let denied_socket = probes.remove(0);
+    let denied_port = port_of(&denied_socket);
+    let a_port = port_of(&probes[0]);
+    let b_port = port_of(&probes[1]);
+    let c_port = port_of(&probes[2]);
+    let range = (a_port, c_port);
+    drop(probes);
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 81);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 81);
+    // The stand-in's answers, one per request in the order the phases send
+    // them: the expose's bind on `a` and the watcher's bind on `b` are
+    // held — each a reservation's in-flight window, wide enough to observe
+    // the other surface losing inside it — and the expose's bind on `c` is
+    // refused, the watcher's publish of `c` accepted.
+    let (handle, gate, served, gate_sender, _id) = box_with_scripted_plan(
+        &mut client,
+        &manager,
+        "ownrace",
+        switch,
+        loopback,
+        range,
+        vec![
+            GateAnswer::Held(200), // 1: the expose's bind on `a`
+            GateAnswer::Held(200), // 2: the watcher's bind on `b`
+            GateAnswer::With(500), // 3: the expose's bind on `c`, refused
+            GateAnswer::With(200), // 4: the watcher's publish of `c`
+        ],
+    )
+    .await;
+
+    // The port the box's ingress does not permit is listened on from before
+    // the launch: the watcher denies it — one line, no bind, and no request
+    // ever names it, whichever of the box's publications stands.
+    soon(|| {
+        capture.contents().lines().any(|line| {
+            line.contains("session=ownrace")
+                && line.contains("left a listening port unpublished")
+                && line.contains(&format!("port={denied_port}"))
+        })
+    })
+    .await;
+    assert!(
+        served_naming(&served, loopback, denied_port).is_empty(),
+        "no surface asks the switch for a port the box's ingress does not \
+         permit: {:?}",
+        served.lock().expect("served lock")
+    );
+
+    // Either order, one port each. The expose surface first: it reserves
+    // `a` and binds — held at the stand-in — before the box's process ever
+    // listens on the port, so the watcher reading that listener arrives at
+    // a port the expose's reservation already holds.
+    let exposing = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.expose_dynamic(a_port).await })
+    };
+    soon(|| served_naming(&served, loopback, a_port).len() == 1).await;
+    let a_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, a_port))
+        .expect("the box's process listens on the expose's port");
+    // The watcher loses to the pending reservation, never to the switch:
+    // the contention is said once while the bind is in flight, and the
+    // port is never asked of the switch at all.
+    soon(|| {
+        capture.contents().lines().any(|line| {
+            line.contains("session=ownrace")
+                && line.contains("left a listening port the runtime expose is publishing")
+                && line.contains(&format!("port={a_port}"))
+        })
+    })
+    .await;
+    assert_eq!(
+        served_naming(&served, loopback, a_port).len(),
+        1,
+        "the expose's held bind is the only request the port has: {:?}",
+        served.lock().expect("served lock")
+    );
+    // The bind resolves, the reservation commits, and the watcher's next
+    // observation settles on the skip: the publication that stands is the
+    // expose's own, never the watcher's, and the skip admits nothing.
+    gate_sender.send(1).expect("the gate opens for the held bind");
+    let mapping = exposing
+        .await
+        .expect("the exposing task ends")
+        .expect("the held bind stood, so the expose publishes its port");
+    assert_eq!(
+        mapping.local, format!("{loopback}:{a_port}"),
+        "the expose binds at its own address at its own port number"
+    );
+    soon(|| {
+        capture.contents().lines().any(|line| {
+            line.contains("session=ownrace")
+                && line.contains("left a listening port the runtime expose already published")
+                && line.contains(&format!("port={a_port}"))
+        })
+    })
+    .await;
+    assert_eq!(
+        served_naming(&served, loopback, a_port).len(),
+        1,
+        "the watcher never asks the switch for a port the expose's \
+         reservation won: {:?}",
+        served.lock().expect("served lock")
+    );
+    assert!(
+        !gate.admits_tcp(a_port),
+        "the skip admits nothing for the port: the expose's publication is \
+         served by its own forward, never by an admission the watcher made"
+    );
+    let logged = capture.contents();
+    assert_eq!(
+        logged
+            .lines()
+            .filter(|line| {
+                line.contains("session=ownrace")
+                    && line.contains("left a listening port the runtime expose is publishing")
+                    && line.contains(&format!("port={a_port}"))
+            })
+            .count(),
+        1,
+        "the contention is said once while the bind is in flight, never \
+         once per poll: {logged}"
+    );
+    assert!(
+        !logged.lines().any(|line| {
+            line.contains("session=ownrace")
+                && line.contains("publishing a listening port on the switch failed")
+                && line.contains(&format!("port={a_port}"))
+        }),
+        "the loser is answered by the reservation, never by a switch error: {logged}"
+    );
+    assert!(
+        !logged.lines().any(|line| {
+            line.contains("session=ownrace")
+                && line.contains("published a listening port on the box's address")
+                && line.contains(&format!("port={a_port}"))
+        }),
+        "the watcher never publishes the port the expose's reservation won: {logged}"
+    );
+
+    // The other order: the watcher first. The box's process listens on `b`,
+    // the watcher reserves it and binds — held at the stand-in — and the
+    // expose asked for the port inside that window is refused by the
+    // reservation, naming the owner whose bind is still in flight.
+    let b_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, b_port))
+        .expect("the box's process listens on its own port");
+    soon(|| served_naming(&served, loopback, b_port).len() == 1).await;
+    match handle.expose_dynamic(b_port).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::AlreadyPublished {
+                port: asked,
+                owner: crate::net::listeners::PublicationOwner::Listen,
+            },
+        )) => assert_eq!(asked, b_port),
+        other => panic!(
+            "the expose loses to the watcher's pending reservation, not to the \
+             switch: {other:?}"
+        ),
+    }
+    gate_sender.send(2).expect("the gate opens for the held bind");
+    soon(|| gate.admits_tcp(b_port)).await;
+    assert_eq!(
+        served_naming(&served, loopback, b_port).len(),
+        1,
+        "the watcher's held bind is the only request the port has: {:?}",
+        served.lock().expect("served lock")
+    );
+    let logged = capture.contents();
+    let b_refusal = logged
+        .lines()
+        .find(|line| {
+            line.contains("dynamic ingress expose")
+                && line.contains("name=ownrace")
+                && line.contains("outcome=\"refused\"")
+                && line.contains(&format!("port={b_port}"))
+        })
+        .unwrap_or_else(|| panic!("the refusal is one line: {logged}"));
+    assert!(
+        b_refusal.contains("owner=listen")
+            && b_refusal.contains(&format!(
+                "reason=port {b_port} is published already by this box (listen)"
+            )),
+        "the refusal names the owner holding the port and the reason it \
+         gave: {b_refusal}"
+    );
+    assert!(
+        logged.lines().any(|line| {
+            line.contains("session=ownrace")
+                && line.contains("published a listening port on the box's address")
+                && line.contains("owner=listen")
+                && line.contains(&format!("port={b_port}"))
+        }),
+        "the watcher's publish of the port it won is one line: {logged}"
+    );
+
+    // A winner's bind can fail: the switch refuses the expose's bind on
+    // `c`, the failure releases the reservation it held, and the box's
+    // process listening on the port afterwards is published by the watcher
+    // — the loser's port ends up published, by its own publisher.
+    match handle.expose_dynamic(c_port).await {
+        Err(crate::net::policy::ExposeFailure::Publish { port, .. }) => assert_eq!(port, c_port),
+        other => panic!("the refused bind is a publish failure: {other:?}"),
+    }
+    let logged = capture.contents();
+    let c_failure = logged
+        .lines()
+        .find(|line| {
+            line.contains("dynamic ingress expose")
+                && line.contains("name=ownrace")
+                && line.contains("outcome=\"publish failed\"")
+                && line.contains(&format!("port={c_port}"))
+        })
+        .unwrap_or_else(|| panic!("the failed bind is one line: {logged}"));
+    assert!(
+        c_failure.contains("owner=expose"),
+        "the publish-failure line names the surface that held the \
+         reservation: {c_failure}"
+    );
+    let c_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, c_port))
+        .expect("the box's process listens on the port the expose failed to bind");
+    soon(|| gate.admits_tcp(c_port)).await;
+    let c_records = served_naming(&served, loopback, c_port);
+    assert_eq!(
+        c_records.len(),
+        2,
+        "the failed bind and the watcher's publish of the freed port: {c_records:?}"
+    );
+    assert!(
+        c_records[1].starts_with("POST /services/forwarder/expose "),
+        "the watcher's publish is the bind that stood: {c_records:?}"
+    );
+    let logged = capture.contents();
+    assert!(
+        logged.lines().any(|line| {
+            line.contains("session=ownrace")
+                && line.contains("published a listening port on the box's address")
+                && line.contains(&format!("port={c_port}"))
+        }),
+        "the watcher's next observation publishes the port the failed bind \
+         released: {logged}"
+    );
+    assert!(
+        served_naming(&served, loopback, denied_port).is_empty(),
+        "the unpermitted listener never rode on any of it: {:?}",
+        served.lock().expect("served lock")
+    );
+
+    handle.stop().await;
+    drop(a_listener);
+    drop(b_listener);
+    drop(c_listener);
+    drop(denied_socket);
+}
+
+/// A reservation is released by its cancellation: a publish dropped
+/// mid-bind — the future that held it aborted — gives the port back, so
+/// the watcher that lost to the pending reservation publishes the port on
+/// its next observation. The actor's own turn is not abortable from its
+/// handles (a dropped reply future abandons the answer, not the work), so
+/// the reservation a cancelled publish drops is driven here through the
+/// seam the launch hands its publication set back on: the same set the
+/// box's two surfaces read, holding the same guard the expose path's
+/// publish holds across its bind, dropped the same way a cancelled bind's
+/// future drops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_publish_releases_its_reservation() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    // One port the box's range covers, with nothing listening on it yet.
+    let port = port_of(&listening_socket());
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 82);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 82);
+    let (handle, gate, served, _gate_sender, id) = box_with_scripted_plan(
+        &mut client,
+        &manager,
+        "owncancel",
+        switch,
+        loopback,
+        (port, port),
+        vec![GateAnswer::With(200)],
+    )
+    .await;
+    let publications = crate::session::listen_plan_seam::publications_of(id)
+        .expect("the launch handed its publication set back");
+
+    // The publish a cancellation drops: a reservation on the box's real
+    // set, held across a bind that never resolves — the shape of the
+    // expose path's own in-flight bind, aborted before it could record.
+    let holder = {
+        let publications = publications.clone();
+        tokio::spawn(async move {
+            let _reservation = publications
+                .reserve(port, crate::net::listeners::PublicationOwner::Expose)
+                .expect("nothing holds the port yet");
+            std::future::pending::<()>().await
+        })
+    };
+
+    // The box's process starts listening: the watcher loses to the pending
+    // reservation — nothing is asked of the switch, and the contention is
+    // said once — for as long as the reservation stands.
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+        .expect("the box's process listens on the port");
+    soon(|| {
+        capture.contents().lines().any(|line| {
+            line.contains("session=owncancel")
+                && line.contains("left a listening port the runtime expose is publishing")
+                && line.contains(&format!("port={port}"))
+        })
+    })
+    .await;
+    assert!(
+        served_naming(&served, loopback, port).is_empty(),
+        "the watcher asks the switch nothing for a port a pending \
+         reservation holds: {:?}",
+        served.lock().expect("served lock")
+    );
+    assert!(
+        !gate.admits_tcp(port),
+        "a pending reservation is not a mapping: nothing is admitted for it"
+    );
+
+    // The publish is cancelled: the task holding the reservation is
+    // aborted mid-bind, the guard drops, and the port is free again — the
+    // watcher's next observation publishes it normally.
+    holder.abort();
+    soon(|| gate.admits_tcp(port)).await;
+    let records = served_naming(&served, loopback, port);
+    assert_eq!(
+        records.len(),
+        1,
+        "the port is published once, by the watcher the reservation held \
+         off: {records:?}"
+    );
+    assert!(
+        records[0].starts_with("POST /services/forwarder/expose "),
+        "the one request is the watcher's publish: {records:?}"
+    );
+    let logged = capture.contents();
+    assert!(
+        logged.lines().any(|line| {
+            line.contains("session=owncancel")
+                && line.contains("published a listening port on the box's address")
+                && line.contains(&format!("port={port}"))
+        }),
+        "the watcher's next observation publishes the freed port: {logged}"
+    );
+    assert!(
+        !logged.lines().any(|line| {
+            line.contains("session=owncancel")
+                && line.contains("publishing a listening port on the switch failed")
+        }),
+        "the contention was never a switch error, and the publish that \
+         followed never failed: {logged}"
+    );
+    assert_eq!(
+        logged
+            .lines()
+            .filter(|line| {
+                line.contains("session=owncancel")
+                    && line.contains("left a listening port the runtime expose is publishing")
+            })
+            .count(),
+        1,
+        "the contention is said once, then settled by the publish: {logged}"
+    );
+    handle.stop().await;
+    drop(listener);
+}
+
+/// The box's stop is a revocation, not a publisher's withdrawal: it unbinds
+/// every runtime publication the box holds — the watcher's and the
+/// expose's alike, whichever owner holds each port — and the publication
+/// set the launch ran on names nothing after it. Neither ownership rule
+/// could take both down (the watcher never withdraws the expose's; the
+/// session's own sweep never sees the watcher's), so the revocation is the
+/// one path that owns both, and it answers to neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revocation_withdraws_regardless_of_owner() {
+    let _capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    // Two ports the box's range covers: one its process listens on from
+    // before the launch — the watcher publishes it — and one only the
+    // runtime expose asks for.
+    let listen_socket = listening_socket();
+    let listen_port = port_of(&listen_socket);
+    let exposed_port = port_of(&listening_socket());
+    let range = (listen_port.min(exposed_port), listen_port.max(exposed_port));
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 83);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 83);
+    let (handle, gate, served, _gate_sender, id) = box_with_scripted_plan(
+        &mut client,
+        &manager,
+        "ownrevoke",
+        switch,
+        loopback,
+        range,
+        vec![GateAnswer::With(200)],
+    )
+    .await;
+
+    // Both owners' publications stand: the watcher's on the port the box's
+    // process listens on, the expose's on the port its user asked for.
+    soon(|| gate.admits_tcp(listen_port)).await;
+    handle
+        .expose_dynamic(exposed_port)
+        .await
+        .expect("the free port publishes");
+
+    // The box stops, and the stop is a revocation: both publications come
+    // down, each exactly once — the watcher's by its own withdrawal, the
+    // expose's by the session's sweep — and the set the launch ran on
+    // names neither port afterwards, whoever owned them.
+    handle.stop().await;
+    let listen_records = served_naming(&served, loopback, listen_port);
+    assert_eq!(
+        listen_records.len(),
+        2,
+        "the watcher's publication came down with the box: {listen_records:?}"
+    );
+    assert!(
+        listen_records[1].starts_with("POST /services/forwarder/unexpose "),
+        "the withdrawal took the watcher's own publication down: {listen_records:?}"
+    );
+    let exposed_records = served_naming(&served, loopback, exposed_port);
+    assert_eq!(
+        exposed_records.len(),
+        2,
+        "the expose's publication came down with the box: {exposed_records:?}"
+    );
+    assert!(
+        exposed_records[1].starts_with("POST /services/forwarder/unexpose "),
+        "the session's sweep took the expose's own publication down: {exposed_records:?}"
+    );
+    assert!(
+        !gate.admits_tcp(listen_port),
+        "the gate refuses the revoked port: no new connection rides on it"
+    );
+    let publications = crate::session::listen_plan_seam::publications_of(id)
+        .expect("the launch handed its publication set back");
+    assert_eq!(
+        publications.held_by(listen_port),
+        None,
+        "the revocation cleared the watcher's entry without an owner check"
+    );
+    assert_eq!(
+        publications.held_by(exposed_port),
+        None,
+        "the revocation cleared the expose's entry without an owner check"
+    );
+    drop(listen_socket);
+}
+
+/// A respawn frees the ports its predecessor published: the publication
+/// set belongs to one launch, so a stopped box's publications never answer
+/// for its successor — the same port is exposable again after the respawn,
+/// and listen-publishable: the respawned box's watcher publishes it once
+/// the box's process binds it, and the expose asking then is the duplicate
+/// the fresh set says it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn respawn_frees_published_ports() {
+    let _capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    // One port the box's range covers, with nothing listening on it.
+    let port = port_of(&listening_socket());
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 84);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 84);
+    let (handle, gate, served, _gate_sender, id) = box_with_scripted_plan(
+        &mut client,
+        &manager,
+        "ownrespawn",
+        switch,
+        loopback,
+        (port, port),
+        vec![GateAnswer::With(200)],
+    )
+    .await;
+
+    // The first box publishes the port at runtime, and its set holds it.
+    handle
+        .expose_dynamic(port)
+        .await
+        .expect("the first box publishes the port");
+    assert_eq!(
+        served_naming(&served, loopback, port).len(),
+        1,
+        "the first publish is one bind: {:?}",
+        served.lock().expect("served lock")
+    );
+
+    // The box stops — the publication comes down with it — and respawns:
+    // the plan the next launch carries is seeded again, the way a real
+    // launch gathers its own facts for every launch it runs.
+    handle.stop().await;
+    assert_eq!(
+        served_naming(&served, loopback, port).len(),
+        2,
+        "the stop unbound the first box's publish: {:?}",
+        served.lock().expect("served lock")
+    );
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    crate::session::listen_plan_seam::seed(
+        id,
+        crate::session::listen_plan_seam::Seeded {
+            lease: switch,
+            published: loopback,
+            control: crate::net::policy::ControlChannel::Unix(sock),
+            gate: std::sync::Arc::clone(&gate),
+        },
+    );
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box respawns its host");
+
+    // The respawn's expose of the same port publishes again: the launch
+    // that runs a box starts from an empty set, so the port the dead spawn
+    // published answers free for its successor.
+    handle
+        .expose_dynamic(port)
+        .await
+        .expect("the respawned box publishes the port the dead spawn held");
+    assert_eq!(
+        served_naming(&served, loopback, port).len(),
+        3,
+        "the second publish is one more bind: {:?}",
+        served.lock().expect("served lock")
+    );
+
+    // Stop and respawn once more, and this time the box's own process binds
+    // the port: the respawn's watcher publishes it — the port is
+    // listen-publishable again, owned by the listen surface now — and the
+    // expose asking after it is the typed duplicate the fresh set says.
+    handle.stop().await;
+    assert_eq!(
+        served_naming(&served, loopback, port).len(),
+        4,
+        "the stop unbound the second publish: {:?}",
+        served.lock().expect("served lock")
+    );
+    let sock = handle
+        .net_switch()
+        .await
+        .unwrap()
+        .lock()
+        .await
+        .control_socket();
+    crate::session::listen_plan_seam::seed(
+        id,
+        crate::session::listen_plan_seam::Seeded {
+            lease: switch,
+            published: loopback,
+            control: crate::net::policy::ControlChannel::Unix(sock),
+            gate: std::sync::Arc::clone(&gate),
+        },
+    );
+    handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box respawns its host again");
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+        .expect("the respawned box's process listens on the port");
+    soon(|| gate.admits_tcp(port)).await;
+    match handle.expose_dynamic(port).await {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::AlreadyPublished {
+                port: asked,
+                owner: crate::net::listeners::PublicationOwner::Listen,
+            },
+        )) => assert_eq!(asked, port),
+        other => panic!("the respawn's watcher owns the port it published: {other:?}"),
+    }
+    assert_eq!(
+        served_naming(&served, loopback, port).len(),
+        5,
+        "the watcher's publish is the only bind of the third launch: {:?}",
+        served.lock().expect("served lock")
+    );
+    handle.stop().await;
+    drop(listener);
 }
