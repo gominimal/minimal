@@ -2103,15 +2103,29 @@ pub struct HostAttrs {
 /// and no verdict of its own, and any other network mode has no host address
 /// to decide on at all.
 ///
+/// The box's declaration is the placement's other half (NET-079): a leaf
+/// is only an enforcement while the declaration is one the classifier can
+/// enforce, so the record is derived from the placement *plus*
+/// [`classifier::unenforceable_rules`] — never from the placement or the
+/// node fact alone — and a placed box whose declaration names a rule the
+/// loaded table cannot enforce is recorded `none`, the state it ran in, on
+/// whatever host it ran on. That is the shape the launch gate above refuses
+/// when the host decides per box; this derivation is what keeps the record
+/// honest for the one host that cannot decide, where the box still runs and
+/// the record must not promise a verdict its rules never had.
+///
 /// Pure over its inputs, so the mapping is pinned where it is written.
 fn host_ip_enforcement(
     network_mode: NetworkMode,
     leaf: Option<&sandbox2::config::ClassifierLeaf>,
+    declaration: Option<&sessions::EgressPolicy>,
 ) -> Option<HostIpEnforcement> {
     match network_mode {
         NetworkMode::HostNet => Some(match leaf {
-            Some(_) => HostIpEnforcement::PerBox,
-            None => HostIpEnforcement::None,
+            Some(_) if crate::net::classifier::unenforceable_rules(declaration).is_empty() => {
+                HostIpEnforcement::PerBox
+            }
+            _ => HostIpEnforcement::None,
         }),
         _ => None,
     }
@@ -3089,6 +3103,19 @@ impl HostIpEnforcementFact {
             (_, None) => None,
         }
     }
+
+    /// Whether the host this fact stands for can decide a host-address
+    /// box's egress verdict per box (NET-079) — the one bit of the node
+    /// fact the create path reads, taking the fact exactly as the create
+    /// response does rather than re-probing the host itself: a create is
+    /// not a place that decides a box, and the launch that follows reads
+    /// the host again for its own gate. A fact no read has set yet — the
+    /// cell's default — answers `false`, so a daemon that has not read its
+    /// host creates what it is handed and leaves the verdicts to its
+    /// launches.
+    pub(crate) fn can_decide_per_box(&self) -> bool {
+        self.enforcement == minimald_rpc::HostIpEnforcement::PerBox
+    }
 }
 
 /// The fact itself: the cell every surface that shows a session reads, in
@@ -4032,6 +4059,40 @@ impl SessionLauncher for SandboxLauncher {
                 guest,
             )
             .await?;
+            // NET-079: the other half of what a host that decides per box
+            // refuses — the declaration's own rules. The create path refuses
+            // the same declaration over the same predicate while the fact
+            // says the host decides, but a box created before that was true —
+            // a create the fact read `none` on, or a record persisted before
+            // this gate existed — still lands here, and the launch is the
+            // last place that can refuse it before the box runs placed and
+            // looking decided while its rules go unenforced. Gated on the
+            // decision this launch has just re-read, not the node fact: the
+            // fact is what a display shows, the launch's own fresh read is
+            // what refuses a box. Refused *before* the leaf below is
+            // allocated — a box this launch refuses to run never lands in
+            // `boxes/allow` — and whatever the launch is for: a hook run of
+            // the same box would run the same rules unenforced, so it is
+            // refused on the same ground as any other launch. On a host that
+            // cannot decide per box the gate answers nothing — NET-079's
+            // exception is that host's to keep, and the refusal below is the
+            // other one's.
+            if let Some(rules) = crate::net::classifier::refuses_unenforceable_declaration(
+                network_mode,
+                decision.can_decide_per_box(),
+                policy.egress.as_ref(),
+            ) {
+                let refusal = crate::net::classifier::unenforceable_declaration_words(&rules);
+                tracing::info!(
+                    session = %session_name,
+                    network_mode = ?network_mode,
+                    host_ip_enforcement = %HostIpEnforcement::PerBox.machine_str(),
+                    refusal = %refusal,
+                    "refusing a host-address box whose declaration names rules \
+                     this host's classifier cannot enforce"
+                );
+                return Err(io::Error::other(refusal));
+            }
             let leaf = create_session_leaf(
                 &classifier_root,
                 mountinfo.as_deref(),
@@ -4054,8 +4115,11 @@ impl SessionLauncher for SandboxLauncher {
         // the fact (`displayed_host_ip_enforcement`), so a leaf placed over
         // a table that is not refusing shows `none` while the host cannot
         // decide and `per_box` once it can again, without a relaunch. The
-        // refusal and the advice below read the one decision.
-        let enforcement = host_ip_enforcement(network_mode, leaf.as_ref());
+        // declaration is the placement's other half: a box whose rules the
+        // classifier cannot enforce is recorded `none` even placed, so the
+        // record never promises `per_box` for rules no verdict enforces.
+        // The refusal and the advice below read the one decision.
+        let enforcement = host_ip_enforcement(network_mode, leaf.as_ref(), policy.egress.as_ref());
 
         // A host-address box this host cannot give a verdict of its own is
         // refused where the box's own declaration is the thing that cannot

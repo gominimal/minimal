@@ -1948,7 +1948,6 @@ mod tests {
             allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
             allow_dns_hosts: Some(vec!["example.com".to_string()]),
             allow_protocols: Some(vec![sessions::IpProto::Tcp]),
-            ..Default::default()
         };
         let rules = unenforceable_rules(Some(&narrowing));
         assert_eq!(
