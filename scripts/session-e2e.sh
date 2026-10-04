@@ -155,10 +155,16 @@
 #                                   two daemons on one machine routing
 #   retired_surfaces_gone            NET-109/110: the retired surfaces are gone,
 #                                    and a direct-tcpip forward relays for real
-#   two_named_vms_on_one_machine     NET-052..059: a second named VM with its
-#                                    own state, one `min ls` listing both,
-#                                    box names resolving to their VM, both
-#                                    routing at once, stop one leaves the other
+#   two_named_vms_on_one_machine     NET-052..059 + the hostname-proxy port
+#                                    story: a second named VM with its own
+#                                    state, one `min ls` listing both, box
+#                                    names resolving to their VM, both booted
+#                                    at the same moment and each routing at
+#                                    once through its own published port, a
+#                                    held default port drawn past and named
+#                                    in the log, a pinned held port failing
+#                                    the start naming the port, stop one
+#                                    leaves the other
 #   github_only_allowlist            NET-066/067/072/073/136 + NET-068's e2e
 #                                    half: a hostname-only allowlist runs a
 #                                    real toolchain against github.com and
@@ -311,6 +317,7 @@ TWO_VM_NAME="" # the named VM the two-named-VMs proof creates; stopped on teardo
 TWO_VM_SEED_A_DIR="" # that proof's default-VM box seed; removed on teardown
 TWO_VM_SEED_B_DIR="" # its named-VM box seed; removed on teardown
 TWO_VM_FWD_PID="" # the `min net forward` it starts; killed on teardown
+TWO_VM_HELD_LISTENER_PID="" # its held-port listener; killed on teardown
 DA_ORIGIN_SEED_DIR="" # the deny-all answer proof's origin box seed; teardown
 DA_TARGET_SEED_DIR="" # its deny-all target box's seed; removed on teardown
 DA_SIBLING_SEED_DIR="" # its sibling box's seed; removed on teardown
@@ -705,6 +712,12 @@ teardown() {
     kill -INT "$TWO_VM_FWD_PID" 2>/dev/null || true
     sleep 0.5 2>/dev/null || true
     kill -9 "$TWO_VM_FWD_PID" 2>/dev/null || true
+  fi
+  # The same proof's held-port listener: a plain background python3 holding
+  # the hostname proxy's default port. A leaked one would keep that port
+  # from every later run of the lane, so the trap is what always kills it.
+  if [ -n "$TWO_VM_HELD_LISTENER_PID" ]; then
+    kill "$TWO_VM_HELD_LISTENER_PID" 2>/dev/null || true
   fi
   [ -n "$DA_ORIGIN_SEED_DIR" ] && rm -rf "$DA_ORIGIN_SEED_DIR"
   [ -n "$DA_TARGET_SEED_DIR" ] && rm -rf "$DA_TARGET_SEED_DIR"
@@ -15525,6 +15538,8 @@ proof_two_named_vms_on_one_machine() {
   TWO_VM_A_PORT=18090            # box A's in-box responder
   TWO_VM_B_PORT=18091            # box B's in-box responder
   TWO_VM_LOCAL_PORT=18093         # the `min net forward` laptop-side listener
+  TWO_VM_HELD_PORT=7654           # the hostname proxy's default port, held by
+                                  # a non-minimal host listener (T93)
   TWO_VM_A_MARKER="TWO_VM_A_OK"  # what box A's responder answers
   TWO_VM_B_MARKER="TWO_VM_B_OK"  # what box B's responder answers
   # The default VM's state directory is the provider root itself — its paths
@@ -15811,39 +15826,102 @@ proof_two_named_vms_on_one_machine() {
   tw_log_lines=0
   if [ -n "$tw_log" ]; then tw_log_lines="$(wc -l < "$tw_log" | tr -d ' ')"; fi
 
-  # Box A on the default VM. The RUST_LOG filter rides each of the two
-  # activates that autospawn a daemon, command-local (the house pattern from
-  # drive_installed_vm_pair): the 'starting VM' record is INFO, a daemon's
-  # filter comes from RUST_LOG at autospawn, and this harness runs the whole
-  # lane at `warn` — which would drop the records the diagnostics beat
-  # asserts before they reached any sink.
+  # ---- T93: a non-minimal listener holds the default hostname-proxy port ----
+  # Every candidate the drawing considers is checked host-wide before it is
+  # served on — a per-port lock, then a bind probe, then a loopback probe —
+  # so a port some other process holds is drawn past with a log record
+  # naming it, never silently reused. This case pins the proxy's default
+  # port under a listener that is not minimal's for the whole boot phase:
+  # both VMs below must come up on ports of their own and the log must say
+  # the default port was skipped, twice — once per boot.
+  if ! np_port_free "$TWO_VM_HELD_PORT"; then
+    echo "::error::127.0.0.1:$TWO_VM_HELD_PORT is already held before this case runs — the hostname proxy's default port must start free here (T93)"
+    fail
+  fi
+  tw_held_dir="$WORK/two-vm-held-listener"
+  mkdir "$tw_held_dir"
+  printf 'held\n' >"$tw_held_dir/marker"
+  (cd "$tw_held_dir" && exec python3 -m http.server "$TWO_VM_HELD_PORT" --bind 127.0.0.1) \
+    >/dev/null 2>"$WORK/two-vm-held-listener.err" &
+  TWO_VM_HELD_LISTENER_PID=$!
+  tw_held_up=""
+  for _ in $(seq 1 40); do
+    if [ "$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+      "http://127.0.0.1:$TWO_VM_HELD_PORT/marker" 2>/dev/null || true)" = "200" ]; then
+      tw_held_up=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$tw_held_up" ]; then
+    echo "::error::the held-port listener never answered on 127.0.0.1:$TWO_VM_HELD_PORT"
+    echo "--- listener stderr ---"
+    cat "$WORK/two-vm-held-listener.err" 2>/dev/null || true
+    fail
+  fi
+  echo "held port: python3 -m http.server $TWO_VM_HELD_PORT --bind 127.0.0.1 answers — no VM below can get this port"
+
+  # Both boxes' activates run at the same moment — the case's own subject
+  # (T93): two boots racing on one machine must not converge on one host
+  # port, and each drawing that sees the other's reservation is the fact the
+  # minvmd harness proves with lock-holders standing in for daemons; these
+  # are the two boots themselves. The RUST_LOG filter rides each activate,
+  # command-local (the house pattern from drive_installed_vm_pair): the
+  # 'starting VM' record is INFO, a daemon's filter comes from RUST_LOG at
+  # autospawn, and this harness runs the whole lane at `warn` — which would
+  # drop the records the diagnostics beat asserts before they reached any
+  # sink. The raised boot timeouts are command-local too: two boots share
+  # one machine's CPU and disk, and the justfile already exports these same
+  # timeouts for every recipe that boots a VM — a double boot is the
+  # contended form of the same cold-boot story.
   TWO_VM_SEED_A_DIR="$(hook_mktemp /tmp/mnltwa.XXXXXX)"
   hook_seed_preamble > "$TWO_VM_SEED_A_DIR/minimal.toml"
   mkdir "$TWO_VM_SEED_A_DIR/.git"
-  tw_a_sid="$(cd "$TWO_VM_SEED_A_DIR" && RUST_LOG="warn,minvmd=info" \
+  TWO_VM_SEED_B_DIR="$(hook_mktemp /tmp/mnltwb.XXXXXX)"
+  hook_seed_preamble > "$TWO_VM_SEED_B_DIR/minimal.toml"
+  mkdir "$TWO_VM_SEED_B_DIR/.git"
+  (cd "$TWO_VM_SEED_A_DIR" && RUST_LOG="warn,minvmd=info" \
+      MINIMAL_SPAWN_TIMEOUT_SECS=240 \
+      MINVMD_READY_TIMEOUT_SECS=240 \
+      MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS=240 \
       mnl session activate . --no-prompt --name "$TWO_VM_A_NAME" \
-      2>"$WORK/two-vm-a-activate.err")" \
-    || { echo "::error::'min session activate' for the default VM's box failed"
-         echo "--- stderr ---"; cat "$WORK/two-vm-a-activate.err" 2>/dev/null || true
-         fail; }
-  tw_a_sid="$(printf '%s\n' "$tw_a_sid" | tail -n1 | tr -d '\r')"
-  echo "box A: $tw_a_sid ($TWO_VM_A_NAME) on VM default — min session activate, no flag"
-
+      >"$WORK/two-vm-a-activate.out" 2>"$WORK/two-vm-a-activate.err") &
+  tw_activate_a_pid=$!
   # Box B on the NAMED VM — the case's own subject: `min --vm alpha session
   # activate` creates the VM if it is not there, because autospawn forwards
   # the name to the daemon it spawns (crates/minimal/src/autospawn.rs), so
   # this one command is both the creation and the first use of it.
-  TWO_VM_SEED_B_DIR="$(hook_mktemp /tmp/mnltwb.XXXXXX)"
-  hook_seed_preamble > "$TWO_VM_SEED_B_DIR/minimal.toml"
-  mkdir "$TWO_VM_SEED_B_DIR/.git"
-  tw_b_sid="$(cd "$TWO_VM_SEED_B_DIR" && RUST_LOG="warn,minvmd=info" \
+  (cd "$TWO_VM_SEED_B_DIR" && RUST_LOG="warn,minvmd=info" \
+      MINIMAL_SPAWN_TIMEOUT_SECS=240 \
+      MINVMD_READY_TIMEOUT_SECS=240 \
+      MINVMD_LIFECYCLE_BOOT_TIMEOUT_SECS=240 \
       two_vm_mn session activate . --no-prompt --name "$TWO_VM_B_NAME" \
-      2>"$WORK/two-vm-b-activate.err")" \
-    || { echo "::error::'min --vm $tw_name session activate' failed to create the named VM and activate a box in it"
-         echo "--- stderr ---"; cat "$WORK/two-vm-b-activate.err" 2>/dev/null || true
-         fail; }
-  tw_b_sid="$(printf '%s\n' "$tw_b_sid" | tail -n1 | tr -d '\r')"
-  echo "box B: $tw_b_sid ($TWO_VM_B_NAME) on VM $tw_name — min --vm $tw_name session activate"
+      >"$WORK/two-vm-b-activate.out" 2>"$WORK/two-vm-b-activate.err") &
+  tw_activate_b_pid=$!
+  tw_rc_a=0
+  tw_rc_b=0
+  wait "$tw_activate_a_pid" || tw_rc_a=$?
+  wait "$tw_activate_b_pid" || tw_rc_b=$?
+  if [ "$tw_rc_a" -ne 0 ]; then
+    echo "::error::'min session activate' for the default VM's box failed (exit $tw_rc_a)"
+    echo "--- stderr ---"; cat "$WORK/two-vm-a-activate.err" 2>/dev/null || true
+    fail
+  fi
+  if [ "$tw_rc_b" -ne 0 ]; then
+    echo "::error::'min --vm $tw_name session activate' failed to create the named VM and activate a box in it (exit $tw_rc_b)"
+    echo "--- stderr ---"; cat "$WORK/two-vm-b-activate.err" 2>/dev/null || true
+    fail
+  fi
+  tw_a_sid="$(tail -n1 "$WORK/two-vm-a-activate.out" | tr -d '\r')"
+  tw_b_sid="$(tail -n1 "$WORK/two-vm-b-activate.out" | tr -d '\r')"
+  if [ -z "$tw_a_sid" ] || [ -z "$tw_b_sid" ]; then
+    echo "::error::an activate printed no session id — both boots raced, so both of their transcripts must be read"
+    echo "--- box A stdout ---"; cat "$WORK/two-vm-a-activate.out" 2>/dev/null || true
+    echo "--- box B stdout ---"; cat "$WORK/two-vm-b-activate.out" 2>/dev/null || true
+    fail
+  fi
+  echo "box A: $tw_a_sid ($TWO_VM_A_NAME) on VM default — min session activate, booted alongside box B"
+  echo "box B: $tw_b_sid ($TWO_VM_B_NAME) on VM $tw_name — min --vm $tw_name session activate, booted alongside box A"
 
   # ---- NET-052/053/054: each VM's own state, the default's unchanged ------
   # The named VM's state directory is its own (NET-052): its state file and
@@ -15928,7 +16006,33 @@ print("yes" if any(s.get("vm") == sys.argv[1] for s in doc["sessions"]) else "no
     echo "::error::both VMs published the same host proxy port 127.0.0.1:$tw_port_a — each needs a port of its own for both to route at once (NET-059)"
     fail
   fi
-  echo "published proxy ports (min ls): default 127.0.0.1:$tw_port_a · $tw_name 127.0.0.1:$tw_port_b"
+  if [ "$tw_port_a" = "$TWO_VM_HELD_PORT" ] || [ "$tw_port_b" = "$TWO_VM_HELD_PORT" ]; then
+    echo "::error::a VM published the held host port 127.0.0.1:$TWO_VM_HELD_PORT — a port another process already holds is never drawn (T93)"
+    echo "published: default 127.0.0.1:$tw_port_a · $tw_name 127.0.0.1:$tw_port_b"
+    fail
+  fi
+  echo "published proxy ports (min ls): default 127.0.0.1:$tw_port_a · $tw_name 127.0.0.1:$tw_port_b — neither is the held $TWO_VM_HELD_PORT"
+
+  # And the log says both boots saw the held port and drew past it: one skip
+  # record per boot naming the candidate port and why it moved on. Read from
+  # the tail after the snapshot, so the records are this run's on a
+  # whole-lane run too; retried because a slow boot's record can trail the
+  # activate that waited on it.
+  tw_skips=""
+  for _ in $(seq 1 20); do
+    tw_skips="$(two_vm_log_since "$tw_log" "$tw_log_lines" \
+      | grep -F -- 'skipped a node-port candidate' \
+      | grep -F -- "\"candidate_port\":$TWO_VM_HELD_PORT" || true)"
+    [ "$(printf '%s\n' "$tw_skips" | grep -c .)" -ge 2 ] && break
+    sleep 0.5
+  done
+  if [ "$(printf '%s\n' "$tw_skips" | grep -c .)" -lt 2 ]; then
+    echo "::error::fewer than two 'skipped a node-port candidate' records name 127.0.0.1:$TWO_VM_HELD_PORT — both boots must log drawing past the held port (T93)"
+    echo "--- log tail ---"; two_vm_log_since "$tw_log" "$tw_log_lines" | tail -20 || true
+    fail
+  fi
+  printf '%s\n' "$tw_skips" | sed 's/^/  /'
+  echo "skip records: both boots drew past the held $TWO_VM_HELD_PORT and the log names it"
 
   # ---- the in-box responders the routing matrix answers through ------------
   two_vm_start_responder mnl "$tw_a_sid" "$TWO_VM_A_PORT" "$TWO_VM_A_MARKER" default "$TWO_VM_A_NAME"
@@ -16205,10 +16309,48 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   echo "VM host daemon start record (default): $tw_rec_a"
   echo "VM host daemon start record ($tw_name): $tw_rec_b"
 
+  # ---- T93: a configured port the host holds fails the start naming it ----
+  # The same listener still holds the same port, now as the operator's pin:
+  # MINVMD_NODE_PROXY_PORT in the boot's env says "this port, exactly", so a
+  # pin the checks refuse is a start that fails — never a quiet move to a
+  # port the operator did not name. The failure must be loud and name the
+  # port: the supervisor's own error in its state directory's run.log, the
+  # detach caller failing with it, and the VM left stopped — a VM never
+  # stays up with no hostname proxy serving. This runs after the
+  # start-records beat above on purpose: a failed boot also writes a
+  # 'starting VM' record, and that beat reads exactly one per VM.
+  tw_pin_rc=0
+  MINVMD_NODE_PROXY_PORT="$TWO_VM_HELD_PORT" minvmd --vm "$tw_name" run --detach \
+    >"$WORK/two-vm-pin-run.out" 2>"$WORK/two-vm-pin-run.err" || tw_pin_rc=$?
+  if [ "$tw_pin_rc" -eq 0 ]; then
+    echo "::error::the pinned boot of a held port came up — a configured port never redraws, so the start must fail (T93)"
+    fail
+  fi
+  tw_pin_log="$tw_alpha/run.log"
+  if ! grep -Fq -- "$TWO_VM_HELD_PORT" "$tw_pin_log" 2>/dev/null \
+     || ! grep -Fq -- 'never redraws' "$tw_pin_log" 2>/dev/null; then
+    echo "::error::the pinned boot's failure does not name the held port — the start must fail naming 127.0.0.1:$TWO_VM_HELD_PORT and saying the configured port never redraws (T93)"
+    echo "--- minvmd run --detach stderr ---"; cat "$WORK/two-vm-pin-run.err" 2>/dev/null || true
+    echo "--- $tw_pin_log ---"; cat "$tw_pin_log" 2>/dev/null || true
+    fail
+  fi
+  case "$(minvmd --vm "$tw_name" status --json 2>/dev/null || true)" in
+    *'"state":"stopped"'*) ;;
+    *) echo "::error::$tw_name came up (or was left half-started) by a boot whose pinned port the host holds — no VM stays up with no hostname proxy (T93)"
+       minvmd --vm "$tw_name" status --json 2>&1 || true
+       fail ;;
+  esac
+  echo "pinned port: MINVMD_NODE_PROXY_PORT=$TWO_VM_HELD_PORT fails the start naming the port, VM left stopped — $(head -n1 "$tw_pin_log" 2>/dev/null || true)"
+
+  # The held listener's job is done; release the default port before the
+  # case ends so nothing later in the lane inherits a port it did not hold.
+  kill "$TWO_VM_HELD_LISTENER_PID" 2>/dev/null || true
+  TWO_VM_HELD_LISTENER_PID=""
+
   mnl session destroy --force "$tw_a_sid" >/dev/null 2>&1 \
     || { echo "::error::could not destroy the default VM's box"; fail; }
   echo "destroy: box A on VM default — min session destroy --force"
-  echo "two named VMs on one machine OK (own state each, one listing with both, box names resolving to their VM, both routing at once, stop one leaves the other)"
+  echo "two named VMs on one machine OK (own state each, one listing with both, box names resolving to their VM, booted at once with a port of their own each and the held default drawn past, both routing at once, a pinned held port failing the start naming the port, stop one leaves the other)"
   echo "::endgroup::"
 }
 
