@@ -815,6 +815,12 @@ impl RegisteredTables {
         );
         let mut accepted = Vec::with_capacity(rows.len());
         let mut refused = Vec::new();
+        // The box addresses this publish's earlier rows claimed: the book
+        // refuses another node's address, and this keeps one node's two
+        // boxes from sharing one either — the second would overwrite the
+        // first's holder record, so its release would free an address the
+        // first box still answers at.
+        let mut claimed: Vec<(Ipv4Addr, String)> = Vec::new();
         for row in rows {
             let name = canonical(&row.name);
             if reserved.contains(&name) {
@@ -877,6 +883,19 @@ impl RegisteredTables {
                     });
                     continue;
                 }
+                if let Some((_, first)) = claimed
+                    .iter()
+                    .find(|(held, held_name)| *held == address && *held_name != name)
+                {
+                    refused.push(RefusedRow {
+                        reason: format!(
+                            "this publish's box {first} already carries the address \
+                             {address}; the answerer hands each box its own"
+                        ),
+                        name: row.name,
+                    });
+                    continue;
+                }
                 if let Err(reason) = self.book().claim(node, &name, address) {
                     refused.push(RefusedRow {
                         name: row.name,
@@ -884,6 +903,7 @@ impl RegisteredTables {
                     });
                     continue;
                 }
+                claimed.push((address, name));
             }
             accepted.push(row);
         }
@@ -5513,6 +5533,39 @@ mod tests {
             );
         }
         drop(intruder);
+
+        // One node's two boxes carrying one free address in one publish:
+        // the first claims it, the second is refused rather than taking
+        // over the first's holder record.
+        let shared = Ipv4Addr::new(127, 0, 64, 200);
+        let twins = connect_and_publish(
+            &channel,
+            &node_c,
+            vec![
+                published_row("left", shared),
+                published_row("right", shared),
+            ],
+        )
+        .expect("node c's second connection is served");
+        assert_eq!(
+            twins.refused.len(),
+            1,
+            "only the second box is refused: {:?}",
+            twins.refused
+        );
+        assert!(
+            twins.refused[0].name.starts_with("right"),
+            "the second box is the one refused: {}",
+            twins.refused[0].name
+        );
+        assert!(
+            twins.refused[0]
+                .reason
+                .contains("already carries the address"),
+            "the shared address is refused naming the first box: {}",
+            twins.refused[0].reason
+        );
+        drop(twins);
 
         // A released box's address leaves the holder's book, but not into
         // another box's hands inside the answer TTL: the next box is handed
