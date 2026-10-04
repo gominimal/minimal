@@ -783,7 +783,10 @@ const RESERVED_SESSION_NAMES: [&str; 3] = ["host", "local", "localhost"];
 /// tab or newline in particular — splits one row into several, and an empty
 /// or whitespace-padded name is useless as an addressable handle. Enforced
 /// here beside the name-collision check so both name writers (`create` for
-/// `activate --name`, `save` for `rename`) share one gate.
+/// `activate --name`, `save` for `rename`) share one gate. The name must
+/// also be a single DNS label (ASCII letters, digits and `-`, 1 to 63
+/// octets, no `-` at either end) because the daemon renders it into
+/// `<name>.min.internal`.
 fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
     let invalid = |msg: &str| {
         std::io::Error::new(
@@ -1505,8 +1508,21 @@ mod tests {
         )
         .unwrap();
 
-        let loader = DiskLoader::new(root).unwrap();
-        assert!(loader.find_by_name("dot.ted.name").unwrap().is_some());
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader
+            .find_by_name("dot.ted.name")
+            .unwrap()
+            .expect("re-indexed");
+
+        // Re-saving the record with its legacy name unchanged (e.g. a status
+        // promotion) must not re-validate the name.
+        let mut promoted = loader.get(&key).unwrap().record().clone();
+        promoted.status = SessionStatus::Active;
+        loader.save(&key, &promoted).unwrap();
+        assert_eq!(
+            loader.get(&key).unwrap().record().status,
+            SessionStatus::Active,
+        );
     }
 
     #[test]
