@@ -1846,6 +1846,7 @@ proof_host_ip_deny_all() {
   local hida_install_out="" hida_place_out="" hida_daemons=""
   local hida_pid="" hida_proc="" hida_comm=""
   local hida_sid="" hida_activate_err="" hida_launch="" hida_records=""
+  local hida_warm_sid="" hida_warm_activate_err="" hida_warm_launch=""
   local hida_ls="" hida_answerer_line="" hida_proxy_port="" hida_host_ns=""
   local hida_resolv="" hida_err="" hida_rc="" hida_status="" hida_tail=""
   local hida_cover="" hida_cgroup="" hida_write="" hida_write_msg="" hida_sib=""
@@ -1876,6 +1877,9 @@ proof_host_ip_deny_all() {
   # uninstall's exit status, so the happy path can fail on a removal that
   # did not happen.
   hida_unwind() {
+    if [ -n "${hida_warm_sid:-}" ]; then
+      mnl session destroy --force "$hida_warm_sid" >/dev/null 2>&1 || true
+    fi
     if [ -n "${hida_sid:-}" ]; then
       mnl session destroy --force "$hida_sid" >/dev/null 2>&1 || true
     fi
@@ -2039,12 +2043,84 @@ proof_host_ip_deny_all() {
     fi
     echo "place: $min_daemon $hida_pid is inside the slice, so the box this case launches is decided on a leaf of its own"
 
+    # ---- the daemon's own fact, turned the one way it is: a launch. A
+    # create answers from the last read the host gave it — the start-up
+    # read, then each host-address launch's re-read — never a fresh probe
+    # of its own, and this case's daemon started outside the slice, before
+    # the --pid step above placed it, so its start-up read could not place
+    # its probe child in a leaf and left the fact carrying the very cause
+    # the placement just ruled out. The re-read runs per launch, so one
+    # throwaway host-address box, driven to its launch and destroyed,
+    # turns the fact: its launch reads the table's effect with the daemon
+    # inside the tree, and the create for the box this half is about then
+    # answers a fact that says per_box. The throwaway box's own create is
+    # the one create that may still carry the start-up read's cause — the
+    # placement clears a cause for the reads after it, not for the fact
+    # the daemon already answered with — so its activation's stderr is
+    # printed below, never asserted: a daemon that started inside the tree
+    # (a Delegate=yes unit) read decided at start-up and owes this create
+    # no advisory either.
+    hida_warm_sid="$(cd "$HIDA_SEED_DIR" && mnl session activate . --no-prompt \
+      --name e2e-hida-warm --network host_ip 2>"$WORK/hida-warm-activate.err")" || {
+      echo "::error::the throwaway host-address box that turns the daemon's classifier fact failed to activate"
+      cat "$WORK/hida-warm-activate.err" 2>/dev/null || true
+      fail
+    }
+    hida_warm_sid="$(printf '%s\n' "$hida_warm_sid" | tail -n1 | tr -d '\r')"
+    hida_warm_activate_err="$(cat "$WORK/hida-warm-activate.err" 2>/dev/null || true)"
+    if [[ "$hida_warm_activate_err" == *"cannot decide a host-address box's"* ]]; then
+      echo "warm create: the throwaway box's start printed the advisory the start-up read left the fact carrying — the placement above clears the cause for reads after it, and the launch that turns the fact is the next beat:"
+      printf '%s\n' "$hida_warm_activate_err" | sed 's/^/  /'
+    fi
+
+    # ---- the capability gate, on this half's first driven box: this half
+    # drives boxes, so a host that cannot run one cannot run it. Observed
+    # fact, degraded on a developer host, a lane fault on CI (the posture
+    # proof's rule).
+    if ! mnl session exec "$hida_warm_sid" 'true' >"$WORK/hida-warm-gate.err" 2>&1 \
+       && ! { sleep 1; mnl session exec "$hida_warm_sid" 'true' >"$WORK/hida-warm-gate.err" 2>&1; }; then
+      if [ -z "${CI:-}" ]; then
+        echo "::warning::host_ip_deny_all proof SKIPPED — this host cannot run a session sandbox, so no box can be driven"
+        echo "  (exec: $(head -n1 "$WORK/hida-warm-gate.err" 2>/dev/null || true))"
+        echo "  the tree and table this case installed are uninstalled below; asserted on the native CI lane"
+        hida_unwind || true
+        echo "::endgroup::"
+        return 0
+      fi
+      echo "::error::a CI native lane that cannot run a session sandbox cannot drive NET-079: the box is the proof"
+      cat "$WORK/hida-warm-gate.err" 2>/dev/null || true
+      fail
+    fi
+
+    # ---- the placement's proof, and the fact turned: the throwaway box's
+    # launch re-read the table's effect with the daemon inside the tree,
+    # so its record says per_box — the fact the box this half is about
+    # will be created against. Pinned by the throwaway box's own leaf,
+    # because the deny-all box below writes a record of its own into the
+    # same log.
+    hida_warm_launch="$(hida_log 'egress verdict is decided on its classifier leaf')"
+    hida_warm_launch="$(printf '%s\n' "$hida_warm_launch" \
+      | grep -F -- "boxes/allow/$hida_warm_sid" || true)"
+    if [[ "$hida_warm_launch" != *'"host_ip_enforcement":"per_box"'* ]]; then
+      echo "::error::the throwaway box's launch record does not say per_box: the placement did not take effect at the launch's re-read, so the create for the deny-all box below would answer a fact that still carries a cause: $hida_warm_launch"
+      fail
+    fi
+    if ! mnl session destroy --force "$hida_warm_sid" \
+        >/dev/null 2>"$WORK/hida-warm-destroy.err"; then
+      echo "::error::the throwaway box would not destroy, so its leaf would hold the tree this case's own uninstall removes at the end"
+      cat "$WORK/hida-warm-destroy.err" 2>/dev/null || true
+      fail
+    fi
+    echo "refresh: the throwaway box's launch (leaf boxes/allow/$hida_warm_sid) re-read the host with the daemon inside the slice — the fact now says per_box, and it is what the deny-all box's create answers"
+
     # ---- the box: the activate launches it, into a leaf of the placed
     # daemon's tree, under the table this case loaded, declared deny-all by
     # the CLI's own spelling of it. The activation's stderr is captured
-    # whole: a decided host's create carries no classifier advisory, so the
-    # capture must carry none either — the start said nothing because there
-    # was nothing to say.
+    # whole: the fact this create answers from is the one the throwaway
+    # box's launch just turned — per_box, on a host whose table is loaded
+    # and whose daemon is placed — so a decided host's create carries no
+    # classifier advisory, and the capture must carry none either: the
+    # start said nothing because there was nothing to say.
     hida_sid="$(cd "$HIDA_SEED_DIR" && mnl session activate . --no-prompt --name e2e-hida \
       --network host_ip --deny-all-egress 2>"$WORK/hida-activate.err")" || {
       echo "::error::'min session activate --network host_ip --deny-all-egress' failed under the loaded table"
@@ -2054,26 +2130,20 @@ proof_host_ip_deny_all() {
     hida_sid="$(printf '%s\n' "$hida_sid" | tail -n1 | tr -d '\r')"
     hida_activate_err="$(cat "$WORK/hida-activate.err" 2>/dev/null || true)"
     if [[ "$hida_activate_err" == *"cannot decide a host-address box's"* ]]; then
-      echo "::error::the activation on a decided host printed the classifier advisory anyway: the create reply carried a cause this case's own install just ruled out"
+      echo "::error::the activation on a decided host printed the classifier advisory anyway: the create reply carried a cause the refresh launch above just ruled out of the fact"
       printf '%s\n' "$hida_activate_err"
       fail
     fi
     echo "activate: the host-address box $hida_sid is declared deny-all (--deny-all-egress) on a host that decides per box, and the start printed no classifier advisory"
 
-    # ---- the capability gate: this half drives a box, so a host that cannot
-    # run one cannot run it. Observed fact, degraded on a developer host, a
-    # lane fault on CI (the posture proof's rule).
+    # ---- the box's launch: the exec is what starts a session's box (it
+    # launches on first use, not at the activate), and the record that
+    # launch leaves is read next. The capability gate above already
+    # answered whether this host can drive a box, so a failure here is a
+    # fault, not a degraded host.
     if ! mnl session exec "$hida_sid" 'true' >"$WORK/hida-gate.err" 2>&1 \
        && ! { sleep 1; mnl session exec "$hida_sid" 'true' >"$WORK/hida-gate.err" 2>&1; }; then
-      if [ -z "${CI:-}" ]; then
-        echo "::warning::host_ip_deny_all proof SKIPPED — this host cannot run a session sandbox, so no box can be driven"
-        echo "  (exec: $(head -n1 "$WORK/hida-gate.err" 2>/dev/null || true))"
-        echo "  the tree and table this case installed are uninstalled below; asserted on the native CI lane"
-        hida_unwind || true
-        echo "::endgroup::"
-        return 0
-      fi
-      echo "::error::a CI native lane that cannot run a session sandbox cannot drive NET-079: the box is the proof"
+      echo "::error::the deny-all box's own exec failed: the box this half is about cannot be driven"
       cat "$WORK/hida-gate.err" 2>/dev/null || true
       fail
     fi
@@ -2082,8 +2152,12 @@ proof_host_ip_deny_all() {
     # leaf it was placed in, and the fresh verdict the host read before it.
     # `per_box` is not a claim the launch makes about itself: it is the
     # verdict a host gets only when the daemon's probe connection out of a
-    # deny leaf was refused the way this table refuses.
+    # deny leaf was refused the way this table refuses. Named by this
+    # box's own leaf, because the throwaway box's launch record above
+    # lives in the same log.
     hida_launch="$(hida_log 'egress verdict is decided on its classifier leaf')"
+    hida_launch="$(printf '%s\n' "$hida_launch" \
+      | grep -F -- "boxes/deny/$hida_sid" || true)"
     if [[ "$hida_launch" != *'"classifier":"deny"'* ]]; then
       echo "::error::the box's launch record does not name the deny subtree a deny-all declaration lands in: $hida_launch"
       fail
