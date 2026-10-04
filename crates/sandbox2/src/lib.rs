@@ -935,28 +935,28 @@ pub mod classifier {
     }
 
     /// The command a person runs on this host to give this daemon a
-    /// classifier tree: the installer takes the account the daemon runs as
-    /// and the two source identities the classification rests on (NET-078 —
-    /// what the boxes cohort leaves as, and what the rest of the slice
-    /// leaves as; the step refuses to render one without the other, so a
-    /// hint that named neither is a command the step itself refuses). The
+    /// classifier tree. A stock install does not ship the installer (the
+    /// release stages only the apparmor one), so the hint names where the
+    /// script lives in the source repository rather than a `scripts/` path
+    /// the host does not have. The installer takes the account the daemon
+    /// runs as and the two source identities the classification rests on
+    /// (NET-078 — what the boxes cohort leaves as, and what the rest of the
+    /// slice leaves as; the step refuses to render one without the other, so
+    /// a hint that named neither is a command the step itself refuses). The
     /// hint spells the whole command, so the advisory that carries it never
     /// has to name a placeholder for the one thing the daemon knows — only
     /// for the two things this host does.
     #[cfg(target_os = "linux")]
     #[must_use]
     pub fn install_hint() -> String {
-        match own_account() {
-            Some(account) => format!(
-                "sudo scripts/install-host-classifier.sh --user {account} \
-                 --cohort-address <cohort address> --node-plane-address \
-                 <node-plane address>"
-            ),
-            None => "sudo scripts/install-host-classifier.sh --user \
-                 <the account this daemon runs as> --cohort-address \
-                 <cohort address> --node-plane-address <node-plane address>"
-                .to_string(),
-        }
+        let account =
+            own_account().unwrap_or_else(|| "<the account this daemon runs as>".to_string());
+        format!(
+            "run: curl -fsSLO \
+             https://raw.githubusercontent.com/gominimal/minimal/main/scripts/install-host-classifier.sh \
+             && sudo bash ./install-host-classifier.sh --user {account} \
+             --cohort-address <cohort address> --node-plane-address <node-plane address>"
+        )
     }
 
     /// Makes one level of the classifier layout, taking `AlreadyExists` as
@@ -4458,6 +4458,34 @@ ff02::2\tip6-allrouters
     // ---------------------------------------------------------------------
     // NET-079: each host-address box in its own classifier leaf, kept there.
     // ---------------------------------------------------------------------
+
+    /// A stock install does not ship the classifier installer, so the hint
+    /// says where to fetch it — the raw file, not GitHub's HTML viewer page,
+    /// which a `curl` of the URL would save and `sudo` would then run — rather
+    /// than name a checkout-relative `scripts/` path, and still spells the
+    /// `--user` the daemon knows.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_install_hint_names_where_the_installer_lives() {
+        let hint = classifier::install_hint();
+        assert!(
+            hint.contains(
+                "https://raw.githubusercontent.com/gominimal/minimal/main/scripts/install-host-classifier.sh"
+            ),
+            "{hint}"
+        );
+        assert!(!hint.contains("/blob/"), "{hint}");
+        assert!(!hint.contains("sudo scripts/"), "{hint}");
+        // The fetch saves the file under its own name, so the run that
+        // follows finds it; a downloaded file has no executable bit, so the
+        // hint runs it via bash.
+        assert!(hint.contains("curl -fsSLO https://"), "{hint}");
+        assert!(
+            hint.contains("sudo bash ./install-host-classifier.sh"),
+            "{hint}"
+        );
+        assert!(hint.contains("--user "), "{hint}");
+    }
 
     /// The mount-table half of the confinement: which cgroup2 mounts a host's
     /// `mountinfo` names, which one a classifier tree lives on, and whether
