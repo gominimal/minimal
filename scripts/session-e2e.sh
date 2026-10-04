@@ -11083,26 +11083,36 @@ PY
 #     shuttle's own protocol at the gate's landing edge — the /connect
 #     upgrade head and length-framed Ethernet frames, the byte stream a root
 #     escapee's connection carries past that edge — wearing each source
-#     address in turn against a host listener the fabric's NAT maps the host
-#     alias to.
+#     address in turn against a host listener on the runner's own interface
+#     address, which a box reaches through the fabric's NAT as ordinary
+#     egress.
+#
+# Not the host alias: box-to-host reach over the alias is default-deny except
+# configured host exposures (design §7.1, gominimal/inbox#867), so a box's own
+# relay drops a probe to it whatever the box declares, and the positive
+# controls could never pass. The runner's address is the default route's
+# source address; the case fails (it does not skip) when that address is
+# unspecified, loopback, inside the switch plan's 100.64/10, or in the
+# reserved local range 127.0.64.0/24, because the relay decides those by its
+# own drops rather than by the boxes' declared union.
 #
 # Two resident boxes with disjoint declared egress bound the union: box A
-# declares 10.0.0.0/8, box B 192.168.0.0/16, and both declare the fabric
-# (100.64.0.0/16), which carries the host alias — inside the union for a
-# box's own address, and the node-plane baseline set's one category-pair
-# (NET-130: the alias is the registry and the cache, shown beside the rules
-# by `min session policy`). The arms:
+# declares 10.0.0.0/8, box B 192.168.0.0/16, and both declare the runner's
+# address as a /32 (the destination their own probes reach) and the fabric
+# (100.64.0.0/16), which carries the host alias, the node-plane baseline
+# set's one category-pair (NET-130: the alias is the registry and the cache,
+# shown beside the rules by `min session policy`). The arms:
 #
-#   * each box's own probe to the host alias arrives — the whole chain
-#     working, and the union's fabric half live for a box's own address;
+#   * each box's own probe to the runner's address arrives — the whole chain
+#     working, and the union's declared half live for a box's own address;
 #   * a made-up in-plan lease — an address the plan could hand out and no
-#     row holds — reaches the alias under the shipped interim, the spoofer's
-#     liveness bracket: its frames traverse the gate, the switch and the NAT
-#     when nothing refuses them, and the gate's interim line names the
-#     source. Recorded the way the in-crate harness records it, so the arm
-#     is flip-stable: when the per-box default binds, the same flow is
-#     refused before any frame leaves the VM and the unknown-source line
-#     names it instead;
+#     row holds — reaches the runner's address under the shipped interim,
+#     the spoofer's liveness bracket: its frames traverse the gate, the
+#     switch and the NAT when nothing refuses them, and the gate's interim
+#     line names the source. Recorded the way the in-crate harness records
+#     it, so the arm is flip-stable: when the per-box default binds, the
+#     same flow is refused before any frame leaves the VM and the
+#     unknown-source line names it instead;
 #   * box A's address toward 192.168.77.7, declared only by box B — the
 #     union's other half — is refused: the row that holds the source address
 #     decides, and box A's row does not cover it (the RFC 1918 the
@@ -11147,7 +11157,7 @@ proof_escape_reaches_only_declared_union() {
   local esu_sid_a="" esu_sid_b="" esu_ip_a="" esu_ip_b=""
   local esu_rec_a="" esu_rec_b="" esu_out="" esu_rows="" esu_line=""
   local esu_route="" esu_v6="" esu_cmdline="" esu_policy="" esu_caps=""
-  local esu_log0="" esu_log0_lines=0 esu_alias="100.64.255.254"
+  local esu_log0="" esu_log0_lines=0 esu_host=""
   local esu_gate_sock="" esu_listener_log=""
   # The loop-carried variables below stay function-local on purpose: sid_var
   # in particular is a name the proxy-source case (bepb_*) also writes, and a
@@ -11175,8 +11185,9 @@ proof_escape_reaches_only_declared_union() {
   fi
 
   # The two seeds: the disjoint declared egress rides on the box specs — one
-  # private range each, plus the fabric they share, so a box's own probe to
-  # the host alias is inside its own declaration.
+  # private range each, plus the runner's address and the fabric they share,
+  # so a box's own probe to the runner's address is inside its own
+  # declaration.
   ESU_A_SEED_DIR="$(hook_mktemp /tmp/mnlesc-a.XXXXXX)"
   hook_seed_preamble > "$ESU_A_SEED_DIR/minimal.toml"
   mkdir "$ESU_A_SEED_DIR/.git"
@@ -11233,17 +11244,49 @@ proof_escape_reaches_only_declared_union() {
     fail
   }
 
-  if python3 -c "import socket; socket.create_connection(('127.0.0.1', $ESU_LISTEN_PORT), 2)" \
+  # The destination: the runner's own non-loopback IPv4 address, the source
+  # address of its default route, read by connecting a UDP socket toward a
+  # TEST-NET-1 address (no packet is sent) — the same read on Linux and
+  # macOS, and the one the in-crate harness makes
+  # (crates/minvmd/tests/vm_escape_integration.rs, host_interface_address).
+  # A box reaches it through the switch's NAT as ordinary egress. Not the
+  # host alias: box-to-host reach over the alias is default-deny except
+  # configured host exposures (design §7.1, gominimal/inbox#867), so each
+  # box's own relay drops a probe to it whatever the box declares.
+  esu_host="$(python3 -c "
+import socket
+probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+probe.connect(('192.0.2.1', 9))
+print(probe.getsockname()[0])
+" 2>"$WORK/esu-host.err")" || esu_host=""
+  # It must sit outside every range the relay drops or reserves on its own:
+  # loopback, the switch plan's 100.64/10 and the reserved local range. A
+  # verdict there would be the relay's own drop, never the declared union's,
+  # so any other answer fails the case rather than skipping it.
+  if [ -z "$esu_host" ] || ! python3 -c "
+import ipaddress, sys
+addr = ipaddress.IPv4Address(sys.argv[1])
+blocked = ('127.0.0.0/8', '100.64.0.0/10', '127.0.64.0/24')
+sys.exit(1 if addr.is_unspecified or any(addr in ipaddress.ip_network(n) for n in blocked) else 0)
+" "$esu_host" 2>>"$WORK/esu-host.err"; then
+    echo "::error::the runner's interface address ('$esu_host') is unreadable, unspecified, loopback, inside the switch plan's 100.64/10, or in the reserved local range 127.0.64.0/24; the relay decides those by its own drops, not the boxes' declared union, so the escape-union proof cannot use it"
+    cat "$WORK/esu-host.err" 2>/dev/null || true
+    esu_fail
+  fi
+  echo "the runner's interface address (the listener's, declared by both boxes as a /32): $esu_host"
+
+  if python3 -c "import socket; socket.create_connection(('$esu_host', $ESU_LISTEN_PORT), 2)" \
       2>/dev/null; then
-    echo "::error::127.0.0.1:$ESU_LISTEN_PORT already answers on this host; the escape-union proof needs it free for its listener"
+    echo "::error::$esu_host:$ESU_LISTEN_PORT already answers on this host; the escape-union proof needs it free for its listener"
     esu_fail
   fi
 
-  # The listener: host loopback behind the fabric's NAT (the host alias maps
-  # to 127.0.0.1 for every port), one line per event, flushed as it happens,
-  # so a marker is readable the moment its sender pushed it.
+  # The listener: on the runner's interface address, behind the fabric's NAT
+  # as ordinary egress, one line per event, flushed as it happens, so a
+  # marker is readable the moment its sender pushed it.
   cat > "$WORK/esu-listener.py" <<'ESU_LISTENER_EOF'
-"""The host listener the fabric's NAT maps the host alias to.
+"""The host listener on the runner's interface address, reached through the
+fabric's NAT as ordinary egress.
 
 Every accepted connection is read on its own thread and held open for its
 budget: the NAT dials this listener when the SYN arrives, before the
@@ -11262,6 +11305,7 @@ BUDGET = 30.0
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--host", required=True)
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--log", required=True)
     args = parser.parse_args()
@@ -11275,10 +11319,10 @@ def main():
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(("127.0.0.1", args.port))
+    listener.bind((args.host, args.port))
     listener.listen(16)
     listener.settimeout(0.2)
-    log(f"listening on 127.0.0.1:{args.port}")
+    log(f"listening on {args.host}:{args.port}")
 
     def read_connection(conn):
         at = time.monotonic() - started
@@ -11316,7 +11360,8 @@ if __name__ == "__main__":
     main()
 ESU_LISTENER_EOF
   : > "$esu_listener_log"
-  python3 "$WORK/esu-listener.py" --port "$ESU_LISTEN_PORT" --log "$esu_listener_log" \
+  python3 "$WORK/esu-listener.py" --host "$esu_host" --port "$ESU_LISTEN_PORT" \
+    --log "$esu_listener_log" \
     >"$WORK/esu-listener.out" 2>"$WORK/esu-listener.err" &
   ESU_LISTENER_PID=$!
   esu_line=""
@@ -11325,11 +11370,11 @@ ESU_LISTENER_EOF
     sleep 0.25
   done
   if [ -z "$esu_line" ]; then
-    echo "::error::the host listener never came up on 127.0.0.1:$ESU_LISTEN_PORT"
+    echo "::error::the host listener never came up on $esu_host:$ESU_LISTEN_PORT"
     cat "$WORK/esu-listener.err" 2>/dev/null || true
     esu_fail
   fi
-  echo "host listener: $esu_line (behind the fabric's NAT, which maps $esu_alias to 127.0.0.1)"
+  echo "host listener: $esu_line (the runner's interface address, behind the fabric's NAT as ordinary egress)"
 
   esu_gate_lines() {
     # The gate's own lines for one source under one rule, this case's lines
@@ -11419,9 +11464,10 @@ ESU_LISTENER_EOF
   esu_sid_a="$(cd "$ESU_A_SEED_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . \
     --no-prompt --name e2e-esc-a --network own_ip \
     --allow-subnets 10.0.0.0/8 --allow-subnets 100.64.0.0/16 \
+    --allow-subnets "$esu_host/32" \
     --allow-protocols tcp \
     2>"$WORK/esu-activate-a.err")" || {
-    echo "::error::box A's activate (--network own_ip, 10.0.0.0/8 and the fabric declared) failed"
+    echo "::error::box A's activate (--network own_ip, 10.0.0.0/8, the fabric and $esu_host/32 declared) failed"
     cat "$WORK/esu-activate-a.err" 2>/dev/null || true
     esu_fail
   }
@@ -11435,9 +11481,10 @@ ESU_LISTENER_EOF
   esu_sid_b="$(cd "$ESU_B_SEED_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . \
     --no-prompt --name e2e-esc-b --network own_ip \
     --allow-subnets 192.168.0.0/16 --allow-subnets 100.64.0.0/16 \
+    --allow-subnets "$esu_host/32" \
     --allow-protocols tcp \
     2>"$WORK/esu-activate-b.err")" || {
-    echo "::error::box B's activate (--network own_ip, 192.168.0.0/16 and the fabric declared) failed"
+    echo "::error::box B's activate (--network own_ip, 192.168.0.0/16, the fabric and $esu_host/32 declared) failed"
     cat "$WORK/esu-activate-b.err" 2>/dev/null || true
     esu_fail
   }
@@ -11481,8 +11528,8 @@ ESU_LISTENER_EOF
     echo "::error::a registration record does not name the switch address it allocated (A: $esu_ip_a, B: $esu_ip_b)"
     esu_fail
   fi
-  echo "box A: $esu_sid_a at switch address $esu_ip_a (declared 10.0.0.0/8 + the fabric)"
-  echo "box B: $esu_sid_b at switch address $esu_ip_b (declared 192.168.0.0/16 + the fabric)"
+  echo "box A: $esu_sid_a at switch address $esu_ip_a (declared 10.0.0.0/8 + the fabric + $esu_host/32)"
+  echo "box B: $esu_sid_b at switch address $esu_ip_b (declared 192.168.0.0/16 + the fabric + $esu_host/32)"
 
   # ---- path (a)'s precondition: the boxes hold no raw-socket capability ---
   # NET-083 (and the seal NET-084 rides on): the box may not forge frames on
@@ -11582,9 +11629,9 @@ ESU_LISTENER_EOF
     echo "box $esu_box's effective policy (the baseline set beside the rules):"
     printf '%s\n' "$esu_policy" | sed 's/^/  /'
     if [ "$esu_box" = a ]; then
-      esu_line='subnets  10.0.0.0/8, 100.64.0.0/16'
+      esu_line="subnets  10.0.0.0/8, 100.64.0.0/16, $esu_host/32"
     else
-      esu_line='subnets  192.168.0.0/16, 100.64.0.0/16'
+      esu_line="subnets  192.168.0.0/16, 100.64.0.0/16, $esu_host/32"
     fi
     if ! grep -q -- "$esu_line" <<<"$esu_policy"; then
       echo "::error::box $esu_box's policy does not show its declared subnets ('$esu_line')"
@@ -11901,9 +11948,9 @@ ESU_SPOOFER_EOF
   esu_probe() {
     # SID MARKER LABEL
     mnl session exec "$1" \
-      "echo $2 | /usr/bin/socat -u - TCP:$esu_alias:$ESU_LISTEN_PORT,connect-timeout=20" \
+      "echo $2 | /usr/bin/socat -u - TCP:$esu_host:$ESU_LISTEN_PORT,connect-timeout=20" \
       >"$WORK/esu-probe-$3.out" 2>"$WORK/esu-probe-$3.err" || {
-      echo "::error::box $3's own probe to $esu_alias:$ESU_LISTEN_PORT failed (its declared fabric half)"
+      echo "::error::box $3's own probe to $esu_host:$ESU_LISTEN_PORT failed (its declared $esu_host/32)"
       cat "$WORK/esu-probe-$3.err" 2>/dev/null || true
       esu_fail
     }
@@ -11924,10 +11971,10 @@ ESU_SPOOFER_EOF
     esu_fail
   }
   esu_rows="$esu_rows
-source=$esu_ip_a (box A's own probe) destination=$esu_alias:$ESU_LISTEN_PORT verdict=arrived (positive control: the box's own declared traffic)"
+source=$esu_ip_a (box A's own probe) destination=$esu_host:$ESU_LISTEN_PORT verdict=arrived (positive control: the box's own declared traffic)"
   esu_rows="$esu_rows
-source=$esu_ip_b (box B's own probe) destination=$esu_alias:$ESU_LISTEN_PORT verdict=arrived (positive control: the box's own declared traffic)"
-  echo "positive controls OK: both boxes' own declared traffic reached the listener through the fabric"
+source=$esu_ip_b (box B's own probe) destination=$esu_host:$ESU_LISTEN_PORT verdict=arrived (positive control: the box's own declared traffic)"
+  echo "positive controls OK: both boxes' own declared traffic reached the listener through the fabric's NAT"
 
   # ---- the arms, each a fresh connection at the gate's landing edge ---------
   # The made-up in-plan lease first — the spoofer's liveness bracket, and the
@@ -11935,7 +11982,7 @@ source=$esu_ip_b (box B's own probe) destination=$esu_alias:$ESU_LISTEN_PORT ver
   # connection's end has nothing to withdraw). Flip-stable: the shipped
   # interim admits it and names it; the per-box default refuses it and names
   # it. Either way the case pins whichever happened.
-  esu_run_spoofer madeup 100.64.0.99 "$esu_alias" esu-spoof-madeup-arrived 10 yes
+  esu_run_spoofer madeup 100.64.0.99 "$esu_host" esu-spoof-madeup-arrived 10 yes
   case "$esu_out" in
     outcome=completed*)
       esu_wait_marker esu-spoof-madeup-arrived 40 || {
@@ -11947,7 +11994,7 @@ source=$esu_ip_b (box B's own probe) destination=$esu_alias:$ESU_LISTEN_PORT ver
         esu_fail
       }
       esu_rows="$esu_rows
-source=100.64.0.99 destination=$esu_alias:$ESU_LISTEN_PORT verdict=reached the listener (the shipped interim's admit, its egress-unregistered-source line naming the source; the per-box default's flip turns this into an unknown-source drop)"
+source=100.64.0.99 destination=$esu_host:$ESU_LISTEN_PORT verdict=reached the listener (the shipped interim's admit, its egress-unregistered-source line naming the source; the per-box default's flip turns this into an unknown-source drop)"
       ;;
     outcome=refused*)
       if grep -q -- esu-spoof-madeup-arrived "$esu_listener_log"; then
@@ -11959,7 +12006,7 @@ source=100.64.0.99 destination=$esu_alias:$ESU_LISTEN_PORT verdict=reached the l
         esu_fail
       }
       esu_rows="$esu_rows
-source=100.64.0.99 destination=$esu_alias:$ESU_LISTEN_PORT verdict=refused at the gate (the per-box default in force: silence, and the egress-unknown-source line)"
+source=100.64.0.99 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the gate (the per-box default in force: silence, and the egress-unknown-source line)"
       ;;
     *)
       echo "::error::the made-up-lease arm reported neither a completed flow nor a refusal: $esu_out"
@@ -12049,9 +12096,9 @@ source=$esu_ip_a destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at th
   #
   # 198.51.100.7 is TEST-NET-2, unreachable past the switch, so the spoofer's
   # outcome line (a plain timeout under either posture) is not what this arm
-  # reads. A fresh made-up address, not the alias arm's 100.64.0.99, so its
-  # line is its own: the gate rate-limits one line per source per rule per
-  # interval.
+  # reads. A fresh made-up address, not the first made-up arm's 100.64.0.99,
+  # so its line is its own: the gate rate-limits one line per source per rule
+  # per interval.
   esu_phase="$(esu_case_log 2>/dev/null | grep -F 'host-side egress gate listening' \
     | sed -n 's/.*"unregistered_in_plan_sources":"\([^"]*\)".*/\1/p' | tail -n1)"
   case "$esu_phase" in
@@ -12123,7 +12170,7 @@ source=$esu_ip_b destination=10.0.0.7:$ESU_LISTEN_PORT verdict=refused at the ga
   # unique to this arm, but the window discipline applies anyway: the count
   # must grow past the arm's own baseline.
   esu_prior="$(esu_gate_lines 203.0.113.7 egress-unknown-source | wc -l)"
-  esu_run_spoofer outside 203.0.113.7 "$esu_alias" esu-spoof-outside 3 no
+  esu_run_spoofer outside 203.0.113.7 "$esu_host" esu-spoof-outside 3 no
   case "$esu_out" in
     outcome=refused*) : ;;
     *)
@@ -12140,7 +12187,19 @@ source=$esu_ip_b destination=10.0.0.7:$ESU_LISTEN_PORT verdict=refused at the ga
     esu_fail
   }
   esu_rows="$esu_rows
-source=203.0.113.7 destination=$esu_alias:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unknown-source — outside the plan there is no lease to spoof)"
+source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unknown-source — outside the plan there is no lease to spoof)"
+
+  # And for the destination: the runner's address is no address the gate
+  # holds as infrastructure, so no refusal in this case is
+  # egress-infrastructure-destination at it — every negative above is the
+  # bound's own, never an infrastructure drop passing for it.
+  esu_line="$(esu_case_log 2>/dev/null | grep -F 'egress-infrastructure-destination' \
+    | grep -F -e "\"$esu_host\"" -e "\"$esu_host:" || true)"
+  if [ -n "$esu_line" ]; then
+    echo "::error::the gate refused the runner's address $esu_host as infrastructure, so this case's refusals would not be the resident union's:"
+    printf '%s\n' "$esu_line" | sed 's/^/  /'
+    esu_fail
+  fi
 
   # ---- the record: each attempt with the gate's verdict beside it ----------
   echo "the attempts against the resident union, each with the gate's verdict:"
