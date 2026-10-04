@@ -480,8 +480,20 @@ async fn register_box_for_activation(
             .unwrap_or_default(),
         egress: policy.egress.clone(),
         credentialed_upstream: policy.credentialed_upstream.clone(),
-        dynamic_ingress: None,
-        dynamic_allowed_range: None,
+        // The box's runtime grant (NET-138): the dynamic ingress stance and
+        // the inclusive range, from the same create inputs the session
+        // record holds — so the host table the reports are later checked
+        // against holds the grant the creating client declared, never
+        // whatever the box later claims. An absent setting is the deny-all
+        // default on both sides, so it crosses as absent.
+        dynamic_ingress: policy
+            .ingress
+            .as_ref()
+            .and_then(|ingress| ingress.dynamic_ingress),
+        dynamic_allowed_range: policy
+            .ingress
+            .as_ref()
+            .and_then(|ingress| ingress.dynamic_allowed_range),
     };
     let registration = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
@@ -4223,6 +4235,114 @@ mod tests {
         assert!(
             !attachments.holds_id(id.to_bytes()),
             "the withdrawn box's id is held by no attachment"
+        );
+    }
+
+    /// NET-138: the host-side registration carries the box's dynamic
+    /// ingress grant — the stance and the inclusive range — from the same
+    /// create inputs the session record holds, so the host table can check
+    /// every runtime port report the in-VM daemon later sends against the
+    /// grant the creating client declared. A create that declares no grant
+    /// crosses as the deny-all default on both sides: absent, the same
+    /// shape an older daemon reads.
+    #[tokio::test]
+    async fn registration_carries_dynamic_ingress_grant() {
+        // The granted create inputs: an ask stance and a range a runtime
+        // port is earned within, beside a declared mapping.
+        let granted = sessions::SessionPolicy {
+            egress: None,
+            ingress: Some(IngressPolicy {
+                port_mappings: vec![PortMapping {
+                    external_port: 8080,
+                    internal_port: 80,
+                    proto: IpProto::Tcp,
+                }],
+                dynamic_allowed_range: Some((9_000, 9_099)),
+                dynamic_ingress: Some(sessions::DynamicIngress::Ask),
+            }),
+            credentialed_upstream: None,
+        };
+
+        // The real control server beside a real registry, so the grant is
+        // asserted where the reports will be checked against it: the row
+        // the registration publishes.
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let sock_path = provider_dir.join("control.sock");
+        let registry = minvmd::box_registry::BoxRegistry::new(switch::SwitchSubnet::default());
+        let _server = minvmd::control::spawn(
+            sock_path.clone(),
+            registry.clone(),
+            minvmd::net::answerer::AnswererStatus::starting(),
+        )
+        .expect("the control server binds its socket");
+        let global = GlobalArgs {
+            provider: Some(Provider::LocalMinvmd),
+            minimal_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let web = register_box_for_activation(
+            paths::ProviderKind::Minvmd,
+            global.minimal_dir.as_deref(),
+            NetworkMode::OwnIp,
+            "web",
+            &granted,
+        )
+        .await
+        .expect("the real control server answers the registration")
+        .expect("an own-address box on a VM-backed host registers");
+        let row = registry
+            .table()
+            .by_source(web.addresses.switch_address.octets())
+            .expect("the registration published the row the reply speaks for");
+        assert_eq!(
+            row.dynamic_ingress(),
+            Some(sessions::DynamicIngress::Ask),
+            "the row holds the stance the create inputs declared"
+        );
+        assert_eq!(
+            row.dynamic_allowed_range(),
+            Some((9_000, 9_099)),
+            "the row holds the range the create inputs declared"
+        );
+
+        // A create that declares no grant crosses as the deny-all default:
+        // the row holds no stance and no range, and nothing is earned by a
+        // report against it.
+        let ungranted = sessions::SessionPolicy {
+            egress: None,
+            ingress: Some(IngressPolicy {
+                port_mappings: Vec::new(),
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+            credentialed_upstream: None,
+        };
+        let db = register_box_for_activation(
+            paths::ProviderKind::Minvmd,
+            global.minimal_dir.as_deref(),
+            NetworkMode::OwnIp,
+            "db",
+            &ungranted,
+        )
+        .await
+        .expect("the real control server answers the second registration")
+        .expect("an own-address box on a VM-backed host registers");
+        let row = registry
+            .table()
+            .by_source(db.addresses.switch_address.octets())
+            .expect("the second registration published its row");
+        assert_eq!(
+            row.dynamic_ingress(),
+            None,
+            "an absent stance crosses as the deny-all default the row holds"
+        );
+        assert_eq!(
+            row.dynamic_allowed_range(),
+            None,
+            "an absent range crosses as the permit-nothing default the row holds"
         );
     }
 
