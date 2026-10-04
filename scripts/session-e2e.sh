@@ -10288,7 +10288,23 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
         grab                       { print }
       ' "$ROOT/.minimal/minimal.toml"
       printf '\n[stack]\nuse = "shell"\n'
-      printf '\n[tasks.e2e-port-run]\nbash = "echo %s; sleep 300"\n' "$PO_RUN_MARKER"
+      # The run's command prints the marker and then KEEPS SPEAKING — a line
+      # every 2s, forever. It must: a lost client is not something the daemon
+      # notices on its own, it is something the exec's next channel write
+      # reports, and the daemon kills the exec'd command on that failure —
+      # the lost-client contract `lost_exec_client_kills_only_its_own_process`
+      # pins (exec.rs's `ssh_write_failed` arm: nothing reading the output
+      # any more, so kill the child rather than let it block on a full pipe).
+      # A silent command — `echo; sleep 300` — never writes after the kill,
+      # so the daemon parks on it until it exits on its own: the box lives
+      # past the 90 s delist poll below and the beat fails waiting for an end
+      # that is still minutes away (the two native-daemon-e2e failures behind
+      # this shape). With the spoken tail, the next tick after the SIGKILL
+      # fails its write, the daemon ends the command, and NET-131's destroy
+      # runs from the daemon side of that exit — which is the end the beat
+      # exists to read.
+      printf '\n[tasks.e2e-port-run]\nbash = "echo %s; while sleep 2; do echo %s; done"\n' \
+        "$PO_RUN_MARKER" "$PO_RUN_MARKER"
     } > "$PO_TASK_SEED_DIR/minimal.toml"
     mkdir "$PO_TASK_SEED_DIR/.git"
     # `exec` inside the subshell makes $! the min client's own pid, so the KILL
@@ -10323,12 +10339,14 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       fail
     fi
     echo "run: box $po_task_box is listed — created for the run, serving it"
-    # The brutal form: the client vanishes mid-run. NET-131 moved the box's
-    # destroy to the daemon side of the exec's exit precisely so this ends the
-    # box rather than stranding it.
+    # The brutal form: the client vanishes mid-run. The daemon notices on the
+    # next tick's failed channel write, ends the command the run was carrying,
+    # and NET-131's destroy runs from the daemon side of that exit — the
+    # destroy used to be the client's, which is what strands a session whose
+    # client never comes back.
     kill -9 "$PO_TASK_PID" 2>/dev/null || true
     PO_TASK_PID=""
-    echo "run: SIGKILLed the client mid-run"
+    echo "run: SIGKILLed the client mid-run (the task keeps ticking; its next output is the write the daemon loses)"
     po_box_ended=""
     for _ in $(seq 1 90); do
       po_task_ls="$(mnl ls 2>/dev/null)"
