@@ -7,7 +7,9 @@ use std::process::ExitCode;
 use anyhow::Context as _;
 use clap::{CommandFactory as _, Parser};
 use minimal::{ExecArgs, PolicyArgs, PolicyOutputFormat};
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::{
+    EnvFilter, Layer, fmt, fmt::MakeWriter, prelude::*, registry::LookupSpan,
+};
 
 /// Custom main: handle shell completion requests before launching the async world.
 fn main() -> ExitCode {
@@ -20,11 +22,17 @@ fn main() -> ExitCode {
 
 #[tokio::main]
 async fn run() -> ExitCode {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("warn")
-            .add_directive("topiary=off".parse().unwrap())
-            .add_directive("libcgroups=off".parse().unwrap())
-    });
+    // True only when RUST_LOG parsed: a malformed RUST_LOG falls back to the
+    // default filter and keeps the plain user-facing format.
+    let (filter, rust_log_set) = match EnvFilter::try_from_default_env() {
+        Ok(filter) => (filter, true),
+        Err(_) => (
+            EnvFilter::new("warn")
+                .add_directive("topiary=off".parse().unwrap())
+                .add_directive("libcgroups=off".parse().unwrap()),
+            false,
+        ),
+    };
 
     // Invoked as `git-remote-min` (a symlink or copy of this binary): speak
     // the git remote-helper protocol on stdout, so logs must go to stderr.
@@ -90,19 +98,19 @@ async fn run() -> ExitCode {
             .init();
     } else if stdout_is_data_contract(&cli.command) {
         registry
-            .with(
-                fmt::layer()
-                    .with_writer(std::io::stderr)
-                    .with_ansi(std::io::stderr().is_terminal()),
-            )
+            .with(console_layer(
+                std::io::stderr,
+                std::io::stderr().is_terminal(),
+                !rust_log_set,
+            ))
             .init();
     } else {
         registry
-            .with(
-                fmt::layer()
-                    .with_writer(ot::StdoutWriter::new)
-                    .with_ansi(std::io::stdout().is_terminal()),
-            )
+            .with(console_layer(
+                ot::StdoutWriter::new,
+                std::io::stdout().is_terminal(),
+                !rust_log_set,
+            ))
             .init();
     }
 
@@ -247,6 +255,26 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
     )
 }
 
+/// The console log layer. `plain` (no `RUST_LOG` in effect) drops the
+/// timestamp and target, so a warning reads as one message line; otherwise the
+/// full tracing format is kept for debugging.
+fn console_layer<S, W>(writer: W, ansi: bool, plain: bool) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    let layer = fmt::layer().with_writer(writer).with_ansi(ansi);
+    if plain {
+        layer
+            .without_time()
+            .with_target(false)
+            .with_level(true)
+            .boxed()
+    } else {
+        layer.boxed()
+    }
+}
+
 /// The machine output mode a run is under: the command's `-o`, the flag the
 /// architecture's machine-output contract hangs on — `json` for
 /// `min session policy -o json`, the one command that takes it today.
@@ -360,6 +388,66 @@ mod tests {
             }),
         }));
         assert!(stdout_is_data_contract(&cmd));
+    }
+
+    /// A `MakeWriter` that appends to a shared buffer, so tests can assert on
+    /// the exact rendered log line.
+    struct BufferWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Without `RUST_LOG`, a warning renders as one plain line: level and
+    /// message only, no timestamp and no target.
+    #[test]
+    fn console_layer_renders_plain_warning() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = {
+            let buf = buf.clone();
+            move || BufferWriter(buf.clone())
+        };
+        let layer = console_layer(writer, false, true);
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(key = "value", "lifecycle_hooks is unknown");
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(out, " WARN lifecycle_hooks is unknown key=\"value\"\n");
+    }
+
+    /// With `RUST_LOG` set, the full tracing format (timestamp and target) is
+    /// kept for debugging.
+    #[test]
+    fn console_layer_keeps_full_format_with_rust_log() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = {
+            let buf = buf.clone();
+            move || BufferWriter(buf.clone())
+        };
+        let layer = console_layer(writer, false, false);
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(key = "value", "lifecycle_hooks is unknown");
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("min::tests:"), "target missing: {out:?}");
+        assert!(out.contains(" WARN "), "level missing: {out:?}");
+        assert!(
+            out.contains("lifecycle_hooks is unknown"),
+            "message missing: {out:?}"
+        );
+        assert!(
+            out.as_bytes().first().is_some_and(u8::is_ascii_digit),
+            "timestamp missing: {out:?}"
+        );
     }
 
     /// `min session policy -o json` writes one document a script parses, so
