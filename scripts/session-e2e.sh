@@ -113,10 +113,12 @@
 #   port_publishes_on_listen_and_box_outlives_client
 #                                    NET-016/121/014/015/131: a declared
 #                                    port refuses fast until a listen, then
-#                                    answers by name at once; an undeclared
-#                                    listen stays unpublished; a detached box
+#                                    answers by name at once; a live
+#                                    undeclared listen is refused by name
+#                                    as not-published; a detached box
 #                                    keeps serving; a run's box ends with
-#                                    its run, client or no client
+#                                    its run's command, its client killed
+#                                    mid-command
 #   proxy_refuses_like_direct        the proxy refuses exactly as the switch
 #                                    does: paired direct/proxied attempts,
 #                                    h2 closed, h2c stripped (NET-069..071, 135)
@@ -11215,10 +11217,10 @@ proof_own_ip_deny_all_box_answers_published_port() {
 }
 
 # ---------------------------------------------------------------------------
-# A listening port the rules permit publishes and answers by name; a declared
-# port refuses fast until something listens; a detached box keeps serving;
-# and a run's box ends with its run (NET-016, NET-121, NET-014, NET-015,
-# NET-131).
+# A declared port refuses fast until something listens, then answers by
+# name; a live listen the rules do not publish is refused as not-published;
+# a detached box keeps serving; and a run's box ends with its run (NET-121,
+# NET-014, NET-016, NET-015, NET-131).
 #
 # Three beats, one box each, every listen, publish, detach and probe printed
 # with its outcome — and a failing run's `min bug` bundle (see `fail`) carries
@@ -11234,15 +11236,20 @@ proof_own_ip_deny_all_box_answers_published_port() {
 #     a timeout at the host (NET-014). Then socat listens inside the box on
 #     the declared port, and the very next request BY NAME — through the
 #     shipped hostname proxy, the name surface every lane has — must answer
-#     with the box's own marker: a permitted port, published and serving, at
-#     once (NET-016). A second listener on a port no declaration names must
-#     stay unpublished: refused by name with the proxy's published-port
-#     refusal, and, where the daemon's log is readable, the listen watcher's
-#     own record of leaving it unpublished. The CLI does not yet expose the
-#     dynamic allow range — `min session activate` resolves dynamic_ingress
-#     to none — so the watcher's permitted arm has no user surface to drive;
-#     the declared port and the watcher's deny record are the two halves
-#     reachable end to end today. Gated on the switch and the tap device
+#     with the box's own marker: the declaration's forward, serving at once
+#     (NET-121). A second listener, LIVE inside the box on a port its rules
+#     permit no publication for, is the NET-016 half this half can reach:
+#     it must stay unpublished, refused by name as NOT PERMITTED — `403`
+#     with a body saying the port is not published, never a nothing-
+#     listening hang — and, where the daemon's log is readable, the listen
+#     watcher's own record of leaving it unpublished. NET-016's permitted
+#     arm — a listen inside the dynamic allow range, published and then
+#     answered by name — has no user surface to drive end to end yet:
+#     `min session activate` cannot set that range (dynamic_ingress resolves
+#     to none), and the proxy's by-name routes are built from the
+#     declaration, so a watcher-published port has no name to reach through;
+#     that arm stays proven in the daemon's own unit layer (net/listeners.rs
+#     and net/proxy.rs), not here. Gated on the switch and the tap device
 #     like the deny-all answer proof: a target without them has no port
 #     surface to drive, and a skip says so rather than failing a lane that
 #     was never the audience.
@@ -11256,15 +11263,17 @@ proof_own_ip_deny_all_box_answers_published_port() {
 #     outside client before and after the detach.
 #
 #   * the run half starts `min task run` of a task that prints a marker and
-#     sleeps, then SIGKILLs the client — the brutal form, because the claim
-#     is that a box created for a run does not depend on its client living —
-#     and demands the run's box delisted within a bound (NET-131: the destroy
-#     moved to the daemon side of the exec's exit, so a lost client strands
-#     no session). Its box IS a session sandbox, so the earlier beats' gate
+#     then exits by itself a few seconds later, SIGKILLs the client while
+#     the command still runs, and demands the run's box leave `min ls`
+#     after the command exits (NET-131: a box created for a run ends with
+#     its run's COMMAND — the destroy keys on the exec's exit status, never
+#     on the client — so a lost client strands no session; a command the
+#     daemon ends because its client's stdio closed is the command exiting,
+#     and counts). Its box IS a session sandbox, so the earlier beats' gate
 #     verdict carries to it: a host that cannot spawn one skips it, a lane
 #     that exists to run it fails.
 proof_port_publishes_on_listen_and_box_outlives_client() {
-  echo "::group::a permitted listen publishes and answers by name; the box outlives its client (NET-016, NET-121, NET-014, NET-015, NET-131)"
+  echo "::group::a declared port answers by name; a live listen the rules do not publish is refused as not-published; the box outlives its client (NET-121, NET-014, NET-016, NET-015, NET-131)"
 
   # The names, ports and markers. Ports are fixed on purpose — the execs that
   # start and probe each listener must agree — and clear of every band the
@@ -11499,12 +11508,11 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     fi
     echo "listen: socat now serves the declared port $PO_EXT inside the box (its own loopback answers $PO_MARKER)"
 
-    # NET-016's answer, by name, AT ONCE: the port is permitted (its
-    # declaration names it), the listen is up, and the next request — the
-    # FIRST by-name request, no retry behind it — through the shipped
-    # hostname proxy must already carry the box's own answer. The proxy is
-    # the name surface every lane has, so this leg runs wherever the half
-    # runs.
+    # NET-121's forward, by name, AT ONCE: the port the box's declaration
+    # publishes, its listener now up, and the next request — the FIRST
+    # by-name request, no retry behind it — through the shipped hostname
+    # proxy must already carry the box's own answer. The proxy is the name
+    # surface every lane has, so this leg runs wherever the half runs.
     po_proxy_port="$(printf '%s\n' "$po_ls" \
       | sed -n 's/^HOSTNAME PROXY: *listening on 127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' | head -n1)"
     if [ -z "$po_proxy_port" ]; then
@@ -11531,7 +11539,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     po_t1=$(now_ms)
     echo "by name: GET http://$PO_BOX_NAME.min.internal:$PO_EXT/ (proxy 127.0.0.1:$po_proxy_port) -> HTTP ${po_name_code:-<none>} (curl exit $po_name_rc) in $((po_t1 - po_t0))ms"
     if [ "$po_name_rc" -ne 0 ] || [ "$po_name_code" != "200" ]; then
-      echo "::error::the permitted port did not answer by name once its listen was up (NET-016)"
+      echo "::error::the declared port did not answer by name once its listen was up (NET-121)"
       echo "--- curl stderr ---"; cat "$WORK/po-name.err" 2>/dev/null || true
       echo "--- body ---"; cat "$WORK/po-name.body" 2>/dev/null || true
       fail
@@ -11540,12 +11548,12 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       echo "::error::the by-name answer does not carry the box's marker (got: '$(cat "$WORK/po-name.body" 2>/dev/null)')"
       fail
     fi
-    echo "the permitted port answers by name at once — published and serving the listen (NET-016, NET-001)"
+    echo "the declared port answers by name at once — its declaration's forward serving the listen (NET-121, NET-001)"
 
-    # The listen no declaration names must stay unpublished. socat again, on a
-    # port the box's declaration does not name and no dynamic range permits —
-    # the CLI has no flag for that range, so this is the reachable shape of
-    # NET-016's negative half today.
+    # The listen no declaration names must stay unpublished. socat again, on
+    # a port the box's rules permit no publication for — no declaration names
+    # it, and the CLI has no flag for a dynamic allow range, so NET-016's
+    # verdict for it is deny.
     mnl session exec "$po_sid" \
       "nohup /usr/bin/socat TCP-LISTEN:$PO_UNDECLARED,reuseaddr,fork SYSTEM:\"cat /home/po-http200\" >/dev/null 2>&1 &" \
       >/dev/null 2>>"$WORK/po-responder.err" \
@@ -11567,8 +11575,12 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     fi
     echo "listen: socat also serves the UNDECLARED port $PO_UNDECLARED inside the box — no declaration names it, so nothing may publish it (NET-016)"
 
-    # Refused by name, instantly: the proxy answers with its own
-    # published-port refusal rather than dialing (NET-014).
+    # Refused by name, instantly — and the refusal must say NOT PERMITTED,
+    # never nothing-listening: the listen is LIVE inside the box (the direct
+    # curl just read its 200), so a refusal here is the box's rules refusing
+    # to publish, not a dead listener. The proxy answers with its own
+    # published-port refusal rather than dialing (NET-016, NET-014): `403`
+    # and a body that says the port is not published.
     po_t0=$(now_ms)
     # The same proxy-env clearing as the permitted leg above: this request
     # goes through the proxy `-x` names, whatever the runner inherited.
@@ -11585,11 +11597,12 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       echo "--- body ---"; cat "$WORK/po-undeclared-name.body" 2>/dev/null || true
       fail
     fi
-    # TODO(T70, #1858): the refusal's own WORDING — a body that says the port
-    # is not published — comes from the switch crate's one refusal builder,
-    # which is not on main yet. Main's proxy answers `403` with an empty body
-    # (`write_status`: Content-Length: 0), so the status above is the whole
-    # assertion today; pin the wording once that builder lands.
+    if [[ "$(cat "$WORK/po-undeclared-name.body" 2>/dev/null)" \
+          != *"the box has not published this port"* ]]; then
+      echo "::error::the by-name refusal does not say the port is not published — a refusal of a LIVE listen must read not permitted, not nothing listening (NET-016)"
+      echo "--- body ---"; cat "$WORK/po-undeclared-name.body" 2>/dev/null || true
+      fail
+    fi
     # Refused at the address too: nothing is bound there for this port.
     if [ -n "$po_addr" ]; then
       po_t0=$(now_ms)
@@ -11682,7 +11695,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     mnl session destroy --force "$po_sid" >/dev/null 2>&1 || true
     rm -rf "$PO_OWNIP_SEED_DIR"; PO_OWNIP_SEED_DIR=""
     po_restore_log
-    echo "port-publish half OK (declared port: refused fast before the listen, then answering by name at once; undeclared listen: refused by name, left unpublished by the watcher; box: outlives its detached client)"
+    echo "port-publish half OK (declared port: refused fast before the listen, then its declaration's forward answering by name at once (NET-121); live undeclared listen: refused by name as not-published, left unpublished by the watcher (NET-016); box: outlives its detached client)"
   }
   po_port_half
 
@@ -11902,23 +11915,21 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
         grab                       { print }
       ' "$ROOT/.minimal/minimal.toml"
       printf '\n[stack]\nuse = "shell"\n'
-      # The run's command prints the marker and then KEEPS SPEAKING — a line
-      # every 2s, forever. It must: a lost client is not something the daemon
-      # notices on its own, it is something the exec's next channel write
-      # reports, and the daemon kills the exec'd command on that failure —
-      # the lost-client contract `lost_exec_client_kills_only_its_own_process`
-      # pins (exec.rs's `ssh_write_failed` arm: nothing reading the output
-      # any more, so kill the child rather than let it block on a full pipe).
-      # A silent command — `echo; sleep 300` — never writes after the kill,
-      # so the daemon parks on it until it exits on its own: the box lives
-      # past the 90 s delist poll below and the beat fails waiting for an end
-      # that is still minutes away (the two native-daemon-e2e failures behind
-      # this shape). With the spoken tail, the next tick after the SIGKILL
-      # fails its write, the daemon ends the command, and NET-131's destroy
-      # runs from the daemon side of that exit — which is the end the beat
-      # exists to read.
-      printf '\n[tasks.e2e-port-run]\nbash = "echo %s; while sleep 2; do echo %s; done"\n' \
-        "$PO_RUN_MARKER" "$PO_RUN_MARKER"
+      # The run's command prints the marker and then exits BY ITSELF a few
+      # seconds later. NET-131's trigger is that exit — the destroy keys on
+      # the exec's exit status, not on the client — so the beat kills the
+      # client INSIDE the command's running window (the marker gates it: the
+      # command is up, the sleep still has its seconds to run) and then
+      # demands the box delisted after the command exits. A client the
+      # daemon sees vanish ends the exec'd command first — the lost-client
+      # contract `lost_exec_client_kills_only_its_own_process` pins the
+      # daemon killing the child when the client's channel closes, then
+      # waiting for it — and a command ended that way is the command
+      # exiting: the exit the destroy keys on either way. Five seconds is
+      # the window: short enough that the run ends shortly after the kill
+      # (the 90 s delist poll below holds it), long enough that the marker
+      # read, the `min ls` and the kill all land while the command runs.
+      printf '\n[tasks.e2e-port-run]\nbash = "echo %s; sleep 5"\n' "$PO_RUN_MARKER"
     } > "$PO_TASK_SEED_DIR/minimal.toml"
     mkdir "$PO_TASK_SEED_DIR/.git"
     # `exec` inside the subshell makes $! the min client's own pid, so the KILL
@@ -11953,14 +11964,15 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       fail
     fi
     echo "run: box $po_task_box is listed — created for the run, serving it"
-    # The brutal form: the client vanishes mid-run. The daemon notices on the
-    # next tick's failed channel write, ends the command the run was carrying,
-    # and NET-131's destroy runs from the daemon side of that exit — the
+    # The client vanishes while the command still runs. The daemon ends the
+    # command the run was carrying — it kills the child when the client's
+    # channel closes, then waits for the exit — and NET-131's destroy runs
+    # from the daemon side of that exit, whatever became of the client: the
     # destroy used to be the client's, which is what strands a session whose
     # client never comes back.
     kill -9 "$PO_TASK_PID" 2>/dev/null || true
     PO_TASK_PID=""
-    echo "run: SIGKILLed the client mid-run (the task keeps ticking; its next output is the write the daemon loses)"
+    echo "run: SIGKILLed the client while the command still ran — the box's end must key on the command's exit, not on the client"
     po_box_ended=""
     po_task_ls=""
     for _ in $(seq 1 90); do
@@ -11982,11 +11994,11 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       sleep 1
     done
     if [ -z "$po_box_ended" ]; then
-      echo "::error::the run's box is STILL listed after its client was killed — a box created for a run must end with the run (NET-131)"
+      echo "::error::the run's box is STILL listed after its command exited — a box created for a run must end with its run's command, never with its client (NET-131)"
       echo "--- min ls (the last listing that answered) ---"; printf '%s\n' "${po_task_ls:-<min ls never answered a listing this wait could read>}"
       fail
     fi
-    echo "run: the box ended with its run — no stranded session, client or no client (NET-131)"
+    echo "run: the box ended with its run's command — the end keyed on the exit, not on the client's death (NET-131)"
     # The daemon-side end's own record, where the lane can read it: one line
     # naming the session, the run and the exit its box ended with — at info
     # under the module this half pinned the daemon to above, whatever filter
@@ -12010,7 +12022,7 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     fi
     rm -rf "$PO_TASK_SEED_DIR"; PO_TASK_SEED_DIR=""
     po_run_restore_log
-    echo "run half OK (box created for the run, delisted when the run's client vanished)"
+    echo "run half OK (box created for the run, delisted when the run's command exited — the client died mid-command and the end keyed on the exit)"
   }
   po_run_half
 
