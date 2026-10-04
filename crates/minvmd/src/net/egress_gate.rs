@@ -396,7 +396,7 @@ const INFRASTRUCTURE_RULE: &str = "egress-infrastructure-destination";
 /// decide different things and the rebinding intersection relies on its own
 /// shape: that set names the gateway's two addresses as `/32`s (here the
 /// gateway is the control-surface rule's, [`SWITCH_CONTROL_RULE`], and the
-/// host alias is local reach inside the node's own block), refuses or admits
+/// host alias is default-deny under this rule), refuses or admits
 /// the whole fabric plane by whether the name is a box-zone name (a frame has
 /// no name, and the plane's one admitted slice is the node's own block), and
 /// keeps its ranges private. The constants overlap without coinciding: the
@@ -436,12 +436,13 @@ static INFRASTRUCTURE_RANGES: LazyLock<InfrastructureRanges> = LazyLock::new(|| 
 });
 
 /// Whether `dst` lies in the infrastructure deny set as the host frame rule
-/// holds it ([`INFRASTRUCTURE_RULE`]): a fixed range; the fabric plane
+/// holds it ([`INFRASTRUCTURE_RULE`]): a fixed range; the host alias, which
+/// is default-deny at every port (design §7.1, NET-062); the fabric plane
 /// outside `own_block`, the subnet the gate's rows live in — a frame to a
-/// sibling, to the host alias, or to the daemon inside the node's own block
-/// is local reach, decided by the row's CIDR rules and the target's ingress,
-/// never by this rule, and the gateway inside it is the control-surface
-/// rule's; or RFC 1918 space the row's `allow_subnets` does not cover.
+/// sibling or to the daemon inside the node's own block is local reach,
+/// decided by the row's CIDR rules and the target's ingress, never by this
+/// rule, and the gateway inside it is the control-surface rule's; or RFC
+/// 1918 space the row's `allow_subnets` does not cover.
 ///
 /// `allow` is the row's compiled `allow_subnets`, `None` when the dimension
 /// is undeclared — allow-all, the shipped default (03-spec R2.1) — which
@@ -461,6 +462,13 @@ fn infrastructure_destination(
 ) -> bool {
     let ranges = &*INFRASTRUCTURE_RANGES;
     if ranges.fixed.iter().any(|cidr| cidr.contains(dst)) {
+        return true;
+    }
+    // The host alias is default-deny (design §7.1, NET-062): a box reaches
+    // the host only through a declared exposure, never by addressing the
+    // alias directly, so the alias is refused under this rule at every port
+    // whatever the row's rules would say about it.
+    if dst == own_block.host_alias().octets() {
         return true;
     }
     let in_own_block = (u32::from_be_bytes(dst) & u32::from(own_block.netmask()))
@@ -7293,8 +7301,11 @@ mod tests {
     /// (link-local) and to a box in another node's block of the fabric
     /// plane, whatever their rules admit — the deferral lifts nothing here,
     /// and neither does the widest allowance. The node's own block is the
-    /// carve-out: the same CIDR row reaches a sibling and the host alias,
-    /// local reach the row's rules and the target's ingress decide. RFC 1918
+    /// carve-out for a sibling and the daemon: the same CIDR row reaches a
+    /// sibling, local reach the row's rules and the target's ingress decide.
+    /// The host alias is not local reach — it is default-deny at every port
+    /// (design §7.1, NET-062), refused under this rule whatever the row's
+    /// rules admit. RFC 1918
     /// is the one exemption: a `10.0.0.0/8` destination is refused for the
     /// name-declaring row, whose declared `allow_subnets` does not cover it
     /// — the frame its deferral would otherwise have passed to the guest —
@@ -7343,11 +7354,11 @@ mod tests {
         let mut h = gate_over(registry).await;
 
         // Local reach inside the node's own block, and RFC 1918 under an
-        // allowance: all admitted, each read back as sent.
+        // allowance: all admitted, each read back as sent. The host alias is
+        // not among them — it is default-deny, refused below.
         let host_alias = SUBNET.host_alias().octets();
         let admitted = [
             ipv4_frame(open, 6, LEASE, 8080),
-            ipv4_frame(open, 6, host_alias, 80),
             ipv4_frame(open, 6, [10, 1, 2, 3], 80),
             ipv4_frame(lan, 6, [10, 1, 2, 3], 80),
             ipv4_frame(bare, 6, [10, 1, 2, 3], 80),
@@ -7369,6 +7380,7 @@ mod tests {
         let other_block = [100, 65, 0, 9];
         let refused = [
             ipv4_frame(LEASE, 6, [10, 1, 2, 3], 443),
+            ipv4_frame(open, 6, host_alias, 80),
             ipv4_frame(open, 6, metadata, 80),
             ipv4_frame(bare, 6, other_block, 80),
             ipv4_frame(LEASE, 6, metadata, 80),
@@ -7400,7 +7412,7 @@ mod tests {
             "destination=10.1.2.3",
             "port=443",
             "source=100.64.0.10",
-            "destination=169.254.169.254",
+            "destination=100.64.255.254",
             "source=100.64.0.12",
             "destination=100.65.0.9",
             "source=100.64.0.13",
