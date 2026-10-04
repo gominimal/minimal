@@ -2731,15 +2731,17 @@ mod tests {
     fn port_holder_identifies_a_child_listener_pid() {
         use std::io::BufRead;
         // A separate process listening on a port it draws itself, printing
-        // the port once it listens; it exits when its stdin closes.
+        // its own pid and the port once it listens (its own pid, not the
+        // spawned one: a python3 shim may re-exec); it exits when its stdin
+        // closes.
         let mut child = std::process::Command::new("python3")
             .args([
                 "-c",
-                "import socket, sys\n\
+                "import os, socket, sys\n\
                  s = socket.socket()\n\
                  s.bind(('127.0.0.1', 0))\n\
                  s.listen()\n\
-                 print(s.getsockname()[1], flush=True)\n\
+                 print(os.getpid(), s.getsockname()[1], flush=True)\n\
                  sys.stdin.read()\n",
             ])
             .stdin(std::process::Stdio::piped())
@@ -2749,14 +2751,22 @@ mod tests {
         let mut line = String::new();
         std::io::BufReader::new(child.stdout.take().expect("the child's stdout"))
             .read_line(&mut line)
-            .expect("the child prints its port");
-        let port: u16 = line.trim().parse().expect("the child's port");
+            .expect("the child prints its pid and port");
+        let mut fields = line.split_whitespace();
+        let pid: u32 = fields
+            .next()
+            .and_then(|f| f.parse().ok())
+            .expect("the child's pid");
+        let port: u16 = fields
+            .next()
+            .and_then(|f| f.parse().ok())
+            .expect("the child's port");
         let holder = super::port_holder(port);
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(
             holder.map(|(pid, _)| pid),
-            Some(child.id()),
+            Some(pid),
             "the holder is the child that listens on 127.0.0.1:{port}"
         );
     }
