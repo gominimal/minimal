@@ -24,6 +24,7 @@ use tokio::task::spawn;
 use crate::{
     ChannelConfig,
     connection::{ConnectionError, ConnectionHandle},
+    net::classifier,
     server::ServerStateHandle,
     sessions::SessionKeyPredicate,
 };
@@ -131,6 +132,38 @@ async fn serve_list_sessions(
             // has not come up pays nothing per list.
             let hostname_proxy_port = s.hostname_proxy_port().await;
             let zone_answerer_port = s.zone_answerer_port().await;
+            // NET-079: the per-box egress enforcement each entry shows — the
+            // box's own launch record, what the launch that produced this
+            // box decided about it, lowered by the daemon's one classifier
+            // fact and never raised above it. A box launched unenforced
+            // stays `none` here for its life, whatever a later launch of
+            // another box decided; only a host-address box that has not
+            // launched yet shows the fact alone. [`displayed_host_ip_enforcement`]
+            // shares the launch's own refusal gate, so a box the classifier
+            // refuses shows nothing here exactly as its launch refused it.
+            // A record that fails to read degrades to `None`: nothing said
+            // is the same silence the other surfaces read as "not a
+            // host-address session", so one unreadable record fails no
+            // listing.
+            let in_microvm = s.in_microvm().await;
+            let fact = crate::session_host::host_ip_enforcement_fact();
+            let enforcement = futures::future::join_all(infos.iter().map(|i| async {
+                let record = mngr
+                    .get_record(SessionKeyPredicate::Id(i.id))
+                    .await
+                    .ok()
+                    .flatten();
+                record.map(|record| {
+                    crate::session_host::displayed_host_ip_enforcement(
+                        in_microvm,
+                        record.network,
+                        classifier::verdict_of(record.policy.egress.as_ref()),
+                        &fact,
+                        record.host_ip_enforcement,
+                    )
+                })
+            }))
+            .await;
             Ok(ListSessionsResponse {
                 daemon_version: Some(OWN_VERSION.to_string()),
                 hostname_routing_unavailable: s.proxy_unavailable().await,
@@ -144,12 +177,14 @@ async fn serve_list_sessions(
                 // client fills it host-side after the reply.
                 sessions: infos
                     .into_iter()
-                    .map(|i| ListSessionsEntry {
+                    .zip(enforcement)
+                    .map(|(i, host_ip_enforcement)| ListSessionsEntry {
                         id: i.id,
                         name: i.name,
                         project_path: Some(i.project_path),
                         status: i.status,
                         git: None,
+                        host_ip_enforcement: host_ip_enforcement.flatten(),
                         attrs: i.attrs.map(|a| minimald_rpc::RunningSessionAttrs {
                             last_stdout: a.stdout_last.map(|i| i.into()),
                             last_stdin: a.stdin_last.map(|i| i.into()),
@@ -258,7 +293,7 @@ async fn serve_create_session(
     ssh_username: Option<String>,
 ) -> Result<(), ConnectionError> {
     CreateSession
-        .handle_channel(c, async |req| {
+        .handle_channel(c, async |mut req| {
             // The version gate, made by the RPC the activation path was
             // already sending rather than by a `GetVersion` ahead of it
             // (#1251). Checked here, before the manager allocates anything,
@@ -280,6 +315,43 @@ async fn serve_create_session(
             // the manager consumes it, and the stored record's egress is what
             // the counts below report beside the "session created" line.
             let egress_counts = EgressRuleCounts::of(&req.config.policy);
+            // NET-079: this host's verdict on whether it can decide a
+            // host-address box's egress per box — the daemon's one node
+            // fact, seeded by the start-up read and refreshed by each
+            // host-address launch's re-read, read here rather than re-probed,
+            // because a create is not a place that decides a box: the launch
+            // that follows reads the host again, over the same tree and the
+            // same table, before it places anything, and records its own
+            // outcome on the session record this create is minting. The
+            // advisory the fact yields rides the reply to the start that is
+            // about to rely on the host's decision, and the enforcement is
+            // the same derivation every read surface answers through — over
+            // the declaration the config carries and with no launch record
+            // to show yet, so the fact is the best either half of the daemon
+            // knows about the box that is coming, and the launch's own
+            // refusal gate holds here too: a create under a probe cause
+            // refuses the box the same way its launch would, and carries
+            // no enforcement value anywhere.
+            //
+            // Nothing is recorded at create: only a launch writes the
+            // outcome, on the daemon-owned record field. The one key a
+            // client might assert — the daemon's own `host_ip_enforcement`
+            // — is stripped here, unconditionally and for every network
+            // mode, because the reads answer over what the launch recorded
+            // and must not be handed one by whoever activated.
+            let in_microvm = s.in_microvm().await;
+            let fact = crate::session_host::host_ip_enforcement_fact();
+            let classifier_cause = fact.cause;
+            let classifier_advisory =
+                create_classifier_advisory(in_microvm, req.config.network, classifier_cause);
+            let host_ip_enforcement = crate::session_host::displayed_host_ip_enforcement(
+                in_microvm,
+                req.config.network,
+                classifier::verdict_of(req.config.policy.egress.as_ref()),
+                &fact,
+                None,
+            );
+            req.config.attrs.remove(HOST_IP_ENFORCEMENT_ATTR);
 
             Ok(match mngr.create_session(req.config, ssh_username).await {
                 Ok(id) => {
@@ -297,6 +369,29 @@ async fn serve_create_session(
                         egress_deny_subnets = egress_counts.deny_subnets,
                         "session created"
                     );
+                    // NET-079's observability: one info line per create
+                    // response that carries the advisory, naming the cause
+                    // it names and the per-box enforcement this create stated
+                    // for a host-address box — so the daemon's log,
+                    // the bundle's tail, carries what this reply told the
+                    // person in the terminal, beside the start line and each
+                    // launch's own record. The advisory rides as a field,
+                    // Debug-escaped, because the line a person copies their
+                    // command from must stay one line: the terminal gets the
+                    // two-line spelling, the log gets the same text whole.
+                    if let Some(advisory) = &classifier_advisory {
+                        tracing::info!(
+                            session_id = %id,
+                            classifier_cause = classifier_cause
+                                .map_or_else(|| "", classifier::Cause::detail),
+                            classifier_install = ?classifier_cause
+                                .and_then(classifier::Cause::install_command),
+                            host_ip_enforcement =
+                                ?host_ip_enforcement.map(|enforcement| enforcement.machine_str()),
+                            advisory = ?advisory,
+                            "session create carried the classifier advisory"
+                        );
+                    }
                     // NET-123: the session-start loopback probe, before any
                     // of this session's names publish. Its interim flag on
                     // the reply is what tells the client to surface the
@@ -321,6 +416,14 @@ async fn serve_create_session(
                         // already chosen to keep the shipped default.
                         deny_all_opt_out: Some(s.deny_all_opt_out().await),
                         answerer_bound: zone_answerer_port.is_some(),
+                        // NET-079's half: the advisory the start prints, and
+                        // the enforcement the same derivation the reads
+                        // answer through states over this create's
+                        // declaration — the one message the activation path
+                        // spends on it.
+                        classifier_advisory,
+                        host_ip_enforcement: host_ip_enforcement
+                            .map(|enforcement| enforcement.machine_str().to_string()),
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Errorable::Err {
@@ -336,6 +439,89 @@ async fn serve_create_session(
             })
         })
         .await
+}
+
+/// The record-attr key a create strips unconditionally (NET-079): the key
+/// the state was once recorded under, so the one a client might assert to
+/// hand the reads a state of its own choosing. The per-box enforcement is a
+/// daemon-owned launch record — written only by the box's own launch, on
+/// the record's `host_ip_enforcement` field, never an attr — and displayed
+/// as that record lowered by the host's current fact, so the key is
+/// removed whatever the session's network mode, and whatever value it
+/// carries.
+const HOST_IP_ENFORCEMENT_ATTR: &str = "host_ip_enforcement";
+
+/// The advisory a cause yields for the reply (NET-079): the cause in words,
+/// the state it leaves the box in, and — only when the cause is one the
+/// command ends — the exact command that ends it. Spelled here, on the one
+/// side that read the host, so the daemon's log line, the reply a client
+/// prints verbatim, and the start that prints it agree by construction, and
+/// the advisory is never a prompt: it names what a person may run, and
+/// running it (and any privilege prompt it carries) is the person's act,
+/// never the session start's.
+///
+/// The state it names is the box outcome the cause leaves, with the
+/// "whatever the boxes' declarations say" clause carried only while that
+/// outcome names no refusals: natively the step's and the mount's causes
+/// leave even a deny-all box running unenforced, while the two probe causes
+/// refuse a deny-all box at placement — an advisory that said "whatever the
+/// declarations say" over a refusal would deny the refusal a person is about
+/// to hit — and in the guest every cause refuses.
+fn classifier_advisory_text(cause: classifier::Cause, guest: bool) -> String {
+    let mut advisory = format!(
+        "note: this host cannot decide a host-address box's egress verdict \
+         per box: {}. While it cannot, {}",
+        cause.detail(),
+        cause.host_ip_box_outcome(guest),
+    );
+    // The clause holds exactly while the outcome sentence names no
+    // refusals — the same causes [`classifier::Cause::host_ip_box_outcome`]
+    // spells "run unenforced" for on a native host, mirrored here so the
+    // clause and the outcome it qualifies cannot drift apart. `guest` is
+    // folded into the mirror: every guest outcome names refusals.
+    if !guest
+        && matches!(
+            cause,
+            classifier::Cause::StepNotInstalled
+                | classifier::Cause::CannotConfine
+                | classifier::Cause::GuestTableNotLoaded
+        )
+    {
+        advisory.push_str(" — whatever the boxes' declarations say");
+    }
+    if let Some(command) = cause.install_command() {
+        // The command ends the advisory with nothing after it, so the line
+        // a person copies from the terminal is the command, verbatim.
+        advisory.push_str(&format!(
+            ". Install the classifier's privileged step with:\n  {command}"
+        ));
+    } else {
+        advisory.push('.');
+    }
+    advisory
+}
+
+/// The advisory a create owes the start it answers (NET-079): only when both
+/// halves it is about are true — the daemon is not running inside a microVM,
+/// and the session is a host-address box, whose verdict is the one the
+/// host's cgroup tree decides. In the guest the start-up line and each
+/// launch's own record already say the interim's state, and a guest's
+/// causes name its image's builder rather than anything the person starting
+/// a session could run; an own-address box's verdict is decided on address
+/// leases, so there is no per-box state to advise about. Over a host-address
+/// box on a native host, the advisory is the cause in words —
+/// [`classifier_advisory_text`]'s, the same text the daemon's log line for
+/// an advisory-carrying create carries. Pure over its inputs, so the gate
+/// is pinned where it is written.
+fn create_classifier_advisory(
+    in_microvm: bool,
+    network: minimald_rpc::NetworkMode,
+    cause: Option<classifier::Cause>,
+) -> Option<String> {
+    if in_microvm || network != minimald_rpc::NetworkMode::HostNet {
+        return None;
+    }
+    cause.map(|cause| classifier_advisory_text(cause, false))
 }
 
 /// The bind probe over the reserved local range, on the blocking pool —
@@ -779,11 +965,17 @@ async fn serve_get_session_policy(
 
 /// The `GetEffectiveSessionPolicy` reply for one record's policy and network
 /// mode: the egress half resolved to what the gate enforces, the ingress half
-/// verbatim. `phase` is the rollout phase to resolve under — the handler
-/// serves [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships,
-/// while the tests pass [`sessions::EgressDefaultPhase::InForce`] so the
-/// deny-all posture the rollout ends at stays proven while the default is
-/// only announced (NET-076).
+/// verbatim. NET-079's enforcement state answers beside this reply, over
+/// `GetSessionRuntimeFacts` — never as a field here, because the policy
+/// struct is `deny_unknown_fields`: an older `min` rejects a key it has no
+/// field for, so a fact that did not exist when that client was built must
+/// ride its own reply or the rules stop reading at all.
+/// `phase` is the rollout
+/// phase to resolve under — the handler serves
+/// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, while the
+/// tests pass [`sessions::EgressDefaultPhase::InForce`] so the deny-all
+/// posture the rollout ends at stays proven while the default is only
+/// announced (NET-076).
 pub(crate) fn effective_policy_reply(
     policy: &sessions::SessionPolicy,
     network: sessions::NetworkMode,
@@ -828,12 +1020,21 @@ async fn serve_get_effective_session_policy(
                 None => Ok(Errorable::Err {
                     error: "no session found".to_string(),
                 }),
-                Some(record) => Ok(Errorable::Ok(effective_policy_reply(
-                    &record.policy,
-                    record.network,
-                    sessions::EGRESS_DEFAULT_PHASE,
-                    opt_out,
-                ))),
+                Some(record) => {
+                    // NET-079's enforcement state no longer rides this
+                    // reply: the policy struct is `deny_unknown_fields`, so
+                    // an older `min` would reject the whole reply over the
+                    // key it has no field for. It answers over
+                    // `GetSessionRuntimeFacts` (see
+                    // [`serve_get_session_runtime_facts`]), beside the
+                    // rules rather than inside them.
+                    Ok(Errorable::Ok(effective_policy_reply(
+                        &record.policy,
+                        record.network,
+                        sessions::EGRESS_DEFAULT_PHASE,
+                        opt_out,
+                    )))
+                }
             }
         })
         .await
@@ -874,6 +1075,58 @@ async fn serve_get_live_ingress(
                         error: e.to_string(),
                     }),
                 },
+            }
+        })
+        .await
+}
+
+/// `GetSessionRuntimeFacts`: NET-079's per-box enforcement state for one
+/// session — the box's own launch record, lowered by the daemon's one
+/// classifier fact over the record's own declaration and network mode — the
+/// same read the listing answers over, so `min session policy` and a listing
+/// cannot disagree, and never re-probed here. The record is the box's own
+/// launch outcome, so a box launched unenforced says `none` for its life
+/// beside the rules it runs under, never the host's later state.
+///
+/// Served over this reply rather than a field on the effective policy
+/// because the policy struct is `deny_unknown_fields`: an older `min` has no
+/// field for the key and would refuse the whole reply, rules included. A
+/// client that cannot ask for the facts — an older `min`, against this
+/// daemon, or a newer one against an older daemon — simply gets no row,
+/// which is the same silence the field's own absence reads as.
+async fn serve_get_session_runtime_facts(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    use minimald_rpc::GetSessionRuntimeFactsRequest;
+    minimald_rpc::GetSessionRuntimeFacts
+        .handle_channel(c, async |req| {
+            let mngr = s.sessions_manager().await;
+            let predicate = match req {
+                GetSessionRuntimeFactsRequest::Id(id) => SessionKeyPredicate::Id(id),
+                GetSessionRuntimeFactsRequest::Name(name) => SessionKeyPredicate::Name(name),
+            };
+            let record = mngr
+                .get_record(predicate)
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            match record {
+                None => Ok(Errorable::Err {
+                    error: "no session found".to_string(),
+                }),
+                Some(record) => {
+                    let host_ip_enforcement = crate::session_host::displayed_host_ip_enforcement(
+                        s.in_microvm().await,
+                        record.network,
+                        classifier::verdict_of(record.policy.egress.as_ref()),
+                        &crate::session_host::host_ip_enforcement_fact(),
+                        record.host_ip_enforcement,
+                    );
+                    Ok(Errorable::Ok(minimald_rpc::SessionRuntimeFacts {
+                        id: record.id,
+                        host_ip_enforcement,
+                    }))
+                }
             }
         })
         .await
@@ -1832,6 +2085,7 @@ pub async fn handle_ssh_rpc(
         | GetSessionPolicy::NAME
         | GetEffectiveSessionPolicy::NAME
         | minimald_rpc::GetLiveIngress::NAME
+        | minimald_rpc::GetSessionRuntimeFacts::NAME
         | minimald_rpc::GetSessionHooks::NAME
         | SessionDelta::NAME
         | GetSessionScreen::NAME
@@ -1921,6 +2175,9 @@ pub async fn handle_ssh_rpc(
         minimald_rpc::GetLiveIngress::NAME => {
             serve!(serve_get_live_ingress(s, channel))
         }
+        minimald_rpc::GetSessionRuntimeFacts::NAME => {
+            serve!(serve_get_session_runtime_facts(s, channel))
+        }
         minimald_rpc::GetSessionHooks::NAME => serve!(serve_get_session_hooks(s, channel)),
         SessionDelta::NAME => serve!(serve_session_delta(s, channel)),
         GetSessionScreen::NAME => serve!(serve_get_session_screen(s, channel)),
@@ -1954,6 +2211,7 @@ mod tests {
 
     use super::*;
     use crate::MINIMAL_SESSION_ID_ENV;
+    use crate::session_host::PROBE_TEST_MUTEX;
     use crate::sessions::SessionKeyPredicate;
     use crate::test_harness::{TestClient, TestServer};
 
@@ -2793,16 +3051,32 @@ mod tests {
         }
     }
 
+    /// NET-079's per-box enforcement is a daemon-owned launch record, never
+    /// a client attr, displayed as the record lowered by the current fact.
+    /// A box no launch has recorded yet shows the daemon's one classifier
+    /// fact: a listing shows the same state the create response said for a
+    /// host-address box (this test's default create is one, never
+    /// launched), and the fact a test that set its own wrote. The guard is taken
+    /// before the server is built and held across the awaited creates on
+    /// purpose: the fact is process-global, so under libtest — where the
+    /// tests of one binary share a process — a listing driven by another
+    /// test would answer over a fact that test set.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the fact is process-global, so the guard must span the awaited \
+                  reads it is held for"
+    )]
     #[tokio::test]
     async fn create_session_shows_in_get_and_list() {
+        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        let id = client
+        let created = client
             .call::<CreateSession>(&req("my session", "/uwu"))
             .await
-            .unwrap()
-            .id;
+            .unwrap();
+        let id = created.id;
         assert!(id != SessionId::nil());
 
         let get_session = client
@@ -2816,6 +3090,32 @@ mod tests {
         assert_eq!(
             get_session.record.as_ref().unwrap().project_path,
             HostAbsPath::try_new("/uwu").unwrap()
+        );
+        assert!(
+            !get_session
+                .record
+                .as_ref()
+                .unwrap()
+                .attrs
+                .contains_key(super::HOST_IP_ENFORCEMENT_ATTR),
+            "the per-box enforcement is a daemon-owned launch record, never \
+             an attr: the record's own field carries it, written only by a \
+             launch, and displayed as that record lowered by the host's \
+             current fact, got: {:?}",
+            get_session.record.as_ref().unwrap().attrs
+        );
+
+        // The create reply's state is the one node fact's, spelled for the
+        // wire — the derivation this test's default (host-address) create
+        // reads it from, pinned here so the listing below is proven to
+        // answer over the same fact the create did, whatever this host
+        // actually decides.
+        let fact = crate::session_host::host_ip_enforcement_fact();
+        assert_eq!(
+            created.host_ip_enforcement.as_deref(),
+            Some(fact.enforcement.machine_str()),
+            "a host-address create states the fact the daemon holds, got: {:?}",
+            created.host_ip_enforcement
         );
 
         let list_sessions = client.call::<ListSessions>(&()).await;
@@ -2831,8 +3131,1299 @@ mod tests {
                 status: sessions::SessionStatus::Pending,
                 // /uwu is not a git repository, so the probe yields nothing.
                 git: None,
+                // The same state the create response above carried
+                // (NET-079) — derived, with the rest of the surfaces, from
+                // the fact this process holds, not read off the record the
+                // create wrote nothing on. This box declares an allow
+                // verdict, so no host's gate refuses it and the fact is what
+                // shows, on any host this test runs on.
+                host_ip_enforcement: Some(fact.enforcement),
                 attrs: None,
             }]
+        );
+    }
+
+    /// The classifier facts a test builds as the step's whole half (NET-079):
+    /// both subtrees with the kernel's delegation-contract files, the loaded
+    /// table's presence marker, and the ct-mark mask recorded beside it — the
+    /// facts that gate the probe, so an injected reading (the session host's
+    /// reading stand-in) is the only input the decision still needs. The
+    /// mount table the test spells beside the tree stands in for the daemon's
+    /// own. Returns the tree guard, which the caller keeps alive for as long
+    /// as the stand-in answers, and the root and mount table to hand a
+    /// launch's re-read ([`crate::session_host::re_read_classifier_fact`]).
+    fn installed_cohort_tree() -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the classifier tree");
+        let root = tree.path().to_path_buf();
+        for verdict in [
+            sandbox2::config::Verdict::Deny,
+            sandbox2::config::Verdict::Allow,
+        ] {
+            let subtree = root
+                .join(sandbox2::classifier::BOXES_DIR)
+                .join(verdict.dir_name());
+            std::fs::create_dir_all(&subtree).expect("the step makes the subtree");
+            for file in ["cgroup.procs", "cgroup.threads", "cgroup.subtree_control"] {
+                std::fs::write(subtree.join(file), "")
+                    .unwrap_or_else(|e| panic!("modeling {file} in {}: {e}", subtree.display()));
+            }
+        }
+        std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+            .expect("the step writes the table's marker");
+        std::fs::create_dir_all(root.join("ct-mark-mask-0x30000000"))
+            .expect("the step records the ct-mark mask beside the marker");
+        let mountinfo = format!(
+            "35 30 0:26 / {} rw,relatime shared:2 - cgroup2 cgroup2 rw,nsdelegate\n",
+            root.display()
+        );
+        (tree, root, mountinfo)
+    }
+
+    /// The classifier-advisory lines this session's create produced (the
+    /// NET-079 observability contract). Attributed by session id, because
+    /// under libtest the capture buffer is shared by every test in the
+    /// binary — assertions on it say `contains`, never `equals`.
+    fn classifier_lines(log: &str, session_id: &SessionId) -> Vec<String> {
+        let message = "session create carried the classifier advisory";
+        let id = format!("session_id={session_id}");
+        log.lines()
+            .filter(|line| line.contains(message) && line.contains(&id))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// NET-079: a native create on a host that cannot decide per box answers
+    /// with the advisory the requirement spells — the cause in words, the
+    /// state it leaves the box in, and, only when the cause is one the
+    /// command ends, the exact command that ends it. Both causes a test has
+    /// to set as the fact, because the daemon's own host decides them for
+    /// real: the step never having run, and a mount that cannot confine a
+    /// box at all — so the advisory a person reads is never handed an
+    /// install that cannot help. The advisory is spelled without a question,
+    /// because it names what a person may run and never asks them to run it,
+    /// and the daemon logs one line per advisory-carrying create naming the
+    /// cause, the command when one applies, and the per-box enforcement the
+    /// reply states — the bundle's tail then says what every create said.
+    // The guard is taken before the server is even built and held across
+    // both awaited creates on purpose: the fact is process-global, so under
+    // libtest another test's create in the window would answer over it too.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the fact is process-global, so the guard must span the awaited \
+                  creates it is set for"
+    )]
+    #[tokio::test]
+    async fn native_host_advises_classifier_install_without_prompt() {
+        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let capture = crate::test_harness::captured_log();
+
+        // The fact a start-up read over a step-missing host leaves: state
+        // `none`, cause the step's — the state the daemon's own start-up
+        // line would spell with the same words the advisory below carries.
+        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+            classifier::Cause::StepNotInstalled,
+        ));
+        let step_missing = client
+            .call::<CreateSession>(&req("step-missing", "/uwu"))
+            .await
+            .unwrap();
+        let advisory = step_missing
+            .classifier_advisory
+            .expect("a create on a step-missing host carries the advisory");
+        assert!(
+            advisory.contains("the classifier's privileged step is not installed on this host"),
+            "the advisory must name the cause in words, got: {advisory}"
+        );
+        assert!(
+            advisory.contains("its host-address boxes run unenforced"),
+            "the advisory must say the state it leaves the box in, got: {advisory}"
+        );
+        // The command's spelling is the install hint's own, pinned in the
+        // classifier crate; the pin here is that the advisory carries the
+        // whole of it, verbatim, whatever the hint currently says — a
+        // stock install ships no `scripts/` tree, so the hint names where
+        // the script lives in the repository instead.
+        let install = sandbox2::classifier::install_hint();
+        assert!(
+            advisory.contains(&install),
+            "a missing step is the cause the install command ends, so the \
+             advisory must carry it, got: {advisory}"
+        );
+        assert!(
+            !advisory.contains('?'),
+            "the advisory names what a person may run; it never asks: {advisory}"
+        );
+
+        // The cannot-confine fact over the same box: the cause is the
+        // mount's, so the advisory names it and nothing to run.
+        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+            classifier::Cause::CannotConfine,
+        ));
+        let cannot_confine = client
+            .call::<CreateSession>(&req("cannot-confine", "/uwu"))
+            .await
+            .unwrap();
+        crate::session_host::clear_host_ip_enforcement_fact();
+        let advisory = cannot_confine
+            .classifier_advisory
+            .expect("a host that cannot confine still gets the advisory");
+        assert!(
+            advisory.contains(
+                "no cgroup2 mount with nsdelegate covers the classifier tree, so a \
+                 box could migrate out of its leaf"
+            ),
+            "the advisory must name this cause in words too, got: {advisory}"
+        );
+        assert!(
+            !advisory.contains("install-host-classifier"),
+            "no command ends this cause, so the advisory must name none: {advisory}"
+        );
+        assert!(
+            !advisory.contains('?'),
+            "the advisory names what a person may run; it never asks: {advisory}"
+        );
+
+        // One line per advisory-carrying create, attributed by the session
+        // it carried — the cause, the command when one applies, and the
+        // enforcement the reply states for the host-address box.
+        let tail = capture.contents();
+        let step_line = classifier_lines(&tail, &step_missing.id);
+        assert_eq!(
+            step_line.len(),
+            1,
+            "each advisory-carrying create must log exactly one line naming \
+             it, got: {tail}"
+        );
+        let step_line = &step_line[0];
+        assert!(
+            step_line.contains("advisory=\"note: this host cannot decide"),
+            "the logged line must carry the advisory's own text, not only \
+             its facts, got: {step_line}"
+        );
+        assert!(
+            step_line.contains("the classifier's privileged step is not installed"),
+            "the logged line must name the cause, got: {step_line}"
+        );
+        assert!(
+            step_line.contains(&install),
+            "the logged line must carry the command when one applies, got: {step_line}"
+        );
+        let confine_line = classifier_lines(&tail, &cannot_confine.id);
+        assert_eq!(
+            confine_line.len(),
+            1,
+            "each advisory-carrying create must log exactly one line naming \
+             it, got: {tail}"
+        );
+        let confine_line = &confine_line[0];
+        assert!(
+            confine_line.contains("no cgroup2 mount with nsdelegate covers the classifier tree"),
+            "the logged line must name this cause too, got: {confine_line}"
+        );
+        assert!(
+            confine_line.contains("host_ip_enforcement=Some(\"none\")"),
+            "the logged line must carry the enforcement stated for the host-address box, got: {confine_line}"
+        );
+    }
+
+    /// NET-079: while the host cannot decide per box, a host-address box's
+    /// create reply and every surface that reads the session after the
+    /// create all say its egress is not enforced per box — the reply so a
+    /// client can say it at once, the listing a picker reads without a
+    /// round trip per session, and the runtime-facts reply
+    /// `min session policy` renders beside the rules it qualifies: a
+    /// deny-all declaration with an enforcement of `none` is the state the
+    /// box actually runs in, not a verdict that looks decided and is not.
+    /// A deny-all box running unenforced is the requirement's own case. The
+    /// enforcement is a daemon-owned launch record — never an attr a
+    /// client can assert, and nothing the create writes — displayed as
+    /// that record lowered by the host's current fact; none of these
+    /// sessions launches, so the reads answer over the fact alone. A box
+    /// whose verdict is decided on address leases instead of the host's
+    /// cgroup tree carries nothing: `None`, not `none`, on every surface —
+    /// the same nothing a daemon that predates the field says. A box the
+    /// classifier refuses — the deny-all box over a probe cause — shows
+    /// nothing on the create reply or the read surfaces, exactly as its
+    /// launch refuses it, while the host-address boxes that are not
+    /// refused keep showing the fact.
+    // The guard is taken before the server is even built and held across
+    // the awaited creates on purpose: the fact is process-global, so under
+    // libtest another test's read in the window would answer over it too.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the fact is process-global, so the guard must span the awaited \
+                  reads it is set for"
+    )]
+    #[tokio::test]
+    async fn create_response_shows_enforcement_none_while_the_host_cannot_decide() {
+        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // The fact a start-up read over a step-missing host leaves.
+        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+            classifier::Cause::StepNotInstalled,
+        ));
+        let mut deny_all = req("deny-all", "/uwu");
+        deny_all.config.policy = SessionPolicy::new(Some(EgressPolicy::deny_all()), None);
+        let created = client.call::<CreateSession>(&deny_all).await.unwrap();
+
+        assert_eq!(
+            created.host_ip_enforcement.as_deref(),
+            Some("none"),
+            "a deny-all box running unenforced on a host that cannot decide \
+             per box must show egress enforcement none, got: {:?}",
+            created.host_ip_enforcement
+        );
+        assert!(
+            created
+                .classifier_advisory
+                .as_deref()
+                .is_some_and(|advisory| advisory.contains("its host-address boxes run unenforced")),
+            "the reply must carry the advisory that says the same state in \
+             words, got: {:?}",
+            created.classifier_advisory
+        );
+
+        // Nothing is recorded by the create: the state the reply named is
+        // the daemon's one classifier fact, and the launch record the reads
+        // answer over — the record's own `host_ip_enforcement` field, which
+        // only a launch writes — is still empty, so the record's attrs
+        // carry no enforcement key at all.
+        let record = client
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(created.id))
+            .await;
+        let attrs = &record
+            .record
+            .expect("the created session has a record")
+            .attrs;
+        assert!(
+            !attrs.contains_key(super::HOST_IP_ENFORCEMENT_ATTR),
+            "the per-box enforcement is a daemon-owned launch record, never \
+             an attr: no create records it, and the reads show the record a \
+             launch wrote, lowered by the host's current fact, got: {attrs:?}"
+        );
+
+        // The surfaces that read a session after the create derive their
+        // answer from the same fact the reply stated: the listing a picker
+        // reads without a round trip per session, and the runtime-facts
+        // reply `min session policy` renders. All of them agree by
+        // construction here — they read one fact, the daemon's own.
+        let listed = client.call::<ListSessions>(&()).await;
+        let entry = listed
+            .sessions
+            .iter()
+            .find(|e| e.id == created.id)
+            .expect("the created session is in the listing");
+        assert_eq!(
+            entry.host_ip_enforcement,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the listing must carry the same state the create reply did, \
+             got: {:?}",
+            entry.host_ip_enforcement
+        );
+        let policy = client
+            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(created.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            policy.egress,
+            EffectiveEgress::Declared(EgressPolicy::deny_all()),
+            "the policy reply keeps the declaration the box launched with"
+        );
+        assert_eq!(
+            facts_enforcement(&mut client, created.id).await,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the runtime-facts reply carries the state beside the rules it \
+             qualifies: a deny-all declaration that is not decided per box \
+             is the state the box runs in"
+        );
+
+        // A box whose verdict is decided on address leases carries nothing:
+        // `None`, not `none`, over the same host that cannot decide.
+        let own_address = own_ip_session(
+            &mut client,
+            "own-address",
+            SessionPolicy::new(Some(EgressPolicy::deny_all()), None),
+        )
+        .await;
+        assert!(own_address != SessionId::nil());
+        let reply = client
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(own_address))
+            .await;
+        let attrs = &reply
+            .record
+            .expect("the own-address session has a record")
+            .attrs;
+        assert!(
+            !attrs.contains_key(super::HOST_IP_ENFORCEMENT_ATTR),
+            "an own-address box's verdict is decided on address leases, so \
+             its record carries no per-box enforcement, got: {attrs:?}"
+        );
+        let listed = client.call::<ListSessions>(&()).await;
+        let own_entry = listed
+            .sessions
+            .iter()
+            .find(|e| e.id == own_address)
+            .expect("the own-address session is in the listing");
+        assert!(
+            own_entry.host_ip_enforcement.is_none(),
+            "an own-address box shows nothing on the listing either — its \
+             verdict was decided on address leases, got: {:?}",
+            own_entry.host_ip_enforcement
+        );
+        assert!(
+            facts_enforcement(&mut client, own_address).await.is_none(),
+            "an own-address box shows nothing on the runtime-facts reply \
+             either — there is no per-box state to qualify rules that are \
+             decided on leases"
+        );
+
+        // A box the classifier refuses shows nothing on any surface: the
+        // same fact, over the probe cause that refuses a placed deny-all
+        // box natively, and the same launch gate the derivation shares —
+        // the deny-all box's launch is refused on this ground, so the
+        // create that mints it says no enforcement value, and its listing
+        // entry and its runtime-facts reply say nothing rather than `none`. The
+        // host-address boxes that are not refused keep showing the fact:
+        // the one carrying an egress section still runs unenforced and
+        // still says so, at its create and after.
+        let mut sectioned = req("sectioned", "/uwu");
+        sectioned.config.policy = SessionPolicy::new(
+            Some(EgressPolicy {
+                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                ..EgressPolicy::deny_all()
+            }),
+            None,
+        );
+        let sectioned_id = client.call::<CreateSession>(&sectioned).await.unwrap().id;
+        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+            classifier::Cause::TableNotEffective,
+        ));
+        let mut refused_create = req("refused-create", "/uwu");
+        refused_create.config.policy = SessionPolicy::new(Some(EgressPolicy::deny_all()), None);
+        let refused_create = client.call::<CreateSession>(&refused_create).await.unwrap();
+        assert!(
+            refused_create.host_ip_enforcement.is_none(),
+            "a create over the probe cause that refuses the deny-all box \
+             carries no enforcement value on its reply either — the box's \
+             own launch would refuse it, got: {:?}",
+            refused_create.host_ip_enforcement
+        );
+        let mut unrefused_create = req("unrefused-create", "/uwu");
+        unrefused_create.config.policy = SessionPolicy::new(
+            Some(EgressPolicy {
+                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                ..EgressPolicy::deny_all()
+            }),
+            None,
+        );
+        let unrefused_create = client
+            .call::<CreateSession>(&unrefused_create)
+            .await
+            .unwrap();
+        assert_eq!(
+            unrefused_create.host_ip_enforcement.as_deref(),
+            Some("none"),
+            "the sectioned box the fact does not refuse keeps getting the \
+             state it runs in on its create reply too, got: {:?}",
+            unrefused_create.host_ip_enforcement
+        );
+        let listed = client.call::<ListSessions>(&()).await;
+        let refused = listed
+            .sessions
+            .iter()
+            .find(|e| e.id == created.id)
+            .expect("the deny-all session is in the listing");
+        assert!(
+            refused.host_ip_enforcement.is_none(),
+            "a deny-all box the classifier refuses shows nothing on the \
+             listing — the refusal is what its launch said, got: {:?}",
+            refused.host_ip_enforcement
+        );
+        assert!(
+            facts_enforcement(&mut client, created.id).await.is_none(),
+            "a refused box shows nothing on the runtime-facts reply either"
+        );
+        let unrefused = listed
+            .sessions
+            .iter()
+            .find(|e| e.id == sectioned_id)
+            .expect("the sectioned session is in the listing");
+        assert_eq!(
+            unrefused.host_ip_enforcement,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the host-address boxes the fact does not refuse keep showing \
+             the state they run in, got: {:?}",
+            unrefused.host_ip_enforcement
+        );
+
+        // The decided host, pinned pure over the derivation every read
+        // surface answers through: a decided fact shows `per_box` for the
+        // box its host places, the probe cause shows nothing for the box it
+        // refuses and the state for the box it does not, and no host shows
+        // a per-box state for a box whose verdict is decided on leases. A
+        // box with no launch record yet — these pins' `None` — shows the
+        // fact; a box with one shows that record, lowered by the fact and
+        // never raised above it.
+        let decided = fact_of(&classifier::Decision::decided());
+        let ineffective = fact_of(&classifier::Decision::undecidable(
+            classifier::Cause::TableNotEffective,
+        ));
+        let step_missing = fact_of(&classifier::Decision::undecidable(
+            classifier::Cause::StepNotInstalled,
+        ));
+        assert_eq!(
+            crate::session_host::displayed_host_ip_enforcement(
+                false,
+                NetworkMode::HostNet,
+                sandbox2::config::Verdict::Deny,
+                &decided,
+                None,
+            ),
+            Some(minimald_rpc::HostIpEnforcement::PerBox),
+            "a host that can decide per box shows its host-address boxes as \
+             enforced"
+        );
+        assert_eq!(
+            crate::session_host::displayed_host_ip_enforcement(
+                false,
+                NetworkMode::HostNet,
+                sandbox2::config::Verdict::Allow,
+                &decided,
+                None,
+            ),
+            Some(minimald_rpc::HostIpEnforcement::PerBox),
+            "the decided fact shows for the box that declared an egress \
+             section too"
+        );
+        assert_eq!(
+            crate::session_host::displayed_host_ip_enforcement(
+                false,
+                NetworkMode::OwnIp,
+                sandbox2::config::Verdict::Deny,
+                &decided,
+                None,
+            ),
+            None,
+            "a decided host still decides an own-address box's verdict on \
+             address leases, not on the cgroup tree"
+        );
+        assert_eq!(
+            crate::session_host::displayed_host_ip_enforcement(
+                false,
+                NetworkMode::HostNet,
+                sandbox2::config::Verdict::Deny,
+                &ineffective,
+                None,
+            ),
+            None,
+            "the probe cause's refusal is the launch's own gate: the box it \
+             refuses shows nothing, exactly as its launch refuses it"
+        );
+        assert_eq!(
+            crate::session_host::displayed_host_ip_enforcement(
+                false,
+                NetworkMode::HostNet,
+                sandbox2::config::Verdict::Allow,
+                &ineffective,
+                None,
+            ),
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the probe cause refuses only the deny-all box: the others run \
+             unenforced and show that state"
+        );
+        assert_eq!(
+            crate::session_host::displayed_host_ip_enforcement(
+                false,
+                NetworkMode::HostNet,
+                sandbox2::config::Verdict::Deny,
+                &step_missing,
+                None,
+            ),
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the step's causes keep the exception: even the deny-all box \
+             runs unenforced and says so"
+        );
+        // The box's own launch record, pinned over the same facts: a box
+        // its launch placed shows `per_box` while the host can still decide,
+        // and `none` the moment it cannot; a box its launch left unenforced
+        // shows `none` whatever the host has since decided, because the
+        // record is the launch's outcome and never the host's current
+        // state's to raise.
+        assert_eq!(
+            crate::session_host::displayed_host_ip_enforcement(
+                false,
+                NetworkMode::HostNet,
+                sandbox2::config::Verdict::Allow,
+                &decided,
+                Some(minimald_rpc::HostIpEnforcement::PerBox),
+            ),
+            Some(minimald_rpc::HostIpEnforcement::PerBox),
+            "a box its launch placed shows the per-box state its placement \
+             gave it, while this host can still decide per box"
+        );
+        assert_eq!(
+            crate::session_host::displayed_host_ip_enforcement(
+                false,
+                NetworkMode::HostNet,
+                sandbox2::config::Verdict::Allow,
+                &ineffective,
+                Some(minimald_rpc::HostIpEnforcement::PerBox),
+            ),
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "a placed box on a host that has since stopped deciding shows \
+             the undecidable state, never the per-box one its record holds"
+        );
+        assert_eq!(
+            crate::session_host::displayed_host_ip_enforcement(
+                false,
+                NetworkMode::HostNet,
+                sandbox2::config::Verdict::Allow,
+                &decided,
+                Some(minimald_rpc::HostIpEnforcement::None),
+            ),
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "a box its own launch left unenforced stays `none` — the record \
+             is never raised to the per-box state a later launch reached"
+        );
+
+        crate::session_host::clear_host_ip_enforcement_fact();
+    }
+
+    /// The fact a decision leaves, as the reads see it — set and copied back
+    /// through the daemon's own accessors, so a pure pin answers over the
+    /// pairing a real read produced, never a pairing a test invented.
+    fn fact_of(decision: &classifier::Decision) -> crate::session_host::HostIpEnforcementFact {
+        crate::session_host::set_host_ip_enforcement_fact(decision);
+        crate::session_host::host_ip_enforcement_fact()
+    }
+
+    /// The listing entry's enforcement for one session: the read surface the
+    /// re-read proof asserts on, so each leg of it says only what changed.
+    async fn listed_enforcement(
+        client: &mut TestClient,
+        id: SessionId,
+    ) -> Option<minimald_rpc::HostIpEnforcement> {
+        client
+            .call::<ListSessions>(&())
+            .await
+            .sessions
+            .into_iter()
+            .find(|e| e.id == id)
+            .expect("the created session is in the listing")
+            .host_ip_enforcement
+    }
+
+    /// The enforcement the runtime-facts reply carries for one session
+    /// (NET-079): the read surface `min session policy` renders beside the
+    /// rules, so the proofs assert on what that command actually prints —
+    /// the same derivation the listing answers over, over the reply the
+    /// CLI reads.
+    async fn facts_enforcement(
+        client: &mut TestClient,
+        id: SessionId,
+    ) -> Option<minimald_rpc::HostIpEnforcement> {
+        use minimald_rpc::{GetSessionRuntimeFacts, GetSessionRuntimeFactsRequest};
+        client
+            .call::<GetSessionRuntimeFacts>(&GetSessionRuntimeFactsRequest::Id(id))
+            .await
+            .unwrap()
+            .host_ip_enforcement
+    }
+
+    /// NET-079's fact follows the launch re-read: the start-up read seeds it
+    /// and every host-address launch's re-read refreshes it, so the read
+    /// surfaces show the state the *last* read reached, never one a re-read
+    /// has replaced. Driven here over the facts a test lays out — the
+    /// installed step's cohort, a spelled mount table, and the probe's
+    /// reading injected the way a test injects every other classifier fact —
+    /// so the table can read as refusing (a host that decides per box), as
+    /// removed (the marker standing over a table whose refusal is gone), and
+    /// as reinstalled, with the listing answering after each read the
+    /// daemon's own launches answer through. The session is a host-address
+    /// box that declares an egress section, so no host's gate refuses it and
+    /// the listing's answer is the fact's alone.
+    // The guard is taken before the server is even built and held across
+    // the awaited re-reads on purpose: the fact is process-global, so under
+    // libtest another test's read in the window would answer over it too.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the fact is process-global, so the guard must span the awaited \
+                  re-reads it is held for"
+    )]
+    #[tokio::test]
+    async fn host_ip_enforcement_follows_the_launch_reread() {
+        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // A host-address box no gate refuses: it declares an egress section,
+        // so its listing entry is the fact's, on any host.
+        let mut session = req("reread-proof", "/uwu");
+        session.config.policy = SessionPolicy::new(
+            Some(EgressPolicy {
+                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                ..EgressPolicy::deny_all()
+            }),
+            None,
+        );
+        let created = client.call::<CreateSession>(&session).await.unwrap();
+
+        // The tree the re-read answers over: the step's whole half, with
+        // the mount table spelled to cover it — the same facts a launch's
+        // knobs stand in, so the decision logic itself runs over them.
+        let (tree, root, mountinfo) = installed_cohort_tree();
+
+        // The re-read over a table that is refusing: `per_box`, the state
+        // the proof starts from. A test's stand-in tree cannot model a
+        // table whose refusal the probe reads — the kernel behind it is not
+        // there — so the reading is injected, the one classifier fact a
+        // stand-in tree cannot vouch for.
+        crate::session_host::install_classifier_reading_standin(classifier::Reading::Refused(
+            Vec::new(),
+        ));
+        let (_, decision) = crate::session_host::re_read_classifier_fact(
+            root.clone(),
+            Some(mountinfo.clone()),
+            false,
+        )
+        .await
+        .expect("the re-read runs");
+        assert!(
+            decision.can_decide_per_box(),
+            "a table whose refusal the probe read decides per box, got: {decision:?}"
+        );
+        assert_eq!(
+            listed_enforcement(&mut client, created.id).await,
+            Some(minimald_rpc::HostIpEnforcement::PerBox),
+            "the listing shows the fact the re-read wrote: a host that \
+             decides per box"
+        );
+
+        // The table read as removed: the marker still stands over a refusal
+        // that is gone, so the same launch re-reads `none` — and the
+        // listing shows it, not the state the earlier read reached.
+        crate::session_host::install_classifier_reading_standin(classifier::Reading::NotRefused {
+            because: "the injected reading stands in for a probe whose \
+                          every leg completed"
+                .to_string(),
+            families: Vec::new(),
+        });
+        let (_, decision) = crate::session_host::re_read_classifier_fact(
+            root.clone(),
+            Some(mountinfo.clone()),
+            false,
+        )
+        .await
+        .expect("the re-read runs");
+        assert_eq!(
+            decision.cause(),
+            Some(classifier::Cause::TableNotEffective),
+            "a marker standing over a table that is not refusing is its own \
+             cause, got: {decision:?}"
+        );
+        assert_eq!(
+            listed_enforcement(&mut client, created.id).await,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the listing follows the re-read: a host whose table read as \
+             removed shows `none`"
+        );
+
+        // The table read as reinstalled: the next launch re-reads `per_box`,
+        // and the listing shows the fact the re-read refreshed.
+        crate::session_host::install_classifier_reading_standin(classifier::Reading::Refused(
+            Vec::new(),
+        ));
+        let (_, decision) = crate::session_host::re_read_classifier_fact(
+            root.clone(),
+            Some(mountinfo.clone()),
+            false,
+        )
+        .await
+        .expect("the re-read runs");
+        assert!(
+            decision.can_decide_per_box(),
+            "a table whose refusal the probe read again decides per box, \
+             got: {decision:?}"
+        );
+        assert_eq!(
+            listed_enforcement(&mut client, created.id).await,
+            Some(minimald_rpc::HostIpEnforcement::PerBox),
+            "the listing follows the re-read back: a host whose table read \
+             as reinstalled shows `per_box` again"
+        );
+
+        crate::session_host::clear_classifier_reading_standin();
+        crate::session_host::clear_host_ip_enforcement_fact();
+        drop(tree);
+    }
+
+    /// Waits for the mock host's echo of `line`, which proves this session's
+    /// attach minted its host — and with it that the launch's own record
+    /// write, which runs before the host is handed back, has landed. The
+    /// shell channel is confirmed before the attach runs, so the echo is the
+    /// earliest a test can know the launch it drove is done.
+    async fn await_launch_echo(channel: &mut russh::Channel<russh::client::Msg>, line: &str) {
+        use russh::ChannelMsg;
+
+        let expected = format!("got:{line}");
+        channel
+            .data_bytes(format!("{line}\n").as_bytes().to_vec())
+            .await
+            .expect("the probe line reaches the shell");
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut stdout = Vec::new();
+            loop {
+                match channel.wait().await {
+                    Some(ChannelMsg::Data { data }) => {
+                        stdout.extend_from_slice(&data);
+                        if String::from_utf8_lossy(&stdout).contains(&expected) {
+                            return;
+                        }
+                    }
+                    Some(_) => {}
+                    None => panic!(
+                        "the launch's shell never echoed {expected:?}, got: {:?}",
+                        String::from_utf8_lossy(&stdout)
+                    ),
+                }
+            }
+        })
+        .await
+        .expect("the attach mints its host within its timeout");
+    }
+
+    /// NET-079's "recorded as such" belongs to the box, not the node: each
+    /// host-address box's own launch records its placement outcome on the
+    /// session record, and every read surface shows that record — lowered to
+    /// `none` when the host cannot decide per box, never raised above the
+    /// placement the launch made. Driven end to end over the daemon's own
+    /// attach path, the launches a session's start takes: boxes A and B
+    /// placed — A while the injected classifier reads undecided, B once it
+    /// reads per_box — and box C left unplaced by the step's absence. A
+    /// records the placement its launch made over a table that was not
+    /// refusing, and shows `none` while the host cannot decide, `per_box`
+    /// the moment the table refuses again — the box is in the leaf its
+    /// launch placed it in. C records `none` and shows `none` beside its
+    /// siblings' `per_box` on the same host, whatever the host has since
+    /// decided — which is what proves the reads answer over the box's own
+    /// record and not the host's state — and when the fact reads `none`
+    /// again, every box on it is lowered beside it.
+    // The guard is taken before the server is even built and held across
+    // every launch and read on purpose: the fact the launches record over
+    // and the reads lower by is process-global, so under libtest another
+    // test's launch or read in the window would answer over it too.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the fact is process-global, so the guard must span the \
+                  awaited launches and reads it is held for"
+    )]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unplaced_launch_stays_none_after_the_host_decides() {
+        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let capture = crate::test_harness::captured_log();
+
+        // The tree the launches' re-reads answer over: the step's whole
+        // half, with the mount table spelled to cover it, so the only thing
+        // injected is the table's effect — the one fact a stand-in tree
+        // cannot vouch for.
+        let (tree, root, mountinfo) = installed_cohort_tree();
+
+        // Box A's host reads undecided: the marker stands over a table whose
+        // refusal is gone, so this host cannot decide per box — but the step's
+        // tree is still there for a launch to place a box in, and the
+        // placement is the outcome A's launch records; the table's state is
+        // the reads' to lower it by, never the launch's to record.
+        crate::session_host::install_classifier_reading_standin(classifier::Reading::NotRefused {
+            because: "the injected reading stands in for a probe whose \
+                          every leg completed"
+                .to_string(),
+            families: Vec::new(),
+        });
+        let (_, decision) = crate::session_host::re_read_classifier_fact(
+            root.clone(),
+            Some(mountinfo.clone()),
+            false,
+        )
+        .await
+        .expect("the re-read runs");
+        assert_eq!(
+            decision.cause(),
+            Some(classifier::Cause::TableNotEffective),
+            "the undecided reading the proof launches A under, got: {decision:?}"
+        );
+
+        // Box A: created, then launched by the attach its start takes.
+        let created_a = client
+            .call::<CreateSession>(&req("launch-proof-a", "/uwu"))
+            .await
+            .unwrap();
+        let mut channel_a = client.open_shell(created_a.id).await;
+        await_launch_echo(&mut channel_a, "probe-a").await;
+
+        // Box A's own record, read back while its host still cannot decide:
+        // the placement its launch made, not the table's state — and every
+        // read surface lowers it to `none` over the fact, never shows a
+        // `per_box` nothing is enforcing.
+        let record_a = client
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(created_a.id))
+            .await
+            .record
+            .expect("box A's record is readable");
+        assert_eq!(
+            record_a.host_ip_enforcement,
+            Some(minimald_rpc::HostIpEnforcement::PerBox),
+            "box A's own launch recorded the placement it made over the \
+             table that was not refusing, got: {:?}",
+            record_a.host_ip_enforcement
+        );
+        assert_eq!(
+            listed_enforcement(&mut client, created_a.id).await,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the listing lowers box A's record to the state its host is in \
+             now — a leaf over a table that is not refusing decides nothing"
+        );
+        assert_eq!(
+            facts_enforcement(&mut client, created_a.id).await,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the runtime-facts reply lowers box A's record beside the rules \
+             it runs under"
+        );
+
+        // Box B's host reads per_box: the table's refusal is in force, so
+        // this host can decide a box's verdict on a leaf of its own.
+        crate::session_host::install_classifier_reading_standin(classifier::Reading::Refused(
+            Vec::new(),
+        ));
+        let (_, decision) = crate::session_host::re_read_classifier_fact(
+            root.clone(),
+            Some(mountinfo.clone()),
+            false,
+        )
+        .await
+        .expect("the re-read runs");
+        assert!(
+            decision.can_decide_per_box(),
+            "the per-box reading the proof launches B under, got: {decision:?}"
+        );
+
+        // Box B: the same create-and-attach, on the host that just decided.
+        let created_b = client
+            .call::<CreateSession>(&req("launch-proof-b", "/uwu"))
+            .await
+            .unwrap();
+        let mut channel_b = client.open_shell(created_b.id).await;
+        await_launch_echo(&mut channel_b, "probe-b").await;
+
+        // The boxes' own records: each launch's outcome, each on the box it
+        // launched — the daemon-owned field a create left empty and only a
+        // launch wrote.
+        let record_b = client
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(created_b.id))
+            .await
+            .record
+            .expect("box B's record is readable");
+        assert_eq!(
+            record_b.host_ip_enforcement,
+            Some(minimald_rpc::HostIpEnforcement::PerBox),
+            "box B's own launch recorded the placement its host decided, \
+             got: {:?}",
+            record_b.host_ip_enforcement
+        );
+
+        // The reads while the host decides: A's recorded placement is one
+        // this host can honour again — the table refuses per the leaf A's
+        // launch placed it in, so A shows `per_box` beside B, without a
+        // relaunch — on the listing and the runtime-facts reply both.
+        assert_eq!(
+            listed_enforcement(&mut client, created_a.id).await,
+            Some(minimald_rpc::HostIpEnforcement::PerBox),
+            "the listing shows box A's record as it stands while the table \
+             refuses again — the box is in the leaf its launch placed it in"
+        );
+        assert_eq!(
+            listed_enforcement(&mut client, created_b.id).await,
+            Some(minimald_rpc::HostIpEnforcement::PerBox),
+            "the listing shows box B's own launch record while its host can \
+             still decide per box"
+        );
+        assert_eq!(
+            facts_enforcement(&mut client, created_a.id).await,
+            Some(minimald_rpc::HostIpEnforcement::PerBox),
+            "the runtime-facts reply shows box A's placement beside the \
+             rules it runs under, once the table enforces it again"
+        );
+        assert_eq!(
+            facts_enforcement(&mut client, created_b.id).await,
+            Some(minimald_rpc::HostIpEnforcement::PerBox),
+            "the runtime-facts reply shows box B's own launch record while \
+             its host can still decide per box"
+        );
+
+        // Box C's host reads the step's absence: a cause the cohort tree
+        // cannot produce — it has the step's whole half — so the fact is
+        // set the way a host without it reads, which is the only half the
+        // test launcher's placement consults. Nothing places a leaf for C:
+        // its launch records the outcome of a placement that did not
+        // happen.
+        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+            classifier::Cause::StepNotInstalled,
+        ));
+
+        // Box C: the same create-and-attach, on the host whose tree is not
+        // there to place it.
+        let created_c = client
+            .call::<CreateSession>(&req("launch-proof-c", "/uwu"))
+            .await
+            .unwrap();
+        let mut channel_c = client.open_shell(created_c.id).await;
+        await_launch_echo(&mut channel_c, "probe-c").await;
+
+        let record_c = client
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(created_c.id))
+            .await
+            .record
+            .expect("box C's record is readable");
+        assert_eq!(
+            record_c.host_ip_enforcement,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "box C's own launch recorded the placement it could not make, \
+             got: {:?}",
+            record_c.host_ip_enforcement
+        );
+        assert_eq!(
+            listed_enforcement(&mut client, created_c.id).await,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the listing shows box C's own record — the outcome of a launch \
+             that placed nothing"
+        );
+        assert_eq!(
+            facts_enforcement(&mut client, created_c.id).await,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the runtime-facts reply shows box C's own record beside the \
+             rules it runs under"
+        );
+
+        // The observability half: one info line per host-address box launch,
+        // each carrying the outcome its own launch recorded, attributed to
+        // the session it belongs to — the placement for A and B, the
+        // placement that did not happen for C.
+        let logged = capture.contents();
+        for (id, expected, label) in [
+            (
+                created_a.id,
+                "host_ip_enforcement=per_box",
+                "the launch that placed its box over a table that was not \
+                 refusing",
+            ),
+            (
+                created_b.id,
+                "host_ip_enforcement=per_box",
+                "the launch whose host decided per box",
+            ),
+            (
+                created_c.id,
+                "host_ip_enforcement=none",
+                "the launch that placed nothing",
+            ),
+        ] {
+            assert!(
+                logged.lines().any(|line| {
+                    line.contains("recorded its host-address box's egress enforcement")
+                        && line.contains(&format!("session_id={id}"))
+                        && line.contains(expected)
+                }),
+                "{label} records its outcome on the daemon's log, got: {logged}"
+            );
+        }
+
+        // The fact reads `none` again: the host can no longer decide per
+        // box, so every box on it shows the state its own record is lowered
+        // to — B falls from `per_box` to `none`, and A stays where its
+        // launch left it.
+        crate::session_host::install_classifier_reading_standin(classifier::Reading::NotRefused {
+            because: "the injected reading stands in for a probe whose \
+                          every leg completed"
+                .to_string(),
+            families: Vec::new(),
+        });
+        let (_, decision) = crate::session_host::re_read_classifier_fact(
+            root.clone(),
+            Some(mountinfo.clone()),
+            false,
+        )
+        .await
+        .expect("the re-read runs");
+        assert_eq!(
+            decision.cause(),
+            Some(classifier::Cause::TableNotEffective),
+            "the undecidable reading the proof lowers both boxes under, got: \
+             {decision:?}"
+        );
+        assert_eq!(
+            listed_enforcement(&mut client, created_b.id).await,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the listing lowers box B's own record to the state its host is \
+             in now — never raised above it, never left standing above it"
+        );
+        assert_eq!(
+            listed_enforcement(&mut client, created_a.id).await,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "box A stays `none` — the state its own launch left it in"
+        );
+        assert_eq!(
+            facts_enforcement(&mut client, created_b.id).await,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the runtime-facts reply lowers box B's own record too, beside \
+             the rules it qualifies"
+        );
+
+        drop(channel_a);
+        drop(channel_b);
+        crate::session_host::clear_classifier_reading_standin();
+        crate::session_host::clear_host_ip_enforcement_fact();
+        drop(tree);
+    }
+
+    /// NET-079's state is the host's verdict, so no client may assert it:
+    /// the daemon strips its own `host_ip_enforcement` key from a create's
+    /// attrs unconditionally — whatever the session's network mode, whatever
+    /// the value — and every read surface answers from the daemon's own
+    /// fact. An own-address box carrying the assertion shows no enforcement
+    /// anywhere (its verdict is decided on leases, so there is no per-box
+    /// state to say), and a host-address box over a host that cannot decide
+    /// still shows the state it runs in, never the `per_box` the activation
+    /// tried to hand the reads.
+    // The guard is taken before the server is even built: the fact the
+    // assertions answer over is process-global, so under libtest another
+    // test's read in the window would answer over it too.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the fact is process-global, so the guard must span the awaited \
+                  reads it is held for"
+    )]
+    #[tokio::test]
+    async fn client_cannot_assert_host_ip_enforcement() {
+        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        // The fact the reads answer from: a host that cannot decide.
+        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+            classifier::Cause::StepNotInstalled,
+        ));
+
+        let mut asserting = req("asserting", "/uwu");
+        asserting.config.network = NetworkMode::OwnIp;
+        asserting.config.attrs.insert(
+            super::HOST_IP_ENFORCEMENT_ATTR.to_string(),
+            "per_box".to_string(),
+        );
+        let own_address = client.call::<CreateSession>(&asserting).await.unwrap();
+
+        // The assertion is stripped, not honoured: the record carries no
+        // enforcement key, and the read surfaces show nothing — their own
+        // derivation for a box whose verdict is decided on leases.
+        let reply = client
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(own_address.id))
+            .await;
+        let attrs = &reply
+            .record
+            .expect("the created session has a record")
+            .attrs;
+        assert!(
+            !attrs.contains_key(super::HOST_IP_ENFORCEMENT_ATTR),
+            "a client-supplied enforcement key is stripped, never recorded, \
+             got: {attrs:?}"
+        );
+        assert_eq!(
+            listed_enforcement(&mut client, own_address.id).await,
+            None,
+            "an own-address box shows no enforcement on the listing, \
+             assertion or not: its verdict is decided on address leases"
+        );
+        assert!(
+            facts_enforcement(&mut client, own_address.id)
+                .await
+                .is_none(),
+            "an own-address box shows no enforcement on the runtime-facts \
+             reply either, assertion or not"
+        );
+
+        // The strip is for every network mode: a host-address box carrying
+        // the same assertion records nothing either, and its listing shows
+        // the daemon's fact — the state the host actually runs in — never
+        // the `per_box` the activation tried to assert.
+        let mut host_address = req("host-address", "/uwu");
+        host_address.config.attrs.insert(
+            super::HOST_IP_ENFORCEMENT_ATTR.to_string(),
+            "per_box".to_string(),
+        );
+        let host_address = client.call::<CreateSession>(&host_address).await.unwrap();
+        let reply = client
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(host_address.id))
+            .await;
+        let attrs = &reply
+            .record
+            .expect("the created session has a record")
+            .attrs;
+        assert!(
+            !attrs.contains_key(super::HOST_IP_ENFORCEMENT_ATTR),
+            "the strip is unconditional — the mode does not let an assertion \
+             through, got: {attrs:?}"
+        );
+        assert_eq!(
+            listed_enforcement(&mut client, host_address.id).await,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "a host-address box's listing is the daemon's own fact, not the \
+             client's assertion: a host that cannot decide shows `none`"
+        );
+
+        crate::session_host::clear_host_ip_enforcement_fact();
+    }
+
+    /// NET-079's advisory is built only where it applies: a create over a
+    /// host-address box on a daemon that is not itself a microVM's guest.
+    /// An own-address box's verdict is decided on address leases, so over
+    /// the same fact that makes a host-address create carry the advisory —
+    /// pinned here as the contrast — an own-address create carries none:
+    /// `None`, the same nothing a host that decides says.
+    // The guard is taken before the server is even built: the fact the
+    // contrast reads is process-global, so under libtest another test's
+    // read in the window would answer over it too.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the fact is process-global, so the guard must span the awaited \
+                  creates it is set for"
+    )]
+    #[tokio::test]
+    async fn own_ip_create_has_no_classifier_advisory() {
+        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+
+        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+            classifier::Cause::StepNotInstalled,
+        ));
+        // The contrast: the same fact over a host-address box carries it.
+        let host_address = client
+            .call::<CreateSession>(&req("host-address", "/uwu"))
+            .await
+            .unwrap();
+        assert!(
+            host_address.classifier_advisory.is_some(),
+            "the fact carries a cause, so a host-address create over it \
+             advises — the contrast this proof needs, got: {:?}",
+            host_address.classifier_advisory
+        );
+        let own_address =
+            own_ip_create_reply(&mut client, "own-address", SessionPolicy::default()).await;
+        assert_eq!(
+            own_address.classifier_advisory, None,
+            "an own-address box's verdict is decided on address leases, so \
+             its create carries no classifier advisory, got: {:?}",
+            own_address.classifier_advisory
+        );
+
+        crate::session_host::clear_host_ip_enforcement_fact();
+    }
+
+    /// NET-079's advisory, the other half of where it applies: a daemon
+    /// running inside a microVM never carries it, whatever its sessions are
+    /// and whatever its fact holds — the guest's start-up line and each
+    /// launch's own record say the interim's state, and its causes name an
+    /// image's builder rather than anything the person starting a session
+    /// could run. Pinned pure over the create's gate: the test harness
+    /// builds native daemons only, so the guest arm is the gate's, with the
+    /// same cause a native host-address create advises on as the input that
+    /// proves the `None` is the guest's doing and not the cause's.
+    #[test]
+    fn microvm_create_has_no_classifier_advisory() {
+        let cause = Some(classifier::Cause::StepNotInstalled);
+        assert_eq!(
+            super::create_classifier_advisory(true, NetworkMode::HostNet, cause),
+            None,
+            "a microVM's daemon carries no classifier advisory, whatever its \
+             sessions or its fact"
+        );
+        assert!(
+            super::create_classifier_advisory(false, NetworkMode::HostNet, cause).is_some(),
+            "the same cause over a native host-address create does advise — \
+             the contrast that proves the guest arm is the gate's own"
+        );
+        assert_eq!(
+            super::create_classifier_advisory(false, NetworkMode::OwnIp, cause),
+            None,
+            "the own-address arm stays the gate's own too, guest or not"
+        );
+    }
+
+    /// The advisory over the two probe causes (NET-079), pinned pure: no
+    /// stand-in can carry either — a fake tree's probe child never places,
+    /// so the stand-ins answer a step or mount cause, and a stand-in that
+    /// carried a decided tree would need a table whose refusal the probe
+    /// could read. The two are the exception's one limit: natively the
+    /// outcome names the refusal — a deny-all host-address box is refused at
+    /// placement — so the advisory must not claim the boxes' declarations do
+    /// not matter over a refusal a person is about to hit. The table a
+    /// reload would fix still names the command; the probe no command can
+    /// make run names none. And in the guest every cause refuses, so the
+    /// clause never appears there either.
+    #[test]
+    fn advisory_over_a_probe_cause_names_the_refusal_not_a_blanket_unenforced() {
+        let not_effective =
+            super::classifier_advisory_text(classifier::Cause::TableNotEffective, false);
+        assert!(
+            not_effective.contains(
+                "its deny-all host-address boxes are refused and its other \
+                 host-address boxes run unenforced"
+            ),
+            "the probe cause's advisory names the refusal, got: {not_effective}"
+        );
+        assert!(
+            !not_effective.contains("whatever the boxes' declarations say"),
+            "the clause holds only while no box is refused, got: {not_effective}"
+        );
+        assert!(
+            not_effective.contains(&sandbox2::classifier::install_hint()),
+            "a table the marker vouches for but the probe does not is the one \
+             the step's install reloads, so the advisory still carries the \
+             command, got: {not_effective}"
+        );
+        assert!(
+            !not_effective.contains('?'),
+            "the advisory names what a person may run; it never asks: {not_effective}"
+        );
+
+        let unreadable = super::classifier_advisory_text(classifier::Cause::ProbeUnreadable, false);
+        assert!(
+            unreadable.contains(
+                "its deny-all host-address boxes are refused and its other \
+                 host-address boxes run unenforced"
+            ),
+            "an unreadable probe leaves the same refusal-naming outcome, \
+             got: {unreadable}"
+        );
+        assert!(
+            !unreadable.contains("whatever the boxes' declarations say"),
+            "the clause still does not apply, got: {unreadable}"
+        );
+        assert!(
+            !unreadable.contains("install-host-classifier"),
+            "no command is known to make a probe run, so none is named, \
+             got: {unreadable}"
+        );
+
+        let guest = super::classifier_advisory_text(classifier::Cause::StepNotInstalled, true);
+        assert!(
+            !guest.contains("whatever the boxes' declarations say"),
+            "a guest refuses a deny-all box on every cause, so its advisory \
+             must not claim the declarations do not matter, got: {guest}"
         );
     }
 
@@ -2920,13 +4511,6 @@ mod tests {
             Some(OWN_VERSION)
         );
     }
-
-    /// Serializes the window in which a loopback-probe stand-in is installed:
-    /// the stand-in is process-global (`net::loopback`), so under libtest —
-    /// where every test in this binary shares one process — a create driven
-    /// by another test would read it too. Nextest runs each test in its own
-    /// process; the mutex keeps the in-process runner as safe.
-    static PROBE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The probe a host whose `lo0` carries no range alias reads: the stock
     /// macOS the spike measured — every bind refused, first at `.1`.
