@@ -1018,6 +1018,27 @@ pub(crate) async fn activate_session(
         eprintln!("{notice}");
     }
 
+    // When a subnet flag carries host bits (e.g. `--deny-subnets 10.0.0.1/8`),
+    // the enforcement layer reads it as the masked network (`10.0.0.0/8`).
+    // Print a one-line notice naming the normalized form so the user knows
+    // how their entry is read, rather than discovering it through a mismatch.
+    if let Some(egress) = &config.policy.egress {
+        if let Some(entries) = &egress.allow_subnets {
+            for entry in entries {
+                if let Some(normalized) = sessions::normalized_cidr(entry) {
+                    eprintln!("--allow-subnets {entry} is read as {normalized}");
+                }
+            }
+        }
+        if let Some(entries) = &egress.deny_subnets {
+            for entry in entries {
+                if let Some(normalized) = sessions::normalized_cidr(entry) {
+                    eprintln!("--deny-subnets {entry} is read as {normalized}");
+                }
+            }
+        }
+    }
+
     // From here the session exists on the daemon in an unfinalized state.
     // Arm a Ctrl-C guard so an interrupt during the (blocking) gating
     // prompt tears it down instead of orphaning it in `Pending` — see
