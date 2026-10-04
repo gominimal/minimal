@@ -84,19 +84,53 @@ async fn control_request_with_vm_host(
     Ok(reply)
 }
 
+/// What a successful registration with the VM host daemon hands the
+/// activating client back (T66, NET-133): the addresses the create request
+/// carries, and the box's own id when the daemon's reply named one — the
+/// id the host minted for this creation, which the published row holds and
+/// its attachment carries. This is the client's record of that id; the
+/// client never sends one. A reply that carries no id — from a daemon that
+/// predates ids — is still a successful registration: the client simply
+/// records no id, and the row and its attachment name the box host-side as
+/// ever.
+#[derive(Debug)]
+struct RegisteredWithVmHost {
+    /// The addresses the create request carries, so the in-VM daemon
+    /// attaches with the handed switch address instead of drawing its own.
+    addresses: sessions::BoxAddresses,
+    /// The box's own id the reply returned — 32 hex digits on the wire,
+    /// the one spelling the row, the attachment and a diagnostic all name
+    /// it by — or `None` when the answering daemon predates ids.
+    box_id: Option<minimald_rpc::BoxId>,
+}
+
 /// Registers an own-address box with the VM host daemon over its control
-/// socket (T66), returning the addresses it handed back.
+/// socket (T66), returning what it handed back.
 async fn register_box_with_vm_host(
     sock_path: &std::path::Path,
     request: minimald_rpc::RegisterBoxRequest,
-) -> anyhow::Result<sessions::BoxAddresses> {
+) -> anyhow::Result<RegisteredWithVmHost> {
     match control_request_with_vm_host(
         sock_path,
         minimald_rpc::BoxControlRequest::Register(request),
     )
     .await?
     {
-        minimald_rpc::BoxControlReply::Addresses(addresses) => Ok(addresses),
+        // The answer a daemon this build boots beside sends: the addresses
+        // beside the id the published row holds.
+        minimald_rpc::BoxControlReply::Registered(web) => Ok(RegisteredWithVmHost {
+            addresses: sessions::BoxAddresses {
+                switch_address: web.switch_address,
+                loopback_address: web.loopback_address,
+            },
+            box_id: Some(web.box_id),
+        }),
+        // A daemon that predates ids answers with the bare pair the
+        // registration has always been answered with.
+        minimald_rpc::BoxControlReply::Addresses(addresses) => Ok(RegisteredWithVmHost {
+            addresses,
+            box_id: None,
+        }),
         minimald_rpc::BoxControlReply::Error { error } => {
             anyhow::bail!("the VM host daemon refused the box registration: {error}")
         }
@@ -317,6 +351,17 @@ pub(crate) async fn withdraw_box_row(
                      answerer status; the row stays published"
                 );
             }
+            // A withdrawal is never answered with a registered box — but a
+            // daemon that speaks another shape here is still not answering
+            // the withdrawal, so the row stays published and the line says
+            // so.
+            minimald_rpc::BoxControlReply::Registered(_) => {
+                tracing::warn!(
+                    box = %name,
+                    "the VM host daemon answered the box row withdrawal with a \
+                     registration; the row stays published"
+                );
+            }
         },
         Ok(Err(error)) => {
             tracing::warn!(
@@ -337,8 +382,8 @@ pub(crate) async fn withdraw_box_row(
 }
 
 /// Registers this activation's box with the VM host daemon, when the daemon
-/// this invocation talks to is minvmd-backed (T66), returning the addresses
-/// it handed back — `Ok(None)` when there is nothing to register.
+/// this invocation talks to is minvmd-backed (T66), returning what it handed
+/// back — `Ok(None)` when there is nothing to register.
 ///
 /// The box this activation creates is registerable only when the daemon
 /// connection resolves through minvmd — [`daemon_provider_kind`], never
@@ -348,6 +393,15 @@ pub(crate) async fn withdraw_box_row(
 /// it is an own-address box: a `host_ip` box shares the node's own row in
 /// the host table, and a `none` box has no switch address at all — both
 /// register nothing and attach exactly as they always have.
+///
+/// The box's own id comes back with it (NET-133): the request carries no
+/// id, the host mints one for this creation, and the reply returns the id
+/// the published row holds, which the client records — so the CLI, the row
+/// and the attachment all carry the one id per box: the id a delivered
+/// connection is attributed by. Every registration is a new creation with a
+/// new id, the autospawn retry's re-registration included. A daemon that
+/// predates ids answers with the bare pair; that registration succeeded
+/// too, and the client records no id.
 ///
 /// A registration that cannot be made — an unresolvable provider dir, a
 /// refusal, the deadline — fails the activation with its cause rather than
@@ -362,7 +416,7 @@ async fn register_box_for_activation(
     network: sessions::NetworkMode,
     name: &str,
     policy: &sessions::SessionPolicy,
-) -> anyhow::Result<Option<sessions::BoxAddresses>> {
+) -> anyhow::Result<Option<RegisteredWithVmHost>> {
     if kind != paths::ProviderKind::Minvmd || network != sessions::NetworkMode::OwnIp {
         return Ok(None);
     }
@@ -378,7 +432,8 @@ async fn register_box_for_activation(
         .ok_or_else(|| anyhow::anyhow!("no provider dir resolved for the ssh socket"))?;
     // The declaration, as this activation expanded it: the ingress rules
     // reduced to the external ports they admit — the shape the host row
-    // holds — and the egress policy verbatim.
+    // holds — and the egress policy verbatim. No box id: the host mints
+    // one for this creation (NET-133).
     let request = minimald_rpc::RegisterBoxRequest {
         name: name.to_string(),
         ingress_ports: policy
@@ -401,15 +456,19 @@ async fn register_box_for_activation(
     )
     .await;
     match registration {
-        Ok(Ok(addresses)) => {
+        Ok(Ok(web)) => {
             tracing::info!(
                 box = %name,
-                switch_address = %addresses.switch_address,
-                loopback_address = %addresses.loopback_address,
+                box_id = %web
+                    .box_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+                switch_address = %web.addresses.switch_address,
+                loopback_address = %web.addresses.loopback_address,
                 "registered the box with the VM host daemon; its addresses are \
                  the host table's to decide by"
             );
-            Ok(Some(addresses))
+            Ok(Some(web))
         }
         Ok(Err(error)) => Err(error.context(
             "registering the box with the VM host daemon failed; the session \
@@ -494,17 +553,30 @@ pub(crate) async fn activate_session(
     }
     // Any egress flag makes the declaration; a field with no values stays
     // `None` — its allow-all/none-denied default — so `--deny-subnets` alone
-    // records an allow-all policy that denies one range.
-    let has_egress = !args.allow_subnets.is_empty()
-        || !allow_protocols.is_empty()
-        || !args.allow_dns_hosts.is_empty()
-        || !args.deny_subnets.is_empty();
-    let egress = has_egress.then_some(sessions::EgressPolicy {
-        allow_subnets: (!args.allow_subnets.is_empty()).then(|| args.allow_subnets.clone()),
-        allow_dns_hosts: (!args.allow_dns_hosts.is_empty()).then(|| args.allow_dns_hosts.clone()),
-        allow_protocols: (!allow_protocols.is_empty()).then_some(allow_protocols),
-        deny_subnets: (!args.deny_subnets.is_empty()).then(|| args.deny_subnets.clone()),
-    });
+    // records an allow-all policy that denies one range. `--deny-all-egress`
+    // is the whole declaration on its own: it maps to
+    // `sessions::EgressPolicy::deny_all()`, every allow list present and
+    // empty, rather than to four absent lists — a deny-all box declared by
+    // flag must read in the record exactly like one declared by file, which
+    // is the shape the host-address classifier decides its verdict on
+    // (NET-079) and the one `min session policy` names `deny-all`. The parse
+    // conflict (`cli.rs`) keeps it from combining with a rule flag, so the
+    // arms cannot both run.
+    let egress = if args.deny_all_egress {
+        Some(sessions::EgressPolicy::deny_all())
+    } else {
+        let has_egress = !args.allow_subnets.is_empty()
+            || !allow_protocols.is_empty()
+            || !args.allow_dns_hosts.is_empty()
+            || !args.deny_subnets.is_empty();
+        has_egress.then_some(sessions::EgressPolicy {
+            allow_subnets: (!args.allow_subnets.is_empty()).then(|| args.allow_subnets.clone()),
+            allow_dns_hosts: (!args.allow_dns_hosts.is_empty())
+                .then(|| args.allow_dns_hosts.clone()),
+            allow_protocols: (!allow_protocols.is_empty()).then_some(allow_protocols),
+            deny_subnets: (!args.deny_subnets.is_empty()).then(|| args.deny_subnets.clone()),
+        })
+    };
     let policy = sessions::SessionPolicy {
         egress,
         ingress: (!port_mappings.is_empty()).then_some(sessions::IngressPolicy {
@@ -696,7 +768,7 @@ pub(crate) async fn activate_session(
     // resolved once, here, and the withdrawals ride on it.
     let kind = daemon_provider_kind(global);
     let control_sock = vm_host_control_sock(kind, global.minimal_dir.as_deref());
-    config.box_addresses = register_box_for_activation(
+    let mut registered = register_box_for_activation(
         kind,
         global.minimal_dir.as_deref(),
         config.network,
@@ -707,6 +779,11 @@ pub(crate) async fn activate_session(
         &config.policy,
     )
     .await?;
+    // The registration is the client's record of the box: the addresses
+    // the create carries, and the id the host minted for it (NET-133).
+    config.box_addresses = registered
+        .as_ref()
+        .map(|registration| registration.addresses);
 
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
@@ -767,8 +844,12 @@ pub(crate) async fn activate_session(
                     // no row behind. The re-registration can itself fail —
                     // the plan can be exhausted by then — and that failure
                     // ends the retry loop the same way the first one would
-                    // have, with its cause.
-                    config.box_addresses = register_box_for_activation(
+                    // have, with its cause. The first registration's id is
+                    // discarded with its row: ids are never freed or
+                    // reused, so the re-registration is a new creation, and
+                    // the host mints it a new id, which replaces the record
+                    // (NET-133).
+                    registered = register_box_for_activation(
                         kind,
                         global.minimal_dir.as_deref(),
                         config.network,
@@ -776,6 +857,9 @@ pub(crate) async fn activate_session(
                         &config.policy,
                     )
                     .await?;
+                    config.box_addresses = registered
+                        .as_ref()
+                        .map(|registration| registration.addresses);
                     continue;
                 }
                 // A create failure that is not a retryable autogen collision
@@ -870,15 +954,16 @@ pub(crate) async fn activate_session(
     // means this VM's names are not answered on the host whatever this
     // host's hook and range say, so neither is read and the warning says
     // the fact instead of the advisory.
-    let (vm_answerer, answerer_port, answerer_bound, held_no_channel) =
+    let (vm_answerer, answerer_port, answerer_bound, held_no_channel, proxy_down) =
         match vm_host_answerer_status(global).await {
             Some(status) => {
-                let read = crate::resolver::host_answerer_read(status).await;
+                let read = crate::resolver::host_answerer_read(status.clone()).await;
                 (
                     Some(status),
                     read.port,
                     read.answerer_bound,
                     read.held_no_channel,
+                    read.proxy_down,
                 )
             }
             None => (
@@ -886,6 +971,7 @@ pub(crate) async fn activate_session(
                 created.zone_answerer_port,
                 created.answerer_bound,
                 false,
+                None,
             ),
         };
     // The interim itself, named at every session start on a VM-backed host
@@ -927,6 +1013,25 @@ pub(crate) async fn activate_session(
                 crate::resolver::LiveSurface::Proxy,
                 created.hostname_proxy_port,
             )
+        );
+    } else if let Some((port, cause)) = proxy_down {
+        // T93: the VM host daemon's own verdict on the hostname proxy's
+        // publication — a terminal publish failure, named with the port it
+        // is about and its cause instead of a bare "not serving" — printed
+        // at every session start, TTY and non-TTY alike, because the names
+        // this session is about to rely on are the ones the line says
+        // cannot resolve. No host read runs in this arm — no detection, no
+        // liveness query, no range probe — because the status is the VM
+        // host daemon's answer on the proxy's publication, and no host
+        // probe can move it.
+        let surface = crate::resolver::LiveSurface::ProxyNotServing { port, cause };
+        tracing::info!(
+            surface = ?surface,
+            "session start decided the live name surface for this host"
+        );
+        eprintln!(
+            "{}",
+            crate::resolver::name_surface_line(surface, created.hostname_proxy_port)
         );
     } else if let Some(answerer_port) = answerer_port {
         let detection = crate::resolver::session_detection().await;
@@ -1651,6 +1756,7 @@ pub(crate) async fn activate_new_for_attach(global: &GlobalArgs) -> Result<(), a
             allow_dns_hosts: Vec::new(),
             allow_protocols: Vec::new(),
             deny_subnets: Vec::new(),
+            deny_all_egress: false,
             credentialed_upstream: false,
             loadout: Vec::new(),
             no_loadouts: false,
@@ -1938,11 +2044,18 @@ pub fn print_classifier_advisory(
 
 /// Render a session's effective policy as its rules: the egress the gate
 /// enforces (NET-074/NET-075) — a declared section's dimensions each
-/// resolved to its list or its default (`allow all`; `deny subnets` reads
-/// `(none)` when nothing is denied), or, for a box that declared no egress
-/// at all, the default its daemon resolved to (`deny all` once the deny-all
-/// default is in force; `allow all` behind the opt-out or before it), with
-/// NET-079's per-box enforcement beside the egress rows when the daemon
+/// resolved to its list or its default (`allow-all`; `deny subnets` reads
+/// `(none)` when nothing is denied), the declared deny-all section by name
+/// (`deny-all` — every list empty would otherwise read as blankness, which
+/// is nothing, never a verdict), or, for a box that declared no egress
+/// at all, the default its daemon resolved to (`deny-all` once the deny-all
+/// default is in force; `allow-all` behind the opt-out or before it),
+/// marked as a default and not as a declaration on the row itself —
+/// `deny-all (default)`, `allow-all (default)` — so a box the rollout
+/// silenced and a box that declared the same verdict never read the same;
+/// the declared deny-all row carries no mark, because the box chose it.
+/// Both spell with the requirement's own hyphenated tokens. The egress
+/// rows carry NET-079's per-box enforcement when the daemon
 /// reported one: a host-address box's verdict is decided on the host's
 /// cgroup tree, so the egress block that says what the box may reach also
 /// says whether this host can decide that per box — `none` beside a
@@ -1977,7 +2090,7 @@ pub fn print_classifier_advisory(
 /// than printed from a plan the session does not attach to. The modes
 /// without a surface to describe are held to the TUI's detail pane: a none
 /// box has no network at all, so it prints the pane's one-line note in
-/// place of both blocks (`allow all` egress would claim a reach a box with
+/// place of both blocks (`allow-all` egress would claim a reach a box with
 /// no network does not have), and a host-address session shares its host's
 /// namespace, so it has no per-session ingress policy — the block is
 /// omitted entirely, and with it the baseline set, which is a
@@ -2000,18 +2113,29 @@ pub fn format_policy(
     }
     writeln!(out, "egress")?;
     match &effective.egress {
-        sessions::EffectiveEgress::DenyAll => writeln!(out, "  deny all")?,
-        sessions::EffectiveEgress::AllowAll => writeln!(out, "  allow all")?,
+        sessions::EffectiveEgress::DenyAll => writeln!(out, "  deny-all (default)")?,
+        sessions::EffectiveEgress::AllowAll => writeln!(out, "  allow-all (default)")?,
+        sessions::EffectiveEgress::Declared(egress) if declares_deny_all(egress) => {
+            // The declared deny-all section, by name rather than as its
+            // rows: every list empty renders as blankness, which reads as
+            // nothing — the one rendering this block must never print
+            // (NET-075's "never nothing"). The same verdict the default
+            // resolves to, spelled without the mark, because the box
+            // declared it: the mark is the difference between a verdict the
+            // box chose and the one the rollout chose for it, and the JSON
+            // document carries the same distinction as `source`.
+            writeln!(out, "  deny-all")?;
+        }
         sessions::EffectiveEgress::Declared(egress) => {
-            write_rules(out, "subnets", egress.allow_subnets.as_ref(), "allow all")?;
+            write_rules(out, "subnets", egress.allow_subnets.as_ref(), "allow-all")?;
             write_rules(
                 out,
                 "dns hosts",
                 egress.allow_dns_hosts.as_ref(),
-                "allow all",
+                "allow-all",
             )?;
             match &egress.allow_protocols {
-                None => writeln!(out, "  protocols  allow all")?,
+                None => writeln!(out, "  protocols  allow-all")?,
                 Some(protos) => writeln!(
                     out,
                     "  protocols  {}",
@@ -2028,7 +2152,7 @@ pub fn format_policy(
     // NET-079's per-box enforcement, as the egress block's closing row: a
     // host-address box's verdict is decided on the host's cgroup tree, so
     // this is the row that says whether the rules above are decided per box
-    // at all — and a `deny all` printed beside an enforcement of `none` is
+    // at all — and a `deny-all` printed beside an enforcement of `none` is
     // the honest rendering, the posture the box declared beside the state it
     // actually runs in, rather than a verdict that looks decided and is not.
     // The value is the runtime-facts reply's, in the machine spelling: the
@@ -2074,17 +2198,17 @@ pub fn format_policy(
     // Ingress is an own-address surface: the switch's static forwarder is the
     // only per-session ingress minimald applies, and a host-address box
     // shares its host's namespace, so there is no per-session ingress policy
-    // to show for it — "deny all" there would claim a deny-rule exists.
+    // to show for it — "deny-all" there would claim a deny-rule exists.
     if network != sessions::NetworkMode::HostNet {
         writeln!(out, "ingress")?;
         match &effective.ingress {
-            None => writeln!(out, "  deny all")?,
+            None => writeln!(out, "  deny-all")?,
             Some(ingress) => {
                 if ingress.port_mappings.is_empty()
                     && ingress.dynamic_allowed_range.is_none()
                     && ingress.dynamic_ingress.is_none()
                 {
-                    writeln!(out, "  deny all")?;
+                    writeln!(out, "  deny-all")?;
                 }
                 for mapping in &ingress.port_mappings {
                     writeln!(
@@ -2157,7 +2281,7 @@ pub const POLICY_JSON_SCHEMA: &str = "min/v1/session-policy";
 
 /// The ingress block as the document carries it: the declared policy, or
 /// `deny_all` where the text rendering writes that reading — the same
-/// decision its "deny all" line makes, so the document never claims rules
+/// decision its "deny-all" line makes, so the document never claims rules
 /// the box never declared. Tagged by `kind` so a client branches on one
 /// field, with the declared policy's own keys flattened beside it.
 #[derive(serde::Serialize)]
@@ -2186,6 +2310,65 @@ impl<'a> PolicyIngressJson<'a> {
                 Self::DenyAll
             }
             Some(ingress) => Self::Declared(ingress),
+        }
+    }
+}
+
+/// The egress block as the document carries it: the posture the gate
+/// enforces, by the name the text rendering prints (`deny-all`,
+/// `allow-all`), and which of the two ways it came about — `default`, the
+/// rollout's resolution of a section the box never declared (NET-074), or
+/// `declared`, the box's own section (NET-075) — so a consumer reading the
+/// document never recomputes the default rule to tell a declared deny-all
+/// from the default's identical verdict: the mark the text rendering puts
+/// on the row, as a field. A declaration that admits something has no
+/// single name, so its rows ride under `rules` with
+/// `effective: "rules"` — the same lists the text rendering prints as its
+/// dimension rows.
+#[derive(serde::Serialize)]
+struct PolicyEgressJson<'a> {
+    /// The posture's name: `deny-all` or `allow-all` when the verdict has
+    /// one, `rules` when the declaration's own rows say it.
+    effective: &'static str,
+    /// `default` for the rollout's resolution of an absent section,
+    /// `declared` for the box's own.
+    source: &'static str,
+    /// The declared section, carried exactly when the box declared one —
+    /// the shape the strict record holds, empty lists and all, so a
+    /// declared deny-all is reconstructable from the document alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rules: Option<&'a sessions::EgressPolicy>,
+}
+
+impl<'a> PolicyEgressJson<'a> {
+    /// The document's form of the block [`format_policy`] prints: the same
+    /// named verdicts, the same declaration-versus-default distinction the
+    /// `(default)` mark carries, so the text and the document say one
+    /// thing about a box's egress.
+    fn from_effective(egress: &'a sessions::EffectiveEgress) -> Self {
+        match egress {
+            sessions::EffectiveEgress::DenyAll => Self {
+                effective: "deny-all",
+                source: "default",
+                rules: None,
+            },
+            sessions::EffectiveEgress::AllowAll => Self {
+                effective: "allow-all",
+                source: "default",
+                rules: None,
+            },
+            // The declared deny-all section keeps its name — the four
+            // present-and-empty lists it would print as blankness — and its
+            // `rules` ride beside the name the way every declaration's do.
+            sessions::EffectiveEgress::Declared(section) => Self {
+                effective: if declares_deny_all(section) {
+                    "deny-all"
+                } else {
+                    "rules"
+                },
+                source: "declared",
+                rules: Some(section),
+            },
         }
     }
 }
@@ -2224,7 +2407,7 @@ struct PolicyJson<'a> {
     schema: &'static str,
     network: sessions::NetworkMode,
     #[serde(skip_serializing_if = "Option::is_none")]
-    egress: Option<&'a sessions::EffectiveEgress>,
+    egress: Option<PolicyEgressJson<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ingress: Option<PolicyIngressJson<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2303,7 +2486,7 @@ pub fn write_policy_json(
         PolicyJson {
             schema: POLICY_JSON_SCHEMA,
             network,
-            egress: Some(&effective.egress),
+            egress: Some(PolicyEgressJson::from_effective(&effective.egress)),
             // Ingress is an own-address surface — the text rendering's gate:
             // a host-address box shares its host's namespace, so a key there
             // would claim a per-session policy that does not exist.
@@ -2511,6 +2694,22 @@ async fn session_policy_as_json(global: &GlobalArgs, session: &str) -> Result<()
     write_policy_json(&mut out, &policy, record.network, fabric, live).context(OutputWriteError)?;
     out.flush().context(OutputWriteError)?;
     Ok(())
+}
+
+/// Whether a declared egress section is the deny-all shape: every allow
+/// list present and empty, nothing admitted on any dimension. The same
+/// shape [`sessions::EgressPolicy::deny_all`] writes and `--deny-all-egress`
+/// maps to, and the one the host-address classifier decides its deny verdict
+/// on — `deny_subnets` is not consulted, because a box that allows nothing
+/// has nothing to deny on top. The rendering's own predicate rather than a
+/// shared one in `sessions`, so [`format_policy`] states its reading of the
+/// section where it renders it: present-and-empty reads as deny-all, the
+/// absence `None` reads as the dimension's allow-all default, and the two
+/// must not render the same.
+fn declares_deny_all(egress: &sessions::EgressPolicy) -> bool {
+    egress.allow_subnets.as_ref().is_some_and(Vec::is_empty)
+        && egress.allow_dns_hosts.as_ref().is_some_and(Vec::is_empty)
+        && egress.allow_protocols.as_ref().is_some_and(Vec::is_empty)
 }
 
 /// One egress rule row: the CIDR or hostname list, or the default the policy
@@ -3235,8 +3434,8 @@ mod tests {
             "dynamic ingress row must be printed: {rendered}"
         );
         assert!(
-            !rendered.contains("  deny all"),
-            "a policy with an explicit dynamic ingress setting must not print 'deny all': {rendered}"
+            !rendered.contains("  deny-all"),
+            "a policy with an explicit dynamic ingress setting must not print 'deny-all': {rendered}"
         );
     }
 
@@ -3272,7 +3471,7 @@ mod tests {
         // A declared-but-empty section: the strict shape the daemon handed
         // down before NET-074, which still arrives as `Declared` when the
         // session or the box opted out of the default — and so keeps
-        // printing the per-dimension defaults, not `deny all`.
+        // printing the per-dimension defaults, not `deny-all`.
         let policy = EffectiveSessionPolicy {
             egress: EffectiveEgress::Declared(sessions::EgressPolicy::default()),
             ingress: None,
@@ -3281,16 +3480,181 @@ mod tests {
         format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains("egress\n"), "{rendered}");
-        assert!(rendered.contains("  allow all\n"), "{rendered}");
+        assert!(rendered.contains("  allow-all\n"), "{rendered}");
         assert!(rendered.contains("ingress\n"), "{rendered}");
-        assert!(rendered.contains("  deny all\n"), "{rendered}");
+        assert!(rendered.contains("  deny-all\n"), "{rendered}");
+    }
+
+    /// A declared deny-all section renders by name (NET-075): every allow
+    /// list present and empty is the verdict `deny-all`, and the rows it
+    /// would print otherwise are four blanks — a rendering that reads as
+    /// nothing, the one this block must never produce. The name is the
+    /// requirement's literal token, and it is bare: the `(default)` mark is
+    /// the one distinction between a verdict the box declared and the same
+    /// verdict the rollout resolved an absent section to, so the declared
+    /// row carries none and the default's carries it — asserted here as
+    /// the difference between the two renders, in the text and in the JSON
+    /// document, whose `source` field carries the same distinction for a
+    /// machine. On a host-address box the row sits beside the per-box
+    /// enforcement value (T73): declared deny-all beside `per_box` is the
+    /// enforced posture, and beside `none` the box's posture beside the
+    /// state it runs in.
+    #[test]
+    fn policy_shows_declared_deny_all() {
+        let declared = EffectiveSessionPolicy {
+            egress: EffectiveEgress::Declared(sessions::EgressPolicy::deny_all()),
+            ingress: None,
+        };
+
+        // Own-address: the name, and no dimension rows — never blankness.
+        let mut out = Vec::new();
+        format_policy(&mut out, &declared, NetworkMode::OwnIp, None, None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("egress\n  deny-all\n"),
+            "a declared deny-all box must show the deny-all name: {rendered}"
+        );
+        for row in ["  subnets", "  dns hosts", "  protocols", "  deny subnets"] {
+            assert!(
+                !rendered.contains(row),
+                "the deny-all verdict must not render as dimension rows: {rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("(default)"),
+            "a declared deny-all is a declaration, never a default, so its \
+             row carries no mark: {rendered}"
+        );
+
+        // The same verdict the in-force default resolves an absent section
+        // to, and the two rows differ by the mark alone: the declared row is
+        // what the box chose, the marked row what the rollout chose for a
+        // box that declared nothing (NET-075's "marked as a default and not
+        // as a declaration" is the mark's own half of the pair).
+        let defaulted = EffectiveSessionPolicy {
+            egress: EffectiveEgress::DenyAll,
+            ingress: None,
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &defaulted, NetworkMode::OwnIp, None, None).unwrap();
+        let default_rendered = String::from_utf8(out).unwrap();
+        assert!(
+            default_rendered.contains("egress\n  deny-all (default)\n"),
+            "a box the rollout resolved to deny-all shows the name, marked \
+             as the default: {default_rendered}"
+        );
+        assert_ne!(
+            rendered, default_rendered,
+            "the declared and the default renders must differ — the mark is \
+             the difference between them"
+        );
+
+        // The JSON document carries the same distinction (NET-075): the
+        // verdict's name in `effective`, its origin in `source`, so a
+        // consumer never recomputes the default rule to tell a declared
+        // deny-all from the default's identical verdict. The declared
+        // section rides with its name, empty lists and all, the shape the
+        // strict record holds; the default's carries no `rules`, because
+        // the box declared nothing to carry.
+        let egress_of = |policy: &EffectiveSessionPolicy| {
+            let mut out = Vec::new();
+            write_policy_json(&mut out, policy, NetworkMode::OwnIp, None, Ok(Vec::new())).unwrap();
+            serde_json_lenient::from_slice::<serde_json_lenient::Value>(&out).unwrap()["egress"]
+                .clone()
+        };
+        let declared_json = egress_of(&declared);
+        assert_eq!(
+            declared_json["effective"], "deny-all",
+            "the document names the declared verdict by the same token: {declared_json}"
+        );
+        assert_eq!(
+            declared_json["source"], "declared",
+            "a declared verdict says where it came from: {declared_json}"
+        );
+        assert_eq!(
+            declared_json["rules"]["allow_subnets"],
+            serde_json_lenient::Value::Array(Vec::new()),
+            "the declared section rides with its name, present-and-empty \
+             lists and all: {declared_json}"
+        );
+        let default_json = egress_of(&defaulted);
+        assert_eq!(
+            default_json["effective"], "deny-all",
+            "the default's verdict is the same name: {default_json}"
+        );
+        assert_eq!(
+            default_json["source"], "default",
+            "the rollout's resolution says so, so no consumer recomputes it: {default_json}"
+        );
+        assert!(
+            default_json.get("rules").is_none(),
+            "a box that declared nothing carries no section to carry: {default_json}"
+        );
+        assert_ne!(
+            declared_json, default_json,
+            "a declared deny-all and the default's never read the same in \
+             the document"
+        );
+
+        // Host-address: the same name beside the per-box enforcement value.
+        let mut out = Vec::new();
+        format_policy(
+            &mut out,
+            &declared,
+            NetworkMode::HostNet,
+            Some(sessions::HostIpEnforcement::PerBox),
+            None,
+        )
+        .unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("egress\n  deny-all\n  per-box enforcement  per_box\n"),
+            "the deny-all row sits beside the per-box enforcement value: {rendered}"
+        );
+
+        // A section that allows something is not deny-all and keeps its
+        // rows: one allowed subnet makes the verdict "10.0.0.0/8 and
+        // nothing else", not deny-all, so it must not collapse to the name.
+        let not_deny_all = EffectiveSessionPolicy {
+            egress: EffectiveEgress::Declared(sessions::EgressPolicy {
+                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                allow_dns_hosts: Some(vec![]),
+                allow_protocols: Some(vec![]),
+                deny_subnets: None,
+            }),
+            ingress: None,
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &not_deny_all, NetworkMode::OwnIp, None, None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  subnets  10.0.0.0/8"),
+            "a section that allows a subnet keeps its rows: {rendered}"
+        );
+        assert!(
+            !rendered.contains("egress\n  deny-all\n"),
+            "an allow-listed section is not deny-all and must not read as it: {rendered}"
+        );
+        // And in the document it is the one shape that carries rows rather
+        // than a name: the verdict is the lists, spelled as the text
+        // rendering spells them.
+        let not_deny_all_json = egress_of(&not_deny_all);
+        assert_eq!(
+            not_deny_all_json["effective"], "rules",
+            "a declaration that admits something has no name; its rows are \
+             the verdict: {not_deny_all_json}"
+        );
+        assert_eq!(
+            not_deny_all_json["rules"]["allow_subnets"][0], "10.0.0.0/8",
+            "the named subnet rides the declared section: {not_deny_all_json}"
+        );
     }
 
     #[test]
     fn format_policy_prints_the_effective_default_for_a_bare_own_ip_box() {
         // NET-075: once the deny-all default is in force, a box that
         // declared no egress prints the posture the gate enforces, not the
-        // absent section.
+        // absent section — by name, marked as the default it is.
         let deny_all = EffectiveSessionPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
@@ -3299,15 +3663,16 @@ mod tests {
         format_policy(&mut out, &deny_all, NetworkMode::OwnIp, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
-            rendered.contains("egress\n  deny all\n"),
-            "a bare own-address box must show deny-all: {rendered}"
+            rendered.contains("egress\n  deny-all (default)\n"),
+            "a bare own-address box must show deny-all, marked as the \
+             default: {rendered}"
         );
         assert!(
-            !rendered.contains("allow all"),
+            !rendered.contains("allow-all"),
             "deny-all must not also print the allow-all default row: {rendered}"
         );
         // The opt-out keeps the shipped default, so that box still reads
-        // allow-all (NET-077).
+        // allow-all (NET-077), under the same mark.
         let allow_all = EffectiveSessionPolicy {
             egress: EffectiveEgress::AllowAll,
             ingress: None,
@@ -3316,7 +3681,7 @@ mod tests {
         format_policy(&mut out, &allow_all, NetworkMode::OwnIp, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
-            rendered.contains("egress\n  allow all\n"),
+            rendered.contains("egress\n  allow-all (default)\n"),
             "an opted-out bare box must show allow-all: {rendered}"
         );
     }
@@ -3333,7 +3698,7 @@ mod tests {
     #[test]
     fn policy_render_carries_the_enforcement_row_when_the_host_reported_it() {
         let unenforced = EffectiveSessionPolicy {
-            egress: EffectiveEgress::DenyAll,
+            egress: EffectiveEgress::Declared(sessions::EgressPolicy::deny_all()),
             ingress: None,
         };
         let mut out = Vec::new();
@@ -3347,7 +3712,7 @@ mod tests {
         .unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
-            rendered.contains("egress\n  deny all\n  per-box enforcement  none\n"),
+            rendered.contains("egress\n  deny-all\n  per-box enforcement  none\n"),
             "a deny-all declaration beside an enforcement of none is the \
              state the box runs in, got: {rendered}"
         );
@@ -3902,11 +4267,11 @@ mod tests {
         .expect("a registration that cannot be made is the activation's error")
         .expect("an own-address box on a VM-backed host registers");
         assert_eq!(
-            handed.switch_address,
+            handed.addresses.switch_address,
             std::net::Ipv4Addr::new(100, 64, 0, 2)
         );
         assert_eq!(
-            handed.loopback_address,
+            handed.addresses.loopback_address,
             std::net::Ipv4Addr::new(127, 0, 64, 0)
         );
         {
@@ -3922,6 +4287,11 @@ mod tests {
             assert_eq!(request.name, "web");
             assert_eq!(request.ingress_ports, vec![8080, 5432]);
             assert_eq!(request.egress.as_ref(), policy.egress.as_ref());
+            assert!(
+                !seen[0].contains("box_id"),
+                "the client never presents a box id; the host mints it: {}",
+                seen[0]
+            );
         }
 
         // Every other shape of activation registers nothing: a native
@@ -3979,6 +4349,140 @@ mod tests {
         assert!(
             refused.to_string().contains("address plan is exhausted"),
             "the refusal surfaces with its reason: {refused}"
+        );
+    }
+
+    /// NET-133/BEP-070: the CLI, the row and the attachment carry one id per
+    /// box. The registration presents no id, so the host mints one for this
+    /// creation and the reply returns it — and the id the CLI then records
+    /// is the id the published row's attachment carries, the one a delivered
+    /// connection is attributed by. The autospawn retry's shape — the row
+    /// withdrawn, then a re-registration — is a new creation: the reply
+    /// carries a new id, never the first one, and the CLI's record, the new
+    /// row and the new attachment all agree on it.
+    #[tokio::test]
+    async fn attachment_carries_the_registered_box_id() {
+        let policy = sessions::SessionPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: None,
+        };
+
+        // The real host tables and the real control server the daemon boots
+        // beside them — a registry feeding real attachments — so the id the
+        // CLI holds is compared against the attachment a real registration
+        // issued, not a stand-in's reply.
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let sock_path = provider_dir.join("control.sock");
+        let subnet = switch::SwitchSubnet::default();
+        let attachments = minvmd::bep_attach::Attachments::new();
+        let registry = minvmd::box_registry::BoxRegistry::new(subnet)
+            .feeding_proxy_attachments(attachments.clone());
+        let _server = minvmd::control::spawn(
+            sock_path.clone(),
+            registry.clone(),
+            minvmd::net::answerer::AnswererStatus::starting(),
+            minvmd::control::ProxyPublishStatus::default(),
+        )
+        .expect("the control server binds its socket");
+        let global = GlobalArgs {
+            provider: Some(Provider::LocalMinvmd),
+            minimal_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        // The first registration: the request carries no id, the host
+        // mints one for this creation, and the reply returns it.
+        let first = register_box_for_activation(
+            paths::ProviderKind::Minvmd,
+            global.minimal_dir.as_deref(),
+            NetworkMode::OwnIp,
+            "web",
+            &policy,
+        )
+        .await
+        .expect("the real control server answers the registration")
+        .expect("an own-address box on a VM-backed host registers");
+        let id = first
+            .box_id
+            .expect("the daemon's reply returned the box's own id");
+        assert_ne!(
+            id.to_bytes(),
+            [0u8; 16],
+            "the id is the box's own minted UUIDv7, never the all-zero non-id"
+        );
+
+        // The attachment the registration issued carries that id, and so
+        // does the row the reply speaks for: the CLI, the row and the
+        // attachment hold the one id per box.
+        let attachment = attachments
+            .by_source(first.addresses.switch_address.octets())
+            .expect("the registration issued the box's attachment");
+        assert_eq!(
+            id,
+            minimald_rpc::BoxId::from_bytes(attachment.box_id()),
+            "the id the CLI holds is the id the attachment carries"
+        );
+        let row = registry
+            .table()
+            .by_source(first.addresses.switch_address.octets())
+            .expect("the registration published the row the reply speaks for");
+        assert_eq!(
+            id,
+            minimald_rpc::BoxId::from_bytes(row.box_id()),
+            "the id the CLI holds is the id the row holds"
+        );
+
+        // The autospawn retry's shape: the row is withdrawn — its creator
+        // presents the pair it was handed — and the re-registration under
+        // the re-minted name is a new creation the host mints a new id for.
+        withdraw_box_row(Some(sock_path.clone()), Some("web"), Some(first.addresses)).await;
+        let again = register_box_for_activation(
+            paths::ProviderKind::Minvmd,
+            global.minimal_dir.as_deref(),
+            NetworkMode::OwnIp,
+            "web-again",
+            &policy,
+        )
+        .await
+        .expect("the real control server answers the re-registration")
+        .expect("the re-registration registers under the re-minted name");
+        let new_id = again
+            .box_id
+            .expect("the daemon's reply returned the new box's own id");
+        assert_ne!(
+            new_id, id,
+            "the re-registration is a new box with a new id: ids are never reused"
+        );
+        assert_ne!(
+            again.addresses.switch_address, first.addresses.switch_address,
+            "the recreation spent the run's next address, never a spent one again"
+        );
+
+        // The CLI's record, the new row and the new attachment agree on the
+        // new id; the first id is held nowhere.
+        let reattached = attachments
+            .by_source(again.addresses.switch_address.octets())
+            .expect("the re-registration issued the box's attachment");
+        assert_eq!(
+            new_id,
+            minimald_rpc::BoxId::from_bytes(reattached.box_id()),
+            "the id the CLI records is the id the new attachment carries"
+        );
+        let new_row = registry
+            .table()
+            .by_source(again.addresses.switch_address.octets())
+            .expect("the re-registration published the row the reply speaks for");
+        assert_eq!(
+            new_id,
+            minimald_rpc::BoxId::from_bytes(new_row.box_id()),
+            "the id the CLI records is the id the new row holds"
+        );
+        assert!(
+            !attachments.holds_id(id.to_bytes()),
+            "the withdrawn box's id is held by no attachment"
         );
     }
 
@@ -4270,7 +4774,7 @@ mod tests {
         .expect("a minvmd-backed own-address box registers")
         .expect("the registration hands addresses back");
         assert_eq!(
-            handed.switch_address,
+            handed.addresses.switch_address,
             std::net::Ipv4Addr::new(100, 64, 0, 2)
         );
         assert!(

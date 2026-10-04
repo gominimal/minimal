@@ -98,14 +98,6 @@ impl RuntimeIngress {
             .collect()
     }
 
-    /// Whether `internal_port` is published already, live.
-    pub(crate) fn publishes(&self, internal_port: u16) -> bool {
-        self.state()
-            .forwards
-            .iter()
-            .any(|live| live.mapping.internal_port == internal_port)
-    }
-
     /// Whether the spawn the box's forwards deliver to has ended with no new
     /// one attached.
     pub(crate) fn is_detached(&self) -> bool {

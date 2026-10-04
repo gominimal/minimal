@@ -476,6 +476,105 @@ fn default_hooks_enabled() -> bool {
     true
 }
 
+/// A box's identity on its host: 16 bytes — one UUIDv7, 32 lowercase hex
+/// digits on the wire — minted once per box by the host-side creator
+/// outside the VM, with its random fields from the host's OS CSPRNG
+/// (BEP-070): never a counter, never a digest of the box's facts, never
+/// anything a process inside the VM could predict or arrange. The
+/// registration that publishes the box's row mints it — a client never
+/// presents one — the row and the proxy's attachment hold it, and the
+/// reply hands it back so the client records the id its box was created
+/// as.
+///
+/// Unique per creation by construction: a box recreated with the same
+/// name and the same addresses is a new box, and its id says so. Ids are
+/// never reused — no registration can present one, and the host refuses a
+/// mint that collides with a record it holds — so a revocation scoped to
+/// an id stays scoped forever. The all-zero id is not
+/// a mint's output and never names a box: the delivery header carried it
+/// for "no box named" before ids were the box's own, and the acceptor
+/// that reads a delivered header refuses it like any other id the
+/// source's attachment does not hold.
+///
+/// On the wire it is one hex string, the same 32 lowercase digits a
+/// diagnostic names a box id by — so a log line, a transcript and a
+/// socket capture all read the same spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BoxId([u8; 16]);
+
+impl BoxId {
+    /// Wraps `bytes` as a box id — the shape [`RegisteredBox::box_id`]
+    /// carries and a delivery header fills from the box's attachment.
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// The id's own 16 bytes.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl std::fmt::Display for BoxId {
+    /// 32 lowercase hex digits — the one fixed form every diagnostic that
+    /// names a box id uses, so a tail can compare two lines for the same
+    /// box.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for BoxId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for BoxId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text: &str = Deserialize::deserialize(deserializer)?;
+        let bytes = hex::decode(text).map_err(serde::de::Error::custom)?;
+        let bytes: [u8; 16] = match bytes.try_into() {
+            Ok(bytes) => bytes,
+            Err(bytes) => {
+                return Err(serde::de::Error::custom(format!(
+                    "a box id is 32 hex digits (16 bytes); got {} bytes",
+                    bytes.len()
+                )));
+            }
+        };
+        Ok(Self(bytes))
+    }
+}
+
+/// What a successful registration hands back: the allocated addresses —
+/// the pair [`BoxAddresses`] has always carried — and the box id the
+/// published row now holds ([`BoxId`]): the one the host minted for this
+/// creation. A registration carries no id; this reply is where the client
+/// learns its box's.
+///
+/// The id travels beside the addresses because both belong to the same
+/// fact — this is the box the host just published — so the client records
+/// the id it is handed, and the client's record, the sealed member's
+/// claims and the proxy's attachment name the box by the same id. A
+/// re-registration is a new creation and is handed a new id.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisteredBox {
+    /// The box's address on the switch ([`BoxAddresses::switch_address`]).
+    pub switch_address: std::net::Ipv4Addr,
+    /// The box's published loopback address
+    /// ([`BoxAddresses::loopback_address`]).
+    pub loopback_address: std::net::Ipv4Addr,
+    /// The box id the published row holds: the box's own UUIDv7, handed
+    /// back to the registering client.
+    pub box_id: BoxId,
+}
+
 /// The wire types of the VM host daemon's box control socket (T66): the
 /// one door a client has to the host-side box table (NET-138).
 ///
@@ -492,6 +591,11 @@ fn default_hooks_enabled() -> bool {
 /// These types live here rather than in `minvmd` because both ends depend
 /// on this crate — the activating client and the host daemon — and the
 /// protocol must not drift between them.
+///
+/// A box's identity is its [`BoxId`]: minted once per box by the host-side
+/// creator outside the VM — never carried on the registration the client
+/// sends — and handed back on the reply, so the client, the published row
+/// and the proxy's attachment all name the box by one id.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegisterBoxRequest {
     /// The box's name — the session name the following create request
@@ -599,7 +703,7 @@ pub enum BoxControlRequest {
 /// forgeable from inside the escape boundary, and the answerer's port is
 /// held on the host's loopback, where only the host's own client can read
 /// it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ZoneAnswererStatus {
     /// The answerer's acquisition has not finished its first pass: the
@@ -624,6 +728,56 @@ pub enum ZoneAnswererStatus {
         /// The machine's answerer port, held by a process with no channel.
         port: u16,
     },
+    /// The hostname proxy this VM host daemon reserved for its VM is not
+    /// serving, and this is the host-side cause (T93): the port the
+    /// supervisor drew or was pinned and what kept it from publishing. It
+    /// rides the answerer's read because that read is already the one
+    /// host-side fact the CLI asks this daemon for — the proxy's publish
+    /// outcome is a host fact the same way the answerer's state is, never
+    /// something the guest could vouch for, and it is the CLI's only way to
+    /// say *why* the proxy is down rather than that it merely is.
+    ProxyNotServing {
+        /// The port the supervisor reserved and the guest could not publish.
+        port: u16,
+        /// What kept the proxy from serving on that port.
+        cause: ProxyDownCause,
+    },
+}
+
+/// Why a VM host daemon says its VM's hostname proxy is not serving (T93):
+/// the terminal publish outcomes the supervisor itself reached — the port
+/// it reserved is held by another process on the host, or the draws to find
+/// a free one ran out — or that its publish is unconfirmed, the one
+/// non-terminal state: the VM is up, the publish is not one the host saw. A
+/// host that merely has no switch to publish through says nothing here: that
+/// boot's proxy never attempted a publish, and its story stays the daemon
+/// log's, not a cause this status could name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyDownCause {
+    /// Another process on the host holds the published port — for a port
+    /// the operator pinned this fails the start outright; for a drawn one
+    /// it is what every redraw skipped.
+    PortHeld,
+    /// The drawn port's publish tries ran out: every port the reservation
+    /// drew was already taken when the guest tried to publish it.
+    RedrawsRanOut,
+    /// The VM came up but the guest never reported the publish, and the
+    /// supervisor could not attribute the port to this VM's own forwarder:
+    /// nothing answers on it, or its holder is one the host does not let
+    /// this user see. Not a failure — the VM stays up — but not a publish
+    /// the host can vouch for either, so the surfaces say "unconfirmed"
+    /// rather than "serving" until the guest's late report clears it.
+    PublishUnconfirmed,
+    /// The VM came up with its publish unconfirmed, and the guest's late
+    /// report then said the port is held: the VM stays up with no hostname
+    /// proxy — not a start failure, so it never reads like one. Names the
+    /// holder as the host saw it when the report landed (`pid <pid>
+    /// (<exe>)`), or `None` when the host would not name it.
+    PortHeldAfterStart {
+        /// Who holds the port, when the host let the supervisor see it.
+        holder: Option<String>,
+    },
 }
 
 /// The addresses a successful registration hands back
@@ -634,15 +788,31 @@ pub enum ZoneAnswererStatus {
 ///
 /// The one reply line the control socket answers any verb with: the handed
 /// addresses, or the reason the verb did not happen. A registration hands
-/// the allocated pair back; a withdrawal echoes the pair it withdrew by, so
+/// the allocated pair and the box id the row holds back
+/// ([`RegisteredBox`]); a withdrawal echoes the pair it withdrew by, so
 /// the client can check the daemon meant the row it asked about; the status
 /// verb answers the answerer's state. Untagged so the reply stays one flat
 /// JSON object either way.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum BoxControlReply {
-    /// The verb succeeded: a registration's allocated addresses, or a
-    /// withdrawal's echo of the pair the row went by.
+    /// The registration succeeded: the allocated addresses and the box id
+    /// the published row holds ([`RegisteredBox`]) — the reply the register
+    /// verb answers with. The withdrawal never answers this: it has no id
+    /// to hand back, and the addresses echo it has always answered with
+    /// stays its answer ([`Addresses`](Self::Addresses)).
+    ///
+    /// First in the order on purpose. The reply is untagged and serde
+    /// ignores a document's unknown fields, so a variant whose fields are
+    /// a strict superset of another's must be tried before it: an
+    /// id-carrying reply parsed as `Addresses` would silently drop the
+    /// id, and the client would record no id for a box the host named. A
+    /// reply that carries no `box_id` — from a daemon that predates ids —
+    /// fails this variant and parses as `Addresses`: the registration
+    /// succeeded, and the client simply records no id for the box.
+    Registered(RegisteredBox),
+    /// The verb succeeded: a withdrawal's echo of the pair the row went by,
+    /// and a registration's answer on a daemon that predates box ids.
     Addresses(BoxAddresses),
     /// The verb failed: `error` is a sentence naming why, for the client to
     /// warn with.

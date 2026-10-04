@@ -18,7 +18,11 @@
 //! [`minimald_rpc::ZoneAnswererStatus`]) — the host fact the CLI surfaces at
 //! session start and on `min ls`, read here rather than through the in-VM
 //! daemon because a guest relaying a host fact is forgeable from inside the
-//! escape boundary. The read touches no row and mutates nothing.
+//! escape boundary. The same read answers the hostname proxy's publish
+//! outcome (T93): when the supervisor reached a cause that names why the
+//! proxy is not serving, the reply carries it (see
+//! [`ProxyPublishStatus`]), so the CLI's surfaces say *why*, not just that.
+//! The read touches no row and mutates nothing.
 //!
 //! The socket lives beside the daemon's ssh socket in the provider-instance
 //! dir and is created with the same 0700-dir / 0600-socket posture the
@@ -28,8 +32,8 @@
 //! long-lived host services whose failures must not take the daemon down
 //! with them: a failed registration answers the client with the reason and
 //! keeps serving, and a client that never reaches the socket (a supervisor
-//! predating this module) still activates, handed no addresses, under the
-//! egress gate's announced interim.
+//! predating this module) still activates, handed no addresses — with the
+//! egress gate dropping its frames under the unregistered rule (NET-085).
 //!
 //! The v1 posture, stated: the trust is the uid. The bind tightens the
 //! provider dir to 0700 when the daemon owns it, refuses one it does not
@@ -44,22 +48,23 @@
 //! are served serially, one connection at a time, each read bounded by a
 //! 30-second timeout. That is what v1 ships, not a design endpoint.
 //!
-//! The interim is also where a box whose row is gone runs — never
-//! registered, or withdrawn at destroy — and putting the per-box default
-//! that eventually refuses it in force is the flip that lands with the last
-//! row source (T66's follow-up), not a change this socket makes.
+//! A box whose row is gone — never registered, or withdrawn at destroy —
+//! is dropped by the gate's unregistered rule unconditionally (NET-085);
+//! the flip that lands with the last row source (T66's follow-up) decides
+//! only what the publish half admits, not a change this socket makes.
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use minimald_rpc::{
-    BoxAddresses, BoxControlReply, BoxControlRequest, RegisterBoxRequest, WithdrawBoxRequest,
+    BoxAddresses, BoxControlReply, BoxControlRequest, ProxyDownCause, RegisterBoxRequest,
+    RegisteredBox, WithdrawBoxRequest, ZoneAnswererStatus,
 };
 
 use crate::box_registry::{BoxRegistry, ClientBoxSpec};
@@ -80,6 +85,260 @@ const REGISTER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// The largest request line the server will read. A registration carries a
 /// name, a port list, and a policy; anything past this bound is not one.
 const MAX_REQUEST_LINE: usize = 64 * 1024;
+
+/// How many times one VM start may ask the guest to publish the hostname
+/// proxy (T93): the first boot plus every redraw an address-in-use publish
+/// forced. A constant, not a configuration: the bound exists to end a start
+/// whose every drawn port is taken — a host where a start cannot find one
+/// free port in three draws is a host whose problem the operator must see,
+/// not one a longer sequence of retries would paper over.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) const PUBLISH_TRIES: usize = 3;
+
+/// How [`decide_publish`] names whoever kept a port from publishing (T93):
+/// the one fact the host side can vouch for. The kernel says a bind is
+/// refused, not who refused it — the guest's own log tail is where the
+/// taker's own identity, if anywhere, is said.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) const HELD_BY_ANOTHER_PROCESS: &str = "another process on the host";
+
+/// What the supervisor learned about the publish of the hostname-proxy port
+/// it reserved (T93): the guest's report over the boot-marker channel — the
+/// one control path from inside a microVM to the VM host daemon — or, when
+/// no report arrived inside the watch, the supervisor's own probe of the
+/// port. The guest's voice is the one that can say the port was *taken*
+/// (a bind that refused the publish is a fact the publish saw and a connect
+/// probe cannot attribute), which is why nothing here decides anything
+/// until the report or the probe says it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) enum GuestPublish {
+    /// The guest published the hostname proxy: it is serving on the port.
+    Serving {
+        /// The published port, as the guest handed it back.
+        port: u16,
+    },
+    /// The guest's publish was refused for address-in-use: the port is
+    /// taken, and the guest has stopped retrying (the terminal report,
+    /// never a backoff).
+    PortHeld {
+        /// The port the publish could not take.
+        port: u16,
+    },
+    /// No report arrived inside the watch: the supervisor's own probe of
+    /// the port, and of who holds it, is the whole outcome.
+    NoReport {
+        /// The port the watch was about — the one this start reserved.
+        port: u16,
+        /// Who the supervisor found on the port ([`NoReportHolder`]).
+        holder: NoReportHolder,
+    },
+}
+
+/// Who the supervisor found on the reserved port when the publish watch
+/// expired without the guest's report (T93) — the identification that lets
+/// a missing report be decided instead of guessed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) enum NoReportHolder {
+    /// The port answers and its holder is a process this supervisor spawned
+    /// for this VM — the forwarder that carries the guest's publish (the
+    /// host switch) or the VMM child — matched by pid: the publish landed
+    /// and only the report was late.
+    OwnForwarder,
+    /// The port answers and its holder is a process this supervisor did not
+    /// spawn: the port is taken exactly as a refused publish says it is.
+    Foreign,
+    /// The port answers but the host would not name its holder (a listener
+    /// of another user, a host this cannot read), and the guest's report did
+    /// not come inside the grace either. Ambiguity alone never redraws.
+    Unknown,
+    /// Nothing answers on the port: no publish the host can see.
+    NotAnswering,
+}
+
+/// [`NoReportHolder`] from the probe's facts: whether the port answered,
+/// the pid of the listener the host named (if it named one), and the pids
+/// this supervisor spawned for this VM.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) fn classify_no_report_holder(
+    answers: bool,
+    holder_pid: Option<u32>,
+    own_pids: &[u32],
+) -> NoReportHolder {
+    match (answers, holder_pid) {
+        (false, _) => NoReportHolder::NotAnswering,
+        (true, Some(pid)) if own_pids.contains(&pid) => NoReportHolder::OwnForwarder,
+        (true, Some(_)) => NoReportHolder::Foreign,
+        (true, None) => NoReportHolder::Unknown,
+    }
+}
+
+/// What the supervisor does with what it learned about the publish (T93):
+/// [`decide_publish`]'s verdict, composed of facts the reservation and the
+/// port's origin already hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) enum PublishDecision {
+    /// The VM may come up: the proxy published — the guest said so, or the
+    /// port's holder is this VM's own forwarder.
+    Up,
+    /// The VM may come up, but its publish is unconfirmed: no report came
+    /// and the port is either silent or held by a process the host would
+    /// not name. The status read says so ([`ProxyDownCause::PublishUnconfirmed`])
+    /// until the guest's late report clears it.
+    UpUnconfirmed {
+        /// The port whose publish is unconfirmed.
+        port: u16,
+    },
+    /// A drawn port with tries left: release the old reservation, draw
+    /// again under the same reservation discipline, and ask the guest to
+    /// publish again.
+    Redraw {
+        /// The port to draw past — the one the publish could not take.
+        port: u16,
+    },
+    /// The start fails, naming the port and the holder: a drawn port whose
+    /// draws ran out, or the operator's pin, which never redraws. The cause
+    /// is the wire fact the CLI's `min ls` and session-start surfaces name.
+    FailStart {
+        /// The port the publish could not take.
+        port: u16,
+        /// How the holder is named — [`HELD_BY_ANOTHER_PROCESS`].
+        holder: &'static str,
+        /// Why the proxy is not serving, for the control-socket read.
+        cause: ProxyDownCause,
+    },
+}
+
+/// What one learned publish outcome means for the start (T93), given
+/// whether the port was drawn or the operator's pin and how many publish
+/// tries the start has spent.
+///
+/// The arms, said plainly:
+///
+/// - The guest reported serving: [`PublishDecision::Up`], whatever the
+///   origin or the count — a boot that landed is a boot that landed.
+/// - The guest reported the port taken, or no report came and the port's
+///   holder is another process ([`NoReportHolder::Foreign`]): a drawn port
+///   redraws while tries remain ([`PUBLISH_TRIES`]) and then fails
+///   [`ProxyDownCause::RedrawsRanOut`]; a pin fails at once,
+///   [`ProxyDownCause::PortHeld`], naming the port and the holder. A VM
+///   never stays up with no hostname proxy: a proxyless VM answers nothing
+///   this task's surfaces promise, and the pin's whole point is the
+///   operator named the port.
+/// - No report came and the port's holder is this VM's own forwarder
+///   ([`NoReportHolder::OwnForwarder`]): the publish landed and the report
+///   was late — [`PublishDecision::Up`].
+/// - No report came and the port's holder could not be named
+///   ([`NoReportHolder::Unknown`], after the watch's grace for the report),
+///   or nothing answers on the port ([`NoReportHolder::NotAnswering`]):
+///   [`PublishDecision::UpUnconfirmed`] — the VM comes up, but its publish
+///   is shown as unconfirmed, never as serving. Ambiguity alone never
+///   redraws.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+pub(crate) fn decide_publish(
+    drawn: bool,
+    tries_used: usize,
+    outcome: GuestPublish,
+) -> PublishDecision {
+    let port = match outcome {
+        GuestPublish::Serving { .. }
+        | GuestPublish::NoReport {
+            holder: NoReportHolder::OwnForwarder,
+            ..
+        } => return PublishDecision::Up,
+        GuestPublish::NoReport {
+            port,
+            holder: NoReportHolder::Unknown | NoReportHolder::NotAnswering,
+        } => return PublishDecision::UpUnconfirmed { port },
+        GuestPublish::PortHeld { port }
+        | GuestPublish::NoReport {
+            port,
+            holder: NoReportHolder::Foreign,
+        } => port,
+    };
+    if !drawn {
+        // The operator's pin never redraws: the first refusal is the
+        // start's, naming the port and the holder.
+        PublishDecision::FailStart {
+            port,
+            holder: HELD_BY_ANOTHER_PROCESS,
+            cause: ProxyDownCause::PortHeld,
+        }
+    } else if tries_used < PUBLISH_TRIES {
+        PublishDecision::Redraw { port }
+    } else {
+        PublishDecision::FailStart {
+            port,
+            holder: HELD_BY_ANOTHER_PROCESS,
+            cause: ProxyDownCause::RedrawsRanOut,
+        }
+    }
+}
+
+/// The hostname proxy's publish state for this VM (T93) — the host fact the
+/// CLI's `min ls` row and session-start message read to *name why* the proxy
+/// is not serving, in the same read that already carries the answerer's
+/// state. Held by the supervisor, written when a start fails on the publish
+/// — a supervisor about to stop, whose fact outlives it exactly as long as
+/// the socket does — or when the VM came up with its publish unconfirmed,
+/// the one entry a later report clears ([`Self::confirm`]).
+///
+/// Shaped like [`AnswererStatus`] — a cloneable cell behind one mutex,
+/// read on the serving thread — because that is the pattern the status
+/// read already serves under.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+#[derive(Clone, Default)]
+pub struct ProxyPublishStatus(Arc<Mutex<Option<(u16, ProxyDownCause)>>>);
+
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+impl ProxyPublishStatus {
+    /// The empty cell a start begins with: no cause to name.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record why the proxy is not serving — the decision that failed the
+    /// start, carrying the port and the cause.
+    pub(crate) fn set_down(&self, port: u16, cause: ProxyDownCause) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((port, cause));
+    }
+
+    /// Record that the proxy's publish on `port` is unconfirmed: the VM came
+    /// up with no report from the guest and no holder the host could vouch
+    /// for ([`PublishDecision::UpUnconfirmed`]).
+    pub(crate) fn set_unconfirmed(&self, port: u16) {
+        self.set_down(port, ProxyDownCause::PublishUnconfirmed);
+    }
+
+    /// Clear an unconfirmed publish on `port` — the guest's late report said
+    /// it is serving. Any other recorded cause stays: only the state the
+    /// report answers is the report's to clear.
+    pub(crate) fn confirm(&self, port: u16) {
+        let mut cell = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *cell == Some((port, ProxyDownCause::PublishUnconfirmed)) {
+            *cell = None;
+        }
+    }
+
+    /// The status to serve the read-only verb with: the proxy-down cause
+    /// when the supervisor wrote one, or `None` to let the answerer's state
+    /// answer as it always did.
+    pub(crate) fn down(&self) -> Option<ZoneAnswererStatus> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .map(|(port, cause)| ZoneAnswererStatus::ProxyNotServing { port, cause })
+    }
+}
 
 /// Resolve the control socket's path: `<provider dir>/control.sock`, the
 /// dir the CLI resolves the ssh socket under, so the client finds both by
@@ -102,6 +361,7 @@ pub fn spawn(
     sock_path: PathBuf,
     boxes: BoxRegistry,
     answerer: AnswererStatus,
+    proxy_publish: ProxyPublishStatus,
 ) -> std::io::Result<JoinHandle<()>> {
     crate::sock::check_uds_path_len(&sock_path)?;
     crate::sock::prepare_socket_dir(&sock_path)?;
@@ -114,18 +374,23 @@ pub fn spawn(
     crate::sock::enforce_socket_permissions(&sock_path)?;
     std::thread::Builder::new()
         .name("minvmd-control".to_string())
-        .spawn(move || accept_loop(listener, boxes, answerer))
+        .spawn(move || accept_loop(listener, boxes, answerer, proxy_publish))
 }
 
 /// Accept and serve box control requests until the daemon exits. One
 /// connection at a time: a request is a row's map write or removal, served
 /// serially so the table sees its requests in arrival order — and the
 /// status read rides the same serial turn.
-fn accept_loop(listener: UnixListener, boxes: BoxRegistry, answerer: AnswererStatus) {
+fn accept_loop(
+    listener: UnixListener,
+    boxes: BoxRegistry,
+    answerer: AnswererStatus,
+    proxy_publish: ProxyPublishStatus,
+) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = serve_connection(stream, &boxes, &answerer) {
+                if let Err(error) = serve_connection(stream, &boxes, &answerer, &proxy_publish) {
                     tracing::debug!(error = %error, "box control connection failed");
                 }
             }
@@ -139,6 +404,7 @@ fn serve_connection(
     stream: UnixStream,
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
+    proxy_publish: &ProxyPublishStatus,
 ) -> std::io::Result<()> {
     let mut stream = stream;
     stream.set_read_timeout(Some(REGISTER_READ_TIMEOUT))?;
@@ -167,7 +433,7 @@ fn serve_connection(
             return write_reply(&mut stream, &BoxControlReply::Error { error });
         }
     };
-    serve_request(&mut stream, boxes, answerer, request)
+    serve_request(&mut stream, boxes, answerer, proxy_publish, request)
 }
 
 /// Dispatch one parsed request to its verb and write its one reply line.
@@ -185,13 +451,22 @@ fn serve_request(
     stream: &mut UnixStream,
     boxes: &BoxRegistry,
     answerer: &AnswererStatus,
+    proxy_publish: &ProxyPublishStatus,
     request: BoxControlRequest,
 ) -> std::io::Result<()> {
     match request {
         BoxControlRequest::Register(request) => register_and_reply(stream, boxes, request),
         BoxControlRequest::Withdraw(request) => withdraw_and_reply(stream, boxes, request),
         BoxControlRequest::AnswererStatus => {
-            let reply = BoxControlReply::Status(answerer.get());
+            // The one read-only verb answers the host facts the CLI's
+            // surfaces read (T93): why the hostname proxy is not serving
+            // when the supervisor reached a cause that names it, and
+            // otherwise the answerer's state as it always did — the
+            // proxy-down cause is the exception, not a new shape.
+            let reply = match proxy_publish.down() {
+                Some(status) => BoxControlReply::Status(status),
+                None => BoxControlReply::Status(answerer.get()),
+            };
             write_reply(stream, &reply)
         }
     }
@@ -327,10 +602,11 @@ fn parse_request(line: &str) -> Result<BoxControlRequest, serde_json_lenient::Er
     serde_json_lenient::from_str(line)
 }
 
-/// Allocate the box into the table and write the reply — the addresses on
-/// success, the reason on a refusal. One info line per registration names
-/// the box, both addresses and the declared egress the row carries: the
-/// diagnostic a bundle's VM host daemon log is read for.
+/// Allocate the box into the table and write the reply — the addresses and
+/// the box id on success, the reason on a refusal. One info line per
+/// registration names the box, its id, both addresses and the declared
+/// egress the row carries: the diagnostic a bundle's VM host daemon log is
+/// read for.
 fn register_and_reply(
     stream: &mut UnixStream,
     boxes: &BoxRegistry,
@@ -339,6 +615,9 @@ fn register_and_reply(
     // The declaration as the row received it; `null` for a box with no
     // egress section. A plain struct of strings serialises infallibly.
     let declared_egress = serde_json_lenient::to_string(&request.egress).unwrap_or_default();
+    // The request carries no id: the registry mints the box's own UUIDv7
+    // for this creation (BEP-070), and the reply hands back the id the
+    // published row holds — the one the client records.
     let spec = ClientBoxSpec {
         name: request.name.clone(),
         ingress_ports: request.ingress_ports,
@@ -349,14 +628,16 @@ fn register_and_reply(
         Ok(record) => {
             tracing::info!(
                 box = %record.name(),
+                box_id = %crate::bep_attach::BoxIdText(&record.box_id()),
                 switch_address = %record.switch_addr(),
                 loopback_address = %record.loopback_addr(),
                 egress = %declared_egress,
                 "registered box with the VM host daemon; addresses allocated"
             );
-            BoxControlReply::Addresses(BoxAddresses {
+            BoxControlReply::Registered(RegisteredBox {
                 switch_address: record.switch_addr(),
                 loopback_address: record.loopback_addr(),
+                box_id: minimald_rpc::BoxId::from_bytes(record.box_id()),
             })
         }
         Err(error) => {
@@ -482,16 +763,30 @@ mod tests {
     /// returns (path, handle keeping the server thread identified, the
     /// registry the server serves — the same rows a gate the test brings up
     /// later shares — and the answerer status the read-only verb answers
-    /// from, the same cell the daemon's acquisition loop writes). The thread
+    /// from, the same cell the daemon's acquisition loop writes). The
+    /// proxy-publish cell is the same cell a supervisor writes a
+    /// proxy-down cause into (T93), empty at the bind. The thread
     /// outlives the test the way a daemon's does; the temp dir's drop after
     /// the test closes the test's view of the socket.
     fn spawn_server(
         dir: &std::path::Path,
-    ) -> std::io::Result<(PathBuf, JoinHandle<()>, BoxRegistry, AnswererStatus)> {
+    ) -> std::io::Result<(
+        PathBuf,
+        JoinHandle<()>,
+        BoxRegistry,
+        AnswererStatus,
+        ProxyPublishStatus,
+    )> {
         let sock_path = dir.join(CONTROL_SOCK_FILE);
         let boxes = BoxRegistry::new(SUBNET);
         let answerer = AnswererStatus::starting();
-        let handle = spawn(sock_path.clone(), boxes.clone(), answerer.clone())?;
+        let proxy_publish = ProxyPublishStatus::new();
+        let handle = spawn(
+            sock_path.clone(),
+            boxes.clone(),
+            answerer.clone(),
+            proxy_publish.clone(),
+        )?;
         // Wait until the socket accepts rather than racing the bind.
         for _ in 0..500 {
             if TestStream::connect(&sock_path).is_ok() {
@@ -499,7 +794,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        Ok((sock_path, handle, boxes, answerer))
+        Ok((sock_path, handle, boxes, answerer, proxy_publish))
     }
 
     /// A client that writes the request and reads the reply line back,
@@ -530,16 +825,24 @@ mod tests {
         control(sock_path, &BoxControlRequest::Register(request.clone()))
     }
 
-    /// The registered box's two addresses, asserted as the reply the daemon
-    /// hands back.
-    fn handed(reply: BoxControlReply) -> BoxAddresses {
+    /// The registered box the daemon hands back — both addresses and the
+    /// box's own id — panicked into the test when the reply is a refusal or
+    /// a status instead.
+    fn handed(reply: BoxControlReply) -> RegisteredBox {
         match reply {
-            BoxControlReply::Addresses(addresses) => addresses,
+            BoxControlReply::Registered(web) => web,
+            BoxControlReply::Addresses(addresses) => {
+                panic!(
+                    "a registration is answered with the registered box, got bare addresses {addresses:?}"
+                )
+            }
             BoxControlReply::Error { error } => {
-                panic!("a valid request is answered with addresses, refused with {error}")
+                panic!("a valid request is answered with the registered box, refused with {error}")
             }
             BoxControlReply::Status(status) => {
-                panic!("a registration is answered with addresses, got the status {status:?}")
+                panic!(
+                    "a registration is answered with the registered box, got the status {status:?}"
+                )
             }
         }
     }
@@ -555,7 +858,7 @@ mod tests {
     fn box_addresses_allocated_on_host_and_handed_to_daemon() {
         let capture = server_capture();
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let (sock_path, _server, _boxes, _answerer) =
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
             spawn_server(dir.path()).expect("server binds");
 
         // The first registration is handed the hand-out run's first switch
@@ -593,9 +896,25 @@ mod tests {
                 .first(),
             "the first box takes the first address of the slice the host switch publishes at"
         );
+        assert_eq!(
+            web.box_id,
+            minimald_rpc::BoxId::from_bytes(
+                registry
+                    .table()
+                    .by_source(web.switch_address.octets())
+                    .expect("the registration published the row the reply speaks for")
+                    .box_id()
+            ),
+            "the reply carries the id the published row holds — the box's own id"
+        );
+        assert_ne!(
+            web.box_id,
+            minimald_rpc::BoxId::from_bytes([0u8; 16]),
+            "the id is a minted UUIDv7, never the all-zero non-id"
+        );
 
-        // The registration's one info line names the box, both addresses
-        // it handed back, and the declared egress the row carries.
+        // The registration's one info line names the box, its id, both
+        // addresses it handed back, and the declared egress the row carries.
         let log = capture.contents();
         assert!(
             log.contains("registered box with the VM host daemon; addresses allocated"),
@@ -608,13 +927,18 @@ mod tests {
             "the info line names the box and the addresses it handed back: {log}"
         );
         assert!(
+            log.contains(&format!("box_id={}", web.box_id)),
+            "the info line carries the box's own id in the one spelling a tail reads: {log}"
+        );
+        assert!(
             log.contains(r#""allow_subnets":["10.0.0.0/8"]"#)
                 && log.contains(r#""allow_protocols":["tcp"]"#),
             "the info line carries the declared egress allow-list: {log}"
         );
 
         // The second registration takes the next address on both runs —
-        // sequential allocation, no reuse.
+        // sequential allocation, no reuse — and mints the next box its own
+        // id: one id per creation, never shared.
         let db = handed(
             register(
                 &sock_path,
@@ -626,6 +950,10 @@ mod tests {
                 },
             )
             .expect("second registration is answered"),
+        );
+        assert_ne!(
+            db.box_id, web.box_id,
+            "the second box is created as its own identity, not the first's"
         );
         assert_eq!(
             db.switch_address,
@@ -762,18 +1090,16 @@ mod tests {
     /// (T66): it registers the box, presents the pair the registration
     /// handed back to prove it is the row's creator, and the daemon removes
     /// the row from its table — at both addresses. What the gate then
-    /// decides at the withdrawn switch address is the phase's to say, and
-    /// both arms are pinned at relay level through the phase parameter (not
-    /// the shipped constant), so the flip that ends the interim breaks
-    /// nothing here: the announced interim admits the withdrawn address's
-    /// frame under its warn, the in-force per-box default drops it.
+    /// decides at the withdrawn switch address is unconditional: the
+    /// unregistered drop (NET-085) refuses the frame — the row's rules
+    /// ended with the row — so no flip of the per-box default changes it.
     #[tokio::test]
     async fn host_row_withdrawn_on_destroy() {
-        use crate::net::egress_gate::{UnregisteredSourcePhase, test_support};
+        use crate::net::egress_gate::test_support;
 
         let capture = server_capture();
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let (sock_path, _server, registry, _answerer) =
+        let (sock_path, _server, registry, _answerer, _proxy_publish) =
             spawn_server(dir.path()).expect("server binds");
 
         // The registering client holds the pair the registration hands
@@ -814,7 +1140,14 @@ mod tests {
         .expect("the withdrawal is answered");
         match reply {
             BoxControlReply::Addresses(echoed) => {
-                assert_eq!(echoed, web, "the withdrawal echoes the pair it went by");
+                assert!(
+                    echoed.switch_address == web.switch_address
+                        && echoed.loopback_address == web.loopback_address,
+                    "the withdrawal echoes the pair it went by: {echoed:?}"
+                );
+            }
+            BoxControlReply::Registered(..) => {
+                panic!("a withdrawal echoes the pair it went by, never a registered box")
             }
             BoxControlReply::Error { error } => {
                 panic!("the creator's withdrawal is answered with the pair, refused with {error}")
@@ -891,6 +1224,9 @@ mod tests {
                 BoxControlReply::Addresses(..) => {
                     panic!("a foreign pair's withdrawal must be refused, got addresses")
                 }
+                BoxControlReply::Registered(..) => {
+                    panic!("a foreign pair's withdrawal must be refused, got a registered box")
+                }
                 BoxControlReply::Status(status) => {
                     panic!("a withdrawal must be refused, got the status {status:?}")
                 }
@@ -917,7 +1253,14 @@ mod tests {
         .expect("the repeat withdrawal is answered");
         match again {
             BoxControlReply::Addresses(echoed) => {
-                assert_eq!(echoed, web, "the repeat withdrawal echoes the pair too");
+                assert!(
+                    echoed.switch_address == web.switch_address
+                        && echoed.loopback_address == web.loopback_address,
+                    "the repeat withdrawal echoes the pair too: {echoed:?}"
+                );
+            }
+            BoxControlReply::Registered(..) => {
+                panic!("a repeat withdrawal echoes the pair, never a registered box")
             }
             BoxControlReply::Error { error } => {
                 panic!("no row at the address is success, refused with {error}")
@@ -952,61 +1295,33 @@ mod tests {
         );
 
         // The gate shares the registry's table, as production does: the
-        // announced interim admits the withdrawn address's frame under its
-        // warn — the row's rules ended with the row — while a published
-        // box's frame is the marker that proves nothing else slipped.
+        // unregistered drop (NET-085) refuses the withdrawn address's frame —
+        // the row's rules ended with the row — while a published box's frame
+        // is the marker that proves nothing else slipped. No phase reaches
+        // this, so the shipped gate is the whole proof.
         let marker = test_support::ipv4_frame(db.switch_address.octets(), 6, [10, 1, 2, 3], 80);
         let from_withdrawn =
             test_support::ipv4_frame(web.switch_address.octets(), 6, [10, 1, 2, 3], 80);
-        let mut h = test_support::gate_over_with_phase(
-            registry.clone(),
-            UnregisteredSourcePhase::Announced,
-        )
-        .await;
-        test_support::send_frame(&mut h.guest, &from_withdrawn).await;
-        test_support::send_frame(&mut h.guest, &marker).await;
-        let seen = test_support::expect_frame(&mut h.switch).await;
-        assert_eq!(
-            seen, from_withdrawn,
-            "the announced interim admits the withdrawn address's frame"
-        );
-        let seen = test_support::expect_frame(&mut h.switch).await;
-        assert_eq!(seen, marker, "the published box's frame is the marker");
-        test_support::expect_silence(&mut h.switch).await;
-        test_support::wait_for_log(&h.log, "egress-unregistered-source").await;
-        let logged = h.log.contents();
-        assert!(
-            logged.contains(&format!("source={}", web.switch_address)),
-            "the interim's line names the withdrawn source, got: {logged}"
-        );
-        assert!(
-            logged.contains("T66 (#1711)"),
-            "the interim's line names the path that ends it, got: {logged}"
-        );
-
-        // And the in-force arm drops the same frame — the per-box default
-        // the flip puts in force — while the marker still passes.
-        let mut h =
-            test_support::gate_over_with_phase(registry.clone(), UnregisteredSourcePhase::InForce)
-                .await;
+        let mut h = test_support::gate_over(registry.clone()).await;
         test_support::send_frame(&mut h.guest, &from_withdrawn).await;
         test_support::send_frame(&mut h.guest, &marker).await;
         let seen = test_support::expect_frame(&mut h.switch).await;
         assert_eq!(
             seen, marker,
-            "the in-force default drops the withdrawn address's frame and \
-             passes the published box's"
+            "the gate drops the withdrawn address's frame and passes the \
+             published box's"
         );
         test_support::expect_silence(&mut h.switch).await;
-        test_support::wait_for_log(&h.log, "egress-unknown-source").await;
+        test_support::wait_for_log(&h.log, "egress-unregistered-source").await;
         let logged = h.log.contents();
         assert!(
             logged.contains(&format!("source={}", web.switch_address)),
             "the drop line names the withdrawn source, got: {logged}"
         );
         assert!(
-            !logged.contains("egress-unregistered-source"),
-            "the in-force arm fires no interim line, got: {logged}"
+            !logged.contains("egress-unknown-source"),
+            "the withdrawn address is in-plan, so its drop is the \
+             unregistered rule's, got: {logged}"
         );
     }
 
@@ -1019,7 +1334,7 @@ mod tests {
     #[test]
     fn answerer_state_is_read_over_the_control_socket() {
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let (sock_path, _server, registry, answerer) =
+        let (sock_path, _server, registry, answerer, _proxy_publish) =
             spawn_server(dir.path()).expect("server binds");
 
         // Before the acquisition loop's first pass, the read answers the
@@ -1042,7 +1357,7 @@ mod tests {
             ZoneAnswererStatus::Registered { port },
             ZoneAnswererStatus::PortHeldNoChannel { port },
         ] {
-            answerer.set(state);
+            answerer.set(state.clone());
             let reply = control(&sock_path, &BoxControlRequest::AnswererStatus)
                 .expect("the status read is answered");
             assert_eq!(
@@ -1054,7 +1369,7 @@ mod tests {
 
         // The read mutates nothing: a row published before it is still
         // published after, and the next registration is still answered
-        // with addresses.
+        // with the registered box.
         let web = handed(
             register(
                 &sock_path,
@@ -1073,6 +1388,271 @@ mod tests {
                 .by_source(web.switch_address.octets())
                 .is_some(),
             "the read-only verb leaves the row the registration published"
+        );
+    }
+
+    /// The drawn port's story (T93): a guest that reports its publish was
+    /// refused for address-in-use redraws the port under the reservation
+    /// while tries remain, the tries are the constant's (the first boot
+    /// plus every redraw), and the refusal that outlasts them fails the
+    /// start naming the port and the holder — the cause the status read
+    /// then serves over this socket, for the CLI's surfaces to name.
+    #[test]
+    fn publish_in_use_redraws_then_fails_named() {
+        let port = 19_911;
+        let held = GuestPublish::PortHeld { port };
+
+        // A serving publish is up, whatever the tries or the origin: a
+        // boot that landed is a boot that landed.
+        assert_eq!(
+            decide_publish(true, 1, GuestPublish::Serving { port }),
+            PublishDecision::Up,
+            "a serving publish never fails the start"
+        );
+
+        // The first two publishes that find the port taken redraw: the
+        // first boot's refusal and the first redraw's, each naming the port
+        // the publish could not take.
+        for tries_used in 1..PUBLISH_TRIES {
+            assert_eq!(
+                decide_publish(true, tries_used, held),
+                PublishDecision::Redraw { port },
+                "a drawn port with tries left redraws, at try {tries_used}"
+            );
+        }
+
+        // The third try's refusal exhausts them: the start fails, naming
+        // the port and the holder, with the cause the CLI names.
+        match decide_publish(true, PUBLISH_TRIES, held) {
+            PublishDecision::FailStart {
+                port: named,
+                holder,
+                cause,
+            } => {
+                assert_eq!(named, port, "the failure names the port");
+                assert_eq!(
+                    holder, HELD_BY_ANOTHER_PROCESS,
+                    "the failure names the holder"
+                );
+                assert_eq!(
+                    cause,
+                    ProxyDownCause::RedrawsRanOut,
+                    "the cause is the draws'"
+                );
+            }
+            other => panic!("the draws ran out: the start fails, got {other:?}"),
+        }
+    }
+
+    /// No report, and the port's holder is this VM's own forwarder — the
+    /// pid the supervisor spawned: the publish landed and the report was
+    /// late, so the VM is up, confirmed, whatever the origin or the tries.
+    #[test]
+    fn no_report_with_own_forwarder_holding_is_up() {
+        let own = [4_242, 4_243];
+        let holder = classify_no_report_holder(true, Some(4_243), &own);
+        assert_eq!(holder, NoReportHolder::OwnForwarder);
+        for drawn in [true, false] {
+            for tries_used in 1..=PUBLISH_TRIES {
+                assert_eq!(
+                    decide_publish(
+                        drawn,
+                        tries_used,
+                        GuestPublish::NoReport {
+                            port: 19_913,
+                            holder
+                        }
+                    ),
+                    PublishDecision::Up,
+                    "own forwarder holding is a late report (drawn={drawn}, try {tries_used})"
+                );
+            }
+        }
+    }
+
+    /// No report, and another process holds the port: exactly the refused
+    /// publish's story — a drawn port redraws within the tries and then
+    /// fails with the draws' cause; a pin fails at once, the held port's.
+    #[test]
+    fn no_report_with_foreign_holder_redraws_drawn_and_fails_pinned() {
+        let port = 19_914;
+        let holder = classify_no_report_holder(true, Some(9_999), &[4_242]);
+        assert_eq!(holder, NoReportHolder::Foreign);
+        let outcome = GuestPublish::NoReport { port, holder };
+        for tries_used in 1..PUBLISH_TRIES {
+            assert_eq!(
+                decide_publish(true, tries_used, outcome),
+                PublishDecision::Redraw { port },
+                "a drawn port held by another process redraws at try {tries_used}"
+            );
+        }
+        assert_eq!(
+            decide_publish(true, PUBLISH_TRIES, outcome),
+            PublishDecision::FailStart {
+                port,
+                holder: HELD_BY_ANOTHER_PROCESS,
+                cause: ProxyDownCause::RedrawsRanOut,
+            },
+            "the draws run out like a refused publish's"
+        );
+        for tries_used in 1..=PUBLISH_TRIES {
+            assert_eq!(
+                decide_publish(false, tries_used, outcome),
+                PublishDecision::FailStart {
+                    port,
+                    holder: HELD_BY_ANOTHER_PROCESS,
+                    cause: ProxyDownCause::PortHeld,
+                },
+                "a pin held by another process fails at once, at try {tries_used}"
+            );
+        }
+    }
+
+    /// No report and a holder the host would not name, or no listener at
+    /// all: the VM is up, unconfirmed — ambiguity never redraws, never
+    /// fails, and never claims serving.
+    #[test]
+    fn no_report_unknown_or_silent_is_up_unconfirmed() {
+        let port = 19_915;
+        assert_eq!(
+            classify_no_report_holder(true, None, &[4_242]),
+            NoReportHolder::Unknown
+        );
+        assert_eq!(
+            classify_no_report_holder(false, Some(4_242), &[4_242]),
+            NoReportHolder::NotAnswering,
+            "a silent port is not attributed to anyone"
+        );
+        for holder in [NoReportHolder::Unknown, NoReportHolder::NotAnswering] {
+            for drawn in [true, false] {
+                for tries_used in 1..=PUBLISH_TRIES {
+                    assert_eq!(
+                        decide_publish(drawn, tries_used, GuestPublish::NoReport { port, holder }),
+                        PublishDecision::UpUnconfirmed { port },
+                        "{holder:?} is up, unconfirmed (drawn={drawn}, try {tries_used})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The unconfirmed state rides the status read until the guest's late
+    /// report confirms the port, and a confirm never clears a terminal
+    /// cause or another port's state.
+    #[test]
+    fn unconfirmed_publish_rides_the_read_until_confirmed() {
+        let port = 19_916;
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _boxes, answerer, proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        answerer.set(ZoneAnswererStatus::Holder { port: 7_656 });
+        proxy_publish.set_unconfirmed(port);
+        assert_eq!(
+            control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
+            BoxControlReply::Status(ZoneAnswererStatus::ProxyNotServing {
+                port,
+                cause: ProxyDownCause::PublishUnconfirmed,
+            }),
+            "an unconfirmed publish is what the read answers"
+        );
+        proxy_publish.confirm(port + 1);
+        assert_eq!(
+            proxy_publish.down(),
+            Some(ZoneAnswererStatus::ProxyNotServing {
+                port,
+                cause: ProxyDownCause::PublishUnconfirmed,
+            }),
+            "another port's report confirms nothing"
+        );
+        proxy_publish.confirm(port);
+        assert_eq!(
+            control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
+            BoxControlReply::Status(ZoneAnswererStatus::Holder { port: 7_656 }),
+            "the late report clears it; the answerer's state answers again"
+        );
+        proxy_publish.set_down(port, ProxyDownCause::PortHeld);
+        proxy_publish.confirm(port);
+        assert_eq!(
+            proxy_publish.down(),
+            Some(ZoneAnswererStatus::ProxyNotServing {
+                port,
+                cause: ProxyDownCause::PortHeld,
+            }),
+            "a confirm never clears a terminal cause"
+        );
+        // A late refusal after an unconfirmed start: the VM stays up, and the
+        // read carries the holder over the wire so the CLI can name it.
+        let late = ProxyDownCause::PortHeldAfterStart {
+            holder: Some("pid 4242 (python3)".to_string()),
+        };
+        proxy_publish.set_unconfirmed(port);
+        proxy_publish.set_down(port, late.clone());
+        proxy_publish.confirm(port);
+        assert_eq!(
+            control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
+            BoxControlReply::Status(ZoneAnswererStatus::ProxyNotServing { port, cause: late }),
+            "a late refusal rides the read with its holder, and a confirm never clears it"
+        );
+    }
+
+    /// The operator's pin's story (T93): the first address-in-use publish
+    /// fails the start — never a redraw, whatever the tries left — naming
+    /// the port and the holder, and the cause the status read then serves
+    /// over this socket is the held port's, so the CLI's surfaces name why
+    /// the proxy is not serving instead of a bare "not serving".
+    #[test]
+    fn configured_proxy_port_in_use_fails_named_without_redraw() {
+        let port = 19_912;
+        let held = GuestPublish::PortHeld { port };
+
+        // No try count changes the pin's story: every refusal is the
+        // start's, from the first.
+        for tries_used in 1..=PUBLISH_TRIES {
+            match decide_publish(false, tries_used, held) {
+                PublishDecision::FailStart {
+                    port: named,
+                    holder,
+                    cause,
+                } => {
+                    assert_eq!(named, port, "the failure names the pinned port");
+                    assert_eq!(
+                        holder, HELD_BY_ANOTHER_PROCESS,
+                        "the failure names the holder"
+                    );
+                    assert_eq!(cause, ProxyDownCause::PortHeld, "the cause is the holder's");
+                }
+                other => panic!("the pin never redraws at try {tries_used}, got {other:?}"),
+            }
+        }
+
+        // And the failure's cause rides the read-only verb the CLI's
+        // surfaces read: once the supervisor writes it, the status read
+        // answers the port and the cause, not the answerer's state.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (sock_path, _server, _boxes, answerer, proxy_publish) =
+            spawn_server(dir.path()).expect("server binds");
+        assert_eq!(
+            control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
+            BoxControlReply::Status(ZoneAnswererStatus::Starting),
+            "before any cause, the read answers the answerer's state as it always did"
+        );
+        proxy_publish.set_down(port, ProxyDownCause::PortHeld);
+        assert_eq!(
+            control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
+            BoxControlReply::Status(ZoneAnswererStatus::ProxyNotServing {
+                port,
+                cause: ProxyDownCause::PortHeld,
+            }),
+            "the read answers the cause the supervisor reached, naming the port"
+        );
+        answerer.set(ZoneAnswererStatus::Holder { port: 7_656 });
+        assert_eq!(
+            control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
+            BoxControlReply::Status(ZoneAnswererStatus::ProxyNotServing {
+                port,
+                cause: ProxyDownCause::PortHeld,
+            }),
+            "the cause outranks the answerer's state while the supervisor holds it"
         );
     }
 
@@ -1114,7 +1694,7 @@ mod tests {
         let dir = tmp.path().join("local-minvmd0");
         std::fs::create_dir(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let (sock_path, _handle, _boxes, _answerer) = spawn_server(&dir).unwrap();
+        let (sock_path, _handle, _boxes, _answerer, _proxy_publish) = spawn_server(&dir).unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         assert!(TestStream::connect(&sock_path).is_ok());

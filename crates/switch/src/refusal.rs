@@ -201,12 +201,13 @@ pub fn classify(frame: &[u8]) -> Option<Segment> {
 /// The ones' complement sum of `bytes` as 16-bit big-endian words (RFC 1071):
 /// the accumulator widened so the carries survive to be folded back in.
 pub fn ones_sum(bytes: &[u8]) -> u32 {
-    let sum: u32 = bytes
-        .chunks_exact(2)
-        .map(|word| u32::from(u16::from_be_bytes([word[0], word[1]])))
+    let (words, tail) = bytes.as_chunks::<2>();
+    let sum: u32 = words
+        .iter()
+        .map(|word| u32::from(u16::from_be_bytes(*word)))
         .sum();
     // A trailing odd byte counts as the high half of a final word.
-    if let Some(tail) = bytes.chunks_exact(2).remainder().first() {
+    if let Some(tail) = tail.first() {
         sum + (u32::from(*tail) << 8)
     } else {
         sum
@@ -405,6 +406,11 @@ pub const FOREIGN_SOURCE_MAC_RULE: &str = "foreign source mac";
 /// a source already holding its share's cap of the listener pool.
 pub const SHARE_SPENT_RULE: &str = "per-source share spent";
 
+/// Rule text for the box egress proxy's pool aborting an accepted
+/// connection from a source whose box holds no attachment (NET-133): no
+/// attachment, no delivery.
+pub const NO_ATTACHMENT_RULE: &str = "no box attachment";
+
 /// What a refusal answers for: the audit line's rule and its reason. A
 /// `Copy` pair of `&'static str`s — the vocabulary is the codebase's rule
 /// constants, which is also what bounds the emitter's overflow buckets
@@ -448,6 +454,15 @@ pub const FOREIGN_SOURCE_MAC: Class = Class {
 pub const SHARE_SPENT: Class = Class {
     rule: SHARE_SPENT_RULE,
     reason: "the source already holds its share of the pool",
+};
+
+/// An accepted connection the box egress proxy's pool aborted because its
+/// source's box holds no attachment (NET-133): the row bought the share the
+/// connection took, but nothing names the box to attribute a delivery to,
+/// so nothing is presented from it.
+pub const NO_ATTACHMENT: Class = Class {
+    rule: NO_ATTACHMENT_RULE,
+    reason: "the source's box holds no proxy attachment",
 };
 
 /// What the refused connection reached for, as the audit line names it: the
@@ -981,11 +996,12 @@ mod tests {
     /// than the builder's helper, so a wrong checksum in a built frame is
     /// caught by construction.
     fn rfc1071(bytes: &[u8]) -> u16 {
-        let mut sum: u32 = bytes
-            .chunks_exact(2)
-            .map(|word| u32::from(u16::from_be_bytes([word[0], word[1]])))
+        let (words, tail) = bytes.as_chunks::<2>();
+        let mut sum: u32 = words
+            .iter()
+            .map(|word| u32::from(u16::from_be_bytes(*word)))
             .sum();
-        if let Some(tail) = bytes.chunks_exact(2).remainder().first() {
+        if let Some(tail) = tail.first() {
             sum += u32::from(*tail) << 8;
         }
         while sum >> 16 != 0 {
