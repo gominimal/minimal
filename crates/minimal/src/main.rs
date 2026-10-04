@@ -5,7 +5,9 @@ use std::process::ExitCode;
 
 use clap::{CommandFactory as _, Parser};
 use minimal::ExecArgs;
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::{
+    EnvFilter, Layer, fmt, fmt::MakeWriter, prelude::*, registry::LookupSpan,
+};
 
 /// Custom main: handle shell completion requests before launching the async world.
 fn main() -> ExitCode {
@@ -18,6 +20,8 @@ fn main() -> ExitCode {
 
 #[tokio::main]
 async fn run() -> ExitCode {
+    // True only when RUST_LOG parsed: a malformed RUST_LOG falls back to the
+    // default filter and keeps the plain user-facing format.
     let (filter, rust_log_set) = match EnvFilter::try_from_default_env() {
         Ok(filter) => (filter, true),
         Err(_) => (
@@ -91,27 +95,21 @@ async fn run() -> ExitCode {
             .with(fmt::layer().with_writer(log).with_ansi(false))
             .init();
     } else if stdout_is_data_contract(&cli.command) {
-        let layer = fmt::layer()
-            .with_writer(std::io::stderr)
-            .with_ansi(std::io::stderr().is_terminal());
-        if rust_log_set {
-            registry.with(layer).init();
-        } else {
-            registry
-                .with(layer.without_time().with_target(false).with_level(true))
-                .init();
-        }
+        registry
+            .with(console_layer(
+                std::io::stderr,
+                std::io::stderr().is_terminal(),
+                !rust_log_set,
+            ))
+            .init();
     } else {
-        let layer = fmt::layer()
-            .with_writer(ot::StdoutWriter::new)
-            .with_ansi(std::io::stdout().is_terminal());
-        if rust_log_set {
-            registry.with(layer).init();
-        } else {
-            registry
-                .with(layer.without_time().with_target(false).with_level(true))
-                .init();
-        }
+        registry
+            .with(console_layer(
+                ot::StdoutWriter::new,
+                std::io::stdout().is_terminal(),
+                !rust_log_set,
+            ))
+            .init();
     }
 
     // Only `version` writes its output through a fallible writer; a broken
@@ -185,6 +183,26 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
     )
 }
 
+/// The console log layer. `plain` (no `RUST_LOG` in effect) drops the
+/// timestamp and target, so a warning reads as one message line; otherwise the
+/// full tracing format is kept for debugging.
+fn console_layer<S, W>(writer: W, ansi: bool, plain: bool) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    let layer = fmt::layer().with_writer(writer).with_ansi(ansi);
+    if plain {
+        layer
+            .without_time()
+            .with_target(false)
+            .with_level(true)
+            .boxed()
+    } else {
+        layer.boxed()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,12 +267,7 @@ mod tests {
             let buf = buf.clone();
             move || BufferWriter(buf.clone())
         };
-        let layer = fmt::layer()
-            .with_writer(writer)
-            .with_ansi(false)
-            .without_time()
-            .with_target(false)
-            .with_level(true);
+        let layer = console_layer(writer, false, true);
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(key = "value", "lifecycle_hooks is unknown");
@@ -272,7 +285,7 @@ mod tests {
             let buf = buf.clone();
             move || BufferWriter(buf.clone())
         };
-        let layer = fmt::layer().with_writer(writer).with_ansi(false);
+        let layer = console_layer(writer, false, false);
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(key = "value", "lifecycle_hooks is unknown");
