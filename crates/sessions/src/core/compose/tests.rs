@@ -363,6 +363,79 @@ mod loadout_root_anchoring {
 }
 
 // =================================================================
+// Project-root anchoring
+// =================================================================
+
+/// A project-declared patch with a repo-relative source is joined
+/// onto the project root so the absoluteness check passes.
+mod project_root_anchoring {
+    use super::*;
+
+    /// A project patch with a relative source resolves against the
+    /// project root carried in its provenance.
+    #[test]
+    fn project_patch_relative_source_anchors_at_project_root() {
+        let pp = ProvenancedPatch::new(
+            Patch::new("config/myrc", PatchDest::try_new("~/.myrc").unwrap()),
+            project_source(),
+        );
+        let expanded = expand_patch_sources(vec![pp], &[], PatchAnchors::default(), false).unwrap();
+        assert_eq!(expanded[0].source.pattern(), "/repo/config/myrc");
+    }
+
+    /// A loadout patch with a relative source still fails with
+    /// `NotAbsolute` — only project patches get the project-root
+    /// anchor.
+    #[test]
+    fn loadout_patch_relative_source_is_still_not_absolute() {
+        let pp = ProvenancedPatch::new(
+            Patch::new("config/myrc", PatchDest::try_new("~/.myrc").unwrap()),
+            user_source(),
+        );
+        let Err(err) = expand_patch_sources(vec![pp], &[], PatchAnchors::default(), false) else {
+            panic!("a loadout patch with a relative source must fail");
+        };
+        assert!(
+            matches!(
+                err,
+                ComposeError::Expansion(crate::core::expansion::ExpandError::NotAbsolute { .. })
+            ),
+            "got: {err:?}",
+        );
+    }
+
+    /// An already-absolute project patch source is left alone.
+    #[test]
+    fn project_patch_absolute_source_is_unchanged() {
+        let pp = ProvenancedPatch::new(
+            Patch::new("/etc/foo", PatchDest::try_new("~/.foo").unwrap()),
+            project_source(),
+        );
+        let expanded = expand_patch_sources(vec![pp], &[], PatchAnchors::default(), false).unwrap();
+        assert_eq!(expanded[0].source.pattern(), "/etc/foo");
+    }
+
+    /// `..` in a project-relative source is still rejected.
+    #[test]
+    fn project_patch_relative_source_rejects_parent_traversal() {
+        let pp = ProvenancedPatch::new(
+            Patch::new("../escape", PatchDest::try_new("~/.escape").unwrap()),
+            project_source(),
+        );
+        let Err(err) = expand_patch_sources(vec![pp], &[], PatchAnchors::default(), false) else {
+            panic!("`..` must be rejected even with a project root");
+        };
+        assert!(
+            matches!(
+                err,
+                ComposeError::Expansion(crate::core::expansion::ExpandError::PathTraversal { .. })
+            ),
+            "got: {err:?}",
+        );
+    }
+}
+
+// =================================================================
 // Vars gating
 // =================================================================
 

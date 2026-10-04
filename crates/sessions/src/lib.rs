@@ -143,6 +143,23 @@ impl EgressPolicy {
         first_invalid_cidr(self.deny_subnets.as_ref())
     }
 
+    /// Returns the first `allow_dns_hosts` entry that is not a valid DNS
+    /// hostname, or `None` when every entry is valid (or none are configured).
+    ///
+    /// Used at launch to name a hostname that can never match the DNS gate's
+    /// exact-match lookup — a name with whitespace, an over-long label, or a
+    /// character outside `[A-Za-z0-9-_.]` — where it can be fixed, rather than
+    /// storing it verbatim as an allow rule that admits nothing.
+    #[must_use]
+    pub fn first_invalid_dns_host(&self) -> Option<&str> {
+        self.allow_dns_hosts
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .find(|host| !is_valid_dns_host(host))
+    }
+
     /// The deny-all section: `Some(vec![])` on every `allow_*` dimension —
     /// the one [`crate::core::egress::EgressRules::from_policy`] shape that
     /// admits nothing — with nothing denied, because there is nothing left
@@ -383,9 +400,8 @@ pub enum EffectiveEgress {
     Declared(EgressPolicy),
 }
 
-/// A session's policy with its egress half resolved to what the gate
-/// enforces: the answer `GetEffectiveSessionPolicy` serves and
-/// `min session policy` renders (NET-075) — the shape that can carry
+/// The answer `GetEffectiveSessionPolicy` serves and `min session policy`
+/// renders (NET-075) — the shape that can carry
 /// [`EffectiveEgress::DenyAll`] without rewriting the strict
 /// [`SessionPolicy`] declaration. The ingress half is carried verbatim:
 /// ingress has no rollout default.
@@ -397,7 +413,12 @@ pub enum EffectiveEgress {
 // Same reason as the attribute on `SessionPolicy`: the response rides an
 // `#[serde(untagged)]` `Errorable`, and the daemon's `{"error": "..."}` reply
 // must fall through to the `Err` arm rather than decode as a valid policy —
-// a silent false negative on a security-introspection command.
+// a silent false negative on a security-introspection command. Its `egress`
+// is required, not an `Option`, so the error reply falls through on its own.
+// The strictness is also the wire contract with an older `min`: an old client
+// rejects a key it has no field for, so a fact that did not exist when it was
+// built must ride its own reply (`GetSessionRuntimeFacts`, the way live
+// ingress rides `GetLiveIngress`) rather than a new field here.
 #[serde(deny_unknown_fields)]
 pub struct EffectiveSessionPolicy {
     /// The effective egress: the declaration, or the default the rollout
@@ -481,6 +502,17 @@ pub enum PolicyError {
     /// both are parsed by #553's egress-enforcement layer.
     #[error("egress deny_subnets entry {cidr:?} is not a valid CIDR prefix")]
     InvalidDenySubnet { cidr: String },
+    /// An egress `allow_dns_hosts` entry is not a valid DNS hostname: empty,
+    /// contains whitespace, a label longer than 63 bytes or empty, a total
+    /// length over 253, or characters outside `[A-Za-z0-9-_.]`. Rejected at
+    /// launch so a name that can never match is named where it can be fixed,
+    /// rather than stored verbatim as an allow rule that admits nothing.
+    #[error(
+        "egress allow_dns_hosts entry {host:?} is not a valid DNS hostname \
+         (wildcards are not supported; write an internationalized name in its \
+         punycode xn-- form)"
+    )]
+    InvalidDnsHost { host: String },
     /// An ingress `dynamic_allowed_range` was given with its lower bound above
     /// its upper bound (e.g. `(8443, 8000)`). The range is inclusive, so a
     /// reversed pair describes no ports; rejected at launch so the misconfig is
@@ -594,6 +626,65 @@ fn is_valid_cidr(s: &str) -> bool {
         Ok(std::net::IpAddr::V6(_)) => prefix <= 128,
         Err(_) => false,
     }
+}
+
+/// Whether `s` is a valid DNS hostname for an egress `allow_dns_hosts` entry:
+/// non-empty, no whitespace, every label non-empty and at most 63 bytes, the
+/// whole name at most 253 bytes, every character in `[A-Za-z0-9-_.]`, and no
+/// label starting or ending with a hyphen (RFC 1035), since no query name can
+/// carry one.
+/// One trailing dot is tolerated because the DNS gate strips it before
+/// matching, so `example.com.` and `example.com` name the same host.
+fn is_valid_dns_host(s: &str) -> bool {
+    if s.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let name = s.strip_suffix('.').unwrap_or(s);
+    if name.is_empty() || name.len() > 253 {
+        return false;
+    }
+    name.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    })
+}
+
+/// The normalized (host-bits-masked) form of a syntactically valid CIDR
+/// prefix, or `None` when `s` is not a valid prefix or already has no host
+/// bits set. `10.0.0.1/8` normalizes to `10.0.0.0/8`; `10.0.0.0/8` is
+/// already normalized and yields `None`, so callers can print a notice only
+/// when the user's string is read as a different network than they wrote.
+/// IPv6 prefixes also yield `None`: the egress rules compile only IPv4
+/// subnets, so an IPv6 entry is never read as any network.
+#[must_use]
+pub fn normalized_cidr(s: &str) -> Option<String> {
+    let (addr, prefix) = s.split_once('/')?;
+    let prefix = prefix.parse::<u8>().ok()?;
+    let ip = addr.parse::<std::net::IpAddr>().ok()?;
+    let normalized = match ip {
+        std::net::IpAddr::V4(v4) => {
+            if prefix > 32 {
+                return None;
+            }
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            let masked = u32::from(v4) & mask;
+            if masked == u32::from(v4) {
+                return None;
+            }
+            std::net::IpAddr::V4(std::net::Ipv4Addr::from(masked))
+        }
+        std::net::IpAddr::V6(_) => return None,
+    };
+    Some(format!("{normalized}/{prefix}"))
 }
 
 /// A session ID, a newtype over a UUID.
@@ -716,6 +807,47 @@ pub struct BoxAddresses {
     pub loopback_address: Ipv4Addr,
 }
 
+/// The per-box egress enforcement state a host-address session's verdict runs
+/// under (NET-079): `per_box` when the session's own launch placed its box in
+/// a classifier leaf of the host's cgroup tree — the state a host that can
+/// decide per box gives the host-address boxes it launches — and `none` when
+/// the launch did not, because the host cannot decide per box at all, or
+/// because the box got no leaf to be decided on, and the box runs with the
+/// host's address and no verdict of its own.
+///
+/// Defined here — beside the [`Record`] field that carries a box's own launch
+/// outcome — rather than in the RPC crate that first spelled it, because the
+/// record is a session-plane type that crate already depends on; the RPC
+/// crate re-exports it under the path its clients spell, so no wire form
+/// changes.
+///
+/// The default is `none` — a daemon that has not read its host, or one whose
+/// host cannot decide, both spell the state the boxes on it run in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostIpEnforcement {
+    /// The box's launch placed it in a classifier leaf: its egress verdict is
+    /// decided on that leaf of its own.
+    PerBox,
+    /// The box runs with the host's address and no verdict of its own.
+    #[default]
+    None,
+}
+
+impl HostIpEnforcement {
+    /// The machine spelling the stringly surfaces carry — the create
+    /// response, the session runtime-facts reply, the daemon's log lines —
+    /// so a script that greps one surface for the state finds the same word
+    /// on every other.
+    #[must_use]
+    pub fn machine_str(self) -> &'static str {
+        match self {
+            Self::PerBox => "per_box",
+            Self::None => "none",
+        }
+    }
+}
+
 /// The on-disk row/record pertaining to a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
@@ -780,11 +912,59 @@ pub struct Record {
     #[serde(default)]
     pub box_addresses: Option<BoxAddresses>,
 
+    /// The per-box egress enforcement this session's own launch placed its
+    /// host-address box under (NET-079): `per_box` when the launch placed the
+    /// box in a classifier leaf of the host's cgroup tree, `none` when it did
+    /// not — the box's own record of its launch, kept on the session record
+    /// rather than in `attrs` so no client can assert it, and daemon-owned
+    /// from its first write: the create strips the key for every mode and
+    /// only a launch ever sets this field.
+    ///
+    /// The reading surfaces show this record, not the host's current state:
+    /// a box launched unenforced stays `none` for its life even after a later
+    /// launch decides per box, because the outcome is a fact about the launch
+    /// that produced it and never about the host as it stands now. Only the
+    /// display halves lower it — a host whose table has since stopped
+    /// deciding reads as `none` for every box on it — never raise it.
+    ///
+    /// `None` for a session that is not host-address (its verdict is decided
+    /// on address leases, never on the host's cgroup tree) and for a
+    /// host-address box that has not launched yet, whose reads fall back to
+    /// the host's state. Defaults to `None` for records that predate the
+    /// field: pre-existing sessions had no launch to record, and their reads
+    /// answer over the host's state exactly as they did before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip_enforcement: Option<HostIpEnforcement>,
+
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
 }
 
 impl Record {
+    /// [`Record::validate_policy`] plus the checks a record must pass only
+    /// when it is created: added after records were already stored, they
+    /// would strand an existing session if they ran on every launch.
+    ///
+    /// # Errors
+    ///
+    /// Any error [`Record::validate_policy`] returns, or
+    /// [`PolicyError::InvalidDnsHost`] when an egress `allow_dns_hosts` entry
+    /// is not a valid DNS hostname.
+    pub fn validate_new_policy(&self) -> Result<(), PolicyError> {
+        self.validate_policy()?;
+        if let Some(bad) = self
+            .policy
+            .egress
+            .as_ref()
+            .and_then(EgressPolicy::first_invalid_dns_host)
+        {
+            return Err(PolicyError::InvalidDnsHost {
+                host: bad.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Validates that this record's networking policy is compatible with its
     /// network mode (R2.1/R2.3, as amended for host-address egress): an egress
     /// policy is accepted on an [`NetworkMode::OwnIp`] and on a
@@ -794,6 +974,11 @@ impl Record {
     /// `OwnIp`-only, since the switch's static forwarder is the only ingress
     /// surface minimald can apply per-session. Returns an error naming the
     /// first incompatible section.
+    ///
+    /// Runs on every launch, so it holds only checks every stored record
+    /// already passed when it was created; a check added later goes in
+    /// [`Record::validate_new_policy`] instead, so an upgrade never strands a
+    /// session that was accepted before it.
     ///
     /// # Errors
     ///
@@ -808,7 +993,7 @@ impl Record {
     /// twice on one transport, or [`PolicyError::InvalidIngressPort`] for one
     /// that targets box port 0. For a `PTask` that accepts egress, returns
     /// [`PolicyError::InvalidSubnet`] when an egress `allow_subnets` entry is
-    /// not a valid CIDR prefix or [`PolicyError::InvalidDenySubnet`] when a
+    /// not a valid CIDR prefix, [`PolicyError::InvalidDenySubnet`] when a
     /// `deny_subnets` entry is not, [`PolicyError::InvalidDynamicRange`] when
     /// the ingress `dynamic_allowed_range` lower bound exceeds its upper bound,
     /// or [`PolicyError::PrivilegedDynamicRange`] when that lower bound is a
@@ -912,6 +1097,7 @@ mod tests {
             status: SessionStatus::default(),
             hooks_enabled: true,
             box_addresses: None,
+            host_ip_enforcement: None,
             attrs: BTreeMap::new(),
         }
     }
@@ -1433,6 +1619,68 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn invalid_egress_dns_host_is_rejected() {
+        // An allow_dns_hosts entry that is not a valid DNS hostname is rejected
+        // at launch, naming the offending string, rather than being stored
+        // verbatim as an allow rule that can never match the DNS gate.
+        for network in [NetworkMode::OwnIp, NetworkMode::HostNet] {
+            for host in [
+                "",
+                "not a host",
+                "a".repeat(64).as_str(),
+                "-",
+                "-foo.example.com",
+                "foo-.example.com",
+            ] {
+                let egress = EgressPolicy {
+                    allow_dns_hosts: Some(vec!["github.com".into(), host.into()]),
+                    ..EgressPolicy::default()
+                };
+                let record = record_with(network, SessionPolicy::new(Some(egress), None));
+                assert_eq!(
+                    record.validate_new_policy(),
+                    Err(PolicyError::InvalidDnsHost { host: host.into() })
+                );
+                // Launch-time validation leaves it alone: a session stored
+                // before the check existed must still attach after an upgrade.
+                assert_eq!(record.validate_policy(), Ok(()));
+            }
+        }
+    }
+
+    #[test]
+    fn valid_egress_dns_hosts_are_accepted() {
+        // A trailing dot is tolerated (the DNS gate strips it before matching),
+        // and underscores are permitted, matching the gate's normalization.
+        let egress = EgressPolicy {
+            allow_dns_hosts: Some(vec![
+                "github.com".into(),
+                "github.com.".into(),
+                "my_host.internal".into(),
+            ]),
+            ..EgressPolicy::default()
+        };
+        for network in [NetworkMode::OwnIp, NetworkMode::HostNet] {
+            let record = record_with(network, SessionPolicy::new(Some(egress.clone()), None));
+            assert!(record.validate_new_policy().is_ok());
+        }
+    }
+
+    #[test]
+    fn normalized_cidr_masks_host_bits() {
+        // A prefix with host bits set is read as its masked network; a prefix
+        // already normalized yields `None` so no notice is printed for it.
+        assert_eq!(
+            normalized_cidr("10.0.0.1/8"),
+            Some("10.0.0.0/8".to_string())
+        );
+        assert_eq!(normalized_cidr("10.0.0.0/8"), None);
+        assert_eq!(normalized_cidr("fd00::1/8"), None);
+        assert_eq!(normalized_cidr("fd00::/8"), None);
+        assert_eq!(normalized_cidr("not-a-cidr"), None);
     }
 
     #[test]
