@@ -261,9 +261,10 @@ pub enum NsenterError {
         source: std::io::Error,
     },
 
-    /// The injected program could not be started. `ENOMEM` from the fork means
-    /// the sandbox's PID namespace has no live init left to reparent to — the
-    /// session shell exited while we were joining.
+    /// The injected program could not be started for a reason a shell would
+    /// not report as its own (those are exit codes 127/126). `ENOMEM` from the
+    /// fork means the sandbox's PID namespace has no live init left to
+    /// reparent to — the session shell exited while we were joining.
     #[error("spawning {program:?} inside the session")]
     Spawn {
         program: PathBuf,
@@ -423,8 +424,12 @@ impl Injection {
     }
 
     /// Mark this injection as entering a none box, so the shim reinstalls the
-    /// none plan's full socket-family seal — every family but `AF_UNIX` —
-    /// after joining the namespaces.
+    /// none plan's full socket-family seal — every family but the ones the
+    /// box's own network namespace confines (`AF_UNIX`, `AF_INET`,
+    /// `AF_INET6`, `AF_NETLINK`) — after joining the namespaces.  That seal
+    /// applies only when the injection joins the box's own network namespace;
+    /// one that does not falls back to `AF_UNIX` alone
+    /// ([`injection_socket_filter`]).
     ///
     /// Every injection is sealed: without this marker the shim reinstalls the
     /// confined-families seal, the one every networked box launches under,
@@ -512,11 +517,7 @@ impl Injection {
         // restated here, so the log names exactly what the shim installs; the
         // shim itself has no tracing subscriber — it is the daemon re-exec'd
         // before its runtime is built.
-        let seal = if self.seal_none_box {
-            sandbox2::socket_family_filter_for_none_box().seal
-        } else {
-            sandbox2::socket_family_filter_for_confined_families().seal
-        };
+        let seal = injection_socket_filter(self.seal_none_box, &namespaces).seal;
         tracing::debug!(
             leader_pid = self.leader_pid,
             program = %self.program.to_string_lossy(),
@@ -583,8 +584,9 @@ pub struct ShimArgs {
     chdir: Option<PathBuf>,
 
     /// When present, the target session is a none box and the shim must
-    /// re-install its full socket-family seal — every family but `AF_UNIX` —
-    /// after joining the namespaces. When absent the shim re-installs the
+    /// re-install its full socket-family seal after joining the namespaces —
+    /// unix, inet, inet6 and netlink admitted when the join enters the box's
+    /// own network namespace, `AF_UNIX` alone when it does not. When absent the shim re-installs the
     /// confined-families seal, the one every other box launches under, which
     /// admits the families the box's namespace confines and refuses the
     /// rest.  Either way the filter is inherited by children of the filtered
@@ -622,8 +624,11 @@ pub struct ShimArgs {
 ///
 /// [`NsenterError::JoinDenyLeaf`] if the box is deny-all and its classifier
 /// leaf cannot be joined, [`NsenterError::Setns`] if the namespaces cannot be
-/// joined, and [`NsenterError::Spawn`] if the program cannot be started inside
-/// them.
+/// joined, [`NsenterError::Spawn`] if the program cannot be started for a
+/// reason a shell would not report, and [`NsenterError::Wait`] if the started
+/// program cannot be reaped. A program that is missing, not executable, or not
+/// an executable format is reported on stderr and returned as the shell's exit
+/// code (127/126) rather than as an error.
 pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     // SAFETY: `command_in_session` placed a pidfd on this descriptor and it
     // survived the exec; nothing else in this freshly-exec'd process owns it.
@@ -709,13 +714,10 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     // Resolved here, before the fork: building the filter allocates, and the
     // first `OnceLock` access is what builds it. Only the `&'static` result
     // crosses into the child. Every injection is sealed — the none box's
-    // full seal, or the confined-families seal every other box launches
+    // full seal (unix-only unless the join entered the box's own network
+    // namespace), or the confined-families seal every other box launches
     // under.
-    let socket_family_filter = if args.seal_none_box {
-        sandbox2::socket_family_filter_for_none_box()
-    } else {
-        sandbox2::socket_family_filter_for_confined_families()
-    };
+    let socket_family_filter = injection_socket_filter(args.seal_none_box, &args.join);
 
     // SAFETY: the closures run in the forked child between `fork` and `exec`,
     // where only async-signal-safe calls are legal. `prctl` and the raw
@@ -773,10 +775,24 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     }
 
     let program = PathBuf::from(program);
-    let mut child = cmd.spawn().map_err(|source| NsenterError::Spawn {
-        program: program.clone(),
-        source,
-    })?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(source) => {
+            // The child's `chdir` fails with the same `ENOENT` as a missing
+            // program; a missing working directory is not "command not found".
+            let chdir_missing = spawn_failed_on_missing_chdir(&source, args.chdir.as_deref());
+            let mapped = if chdir_missing {
+                None
+            } else {
+                spawn_failure_code_and_message(&source)
+            };
+            let Some((code, msg)) = mapped else {
+                return Err(NsenterError::Spawn { program, source });
+            };
+            eprintln!("{program}: {msg}", program = program.display());
+            return Ok(code);
+        }
+    };
     let status = child.wait().map_err(|source| NsenterError::Wait {
         program: program.clone(),
         source,
@@ -790,9 +806,129 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
         .unwrap_or(1))
 }
 
+/// Maps a failed `spawn` to the shell's exit-code and message conventions:
+/// `ENOENT` is "command not found" (127), `EACCES` is "permission denied"
+/// (126), and `ENOEXEC` is "cannot execute" (126). Any other failure — a
+/// fork's `ENOMEM`, or an `EPERM` from a `pre_exec` hook, included — is not the
+/// program's to report, so it is `None` and stays a [`NsenterError::Spawn`].
+/// `EACCES` is matched by errno rather than [`std::io::ErrorKind::PermissionDenied`],
+/// which also covers `EPERM`.
+///
+/// The message is the plain text a shell would print, without the debug
+/// wrapper `main` adds to [`NsenterError`] — a script must be able to tell
+/// "not found" from the command's own failure.
+fn spawn_failure_code_and_message(source: &std::io::Error) -> Option<(i32, String)> {
+    match source.raw_os_error()? {
+        libc::ENOENT => Some((127, "command not found".to_string())),
+        libc::EACCES => Some((126, "permission denied".to_string())),
+        libc::ENOEXEC => Some((126, format!("cannot execute: {source}"))),
+        _ => None,
+    }
+}
+
+/// Whether a failed `spawn` is the child's `chdir` failing on a missing
+/// working directory rather than the program itself being missing. Only
+/// `ENOENT` is ambiguous between the two — `EACCES` and `ENOEXEC` are the
+/// program's own failure whichever syscall raised them, so they map
+/// unconditionally and never route through this discriminator.
+fn spawn_failed_on_missing_chdir(source: &std::io::Error, chdir: Option<&Path>) -> bool {
+    source.raw_os_error() == Some(libc::ENOENT) && chdir.is_some_and(|dir| !dir.is_dir())
+}
+
+/// The socket-family filter an injected process installs after joining a
+/// box.  A none box's relaxed seal admits inet and netlink only because the
+/// box's own network namespace confines them, so it applies only when the
+/// join enters that namespace (`join` names `Net`); an injection that stays
+/// in the daemon's namespace gets the unix-only seal instead, fail closed
+/// ([`sandbox2::SocketSeal::in_netns`]).
+fn injection_socket_filter(
+    seal_none_box: bool,
+    join: &[Namespace],
+) -> &'static sandbox2::SocketFamilyFilter {
+    if seal_none_box {
+        let joins_box_netns = join.contains(&Namespace::Net);
+        sandbox2::socket_family_filter_for_seal(
+            sandbox2::SocketSeal::Full.in_netns(joins_box_netns),
+        )
+    } else {
+        sandbox2::socket_family_filter_for_confined_families()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed spawn maps to the shell's exit-code and message conventions:
+    /// `ENOENT` is "command not found" (127), `EACCES` is "permission denied"
+    /// (126), and `ENOEXEC` is "cannot execute" (126). Anything else, such as
+    /// the fork's `ENOMEM` or a `pre_exec` hook's `EPERM`, is left to
+    /// [`NsenterError::Spawn`].
+    #[test]
+    fn spawn_failures_map_to_shell_exit_codes_and_messages() {
+        let not_found = std::io::Error::from_raw_os_error(libc::ENOENT);
+        let (code, msg) = spawn_failure_code_and_message(&not_found).unwrap();
+        assert_eq!(code, 127);
+        assert_eq!(msg, "command not found");
+
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
+        let (code, msg) = spawn_failure_code_and_message(&denied).unwrap();
+        assert_eq!(code, 126);
+        assert_eq!(msg, "permission denied");
+
+        let no_exec = std::io::Error::from_raw_os_error(libc::ENOEXEC);
+        let (code, msg) = spawn_failure_code_and_message(&no_exec).unwrap();
+        assert_eq!(code, 126);
+        assert!(msg.starts_with("cannot execute: "), "got {msg:?}");
+
+        let fork_failed = std::io::Error::from_raw_os_error(libc::ENOMEM);
+        assert_eq!(spawn_failure_code_and_message(&fork_failed), None);
+
+        let hook_refused = std::io::Error::from_raw_os_error(libc::EPERM);
+        assert_eq!(spawn_failure_code_and_message(&hook_refused), None);
+    }
+
+    /// Only `ENOENT` is ambiguous between a missing program and a missing
+    /// working directory. An `EACCES` from `chdir` (an inaccessible cwd) is
+    /// the program's own failure and must not be swallowed by the
+    /// missing-chdir discriminator, so it still maps to 126.
+    #[test]
+    fn missing_chdir_discriminator_only_swallows_enoent() {
+        let missing = std::io::Error::from_raw_os_error(libc::ENOENT);
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
+        let no_exec = std::io::Error::from_raw_os_error(libc::ENOEXEC);
+        let chdir = Some(Path::new("/definitely/not/here"));
+
+        assert!(spawn_failed_on_missing_chdir(&missing, chdir));
+        assert!(!spawn_failed_on_missing_chdir(&missing, None));
+        assert!(!spawn_failed_on_missing_chdir(&denied, chdir));
+        assert!(!spawn_failed_on_missing_chdir(&no_exec, chdir));
+    }
+
+    /// The fail-closed gate on the injection path: a none-box injection
+    /// gets the relaxed none seal only when it joins the box's network
+    /// namespace, and the unix-only seal when the join set leaves `Net` out.
+    #[test]
+    fn none_injection_relaxes_only_when_joining_the_box_netns() {
+        use sandbox2::SocketSeal;
+        let with_net = [Namespace::User, Namespace::Mnt, Namespace::Net];
+        let without_net = [Namespace::User, Namespace::Mnt];
+        assert_eq!(
+            injection_socket_filter(true, &with_net).seal,
+            SocketSeal::Full
+        );
+        assert_eq!(
+            injection_socket_filter(true, &without_net).seal,
+            SocketSeal::UnixOnly,
+            "a none-box injection outside the box's netns must keep the unix-only seal"
+        );
+        for join in [&with_net[..], &without_net[..]] {
+            assert_eq!(
+                injection_socket_filter(false, join).seal,
+                SocketSeal::ConfinedFamilies
+            );
+        }
+    }
 
     /// A process whose only child is known: `sh` prints the PID of the
     /// background `sleep` it forked, so the expected answer arrives on stdout
@@ -814,6 +950,19 @@ mod tests {
             .expect("reading the child pid");
         let child_pid = out.trim().parse().expect("sh printed a pid");
         (sh, child_pid)
+    }
+
+    /// Every box unshares its own IPC namespace, so a process injected into a
+    /// box has to be able to join it: the joinable set includes IPC, and
+    /// [`namespaces_to_join`] picks it up wherever the box's differs from ours.
+    #[test]
+    fn the_ipc_namespace_is_one_an_injected_process_joins() {
+        assert!(
+            Namespace::ALL.contains(&Namespace::Ipc),
+            "an injected process must join its box's IPC namespace"
+        );
+        assert_eq!(Namespace::Ipc.proc_name(), "ipc");
+        assert_eq!(Namespace::Ipc.clone_flag(), CloneFlags::CLONE_NEWIPC);
     }
 
     #[test]

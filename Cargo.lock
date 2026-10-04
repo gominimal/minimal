@@ -4214,6 +4214,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
  "version",
 ]
 
@@ -7158,6 +7159,7 @@ name = "switch"
 version = "0.0.1"
 dependencies = [
  "smoltcp",
+ "switch",
  "tempfile",
  "tokio",
  "tracing",

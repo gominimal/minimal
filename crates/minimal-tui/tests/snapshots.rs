@@ -20,6 +20,7 @@ fn entry(n: u128, name: Option<&str>, project: &str) -> minimald_rpc::ListSessio
         project_path: Some(paths::HostAbsPath::try_new(project).unwrap()),
         status: sessions::SessionStatus::Active,
         git: None,
+        host_ip_enforcement: None,
         attrs: None,
     }
 }
@@ -75,6 +76,9 @@ fn record(name: Option<&str>, network: NetworkMode) -> sessions::Record {
         box_addresses: None,
         status: sessions::SessionStatus::Active,
         hooks_enabled: true,
+        // A record that predates a launch of its box: the TUI's rows render
+        // over whatever the record carries, and these carry no launch yet.
+        host_ip_enforcement: None,
         attrs: Default::default(),
     }
 }
@@ -230,6 +234,41 @@ fn detail_pane_with_policy() {
     // Focus the session.
     model.cursor = 1;
     insta::assert_snapshot!(render(&mut model));
+}
+
+#[test]
+fn detail_pane_names_a_declared_deny_all() {
+    // Every allow list present and empty: the box declared deny-all, and the
+    // pane names it as `min session policy` does instead of printing the
+    // empty dimension rows as blankness.
+    let mut model = fixed_model(vec![provider(
+        "host",
+        vec![entry(1, Some("api-staging"), "/src/api")],
+    )]);
+    let key = SessionKey {
+        provider: "host".to_string(),
+        id: id(1),
+    };
+    model.details.insert(
+        key,
+        Detail {
+            record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
+            policy: Some(sessions::SessionPolicy::new(
+                Some(sessions::EgressPolicy {
+                    allow_subnets: Some(vec![]),
+                    allow_dns_hosts: Some(vec![]),
+                    allow_protocols: Some(vec![]),
+                    deny_subnets: None,
+                }),
+                None,
+            )),
+        },
+    );
+    model.cursor = 1;
+    let rendered = render(&mut model);
+    assert!(rendered.contains("  deny-all "), "{rendered}");
+    assert!(!rendered.contains("  subnets "), "{rendered}");
+    assert!(!rendered.contains("dns hosts"), "{rendered}");
 }
 
 #[test]

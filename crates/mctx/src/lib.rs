@@ -34,7 +34,7 @@ pub use mfile_search_strategy::MFileSearchStrategy;
 mod project_setup;
 pub use project_setup::ProjectSetup;
 
-pub use env::{Env, PatchHome, interpolate_task_strings};
+pub use env::{Env, PatchHome, WdLayout, interpolate_task_strings};
 use tokio::sync::Semaphore;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
 
@@ -894,6 +894,7 @@ impl Context {
             packages,
             std::sync::Arc::new(sandbox2::HostNet),
             home,
+            WdLayout::BoundDir,
         )
         .await
     }
@@ -907,6 +908,11 @@ impl Context {
     /// `home` is the directory `~/`-rooted patch paths expand against; see
     /// [`PatchHome`] for why every caller states it rather than letting
     /// the conversion read the ambient one.
+    ///
+    /// `wd_layout` chooses how the sandbox's working directory is laid out;
+    /// see [`WdLayout`]. Callers that run a task inside a session pass
+    /// [`WdLayout::Session`] so the task sees `/workbench` and `/home` rather
+    /// than the daemon's internal tree.
     // Left positional: public library API; `make_env` already forwards here, so
     // a struct would only relocate the same argument list.
     #[allow(clippy::too_many_arguments)]
@@ -921,6 +927,7 @@ impl Context {
         packages: S,
         network: std::sync::Arc<dyn sandbox2::Network>,
         home: PatchHome,
+        wd_layout: WdLayout,
     ) -> Result<env::Env<'a>, Error> {
         let mfile = self.minimal_file();
 
@@ -995,6 +1002,7 @@ impl Context {
                 state_base_dir,
                 transitives: transitive_deps,
                 cwd: wd,
+                wd_layout,
                 patches,
                 home,
                 env_vars,
@@ -1148,7 +1156,7 @@ impl Context {
         match mode {
             AddDepMode::BuildPackages => {
                 if let Some(h) = doc["stack"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved);
+                    did_edit |= upsert_toml_packages_list(h, "build_packages", &resolved)?;
                     println!("Added {} to stack.build_packages", resolved.join(", "));
                 } else {
                     return Err(Error::Other(anyhow!(
@@ -1158,7 +1166,7 @@ impl Context {
             }
             AddDepMode::RuntimePackages => {
                 if let Some(h) = doc["stack"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved);
+                    did_edit |= upsert_toml_packages_list(h, "runtime_packages", &resolved)?;
                     println!("Added {} to stack.runtime_packages", resolved.join(", "));
                 } else {
                     return Err(Error::Other(anyhow!(
@@ -1171,7 +1179,7 @@ impl Context {
                     && let Some(t) = tasks.get_mut(&name)
                     && let Some(t) = t.as_table_mut()
                 {
-                    did_edit |= upsert_toml_packages_list(t, "packages", &resolved);
+                    did_edit |= upsert_toml_packages_list(t, "packages", &resolved)?;
                     println!("Added {} to tasks.{}.packages", resolved.join(", "), name);
                 } else {
                     return Err(Error::Other(anyhow!(
@@ -1182,7 +1190,7 @@ impl Context {
             }
             AddDepMode::SessionPackages => {
                 if let Some(h) = doc["session"].as_table_mut() {
-                    did_edit |= upsert_toml_packages_list(h, "packages", &resolved);
+                    did_edit |= upsert_toml_packages_list(h, "packages", &resolved)?;
                 } else {
                     doc.insert(
                         "session",
@@ -1218,28 +1226,94 @@ pub enum AddDepMode {
     SessionPackages,
 }
 
-fn upsert_toml_packages_list<T: TableLike>(t: &mut T, key: &str, upsert: &[String]) -> bool {
+fn upsert_toml_packages_list<T: TableLike>(
+    t: &mut T,
+    key: &str,
+    upsert: &[String],
+) -> Result<bool, Error> {
     if let Some(bp) = t.get_mut(key) {
-        let mut existing: Vec<_> = bp
-            .as_array()
-            .unwrap()
+        let arr = bp.as_array_mut().ok_or_else(|| {
+            Error::Other(anyhow!(
+                "`{key}` in minimal.toml must be an array of package names"
+            ))
+        })?;
+
+        let mut existing: Vec<String> = arr
             .iter()
-            .map(|i| i.as_str().unwrap())
-            .collect();
+            .map(|i| {
+                i.as_str().map(str::to_owned).ok_or_else(|| {
+                    Error::Other(anyhow!(
+                        "`{key}` in minimal.toml must be an array of package names"
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        // For multi-line arrays, copy the last element's prefix decor so pushed
+        // elements land on their own line with matching indentation.
+        let last_prefix = arr
+            .iter()
+            .last()
+            .and_then(|v| v.decor().prefix())
+            .and_then(|p| p.as_str())
+            .and_then(|s| s.rfind('\n').map(|i| s[i..].to_owned()));
 
         let mut did_edit = false;
-        upsert.iter().for_each(|p| {
-            if !existing.contains(&p.as_str()) {
-                existing.push(p);
+        for p in upsert {
+            if !existing.iter().any(|e| e == p) {
+                let mut value = Value::from(p.as_str());
+                if let Some(prefix) = &last_prefix {
+                    let carried = if did_edit {
+                        String::new()
+                    } else {
+                        detach_array_close(arr)
+                    };
+                    value.decor_mut().set_prefix(carried + prefix);
+                }
+                arr.push(value);
+                existing.push(p.clone());
                 did_edit = true;
             }
-        });
-        *bp = Item::Value(Value::Array(Array::from_iter(existing)));
-        did_edit
+        }
+        Ok(did_edit)
     } else {
         t.insert(key, Item::Value(Value::Array(Array::from_iter(upsert))));
-        true
+        Ok(true)
     }
+}
+
+/// Prepares a multi-line array for appending after its last element.
+///
+/// Whatever follows the last element up to its final line break, such as a
+/// same-line comment, is cut out and returned so the caller can put it ahead of
+/// the appended element and keep it on the old last element's line. The final
+/// line break and anything after it become the array's trailing text, so the
+/// appended element closes the array the same way the old last element did.
+/// Without a trailing comma that text sits in the last element's suffix,
+/// otherwise in the array's trailing.
+fn detach_array_close(arr: &mut Array) -> String {
+    let trailing = arr.trailing().as_str().unwrap_or_default().to_owned();
+    let suffix = arr
+        .iter()
+        .last()
+        .and_then(|v| v.decor().suffix())
+        .and_then(|s| s.as_str())
+        .filter(|s| s.contains('\n'))
+        .map(str::to_owned);
+    let (tail, rest) = match suffix {
+        Some(suffix) => {
+            if let Some(last) = arr.iter_mut().last() {
+                last.decor_mut().set_suffix("");
+            }
+            (suffix, trailing)
+        }
+        None => (trailing, String::new()),
+    };
+    let Some(i) = tail.rfind('\n') else {
+        return String::new();
+    };
+    arr.set_trailing(format!("{}{rest}", &tail[i..]));
+    tail[..i].trim_end().to_owned()
 }
 
 #[cfg(test)]
@@ -1613,6 +1687,139 @@ mod tests {
             String::from_utf8(std::fs::read(&mfile_path).unwrap())
                 .unwrap()
                 .contains("[session]\npackages = [\"uroot\"]")
+        );
+    }
+
+    #[test]
+    fn upsert_packages_preserves_multiline_layout() {
+        let mut doc = indoc! {r#"
+            packages = [
+              "base", # essential
+              "vim",
+              "git",
+            ]
+        "#}
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        assert!(
+            upsert_toml_packages_list(doc.as_table_mut(), "packages", &["python".to_string()])
+                .unwrap()
+        );
+
+        assert_eq!(
+            doc.to_string(),
+            indoc! {r#"
+                packages = [
+                  "base", # essential
+                  "vim",
+                  "git",
+                  "python",
+                ]
+            "#}
+        );
+    }
+
+    #[test]
+    fn upsert_packages_keeps_last_element_comment_in_place() {
+        let mut doc = indoc! {r#"
+            packages = [
+              "base",
+              "git", # pinned
+            ]
+        "#}
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        assert!(
+            upsert_toml_packages_list(
+                doc.as_table_mut(),
+                "packages",
+                &["python".to_string(), "vim".to_string()]
+            )
+            .unwrap()
+        );
+
+        assert_eq!(
+            doc.to_string(),
+            indoc! {r#"
+                packages = [
+                  "base",
+                  "git", # pinned
+                  "python",
+                  "vim",
+                ]
+            "#}
+        );
+    }
+
+    #[test]
+    fn upsert_packages_without_trailing_comma() {
+        let mut doc = indoc! {r#"
+            packages = [
+              "base",
+              "git"
+            ]
+            tools = [
+              "base",
+              "git" # pinned
+            ]
+        "#}
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        for key in ["packages", "tools"] {
+            assert!(
+                upsert_toml_packages_list(doc.as_table_mut(), key, &["python".to_string()])
+                    .unwrap()
+            );
+        }
+
+        assert_eq!(
+            doc.to_string(),
+            indoc! {r#"
+                packages = [
+                  "base",
+                  "git",
+                  "python"
+                ]
+                tools = [
+                  "base",
+                  "git", # pinned
+                  "python"
+                ]
+            "#}
+        );
+    }
+
+    #[test]
+    fn upsert_packages_keeps_single_line() {
+        let mut doc = "packages = [\"base\", \"vim\"]\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        assert!(
+            upsert_toml_packages_list(doc.as_table_mut(), "packages", &["python".to_string()])
+                .unwrap()
+        );
+
+        assert_eq!(
+            doc.to_string(),
+            "packages = [\"base\", \"vim\", \"python\"]\n"
+        );
+    }
+
+    #[test]
+    fn upsert_packages_errors_on_non_array() {
+        let mut doc = "packages = \"base\"\n".parse::<DocumentMut>().unwrap();
+
+        let err =
+            upsert_toml_packages_list(doc.as_table_mut(), "packages", &["python".to_string()])
+                .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "`packages` in minimal.toml must be an array of package names"
         );
     }
 

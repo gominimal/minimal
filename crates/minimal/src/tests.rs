@@ -475,6 +475,7 @@ fn twin_entry(
         project_path: path.map(|p| paths::HostAbsPath::try_new(p).unwrap()),
         status,
         git: None,
+        host_ip_enforcement: None,
         attrs: None,
     }
 }
@@ -1222,6 +1223,16 @@ fn ingress_spec_rejects_malformed_and_bad_proto() {
     assert!(parse_ingress_mapping("18080:80/icmp").is_err());
 }
 
+#[test]
+fn ingress_spec_rejects_box_port_zero() {
+    let err = parse_ingress_mapping("8080:0").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("port 0 is reserved"),
+        "box port 0 must be rejected: {msg}"
+    );
+}
+
 /// Regression: a config in the `.minimal/` layout must be detected so
 /// `activate` returns without prompting and never scaffolds over it.
 /// The old naive `join(MFILE_NAME)` check missed this path.
@@ -1251,6 +1262,44 @@ fn project_has_mfile_false_when_absent() {
     let dir = tempfile::tempdir().unwrap();
     let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
     assert!(!project_has_mfile(path));
+}
+
+/// `--sync none` drops a config only when one exists up the tree: a
+/// `minimal.toml` at the project root is detected from a nested subdir,
+/// so the notice fires for the case that would otherwise silently lose
+/// the project's packages, vars, patches and hooks.
+#[test]
+fn sync_none_drops_project_config_true_when_mfile_up_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(mfile::MFILE_NAME),
+        "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+    )
+    .unwrap();
+    let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+    let subdir = root.join("nested/deep");
+    std::fs::create_dir_all(&subdir).unwrap();
+
+    assert!(sync_none_drops_project_config(&subdir));
+    let notice = sync_none_notice(&subdir).expect("a config to drop gets a notice");
+    assert!(notice.contains("minimal.toml is not sent"), "{notice}");
+}
+
+/// With no mfile anywhere up the tree, `--sync none` has nothing to
+/// drop, so the notice stays silent. Anchored in `$HOME` for the same
+/// reason as [`resolve_upload_root_returns_input_when_no_mfile`]: the
+/// upward walk stops there, so "no mfile up the tree" is guaranteed.
+#[test]
+fn sync_none_drops_project_config_false_when_no_mfile() {
+    let Some(home) = std::env::home_dir() else {
+        return; // no HOME: no walk boundary to anchor the test to
+    };
+    let Ok(dir) = tempfile::tempdir_in(&home) else {
+        return; // can't create temp dir in HOME, such as on a read only file system
+    };
+    let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+    assert!(!sync_none_drops_project_config(path));
+    assert_eq!(sync_none_notice(path), None);
 }
 
 /// With no mfile anywhere up the tree, `resolve_upload_root` returns the
@@ -1721,6 +1770,76 @@ fn legacy_network_spellings_parse_with_hint() {
     );
 }
 
+/// `--deny-all-egress` conflicts with every egress rule flag at parse
+/// (NET-075's CLI half): a deny-all declaration admits no exceptions, so
+/// combining it with any `--allow-*`/`--deny-*` rule is refused before the
+/// activation runs, naming both flags — and the refusal is the parser's
+/// conflict, not a later validation, so nothing is half-declared. The one
+/// egress-shaped flag it must combine with is `--credentialed-upstream`
+/// (NET-134): the proxy listener is infrastructure, the machine-internal
+/// analogue of the fabric pin's infrastructure set, so a deny-all box may
+/// still declare the lane — the proxy's own checks govern what the lane
+/// grants, and this flag's conflict is with rules, never with
+/// infrastructure.
+#[test]
+fn deny_all_egress_conflicts_with_every_egress_flag() {
+    use clap::Parser as _;
+
+    for (rule, value) in [
+        ("--allow-subnets", "10.0.0.0/8"),
+        ("--allow-dns-hosts", "github.com"),
+        ("--allow-protocols", "tcp"),
+        ("--deny-subnets", "0.0.0.0/0"),
+    ] {
+        let err = Cli::try_parse_from([
+            "min",
+            "session",
+            "activate",
+            "--deny-all-egress",
+            rule,
+            value,
+        ])
+        .map(|_| ())
+        .expect_err("--deny-all-egress must conflict with every egress rule flag");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "the combination must be refused as a parse conflict, not a later \
+             validation: {err}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("--deny-all-egress"),
+            "the refusal must name the deny-all flag: {rendered}"
+        );
+        assert!(
+            rendered.contains(rule),
+            "the refusal must name the rule flag it conflicts with: {rendered}"
+        );
+    }
+
+    // The flag on its own parses, and it carries one meaning wherever the
+    // egress flags appear: a boolean declaration with no value to validate.
+    let args = Cli::try_parse_from(["min", "session", "activate", "--deny-all-egress"])
+        .expect("--deny-all-egress alone must parse");
+    match args.command {
+        Some(Command::Session(SessionArgs {
+            command: SessionCommand::Activate(a),
+        })) => assert!(a.deny_all_egress, "the flag must land on the args"),
+        _ => panic!("expected an activate command"),
+    }
+
+    // The proxy lane is not a rule (NET-134): the two combine.
+    Cli::try_parse_from([
+        "min",
+        "session",
+        "activate",
+        "--deny-all-egress",
+        "--credentialed-upstream",
+    ])
+    .expect("--deny-all-egress must combine with --credentialed-upstream");
+}
+
 /// The CLI reference documents the network flags on `session activate`
 /// (NET-036), read from the real file so a docs edit cannot silently drop
 /// either row.
@@ -1989,8 +2108,8 @@ async fn ls_shows_vm_per_box() {
             json: false,
         },
         &single[0].resp,
-        surfaces[1],
-        answerers[1],
+        surfaces[1].clone(),
+        answerers[1].clone(),
     )
     .expect("format_ls on the same listing");
     assert_eq!(
