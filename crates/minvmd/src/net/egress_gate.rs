@@ -6091,9 +6091,8 @@ mod tests {
     fn gate_verdict_refuses_gateway_dial_from_admitted_port_without_inbound_flow() {
         let registry = BoxRegistry::new(SUBNET);
         // The node row, as the run path registers it: allow-all, at the
-        // node's own address, with the proxy port and the answerer port
-        // admitted.
-        let node = registry.register_node_namespace(7654, 7656);
+        // node's own address, with the proxy port admitted.
+        let node = registry.register_node_namespace(7654);
         let node_addr = node.switch_addr().octets();
         // The publish's note for the proxy port, taken as the applied
         // publish takes it.
@@ -6864,7 +6863,7 @@ mod tests {
     #[tokio::test]
     async fn node_proxy_reply_to_forwarder_reaches_switch() {
         let registry = BoxRegistry::new(SUBNET);
-        let node = registry.register_node_namespace(7654, 7656);
+        let node = registry.register_node_namespace(7654);
         let node_addr = node.switch_addr().octets();
         // The proxy port published at the node's own address, as the
         // daemon's client spells it: the row holds the port, so the publish
