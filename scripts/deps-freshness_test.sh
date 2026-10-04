@@ -15,6 +15,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 script="$here/deps-freshness.sh"
 [ -f "$script" ] || { echo "cannot find deps-freshness.sh next to test" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "jq not installed — skipping deps-freshness_test.sh"; exit 0; }
 
 tmp="$(mktemp -d 2>/dev/null || mktemp -d -t minimal-depsfreshtest)"
 trap 'rm -rf "$tmp"' EXIT
@@ -54,7 +55,13 @@ url="${*: -1}"
 case " $* " in *" --max-time "*) ;; *) echo "curl stub: unbounded call $*" >&2; exit 2 ;; esac
 case "$url" in
     *kernel.org/releases.json)
-        printf '{"releases":[\n{"version": "6.18.3"},\n{"version": "6.12.111"},\n{"version": "6.12.9"}\n]}\n' ;;
+        # KERNEL_STUB: ok (6.12 listed), eol (listed, flagged EOL), absent (dropped).
+        case "${KERNEL_STUB:-ok}" in
+            ok)     k='{"moniker":"longterm","version":"6.12.111","iseol":false},' ;;
+            eol)    k='{"moniker":"longterm","version":"6.12.111","iseol":true},' ;;
+            absent) k='' ;;
+        esac
+        printf '{"releases":[{"moniker":"stable","version":"6.18.3","iseol":false},%s{"moniker":"longterm","version":"6.1.9","iseol":false}]}\n' "$k" ;;
     *latest-releases.yaml)
         printf -- '---\n-\n  title: "Mini root filesystem"\n  version: 3.24.2\n' ;;
     *) echo "curl stub: unexpected $url" >&2; exit 22 ;;
@@ -90,7 +97,7 @@ make_tree() {
     for w in ci nightly-tests; do
         printf '  tool: zizmor@1.30.1\n  run: docker run rhysd/actionlint:1.7.12 -color\n' >"$d/.github/workflows/$w.yml"
     done
-    printf '"wget .../v25.1/protoc-25.1-linux-x86_64.zip"\n' >"$d/Cross.toml"
+    printf 'pre-build = [\n    "wget https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-x86_64.zip -O /tmp/protoc.zip",\n]\n' >"$d/Cross.toml"
     printf 'shellcheck 0.11.0\n' >"$d/.tool-versions"
     printf 'Packages = https://github.com/tbhb/vale-ai-tells/releases/download/v1.31.0/ai-tells.zip, https://github.com/amoslives/vale-ste/releases/download/v0.1.1/ste.zip\n' >"$d/.vale.ini"
 }
@@ -154,13 +161,39 @@ GH_STUB_TAGS="" expect 0 "unreachable upstream reports unknown and does not fail
 
 fresh
 rm "$tree/.tool-versions"
-expect 0 "unreadable pin reports unknown in the report" \
+expect 1 "unreadable pin reports unknown in the report and fails the checks" \
     '^shellcheck +\? +\? +unknown \(pin unreadable\)$' -- run
+
+fresh
+KERNEL_STUB=eol expect 0 "a kernel series kernel.org marks EOL is flagged" \
+    '^kernel \(pkgs virtio-linux\) +6\.12\.105 +6\.12\.111 +behind \(series EOL\)$' -- run
+
+fresh
+KERNEL_STUB=absent expect 0 "a kernel series kernel.org no longer lists reads EOL, not unreachable" \
+    '^kernel \(pkgs virtio-linux\) +6\.12\.105 +\? +series EOL \(no longer listed on kernel\.org\)$' -- run
+
+fresh
+printf '# tool: zizmor@1.29.0 was the previous pin\n' >"$tree/.github/workflows/ci.yml.new"
+cat "$tree/.github/workflows/ci.yml" >>"$tree/.github/workflows/ci.yml.new"
+mv "$tree/.github/workflows/ci.yml.new" "$tree/.github/workflows/ci.yml"
+expect 0 "a comment mentioning a pinned tool is not read as the pin" \
+    '^zizmor +1\.30\.1 +1\.30\.1 +current$' \
+    '^ok +zizmor ci = nightly-tests +1\.30\.1$' -- run
+
+fresh
+printf '  tool: zizmor@1.31.0\n' >>"$tree/.github/workflows/ci.yml"
+expect 1 "a pin matching two values reports ambiguous, not the first" \
+    '^zizmor +\? +\? +unknown \(ambiguous: 1\.30\.1 1\.31\.0\)$' -- run
+expect 1 "an ambiguous pin fails --check" \
+    '^FAIL +zizmor ci = nightly-tests +unresolved' \
+    '^FAIL +pin: zizmor +ambiguous: 1\.30\.1 1\.31\.0' -- run --check --offline
 
 fresh
 expect 0 "--check passes on a consistent tree" \
     '^ok +kani workflow = justfile +0\.68\.0$' \
     '^ok +zizmor ci = nightly-tests +1\.30\.1$' \
+    '^ok +every pin resolves$' \
+    '^ok +every vendor lock file is listed$' \
     -- run --check
 if grep -q 'releases/latest' "$GH_STUB_LOG"; then
     bad "--check skips release lookups (it queried: $(cat "$GH_STUB_LOG"))"
@@ -201,9 +234,27 @@ else
 fi
 
 fresh
+rm "$tree/.tool-versions"
+expect 1 "a local pin that no longer resolves fails --check --offline" \
+    '^FAIL +pin: shellcheck +pin unreadable' -- run --check --offline
+
+fresh
+sed -i.bak 's/^shellcheck /shellcheck-py /' "$tree/.tool-versions"
+expect 1 "a pin line that changed shape fails --check --offline" \
+    '^FAIL +pin: shellcheck +pin unreadable' -- run --check --offline
+
+fresh
+mkdir -p "$tree/vendor/newdep" && printf 'version=v1.0.0\n' >"$tree/vendor/newdep/newdep.lock"
+expect 1 "a vendor lock file with no PINS row fails --check" \
+    '^FAIL +lock file unlisted +vendor/newdep/newdep\.lock has no PINS row$' -- run --check --offline
+
+fresh
 expect 2 "--offline without --check is rejected" 'only applies to --check' -- run --offline
 
-expect 0 "the real tree's duplicated pins agree" '^ok +kani workflow = justfile' \
+expect 0 "the real tree's duplicated pins agree, its pins resolve, its locks are listed" \
+    '^ok +kani workflow = justfile' \
+    '^ok +every pin resolves \(pkgs rows skipped: need the network\)$' \
+    '^ok +every vendor lock file is listed$' \
     -- bash "$script" --check --offline
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

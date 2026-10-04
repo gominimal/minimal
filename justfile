@@ -255,9 +255,11 @@ kernel-review *args:
     scripts/kernel-bump-review.sh {{args}}
 
 # Not a CI gate: the report queries GitHub, kernel.org and Alpine. Lag never
-# fails; the duplicated-pin checks do (`--check`, or `--check --offline` for
-# the ones that read only local files, which `just test-shell` runs). The pin
-# inventory is the PINS table in scripts/deps-freshness.sh. Needs `gh`.
+# fails; the checks do: duplicated pins that disagree, a pin that no longer
+# resolves to exactly one value, and a vendor lock file missing from the
+# inventory (`--check`, or `--check --offline` for the local-only subset,
+# which `just test-shell` runs against this tree). The pin inventory is the
+# PINS table in scripts/deps-freshness.sh. Needs `gh` and `jq`.
 # Report non-Rust dependency pins against upstream (`just deps-freshness [--check]`).
 deps-freshness *args:
     scripts/deps-freshness.sh {{args}}
