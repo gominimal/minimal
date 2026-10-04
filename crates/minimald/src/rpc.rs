@@ -515,18 +515,6 @@ fn classifier_advisory_text(cause: classifier::Cause, guest: bool) -> String {
     advisory
 }
 
-/// The advisory a create owes the start it answers (NET-079): only when both
-/// halves it is about are true — the daemon is not running inside a microVM,
-/// and the session is a host-address box, whose verdict is the one the
-/// host's cgroup tree decides. In the guest the start-up line and each
-/// launch's own record already say the interim's state, and a guest's
-/// causes name its image's builder rather than anything the person starting
-/// a session could run; an own-address box's verdict is decided on address
-/// leases, so there is no per-box state to advise about. Over a host-address
-/// box on a native host, the advisory is the cause in words —
-/// [`classifier_advisory_text`]'s, the same text the daemon's log line for
-/// an advisory-carrying create carries. Pure over its inputs, so the gate
-/// is pinned where it is written.
 /// The refusal an own-address create gets on a VM-backed node when it
 /// carries no handed addresses (NET-081): the VM host allocates every
 /// box-plane address and hands it in through the registration its control
@@ -552,6 +540,18 @@ fn refuse_unhanded_vm_box(
     Ok(())
 }
 
+/// The advisory a create owes the start it answers (NET-079): only when both
+/// halves it is about are true — the daemon is not running inside a microVM,
+/// and the session is a host-address box, whose verdict is the one the
+/// host's cgroup tree decides. In the guest the start-up line and each
+/// launch's own record already say the interim's state, and a guest's
+/// causes name its image's builder rather than anything the person starting
+/// a session could run; an own-address box's verdict is decided on address
+/// leases, so there is no per-box state to advise about. Over a host-address
+/// box on a native host, the advisory is the cause in words —
+/// [`classifier_advisory_text`]'s, the same text the daemon's log line for
+/// an advisory-carrying create carries. Pure over its inputs, so the gate
+/// is pinned where it is written.
 fn create_classifier_advisory(
     in_microvm: bool,
     network: minimald_rpc::NetworkMode,
