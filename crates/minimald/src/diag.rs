@@ -291,6 +291,13 @@ async fn build_bundle(
         state_listing(&mut w, &state_dir, req.include_state_listing)
     );
     collect_step!(w, "sessions", sessions(&mut w, &state_dir));
+    // The local decision log's tail (NET-046): every dynamic ingress
+    // decision this daemon made — allowed, denied, asked and answered — one
+    // line each, with the box, the port, and who decided. Beside the session
+    // records because it is the other half of "what did this daemon do to
+    // whom": the records say what was configured, the audit says what was
+    // decided.
+    collect_step!(w, "audit", audit(&mut w, &state_dir, log_tail_cap(req)));
     collect_step!(w, "env", env(&mut w));
     // Incident captures: pure `/proc`, since the microVM rootfs has no `ps`,
     // `lsof`, `ss` or `ip`. The mechanics are the ones the host bundle uses.
@@ -672,6 +679,40 @@ async fn sessions<W: BundleSink>(
         }
     }
     Ok(())
+}
+
+/// The local decision log's tail (NET-046), beside the session records: one
+/// line per dynamic ingress decision this daemon made, naming the box, the
+/// port, the decision the box's setting made, who decided it, and the
+/// outcome. Its absence is a fresh daemon that has decided nothing — the same
+/// answer `logs` gives a daemon that has never run detached — and any other
+/// failure is a skipped entry, not a broken bundle: `add_file_tail` opens
+/// `O_NOFOLLOW`, so on the guest-writable state volume a `decisions.log`
+/// swapped for a link is refused at open exactly the way a swapped log file
+/// is.
+async fn audit<W: BundleSink>(
+    w: &mut BundleWriter<W>,
+    state_dir: &Path,
+    cap: u64,
+) -> Result<(), anyhow::Error> {
+    let path = crate::audit::log_path(state_dir);
+    match w
+        .add_file_tail(crate::audit::LOG_RELATIVE, &path, cap)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(e) if io_kind(&e) == Some(std::io::ErrorKind::NotFound) => {
+            w.skip(
+                crate::audit::LOG_RELATIVE,
+                "not present — this daemon has recorded no decisions yet",
+            );
+            Ok(())
+        }
+        Err(e) => {
+            w.skip(crate::audit::LOG_RELATIVE, format!("unreadable: {e:#}"));
+            Ok(())
+        }
+    }
 }
 
 /// Reads one session JSON file whole, bounded by [`MAX_SESSION_FILE_BYTES`]
