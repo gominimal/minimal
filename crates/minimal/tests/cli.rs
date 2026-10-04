@@ -943,7 +943,14 @@ async fn policy_json_carries_schema_and_pending() {
     ];
 
     let mut out = Vec::new();
-    write_policy_json(&mut out, &policy, sessions::NetworkMode::OwnIp, None, &live).unwrap();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        Ok(live),
+    )
+    .unwrap();
     let document: Value = serde_json_lenient::from_slice(&out).unwrap();
     assert_eq!(
         document["schema"], "min/v1/session-policy",
@@ -1003,7 +1010,7 @@ async fn policy_json_carries_schema_and_pending() {
         &policy,
         sessions::NetworkMode::OwnIp,
         None,
-        &[pre_field],
+        Ok(vec![pre_field]),
     )
     .unwrap();
     let document: Value = serde_json_lenient::from_slice(&out).unwrap();
@@ -1014,6 +1021,76 @@ async fn policy_json_carries_schema_and_pending() {
         rows[0]["pending"],
         Value::Null,
         "a pre-field row's unknown state rides the document as null, never as a bool:\n{document}"
+    );
+}
+
+/// The `live_ingress` key carries three states a client must be able to tell
+/// apart, because each says a different thing: the rows the daemon served —
+/// an empty list included, which is the claim that the box published
+/// nothing — `null` for the view the daemon could not serve, which is no
+/// claim at all (the box may have published anything, and the run cannot
+/// warn in prose: a `-o json` run's stderr is the error object's alone), and
+/// no key at all for a mode without the surface. A degraded fetch — an
+/// older daemon without the subsystem, a session mid-teardown — is the
+/// middle one, never collapsed into the first.
+#[test]
+fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
+    let policy = sessions::EffectiveSessionPolicy {
+        egress: sessions::EffectiveEgress::AllowAll,
+        ingress: None,
+    };
+
+    // A box that published nothing: the empty list is an authoritative
+    // claim about the box.
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        Ok(Vec::new()),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        document.get("live_ingress"),
+        Some(&Value::Array(Vec::new())),
+        "a served empty view is the box's own claim that it published nothing:\n{document}"
+    );
+
+    // A view the daemon could not serve: `null`, the document's unknown —
+    // present as a key, so it is not the mode's absence either.
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        Err("live port mappings are unavailable: no session found".to_string()),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        document.get("live_ingress"),
+        Some(&Value::Null),
+        "an unavailable live view rides the document as null, never as an empty list:\n{document}"
+    );
+
+    // A mode without the surface: no key at all, a third state again.
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::NoNet,
+        None,
+        Ok(Vec::new()),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        document.get("live_ingress"),
+        None,
+        "a mode without a live-ingress surface leaves the key out entirely:\n{document}"
     );
 }
 

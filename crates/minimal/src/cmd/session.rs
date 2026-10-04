@@ -1791,8 +1791,10 @@ pub async fn cmd_session_policy(
 
     // The ports the box published at runtime, listed beside the declaration
     // (NET-044) — the rows that make a `min net expose` visible rather than
-    // only permitted. Fetched through the shared helper, which degrades the
-    // same way for the JSON rendering below.
+    // only permitted. Fetched through the text walk's own degrade of the
+    // shared fetch: warn on stderr and print no section — the JSON
+    // rendering below degrades differently, saying the unknown in the
+    // document instead.
     let live = fetch_live_ingress_degrading(&mut client, &args.session).await;
 
     match resp {
@@ -2108,19 +2110,41 @@ struct PolicyJson<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     node_plane_baseline: Option<PolicyBaselineJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    live_ingress: Option<&'a [minimald_rpc::LiveMapping]>,
+    live_ingress: Option<LiveIngressJson>,
+}
+
+/// The live rows as the document carries them — the two states a client
+/// must be able to tell apart, because each says a different thing about
+/// the box: the rows the wire served, `pending` included — an empty list
+/// is a claim about the box, that it published nothing — or `null`, the
+/// view the daemon could not serve, which is no claim at all: the box may
+/// have published anything, so an unavailability must never read as a
+/// publish count of zero. (The third state is the key's absence, which
+/// [`write_policy_json`] decides from the mode: a box with no network has
+/// no live-ingress surface.)
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum LiveIngressJson {
+    /// The daemon could not serve the view — an older build without the
+    /// subsystem, a session mid-teardown. The same `null` a pre-field
+    /// `pending` row reads as: unknown, never empty.
+    Unavailable,
+    /// The rows the wire served.
+    Rows(Vec<minimald_rpc::LiveMapping>),
 }
 
 /// The document renderer `min session policy -o json` goes through — the
 /// JSON-side counterpart of [`format_policy`], taking the same inputs the
-/// command walks for so the two renderings describe the same policy. Shared
-/// with the tests that pin the document, the way [`format_policy`] is.
+/// command walks for so the two renderings describe the same policy: the
+/// live rows arrive as the fetch's own result, served or failed, because
+/// which of the two it was is part of what the document says. Shared with
+/// the tests that pin the document, the way [`format_policy`] is.
 pub fn write_policy_json(
     out: &mut impl std::io::Write,
     effective: &sessions::EffectiveSessionPolicy,
     network: sessions::NetworkMode,
     fabric: Option<switch::SwitchSubnet>,
-    live: &[minimald_rpc::LiveMapping],
+    live: Result<Vec<minimald_rpc::LiveMapping>, String>,
 ) -> Result<(), anyhow::Error> {
     // A none box has no policy to describe; the text rendering's one-line
     // note is prose for a person, so the document carries the schema and
@@ -2169,7 +2193,16 @@ pub fn write_policy_json(
             // The wire's own rows, `pending` included — an empty list is a
             // claim about the box (it published nothing), which is what the
             // key is for; the modes without a surface leave it out instead.
-            live_ingress: Some(live),
+            // A fetch that failed is neither of those, so it must not
+            // collapse into the first: the box may have published anything,
+            // and the run cannot warn about it in prose either (a `-o
+            // json` run's stderr is the error object's alone), so the
+            // document says the state itself — `null`, the unknown — and
+            // the why goes nowhere.
+            live_ingress: Some(match live {
+                Ok(rows) => LiveIngressJson::Rows(rows),
+                Err(_) => LiveIngressJson::Unavailable,
+            }),
         }
     };
     let encoded =
@@ -2227,20 +2260,25 @@ impl PolicyJsonFailure {
     }
 }
 
-/// The live-ingress half of either rendering's walk: the ports the box
-/// published at runtime, listed beside the declaration (NET-044) — the rows
-/// that make a `min net expose` visible rather than only permitted. Built
-/// through `SessionLookup::parse` rather than a conversion so the request
-/// types stay the rpc crate's, where the wire contract lives. A view of live
-/// state, not a fact the listing stands on, so it degrades rather than
-/// fails: against a daemon that cannot serve it — an older build without
-/// the subsystem, a session mid-teardown — the declaration still renders,
-/// with a warning that the live rows are unavailable rather than a claim
-/// that nothing is published.
-async fn fetch_live_ingress_degrading(
+/// The live-ingress fetch itself: the ports the box published at runtime
+/// (NET-044) — the rows that make a `min net expose` visible rather than
+/// only permitted — as the wire served them, or the failure as its
+/// message. Built through `SessionLookup::parse` rather than a conversion
+/// so the request types stay the rpc crate's, where the wire contract
+/// lives.
+///
+/// A view of live state, not a fact the listing stands on, so both walks
+/// degrade rather than fail — and the failure comes back rather than being
+/// printed here, because the two renderings degrade differently and only
+/// one of them may say it in prose: the text walk warns on stderr
+/// ([`fetch_live_ingress_degrading`]), while a `-o json` run's stderr is
+/// the error object's alone, so its document says the view is unknown
+/// instead (see [`write_policy_json`]) — an unavailability must never read
+/// as a claim that the box published nothing.
+async fn fetch_live_ingress(
     client: &mut client::Client,
     session: &str,
-) -> Vec<minimald_rpc::LiveMapping> {
+) -> Result<Vec<minimald_rpc::LiveMapping>, String> {
     let live_lookup = match SessionLookup::parse(session) {
         SessionLookup::Id(id) => minimald_rpc::GetLiveIngressRequest::Id(id),
         SessionLookup::Name(n) => minimald_rpc::GetLiveIngressRequest::Name(n),
@@ -2249,23 +2287,40 @@ async fn fetch_live_ingress_degrading(
         .oneshot_rpc::<minimald_rpc::GetLiveIngress>(live_lookup)
         .await
     {
-        Ok(minimald_rpc::Errorable::Ok(live)) => live,
+        Ok(minimald_rpc::Errorable::Ok(live)) => Ok(live),
         Ok(minimald_rpc::Errorable::Err { error }) => {
-            eprintln!("warning: live port mappings are unavailable: {error}");
-            Vec::new()
+            Err(format!("live port mappings are unavailable: {error}"))
         }
-        Err(error) => {
-            eprintln!("warning: live port mappings are unavailable: {error:#}");
-            Vec::new()
-        }
+        Err(error) => Err(format!("live port mappings are unavailable: {error:#}")),
     }
+}
+
+/// The text walk's degrade of [`fetch_live_ingress`]: against a daemon
+/// that cannot serve the rows — an older build without the subsystem, a
+/// session mid-teardown — the declaration still renders, with a warning
+/// that the live rows are unavailable rather than a claim that nothing is
+/// published. Prose for a person, so stderr is where it goes, and this is
+/// the one rendering that may put it there.
+async fn fetch_live_ingress_degrading(
+    client: &mut client::Client,
+    session: &str,
+) -> Vec<minimald_rpc::LiveMapping> {
+    fetch_live_ingress(client, session)
+        .await
+        .unwrap_or_else(|warning| {
+            eprintln!("warning: {warning}");
+            Vec::new()
+        })
 }
 
 /// The walk behind the JSON rendering: the same three steps as the text
 /// walk — resolve the record, read the effective policy, list the live
 /// mappings — with each failure tagged where the kinds can be told apart,
-/// since the error document's `code` is a contract, and with the same
-/// degrade-or-warn live fetch.
+/// since the error document's `code` is a contract. The live fetch comes
+/// back as its own result rather than degraded here, because the two
+/// renderings degrade differently (see [`fetch_live_ingress`]): the
+/// document says the unknown itself, so nothing is printed for it on a
+/// stderr the error object has alone.
 async fn session_policy_json_inputs(
     global: &GlobalArgs,
     session: &str,
@@ -2273,7 +2328,7 @@ async fn session_policy_json_inputs(
     (
         sessions::Record,
         sessions::EffectiveSessionPolicy,
-        Vec<minimald_rpc::LiveMapping>,
+        Result<Vec<minimald_rpc::LiveMapping>, String>,
     ),
     PolicyJsonFailure,
 > {
@@ -2303,7 +2358,7 @@ async fn session_policy_json_inputs(
         .await
         .map_err(|error| PolicyJsonFailure::PolicyUnavailable(format!("{error:#}")))?;
 
-    let live = fetch_live_ingress_degrading(&mut client, session).await;
+    let live = fetch_live_ingress(&mut client, session).await;
 
     match resp {
         minimald_rpc::Errorable::Ok(policy) => Ok((record, policy, live)),
@@ -2333,7 +2388,7 @@ async fn session_policy_as_json(global: &GlobalArgs, session: &str) -> Result<()
     let fabric = (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
         .then_some(switch::SwitchSubnet::default());
     let mut out = std::io::stdout();
-    write_policy_json(&mut out, &policy, record.network, fabric, &live)?;
+    write_policy_json(&mut out, &policy, record.network, fabric, live)?;
     out.flush().context("Failed to write policy")?;
     Ok(())
 }
