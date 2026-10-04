@@ -1223,6 +1223,16 @@ fn ingress_spec_rejects_malformed_and_bad_proto() {
     assert!(parse_ingress_mapping("18080:80/icmp").is_err());
 }
 
+#[test]
+fn ingress_spec_rejects_box_port_zero() {
+    let err = parse_ingress_mapping("8080:0").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("port 0 is reserved"),
+        "box port 0 must be rejected: {msg}"
+    );
+}
+
 /// Regression: a config in the `.minimal/` layout must be detected so
 /// `activate` returns without prompting and never scaffolds over it.
 /// The old naive `join(MFILE_NAME)` check missed this path.
