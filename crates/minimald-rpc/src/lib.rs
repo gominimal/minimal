@@ -711,6 +711,19 @@ pub enum ReportSource {
     Listen,
 }
 
+impl std::fmt::Display for ReportSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The wire's own word — the one the host's diagnostics line and
+        // audit copy spell the source by, so a log line and its JSON
+        // report never disagree.
+        f.write_str(match self {
+            Self::Expose => "expose",
+            Self::Ask => "ask",
+            Self::Listen => "listen",
+        })
+    }
+}
+
 /// The in-VM daemon's report that one port now stands published on the
 /// box's address at runtime (NET-138): the row key, the port, the protocol
 /// — and the reporting source, the one word the host's log line names the
@@ -2929,10 +2942,9 @@ mod tests {
 
         // A refused report stays the socket's one refusal shape, and it
         // still decodes — the reporting side reads the sentence and unwinds.
-        let refused: BoxControlReply = serde_json_lenient::from_str(
-            r#"{"error":"the row holds no grant for port 3000"}"#,
-        )
-        .expect("a refused report decodes");
+        let refused: BoxControlReply =
+            serde_json_lenient::from_str(r#"{"error":"the row holds no grant for port 3000"}"#)
+                .expect("a refused report decodes");
         assert_eq!(
             refused,
             BoxControlReply::Error {
@@ -2989,13 +3001,18 @@ mod tests {
             declared_ports: vec![80, 443],
             runtime_ports: vec![3000, 3001],
         };
-        let held = BoxControlReply::Row(BoxRowReport { row: Some(row.clone()) });
+        let held = BoxControlReply::Row(BoxRowReport {
+            row: Some(row.clone()),
+        });
         assert_eq!(round_trip(&held), held);
 
         // The line's shape, verbatim: the row's four facts, held.
         let line = serde_json_lenient::to_string(&held).expect("serialize");
         assert!(line.contains(r#""switch_address":"100.64.0.10""#), "{line}");
-        assert!(line.contains(r#""egress_allow_list":["10.0.0.0/8"]"#), "{line}");
+        assert!(
+            line.contains(r#""egress_allow_list":["10.0.0.0/8"]"#),
+            "{line}"
+        );
         assert!(line.contains(r#""declared_ports":[80,443]"#), "{line}");
         assert!(line.contains(r#""runtime_ports":[3000,3001]"#), "{line}");
 
@@ -3003,11 +3020,15 @@ mod tests {
         // and not an error the reader would have to interpret.
         let gone = BoxControlReply::Row(BoxRowReport { row: None });
         assert_eq!(
-            round_trip(&gone), gone,
+            round_trip(&gone),
+            gone,
             "no row held round-trips as the same absence"
         );
         let line = serde_json_lenient::to_string(&gone).expect("serialize");
-        assert_eq!(line, r#"{"row":null}"#, "the absence is one flat object: {line}");
+        assert_eq!(
+            line, r#"{"row":null}"#,
+            "the absence is one flat object: {line}"
+        );
 
         // The untagged reply never mistakes the row report for one of the
         // earlier variants — every reply is one line, and the line a row
@@ -3025,7 +3046,7 @@ mod tests {
                         egress_allow_list: None,
                         declared_ports: vec![],
                         runtime_ports: vec![],
-                    })
+                    }),
                 }),
             ),
         ] {

@@ -46,6 +46,83 @@ pub fn run(json: bool) -> Result<StatusExit> {
     run_with_state_dir(json, StateDir::default_path())
 }
 
+/// Run the read-only row read, `minvmd status --row <name>` (NET-138): one
+/// request line over the VM host daemon's control socket, and the reply
+/// printed — the live row the box's name resolves to (its switch address,
+/// its derived egress allow-list, and its declared and runtime-admitted
+/// ports), or the report that no row is held. The reply is the verb's own
+/// answer, printed verbatim under `--json`; the human line spells the same
+/// facts.
+///
+/// The read is served only while the daemon is: a served read exits 0
+/// whether or not a row is held — absence is the answer, not a failure —
+/// and a control socket that cannot be reached, or a reply the daemon
+/// refuses to give, is the error this command fails with.
+pub fn run_row(json: bool, name: &str) -> Result<()> {
+    let sock_path = crate::control::resolve_control_sock()
+        .context("resolving the VM host daemon's control socket for the row read")?;
+    let reply = crate::control::read_row(&sock_path, name)
+        .with_context(|| format!("reading the row of the box `{name}` over the control socket"))?;
+    match reply {
+        minimald_rpc::BoxControlReply::Row(report) => {
+            if json {
+                let json_line = serde_json_lenient::to_string(&report)
+                    .context("serialising the row read's reply")?;
+                println!("{json_line}");
+            } else {
+                print_row_human(name, &report);
+            }
+            Ok(())
+        }
+        minimald_rpc::BoxControlReply::Error { error } => {
+            anyhow::bail!("the VM host daemon refused the row read for `{name}`: {error}")
+        }
+        other => anyhow::bail!(
+            "the VM host daemon answered the row read for `{name}` with another verb's reply: {other:?}"
+        ),
+    }
+}
+
+/// The human line for the row read: the row's own facts in the words the
+/// registration used, or the one-line absence.
+fn print_row_human(name: &str, report: &minimald_rpc::BoxRowReport) {
+    match &report.row {
+        Some(row) => {
+            let allow_list = match &row.egress_allow_list {
+                Some(list) if list.is_empty() => "deny all".to_string(),
+                Some(list) => list.join(" "),
+                None => "allow all".to_string(),
+            };
+            println!(
+                "row for `{name}`: switch address {}, egress {allow_list}",
+                row.switch_address
+            );
+            println!(
+                "  declared ports {} · runtime ports {}",
+                ports_text(&row.declared_ports),
+                ports_text(&row.runtime_ports),
+            );
+        }
+        None => println!("no row is held for `{name}`"),
+    }
+}
+
+/// A port set as one readable word, bounded the way a long set stays one
+/// line: the first few, and the count.
+fn ports_text(ports: &[u16]) -> String {
+    match ports.len() {
+        0 => "(none)".to_string(),
+        count if count > 5 => {
+            let shown: Vec<String> = ports.iter().take(5).map(u16::to_string).collect();
+            format!("[{} … {count} total]", shown.join(", "))
+        }
+        _ => {
+            let shown: Vec<String> = ports.iter().map(u16::to_string).collect();
+            format!("[{}]", shown.join(", "))
+        }
+    }
+}
+
 fn run_with_state_dir(json: bool, dir: std::path::PathBuf) -> Result<StatusExit> {
     let state_dir = StateDir::new(dir).context("opening state dir")?;
 

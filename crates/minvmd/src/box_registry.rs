@@ -34,12 +34,13 @@
 //! attachment with it — the same host-side facts, the same trust boundary,
 //! the one writer.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use sessions::DynamicIngress;
 use sessions::EgressPolicy;
 use sessions::core::egress::EgressRules;
 use sessions::core::zone_answer;
@@ -78,6 +79,97 @@ pub fn node_zone_name() -> String {
 /// every time (a hash map's would vary run to run).
 type Rows = BTreeMap<[u8; 4], Arc<BoxRecord>>;
 
+/// The per-row cap on runtime-admitted ports (NET-138's report half): once
+/// a row holds this many runtime ports, an admit report for a new port is
+/// refused — the row's runtime set is host-held state, and this bounds how
+/// much of it one box's lifetime may pin. A report for a port the row
+/// already holds never touches the cap: the set does not grow.
+pub const RUNTIME_PORT_CAP: usize = 256;
+
+/// The per-row admit rate (NET-138's report half): at most this many
+/// recorded admits per rolling [`RUNTIME_ADMIT_WINDOW`]. A stream of
+/// reports faster than one row can absorb is refused at the tenth, whatever
+/// the grant says — a withdraw report is never refused by the rate, so the
+/// end of a runtime admission can always be recorded even while the box's
+/// publishes are being throttled.
+pub const RUNTIME_ADMIT_RATE: usize = 10;
+
+/// The window the admit rate counts within.
+const RUNTIME_ADMIT_WINDOW: Duration = Duration::from_secs(1);
+
+/// The runtime-admitted half a row holds beside its declaration (NET-138):
+/// the ports the in-VM daemon's reports earned inside the grant the same
+/// declaration set, and the instants those admissions were recorded at —
+/// the rolling record the admit rate decides by. Interior to one row, held
+/// under the row's own lock (never the table's), so a report lands while the
+/// gate reads the table's rows without either waiting on the other longer
+/// than one admission takes.
+#[derive(Debug, Default)]
+struct RuntimePorts {
+    /// The admitted ports, ascending — the shape the row reports and the
+    /// gate's publish records read.
+    ports: BTreeSet<u16>,
+    /// When the last recorded admits landed: at most one entry per
+    /// admission inside the window, drained as it ages out.
+    admits: VecDeque<Instant>,
+}
+
+/// The row's runtime half under its lock, with the comparisons a row's
+/// derive needs. Two rows are equal when their declarations and their
+/// runtime port sets are equal; the rolling admit window is rate state,
+/// not row content, and a row fresh from its first admission compares
+/// equal to itself a second later — the port set is the fact, the window
+/// only how fast it filled.
+#[derive(Debug, Default)]
+struct RuntimeCell(Mutex<RuntimePorts>);
+
+impl PartialEq for RuntimeCell {
+    fn eq(&self, other: &Self) -> bool {
+        let lock_poison =
+            "the runtime cell's lock is never held across a panic, so it cannot be poisoned";
+        self.0.lock().expect(lock_poison).ports == other.0.lock().expect(lock_poison).ports
+    }
+}
+
+impl Eq for RuntimeCell {}
+
+/// Why an admit report was refused against the host-held grant (NET-138):
+/// each refusal names its own fact — the row the report named, the stance
+/// the row holds from its registration, the range beside that stance, or
+/// the row's own bounds, the cap and the admit rate — in one sentence the
+/// reporting side reads off the socket's refusal and unwinds its publish
+/// with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AdmitError {
+    /// No row is held at the address the report keyed: a box that was
+    /// never registered, or whose row a withdrawal already retired.
+    #[error("no row is held at switch address {switch_address}")]
+    NoRow { switch_address: Ipv4Addr },
+    /// The row's dynamic ingress stance is not a grant: absent or `deny`
+    /// admits nothing at runtime, and `allow` and `ask` are the only
+    /// stances a runtime port may be earned under. An absent stance renders
+    /// as deny, the meaning an unspecified setting carries.
+    #[error("the box's dynamic ingress stance is {rendered}, so no runtime port is granted", rendered = stance.map_or_else(|| "deny".to_string(), |stance| stance.to_string()))]
+    StanceDenied { stance: Option<DynamicIngress> },
+    /// The row's stance is a grant but its registration declared no permit
+    /// range — and an absent range permits nothing, the same meaning the
+    /// box's own decision gives it (NET-047).
+    #[error("the box's dynamic ingress carries no permit range, so no port is inside the grant")]
+    NoRange,
+    /// The port falls outside the row's permit range, inclusive at both
+    /// bounds.
+    #[error("port {port} is outside the box's dynamic range {}-{}", range.0, range.1)]
+    OutsideRange { port: u16, range: (u16, u16) },
+    /// The row already holds the cap of runtime ports
+    /// ([`RUNTIME_PORT_CAP`]); a row this full refuses the next new port.
+    #[error("the row already holds the cap of {cap} runtime ports")]
+    RowCapFull { cap: usize },
+    /// The row's admit rate ([`RUNTIME_ADMIT_RATE`] per rolling second) is
+    /// exceeded; the report stream outran one row's absorption.
+    #[error("the row's admit rate of {rate} per second is exceeded")]
+    RateLimited { rate: usize },
+}
+
 /// One published namespace's row in the host-side table. Of what it holds,
 /// two dimensions decide a frame from this namespace's address: its switch
 /// address, the lease the shared verdict checks every frame's source against
@@ -106,6 +198,33 @@ pub struct BoxRecord {
     resolves_names: bool,
     dns_hosts: Vec<String>,
     credentialed_upstream: bool,
+    /// The box's dynamic ingress stance, as its registration carried it
+    /// (NET-043): the host-held half of the grant an admit report is
+    /// checked against — `allow` and `ask` earn a runtime port inside the
+    /// range beside this, absent and `deny` admit nothing. `None` is the
+    /// deny-all default an unspecified setting means, the same reading the
+    /// box's own decision gives it.
+    dynamic_ingress: Option<DynamicIngress>,
+    /// The inclusive permit range the box's dynamic ingress was granted
+    /// within, as its registration carried it (NET-047). `None` permits
+    /// nothing — the same reading the box's own decision gives an absent
+    /// range — so an admit report against a range-less row is refused
+    /// however permissive its stance reads.
+    dynamic_allowed_range: Option<(u16, u16)>,
+    /// The derived egress allow-list: the destination CIDR prefixes the
+    /// declaration's `allow_subnets` carried, verbatim — the row-report
+    /// half of the declaration the client can read back
+    /// (`None` the allow-all default). Retained beside the compiled rules
+    /// because the compiled rules no longer spell them: prefixes are the
+    /// decision's shape, and the declaration's own words are the report's.
+    egress_allow_list: Option<Vec<String>>,
+    /// The runtime-admitted half (NET-138's report half): the ports the
+    /// in-VM daemon's reports earned inside the grant the declaration
+    /// holds, with the rolling admit record the rate decides by. Held
+    /// under its own lock — the row is shared with the gate's read-only
+    /// table — and dropped with the row: a row's withdrawal clears its
+    /// runtime set, because the set lives nowhere else.
+    runtime: RuntimeCell,
 }
 
 impl BoxRecord {
@@ -232,6 +351,52 @@ impl BoxRecord {
     pub fn declares_credentialed_upstream(&self) -> bool {
         self.credentialed_upstream
     }
+
+    /// The box's dynamic ingress stance, as its registration carried it:
+    /// the host-held grant an admit report is checked against. `None` is
+    /// the deny-all default an unspecified setting means.
+    #[must_use]
+    pub fn dynamic_ingress(&self) -> Option<DynamicIngress> {
+        self.dynamic_ingress
+    }
+
+    /// The inclusive permit range the box's dynamic ingress was granted
+    /// within. `None` permits nothing — the reading the box's own decision
+    /// gives an absent range (NET-047).
+    #[must_use]
+    pub fn dynamic_allowed_range(&self) -> Option<(u16, u16)> {
+        self.dynamic_allowed_range
+    }
+
+    /// The derived egress allow-list: the destination CIDR prefixes the
+    /// declaration's `allow_subnets` carried, verbatim. `None` is the
+    /// allow-all default — the same meaning the create request's egress
+    /// policy gives an absent field.
+    #[must_use]
+    pub fn egress_allow_list(&self) -> Option<&[String]> {
+        self.egress_allow_list.as_deref()
+    }
+
+    /// The ports the in-VM daemon's reports earned inside the grant this
+    /// row holds (NET-138's report half): the runtime-admitted set, the
+    /// records the gate's publish decision admits by beside the declared
+    /// ports, and the ones a retract decision requires. Ascending, the
+    /// shape the set stores; a row that reported nothing admits only what
+    /// its declaration named. Cleared with the row — a withdrawn row's
+    /// runtime set is gone, and a re-registered row starts empty.
+    #[must_use]
+    pub fn runtime_ports(&self) -> Vec<u16> {
+        self.runtime
+            .0
+            .lock()
+            .expect(
+                "the runtime cell's lock is never held across a panic, so it cannot be poisoned",
+            )
+            .ports
+            .iter()
+            .copied()
+            .collect()
+    }
 }
 
 /// A namespace's declaration as it arrives on the host, before any frame
@@ -248,6 +413,8 @@ pub struct BoxRegistration {
     declared_names: Vec<String>,
     egress: Option<EgressPolicy>,
     credentialed_upstream: Option<sessions::CredentialedUpstream>,
+    dynamic_ingress: Option<DynamicIngress>,
+    dynamic_allowed_range: Option<(u16, u16)>,
 }
 
 impl BoxRegistration {
@@ -268,6 +435,8 @@ impl BoxRegistration {
             declared_names: Vec::new(),
             egress: None,
             credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
         }
     }
 
@@ -314,6 +483,23 @@ impl BoxRegistration {
         self.credentialed_upstream = Some(declaration);
         self
     }
+
+    /// The box's dynamic ingress grant (NET-043/NET-047): the stance a
+    /// runtime port is earned under — `allow` or `ask`, with absent and
+    /// `deny` admitting nothing — and the inclusive range it is earned
+    /// within, where `None` permits nothing. The row holds both so an
+    /// admit report is checked against the grant the creating client
+    /// declared, never against whatever the box later claims (NET-138).
+    #[must_use]
+    pub fn with_dynamic_ingress(
+        mut self,
+        stance: DynamicIngress,
+        allowed_range: Option<(u16, u16)>,
+    ) -> Self {
+        self.dynamic_ingress = Some(stance);
+        self.dynamic_allowed_range = allowed_range;
+        self
+    }
 }
 
 /// A box declaration as the activating client carries it over the host's
@@ -340,6 +526,18 @@ pub struct ClientBoxSpec {
     /// refused under the box-to-host default-deny. The one field a client
     /// that predates NET-134 sends absent, every time.
     pub credentialed_upstream: Option<sessions::CredentialedUpstream>,
+    /// The box's dynamic ingress stance, from the same create inputs the
+    /// session record holds (NET-043): the host row holds it so the
+    /// admission of a runtime port is the host's own check against the
+    /// grant the creating client declared. `None` is the deny-all default
+    /// an unspecified setting means — the one a client that predates the
+    /// runtime report half sends, every time.
+    pub dynamic_ingress: Option<DynamicIngress>,
+    /// The inclusive port range the box's dynamic ingress is permitted
+    /// within, from the same create inputs the session record holds
+    /// (NET-047). `None` permits nothing, the same meaning the box's own
+    /// decision gives an absent range.
+    pub dynamic_allowed_range: Option<(u16, u16)>,
 }
 
 /// The run of `subnet`'s address plan the host hands registered boxes from:
@@ -608,6 +806,15 @@ impl BoxRegistry {
             .cloned()
             .unwrap_or_default();
         let resolves_names = !dns_hosts.is_empty();
+        // The row's reportable allow-list: the declaration's own
+        // `allow_subnets` words, retained verbatim beside the compiled
+        // prefixes because the compiled rules no longer spell them — the
+        // row read names what the declaration allowed, in the words it
+        // allowed them by.
+        let egress_allow_list = registration
+            .egress
+            .as_ref()
+            .and_then(|policy| policy.allow_subnets.clone());
         // The box's own id (BEP-070): the one a client-driven registration
         // minted and checked ([`Self::register_client_box`]), or a fresh
         // UUIDv7 minted here for this creation — never a counter, never a
@@ -641,6 +848,15 @@ impl BoxRegistry {
             loopback_addr: registration.loopback_addr,
             admitted_ports: registration.admitted_ports,
             declared_names: registration.declared_names,
+            // The runtime grant the report half is checked against
+            // (NET-138): the stance and range the creating client declared,
+            // held outside the VM where nothing the box says can change
+            // them. The runtime set starts empty — a row's runtime
+            // admissions are its reports' to earn, one admit at a time.
+            dynamic_ingress: registration.dynamic_ingress,
+            dynamic_allowed_range: registration.dynamic_allowed_range,
+            egress_allow_list,
+            runtime: RuntimeCell::default(),
         });
         // NET-133: the box's proxy attachment is issued from the row's own
         // host facts — the name, both addresses, and the box's own id
@@ -810,6 +1026,9 @@ impl BoxRegistry {
         if let Some(declaration) = spec.credentialed_upstream {
             registration = registration.with_credentialed_upstream(declaration);
         }
+        if let Some(stance) = spec.dynamic_ingress {
+            registration = registration.with_dynamic_ingress(stance, spec.dynamic_allowed_range);
+        }
         registration.box_id = Some(id);
         Ok(self.register(registration))
     }
@@ -904,6 +1123,151 @@ impl BoxRegistry {
         drop(rows);
         self.retired(&removed);
         Ok(removed)
+    }
+
+    /// Records one runtime admission in the box's row (NET-138's report
+    /// half): the in-VM daemon's report of a port it published at runtime,
+    /// checked against the grant the row holds from its registration before
+    /// anything is written. The row must be live, its dynamic ingress stance
+    /// must be `allow` or `ask`, and the port must fall inside the row's
+    /// permit range — inclusive at both bounds, with an absent range
+    /// permitting nothing — and then the row's own bounds apply: the cap on
+    /// distinct runtime ports ([`RUNTIME_PORT_CAP`]) and the rolling admit
+    /// rate ([`RUNTIME_ADMIT_RATE`] per second). Every refusal names its
+    /// own fact in [`AdmitError`], for the one warn line the control socket
+    /// writes and the sentence the reporting side unwinds with.
+    ///
+    /// A report for a port the row already holds is recorded again without
+    /// touching the cap — the set does not grow — but it does spend a rate
+    /// slot: the rate bounds the reports the row absorbs, not the ports it
+    /// ends up holding. The check and the write run under the row lock, so a
+    /// withdrawal cannot land between finding the row and recording into
+    /// it: a row that admits is live the whole admission through.
+    ///
+    /// Returns the row recorded into, so the one info line the caller logs
+    /// names the box by its own row's name.
+    pub fn admit_runtime_port(
+        &self,
+        switch_addr: Ipv4Addr,
+        port: u16,
+    ) -> Result<Arc<BoxRecord>, AdmitError> {
+        #[expect(
+            clippy::unwrap_in_result,
+            reason = "the expects are the locks' poison guards, not this function's error \
+                      handling: neither lock is ever held across a panic, so neither can be \
+                      poisoned"
+        )]
+        let rows = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        let Some(record) = rows.get(&switch_addr.octets()) else {
+            return Err(AdmitError::NoRow {
+                switch_address: switch_addr,
+            });
+        };
+        // The stance decides first and the range second, the same order the
+        // box's own decision reads them in — a box that denies never reveals
+        // whether the port would have been in range.
+        if !matches!(
+            record.dynamic_ingress,
+            Some(DynamicIngress::Allow) | Some(DynamicIngress::Ask)
+        ) {
+            return Err(AdmitError::StanceDenied {
+                stance: record.dynamic_ingress,
+            });
+        }
+        match record.dynamic_allowed_range {
+            None => return Err(AdmitError::NoRange),
+            Some((low, high)) if low <= port && port <= high => {}
+            Some(range) => {
+                return Err(AdmitError::OutsideRange { port, range });
+            }
+        }
+        let mut runtime = record.runtime.0.lock().expect(
+            "the runtime cell's lock is never held across a panic, so it cannot be poisoned",
+        );
+        let now = Instant::now();
+        // The rate window rolls on arrivals: a slot older than the window
+        // no longer counts against this report.
+        while runtime
+            .admits
+            .front()
+            .is_some_and(|&recorded_at| now.duration_since(recorded_at) > RUNTIME_ADMIT_WINDOW)
+        {
+            runtime.admits.pop_front();
+        }
+        if runtime.admits.len() >= RUNTIME_ADMIT_RATE {
+            return Err(AdmitError::RateLimited {
+                rate: RUNTIME_ADMIT_RATE,
+            });
+        }
+        // The cap bounds the ports the row holds, not the reports it
+        // re-records: a port already admitted was inside the cap when it
+        // was earned and the set is not growing now.
+        if !runtime.ports.contains(&port) && runtime.ports.len() >= RUNTIME_PORT_CAP {
+            return Err(AdmitError::RowCapFull {
+                cap: RUNTIME_PORT_CAP,
+            });
+        }
+        runtime.admits.push_back(now);
+        runtime.ports.insert(port);
+        Ok(Arc::clone(record))
+    }
+
+    /// Ends one runtime admission in the box's row (NET-138's report half):
+    /// the in-VM daemon's report that a published port's admission is over.
+    /// Never refused by the cap or the rate — the end of an admission is
+    /// always recordable, whatever the row's bounds say about new ones —
+    /// and idempotent: a port the row no longer held was already in the
+    /// report's goal state.
+    ///
+    /// `Some((row, removed))` when a row is live at the address — `removed`
+    /// says whether the row held the port, the fact its one line names —
+    /// and `None` when no row is, in which case the withdrawal already
+    /// cleared the whole runtime set with the row. A row's withdrawal
+    /// clears its runtime ports the only way a set can be cleared here:
+    /// structurally, because the set lives in the row and the row is gone.
+    pub fn withdraw_runtime_port(
+        &self,
+        switch_addr: Ipv4Addr,
+        port: u16,
+    ) -> Option<(Arc<BoxRecord>, bool)> {
+        let rows = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        let record = rows.get(&switch_addr.octets())?;
+        let removed = record
+            .runtime
+            .0
+            .lock()
+            .expect(
+                "the runtime cell's lock is never held across a panic, so it cannot be poisoned",
+            )
+            .ports
+            .remove(&port);
+        Some((Arc::clone(record), removed))
+    }
+
+    /// Resolves a box's name to its live row (NET-138's read-only row
+    /// verb): the name a row was registered under — the session name the
+    /// box was created with, the same name the zone answers it by. A
+    /// destroyed box's name resolves to no row, never to the row it last
+    /// held, because a withdrawal removed that row; a box registered again
+    /// under the name resolves to the live registration's. Names are held
+    /// unique per daemon by the register paths' own rules (a client box's
+    /// name keys its withdrawal proof); a name that somehow names two live
+    /// rows resolves to the one at the lower switch address, the rows' own
+    /// deterministic order.
+    pub fn row_by_name(&self, name: &str) -> Option<Arc<BoxRecord>> {
+        let rows = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        rows.values()
+            .find(|record| record.name() == name)
+            .map(Arc::clone)
     }
 
     /// Retires a removed row's side facts: its stopped mark is stale with
@@ -1636,6 +2000,8 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
             })
             .expect("the default plan has hand-out addresses");
         assert_eq!(
@@ -1663,6 +2029,8 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
             })
             .expect("the carved subnet has hand-out addresses");
         assert_eq!(
@@ -1677,6 +2045,8 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
                 })
                 .expect("the slice holds 32 published addresses");
         }
@@ -1688,6 +2058,8 @@ mod tests {
                         ingress_ports: Vec::new(),
                         egress: None,
                         credentialed_upstream: None,
+                        dynamic_ingress: None,
+                        dynamic_allowed_range: None,
                     }),
                     Err(AllocationError::LoopbackExhausted)
                 ),
@@ -1713,6 +2085,8 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
             })
             .expect("the plan has an address for the first box");
         assert!(
@@ -1730,6 +2104,8 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
                 },
                 web.box_id(),
             )
@@ -1756,6 +2132,8 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
             })
             .expect("the plan has a second hand-out address");
         assert_eq!(
@@ -1801,6 +2179,8 @@ mod tests {
             ingress_ports: vec![8080],
             egress: None,
             credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
         };
         let first = registry
             .register_client_box(spec())
@@ -2216,6 +2596,308 @@ mod tests {
         assert!(
             harness.table.by_source(lease).is_none(),
             "the row went with the attachment: the two are withdrawn together"
+        );
+    }
+
+    /// NET-138's report half: an admit report is recorded only inside the
+    /// grant the row's registration holds — the stance first, the range
+    /// second, the same order the box's own decision reads them in. A row
+    /// that denies, or that was registered with no dynamic ingress at all,
+    /// refuses every report with the deny-all default an absent stance
+    /// means; a row that earns but holds no range permits nothing; and a
+    /// port outside the row's range is refused with the range it was
+    /// measured against. Refusals write nothing into the row.
+    #[test]
+    fn admit_report_refused_outside_range_or_under_deny() {
+        let registry = BoxRegistry::new(SUBNET);
+
+        // The allowed row: a stance that earns and a range to earn within.
+        let web = registry.register(
+            BoxRegistration::new("web", Ipv4Addr::new(100, 64, 0, 9), Ipv4Addr::LOCALHOST)
+                .with_dynamic_ingress(DynamicIngress::Allow, Some((9_000, 9_099))),
+        );
+        registry
+            .admit_runtime_port(web.switch_addr(), 9_000)
+            .expect("a port inside an allowed row's range is recorded");
+        registry
+            .admit_runtime_port(web.switch_addr(), 9_099)
+            .expect("the range's upper bound is inside the range");
+        assert_eq!(web.runtime_ports(), [9_000, 9_099]);
+
+        // The range refuses outside itself, with the range it measured by.
+        assert!(
+            matches!(
+                registry.admit_runtime_port(web.switch_addr(), 9_100),
+                Err(AdmitError::OutsideRange {
+                    port: 9_100,
+                    range: (9_000, 9_099),
+                })
+            ),
+            "a port past the range is refused with the range it was measured against"
+        );
+        assert_eq!(
+            web.runtime_ports(),
+            [9_000, 9_099],
+            "the refused report wrote nothing into the row"
+        );
+
+        // A row that denies — and one registered with no dynamic ingress at
+        // all, the deny-all default a client that predates the report half
+        // sends — refuses everything, never revealing whether the port
+        // would have been in range.
+        let denied = registry.register(
+            BoxRegistration::new("db", Ipv4Addr::new(100, 64, 0, 10), Ipv4Addr::LOCALHOST)
+                .with_dynamic_ingress(DynamicIngress::Deny, Some((9_000, 9_099))),
+        );
+        assert!(
+            matches!(
+                registry.admit_runtime_port(denied.switch_addr(), 9_000),
+                Err(AdmitError::StanceDenied {
+                    stance: Some(DynamicIngress::Deny),
+                })
+            ),
+            "a denying row refuses the report before its range is ever read"
+        );
+        let silent = registry.register(BoxRegistration::new(
+            "cache",
+            Ipv4Addr::new(100, 64, 0, 11),
+            Ipv4Addr::LOCALHOST,
+        ));
+        assert!(
+            matches!(
+                registry.admit_runtime_port(silent.switch_addr(), 9_000),
+                Err(AdmitError::StanceDenied { stance: None })
+            ),
+            "a row registered with no dynamic ingress refuses as the deny-all default"
+        );
+        assert!(
+            denied.runtime_ports().is_empty() && silent.runtime_ports().is_empty(),
+            "the refused reports wrote nothing into either row"
+        );
+
+        // A stance that earns without a range permits nothing — the same
+        // meaning the box's own decision gives an absent range — and a
+        // report against no live row names the row's absence.
+        let rangeless = registry.register(
+            BoxRegistration::new("asked", Ipv4Addr::new(100, 64, 0, 12), Ipv4Addr::LOCALHOST)
+                .with_dynamic_ingress(DynamicIngress::Ask, None),
+        );
+        assert!(
+            matches!(
+                registry.admit_runtime_port(rangeless.switch_addr(), 9_000),
+                Err(AdmitError::NoRange)
+            ),
+            "an absent range permits nothing whatever the stance"
+        );
+        // `ask` earns the report path the same way `allow` does — the host
+        // holds the grant, the box answers its own asks — so a row under
+        // ask with a range records what its reports earn.
+        let answered = registry.register(
+            BoxRegistration::new(
+                "answered",
+                Ipv4Addr::new(100, 64, 0, 13),
+                Ipv4Addr::LOCALHOST,
+            )
+            .with_dynamic_ingress(DynamicIngress::Ask, Some((9_000, 9_099))),
+        );
+        registry
+            .admit_runtime_port(answered.switch_addr(), 9_050)
+            .expect("a row under ask records what its reports earn");
+        assert_eq!(answered.runtime_ports(), [9_050]);
+        assert!(
+            matches!(
+                registry.admit_runtime_port(Ipv4Addr::new(100, 64, 0, 99), 9_000),
+                Err(AdmitError::NoRow { switch_address })
+                    if switch_address == Ipv4Addr::new(100, 64, 0, 99)
+            ),
+            "a report against an address no row holds names the absence"
+        );
+    }
+
+    /// NET-138's report half, the row's own bounds: the cap on distinct
+    /// runtime ports a row may hold, and the rolling rate on the reports it
+    /// absorbs. A burst of recorded reports fills the rate window and the
+    /// next is refused — with the refused report consuming no rate slot —
+    /// while a row that already holds its cap refuses a new port but not a
+    /// re-report of one it holds, and a withdraw report is refused by
+    /// neither bound.
+    #[test]
+    fn admit_report_refused_past_row_cap_or_rate() {
+        let registry = BoxRegistry::new(SUBNET);
+
+        // The rate: a fresh row absorbs RUNTIME_ADMIT_RATE recorded reports
+        // in a burst, then refuses the next within the same window.
+        let web = registry.register(
+            BoxRegistration::new("web", Ipv4Addr::new(100, 64, 0, 9), Ipv4Addr::LOCALHOST)
+                .with_dynamic_ingress(DynamicIngress::Allow, Some((9_000, 9_999))),
+        );
+        for offset in 0..u16::try_from(RUNTIME_ADMIT_RATE).expect("the rate fits a port") {
+            registry
+                .admit_runtime_port(web.switch_addr(), 9_000 + offset)
+                .unwrap_or_else(|error| panic!("report {offset} is inside the rate: {error}"));
+        }
+        assert!(
+            matches!(
+                registry.admit_runtime_port(web.switch_addr(), 9_050),
+                Err(AdmitError::RateLimited {
+                    rate: RUNTIME_ADMIT_RATE,
+                })
+            ),
+            "a burst past the rate is refused"
+        );
+        // The refused report consumed no rate slot: the window still holds
+        // exactly the recorded reports. Read from the row's own cell, the
+        // one state the rate bounds — earning a window's worth of slots at
+        // the rate the row admits them takes a second per slot of wall clock
+        // a test of the bound does not need to spend.
+        assert_eq!(
+            web.runtime
+                .0
+                .lock()
+                .expect(
+                    "the runtime cell's lock is never held across a panic, so it cannot be poisoned"
+                )
+                .admits
+                .len(),
+            RUNTIME_ADMIT_RATE,
+            "the refused report spent no rate slot"
+        );
+        // A withdraw report is never refused by the rate — the end of an
+        // admission is always recordable — and frees the port it names.
+        let (row, removed) = registry
+            .withdraw_runtime_port(web.switch_addr(), 9_000)
+            .expect("a live row answers a withdraw report at any rate");
+        assert!(removed, "the row held the port the report ended");
+        assert_eq!(row.runtime_ports().len(), RUNTIME_ADMIT_RATE - 1);
+
+        // The cap: a row that already holds RUNTIME_PORT_CAP distinct
+        // runtime ports — filled directly, because earning them at the
+        // rate the row admits reports takes half a minute of wall clock a
+        // test of the cap does not need to spend — refuses a new one, and
+        // the refusal names the bound. A re-report of a port the row
+        // already holds is not refused by the cap: the set is not growing.
+        let db = registry.register(
+            BoxRegistration::new("db", Ipv4Addr::new(100, 64, 0, 10), Ipv4Addr::LOCALHOST)
+                .with_dynamic_ingress(DynamicIngress::Allow, Some((20_000, 20_999))),
+        );
+        {
+            let mut runtime = db.runtime.0.lock().expect(
+                "the runtime cell's lock is never held across a panic, so it cannot be poisoned",
+            );
+            runtime.ports.extend(
+                20_000..20_000 + u16::try_from(RUNTIME_PORT_CAP).expect("the cap fits a port"),
+            );
+        }
+        assert!(
+            matches!(
+                registry.admit_runtime_port(db.switch_addr(), 20_500),
+                Err(AdmitError::RowCapFull {
+                    cap: RUNTIME_PORT_CAP,
+                })
+            ),
+            "a report past the row's cap of distinct runtime ports is refused"
+        );
+        assert_eq!(
+            db.runtime_ports().len(),
+            RUNTIME_PORT_CAP,
+            "the refused report grew nothing"
+        );
+        registry
+            .admit_runtime_port(db.switch_addr(), 20_000)
+            .expect("a re-report of a port the row already holds is not the cap's to refuse");
+        assert_eq!(
+            db.runtime_ports().len(),
+            RUNTIME_PORT_CAP,
+            "the re-report grew nothing — the port was already held"
+        );
+    }
+
+    /// NET-138's report half: a withdraw report removes the port it names —
+    /// idempotently, never refused by the cap or the rate — and a row's own
+    /// withdrawal clears its runtime ports the only way a set can be
+    /// cleared here: structurally, because the set lives in the row and the
+    /// row is gone. A report against no live row names the row's absence,
+    /// and a name registered again starts with an empty runtime set.
+    #[test]
+    fn runtime_port_withdrawn_on_report_and_on_row_withdrawal() {
+        let registry = BoxRegistry::new(SUBNET);
+        let grant = ClientBoxSpec {
+            name: "web".to_string(),
+            ingress_ports: vec![8080],
+            egress: None,
+            credentialed_upstream: None,
+            dynamic_ingress: Some(DynamicIngress::Allow),
+            dynamic_allowed_range: Some((9_000, 9_099)),
+        };
+        let web = registry
+            .register_client_box(grant.clone())
+            .expect("a client box is registered against the planned subnet");
+
+        // Two admissions, recorded by their reports.
+        registry
+            .admit_runtime_port(web.switch_addr(), 9_000)
+            .expect("the first report is inside the grant");
+        registry
+            .admit_runtime_port(web.switch_addr(), 9_010)
+            .expect("the second report is inside the grant");
+        assert_eq!(web.runtime_ports(), [9_000, 9_010]);
+
+        // A withdraw report ends one admission, and is accepted
+        // idempotently: the row no longer held the port, and the repeat
+        // report says so instead of refusing.
+        let (row, removed) = registry
+            .withdraw_runtime_port(web.switch_addr(), 9_000)
+            .expect("a live row answers a withdraw report");
+        assert!(removed, "the row held the port the report ended");
+        assert_eq!(row.runtime_ports(), [9_010]);
+        let (_, removed_again) = registry
+            .withdraw_runtime_port(web.switch_addr(), 9_000)
+            .expect("a withdraw report is never refused");
+        assert!(
+            !removed_again,
+            "the row no longer held the port; the report's goal state holds"
+        );
+        assert_eq!(web.runtime_ports(), [9_010]);
+
+        // The row's own withdrawal — the destroy's — clears its runtime
+        // ports structurally: the set lives in the row, and the row is gone.
+        registry
+            .withdraw_client_box("web", web.switch_addr(), web.loopback_addr())
+            .expect("the registering client's pair withdraws its row")
+            .expect("the row was live");
+        assert!(
+            registry.row_by_name("web").is_none(),
+            "the withdrawal removed the row, so no name resolves to it"
+        );
+        assert!(
+            matches!(
+                registry.admit_runtime_port(web.switch_addr(), 9_000),
+                Err(AdmitError::NoRow { .. })
+            ),
+            "a report against no live row is refused with the row's absence"
+        );
+        assert!(
+            registry
+                .withdraw_runtime_port(web.switch_addr(), 9_000)
+                .is_none(),
+            "a withdraw report against no live row is still accepted — it \
+             names no row, because the row and its ports went together"
+        );
+
+        // The name is free again, and the live registration under it starts
+        // empty: the earlier box's admissions went with the earlier row.
+        let again = registry
+            .register_client_box(grant)
+            .expect("the name is free again after its row's withdrawal");
+        assert!(
+            registry
+                .row_by_name("web")
+                .is_some_and(|row| Arc::ptr_eq(&row, &again)),
+            "the name resolves to the live registration's row"
+        );
+        assert!(
+            again.runtime_ports().is_empty(),
+            "a re-registered row's runtime set starts empty"
         );
     }
 }

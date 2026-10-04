@@ -58,6 +58,11 @@ enum Command {
         /// Print status as a JSON object.
         #[arg(long)]
         json: bool,
+        /// Read one box's row from the VM host daemon's control socket
+        /// (NET-138): the live row the box's name resolves to, or no row
+        /// held. Prints the row verb's own reply.
+        #[arg(long = "row", value_name = "NAME")]
+        row: Option<String>,
     },
     /// Show or set persisted per-VM resource configuration (applied next boot).
     Config {
@@ -120,14 +125,17 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Run { detach, timeout } => minvmd::cmd::run::run(detach, timeout),
-        Command::Status { json } => {
-            let exit = minvmd::cmd::status::run(json)?;
-            let code = exit.code();
-            if code != 0 {
-                std::process::exit(code);
+        Command::Status { json, row } => match row {
+            Some(name) => minvmd::cmd::status::run_row(json, &name),
+            None => {
+                let exit = minvmd::cmd::status::run(json)?;
+                let code = exit.code();
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                Ok(())
             }
-            Ok(())
-        }
+        },
         Command::Config { action } => match action {
             ConfigAction::Show { json } => minvmd::cmd::config::run_show(json),
             ConfigAction::Set { vcpus, ram_mib } => minvmd::cmd::config::run_set(vcpus, ram_mib),
