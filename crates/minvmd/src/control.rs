@@ -1314,8 +1314,15 @@ mod tests {
                 cause,
             } => {
                 assert_eq!(named, port, "the failure names the port");
-                assert_eq!(holder, HELD_BY_ANOTHER_PROCESS, "the failure names the holder");
-                assert_eq!(cause, ProxyDownCause::RedrawsRanOut, "the cause is the draws'");
+                assert_eq!(
+                    holder, HELD_BY_ANOTHER_PROCESS,
+                    "the failure names the holder"
+                );
+                assert_eq!(
+                    cause,
+                    ProxyDownCause::RedrawsRanOut,
+                    "the cause is the draws'"
+                );
             }
             other => panic!("the draws ran out: the start fails, got {other:?}"),
         }
@@ -1323,7 +1330,11 @@ mod tests {
         // A watch that expired with nothing answering is up — the degraded
         // boot's story stays the daemon log's, not this decision's.
         assert_eq!(
-            decide_publish(true, PUBLISH_TRIES, GuestPublish::NoReport { port_held: false }),
+            decide_publish(
+                true,
+                PUBLISH_TRIES,
+                GuestPublish::NoReport { port_held: false }
+            ),
             PublishDecision::Up,
             "no report and no listener fails nothing"
         );
@@ -1349,7 +1360,10 @@ mod tests {
                     cause,
                 } => {
                     assert_eq!(named, port, "the failure names the pinned port");
-                    assert_eq!(holder, HELD_BY_ANOTHER_PROCESS, "the failure names the holder");
+                    assert_eq!(
+                        holder, HELD_BY_ANOTHER_PROCESS,
+                        "the failure names the holder"
+                    );
                     assert_eq!(cause, ProxyDownCause::PortHeld, "the cause is the holder's");
                 }
                 other => panic!("the pin never redraws at try {tries_used}, got {other:?}"),

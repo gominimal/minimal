@@ -4015,7 +4015,9 @@ mod tests {
         );
 
         let (mut writer, reader) = tokio::io::duplex(4096);
-        write_proxy_port_held_report(&mut writer, port).await.unwrap();
+        write_proxy_port_held_report(&mut writer, port)
+            .await
+            .unwrap();
         drop(writer);
         assert_eq!(
             drain(reader).await,

@@ -903,7 +903,11 @@ fn run_foreground() -> Result<()> {
                 boxes.register_node_namespace(node_port.port);
                 continue;
             }
-            crate::control::PublishDecision::FailStart { port, holder, cause } => {
+            crate::control::PublishDecision::FailStart {
+                port,
+                holder,
+                cause,
+            } => {
                 // The start fails here, naming the port and the holder — one
                 // error line (T93) — and the cause is written to the status
                 // cell first, so a client reading the control socket in the
@@ -1170,7 +1174,9 @@ fn node_ports_dir() -> Result<std::path::PathBuf> {
     let base = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .map(|home| home.join("Library/Application Support/minimal/run"))
-        .ok_or_else(|| anyhow::anyhow!("HOME is not set: nowhere to keep node-port reservations"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("HOME is not set: nowhere to keep node-port reservations")
+        })?;
     #[cfg(not(target_os = "macos"))]
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|value| !value.is_empty())
@@ -1211,13 +1217,19 @@ fn node_ports_dir() -> Result<std::path::PathBuf> {
 /// the directory's own hygiene is the whole question.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn verify_ports_dir(ports: &std::path::Path) -> Result<()> {
-    use anyhow::{bail, Context as _};
+    use anyhow::{Context as _, bail};
     use std::os::unix::fs::PermissionsExt as _;
     let metadata = std::fs::metadata(ports).with_context(|| {
-        format!("inspecting the node-port reservation directory {}", ports.display())
+        format!(
+            "inspecting the node-port reservation directory {}",
+            ports.display()
+        )
     })?;
     if !metadata.is_dir() {
-        bail!("the node-port reservation directory {} exists and is not a directory", ports.display());
+        bail!(
+            "the node-port reservation directory {} exists and is not a directory",
+            ports.display()
+        );
     }
     let mode = metadata.permissions().mode() & 0o777;
     if mode & !PORTS_DIR_MODE != 0 {
@@ -1277,7 +1289,9 @@ impl NodePortReservation {
             .write(true)
             .truncate(false)
             .open(&path)
-            .with_context(|| format!("opening the node-port reservation file {}", path.display()))?;
+            .with_context(|| {
+                format!("opening the node-port reservation file {}", path.display())
+            })?;
         match unsafe { libc::flock(_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } {
             0 => Ok(Some(Self { port, _lock })),
             _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock => {
@@ -1327,7 +1341,7 @@ fn check_candidate(
         Err(error) => {
             return CandidateCheck::Error(
                 anyhow::Error::from(error).context("probing a node-port candidate"),
-            )
+            );
         }
         Ok(_) if udp => None,
         Ok(_) if loopback_answers(port) => Some(SKIP_LOOPBACK_ANSWERING),
@@ -1357,7 +1371,11 @@ fn check_candidate(
 /// landed on.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn log_skipped_candidate(port: u16, reason: &'static str) {
-    tracing::info!(candidate_port = port, skip_reason = reason, "skipped a node-port candidate");
+    tracing::info!(
+        candidate_port = port,
+        skip_reason = reason,
+        "skipped a node-port candidate"
+    );
 }
 
 /// One line per reserved node port (T93): the port the supervisor holds the
@@ -1441,7 +1459,9 @@ fn configured_node_port(port: u16) -> Result<NodePortAssignment> {
              or unset {} and start again",
             crate::vm::NODE_PROXY_PORT_ENV
         )),
-        CandidateCheck::Error(error) => Err(error.context("assigning the configured hostname-proxy port")),
+        CandidateCheck::Error(error) => {
+            Err(error.context("assigning the configured hostname-proxy port"))
+        }
     }
 }
 
@@ -1727,10 +1747,8 @@ fn spawn_marker_gate(
             let Ok(stream) = stream else {
                 return; // the listener closed: the supervisor is gone
             };
-            let event = classify_marker_connection(
-                &mut std::io::BufReader::new(stream),
-                &known_hosts_path,
-            );
+            let event =
+                classify_marker_connection(&mut std::io::BufReader::new(stream), &known_hosts_path);
             match event {
                 Some(event) => {
                     if events.send(event).is_err() {
@@ -1800,7 +1818,11 @@ fn wait_boot_beacon(
         match events.recv_timeout(ready_timeout) {
             Ok(MarkerEvent::Beacon(Ok(crate::cmd::BootBeacon::Ready))) => return Ok(()),
             Ok(MarkerEvent::Beacon(Ok(crate::cmd::BootBeacon::MountFailed { reason }))) => {
-                return Err(crate::cmd::mount_failed_error(&reason, volume_path, volume_preexisted));
+                return Err(crate::cmd::mount_failed_error(
+                    &reason,
+                    volume_path,
+                    volume_preexisted,
+                ));
             }
             Ok(MarkerEvent::Beacon(Err(e))) => return Err(anyhow::anyhow!("boot failed: {e}")),
             Ok(MarkerEvent::ProxyServing(port)) | Ok(MarkerEvent::ProxyPortHeld(port)) => {
@@ -1877,7 +1899,9 @@ fn watch_proxy_publish(
                     "the publish watch expired without the guest's report; the \
                      boot proceeds on the probes' own story"
                 );
-                return crate::control::GuestPublish::NoReport { port_held: port_answers };
+                return crate::control::GuestPublish::NoReport {
+                    port_held: port_answers,
+                };
             }
         }
     }
@@ -2283,7 +2307,10 @@ mod tests {
         unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, pin.to_string()) };
         let pinned = super::assign_node_proxy_port().unwrap();
         assert_eq!(pinned.port, pin, "the override is the resolution");
-        assert!(pinned.configured, "the assignment says the port came from the pin");
+        assert!(
+            pinned.configured,
+            "the assignment says the port came from the pin"
+        );
         let registry = crate::box_registry::BoxRegistry::new(switch::DEFAULT_SUBNET);
         let node = registry.register_node_namespace(pinned.port);
         assert_eq!(
@@ -2358,7 +2385,11 @@ mod tests {
              the probes, is the arbiter (first {}, second {preferred})",
             first.port
         );
-        let loser = if first.port == preferred { &second } else { &first };
+        let loser = if first.port == preferred {
+            &second
+        } else {
+            &first
+        };
         // The loser's skip reason is whichever check it lost to: the
         // reservation when both walks' probes passed, or a bind probe that
         // collided with the winner's own probe — which holds the port
@@ -2394,16 +2425,12 @@ mod tests {
             .expect("a free port's reservation is taken");
         assert_eq!(held.port, port, "the reservation names the port it holds");
         assert!(
-            super::NodePortReservation::take(port)
-                .unwrap()
-                .is_none(),
+            super::NodePortReservation::take(port).unwrap().is_none(),
             "a second supervisor's reservation of the held port is refused"
         );
         drop(held);
         assert!(
-            super::NodePortReservation::take(port)
-                .unwrap()
-                .is_some(),
+            super::NodePortReservation::take(port).unwrap().is_some(),
             "the kernel released the reservation with the fd: the next boot \
              takes the same port"
         );
