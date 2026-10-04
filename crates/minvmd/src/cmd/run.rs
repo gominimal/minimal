@@ -308,11 +308,20 @@ fn run_detach(timeout_secs: u64) -> Result<()> {
         let vmm_owned = state.vmm_pid.is_some_and(vmm_owned_by_live_supervisor);
         match classify_detach_poll(ready, child_status, daemon_alive, state.vmm_pid, vmm_owned) {
             DetachPoll::Ready => return Ok(()),
-            DetachPoll::Failed(status) => bail!(
-                "the detached supervisor exited during startup ({status}); \
-                 see {} for its error output",
-                log_path.display()
-            ),
+            DetachPoll::Failed(status) => {
+                // A start that failed on the hostname proxy's port says so
+                // inline — port, holder and why (T93) — so the CLI's
+                // autospawn error carries it, not just a log path.
+                let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+                if let Some(line) = proxy_failure_line(&log) {
+                    bail!("{line} (supervisor log: {})", log_path.display());
+                }
+                bail!(
+                    "the detached supervisor exited during startup ({status}); \
+                     see {} for its error output",
+                    log_path.display()
+                )
+            }
             DetachPoll::LeakedVmm(pid) => bail!(
                 "the supervisor exited but a leaked __krun-vmm (pid {pid}) still holds the \
                  alive lock; run `min stop` (or `kill -9 {pid}`), then retry"
@@ -508,7 +517,9 @@ fn run_foreground() -> Result<()> {
     // (T93): two supervisors booting at the same moment contend for it in
     // the kernel, and the kernel releases it when this supervisor stops,
     // exits or crashes — never a pid file, never a stale entry to clean.
-    let mut node_port = assign_node_proxy_port().context("assigning the node's proxy port")?;
+    let ports_dir = node_ports_dir().context("opening the node-port reservation directory")?;
+    let mut node_port =
+        assign_node_proxy_port(&ports_dir).context("assigning the node's proxy port")?;
     boxes.register_node_namespace(node_port.port);
     // A box's row goes with its shuttle connection: the gate reports which
     // addresses each relay carried at the relay's end, and this drainer thread
@@ -902,7 +913,7 @@ fn run_foreground() -> Result<()> {
                 );
                 let _ = child.kill();
                 let _ = child.wait();
-                node_port = assign_node_proxy_port()
+                node_port = assign_node_proxy_port(&ports_dir)
                     .context("redrawing the node's proxy port after a refused publish")?;
                 boxes.register_node_namespace(node_port.port);
                 continue;
@@ -922,18 +933,17 @@ fn run_foreground() -> Result<()> {
                 let _ = child.kill();
                 let _ = child.wait();
                 crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
-                match cause {
-                    ProxyDownCause::PortHeld => bail!(
-                        "the VM start failed: the hostname proxy cannot publish on \
-                         127.0.0.1:{port} — {holder}. The configured port never redraws, \
-                         so free the port or unset {} and start again",
-                        crate::vm::NODE_PROXY_PORT_ENV
-                    ),
-                    ProxyDownCause::RedrawsRanOut => bail!(
-                        "the VM start failed: the hostname proxy could not publish in \
-                         {publish_tries} tries — {holder}; the last port was 127.0.0.1:{port}"
-                    ),
-                }
+                // The holder by pid and exe when the host can see it, the
+                // decision's generic holder otherwise.
+                let holder = port_holder(port).unwrap_or_else(|| holder.to_string());
+                let why = match cause {
+                    ProxyDownCause::PortHeld => configured_never_redraws(),
+                    ProxyDownCause::RedrawsRanOut => {
+                        format!("{publish_tries} publish tries exhausted, every drawn port taken")
+                    }
+                };
+                tracing::error!(port, %holder, %why, "the VM start failed on the proxy publish");
+                bail!("{}", proxy_port_failure(port, &holder, &why));
             }
         }
     }
@@ -1270,10 +1280,10 @@ impl NodePortReservation {
     /// running, or one that died mid-redraw — so the caller logs the skip
     /// ([`SKIP_RESERVED_BY_ANOTHER_VM`]) and draws its next candidate.
     #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-    fn take(port: u16) -> Result<Option<Self>> {
+    fn take(dir: &std::path::Path, port: u16) -> Result<Option<Self>> {
         use anyhow::Context as _;
         use std::os::fd::AsRawFd as _;
-        let path = node_ports_dir()?.join(format!("{port}.lock"));
+        let path = dir.join(format!("{port}.lock"));
         let _lock = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -1318,6 +1328,7 @@ enum CandidateCheck {
 /// because the `flock` is the arbiter two concurrent boots race for.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn check_candidate(
+    dir: &std::path::Path,
     port: u16,
     udp: bool,
     probe: &dyn Fn(u16) -> std::io::Result<u16>,
@@ -1342,7 +1353,7 @@ fn check_candidate(
         log_skipped_candidate(port, reason);
         return CandidateCheck::Skip(reason);
     }
-    match NodePortReservation::take(port) {
+    match NodePortReservation::take(dir, port) {
         Ok(Some(reservation)) => {
             log_reserved_candidate(port);
             CandidateCheck::Free(reservation)
@@ -1419,10 +1430,10 @@ struct NodePortAssignment {
 /// answerer (NET-138) and the host answerer serves the zone, so a handed
 /// answerer port would be an admitted port with nothing behind it.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn assign_node_proxy_port() -> Result<NodePortAssignment> {
+fn assign_node_proxy_port(dir: &std::path::Path) -> Result<NodePortAssignment> {
     let proxy = match node_port_override(crate::vm::NODE_PROXY_PORT_ENV)? {
-        Some(proxy) => configured_node_port(proxy)?,
-        None => assign_node_port(NODE_DEFAULT_PROXY_PORT, false)?,
+        Some(proxy) => configured_node_port(dir, proxy)?,
+        None => assign_node_port(dir, NODE_DEFAULT_PROXY_PORT, false)?,
     };
     log_node_port_assignment("hostname proxy", &proxy);
     Ok(proxy)
@@ -1435,9 +1446,9 @@ fn assign_node_proxy_port() -> Result<NodePortAssignment> {
 /// pin, and one that kept going would boot a VM whose proxy serves on a
 /// port someone else already holds.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn configured_node_port(port: u16) -> Result<NodePortAssignment> {
+fn configured_node_port(dir: &std::path::Path, port: u16) -> Result<NodePortAssignment> {
     let probe = node_port_probe(false);
-    match check_candidate(port, false, &probe) {
+    match check_candidate(dir, port, false, &probe) {
         CandidateCheck::Free(reservation) => Ok(NodePortAssignment {
             port,
             preferred: port,
@@ -1445,16 +1456,169 @@ fn configured_node_port(port: u16) -> Result<NodePortAssignment> {
             configured: true,
             _reservation: reservation,
         }),
-        CandidateCheck::Skip(reason) => Err(anyhow::anyhow!(
-            "the operator-configured hostname-proxy port {port} is not available: {reason}. \
-             The configured port never redraws, so the VM start fails here; free the port \
-             or unset {} and start again",
-            crate::vm::NODE_PROXY_PORT_ENV
-        )),
+        CandidateCheck::Skip(reason) => {
+            // Who holds it, as well as the host can say: a process by pid
+            // and exe when the bind or connect probe refused it, the node's
+            // own reservation, or another of this user's VMs.
+            let holder = match reason {
+                SKIP_NODE_RESERVED => "the node's own zone answerer (a reserved port)".to_string(),
+                SKIP_RESERVED_BY_ANOTHER_VM => "another VM's reservation".to_string(),
+                _ => port_holder(port)
+                    .unwrap_or_else(|| crate::control::HELD_BY_ANOTHER_PROCESS.to_string()),
+            };
+            let why = format!("{reason}; {}", configured_never_redraws());
+            Err(anyhow::anyhow!(
+                "{}",
+                proxy_port_failure(port, &holder, &why)
+            ))
+        }
         CandidateCheck::Error(error) => {
             Err(error.context("assigning the configured hostname-proxy port"))
         }
     }
+}
+
+/// How every proxy-port start failure begins (T93): the one line the
+/// detaching parent lifts out of the supervisor's log ([`proxy_failure_line`])
+/// so the CLI's autospawn error names the port, the holder and why inline,
+/// rather than pointing at a log file.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+const PROXY_PORT_FAILURE_PREFIX: &str = "hostname proxy port ";
+
+/// The one-line proxy-port start failure: the port, who holds it, and why the
+/// start ends instead of moving on.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn proxy_port_failure(port: u16, holder: &str, why: &str) -> String {
+    format!("{PROXY_PORT_FAILURE_PREFIX}{port} held by {holder}; {why}")
+}
+
+/// Why a configured port's failure ends the start: the pin never redraws.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn configured_never_redraws() -> String {
+    format!(
+        "configured ports never redraw (free the port or unset {})",
+        crate::vm::NODE_PROXY_PORT_ENV
+    )
+}
+
+/// The proxy-port failure line in a supervisor's captured stderr, when the
+/// start failed on it ([`PROXY_PORT_FAILURE_PREFIX`]), from the prefix on —
+/// anyhow's `Error:` and `Caused by:` framing dropped.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn proxy_failure_line(log: &str) -> Option<&str> {
+    log.lines().find_map(|line| {
+        line.find(PROXY_PORT_FAILURE_PREFIX)
+            .map(|at| line[at..].trim_end())
+    })
+}
+
+/// Who listens on `port` on this host, as `pid <pid> (<exe>)`, when the host
+/// lets this user see it (T93): the start failure names the holder so the
+/// operator knows what to free. `None` when no visible process holds it — a
+/// listener of another user, or a host this cannot read.
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn port_holder(port: u16) -> Option<String> {
+    // The listening sockets on the port, on loopback or the wildcard — the
+    // addresses whose holder refuses a bind of 127.0.0.1:<port>.
+    const HOLDING_ADDRS: &[&str] = &[
+        "0100007F",
+        "00000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000001000000",
+        "0000000000000000FFFF00000100007F",
+    ];
+    let mut sockets = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        for line in text.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // local_address is field 1, st field 3 (0A = LISTEN), inode 9.
+            if fields.len() < 10 || fields[3] != "0A" {
+                continue;
+            }
+            let Some((addr, hex_port)) = fields[1].rsplit_once(':') else {
+                continue;
+            };
+            if u16::from_str_radix(hex_port, 16).ok() == Some(port) && HOLDING_ADDRS.contains(&addr)
+            {
+                sockets.push(format!("socket:[{}]", fields[9]));
+            }
+        }
+    }
+    if sockets.is_empty() {
+        return None;
+    }
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(target) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            if sockets.iter().any(|s| target.as_os_str() == s.as_str()) {
+                let exe = std::fs::read_link(entry.path().join("exe"))
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .or_else(|| {
+                        std::fs::read_to_string(entry.path().join("comm"))
+                            .ok()
+                            .map(|c| c.trim().to_string())
+                    });
+                return Some(match exe {
+                    Some(exe) => format!("pid {pid} ({exe})"),
+                    None => format!("pid {pid}"),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Who listens on `port` on this host (see the Linux twin): macOS has no
+/// procfs, so `lsof` answers, for the processes this user may see.
+#[cfg(target_os = "macos")]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn port_holder(port: u16) -> Option<String> {
+    let output = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpc"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    lsof_holder(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The first process in `lsof -Fpc` output, as `pid <pid> (<command>)`.
+#[cfg(target_os = "macos")]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn lsof_holder(output: &str) -> Option<String> {
+    let mut pid = None;
+    for line in output.lines() {
+        if let Some(p) = line.strip_prefix('p') {
+            pid = Some(p);
+        } else if let (Some(command), Some(p)) = (line.strip_prefix('c'), pid) {
+            return Some(format!("pid {p} ({command})"));
+        }
+    }
+    pid.map(|p| format!("pid {p}"))
+}
+
+/// No way to name a holder on this host.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn port_holder(_port: u16) -> Option<String> {
+    None
 }
 
 /// One line per node-port assignment: the port the assignment preferred, the
@@ -1549,13 +1713,17 @@ fn loopback_answers(port: u16) -> bool {
 /// port — the `flock` is the arbiter, and the loser skips, logs the reason,
 /// and draws again.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn assign_node_port(preferred: u16, udp: bool) -> Result<NodePortAssignment> {
+fn assign_node_port(
+    dir: &std::path::Path,
+    preferred: u16,
+    udp: bool,
+) -> Result<NodePortAssignment> {
     use anyhow::Context as _;
     let probe = node_port_probe(udp);
     // Why the preferred port was not handed, when it was not: every candidate
     // — the preferred included — is held to the same checks, and each skipped
     // one logs its own line before the draw moves on.
-    let skipped = match check_candidate(preferred, udp, &probe) {
+    let skipped = match check_candidate(dir, preferred, udp, &probe) {
         CandidateCheck::Free(reservation) => {
             return Ok(NodePortAssignment {
                 port: preferred,
@@ -1570,7 +1738,7 @@ fn assign_node_port(preferred: u16, udp: bool) -> Result<NodePortAssignment> {
             return Err(error).context("probing the node's default port");
         }
     };
-    let (port, reservation) = fallback_port(|| probe(0), udp)?;
+    let (port, reservation) = fallback_port(dir, || probe(0), udp)?;
     Ok(NodePortAssignment {
         port,
         preferred,
@@ -1646,6 +1814,7 @@ const FALLBACK_PORT_ATTEMPTS: usize = 8;
 /// draw, released the moment its number is read.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn fallback_port(
+    dir: &std::path::Path,
     mut next: impl FnMut() -> std::io::Result<u16>,
     udp: bool,
 ) -> Result<(u16, NodePortReservation)> {
@@ -1658,7 +1827,7 @@ fn fallback_port(
             drawn => drawn
                 .context("the node's default port is held and no OS-assigned port is available")?,
         };
-        match check_candidate(port, udp, &probe) {
+        match check_candidate(dir, port, udp, &probe) {
             CandidateCheck::Free(reservation) => return Ok((port, reservation)),
             CandidateCheck::Skip(_) => continue,
             CandidateCheck::Error(error) => return Err(error),
@@ -2047,6 +2216,8 @@ mod tests {
 
     #[test]
     fn node_port_probe_skips_a_port_served_on_loopback() {
+        // Its own reservation dir: no test takes a flock in the real one.
+        let ports = tempfile::tempdir().expect("a test reservation dir");
         // The hostname surface a VM holds on the host is the loopback address
         // (minimald's proxy binds `127.0.0.1:<port>`), so the port one VM is
         // serving on is exactly the port the next VM wants: the assignment has
@@ -2060,7 +2231,7 @@ mod tests {
             super::loopback_answers(served),
             "the loopback probe sees the listener on 127.0.0.1:{served}"
         );
-        let assigned = super::assign_node_port(served, false).unwrap();
+        let assigned = super::assign_node_port(ports.path(), served, false).unwrap();
         assert_ne!(
             assigned.port, served,
             "a port another VM is serving on loopback is not handed as-is"
@@ -2077,6 +2248,8 @@ mod tests {
 
     #[test]
     fn node_port_bind_probe_refuses_a_port_held_on_loopback() {
+        // Its own reservation dir: no test takes a flock in the real one.
+        let ports = tempfile::tempdir().expect("a test reservation dir");
         // The bind probe alone reports a port another VM serves on
         // `127.0.0.1` as taken, on macOS as on Linux: std's SO_REUSEADDR lets
         // a macOS wildcard bind succeed over that listener, so the probe binds
@@ -2089,7 +2262,7 @@ mod tests {
             std::io::ErrorKind::AddrInUse,
             "the bind probe reports 127.0.0.1:{served} as taken"
         );
-        let assigned = super::assign_node_port(served, false).unwrap();
+        let assigned = super::assign_node_port(ports.path(), served, false).unwrap();
         assert_ne!(assigned.port, served, "the served port is not handed");
         assert_eq!(
             assigned.skipped,
@@ -2111,6 +2284,8 @@ mod tests {
 
     #[test]
     fn node_port_probe_keeps_a_free_preferred_port() {
+        // Its own reservation dir: no test takes a flock in the real one.
+        let ports = tempfile::tempdir().expect("a test reservation dir");
         // A port with nothing on it is handed as asked: the loopback half of
         // the TCP probe refuses nothing that is actually free, so a lone VM
         // still lands on the default proxy port — the case the session e2e's
@@ -2122,7 +2297,7 @@ mod tests {
             !super::loopback_answers(free),
             "the loopback probe leaves a free port alone"
         );
-        let assigned = super::assign_node_port(free, false).unwrap();
+        let assigned = super::assign_node_port(ports.path(), free, false).unwrap();
         assert_eq!(
             assigned.port, free,
             "a free preferred port is handed unchanged"
@@ -2141,7 +2316,7 @@ mod tests {
         let freed_udp = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
         let free_udp = freed_udp.local_addr().unwrap().port();
         drop(freed_udp);
-        let assigned_udp = super::assign_node_port(free_udp, true).unwrap();
+        let assigned_udp = super::assign_node_port(ports.path(), free_udp, true).unwrap();
         assert_eq!(
             assigned_udp.port, free_udp,
             "a free UDP preferred port is handed unchanged"
@@ -2150,6 +2325,8 @@ mod tests {
 
     #[test]
     fn node_port_fallback_skips_a_candidate_served_on_loopback() {
+        // Its own reservation dir: no test takes a flock in the real one.
+        let ports = tempfile::tempdir().expect("a test reservation dir");
         // The OS-assigned fallback draws its candidates under the same
         // SO_REUSEADDR semantics the wildcard bind carries, so on macOS a draw
         // can land on a port another VM's hostname surface already serves on
@@ -2180,7 +2357,7 @@ mod tests {
         let candidates = [served, free];
         let mut drawn = candidates.into_iter();
         let (handed, _reservation) =
-            super::fallback_port(|| Ok(drawn.next().unwrap()), false).unwrap();
+            super::fallback_port(ports.path(), || Ok(drawn.next().unwrap()), false).unwrap();
         assert_eq!(
             handed, free,
             "the fallback hands the first candidate no listener answers on"
@@ -2189,6 +2366,8 @@ mod tests {
 
     #[test]
     fn node_port_fallback_fails_when_every_drawn_candidate_is_served() {
+        // Its own reservation dir: no test takes a flock in the real one.
+        let ports = tempfile::tempdir().expect("a test reservation dir");
         // A host whose every draw lands on a served port fails the boot naming
         // the conflict: handing the candidate anyway would hand two VMs one
         // hostname surface, which is the collision this assignment exists to
@@ -2197,6 +2376,7 @@ mod tests {
         let served = held.local_addr().unwrap().port();
         let mut drawn = 0usize;
         let err = super::fallback_port(
+            ports.path(),
             || {
                 drawn += 1;
                 Ok(served)
@@ -2217,6 +2397,8 @@ mod tests {
 
     #[test]
     fn node_port_fallback_hands_udp_candidates_without_the_loopback_probe() {
+        // Its own reservation dir: no test takes a flock in the real one.
+        let ports = tempfile::tempdir().expect("a test reservation dir");
         // The answerer's UDP probe is unchanged on the fallback path too: a
         // UDP socket never accepts a connection, so a listener answering TCP on
         // the loopback address is no conflict for it and the first candidate
@@ -2229,6 +2411,7 @@ mod tests {
         );
         let mut drawn = 0usize;
         let (handed, _reservation) = super::fallback_port(
+            ports.path(),
             || {
                 drawn += 1;
                 Ok(served)
@@ -2242,6 +2425,8 @@ mod tests {
 
     #[test]
     fn node_port_assigned_on_host_and_handed_to_daemon() {
+        // Its own reservation dir: no test takes a flock in the real one.
+        let ports = tempfile::tempdir().expect("a test reservation dir");
         // A port the test holds is busy: the assignment falls through to an
         // OS-assigned port rather than failing the boot over a shared-host
         // conflict — the case of a native daemon and a VM on one host. The
@@ -2252,7 +2437,7 @@ mod tests {
         // surface has — is the two tests above.
         let held = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
         let busy = held.local_addr().unwrap().port();
-        let assigned = super::assign_node_port(busy, false).unwrap();
+        let assigned = super::assign_node_port(ports.path(), busy, false).unwrap();
         assert_ne!(assigned.port, busy, "a held port is not assigned as-is");
         assert!(assigned.port != 0, "the fallback is a real port");
 
@@ -2264,7 +2449,9 @@ mod tests {
         let free = freed.local_addr().unwrap().port();
         drop(freed);
         assert_eq!(
-            super::assign_node_port(free, false).unwrap().port,
+            super::assign_node_port(ports.path(), free, false)
+                .unwrap()
+                .port,
             free,
             "a free port is assigned as asked"
         );
@@ -2273,14 +2460,14 @@ mod tests {
         // whatever the host picked, it is a real port the guest can bind as
         // handed (the cmdline and bind halves are the vm.rs and minimald
         // tests of the same name).
-        let assigned = super::assign_node_proxy_port().unwrap();
+        let assigned = super::assign_node_proxy_port(ports.path()).unwrap();
         assert!(assigned.port != 0, "the node's proxy port is assigned");
 
         // The answerer's probe is the same default-first over UDP, held on
         // the same wildcard the UDP probe addresses.
         let held_udp = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
         let busy_udp = held_udp.local_addr().unwrap().port();
-        let assigned_udp = super::assign_node_port(busy_udp, true).unwrap();
+        let assigned_udp = super::assign_node_port(ports.path(), busy_udp, true).unwrap();
         assert_ne!(
             assigned_udp.port, busy_udp,
             "a held UDP port is not assigned as-is"
@@ -2297,7 +2484,7 @@ mod tests {
         let pin = freed_pin.local_addr().unwrap().port();
         drop(freed_pin);
         unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, pin.to_string()) };
-        let pinned = super::assign_node_proxy_port().unwrap();
+        let pinned = super::assign_node_proxy_port(ports.path()).unwrap();
         assert_eq!(pinned.port, pin, "the override is the resolution");
         assert!(
             pinned.configured,
@@ -2318,25 +2505,37 @@ mod tests {
         let held_pin = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let refused_pin = held_pin.local_addr().unwrap().port();
         unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, refused_pin.to_string()) };
-        let err = super::assign_node_proxy_port().unwrap_err().to_string();
+        let err = super::assign_node_proxy_port(ports.path())
+            .unwrap_err()
+            .to_string();
         assert!(
-            err.contains(&refused_pin.to_string())
-                && err.contains("configured port never redraws")
+            err.contains(&format!("hostname proxy port {refused_pin} held by"))
+                && err.contains("configured ports never redraw")
                 && err.contains(super::SKIP_BIND_REFUSED),
-            "a held pin fails the start naming the port and the holder, got: {err}"
+            "a held pin fails the start naming the port and why, got: {err}"
         );
+        // The holder is this test process, by pid: the listener is its own.
+        assert!(
+            err.contains(&format!("pid {}", std::process::id())),
+            "a held pin names the holder's pid, got: {err}"
+        );
+        drop(held_pin);
 
         // The override's own garbage fails at the supervisor, naming the
         // variable and the value — never a fallback to selection that would
         // hand the guest a port different from the one the operator pinned.
         unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, "no-port-here") };
-        let err = super::assign_node_proxy_port().unwrap_err().to_string();
+        let err = super::assign_node_proxy_port(ports.path())
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("MINVMD_NODE_PROXY_PORT") && err.contains("no-port-here"),
             "an undecodable override names the variable and the value, got: {err}"
         );
         unsafe { std::env::set_var(crate::vm::NODE_PROXY_PORT_ENV, "0") };
-        let err = super::assign_node_proxy_port().unwrap_err().to_string();
+        let err = super::assign_node_proxy_port(ports.path())
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("not a port to pin"),
             "a zero override is refused, got: {err}"
@@ -2350,7 +2549,39 @@ mod tests {
     }
 
     #[test]
+    fn detach_error_names_proxy_port_and_holder() {
+        // The supervisor's start failure, as its stderr lands in run.log —
+        // anyhow's `Error:` framing and the boot's context above it — is the
+        // line the detaching parent lifts for the CLI (T93).
+        let failure = super::proxy_port_failure(7654, "pid 4242 (python3)", "why");
+        let err = anyhow::anyhow!("{failure}").context("assigning the node's proxy port");
+        let log = format!("some gvproxy line\nError: {err:?}\n");
+        assert_eq!(
+            super::proxy_failure_line(&log),
+            Some("hostname proxy port 7654 held by pid 4242 (python3); why"),
+            "the failure line is lifted whole, framing dropped, from: {log}"
+        );
+        assert_eq!(
+            super::proxy_failure_line("Error: boot timed out\n"),
+            None,
+            "a start that failed on something else lifts nothing"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lsof_output_names_the_holder() {
+        assert_eq!(
+            super::lsof_holder("p4242\ncpython3\nf3\n").as_deref(),
+            Some("pid 4242 (python3)")
+        );
+        assert_eq!(super::lsof_holder(""), None);
+    }
+
+    #[test]
     fn concurrent_boots_never_draw_the_same_proxy_port() {
+        // Its own reservation dir: no test takes a flock in the real one.
+        let ports = tempfile::tempdir().expect("a test reservation dir");
         // Two supervisors drawing at the same moment contend for the port in
         // the kernel (T93): the flock is held by the open file description,
         // so the second draw — another thread here, another process in
@@ -2362,8 +2593,12 @@ mod tests {
         let preferred = freed.local_addr().unwrap().port();
         drop(freed);
 
-        let first = std::thread::spawn(move || super::assign_node_port(preferred, false).unwrap());
-        let second = std::thread::spawn(move || super::assign_node_port(preferred, false).unwrap());
+        // One shared dir, as two supervisors of one user share theirs.
+        let (dir_a, dir_b) = (ports.path().to_path_buf(), ports.path().to_path_buf());
+        let first =
+            std::thread::spawn(move || super::assign_node_port(&dir_a, preferred, false).unwrap());
+        let second =
+            std::thread::spawn(move || super::assign_node_port(&dir_b, preferred, false).unwrap());
         let first = first.join().expect("the first draw finishes");
         let second = second.join().expect("the second draw finishes");
 
@@ -2401,6 +2636,8 @@ mod tests {
 
     #[test]
     fn reservation_is_released_when_the_vm_stops() {
+        // Its own reservation dir: no test takes a flock in the real one.
+        let ports = tempfile::tempdir().expect("a test reservation dir");
         // The reservation is the supervisor's open file, no pid file and no
         // stale entry to clean (T93): held, a second supervisor's take is
         // refused; dropped — the VM stopped, the supervisor exited, or it
@@ -2412,22 +2649,24 @@ mod tests {
         let port = freed.local_addr().unwrap().port();
         drop(freed);
 
-        let held = super::NodePortReservation::take(port)
+        let held = super::NodePortReservation::take(ports.path(), port)
             .unwrap()
             .expect("a free port's reservation is taken");
         assert!(
-            super::NodePortReservation::take(port).unwrap().is_none(),
+            super::NodePortReservation::take(ports.path(), port)
+                .unwrap()
+                .is_none(),
             "a second supervisor's reservation of the held port is refused"
         );
         drop(held);
         assert!(
-            super::NodePortReservation::take(port).unwrap().is_some(),
+            super::NodePortReservation::take(ports.path(), port)
+                .unwrap()
+                .is_some(),
             "the kernel released the reservation with the fd: the next boot \
              takes the same port"
         );
-        let lock_file = super::node_ports_dir()
-            .unwrap()
-            .join(format!("{port}.lock"));
+        let lock_file = ports.path().join(format!("{port}.lock"));
         assert!(
             lock_file.exists(),
             "the lock file is never unlinked, and holds nothing a take does not prove"
@@ -2436,6 +2675,8 @@ mod tests {
 
     #[test]
     fn draw_skips_the_answerer_hook_port_while_free() {
+        // Its own reservation dir: no test takes a flock in the real one.
+        let ports = tempfile::tempdir().expect("a test reservation dir");
         // The answerer's hook port is the node's own, whatever any probe
         // says about it (T93): nothing binds it while this test runs, and
         // the draw still never hands it — a VM handed the hook port would
@@ -2451,7 +2692,7 @@ mod tests {
             super::NODE_RESERVED_PORTS.contains(&hook),
             "the node-reserved set names the answerer's hook port"
         );
-        let assigned = super::assign_node_port(hook, false).unwrap();
+        let assigned = super::assign_node_port(ports.path(), hook, false).unwrap();
         assert_ne!(
             assigned.port, hook,
             "the draw never hands the node's own port, even with it free"
