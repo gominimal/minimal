@@ -2436,8 +2436,12 @@ mod tests {
         let capture = crate::test_harness::captured_log();
 
         // A port that is not a number, and a session that is gone: two
-        // requests a dangling channel answers on its own.
-        let (_state, _rootfs, _cwd, mut chan) = setup_channel();
+        // requests a dangling channel answers on its own. Under this test's
+        // own box name — the shared capture holds every test's lines, so
+        // each request's line below is found and counted by the box it
+        // names.
+        let (_state, _rootfs, _cwd, mut chan) =
+            setup_channel_with(crate::session::WeakSessionHandle::dangling(), "chanweb");
         let (mut ours, theirs) = UnixStream::pair().unwrap();
         #[expect(
             clippy::large_futures,
@@ -2565,16 +2569,34 @@ mod tests {
         );
 
         // One line per request — four wrote one, and the ENOTCONN publish
-        // wrote none — each naming the box and the port as given.
+        // wrote none — each naming the box and the port as given. Counted
+        // and taken per box name: under the shared capture every test's
+        // lines ride one buffer, so a request's line is found by the box
+        // it names.
         let logged = capture.contents();
-        let expose: Vec<&str> = logged
-            .lines()
-            .filter(|line| line.contains("dynamic ingress expose"))
-            .collect();
+        let lines_for = |name: &str| -> Vec<&str> {
+            logged
+                .lines()
+                .filter(|line| {
+                    line.contains("dynamic ingress expose")
+                        && line.contains(&format!("name={name}"))
+                })
+                .collect()
+        };
         assert_eq!(
-            expose.len(),
-            4,
-            "one line per request, including the ones no actor saw: {logged}"
+            lines_for("chanweb").len(),
+            2,
+            "one line per request the dangling channel answered on its own: {logged}"
+        );
+        assert_eq!(
+            lines_for("recweb").len(),
+            1,
+            "the record the actor could not read says its one line: {logged}"
+        );
+        assert_eq!(
+            lines_for("bindweb").len(),
+            1,
+            "the dropped reply channel says its one line: {logged}"
         );
         assert!(
             !logged
@@ -2584,38 +2606,36 @@ mod tests {
              this channel must not add one for the same request: {logged}"
         );
         assert!(
-            expose[0].contains("name=web")
-                && expose[0].contains("port=http")
-                && expose[0].contains("outcome=\"refused\"")
-                && expose[0].contains("reason='http' is not a port number"),
+            lines_for("chanweb")[0].contains("port=http")
+                && lines_for("chanweb")[0].contains("outcome=\"refused\"")
+                && lines_for("chanweb")[0].contains("reason='http' is not a port number"),
             "the non-numeric port's line names the port as given: {}",
-            expose[0]
+            lines_for("chanweb")[0]
         );
         assert!(
-            expose[1].contains("name=web")
-                && expose[1].contains("port=3000")
-                && expose[1].contains("outcome=\"refused\"")
-                && expose[1].contains("reason=the session is gone"),
+            lines_for("chanweb")[1].contains("port=3000")
+                && lines_for("chanweb")[1].contains("outcome=\"refused\"")
+                && lines_for("chanweb")[1].contains("reason=the session is gone"),
             "the gone session's line says so: {}",
-            expose[1]
+            lines_for("chanweb")[1]
         );
         assert!(
-            expose[2].contains("name=recweb")
-                && expose[2].contains("port=3000")
-                && expose[2].contains("outcome=\"refused\"")
-                && expose[2].contains("reason=reading the session record for port 3000 failed"),
+            lines_for("recweb")[0].contains("port=3000")
+                && lines_for("recweb")[0].contains("outcome=\"refused\"")
+                && lines_for("recweb")[0]
+                    .contains("reason=reading the session record for port 3000 failed"),
             "the record-read failure's line names the box, whose name the \
              unreadable record could not: {}",
-            expose[2]
+            lines_for("recweb")[0]
         );
         assert!(
-            expose[3].contains("name=bindweb")
-                && expose[3].contains("port=3000")
-                && expose[3].contains("outcome=\"refused\"")
-                && expose[3].contains("reason=the session actor for port 3000 is gone"),
+            lines_for("bindweb")[0].contains("port=3000")
+                && lines_for("bindweb")[0].contains("outcome=\"refused\"")
+                && lines_for("bindweb")[0]
+                    .contains("reason=the session actor for port 3000 is gone"),
             "the dropped reply channel's line is this channel's, naming the \
              box: {}",
-            expose[3]
+            lines_for("bindweb")[0]
         );
     }
 

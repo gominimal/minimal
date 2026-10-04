@@ -5263,7 +5263,10 @@ async fn expose_allow_publishes_and_lists() {
     manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
     let web = finalize_dynamic_ingress_session(
         &mut client,
-        "web",
+        // This test's own box name: under the shared capture every test's
+        // lines ride one buffer, so each assertion finds its line by the
+        // box it names.
+        "listweb",
         std::net::Ipv4Addr::new(100, 64, 128, 21),
         std::net::Ipv4Addr::new(127, 0, 64, 21),
         Some(sessions::DynamicIngress::Allow),
@@ -5328,7 +5331,7 @@ async fn expose_allow_publishes_and_lists() {
     };
     let by_name: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
         .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Name(
-            "web".to_string(),
+            "listweb".to_string(),
         ))
         .await;
     assert_eq!(
@@ -5346,16 +5349,20 @@ async fn expose_allow_publishes_and_lists() {
     );
 
     // The one line the request leaves in the log, with the box, the port, the
-    // decision the box's setting made, and the outcome.
+    // decision the box's setting made, and the outcome — found by this
+    // test's own box name, the shared capture holding every test's lines.
     let logged = capture.contents();
     let line = logged
         .lines()
-        .find(|line| line.contains("dynamic ingress expose") && line.contains("name=web"))
+        .find(|line| {
+            line.contains("dynamic ingress expose")
+                && line.contains("name=listweb")
+                && line.contains("outcome=\"published\"")
+        })
         .unwrap_or_else(|| panic!("the publish must be logged, got: {logged}"));
     assert!(
         line.contains("port=3000")
             && line.contains("decision=allow")
-            && line.contains("outcome=\"published\"")
             && line.contains("local=127.0.64.21:3000"),
         "the publish line names the box, the port, the decision and the \
          outcome: {line}"
@@ -5599,9 +5606,12 @@ async fn expose_deny_typed_error() {
     let capture = crate::test_harness::captured_log();
     let server = TestServer::new().await;
     let mut client = server.connect().await;
+    // This test's own box names: under the shared capture every test's lines
+    // ride one buffer, so each assertion finds its lines by the box they
+    // name.
     let closed = finalize_dynamic_ingress_session(
         &mut client,
-        "closed",
+        "denyclosed",
         std::net::Ipv4Addr::new(100, 64, 128, 31),
         std::net::Ipv4Addr::new(127, 0, 64, 31),
         Some(sessions::DynamicIngress::Deny),
@@ -5610,7 +5620,7 @@ async fn expose_deny_typed_error() {
     .await;
     let bare = finalize_dynamic_ingress_session(
         &mut client,
-        "bare",
+        "denybare",
         std::net::Ipv4Addr::new(100, 64, 128, 32),
         std::net::Ipv4Addr::new(127, 0, 64, 32),
         None,
@@ -5664,7 +5674,7 @@ async fn expose_deny_typed_error() {
     );
     let live: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
         .call::<minimald_rpc::GetLiveIngress>(&minimald_rpc::GetLiveIngressRequest::Name(
-            "bare".to_string(),
+            "denybare".to_string(),
         ))
         .await;
     assert_eq!(
@@ -5674,25 +5684,27 @@ async fn expose_deny_typed_error() {
     );
 
     // Both refusals say their line, each naming the box, the port, the
-    // decision the box's setting made, and the reason.
+    // decision the box's setting made, and the reason — counted and taken
+    // per box name, the shared capture holding every test's refused lines.
     let logged = capture.contents();
-    let refused: Vec<_> = logged
-        .lines()
-        .filter(|line| {
-            line.contains("dynamic ingress expose") && line.contains("outcome=\"refused\"")
-        })
-        .collect();
-    assert_eq!(
-        refused.len(),
-        2,
-        "one refused line per request, got: {logged}"
-    );
-    for line in &refused {
+    for name in ["denyclosed", "denybare"] {
+        let refused: Vec<&str> = logged
+            .lines()
+            .filter(|line| {
+                line.contains("dynamic ingress expose") && line.contains(&format!("name={name}"))
+            })
+            .collect();
+        assert_eq!(
+            refused.len(),
+            1,
+            "one refused line per request for {name}, got: {logged}"
+        );
         assert!(
-            line.contains("port=3000")
-                && line.contains("decision=deny")
-                && line.contains("reason=dynamic ingress is denied for this box"),
-            "the refusal names the port, the decision and the reason: {line}"
+            refused[0].contains("port=3000")
+                && refused[0].contains("decision=deny")
+                && refused[0].contains("reason=dynamic ingress is denied for this box"),
+            "the refusal names the port, the decision and the reason: {}",
+            refused[0]
         );
     }
 }
@@ -5835,7 +5847,10 @@ async fn expose_colliding_on_shared_address_is_a_bind_error() {
     manager.land_range_verdict(crate::net::dns::RangeVerdict::Absent);
     let web = finalize_dynamic_ingress_session(
         &mut client,
-        "web",
+        // This test's own box names: under the shared capture every test's
+        // lines ride one buffer, so the assertion below finds the failed
+        // publish by the box it names.
+        "clashweb",
         std::net::Ipv4Addr::new(100, 64, 128, 31),
         std::net::Ipv4Addr::new(127, 0, 64, 31),
         Some(sessions::DynamicIngress::Allow),
@@ -5844,7 +5859,7 @@ async fn expose_colliding_on_shared_address_is_a_bind_error() {
     .await;
     let db = finalize_dynamic_ingress_session(
         &mut client,
-        "db",
+        "clashdb",
         std::net::Ipv4Addr::new(100, 64, 128, 32),
         std::net::Ipv4Addr::new(127, 0, 64, 32),
         Some(sessions::DynamicIngress::Allow),
@@ -5971,7 +5986,7 @@ async fn expose_colliding_on_shared_address_is_a_bind_error() {
     let logged = capture.contents();
     let line = logged
         .lines()
-        .find(|line| line.contains("dynamic ingress expose") && line.contains("name=db"))
+        .find(|line| line.contains("dynamic ingress expose") && line.contains("name=clashdb"))
         .unwrap_or_else(|| panic!("the failed publish must be logged, got: {logged}"));
     assert!(
         line.contains("port=3000")
@@ -6112,7 +6127,10 @@ async fn expose_on_stopped_box_refused() {
     manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
     let web = finalize_dynamic_ingress_session(
         &mut client,
-        "web",
+        // This test's own box name: under the shared capture every test's
+        // lines ride one buffer, so the assertion below finds the refusal
+        // by the box it names.
+        "stopweb",
         std::net::Ipv4Addr::new(100, 64, 128, 9),
         std::net::Ipv4Addr::new(127, 0, 64, 9),
         Some(sessions::DynamicIngress::Allow),
@@ -6168,15 +6186,15 @@ async fn expose_on_stopped_box_refused() {
     );
 
     // The one line the request owes the log: the box, the port, the decision
-    // its setting made, and the refusal that answered it.
+    // its setting made, and the refusal that answered it — found by this
+    // test's own box name, the shared capture holding every test's lines.
     let logged = capture.contents();
     let line = logged
         .lines()
-        .find(|line| line.contains("dynamic ingress expose"))
+        .find(|line| line.contains("dynamic ingress expose") && line.contains("name=stopweb"))
         .unwrap_or_else(|| panic!("the refused request must be logged, got: {logged}"));
     assert!(
-        line.contains("name=web")
-            && line.contains("port=3000")
+        line.contains("port=3000")
             && line.contains("decision=allow")
             && line.contains("outcome=\"refused\"")
             && line.contains("reason=this box is not running; start the box and try again"),
@@ -6197,7 +6215,10 @@ async fn expose_without_published_address_is_not_a_policy_deny() {
     let mut client = server.connect().await;
     let web = finalize_self_allocated_dynamic_ingress_session(
         &mut client,
-        "selfweb",
+        // This test's own box name: under the shared capture every test's
+        // lines ride one buffer, so the assertion below finds the refusal
+        // by the box it names.
+        "nopubweb",
         Some(sessions::DynamicIngress::Allow),
         Some((3000, 3999)),
     )
@@ -6226,7 +6247,7 @@ async fn expose_without_published_address_is_not_a_policy_deny() {
     // deliver to and nowhere to bind at.
     registry.write().expect("registry lock").report_own_address(
         web,
-        "selfweb",
+        "nopubweb",
         std::net::Ipv4Addr::new(100, 64, 128, 42),
         std::collections::BTreeMap::new(),
     );
@@ -6253,15 +6274,15 @@ async fn expose_without_published_address_is_not_a_policy_deny() {
     );
 
     // The log's answer is not a misreading waiting to happen: the decision
-    // was allow, and the refusal names the missing publish.
+    // was allow, and the refusal names the missing publish — found by this
+    // test's own box name, the shared capture holding every test's lines.
     let logged = capture.contents();
     let line = logged
         .lines()
-        .find(|line| line.contains("dynamic ingress expose"))
+        .find(|line| line.contains("dynamic ingress expose") && line.contains("name=nopubweb"))
         .unwrap_or_else(|| panic!("the refused request must be logged, got: {logged}"));
     assert!(
-        line.contains("name=selfweb")
-            && line.contains("port=3000")
+        line.contains("port=3000")
             && line.contains("decision=allow")
             && line.contains("outcome=\"refused\"")
             && line
@@ -6285,10 +6306,13 @@ async fn expose_logs_every_path() {
     let manager = server.state.sessions_manager().await;
     manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
 
-    // A box that publishes, and then refuses its own duplicate.
+    // A box that publishes, and then refuses its own duplicate. The three
+    // boxes are this test's own names: under the shared capture every
+    // test's lines ride one buffer, so each request's line below is found
+    // and counted by the box it names.
     let web = finalize_dynamic_ingress_session(
         &mut client,
-        "web",
+        "pathweb",
         std::net::Ipv4Addr::new(100, 64, 128, 25),
         std::net::Ipv4Addr::new(127, 0, 64, 25),
         Some(sessions::DynamicIngress::Allow),
@@ -6329,7 +6353,7 @@ async fn expose_logs_every_path() {
     // A box that declared nothing: the deny-all default refuses it.
     let closed = finalize_dynamic_ingress_session(
         &mut client,
-        "closed",
+        "pathclosed",
         std::net::Ipv4Addr::new(100, 64, 128, 26),
         std::net::Ipv4Addr::new(127, 0, 64, 26),
         None,
@@ -6356,7 +6380,7 @@ async fn expose_logs_every_path() {
     // takes it over from the 200 one that served the publish above.
     let broken = finalize_dynamic_ingress_session(
         &mut client,
-        "broken",
+        "pathbroken",
         std::net::Ipv4Addr::new(100, 64, 128, 27),
         std::net::Ipv4Addr::new(127, 0, 64, 27),
         Some(sessions::DynamicIngress::Allow),
@@ -6398,28 +6422,44 @@ async fn expose_logs_every_path() {
         "the failed publish asked the switch once"
     );
 
-    // One line per request — four requests, four lines, no strays — each
-    // naming the box, the port, the decision, and the outcome.
+    // One line per request — four requests, four lines among this test's
+    // own boxes, no strays from any test sharing the process-wide capture —
+    // each naming the box, the port, the decision, and the outcome.
     let logged = capture.contents();
-    let lines: Vec<&str> = logged
-        .lines()
-        .filter(|line| line.contains("dynamic ingress expose"))
-        .collect();
+    let lines_for = |name: &str| -> Vec<&str> {
+        logged
+            .lines()
+            .filter(|line| {
+                line.contains("dynamic ingress expose") && line.contains(&format!("name={name}"))
+            })
+            .collect()
+    };
     assert_eq!(
-        lines.len(),
-        4,
-        "one line per request on every path the actor sees, got: {logged}"
+        lines_for("pathweb").len(),
+        2,
+        "one line per request at the publishing box, got: {logged}"
+    );
+    assert_eq!(
+        lines_for("pathclosed").len(),
+        1,
+        "the unenrolled box's refusal says its one line, got: {logged}"
+    );
+    assert_eq!(
+        lines_for("pathbroken").len(),
+        1,
+        "the broken box's failed publish says its one line, got: {logged}"
     );
     let line_for = |name: &str, outcome: &str| {
-        lines
-            .iter()
+        logged
+            .lines()
             .find(|line| {
-                line.contains(&format!("name={name}"))
+                line.contains("dynamic ingress expose")
+                    && line.contains(&format!("name={name}"))
                     && line.contains(&format!("outcome=\"{outcome}\""))
             })
             .unwrap_or_else(|| panic!("a line per outcome, got: {logged}"))
     };
-    let published = line_for("web", "published");
+    let published = line_for("pathweb", "published");
     assert!(
         published.contains("port=3000")
             && published.contains("decision=allow")
@@ -6427,21 +6467,21 @@ async fn expose_logs_every_path() {
         "the publish line names the box, the port, the decision and the \
          address it bound: {published}"
     );
-    let duplicate = line_for("web", "refused");
+    let duplicate = line_for("pathweb", "refused");
     assert!(
         duplicate.contains("port=3000")
             && duplicate.contains("decision=allow")
             && duplicate.contains("reason=port 3000 is published already by this box"),
         "the duplicate refusal names the port and the reason: {duplicate}"
     );
-    let denied = line_for("closed", "refused");
+    let denied = line_for("pathclosed", "refused");
     assert!(
         denied.contains("port=3000")
             && denied.contains("decision=deny")
             && denied.contains("reason=dynamic ingress is denied for this box"),
         "the policy refusal names the decision and the reason: {denied}"
     );
-    let failed = line_for("broken", "publish failed");
+    let failed = line_for("pathbroken", "publish failed");
     assert!(
         failed.contains("port=3000")
             && failed.contains("decision=allow")
