@@ -3849,6 +3849,7 @@ dependencies = [
  "checkouts",
  "codespan-reporting",
  "common",
+ "decode",
  "futures",
  "google-cloud-auth",
  "google-cloud-storage",
