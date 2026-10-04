@@ -704,6 +704,14 @@ pub(crate) fn probe_effect(root: &Path, endpoints: &[(Family, SocketAddr)]) -> R
         }
     }
     let leaf = probe_leaf(root);
+    // The leaf is named by the daemon's pid, so two probes in one daemon —
+    // two host-address launches read concurrently — would share it: the
+    // second would remove the first's leaf or meet it as `EEXIST` and read
+    // as unreadable. One probe holds the leaf at a time; the lock guards no
+    // data, so a poisoned one is as good as a clean one.
+    let _held = PROBE_LEAF_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // A probe that died before its own cleanup leaves its leaf behind, and
     // this probe removes it rather than wedging into it: the file first —
     // over a stand-in tree that is the modeled `cgroup.procs` a previous
@@ -734,6 +742,9 @@ pub(crate) fn probe_effect(root: &Path, endpoints: &[(Family, SocketAddr)]) -> R
     let _ = std::fs::remove_dir(&leaf);
     Reading::of(&observations)
 }
+
+/// Serializes the probes of one daemon over their one pid-named leaf.
+static PROBE_LEAF_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The probe's throwaway leaf, in the deny subtree the refusing rule
 /// matches: `<root>/boxes/deny/filter-probe-<pid>`, named by this daemon's
@@ -4734,6 +4745,35 @@ mod tests {
         assert!(
             !probe_leaf(root).exists(),
             "the probe removes the throwaway leaf it placed its child in"
+        );
+    }
+
+    /// Two launches read concurrently in one daemon, and their probes share
+    /// the daemon's one pid-named leaf: each must still read the table's
+    /// effect, never the other's leaf as `EEXIST` — the race that refused a
+    /// guest's deny-all box while a second box launched beside it.
+    #[test]
+    fn concurrent_probes_in_one_daemon_each_read_the_effect() {
+        let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+        let root = tree.path();
+        installed_cohort(root);
+        let readings = std::thread::scope(|scope| {
+            let probes: Vec<_> = (0..8).map(|_| scope.spawn(|| read_filter(root))).collect();
+            probes
+                .into_iter()
+                .map(|probe| probe.join().expect("a probe thread does not panic"))
+                .collect::<Vec<_>>()
+        });
+        for reading in &readings {
+            assert!(
+                matches!(reading, Reading::NotRefused { .. }),
+                "every concurrent probe reads the effect behind no table, not \
+                 an unreadable leaf: {reading:?}"
+            );
+        }
+        assert!(
+            !probe_leaf(root).exists(),
+            "the last probe removes the shared leaf"
         );
     }
 
