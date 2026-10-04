@@ -143,6 +143,24 @@ async fn register_box_with_vm_host(
                  answerer status {status:?}; the registration did not happen"
             )
         }
+        minimald_rpc::BoxControlReply::Row(row) => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with the box \
+                 row {row:?}; the registration did not happen"
+            )
+        }
+        minimald_rpc::BoxControlReply::NoRow { name, .. } => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with the no-row \
+                 marker for {name:?}; the registration did not happen"
+            )
+        }
+        minimald_rpc::BoxControlReply::PortRecorded { port, .. } => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with the port \
+                 report {port}; the registration did not happen"
+            )
+        }
     }
 }
 
@@ -362,6 +380,31 @@ pub(crate) async fn withdraw_box_row(
                      registration; the row stays published"
                 );
             }
+            // The read-only and report replies are other verbs' answers on
+            // a wire whose shapes are disjoint: none of them says the row
+            // went, so the row stays published and the line says so.
+            minimald_rpc::BoxControlReply::Row(_) => {
+                tracing::warn!(
+                    box = %name,
+                    "the VM host daemon answered the box row withdrawal with a \
+                     row read; the row stays published"
+                );
+            }
+            minimald_rpc::BoxControlReply::NoRow { .. } => {
+                tracing::warn!(
+                    box = %name,
+                    "the VM host daemon answered the box row withdrawal with a \
+                     no-row marker; the row stays published"
+                );
+            }
+            minimald_rpc::BoxControlReply::PortRecorded { port, .. } => {
+                tracing::warn!(
+                    box = %name,
+                    port,
+                    "the VM host daemon answered the box row withdrawal with a \
+                     port report; the row stays published"
+                );
+            }
         },
         Ok(Err(error)) => {
             tracing::warn!(
@@ -449,6 +492,20 @@ async fn register_box_for_activation(
             .unwrap_or_default(),
         egress: policy.egress.clone(),
         credentialed_upstream: policy.credentialed_upstream.clone(),
+        // The dynamic-ingress grant (NET-045, NET-138), from the same
+        // create inputs the session record holds: the stance and the range
+        // the host-side row holds every runtime port report against — the
+        // half of the grant the host decides by, never something the guest
+        // could bring with its report. Absent fields carry the deny
+        // default the host's row fills in: nothing is permitted.
+        dynamic_ingress: policy
+            .ingress
+            .as_ref()
+            .and_then(|ingress| ingress.dynamic_ingress),
+        dynamic_allowed_range: policy
+            .ingress
+            .as_ref()
+            .and_then(|ingress| ingress.dynamic_allowed_range),
     };
     let registration = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
@@ -4342,6 +4399,8 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
             },
         )
         .await
@@ -4350,6 +4409,84 @@ mod tests {
             refused.to_string().contains("address plan is exhausted"),
             "the refusal surfaces with its reason: {refused}"
         );
+    }
+
+    /// NET-045/NET-138: the host-side registration carries the box's
+    /// dynamic-ingress grant — the stance and the range — from the same
+    /// create inputs the session record holds, so the host-side row holds
+    /// every runtime port report against the grant the box was created
+    /// with, never against one the guest could bring with its report. A
+    /// declaration that carries no grant carries nothing, and the host's
+    /// row fills the deny default in: nothing is permitted.
+    #[tokio::test]
+    async fn registration_carries_dynamic_ingress_grant() {
+        let granted = sessions::SessionPolicy {
+            egress: None,
+            ingress: Some(IngressPolicy {
+                port_mappings: vec![PortMapping {
+                    external_port: 8080,
+                    internal_port: 80,
+                    proto: IpProto::Tcp,
+                }],
+                dynamic_allowed_range: Some((3000, 3999)),
+                dynamic_ingress: Some(sessions::DynamicIngress::Ask),
+            }),
+            credentialed_upstream: None,
+        };
+        let ungranted = sessions::SessionPolicy {
+            egress: None,
+            ingress: Some(IngressPolicy {
+                port_mappings: Vec::new(),
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+            credentialed_upstream: None,
+        };
+
+        for (policy, name) in [(granted, "granted"), (ungranted, "ungranted")] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let provider_dir = dir.path().join("providers").join("local-minvmd0");
+            std::fs::create_dir_all(&provider_dir).unwrap();
+            let sock_path = provider_dir.join("control.sock");
+            let requests = fake_vm_host(
+                sock_path.clone(),
+                r#"{"switch_address":"100.64.0.2","loopback_address":"127.0.64.0"}"#.to_string(),
+            )
+            .await;
+            let global = GlobalArgs {
+                provider: Some(Provider::LocalMinvmd),
+                minimal_dir: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            };
+            register_box_for_activation(
+                paths::ProviderKind::Minvmd,
+                global.minimal_dir.as_deref(),
+                NetworkMode::OwnIp,
+                name,
+                &policy,
+            )
+            .await
+            .expect("the registration is answered")
+            .expect("an own-address box on a VM-backed host registers");
+            let seen = requests.lock().unwrap();
+            let request: minimald_rpc::BoxControlRequest =
+                serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type");
+            let minimald_rpc::BoxControlRequest::Register(request) = request else {
+                panic!("a registration is carried by the register verb");
+            };
+            // The grant rides the same create inputs the session record
+            // holds: the policy's own stance and range, verbatim.
+            assert_eq!(
+                request.dynamic_ingress,
+                policy.ingress.as_ref().unwrap().dynamic_ingress,
+                "the registration carries the stance the create inputs hold"
+            );
+            assert_eq!(
+                request.dynamic_allowed_range,
+                policy.ingress.as_ref().unwrap().dynamic_allowed_range,
+                "the registration carries the range the create inputs hold"
+            );
+        }
     }
 
     /// NET-133/BEP-070: the CLI, the row and the attachment carry one id per
