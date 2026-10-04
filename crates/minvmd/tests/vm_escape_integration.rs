@@ -30,26 +30,24 @@
 //! arbitrary-exec RPC), so the test speaks for the escapee at the edges above
 //! rather than pretending to exec it.
 //!
-//! **The shipped posture.** The host-side gate decides a frame whose source
-//! is an address the plan could hand to a box but no published row holds as
-//! the announced interim's admit — no rules consulted — because the rows that
-//! would bound it are T66's (#1711, the creator-side registration), whose
-//! flip also replaces the interim with a per-box default. So today a spoofed
-//! in-plan source is admitted end-to-end, and the test says so — the way the
-//! tree's own interim tests pin both arms (`unknown_source_default_deny`) —
-//! with a comment naming the in-force arm each shipped admit becomes. What
-//! holds at this branch and holds after the flip:
+//! **The shipped posture.** The host-side gate drops a frame whose source is
+//! an address the plan could hand to a box but no published row holds — no
+//! rules consulted, no phase gating the decision — because a lease the plan
+//! could mint but no box holds is exactly the address a root escapee forges
+//! (NET-085). So today a spoofed in-plan source never leaves the VM, and the
+//! test says so. What holds at this branch:
 //!
 //! - an address **outside** the plan's lease block is refused outright
-//!   (`egress-unknown-source`), under either phase: outside the plan there
-//!   is no lease to spoof — the rule-0 refusal, flip-stable;
+//!   (`egress-unknown-source`): outside the plan there is no lease to
+//!   spoof — the rule-0 refusal;
 //! - a **resident box's own** declared traffic reaches its declared
-//!   destination — the positive controls, flip-stable under T66's rows;
-//! - a spoofed **in-plan** source admitted by the shipped interim — the gap
-//!   the flip closes, named per attempt.
+//!   destination — the positive controls, admitted by their own rows;
+//! - a spoofed **in-plan** source no row holds is dropped under the gate's
+//!   unregistered rule (`egress-unregistered-source`), toward every
+//!   destination the baseline set's own included.
 //!
 //! Diagnostics: after the spoofs the test prints the host-side gate's own
-//! lines for the spoofed sources (the drop and interim-admit lines), so the
+//! lines for the spoofed sources (the drop lines), so the
 //! bound can be read off the test output; observability: every spoofed
 //! destination attempt is recorded with the verdict its arrival gave it.
 //!
@@ -123,9 +121,6 @@ const SUBPROC_TIMEOUT: Duration = Duration::from_secs(180);
 /// How long a gate line may take to reach the supervisor's log file, which
 /// a non-blocking writer fills behind the gate.
 const LOG_DEADLINE: Duration = Duration::from_secs(5);
-/// How long one spoofed flow may take to produce its verdict: the ARP claim,
-/// the SYN, and the handshake across the real switch and the host listener.
-const FLOW_DEADLINE: Duration = Duration::from_secs(10);
 /// How long a flow expected to be dropped is waited for before its silence is
 /// read as the verdict. The gate decides before any frame leaves the VM, so
 /// the silence is available well within this.
@@ -173,6 +168,9 @@ fn e2e_enabled() -> Option<PathBuf> {
 struct Guest {
     sock_path: PathBuf,
     gate_sock: PathBuf,
+    /// The VM host daemon's box control socket, where each box is registered
+    /// before its session is created, as `min session activate` does.
+    control_sock: PathBuf,
     gvproxy: PathBuf,
     /// The VMM child's pid from `status --json`, killed directly when
     /// `minvmd stop` fails.
@@ -317,6 +315,7 @@ impl Guest {
             // The gate binds the socket beside the switch socket, which sits
             // beside the bridge socket.
             gate_sock: provider_dir.join("gvproxy-gate.sock"),
+            control_sock: provider_dir.join(minvmd::control::CONTROL_SOCK_FILE),
             gvproxy: gvproxy.to_path_buf(),
             vmm_pid: None,
             _state: state,
@@ -372,8 +371,8 @@ impl Guest {
             .unwrap_or_else(|e| format!("(no run.log at {}: {e})", path.display()))
     }
 
-    /// The supervisor's tracing so far — where the host-side gate's drop and
-    /// interim lines land — one rendered record per line. A detached
+    /// The supervisor's tracing so far — where the host-side gate's drop
+    /// lines land — one rendered record per line. A detached
     /// supervisor writes JSON records to `<state>/minimal/logs/minvmd.log.*`.
     fn log(&self) -> String {
         let dir = self._state.path().join("minimal/logs");
@@ -459,6 +458,7 @@ impl BoxSession {
     /// the handle for execs.
     async fn open(
         sock_path: &Path,
+        control_sock: &Path,
         network: sessions::NetworkMode,
         egress: sessions::EgressPolicy,
         label: &str,
@@ -504,8 +504,9 @@ impl BoxSession {
 
         // CreateSession with the declared egress: the box's policy as the
         // session record carries it, which the box's own relay enforces
-        // in-guest (NET-084) and which T66 (#1711) will publish as the
-        // host-side row the egress gate decides the box's frames by.
+        // in-guest (NET-084) and which its registration with the VM host
+        // files as the host-side row the egress gate decides the box's
+        // frames by.
         let session_id = {
             let channel = handle
                 .channel_open_session()
@@ -517,7 +518,7 @@ impl BoxSession {
                 .map_err(|e| format!("request_subsystem: {e}"))?;
 
             let policy = sessions::SessionPolicy {
-                egress: Some(egress),
+                egress: Some(egress.clone()),
                 ..Default::default()
             };
             // Unique per invocation — minimald dedups sessions by name and
@@ -531,16 +532,22 @@ impl BoxSession {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
+            let name = format!("vm-escape-{label}-{uniq:x}");
+            // The box's row, filed with the VM host the way `min session
+            // activate` files it: a box with no row is an unregistered
+            // source the gate drops unconditionally (NET-085), so a box
+            // whose own declared traffic is a positive control must hold one.
+            let addresses = common::register_box(control_sock, &name, Some(egress))?;
             let req = CreateSessionRequest {
                 config: minimald_rpc::SessionConfig {
-                    name: Some(format!("vm-escape-{label}-{uniq:x}")),
+                    name: Some(name),
                     project_path: paths::HostAbsPath::try_new("/tmp")
                         .map_err(|e| format!("project_path: {e}"))?,
                     network,
                     policy,
-                    // No registration happened on this path: the box attaches
-                    // as an unregistered one always has.
-                    box_addresses: None,
+                    // The addresses the registration handed back, so the
+                    // in-VM daemon attaches the box at its row's lease.
+                    box_addresses: Some(addresses),
                     // The serde default, and what every non-`--no-hooks`
                     // activation sends. This session only runs execs, so it
                     // declares no hooks either way.
@@ -840,7 +847,15 @@ async fn open_box(
     tokio::time::sleep(Duration::from_millis(500)).await;
     let mut last = "not attempted".to_string();
     for attempt in 1..=6 {
-        match BoxSession::open(&guest.sock_path, network, egress.clone(), label).await {
+        match BoxSession::open(
+            &guest.sock_path,
+            &guest.control_sock,
+            network,
+            egress.clone(),
+            label,
+        )
+        .await
+        {
             Ok(session) => return session,
             Err(e) => {
                 last = e;
@@ -1393,11 +1408,12 @@ struct HostListener {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-/// The gate's own account of a connection, for a marker that never arrived.
-/// Which lines are present is the discriminator: an `egress-unregistered-source`
-/// line and nothing else means the gate admitted the frames and the loss is
-/// past it, while an ingress-leg line means the relay came off on the switch
-/// side and anything the guest had buffered went with it (#1847).
+/// The gate's own account of a connection, for an assertion that cannot find
+/// the line it expects. Which lines are present is the discriminator: an
+/// `egress-unregistered-source` line and nothing else means the gate dropped
+/// the frames at its own edge, while an ingress-leg line means the relay
+/// came off on the switch side and anything the guest had buffered went with
+/// it (#1847).
 fn gate_account(guest: &Guest) -> String {
     let lines = guest.log_lines(&[
         "egress-unregistered-source",
@@ -1604,11 +1620,10 @@ async fn vm_escape_bounded_to_resident_union() {
     let host_cidr = format!("{host}/32");
 
     // Two resident boxes with disjoint declared egress. Both declare the
-    // host listener's address (the destination their own probes reach, the
-    // flip-stable arm: a box's own declared traffic, admitted by its own
-    // declaration under either phase) and the fabric, and each declares a
-    // private range the other does not — the disjoint half the cross-box
-    // spoof would have to buy.
+    // host listener's address (the destination their own probes reach: a
+    // box's own declared traffic, admitted by its own declaration) and the
+    // fabric, and each declares a private range the other does not — the
+    // disjoint half the cross-box spoof would have to buy.
     let mut box_a = open_box(
         &guest,
         sessions::NetworkMode::OwnIp,
@@ -1681,7 +1696,7 @@ async fn vm_escape_bounded_to_resident_union() {
 
     // The positive controls: each box's own declared traffic reaches the
     // listener — the whole chain working, relay to gate to switch to NAT —
-    // and the flip-stable arm of the bound. The marker names its sender.
+    // and the bound's own row-decided arm. The marker names its sender.
     for (label, box_session, marker) in [
         ("box-a", &mut box_a, "own-a-reached"),
         ("box-b", &mut box_b, "own-b-reached"),
@@ -1714,15 +1729,12 @@ async fn vm_escape_bounded_to_resident_union() {
     // carries past that edge.
     //
     // In-plan made-up leases — addresses the plan could hand to a box and no
-    // row holds: under the shipped interim the gate admits these frames
-    // without consulting any rules, so the flow completes and its marker
-    // arrives at the host listener; the gate's own line names the source
-    // (`egress-unregistered-source`). When T66 (#1711) lands — box rows
-    // published, the interim replaced by the per-box default — every one of
-    // these becomes an unknown-source drop, because a made-up lease has no
-    // row to be decided by: the flip turns each admit below into
-    // `egress-unknown-source`, and the reach a made-up lease buys goes to
-    // nothing.
+    // row holds: the gate drops these frames under its own unregistered
+    // source rule, toward every destination alike — no rules consulted, no
+    // phase gating the decision (NET-085), because a lease the plan could
+    // mint but no box holds is exactly the address a root escapee forges.
+    // The flow never completes, nothing arrives, and the gate's own line
+    // names the source (`egress-unregistered-source`).
     //
     // The sources are written here, not read off the boxes' own leases: the
     // arm under test is an in-plan address *no row holds*, which the boxes'
@@ -1738,55 +1750,35 @@ async fn vm_escape_bounded_to_resident_union() {
             src_port: 40_000 + u16::from(src.octets()[3]),
             marker: format!("spoof-{src}-arrived"),
         };
-        // Both arms of the in-plan source are pinned: the shipped interim
-        // admits it — the flow completes, the marker arrives, and the gate's
-        // interim line names the source — and the per-box default T66 (#1711)
-        // flips in refuses it before any frame leaves the VM — silence at the
-        // listener, and the gate's unknown-source line naming the source.
-        // When the flip lands this arm strengthens instead of breaking: the
-        // Err arm becomes the in-force verdict, recorded like any other.
-        let verdict = match spoofed_flow(&guest.gate_sock, &flow, FLOW_DEADLINE) {
-            Ok(marker_ack) => {
-                assert!(
-                    listener.wait_for(&flow.marker, Duration::from_secs(10)),
-                    "the spoofed flow from {src} completed its handshake but its \
-                     marker never reached the host listener; {marker_ack}; the \
-                     listener saw: {}; the gate said: {}",
-                    listener.report(),
-                    gate_account(&guest)
-                );
-                // The gate's own line for the admit: the diagnostics a host
-                // reads the interim's posture out of, naming the source the
-                // frame wore.
-                assert!(
-                    guest.log_contains("egress-unregistered-source")
-                        && guest.log_contains(&format!("source={src}")),
-                    "the gate admitted spoofed source {src} without its interim \
-                     line naming it"
-                );
-                format!(
-                    "spoofed source {src} reached {host}:{port} (the shipped \
-                         interim's admit; T66's flip makes it an unknown-source drop; \
-                         {marker_ack})"
-                )
-            }
+        // The one arm this posture leaves: refused before any frame leaves
+        // the VM — silence at the listener, and the unregistered-source line
+        // naming the source. A completed flow here means the gate stopped
+        // dropping a source no row holds, so it is a failure, not a verdict.
+        let verdict = match spoofed_flow(&guest.gate_sock, &flow, DROP_DEADLINE) {
+            Ok(marker_ack) => panic!(
+                "vm_escape_integration: a spoofed in-plan source no row holds \
+                 ({src}) completed a flow to {host}:{port}; the gate must drop \
+                 it (NET-085) [{marker_ack}]"
+            ),
             Err(e) => {
-                // The in-force arm: the flow was decided before it left the
-                // VM — nothing arrives, and the drop line names the source.
+                // The flow was decided before it left the VM — nothing
+                // arrives, and the drop line names the source.
                 assert!(
                     !listener.seen_any(&flow.marker),
                     "the spoofed flow from {src} was refused at the gate, but \
-                     its marker reached the host listener"
+                     its marker reached the host listener; the listener saw: {}",
+                    listener.report()
                 );
                 assert!(
-                    guest.log_contains("egress-unknown-source")
+                    guest.log_contains("egress-unregistered-source")
                         && guest.log_contains(&format!("source={src}")),
-                    "the gate refused spoofed source {src} without its \
-                     unknown-source line naming it"
+                    "the gate dropped spoofed source {src} without its \
+                     unregistered-source line naming it; the gate said: {}",
+                    gate_account(&guest)
                 );
                 format!(
-                    "spoofed source {src} refused at the gate (the per-box \
-                         default; silence, and the unknown-source line) [{e}]"
+                    "spoofed source {src} refused at the gate (silence, and \
+                         the unregistered-source line) [{e}]"
                 )
             }
         };
@@ -1798,11 +1790,10 @@ async fn vm_escape_bounded_to_resident_union() {
         });
     }
 
-    // Out of the plan's lease block: refused outright, under either phase —
-    // outside the plan there is no lease to spoof. The rule-0 refusal,
-    // flip-stable: the gate drops the SYN before any frame leaves the VM, so
-    // the flow gets silence, no marker arrives, and the gate's drop line
-    // names the source.
+    // Out of the plan's lease block: refused outright — outside the plan
+    // there is no lease to spoof. The rule-0 refusal: the gate drops the SYN
+    // before any frame leaves the VM, so the flow gets silence, no marker
+    // arrives, and the gate's drop line names the source.
     let outside_plan = Ipv4Addr::new(203, 0, 113, 7);
     let flow = SpoofedFlow {
         src: outside_plan,
@@ -1858,18 +1849,18 @@ async fn vm_escape_bounded_to_resident_union() {
     );
 
     // The cross-box pairs — a spoofed box address tried at a destination only
-    // the other box declared — have no observable today: the shipped interim
-    // admits them without rules, and the destinations have nothing listening,
-    // so neither an arrival nor a gate line can attribute the frame to this
-    // test. What bounds them is the decision the unit case pins
+    // the other box declared — leave no arrival this test can attribute to
+    // itself: the destinations have nothing listening, and a frame the row
+    // that holds the worn source refuses dies at the gate with no listener
+    // behind it to say so. What bounds them is the decision the unit case pins
     // (spoofed_source_bounded_to_resident_union): the row that holds the
-    // spoofed source decides it, so after T66's flip a spoof of box-a's
-    // address reaches box-a's declared egress and nothing else. This test
-    // does not send unobservable frames; the record above is what the VM
-    // boundary can say today.
+    // spoofed source decides it, so a spoof of box-a's address reaches
+    // box-a's declared egress and nothing else. This test does not send
+    // unobservable frames; the record above is what the VM boundary can say
+    // today.
 
     // The record, then the host-side gate's own lines for the spoofed
-    // sources: the attempt table and the drop/admit lines beside it, so the
+    // sources: the attempt table and the drop lines beside it, so the
     // bound can be read off the test output.
     eprintln!("vm_escape_integration: spoof attempts against the resident union:");
     for attempt in &attempts {
