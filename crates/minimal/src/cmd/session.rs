@@ -1629,7 +1629,7 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
     session_via_ssh(
         &sock,
         r.id,
-        minimal_client::attach::remote_command(&args.command),
+        minimal_client::attach::checked_remote_command(&args.command)?,
         None,
     )
     .await
