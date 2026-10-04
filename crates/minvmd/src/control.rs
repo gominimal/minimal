@@ -100,7 +100,7 @@ pub(crate) const PUBLISH_TRIES: usize = 3;
 /// refused, not who refused it — the guest's own log tail is where the
 /// taker's own identity, if anywhere, is said.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-pub(crate) const HELD_BY_ANOTHER_PROCESS: &str = "another process on the host holds it";
+pub(crate) const HELD_BY_ANOTHER_PROCESS: &str = "another process on the host";
 
 /// What the supervisor learned about the publish of the hostname-proxy port
 /// it reserved (T93): the guest's report over the boot-marker channel — the
