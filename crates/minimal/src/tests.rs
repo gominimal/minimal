@@ -767,6 +767,15 @@ fn sanitize_name_component_trims_and_falls_back() {
     assert_eq!(sanitize_name_component("café"), "caf");
     assert_eq!(sanitize_name_component("...."), "session");
     assert_eq!(sanitize_name_component("a\tb"), "ab");
+    // `_` and `.` map to `-`, so the minted name stays a single DNS label.
+    assert_eq!(sanitize_name_component("my_app.dev"), "my-app-dev");
+    assert_eq!(sanitize_name_component("mnlh.Ab12_"), "mnlh-ab12");
+    // An over-long basename is capped and re-trimmed.
+    assert_eq!(sanitize_name_component(&"a".repeat(100)).len(), 48);
+    assert_eq!(
+        sanitize_name_component(&format!("{}-tail", "b".repeat(47))),
+        "b".repeat(47)
+    );
 }
 
 /// The minted suffix is exactly four lowercase hex digits.
