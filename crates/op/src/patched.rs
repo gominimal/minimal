@@ -13,8 +13,9 @@ pub struct PatchedBuildResult {
     pub meta: EntryMeta,
 }
 
-/// Builds a spec, resolving dependencies by name from the most recent cached
-/// build of each dependency rather than by spec hash.
+/// Builds a spec, resolving each dependency to its most recent cached build by
+/// name, falling back to its exact spec-hash entry. Every dependency that has
+/// neither is reported together in one error.
 ///
 /// This breaks the normal caching model but is useful for development workflows
 /// where you want to test a build against locally-modified dependencies.
@@ -67,9 +68,8 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
 
         if !missing.is_empty() {
             return Err(Error::Other(anyhow!(
-                "patched-build needs local builds of: {}; run 'min package build {}' first",
-                missing.join(", "),
-                missing.join(" ")
+                "patched-build needs local builds of: {}; build them first",
+                missing.join(", ")
             )));
         }
 
@@ -231,6 +231,49 @@ mod tests {
         assert!(
             !msg.contains("dep-b"),
             "dep-b is cached by spec hash and must not be reported missing, got: {msg}"
+        );
+    }
+
+    /// Several missing dependencies are collected into one error rather than
+    /// the first miss aborting the lookup.
+    #[test]
+    fn reports_several_missing_dependencies_in_one_error() {
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::at_dir(tmp.path()).unwrap();
+        let dg = graph_from(THREE_DEPS);
+
+        // Only dep-a is built; dep-b and dep-c are both absent.
+        fake_build(&cache, &dg, "dep-a", "dep-a");
+
+        let bsr = *dg.by_name("top").unwrap();
+        let fetcher = UnusedFetcher;
+        let mut pb = patched_build(&bsr, &fetcher);
+        let opts = Options {
+            cache: cache.clone(),
+            graph: &dg,
+            exec_base: "/not-exists".into(),
+            ot: None,
+            daemon_id: None,
+        };
+
+        let err = futures::executor::block_on(pb.run(&opts))
+            .err()
+            .expect("PatchedBuild::run should fail when dependencies are missing");
+
+        let msg = format!("{err}");
+        for missing in ["dep-b", "dep-c"] {
+            assert!(
+                msg.contains(missing),
+                "the error must name every missing dependency ({missing}), got: {msg}"
+            );
+        }
+        assert!(
+            !msg.contains("dep-a"),
+            "dep-a is cached by name and must not be reported missing, got: {msg}"
+        );
+        assert!(
+            msg.contains("build them first"),
+            "the error must say how to recover, got: {msg}"
         );
     }
 
