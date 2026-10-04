@@ -854,8 +854,9 @@ pub(crate) fn parse_dynamic_ingress_mode(raw: &str) -> Result<sessions::DynamicI
 
 /// Parse a `--dynamic-range <lo>-<hi>` value (NET-043) into the inclusive
 /// `(lo, hi)` pair the create request's `dynamic_allowed_range` carries.
-/// A malformed value (no `-`, a non-numeric end, a port outside u16) or an
-/// inverted one (`hi` below `lo`) is a create-time error here, at the flag,
+/// A malformed value (no `-`, a non-numeric end, a port outside u16), an
+/// inverted one (`hi` below `lo`), or a privileged one (`lo` below
+/// [`sessions::MIN_DYNAMIC_INGRESS_PORT`]) is a create-time error here, at the flag,
 /// rather than a daemon-side refusal after the box's directory exists: the
 /// user sees what they typed named in the error, with no half-created
 /// session behind it.
@@ -874,6 +875,14 @@ pub(crate) fn parse_dynamic_range(raw: &str) -> Result<(u16, u16), String> {
     if hi < lo {
         return Err(format!(
             "dynamic range '{raw}': the upper end must not be below the lower end"
+        ));
+    }
+    // The launch check's own bound and wording (`validate_policy`), so a
+    // privileged range is refused here, at the flag, in the same words.
+    if lo < sessions::MIN_DYNAMIC_INGRESS_PORT {
+        return Err(format!(
+            "dynamic range '{raw}': {}",
+            sessions::PolicyError::PrivilegedDynamicRange { lo }
         ));
     }
     Ok((lo, hi))

@@ -653,6 +653,9 @@ async fn create_carries_dynamic_ingress() {
             Some(sessions::DynamicIngress::Allow),
             Some((8000, 8443)),
         ),
+        // The mode alone, with no range and no static mapping, still makes
+        // the declaration.
+        ("dyn-ask", Some(sessions::DynamicIngress::Ask), None),
         ("dyn-bare", None, None),
     ] {
         let project = tempfile::TempDir::new().unwrap();
@@ -696,6 +699,7 @@ async fn create_carries_dynamic_ingress() {
             "dyn-allow",
             Some((sessions::DynamicIngress::Allow, Some((8000, 8443)))),
         ),
+        ("dyn-ask", Some((sessions::DynamicIngress::Ask, None))),
         ("dyn-bare", None),
     ] {
         let resp = client
@@ -768,6 +772,10 @@ async fn create_rejects_bad_dynamic_range() {
         (
             &["--dynamic-ingress", "allow", "--dynamic-range", "8443-8000"][..],
             "the upper end must not be below the lower end",
+        ),
+        (
+            &["--dynamic-ingress", "allow", "--dynamic-range", "80-90"][..],
+            "minimald refuses to publish host ports below 1024",
         ),
         // A range with no mode: clap's `requires` names the missing flag, so
         // the stance the range would imply is spelled by the person, not
