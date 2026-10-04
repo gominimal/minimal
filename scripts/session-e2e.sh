@@ -10920,7 +10920,7 @@ proof_min_internal_names_through_proxy() {
     # reach over that alias is default-deny except configured host exposures
     # (design §7.1), and this box's switch has none, so the reach is not
     # asserted here. TODO(host-exposure): the positive reach arm comes back
-    # with a configured exposure once the host-exposure task lands.
+    # with a configured exposure (gominimal/inbox#867).
     proxy_own_resolved="$(mnl session exec "$PROXY_OWN_SID" \
       "getent ahostsv4 host.min.internal" 2>"$WORK/proxy-own-resolve.err" \
       | awk 'NR == 1 { print $1 }' | tr -d '\r')" || true
@@ -10938,8 +10938,8 @@ proof_min_internal_names_through_proxy() {
     # under the infrastructure deny set's rule. The deprecation notice is
     # not asserted: the relay emits it only for a frame its verdict admits,
     # and the alias admits none without an exposure. TODO(host-exposure):
-    # the positive reach arm and the notice come back with a configured
-    # exposure once the host-exposure task lands.
+    # the positive reach arm comes back with a configured exposure
+    # (gominimal/inbox#867); the notice on a drop is gominimal/inbox#868.
     #
     # The relay runs in the daemon, and every lane that has a switch
     # (MINVMD_GVPROXY_BIN, the gate around this half) also runs with
