@@ -630,7 +630,9 @@ fn is_valid_cidr(s: &str) -> bool {
 
 /// Whether `s` is a valid DNS hostname for an egress `allow_dns_hosts` entry:
 /// non-empty, no whitespace, every label non-empty and at most 63 bytes, the
-/// whole name at most 253 bytes, and every character in `[A-Za-z0-9-_.]`.
+/// whole name at most 253 bytes, every character in `[A-Za-z0-9-_.]`, and no
+/// label starting or ending with a hyphen (RFC 1035), since no query name can
+/// carry one.
 /// One trailing dot is tolerated because the DNS gate strips it before
 /// matching, so `example.com.` and `example.com` name the same host.
 fn is_valid_dns_host(s: &str) -> bool {
@@ -644,6 +646,8 @@ fn is_valid_dns_host(s: &str) -> bool {
     name.split('.').all(|label| {
         !label.is_empty()
             && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
             && label
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
@@ -1623,7 +1627,14 @@ mod tests {
         // at launch, naming the offending string, rather than being stored
         // verbatim as an allow rule that can never match the DNS gate.
         for network in [NetworkMode::OwnIp, NetworkMode::HostNet] {
-            for host in ["", "not a host", "a".repeat(64).as_str()] {
+            for host in [
+                "",
+                "not a host",
+                "a".repeat(64).as_str(),
+                "-",
+                "-foo.example.com",
+                "foo-.example.com",
+            ] {
                 let egress = EgressPolicy {
                     allow_dns_hosts: Some(vec!["github.com".into(), host.into()]),
                     ..EgressPolicy::default()
