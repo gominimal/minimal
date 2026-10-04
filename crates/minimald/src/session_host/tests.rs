@@ -4957,6 +4957,12 @@ async fn expose_unenrolled_decision_audited() {
         None,
     )
     .await;
+    // A publish needs a box running behind it (NET-047's stopped-box
+    // refusal), so the allowing box launches its host first.
+    web_handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
     let sock = web_handle
         .net_switch()
         .await
