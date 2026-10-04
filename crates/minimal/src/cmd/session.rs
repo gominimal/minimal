@@ -521,12 +521,42 @@ pub fn box_registered_start_line(
 /// suppresses it — that path must land in a session, never in a config
 /// prompt. Everything else, including the session id on stdout, is
 /// identical for both callers.
+/// The refusal a VM-backed host gives a box created with a dynamic-ingress
+/// stance that could publish (`allow` or `ask`). The VM host's egress gate
+/// admits a runtime publish only at a port the box's host-side registration
+/// already carries, and that registration carries the create's static
+/// `--ingress` mappings alone, so an in-range publish would be decided allow
+/// and then refused at the host. Until the dynamic range reaches the host
+/// registration (gominimal/minimal#1878) the create says so up front instead
+/// of handing the box a stance it cannot keep. `deny`, an absent stance, and
+/// every native host are unchanged.
+fn refuse_dynamic_ingress_on_vm(
+    kind: paths::ProviderKind,
+    mode: Option<sessions::DynamicIngress>,
+) -> Result<(), anyhow::Error> {
+    if kind == paths::ProviderKind::Minvmd
+        && matches!(
+            mode,
+            Some(sessions::DynamicIngress::Allow | sessions::DynamicIngress::Ask)
+        )
+    {
+        anyhow::bail!(
+            "dynamic ingress allow/ask is not yet supported on VM-backed hosts \
+             (gominimal/minimal#1878)"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) async fn activate_session(
     global: &GlobalArgs,
     args: ActivateArgs,
     offer_scaffold: bool,
 ) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
+    // Before anything is created: a VM-backed host cannot keep an allow/ask
+    // stance yet, so the activation ends here with the reason.
+    refuse_dynamic_ingress_on_vm(daemon_provider_kind(global), args.dynamic_ingress)?;
 
     let effective_path = match (&args.path, &global.repo_dir) {
         (Some(p), _) => std::path::PathBuf::from(p),
@@ -3467,6 +3497,27 @@ mod tests {
         DynamicIngress, EffectiveEgress, EffectiveSessionPolicy, IngressPolicy, IpProto,
         NetworkMode, PortMapping,
     };
+
+    #[test]
+    fn vm_backed_activate_refuses_dynamic_allow_until_host_admission() {
+        use paths::ProviderKind::{Minimald, Minvmd};
+        for mode in [DynamicIngress::Allow, DynamicIngress::Ask] {
+            let error = refuse_dynamic_ingress_on_vm(Minvmd, Some(mode))
+                .expect_err("a VM-backed host must refuse an allow/ask stance");
+            assert_eq!(
+                error.to_string(),
+                "dynamic ingress allow/ask is not yet supported on VM-backed hosts \
+                 (gominimal/minimal#1878)"
+            );
+            refuse_dynamic_ingress_on_vm(Minimald, Some(mode))
+                .expect("a native host keeps every stance");
+        }
+        for kind in [Minvmd, Minimald] {
+            refuse_dynamic_ingress_on_vm(kind, Some(DynamicIngress::Deny))
+                .expect("deny is never refused");
+            refuse_dynamic_ingress_on_vm(kind, None).expect("an absent stance is never refused");
+        }
+    }
 
     #[test]
     fn format_policy_dynamic_ingress_allow_prints_row_not_deny_all() {
