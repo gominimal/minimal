@@ -2388,8 +2388,8 @@ async fn session_policy_as_json(global: &GlobalArgs, session: &str) -> Result<()
     let fabric = (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
         .then_some(switch::SwitchSubnet::default());
     let mut out = std::io::stdout();
-    write_policy_json(&mut out, &policy, record.network, fabric, live)?;
-    out.flush().context("Failed to write policy")?;
+    write_policy_json(&mut out, &policy, record.network, fabric, live).context(OutputWriteError)?;
+    out.flush().context(OutputWriteError)?;
     Ok(())
 }
 

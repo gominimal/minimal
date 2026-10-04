@@ -138,7 +138,6 @@ async fn run() -> ExitCode {
                     emit_machine_mode_error(&failure);
                     return ExitCode::FAILURE;
                 }
-                MachineModeAnswer::NotMachine => {}
             }
         }
         // A reader that went away (`min version | head -1`) is not an error
@@ -171,16 +170,17 @@ enum MachineModeAnswer {
     Quiet,
     /// The one `min/v1/error` object, on stderr.
     Object(minimal::MachineModeFailure),
-    /// No machine-mode answer: the plain error path handles it.
-    NotMachine,
 }
 
 /// The machine-mode answer to a failed run, shared by every command that
-/// takes `-o json`. A walk's own failure is the payload it already failed
-/// into. A broken pipe means the consumer hung up, so the run exits
-/// quietly. Any other I/O failure is the CLI failing to write its own
-/// document (a full disk, a closed descriptor), which still answers with an
-/// object: `output_failed`, so a script can tell it from a crash.
+/// takes `-o json`: in a machine mode every failure is the one error object
+/// (or, for a reader that hung up, nothing). A walk's own failure is the
+/// payload it already failed into. A broken pipe means the consumer hung
+/// up, so the run exits quietly. A failure the command tagged as its own
+/// document write ([`minimal::OutputWriteError`]) is `output_failed`, so a
+/// script can tell it from a crash. Anything else is `unspecified`, the
+/// exit table's unspecified error, with the chain as its message and no
+/// hint, because nothing about it is known to name a remedy.
 fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
     if let Some(failure) = e.downcast_ref::<minimal::MachineModeFailure>() {
         return MachineModeAnswer::Object(failure.clone());
@@ -188,7 +188,7 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
     if is_broken_pipe(e) {
         return MachineModeAnswer::Quiet;
     }
-    if e.chain().any(|cause| cause.is::<std::io::Error>()) {
+    if e.downcast_ref::<minimal::OutputWriteError>().is_some() {
         return MachineModeAnswer::Object(minimal::MachineModeFailure::new(
             "output_failed",
             format!("{e:#}"),
@@ -197,7 +197,11 @@ fn machine_mode_answer(e: &anyhow::Error) -> MachineModeAnswer {
                 .to_string(),
         ));
     }
-    MachineModeAnswer::NotMachine
+    MachineModeAnswer::Object(minimal::MachineModeFailure::new(
+        "unspecified",
+        format!("{e:#}"),
+        String::new(),
+    ))
 }
 
 /// A cheaply clonable writer over the dash log file: every clone writes
@@ -270,6 +274,8 @@ struct MachineModeErrorDoc<'a> {
     schema: &'static str,
     code: &'a str,
     message: &'a str,
+    /// Omitted when nothing about the failure names a remedy (`unspecified`).
+    #[serde(skip_serializing_if = "str::is_empty")]
     hint: &'a str,
 }
 
@@ -382,8 +388,8 @@ mod tests {
     /// either — the same three-way split the subscriber gate makes, read
     /// before the CLI is consumed so the failed run can still be asked what
     /// mode it was in.
-    /// A walk's payload, a hung-up reader and a failed write each get their
-    /// own machine-mode answer; anything else is not the mode's to answer.
+    /// A walk's payload, a hung-up reader, a tagged document write and any
+    /// other failure each get their own machine-mode answer.
     #[test]
     fn machine_mode_answers_write_failures() {
         let walk = minimal::MachineModeFailure::new(
@@ -397,11 +403,11 @@ mod tests {
         );
 
         let hung_up = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
-            .context("Failed to write policy");
+            .context(minimal::OutputWriteError);
         assert_eq!(machine_mode_answer(&hung_up), MachineModeAnswer::Quiet);
 
         let full = anyhow::Error::new(std::io::Error::other("no space left on device"))
-            .context("Failed to write policy");
+            .context(minimal::OutputWriteError);
         match machine_mode_answer(&full) {
             MachineModeAnswer::Object(failure) => {
                 assert_eq!(failure.code(), "output_failed");
@@ -411,13 +417,35 @@ mod tests {
                     failure.message()
                 );
             }
-            other => panic!("a failed write answers with an object, got {other:?}"),
+            other => panic!("a failed document write answers output_failed, got {other:?}"),
         }
 
-        assert_eq!(
-            machine_mode_answer(&anyhow::anyhow!("something else")),
-            MachineModeAnswer::NotMachine
-        );
+        // An io error the run met elsewhere (a config read, a socket) is
+        // not the document's write: it must not claim stdout failed.
+        let elsewhere = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("reading the config");
+        for unrelated in [elsewhere, anyhow::anyhow!("something else")] {
+            match machine_mode_answer(&unrelated) {
+                MachineModeAnswer::Object(failure) => {
+                    assert_eq!(failure.code(), "unspecified", "for {unrelated:#}");
+                    assert!(failure.hint().is_empty(), "no remedy is known");
+                }
+                other => panic!("an unmapped failure is still an object, got {other:?}"),
+            }
+        }
+    }
+
+    /// An `unspecified` object carries no hint key at all.
+    #[test]
+    fn machine_mode_error_line_omits_an_empty_hint() {
+        let line = machine_mode_error_line(&minimal::MachineModeFailure::new(
+            "unspecified",
+            "boom".to_string(),
+            String::new(),
+        ))
+        .unwrap();
+        assert!(!line.contains("hint"), "got {line}");
+        assert!(line.contains(r#""code":"unspecified""#), "got {line}");
     }
 
     #[test]

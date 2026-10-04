@@ -342,6 +342,18 @@ impl std::fmt::Display for MachineModeFailure {
 
 impl std::error::Error for MachineModeFailure {}
 
+/// The context a machine-output command puts on a failure to write its own
+/// document to stdout, so the machine-mode error path can tell that failure
+/// (`output_failed`) from any other I/O error the run met on the way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputWriteError;
+
+impl std::fmt::Display for OutputWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failed to write the document to stdout")
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct LoadoutArgs {
     #[command(subcommand)]
