@@ -1132,6 +1132,9 @@ mod tests {
                 dynamic_ingress: Some(sessions::DynamicIngress::Allow),
             }),
             egress: None,
+            // No credentialed upstream (NET-134): these tests hold no lane,
+            // so the compiled egress they observe is the rules' alone.
+            credentialed_upstream: None,
         }
     }
 
@@ -1291,6 +1294,7 @@ mod tests {
                 dynamic_ingress: Some(sessions::DynamicIngress::Allow),
             }),
             egress: None,
+            credentialed_upstream: None,
         };
         let (watcher, gate, server, mut served) = started_watcher(&dir, &policy);
 
@@ -1622,6 +1626,7 @@ mod tests {
                 dynamic_ingress: Some(sessions::DynamicIngress::Allow),
             }),
             egress: None,
+            credentialed_upstream: None,
         };
         let (watcher, gate, server, mut served) = started_watcher(&dir, &policy);
 

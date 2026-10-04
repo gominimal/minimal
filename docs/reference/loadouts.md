@@ -178,6 +178,11 @@ MUXER = { inherit = true }               # inherit from the host env
 ```
 
 - A **literal** string sets the variable to that value.
+- `PATH` is the one exception to literal values. A `PATH` that contains
+  `$PATH` or `${PATH}` expands that reference to the session's default
+  `PATH`. So `PATH = "/opt/bin:$PATH"` puts `/opt/bin` before the default
+  directories instead of replacing them. A `PATH` without a reference stays
+  verbatim, and every other variable stays literal.
 - `{ inherit = true }` passes the variable through from the environment of
   the `min` process on the host. If the host does not have it set, the
   variable is dropped from the session (with a warning) rather than failing

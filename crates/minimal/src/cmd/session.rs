@@ -393,6 +393,7 @@ async fn register_box_for_activation(
             })
             .unwrap_or_default(),
         egress: policy.egress.clone(),
+        credentialed_upstream: policy.credentialed_upstream.clone(),
     };
     let registration = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
@@ -511,6 +512,13 @@ pub(crate) async fn activate_session(
             dynamic_allowed_range: None,
             dynamic_ingress: None,
         }),
+        // NET-134: the lane is the box's own declaration, never a default —
+        // a box that did not ask for a credentialed upstream keeps every
+        // frame it sends to the proxy's address refused at the host-side
+        // gate, whatever its egress rules say.
+        credentialed_upstream: args
+            .credentialed_upstream
+            .then(sessions::CredentialedUpstream::default),
     };
 
     // A session with no `--name` still deserves a typable handle, so mint
@@ -1643,6 +1651,7 @@ pub(crate) async fn activate_new_for_attach(global: &GlobalArgs) -> Result<(), a
             allow_dns_hosts: Vec::new(),
             allow_protocols: Vec::new(),
             deny_subnets: Vec::new(),
+            credentialed_upstream: false,
             loadout: Vec::new(),
             no_loadouts: false,
             no_hooks: false,
@@ -2273,17 +2282,18 @@ pub async fn cmd_session_setup_zed(
 ///
 /// Rows are in setup order — project first, then loadouts in the order
 /// they were applied. Teardown runs the reverse.
-pub(crate) async fn cmd_session_hooks(
-    global: &GlobalArgs,
-    args: HooksArgs,
-) -> Result<(), anyhow::Error> {
+pub async fn cmd_session_hooks(global: &GlobalArgs, args: HooksArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
     let mut client = connect_daemon(global).await?;
 
+    // Resolve first, like every other session command, so a missing session
+    // is named in the error; then ask for the hooks of the record that
+    // resolved, so both calls target the same session.
+    let record = resolve_session(&mut client, &args.session).await?;
+
     use minimald_rpc::{GetSessionHooks, GetSessionHooksRequest};
-    let lookup: GetSessionHooksRequest = SessionLookup::parse(&args.session).into();
     let resp = client
-        .oneshot_rpc::<GetSessionHooks>(lookup)
+        .oneshot_rpc::<GetSessionHooks>(GetSessionHooksRequest::Id(record.id))
         .await
         .context("GetSessionHooks RPC failed")?;
 
@@ -3347,6 +3357,7 @@ mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
             }),
+            credentialed_upstream: None,
         };
 
         // The successful shape, driven the way the activation drives it:
@@ -3447,6 +3458,7 @@ mod tests {
                 name: "db".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
+                credentialed_upstream: None,
             },
         )
         .await

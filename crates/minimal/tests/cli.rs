@@ -316,7 +316,7 @@ async fn activate_creates_session() {
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
-        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
     )
     .unwrap();
 
@@ -330,6 +330,7 @@ async fn activate_creates_session() {
         allow_dns_hosts: vec![],
         allow_protocols: vec![],
         deny_subnets: vec![],
+        credentialed_upstream: false,
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -360,7 +361,7 @@ async fn activate_uploads_project_files() {
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
-        "# test\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+        "# test\n[stack]\nuse = \"shell\"\n",
     )
     .unwrap();
     std::fs::write(project.path().join("hello.txt"), "hello world").unwrap();
@@ -377,6 +378,7 @@ async fn activate_uploads_project_files() {
         allow_dns_hosts: vec![],
         allow_protocols: vec![],
         deny_subnets: vec![],
+        credentialed_upstream: false,
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -446,7 +448,7 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
-        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
     )
     .unwrap();
     std::fs::write(project.path().join("hello.txt"), "hello world").unwrap();
@@ -463,6 +465,7 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
         allow_dns_hosts: vec![],
         allow_protocols: vec![],
         deny_subnets: vec![],
+        credentialed_upstream: false,
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -1328,7 +1331,7 @@ async fn deny_all_announcement_printed() {
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
-        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
     )
     .unwrap();
 
@@ -1475,6 +1478,32 @@ async fn setup_opted_out() -> (
     (server, args, temp)
 }
 
+// --- session hooks ---
+
+/// `min session hooks` names the session it could not find, like every other
+/// session command: the error is `No session found matching '<name>'` rather
+/// than the daemon's bare `no session found`.
+#[tokio::test]
+async fn session_hooks_missing_session_names_the_lookup() {
+    let (_daemon, args) = setup().await;
+
+    let err = cmd_session_hooks(
+        &args,
+        HooksArgs {
+            session: "nosuch".to_string(),
+            json: false,
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "No session found matching 'nosuch'",
+        "a missing session must be named in the error"
+    );
+}
+
 // --- hostname routing warning (NET-020/NET-021/NET-022) ---
 //
 // The startup retry lives in `minimald::server` behind the Linux gate with the
@@ -1595,7 +1624,7 @@ async fn listener_failure_reported_with_remedy() {
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
-        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
     )
     .unwrap();
     let activate_stderr = run_min_stderr(
@@ -1853,7 +1882,7 @@ async fn activate_and_ls_report_native_surface() {
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
-        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
     )
     .unwrap();
     let activate_stderr = run_min_stderr(
