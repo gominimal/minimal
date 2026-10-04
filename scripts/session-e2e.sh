@@ -235,6 +235,7 @@ NATIVE_REVERT_LINK="" # the link that proof pointed the host resolver at; revert
 RANGE_SEED_DIR="" # seeded by the local-range proof below; removed on teardown
 RANGE_INSTALLED="" # set when that proof ran its command; gates the unit teardown
 RANGE_RESOLVER_BEFORE="" # the resolver file's prior bytes, when it had any; restored on teardown
+ANSWERER_SERVICE_CHANNEL="" # set when a proof ran an advisory that installs the answerer service: its channel path; gates the service teardown
 BN_SEED_DIR="" # seeded by the browser-path proof below; removed on teardown
 BN_API_SEED_DIR="" # its second box's seed; removed on teardown
 BN_REVERT_LINK="" # the link that proof pointed the host resolver at; reverted on teardown
@@ -572,6 +573,9 @@ teardown() {
   # a run that died between its install and its own cleanup must not leave
   # it behind — the same reasoning as the native link revert below.
   range_teardown_unit
+  # Every proof that runs the advisory as root also installs the answerer
+  # host service; a run that died after that must not leave it behind.
+  answerer_service_teardown
   # The native-resolution proof points the HOST resolver at the daemon's
   # answerer; a run that died between that and its own revert must not leave
   # the change behind. `resolvectl revert` restores the link's DNS state and
@@ -5064,6 +5068,12 @@ proof_local_range_reserved_by_privileged_step() {
     echo "removing a leftover range unit from a prior run, so this proof starts from the advisory's own premise"
     range_remove_unit
   fi
+  if [ -e /Library/LaunchDaemons/dev.minimal.zone-answerer.plist ] \
+     || [ -e /Library/PrivilegedHelperTools/dev.minimal.zone-answerer ]; then
+    echo "removing a leftover answerer service from a prior run, for the same reason"
+    ANSWERER_SERVICE_CHANNEL="${ANSWERER_SERVICE_CHANNEL:-/nonexistent}"
+    answerer_service_teardown
+  fi
 
   RANGE_SEED_DIR="$(hook_mktemp /tmp/mnlrr.XXXXXX)"
   hook_seed_preamble > "$RANGE_SEED_DIR/minimal.toml"
@@ -5166,6 +5176,12 @@ proof_local_range_reserved_by_privileged_step() {
   # Run the exact command the advisory printed — verbatim, as the user would
   # have. Passwordless sudo was the gate at the top, so it cannot prompt.
   RANGE_INSTALLED=yes
+  ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$range_cmd")"
+  if [ -z "$ANSWERER_SERVICE_CHANNEL" ]; then
+    echo "::error::the advisory's command names no answerer channel, so this run could not undo the service it installs; it was not run"
+    echo "--- command (first and last lines) ---"; printf '%s\n' "$range_cmd" | sed -n '1p;$p'
+    fail
+  fi
   if ! sh -c "$range_cmd" >"$WORK/range-cmd.out" 2>"$WORK/range-cmd.err"; then
     echo "::error::the advisory's command did not run"
     echo "--- command (first and last lines) ---"
@@ -5346,7 +5362,9 @@ proof_local_range_reserved_by_privileged_step() {
   # the resolver file restored to what this host had before the command (or
   # removed when the command created it) — so the soak's next iteration finds
   # the host as this one did. The teardown repeats this wherever a proof dies.
+  # The answerer service the same command installed goes with it.
   range_teardown_unit
+  answerer_service_teardown
   echo "local range reserved by the privileged step OK (unit installed, custody held, probe present, re-run clean, boot re-apply shown, host restored)"
   echo "::endgroup::"
 }
@@ -5378,6 +5396,68 @@ range_teardown_unit() {
     sudo rm -f /etc/resolver/min.internal
   fi
   RANGE_INSTALLED=""
+}
+
+# The advisory's command also installs the box-zone answerer as a host
+# service (NET-122's host service), so every proof that runs it as root
+# records the channel path the command wrote first, and this undoes the
+# rest at the exact paths the command writes: on macOS the LaunchDaemon
+# booted out and its plist and the root-owned program copy removed; on
+# Linux the socket and service units stopped, disabled and removed, the
+# manager reloaded, and the program copy and its directory removed. The
+# channel socket the manager bound is removed last. Best-effort, like the
+# range unit's removal: a no-op until a proof recorded a channel, so the
+# teardown below can call it unconditionally.
+answerer_service_teardown() {
+  [ -n "${ANSWERER_SERVICE_CHANNEL:-}" ] || return 0
+  if [ "$(uname -s)" = Darwin ]; then
+    sudo -n launchctl bootout "system/dev.minimal.zone-answerer" >/dev/null 2>&1 || true
+    sudo -n rm -f "/Library/LaunchDaemons/dev.minimal.zone-answerer.plist" \
+      "/Library/PrivilegedHelperTools/dev.minimal.zone-answerer" >/dev/null 2>&1 || true
+  else
+    sudo -n systemctl disable --now dev.minimal.zone-answerer.socket \
+      dev.minimal.zone-answerer.service >/dev/null 2>&1 || true
+    sudo -n rm -f /etc/systemd/system/dev.minimal.zone-answerer.socket \
+      /etc/systemd/system/dev.minimal.zone-answerer.service \
+      /usr/local/lib/minimal/dev.minimal.zone-answerer >/dev/null 2>&1 || true
+    sudo -n rmdir /usr/local/lib/minimal >/dev/null 2>&1 || true
+    sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
+    sudo -n systemctl reset-failed dev.minimal.zone-answerer.socket \
+      dev.minimal.zone-answerer.service >/dev/null 2>&1 || true
+  fi
+  sudo -n rm -f "$ANSWERER_SERVICE_CHANNEL" >/dev/null 2>&1 || true
+  ANSWERER_SERVICE_CHANNEL=""
+}
+
+# The channel path an advisory command makes the answerer service hold, read
+# off the command's own bytes (the plist's channel `SockPathName` on macOS,
+# the socket unit's `ListenStream=` on Linux), so the teardown removes the
+# exact socket the command bound. Prints nothing for a command that installs
+# no answerer service.
+answerer_channel_of() {
+  printf '%s\n' "$1" | sed -n \
+    -e 's/^ListenStream=\(.*\)$/\1/p' \
+    -e 's/^[[:space:]]*<string>\(\/.*\/answerer\.sock\)<\/string>$/\1/p' | head -n1
+}
+
+# The command the advisory named, whole, as a user would copy it: from the
+# line after the lead-in (de-indented) to the line that closes the quote the
+# command opened (`sudo sh -c "` on Linux, `sudo sh -c '` on macOS). The
+# command spans several lines on both platforms, because the unit files'
+# bytes ride inside it as quoted heredocs, so the first line alone is a
+# command with an unterminated quote. $1: the stderr file. $2: the lead-in.
+advisory_command_from() {
+  awk -v lead="$2" '
+    !started && index($0, lead) > 0 { started = 1; next }
+    started && !first {
+      sub(/^  /, ""); first = 1
+      q = substr($0, length("sudo sh -c ") + 1, 1)
+      print
+      if (length($0) > length("sudo sh -c ") + 1 && substr($0, length($0), 1) == q) exit
+      next
+    }
+    started { print; if (substr($0, length($0), 1) == q) exit }
+  ' "$1" 2>/dev/null
 }
 
 # Wait for the range unit to finish the run its `bootstrap` started, before
@@ -5497,8 +5577,7 @@ proof_native_resolution_without_proxy_env() {
   # the box-zone answerer service with:" on macOS, whose command
   # carries the range step NET-123 folds into it); the range-reserving case
   # below extracts the multi-line command whole.
-  native_cmd="$(grep -A1 -F -- "Configure the host's resolver" \
-    "$native_err" 2>/dev/null | tail -n1 | sed 's/^  //')"
+  native_cmd="$(advisory_command_from "$native_err" "Configure the host's resolver")"
 
   if [ -n "$native_cmd" ]; then
     # The command must name this platform's mechanism and THIS daemon's
@@ -5646,6 +5725,14 @@ proof_native_resolution_without_proxy_env() {
         echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
         fail
       fi
+      # The command also installs the answerer host service: record the
+      # channel it binds BEFORE running it, so a half-failed run still
+      # leaves the teardown a service to remove.
+      ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$native_cmd")"
+      if [ -z "$ANSWERER_SERVICE_CHANNEL" ]; then
+        echo "::error::the advisory's command names no answerer channel, so this run could not undo the service it installs; it was not run (got: '$native_cmd')"
+        fail
+      fi
       # Run the exact command the advisory printed — verbatim, as the user
       # would have. Passwordless sudo is the gate above, so it cannot prompt.
       if ! sh -c "$native_cmd" >"$WORK/native-cmd.out" 2>"$WORK/native-cmd.err"; then
@@ -5743,6 +5830,8 @@ proof_native_resolution_without_proxy_env() {
         echo "::warning::could not remove the dedicated link $NATIVE_REVERT_LINK (this host still carries it)"
       fi
     fi
+    # And the answerer host service the same command installed.
+    answerer_service_teardown
   fi
 
   mnl session destroy --force "$native_sid" >/dev/null 2>&1 || true
@@ -6326,8 +6415,8 @@ proof_box_name_resolves_natively_without_proxy() {
   # NET-122: the advisory, on the activate's stderr — the exact command, no
   # prompt anywhere in the path. The command must name this platform's
   # mechanism and THIS daemon's answerer, and be one the user runs.
-  bn_cmd="$(grep -A1 -F -- "Configure the host's resolver and install the box-zone answerer service with:" \
-    "$bn_err" 2>/dev/null | tail -n1 | sed 's/^  //')"
+  bn_cmd="$(advisory_command_from "$bn_err" \
+    "Configure the host's resolver and install the box-zone answerer service with:")"
   if [ -n "$bn_cmd" ]; then
     case "$bn_cmd" in
       *resolvectl*) ;;
@@ -6534,6 +6623,11 @@ proof_box_name_resolves_natively_without_proxy() {
     if [ -z "$BN_REVERT_LINK" ]; then
       echo "::error::could not find the link in the advisory's command, so it was not run — this run cannot undo a command it cannot name (got: '$bn_cmd')"
       echo "--- activate stderr ---"; cat "$bn_err" 2>/dev/null || true
+      fail
+    fi
+    ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$bn_cmd")"
+    if [ -z "$ANSWERER_SERVICE_CHANNEL" ]; then
+      echo "::error::the advisory's command names no answerer channel, so this run could not undo the service it installs; it was not run (got: '$bn_cmd')"
       fail
     fi
     if ! sh -c "$bn_cmd" >"$WORK/bn-cmd.out" 2>"$WORK/bn-cmd.err"; then
@@ -6848,6 +6942,8 @@ proof_box_name_resolves_natively_without_proxy() {
       echo "::warning::could not remove the dedicated link $BN_REVERT_LINK (this host still carries it)"
     fi
   fi
+  # And the answerer host service the same command installed.
+  answerer_service_teardown
 
   rm -rf "$BN_SEED_DIR" "$BN_API_SEED_DIR"
   BN_SEED_DIR=""; BN_API_SEED_DIR=""
