@@ -427,7 +427,7 @@ fn expand_pattern(
             };
             return finish_expand(
                 joined,
-                unescaped_joined,
+                &unescaped_joined,
                 raw_has_glob_meta,
                 require_absolute,
             );
@@ -438,7 +438,7 @@ fn expand_pattern(
     }
     finish_expand(
         normalized,
-        unescaped_normalized,
+        &unescaped_normalized,
         raw_has_glob_meta,
         require_absolute,
     )
@@ -448,7 +448,7 @@ fn expand_pattern(
 /// into a [`FileSet`], applying the plain-directory rewrite.
 fn finish_expand(
     normalized: String,
-    unescaped_normalized: String,
+    unescaped_normalized: &str,
     raw_has_glob_meta: bool,
     require_absolute: RequireAbsolute,
 ) -> Result<(FileSet, bool), ExpandError> {
@@ -466,7 +466,7 @@ fn finish_expand(
     // suppresses the rewrite while a substituted `[b]` does not.
     let plain_directory = require_absolute == RequireAbsolute::Yes
         && !raw_has_glob_meta
-        && std::path::Path::new(&unescaped_normalized).is_dir();
+        && std::path::Path::new(unescaped_normalized).is_dir();
     let pattern = if plain_directory {
         let mut with_glob = normalized;
         if with_glob.ends_with('/') {
