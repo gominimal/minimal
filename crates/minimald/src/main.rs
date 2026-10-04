@@ -539,23 +539,27 @@ async fn async_main() -> Result<(), MainError> {
 
     let listen_args = cli.listen_args().unwrap();
 
-    // The node ports this daemon listens on, resolved once: the tokens the
-    // VM host handed on the boot line in a microVM, the CLI's otherwise.
-    // The read lives here, once the log sink is live, because a token
-    // present but unusable is a surfaced boot failure, not a fallback: the
-    // daemon would otherwise publish a listener the host's box table does
-    // not name (NET-025, NET-138) and strand every client pointed at the
-    // handed one. A handed pair that cannot bind — something in the guest
-    // already holds a port — fails the boot here too, probed in the bind
-    // base the daemon's own listeners use, rather than surfacing after
-    // READY, when the host already believes the VM healthy.
+    // The node ports this daemon listens on, resolved once: the hostname
+    // proxy's port from the token the VM host handed on the boot line in a
+    // microVM, the CLI's otherwise. The read lives here, once the log sink
+    // is live, because a token present but unusable is a surfaced boot
+    // failure, not a fallback: the daemon would otherwise publish a
+    // listener the host's box table does not name (NET-025, NET-138) and
+    // strand every client pointed at the handed one. A handed port that
+    // cannot bind — something in the guest already holds it — fails the
+    // boot here too, probed in the bind base the daemon's own listeners
+    // use, rather than surfacing after READY, when the host already
+    // believes the VM healthy.
+    //
+    // The answerer's half is `None` on a VM boot by construction, not by
+    // read: a VM-hosted daemon starts no zone answerer — the VM host
+    // daemon's host answerer owns the zone (NET-138) — so the boot line
+    // carries no answerer token and no port exists to report.
     let (hostname_proxy_port, zone_answerer_port) = if is_minimal_microvm() {
         let proxy = guest::handed_proxy_port().map_err(|e| MainError::Other(e.to_string()))?;
-        let answerer =
-            guest::handed_answerer_port().map_err(|e| MainError::Other(e.to_string()))?;
-        guest::probe_handed_node_ports(proxy, answerer)
-            .map_err(|e| MainError::IO(e, "binding the handed node ports"))?;
-        (proxy, answerer)
+        guest::probe_handed_node_port(proxy)
+            .map_err(|e| MainError::IO(e, "binding the handed node port"))?;
+        (proxy, None)
     } else {
         (
             listen_args.hostname_proxy_port,

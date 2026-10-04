@@ -53,10 +53,20 @@
 //! lives here is the
 //! arithmetic the window stores the results of, kept pure and free of
 //! resolver I/O so the NET-067 harness can exhaust it.
+//!
+//! The ingress half is the listen-publication decision (NET-016, NET-017):
+//! whether a port a process in the box is *listening* on may be published
+//! on the box's address — the one ingress fact decided by what the box's
+//! processes do at runtime rather than by what its declaration says. It
+//! is compiled here ([`IngressRules`], the ingress counterpart of
+//! [`EgressRules`]) so the relay's inbound gate and the daemon's listener
+//! watcher both read one decision, and the harness below exhausts the
+//! same iff it exhausts the frame verdict over.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
-use crate::{EgressPolicy, IpProto};
+use crate::{DynamicIngress, EgressPolicy, IngressPolicy, IpProto};
 
 /// Ethernet II header length: destination MAC (6) + source MAC (6) + `EtherType` (2).
 const ETH_HDR: usize = 14;
@@ -134,6 +144,70 @@ pub const DNS_OUTSTANDING_QUERY_CAP: usize = 16;
 /// expiry a reply is one the box never asked for, and it passes through
 /// unpinned, exactly as an unsolicited one does.
 pub const DNS_QUERY_EXPIRY: Duration = Duration::from_secs(30);
+
+/// The reply-flow record's second protocol — TCP, beside the UDP the
+/// resolver carve-out reads, for the gates' record and reply arms.
+pub const IPPROTO_TCP: u8 = 6;
+
+/// TCP control flags, read from the L4 header the two gates parse: the
+/// opening-packet test reads SYN and ACK (a connect is a bare SYN; every
+/// mid-stream segment carries ACK), and the record's end reads FIN and RST —
+/// a flow ends when either end sends either.
+pub const TCP_FIN: u8 = 0x01;
+pub const TCP_SYN: u8 = 0x02;
+pub const TCP_RST: u8 = 0x04;
+pub const TCP_ACK: u8 = 0x10;
+
+/// How long a UDP inbound flow's record admits the box's answer before the
+/// box has answered on it (NET-040's answer half). A UDP datagram carries no
+/// close to read, so the record's life is a window: the first datagram the
+/// gate delivers to an admitted port opens it, and if the box sends nothing
+/// back before the window passes, the conversation it came from is over as
+/// far as the record is concerned — a later answer the box volunteers is a
+/// new connection the box's own rules must admit. Both gates hold the same
+/// window, reading it here, so a record never dies on one gate while its
+/// reply still passes on the other.
+///
+/// It is a working value, the same way the DNS numbers above are: the record
+/// is the *one* thing that admits a frame the box's rules do not, so its
+/// timers stay deliberately short, and the working values live here as
+/// constants so the two gates that read them can never drift apart.
+pub const REPLY_UDP_UNREPLIED_WINDOW: Duration = Duration::from_secs(30);
+
+/// How long a UDP inbound flow's record keeps admitting the box's answer
+/// after the box has answered on it: a conversation the box took part in
+/// outlives the unreplied window, because an exchange of datagrams is the
+/// one signal UDP gives that the flow is live, and severing it mid-answer
+/// would turn a deny-all box's working published port into a one-shot. The
+/// first answer moves the record onto this window and every later answer
+/// refreshes it, so the box's own traffic is what keeps its own replies
+/// admitted.
+pub const REPLY_UDP_REPLIED_WINDOW: Duration = Duration::from_mins(5);
+
+/// How long a TCP inbound flow's record keeps admitting after anything —
+/// the working-value idle cap for an established flow, since a TCP record's
+/// own end is read from the wire: a FIN or RST from either end ends it, and
+/// only a flow nothing has ridden for this long is reclaimed in its absence.
+/// Every segment in either direction refreshes it, so a long-lived
+/// connection stays admitted for as long as it stays live.
+pub const REPLY_TCP_IDLE_CAP: Duration = Duration::from_mins(5);
+
+/// How many inbound flows one box holds records for at once, fail closed at
+/// the cap: a new inbound flow that finds the table full is refused at
+/// ingress — the opening frame is not delivered, so the client's connect
+/// fails — while the flows already recorded keep refreshing and keep their
+/// replies admitted. Expired records are swept before the cap is spent, at
+/// most once per [`REPLY_FLOW_SWEEP_INTERVAL`], so what it bounds is live
+/// flows and the sweep's cost stays bounded. Both gates hold the same cap,
+/// reading it here.
+pub const REPLY_MAX_FLOWS_PER_BOX: usize = 1024;
+
+/// How often a box's reply-flow table is swept for expired records when the
+/// table is at its cap: a bounded sweep's cost is bounded by being rare, so
+/// a flood of inbound flows past the cap cannot turn the sweep into the
+/// relay's hot path — the refused flows are counted and said, the table is
+/// swept at most this often, and nothing else pays.
+pub const REPLY_FLOW_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Which L2 family a frame belongs to — the first fact the verdict needs,
 /// because three of the four families are decided without any rules.
@@ -902,6 +976,672 @@ pub fn rebinding_intersection(
         }
     }
     split
+}
+
+// ---------------------------------------------------------------------------
+// The listen-publication decision (NET-016, NET-017).
+//
+// A declared port's forward is static: bound at publish, held until the
+// box stops (NET-121). The ports a process in the box *listens* on are the
+// runtime half of the same surface — published the moment a listener opens
+// (NET-016), withdrawn the moment it closes (NET-017) — and which of them
+// the rules permit is one pure decision, kept here beside the frame
+// verdict so the relay's inbound gate, the forwarder that publishes, and
+// any future surface read one answer rather than growing a second
+// derivation of the box's declaration that could drift from the first.
+// ---------------------------------------------------------------------------
+
+/// The compiled ingress half of a box's network policy: the internal ports
+/// its declaration names — with their transports — beside the permit range
+/// and the dynamic stance that decide every other port. The ingress
+/// counterpart of [`EgressRules`]: an owned, matchable shape one decision
+/// function reads, compiled once at attach.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IngressRules {
+    /// The internal ports the box's declaration names, each with its
+    /// transport — the ports its mappings publish (NET-121).
+    declared: Vec<(IpProto, u16)>,
+    /// The inclusive port range a listen-published port must fall in;
+    /// `None` permits no port at all.
+    permitted: Option<(u16, u16)>,
+    /// The box's dynamic-ingress stance; `None` is the default deny.
+    dynamic: Option<DynamicIngress>,
+}
+
+impl IngressRules {
+    /// Assembles the compiled rules from their dimensions: the shape the
+    /// Kani proof and [`IngressRules::from_policy`] share.
+    #[must_use]
+    pub fn new(
+        declared: Vec<(IpProto, u16)>,
+        permitted: Option<(u16, u16)>,
+        dynamic: Option<DynamicIngress>,
+    ) -> Self {
+        Self {
+            declared,
+            permitted,
+            dynamic,
+        }
+    }
+
+    /// Compiles a session's ingress policy. An absent policy is the
+    /// deny-all-external default: no port is declared, and neither a range
+    /// nor a stance exists that could publish one — so nothing a process
+    /// in that box listens on is ever published by listening (NET-016's
+    /// own default posture, the same one the relay's inbound gate holds).
+    #[must_use]
+    pub fn from_policy(ingress: Option<&IngressPolicy>) -> Self {
+        let Some(ingress) = ingress else {
+            return Self::default();
+        };
+        Self::new(
+            ingress
+                .port_mappings
+                .iter()
+                .map(|mapping| (mapping.proto, mapping.internal_port))
+                .collect(),
+            ingress.dynamic_allowed_range,
+            ingress.dynamic_ingress,
+        )
+    }
+
+    /// The internal ports the declaration names on `proto` — the one
+    /// derivation every ingress surface reads: the relay's inbound gate,
+    /// and through the registry's routes, the hostname proxy's port gate.
+    pub fn declared(&self, proto: IpProto) -> impl Iterator<Item = u16> + '_ {
+        self.declared
+            .iter()
+            .filter(move |(declared, _)| *declared == proto)
+            .map(|(_, port)| *port)
+    }
+
+    /// Whether the declaration names `port` on `proto`. The fact the listen
+    /// verdict reads: a declared port's forward is the declaration's
+    /// (NET-121) — bound for the mapping's transport before the box's name
+    /// was even registered and held until the box stops — so a listener on
+    /// one is never a listener the watcher has anything to publish, and never
+    /// one whose closing could withdraw what the declaration holds
+    /// (NET-081's sub-requirement: a withdrawal applies only to the
+    /// runtime-published set). The transport is half the fact, because a
+    /// mapping's forward answers the one protocol it was exposed with: a
+    /// port the declaration names on UDP alone is declared on UDP alone, and
+    /// a TCP listener on it is the watcher's to publish or decline — never
+    /// already-published under a forward its protocol would never reach.
+    #[must_use]
+    pub fn declares(&self, proto: IpProto, port: u16) -> bool {
+        self.declared
+            .iter()
+            .any(|(declared, declared_port)| *declared == proto && *declared_port == port)
+    }
+
+    /// What the box's dynamic stance and permit range say about one port
+    /// (NET-043/NET-047): the one derivation every runtime ingress surface
+    /// reads — the daemon's `min net expose` decision and the listen
+    /// verdict below both call it, so a port one surface publishes is a
+    /// port the other publishes too, for the same reason.
+    ///
+    /// The stance decides first and the range second, so a box that denies
+    /// never reveals whether the port would have been in range: absent or
+    /// `deny` is `Deny` (the deny-all default an absent setting means), `ask`
+    /// is `Ask` (nobody is there to answer it), and only an `allow` stance
+    /// reaches the range at all — an absent range permits nothing
+    /// (`NoRange`), a port outside it is named out of it
+    /// (`OutOfRange`), and a port inside it, at either bound, is `Allow`.
+    #[must_use]
+    pub fn dynamic_verdict(&self, port: u16) -> DynamicPortVerdict {
+        match self.dynamic {
+            None | Some(DynamicIngress::Deny) => DynamicPortVerdict::Deny,
+            Some(DynamicIngress::Ask) => DynamicPortVerdict::Ask,
+            Some(DynamicIngress::Allow) => match self.permitted {
+                None => DynamicPortVerdict::NoRange,
+                Some((low, high)) if low <= port && port <= high => DynamicPortVerdict::Allow,
+                Some(range) => DynamicPortVerdict::OutOfRange { range },
+            },
+        }
+    }
+
+    /// The shared verdict for one port a process in the box is listening on,
+    /// on the transport it listens with (NET-016): whether the listener
+    /// watcher publishes it on the box's address, and what holds the port
+    /// back when it does not.
+    ///
+    /// `Publish` needs every fact the declaration gives: the box's dynamic
+    /// stance is `allow`, the port falls inside the permit range — the
+    /// range is inclusive at both ends, and an absent one permits nothing
+    /// — and no declaration names the port on the listener's transport.
+    /// The stance and the range are [`IngressRules::dynamic_verdict`]'s to
+    /// derive, shared with the runtime `expose` decision, so the two
+    /// surfaces cannot part ways on a port; the declaration is the half
+    /// only this verdict adds. A
+    /// declaration that names the port on the *other* transport alone is
+    /// not that: its forward answers the protocol it was exposed with and
+    /// never this listener's, so the port is not published already here —
+    /// the listener is published by these rules, or held back by them,
+    /// exactly as an undeclared one is. Every other listening port is
+    /// `Deny`: it stays unpublished, and a connection to it is refused at
+    /// the box's address, never published by a listener the rules do not
+    /// permit (NET-016's sub-requirement).
+    ///
+    /// NET-138 names the `allow` stance as the gate on this whole surface:
+    /// under `deny` (the default an absent setting falls to) or `ask`
+    /// nothing a process binds is published by listening alone — `ask`'s
+    /// answer is the attached human's to give, and no kernel socket table
+    /// can give it.
+    #[must_use]
+    pub fn listen_verdict(&self, proto: IpProto, port: u16) -> ListenVerdict {
+        if self.declares(proto, port) {
+            return ListenVerdict::Declared;
+        }
+        match self.dynamic_verdict(port) {
+            DynamicPortVerdict::Allow => ListenVerdict::Publish,
+            DynamicPortVerdict::Deny
+            | DynamicPortVerdict::Ask
+            | DynamicPortVerdict::NoRange
+            | DynamicPortVerdict::OutOfRange { .. } => ListenVerdict::Deny,
+        }
+    }
+}
+
+/// What the box's dynamic stance and permit range say about one port
+/// (NET-043/NET-047) — the shared derivation behind both runtime ingress
+/// surfaces, spelled out one fact per variant so each surface can render its
+/// own typed refusal from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicPortVerdict {
+    /// The stance is `allow` and the port is inside the permit range: the
+    /// port may be published at runtime.
+    Allow,
+    /// The stance is absent or `deny`: the box declines every runtime
+    /// publish, and no range is read.
+    Deny,
+    /// The stance is `ask`: the publish waits on an answer nobody on this
+    /// surface can give, so it fails closed.
+    Ask,
+    /// The stance is `allow` but no range was opted in, so nothing is
+    /// permitted.
+    NoRange,
+    /// The stance is `allow` but the port falls outside the range that was
+    /// opted in, which is carried with the refusal so it can be named.
+    OutOfRange {
+        /// The range the box opted in, inclusive at both ends.
+        range: (u16, u16),
+    },
+}
+
+/// What the shared listen verdict says one listening port is (NET-016):
+/// published by the watcher and admitted at the box's gate, or held back —
+/// and by which half of the box's declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenVerdict {
+    /// The rules permit the port and no declaration names it: the watcher
+    /// publishes it on the box's address and admits it at the gate, for as
+    /// long as a process in the box keeps listening (NET-016, NET-017).
+    Publish,
+    /// A declaration names the port on the listener's transport: its
+    /// forward was bound at publish for that transport and is held until
+    /// the box stops (NET-121), so the watcher neither publishes nor
+    /// withdraws it — the port is published already, on that transport.
+    Declared,
+    /// The rules do not permit the port: it stays unpublished, and a
+    /// connection to it is refused at the box's address (NET-014) rather
+    /// than published by a listener the rules do not permit.
+    Deny,
+}
+
+/// One L4 flow identity: the protocol and both ends' address-and-port pairs,
+/// in the direction the *client* spoke it — the key one box's inbound-flow
+/// record is held under, and the exact thing a reply must reverse for the
+/// shared decision ([`ReplyFlows::reply_admits`]) to admit it (NET-040's
+/// answer half).
+///
+/// [`FrameSummary`] deliberately carries no source port and no TCP flags —
+/// the verdict needs neither, and keeping the frame summary lean is what
+/// keeps it allocation-free on the relay's hot path — so the record's key is
+/// its own small type, built by each gate from the L4 header it parses
+/// anyway (the same parse the DNS gates' flow retention reads), in one
+/// direction only: the client's. A record answers exactly the conversation
+/// it was opened for and nothing beside it, which is why the tuple is the
+/// whole of the identity: no address is carved out, no port range, no
+/// protocol — reversing the tuple is the one way a record admits a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FlowTuple {
+    proto: u8,
+    src: [u8; 4],
+    src_port: u16,
+    dst: [u8; 4],
+    dst_port: u16,
+}
+
+impl FlowTuple {
+    /// A flow identity in the direction the client spoke it: `src` the
+    /// client, `dst` the box.
+    #[must_use]
+    pub fn new(proto: u8, src: [u8; 4], src_port: u16, dst: [u8; 4], dst_port: u16) -> Self {
+        Self {
+            proto,
+            src,
+            src_port,
+            dst,
+            dst_port,
+        }
+    }
+
+    /// The same identity reversed — the box speaking back to the client —
+    /// the key a box frame's tuple is looked up under, so that a frame the
+    /// box sends either reverses a recorded flow exactly or matches nothing.
+    #[must_use]
+    pub fn reversed(&self) -> Self {
+        Self {
+            proto: self.proto,
+            src: self.dst,
+            src_port: self.dst_port,
+            dst: self.src,
+            dst_port: self.src_port,
+        }
+    }
+
+    /// The L4 protocol number.
+    #[must_use]
+    pub fn protocol(&self) -> u8 {
+        self.proto
+    }
+
+    /// The client's address.
+    #[must_use]
+    pub fn source(&self) -> [u8; 4] {
+        self.src
+    }
+
+    /// The client's port.
+    #[must_use]
+    pub fn source_port(&self) -> u16 {
+        self.src_port
+    }
+
+    /// The box's address.
+    #[must_use]
+    pub fn destination(&self) -> [u8; 4] {
+        self.dst
+    }
+
+    /// The box's port — the one the ingress declaration published.
+    #[must_use]
+    pub fn destination_port(&self) -> u16 {
+        self.dst_port
+    }
+}
+
+/// One recorded inbound flow: when its record dies, and whether the box has
+/// answered on it — the one signal UDP gives that a conversation is live
+/// past the unreplied window, and so the one thing a UDP record's window
+/// selection reads ([`REPLY_UDP_UNREPLIED_WINDOW`] versus
+/// [`REPLY_UDP_REPLIED_WINDOW`]). A TCP record's own end is read from the
+/// wire — FIN or RST — so it needs no `replied` distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplyRecord {
+    /// The instant past which the record is no longer live.
+    deadline: Instant,
+    /// Whether the box has answered on the flow.
+    replied: bool,
+}
+
+impl ReplyRecord {
+    /// When the record dies: past this instant the flow's replies are no
+    /// longer admitted.
+    #[must_use]
+    pub fn expires_at(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Whether the box has answered on the flow.
+    #[must_use]
+    pub fn was_replied(&self) -> bool {
+        self.replied
+    }
+}
+
+/// What one delivered inbound frame did to the box's reply-flow record — the
+/// four outcomes the recording gate's leg and its log lines read.
+///
+/// Recording is the ingress leg's alone (a record is opened only by an
+/// opening packet the gate *delivered*, toward a port the box's declaration
+/// published — never by a frame the box sent), so what an egress frame can
+/// ever be is a *lookup*: [`ReplyFlows::reply_admits`] never returns any of
+/// these arms, never opens a record, and never refreshes one but from the
+/// reply side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundFlow {
+    /// The frame opened a flow: its record now admits the box's reply on the
+    /// reversed tuple. `filled` says this record took the table to its cap —
+    /// the transition the once-per-box filled line reads, so the gate that
+    /// owns the table says it once and not once per re-fill after a sweep.
+    Recorded {
+        /// Whether the table is now at its cap.
+        filled: bool,
+    },
+    /// The frame belongs to a live record, which now runs longer — an
+    /// established flow's segment or datagram, mid-conversation.
+    Refreshed,
+    /// The frame ended a live record: an inbound FIN or RST on a flow that
+    /// was live. The frame itself is still delivered — the close is part of
+    /// the conversation — but nothing the box sends on the flow after it is
+    /// a reply this record admits.
+    Ended,
+    /// The frame opens no record: a mid-stream TCP segment (only a bare SYN
+    /// opens a TCP record, never a mid-stream ACK) or a protocol with no
+    /// flow to read. Delivered, and nothing recorded.
+    Untracked,
+    /// The box's table is at its cap and the sweep freed nothing: the flow
+    /// is refused at ingress — the frame is **not** delivered, the client's
+    /// connect fails — and the refusal is counted
+    /// ([`ReplyFlows::refused_at_cap`]). The flows already recorded keep
+    /// refreshing and keep their replies admitted.
+    RefusedAtCap,
+}
+
+/// One box's table of inbound flows the gate delivered to its published
+/// ports — the record a reply is admitted against, so that a box whose
+/// ingress declared a port can answer the connections that port receives
+/// even when its own egress rules would refuse the answer's destination
+/// (NET-040's answer half, decided by the same reverse-tuple rule on both
+/// gates).
+///
+/// The table is relay state, the same way the DNS admission tables are, and
+/// lives here for the same reason they keep their numbers here: the timers
+/// and the cap are the cross-gate contract — both gates hold one table per
+/// box, and both must be holding *the same* bounds or the two gates a
+/// VM-backed box's reply crosses would disagree about whether the reply is
+/// one — so the working values are the constants above, and the two gates
+/// read them from one place.
+///
+/// What the record admits is deliberately narrow, and the narrowness is the
+/// security posture: a record is opened only by an opening packet the
+/// recording gate itself delivered toward a port the box's declaration
+/// published — an inbound bare SYN for TCP, the first datagram for UDP —
+/// and it admits exactly the frame that reverses that packet's five-tuple,
+/// nothing else. Not the client's address at any other port, not any other
+/// client's address, not the box's next connection to anywhere. The gates
+/// that own a table never consult it for a frame they did not deliver the
+/// opening of, and the egress lookup below cannot open, refresh or extend a
+/// record at all — the record type's whole surface is what a *reply* can
+/// read of it.
+///
+/// Pure over the table's own state and a caller-supplied `Instant`, exactly
+/// the way the frame verdict is pure over its summary: nothing here knows
+/// about sockets, tasks or clocks, which is what lets the relay-level proofs
+/// drive a record's whole life with a hand-held clock.
+#[derive(Debug, Clone)]
+pub struct ReplyFlows {
+    /// The live records, keyed by the client's five-tuple.
+    flows: HashMap<FlowTuple, ReplyRecord>,
+    /// The working values the record's timers read, held as fields so the
+    /// relay-level proofs can shrink them for a hand-held clock.
+    udp_unreplied_window: Duration,
+    udp_replied_window: Duration,
+    tcp_idle_cap: Duration,
+    /// The per-box cap on live records.
+    cap: usize,
+    /// How rarely the sweep runs once the table is at its cap.
+    sweep_interval: Duration,
+    /// When the last sweep ran, so a flood past the cap buys at most one
+    /// sweep per interval.
+    last_sweep: Option<Instant>,
+    /// How many inbound flows this box has had refused at the cap — the
+    /// counter the gate's status surface reads, so a box whose connections
+    /// were refused reads so in a bundle.
+    refused_at_cap: u64,
+}
+
+impl ReplyFlows {
+    /// An empty table holding the working values above.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            flows: HashMap::new(),
+            udp_unreplied_window: REPLY_UDP_UNREPLIED_WINDOW,
+            udp_replied_window: REPLY_UDP_REPLIED_WINDOW,
+            tcp_idle_cap: REPLY_TCP_IDLE_CAP,
+            cap: REPLY_MAX_FLOWS_PER_BOX,
+            sweep_interval: REPLY_FLOW_SWEEP_INTERVAL,
+            last_sweep: None,
+            refused_at_cap: 0,
+        }
+    }
+
+    /// Shrinks the record's timers — a harness hook, plain so both gates'
+    /// proof modules can reach it: a record's life cannot be asserted
+    /// against a five-minute window, and the relay-level proofs that drive
+    /// one open, answered, idle and expired need a clock the harness can
+    /// out-wait. Shrinking the replied window past the unreplied one is a
+    /// contradiction of the record's design, so the caller keeps the pair
+    /// ordered; a shrink of either past the caller's step size collapses
+    /// the record into an expiry test, which is what the harness wanted.
+    pub fn shrink_windows(&mut self, unreplied: Duration, replied: Duration, tcp_idle: Duration) {
+        self.udp_unreplied_window = unreplied;
+        self.udp_replied_window = replied;
+        self.tcp_idle_cap = tcp_idle;
+    }
+
+    /// Shrinks the per-box cap — the window hook's twin, for the
+    /// relay-level proof that a flood of inbound flows stops at the cap
+    /// without holding a thousand records first.
+    pub fn shrink_cap(&mut self, cap: usize) {
+        self.cap = cap;
+    }
+
+    /// The shared reply decision both gates call ahead of their egress
+    /// verdict: whether `tuple` — a frame the *box* sent, so
+    /// `src` the box, `dst` the client — reverses a live record exactly.
+    ///
+    /// Admitted means the frame passes without the egress rules being
+    /// consulted at all — the box's `deny_subnets` and the infrastructure
+    /// set included — which is the point: the destination being one the
+    /// box's rules refuse is what a reply *is*, for a box that published a
+    /// port and answered the client that connected to it. The record that
+    /// admits it was opened by an opening packet the gate delivered toward
+    /// a published port, so the client's address was on the wire as the
+    /// source of a frame the gate itself passed, and the reply goes back to
+    /// that same conversation, port for port.
+    ///
+    /// Every other box frame falls through to the rules: one that reverses
+    /// no live record, one whose record has expired, one whose record the
+    /// client's FIN or RST already ended. A TCP FIN or RST on a live flow
+    /// is admitted *and* ends it — the close is part of the conversation,
+    /// and what the box sends after it is new traffic the rules decide. A
+    /// UDP answer moves the record onto the replied window and refreshes
+    /// it; a TCP answer refreshes the idle cap. Either way the frame's own
+    /// conversation keeps the record live, and only the record's timers or
+    /// its close can end it.
+    ///
+    /// This is the only arm an egress frame reaches, and it is read-only in
+    /// the direction that matters: it never opens a record, so no frame a
+    /// box sends can ever hand the box an admission — a record exists only
+    /// for a flow the recording gate delivered the opening of.
+    #[must_use = "a reply decision's true half is the frame's only admission; dropping the result admits nothing"]
+    pub fn reply_admits(&mut self, tuple: FlowTuple, flags: u8, now: Instant) -> bool {
+        let reply = tuple.reversed();
+        let Some(record) = self.flows.get_mut(&reply) else {
+            return false;
+        };
+        if record.deadline <= now {
+            // The record's window has passed: the conversation it was opened
+            // for is over, and the box volunteering a frame on it now is new
+            // traffic the rules decide.
+            self.flows.remove(&reply);
+            return false;
+        }
+        if tuple.proto == IPPROTO_TCP {
+            if flags & (TCP_FIN | TCP_RST) != 0 {
+                // The close passes — and ends the record, so nothing after it
+                // is a reply this flow admits.
+                self.flows.remove(&reply);
+                return true;
+            }
+            record.deadline = now + self.tcp_idle_cap;
+        } else {
+            // The first answer is what a UDP record was waiting for: it
+            // moves the record onto the replied window, and every later
+            // answer refreshes it.
+            record.replied = true;
+            record.deadline = now + self.udp_replied_window;
+        }
+        true
+    }
+
+    /// The recording half, the ingress leg's alone: what one *delivered*
+    /// inbound frame did to the box's record — opened a flow, refreshed one,
+    /// ended one, opened nothing, or was refused at the cap.
+    ///
+    /// Only an opening packet opens a record: a bare SYN for TCP (a
+    /// mid-stream segment — every ACK-bearing one — opens nothing, so no
+    /// flow the box did not first accept a connect on is ever recorded),
+    /// and any datagram for UDP, where every datagram is the conversation's
+    /// first. The caller has already decided the frame is one it is
+    /// delivering toward a port the box's declaration published, which is
+    /// what makes the record's opening honest: the gate records a flow only
+    /// for a packet the box's own ingress admitted.
+    ///
+    /// A live record's inbound traffic refreshes it — the conversation is
+    /// still live while the client is still speaking — and an inbound FIN or
+    /// RST ends it from the client's side. At the cap the *new* flow is
+    /// refused, counted, and the caller is told not to deliver it, while
+    /// existing flows keep refreshing: a box under a connection flood keeps
+    /// its established conversations, and only the flood pays.
+    #[must_use = "the flow outcome's RefusedAtCap half is the only refusal signal the caller gets"]
+    pub fn observe_inbound(&mut self, tuple: FlowTuple, flags: u8, now: Instant) -> InboundFlow {
+        // A live record first — and a close from the client's own side ends
+        // it, delivered though the closing frame still is.
+        if let Some(record) = self.flows.get_mut(&tuple) {
+            if record.deadline <= now {
+                self.flows.remove(&tuple);
+            } else if tuple.proto == IPPROTO_TCP && flags & (TCP_FIN | TCP_RST) != 0 {
+                self.flows.remove(&tuple);
+                return InboundFlow::Ended;
+            } else {
+                // A UDP record the box already answered stays on the replied
+                // window: the client's next datagram refreshes it, never
+                // demotes it to the unreplied one.
+                let window = if tuple.proto == IPPROTO_TCP {
+                    self.tcp_idle_cap
+                } else if record.replied {
+                    self.udp_replied_window
+                } else {
+                    self.udp_unreplied_window
+                };
+                record.deadline = now + window;
+                return InboundFlow::Refreshed;
+            }
+        }
+        // The opening packet: a bare SYN for TCP, any datagram for UDP,
+        // nothing for any other shape or protocol.
+        let opening = tuple.proto == IPPROTO_UDP
+            || (tuple.proto == IPPROTO_TCP && flags & TCP_SYN != 0 && flags & TCP_ACK == 0);
+        if !opening {
+            return InboundFlow::Untracked;
+        }
+        // At the cap, sweep the expired once per interval before spending
+        // anything: the bound is on live records, so the sweep is what keeps
+        // it a bound on live ones, and its cost is what the interval bounds.
+        if self.flows.len() >= self.cap && !self.sweep(now) {
+            self.refused_at_cap = self.refused_at_cap.saturating_add(1);
+            return InboundFlow::RefusedAtCap;
+        }
+        self.flows.insert(
+            tuple,
+            ReplyRecord {
+                deadline: now
+                    + if tuple.proto == IPPROTO_TCP {
+                        self.tcp_idle_cap
+                    } else {
+                        self.udp_unreplied_window
+                    },
+                replied: false,
+            },
+        );
+        InboundFlow::Recorded {
+            filled: self.flows.len() >= self.cap,
+        }
+    }
+
+    /// Sweeps the expired records, at most once per
+    /// [`REPLY_FLOW_SWEEP_INTERVAL`] and only when the table is at its cap —
+    /// a healthy table pays nothing and a flooded one pays at most one sweep
+    /// per interval. Whether space was freed is the caller's answer: only a
+    /// sweep that freed room admits a new flow past the cap.
+    fn sweep(&mut self, now: Instant) -> bool {
+        if self
+            .last_sweep
+            .is_some_and(|at| now.duration_since(at) < self.sweep_interval)
+        {
+            return false;
+        }
+        self.last_sweep = Some(now);
+        let before = self.flows.len();
+        self.flows.retain(|_, record| record.deadline > now);
+        before > self.flows.len()
+    }
+
+    /// Ends every recorded flow — ingress revocation and session stop both
+    /// land here. A record is an admission the box's ingress earned, so it
+    /// must not outlive the thing that earned it: when the session stops, or
+    /// the ingress that admitted the flow is revoked, the box's records go
+    /// with it, and a reply the box still owes is new traffic its own rules
+    /// decide. The at-cap counter is the box's history and stays: a box
+    /// whose flows were refused reads so in a bundle even after it stops.
+    pub fn clear(&mut self) {
+        self.flows.clear();
+    }
+
+    /// Ends the records of one published port: the flows that arrived at
+    /// `port` over `proto`. A port whose publication is withdrawn takes its
+    /// admissions with it, as [`Self::clear`] does for the whole box, so a
+    /// reply the box still owes on it is new traffic its own rules decide.
+    pub fn end_port(&mut self, proto: u8, port: u16) {
+        self.flows
+            .retain(|tuple, _| !(tuple.proto == proto && tuple.dst_port == port));
+    }
+
+    /// How many live records the box holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.flows.len()
+    }
+
+    /// Whether the box holds no live record.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.flows.is_empty()
+    }
+
+    /// The per-box cap the table refuses new inbound flows at — the number a
+    /// status surface or a filled line names, read from the table so a
+    /// harness-shrunk cap says the cap the table actually holds.
+    #[must_use]
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// The record a client's five-tuple is held under, when one is live —
+    /// the shape a status surface or a proof reads of the table without
+    /// driving a reply.
+    #[must_use]
+    pub fn record_of(&self, tuple: FlowTuple) -> Option<ReplyRecord> {
+        self.flows.get(&tuple).copied()
+    }
+
+    /// How many of this box's inbound flows have been refused at the cap —
+    /// the counter each gate's status surface reads, one per box, so a box
+    /// whose replies were or were not admitted reads so in a bundle.
+    #[must_use]
+    pub fn refused_at_cap(&self) -> u64 {
+        self.refused_at_cap
+    }
+}
+
+impl Default for ReplyFlows {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -1696,6 +2436,418 @@ mod tests {
         let open = EgressRules::from_policy(None, RESOLVER, LEASE);
         assert!(open.allow_subnets().is_none() && open.deny_subnets().is_none());
     }
+
+    /// NET-016's decision over the box's stance and the permit range: a
+    /// listening port is published exactly when the stance is `allow` and
+    /// the port falls inside the range — inclusively at both ends — and
+    /// listening alone is never the attached human's yes under any other
+    /// stance, range or no range. The declaration's own named ports are
+    /// the other half of the same decision, with their own test:
+    /// [`listen_verdict_never_touches_a_port_the_declaration_names`].
+    /// The exhaustive form of both halves is the ingress half of
+    /// [`super::kani_proofs::kani_frame_verdict_admits_nothing_undeclared`].
+    #[test]
+    fn listen_verdict_publishes_only_within_the_permitted_range() {
+        let policy = IngressPolicy {
+            port_mappings: vec![crate::PortMapping {
+                external_port: 18080,
+                internal_port: 8080,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: Some((3000, 3010)),
+            dynamic_ingress: Some(DynamicIngress::Allow),
+        };
+        let rules = IngressRules::from_policy(Some(&policy));
+        // Inside the range, inclusive at both ends.
+        assert_eq!(
+            rules.listen_verdict(IpProto::Tcp, 3000),
+            ListenVerdict::Publish
+        );
+        assert_eq!(
+            rules.listen_verdict(IpProto::Tcp, 3005),
+            ListenVerdict::Publish
+        );
+        assert_eq!(
+            rules.listen_verdict(IpProto::Tcp, 3010),
+            ListenVerdict::Publish
+        );
+        // Outside it: unpublished, the refused-not-published posture.
+        assert_eq!(
+            rules.listen_verdict(IpProto::Tcp, 2999),
+            ListenVerdict::Deny
+        );
+        assert_eq!(
+            rules.listen_verdict(IpProto::Tcp, 3011),
+            ListenVerdict::Deny
+        );
+        // An absent stance — even with a range set — publishes nothing.
+        let no_stance = IngressRules::from_policy(Some(&IngressPolicy {
+            dynamic_allowed_range: Some((3000, 3010)),
+            dynamic_ingress: None,
+            ..policy.clone()
+        }));
+        assert_eq!(
+            no_stance.listen_verdict(IpProto::Tcp, 3005),
+            ListenVerdict::Deny
+        );
+        // `ask` and `deny` both hold the port back: listening alone is
+        // never the attached human's yes (NET-138).
+        for stance in [Some(DynamicIngress::Ask), Some(DynamicIngress::Deny)] {
+            let held_back = IngressRules::from_policy(Some(&IngressPolicy {
+                dynamic_ingress: stance,
+                ..policy.clone()
+            }));
+            assert_eq!(
+                held_back.listen_verdict(IpProto::Tcp, 3005),
+                ListenVerdict::Deny
+            );
+        }
+        // An absent range permits no port at all.
+        let no_range = IngressRules::from_policy(Some(&IngressPolicy {
+            dynamic_allowed_range: None,
+            ..policy
+        }));
+        assert_eq!(
+            no_range.listen_verdict(IpProto::Tcp, 3005),
+            ListenVerdict::Deny
+        );
+        // An absent policy is deny-all-external: nothing a process
+        // listens on is published.
+        let absent = IngressRules::from_policy(None);
+        assert_eq!(
+            absent.listen_verdict(IpProto::Tcp, 3005),
+            ListenVerdict::Deny
+        );
+    }
+
+    /// NET-016's decision over the declaration's own named ports: a port
+    /// the declaration already names on the listener's transport is
+    /// never the watcher's to publish or withdraw, whatever the range
+    /// says about it. A port the declaration names on the other transport
+    /// alone is not that: its forward answers the one protocol it was
+    /// exposed with, so the listener falls to the rules — the range and
+    /// stance half is
+    /// [`listen_verdict_publishes_only_within_the_permitted_range`].
+    #[test]
+    fn listen_verdict_never_touches_a_port_the_declaration_names() {
+        let policy = IngressPolicy {
+            port_mappings: vec![crate::PortMapping {
+                external_port: 18080,
+                internal_port: 8080,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: Some((3000, 3010)),
+            dynamic_ingress: Some(DynamicIngress::Allow),
+        };
+        let rules = IngressRules::from_policy(Some(&policy));
+        // The declaration's own internal port is published already
+        // (NET-121): the watcher has nothing to publish and nothing to
+        // withdraw, whatever the range says.
+        assert_eq!(
+            rules.listen_verdict(IpProto::Tcp, 8080),
+            ListenVerdict::Declared
+        );
+        // A port the declaration names on UDP alone is declared on UDP
+        // alone: the mapping's forward answers UDP and never a TCP
+        // listener's, so the TCP listener is not published already — it is
+        // the watcher's, and these rules permit it, so it publishes.
+        let udp_declared = IngressRules::from_policy(Some(&IngressPolicy {
+            port_mappings: vec![crate::PortMapping {
+                external_port: 13005,
+                internal_port: 3005,
+                proto: IpProto::Udp,
+            }],
+            ..policy.clone()
+        }));
+        assert_eq!(
+            udp_declared.listen_verdict(IpProto::Udp, 3005),
+            ListenVerdict::Declared
+        );
+        assert_eq!(
+            udp_declared.listen_verdict(IpProto::Tcp, 3005),
+            ListenVerdict::Publish
+        );
+        // The same shape with nothing permitted holds the TCP listener
+        // back — a transport-blind `Declared` would not: the verdict must
+        // fall to the rules, which refuse it, not answer "published
+        // already" for a forward that would never answer its protocol.
+        let udp_declared_no_range = IngressRules::from_policy(Some(&IngressPolicy {
+            port_mappings: vec![crate::PortMapping {
+                external_port: 13005,
+                internal_port: 3005,
+                proto: IpProto::Udp,
+            }],
+            dynamic_allowed_range: None,
+            ..policy.clone()
+        }));
+        assert_eq!(
+            udp_declared_no_range.listen_verdict(IpProto::Tcp, 3005),
+            ListenVerdict::Deny
+        );
+        // An absent policy is deny-all-external: nothing is declared on
+        // either transport either.
+        let absent = IngressRules::from_policy(None);
+        assert_eq!(
+            absent.declared(IpProto::Tcp).collect::<Vec<u16>>(),
+            Vec::<u16>::new()
+        );
+        // The declared ports the gate derives, per transport — the same
+        // derivation every ingress surface reads.
+        assert_eq!(
+            rules.declared(IpProto::Tcp).collect::<Vec<u16>>(),
+            vec![8080]
+        );
+        assert_eq!(
+            rules.declared(IpProto::Udp).collect::<Vec<u16>>(),
+            Vec::<u16>::new()
+        );
+        assert!(rules.declares(IpProto::Tcp, 8080));
+        assert!(!rules.declares(IpProto::Tcp, 3005));
+        // `declares` reads the transport as half the fact: the UDP mapping
+        // names its port on UDP, never on TCP.
+        assert!(udp_declared.declares(IpProto::Udp, 3005));
+        assert!(!udp_declared.declares(IpProto::Tcp, 3005));
+    }
+
+    /// An L4 header carrying both ports — the reply-flow record's frames are
+    /// the one place a frame's *source* port is the fact under test.
+    fn l4_pair(src_port: u16, dst_port: u16) -> [u8; 4] {
+        let mut out = [0u8; 4];
+        out[0..2].copy_from_slice(&src_port.to_be_bytes());
+        out[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        out
+    }
+
+    /// An IPv4 frame for `proto` from `src`:`src_port` to `dst`:`dst_port`.
+    fn ipv4_frame_pair(
+        src: [u8; 4],
+        src_port: u16,
+        proto: u8,
+        dst: [u8; 4],
+        dst_port: u16,
+    ) -> Vec<u8> {
+        eth_frame(
+            ETHERTYPE_IPV4,
+            &ip_payload(proto, src, dst, 0, &l4_pair(src_port, dst_port)),
+        )
+    }
+
+    /// NET-040's answer half, the shared decision's own proof: a box frame
+    /// whose five-tuple exactly reverses a live inbound-flow record is
+    /// admitted ahead of the egress rules — deny-all's own dimensions
+    /// included, the `deny_subnets` a row's rules carry and the
+    /// infrastructure set the host gate refuses by — and no other box frame
+    /// is admitted by the record: not the client's address at another port,
+    /// not another client's address, not another protocol, not the box
+    /// speaking from its own connecting port. The record ends at its close
+    /// (FIN, from either end), at its window, and at revocation — and the
+    /// egress arm can open none of it back up.
+    #[test]
+    fn reply_on_admitted_inbound_flow_passes_egress() {
+        let t0 = Instant::now();
+        let client = [203, 0, 113, 7];
+        let rules = deny_all();
+        // The conversation the record is about: the client's bare SYN to the
+        // box's published port, and the box's answer back — the frame a
+        // deny-all box's own rules refuse.
+        let opening = FlowTuple::new(IPPROTO_TCP, client, 51000, LEASE, 8080);
+        let answer = ipv4_frame_pair(LEASE, 8080, IPPROTO_TCP, client, 51000);
+        assert!(
+            !admits(&answer, &rules),
+            "a deny-all box's answer is not a frame its own rules admit"
+        );
+        let mut flows = ReplyFlows::new();
+        // The gate delivered the opening packet, so the flow is recorded —
+        // and only that is what makes the answer pass.
+        assert_eq!(
+            flows.observe_inbound(opening, TCP_SYN, t0),
+            InboundFlow::Recorded { filled: false }
+        );
+        assert!(
+            flows.reply_admits(opening.reversed(), TCP_ACK, t0),
+            "the reply on a live record passes, ahead of the rules"
+        );
+        // Nothing beside the exact reverse passes: another port at the same
+        // client, another client, another protocol, and the box speaking
+        // from its own connecting port rather than the published one.
+        for near in [
+            FlowTuple::new(IPPROTO_TCP, LEASE, 8080, client, 51001),
+            FlowTuple::new(IPPROTO_TCP, LEASE, 8080, [203, 0, 113, 8], 51000),
+            FlowTuple::new(IPPROTO_UDP, LEASE, 8080, client, 51000),
+            FlowTuple::new(IPPROTO_TCP, LEASE, 40000, client, 51000),
+        ] {
+            assert!(
+                !flows.reply_admits(near, TCP_ACK, t0),
+                "a frame that reverses no live record passes: {near:?}"
+            );
+        }
+        // The box's FIN passes — the close is part of the conversation — and
+        // ends the record, so nothing after it is a reply this flow admits.
+        assert!(flows.reply_admits(opening.reversed(), TCP_FIN, t0));
+        assert_eq!(flows.record_of(opening), None);
+        assert!(
+            !flows.reply_admits(opening.reversed(), TCP_ACK, t0),
+            "a record the box's FIN ended admits nothing after it"
+        );
+        // The client's FIN ends it from its own side, delivered though the
+        // closing frame still is.
+        assert_eq!(
+            flows.observe_inbound(opening, TCP_SYN, t0),
+            InboundFlow::Recorded { filled: false }
+        );
+        assert_eq!(
+            flows.observe_inbound(opening, TCP_FIN, t0),
+            InboundFlow::Ended
+        );
+        assert!(!flows.reply_admits(opening.reversed(), TCP_ACK, t0));
+        // Revocation and session stop end every record without reading the
+        // wire at all.
+        assert_eq!(
+            flows.observe_inbound(opening, TCP_SYN, t0),
+            InboundFlow::Recorded { filled: false }
+        );
+        flows.clear();
+        assert!(!flows.reply_admits(opening.reversed(), TCP_ACK, t0));
+        // UDP: the first answer moves the record onto the replied window, so
+        // an answered conversation outlives the unreplied one — and dies one
+        // replied window after its last answer — while an unanswered one
+        // dies at the unreplied window.
+        let datagram = FlowTuple::new(IPPROTO_UDP, client, 53000, LEASE, 8080);
+        assert_eq!(
+            flows.observe_inbound(datagram, 0, t0),
+            InboundFlow::Recorded { filled: false }
+        );
+        assert!(flows.reply_admits(datagram.reversed(), 0, t0));
+        assert!(
+            flows
+                .record_of(datagram)
+                .is_some_and(|record| record.was_replied())
+        );
+        assert!(flows.reply_admits(datagram.reversed(), 0, t0 + REPLY_UDP_UNREPLIED_WINDOW));
+        assert!(!flows.reply_admits(
+            datagram.reversed(),
+            0,
+            t0 + REPLY_UDP_UNREPLIED_WINDOW + REPLY_UDP_REPLIED_WINDOW
+        ));
+        let quiet = FlowTuple::new(IPPROTO_UDP, client, 53001, LEASE, 8080);
+        assert_eq!(
+            flows.observe_inbound(quiet, 0, t0),
+            InboundFlow::Recorded { filled: false }
+        );
+        assert!(
+            !flows.reply_admits(quiet.reversed(), 0, t0 + REPLY_UDP_UNREPLIED_WINDOW),
+            "a UDP record the box never answered dies at the unreplied window"
+        );
+        // An expired record is gone, not limp: the next delivered opening
+        // packet opens a fresh one.
+        assert_eq!(
+            flows.observe_inbound(quiet, 0, t0 + REPLY_UDP_UNREPLIED_WINDOW),
+            InboundFlow::Recorded { filled: false }
+        );
+    }
+
+    /// The record's other face: no frame a box sends can open one. The
+    /// egress arm is a lookup and nothing else — it never inserts, and never
+    /// mints the admission a box would need to reach a destination its rules
+    /// refuse — so a box cannot talk itself into an inbound flow, whatever
+    /// shape it sends, and only a delivered opening packet ever opens a
+    /// record.
+    #[test]
+    fn box_frame_never_opens_a_reply_record() {
+        let t0 = Instant::now();
+        let client = [203, 0, 113, 7];
+        let mut flows = ReplyFlows::new();
+        // Box frames against an empty table: the reply shape, a connect the
+        // box initiates, a datagram, and a frame to itself. None finds a
+        // record, and none creates one.
+        for sent in [
+            FlowTuple::new(IPPROTO_TCP, LEASE, 8080, client, 51000),
+            FlowTuple::new(IPPROTO_TCP, LEASE, 40000, client, 443),
+            FlowTuple::new(IPPROTO_UDP, LEASE, 8080, client, 51000),
+            FlowTuple::new(IPPROTO_TCP, LEASE, 8080, LEASE, 8080),
+        ] {
+            assert!(
+                !flows.reply_admits(sent, TCP_SYN, t0),
+                "no box frame is admitted with no record to reverse: {sent:?}"
+            );
+        }
+        assert_eq!(flows.len(), 0, "no box frame opened a record");
+        // With a live record the box's reply refreshes it — and still opens
+        // nothing, on this tuple or any other.
+        let opening = FlowTuple::new(IPPROTO_TCP, client, 51000, LEASE, 8080);
+        assert_eq!(
+            flows.observe_inbound(opening, TCP_SYN, t0),
+            InboundFlow::Recorded { filled: false }
+        );
+        assert_eq!(
+            flows.len(),
+            1,
+            "the delivered opening packet is what opened the record"
+        );
+        assert!(flows.reply_admits(opening.reversed(), TCP_ACK, t0));
+        assert_eq!(
+            flows.len(),
+            1,
+            "the box's reply refreshed its record, no more"
+        );
+        for sent in [
+            // A SYN the box sends — a connect it initiates toward the very
+            // client whose record is live — reverses no live record and
+            // mints none.
+            FlowTuple::new(IPPROTO_TCP, LEASE, 40000, client, 51000),
+            FlowTuple::new(IPPROTO_TCP, LEASE, 40000, client, 8080),
+        ] {
+            assert!(
+                !flows.reply_admits(sent, TCP_SYN, t0),
+                "a connect the box initiates is not a reply: {sent:?}"
+            );
+            assert_eq!(flows.len(), 1, "no box frame opened a record");
+        }
+        // And a mid-stream inbound segment opens nothing either — only a
+        // delivered opening packet does, which is what keeps a record an
+        // admission the box's *ingress* earned.
+        let stray_ack = FlowTuple::new(IPPROTO_TCP, client, 59000, LEASE, 8080);
+        assert_eq!(
+            flows.observe_inbound(stray_ack, TCP_ACK, t0),
+            InboundFlow::Untracked
+        );
+        assert_eq!(
+            flows.observe_inbound(stray_ack, TCP_SYN | TCP_ACK, t0),
+            InboundFlow::Untracked
+        );
+        assert_eq!(flows.len(), 1, "no mid-stream segment opened a record");
+    }
+
+    /// A UDP record the box answered stays on the replied window: the
+    /// client's next datagram refreshes it there, and never demotes it to the
+    /// unreplied window, so the box's answer past that shorter window is still
+    /// a reply.
+    #[test]
+    fn answered_udp_record_keeps_replied_window_on_inbound_refresh() {
+        let t0 = Instant::now();
+        let client = [203, 0, 113, 7];
+        let mut flows = ReplyFlows::new();
+        let opening = FlowTuple::new(IPPROTO_UDP, client, 51000, LEASE, 8080);
+        assert_eq!(
+            flows.observe_inbound(opening, 0, t0),
+            InboundFlow::Recorded { filled: false }
+        );
+        assert!(flows.reply_admits(opening.reversed(), 0, t0));
+        let next = t0 + Duration::from_secs(1);
+        assert_eq!(
+            flows.observe_inbound(opening, 0, next),
+            InboundFlow::Refreshed
+        );
+        let past_unreplied = next + REPLY_UDP_UNREPLIED_WINDOW + Duration::from_secs(1);
+        assert!(
+            past_unreplied < next + REPLY_UDP_REPLIED_WINDOW,
+            "the probe sits between the two windows"
+        );
+        assert!(
+            flows.reply_admits(opening.reversed(), 0, past_unreplied),
+            "an answered record refreshed by the client keeps the replied window"
+        );
+    }
 }
 
 /// The frame-level admit-or-drop harness NET-016, NET-062, NET-064,
@@ -1706,6 +2858,15 @@ mod tests {
 /// lists of zero or two rules per dimension, at an unwind bound of 6 (the
 /// `[u8; 4]` address comparisons lower to a 4-trip `memcmp` loop; see the
 /// harness).
+///
+/// The same proof function carries NET-016's ingress half, the
+/// listen-publication decision: exhaustive over every port a process in a
+/// box can listen on, under a declaration of zero or two named ports, a
+/// permit range that may be absent, and every dynamic stance there is.
+/// The two halves decide nothing the other reads — one over frames and
+/// egress rules, one over ports and the ingress declaration — so they ride
+/// one function at one bound rather than two proofs at two, and the half
+/// that regresses fails by itself.
 ///
 /// The module also carries the rebinding intersection's harness (NET-067,
 /// [`kani_rebinding_intersection_admits_no_denied_address`]), which shares
@@ -1726,9 +2887,9 @@ mod tests {
 #[cfg(kani)]
 mod kani_proofs {
     use super::{
-        DNS_PORT, ETH_HDR, ETHERTYPE_IPV4, EgressRules, FrameFamily, FrameVerdict, IPPROTO_UDP,
-        InfrastructureDenySet, Ipv4Cidr, rebinding_admits, rebinding_intersection, summarize,
-        verdict,
+        DNS_PORT, DynamicIngress, ETH_HDR, ETHERTYPE_IPV4, EgressRules, FrameFamily, FrameVerdict,
+        IPPROTO_UDP, InfrastructureDenySet, IngressRules, IpProto, Ipv4Cidr, ListenVerdict,
+        rebinding_admits, rebinding_intersection, summarize, verdict,
     };
 
     /// One dimension's rules under every declaration the compile can
@@ -1766,13 +2927,56 @@ mod kani_proofs {
         }
     }
 
-    /// A frame is admitted exactly when it is declared: stated as an iff so
-    /// neither arm can silently become unreachable (the rcache harness
-    /// pattern). The declared half is restated over the same summary and
-    /// rules — the lease first (NET-084: the source is the lease), then the
-    /// resolver carve-out (NET-079), then the three declared dimensions
-    /// conjunctively — so a verdict that checks in a different order, or
-    /// that reads `None` as deny-all, fails here.
+    /// The ingress half's declared-port dimension, in [`two_protocols`]'s
+    /// shape: nothing declared, or two declared internal ports — one per
+    /// transport the record can name, their ports fully symbolic, so the
+    /// proof covers the one port declared on both transports, the two
+    /// ports declared on one, and every other port beside them. No
+    /// `Option` wrapper: an absent ingress declaration is the empty list,
+    /// the deny-all-external default [`IngressRules::from_policy`] compiles.
+    /// The transports stay concrete — TCP and UDP are the only two
+    /// `validate_policy` lets a declaration carry — while the port a box
+    /// is listening on, below, stays fully symbolic.
+    fn two_declared_ports() -> Vec<(IpProto, u16)> {
+        match kani::any::<bool>() {
+            false => Vec::new(),
+            true => Vec::from([
+                (IpProto::Tcp, kani::any::<u16>()),
+                (IpProto::Udp, kani::any::<u16>()),
+            ]),
+        }
+    }
+
+    /// The permit range under every declaration there is: absent (nothing
+    /// is permitted), or inclusive with fully symbolic ends — including
+    /// the inverted pair, which the decision must read as permitting
+    /// nothing rather than everything.
+    fn a_range() -> Option<(u16, u16)> {
+        kani::any::<bool>().then_some((kani::any::<u16>(), kani::any::<u16>()))
+    }
+
+    /// The dynamic stance under every setting there is: absent (the
+    /// default deny), allow, deny, or ask — all four, so the proof covers
+    /// the stance that publishes and each one that must not.
+    fn a_stance() -> Option<DynamicIngress> {
+        match (kani::any::<bool>(), kani::any::<bool>()) {
+            (false, false) => None,
+            (false, true) => Some(DynamicIngress::Allow),
+            (true, false) => Some(DynamicIngress::Deny),
+            (true, true) => Some(DynamicIngress::Ask),
+        }
+    }
+
+    /// A frame is admitted exactly when it is declared, and a listening port
+    /// is published exactly when it is permitted: two iff properties in one
+    /// proof, each restated over the same compiled rules so neither arm can
+    /// silently become unreachable (the rcache harness pattern). The frame
+    /// half is restated over the same summary and rules — the lease first
+    /// (NET-084: the source is the lease), then the resolver carve-out
+    /// (NET-079), then the three declared dimensions conjunctively — so a
+    /// verdict that checks in a different order, or that reads `None` as
+    /// deny-all, fails here. The listen half (NET-016) is restated over the
+    /// same ingress rules, below.
     ///
     /// The unwind bound is 6, with one loop to spare over the longest
     /// this proof unwinds: comparing `[u8; 4]` addresses lowers to
@@ -1782,7 +2986,8 @@ mod kani_proofs {
     /// most two rules) has exited by its third check. The bound has to
     /// clear every trip the compiler generates, not only the ones the
     /// source shows; the lease check's source comparison is one more of
-    /// those `memcmp`s, not a longer one.
+    /// those `memcmp`s, not a longer one. The ingress half's own scans
+    /// compare scalars, so they add no trip past that.
     #[kani::proof]
     #[kani::unwind(6)]
     fn kani_frame_verdict_admits_nothing_undeclared() {
@@ -1867,6 +3072,57 @@ mod kani_proofs {
             _ => false,
         };
         assert_eq!(admitted, declared);
+
+        // NET-016's half: a port a process in the box is listening on, on
+        // the transport it listens with, is published exactly when no
+        // declaration names it on that transport, the box's stance is
+        // `allow`, and the port falls inside the permit range — stated as
+        // an iff over the three verdicts, so neither the published nor
+        // the withheld arm can silently become unreachable, and a port
+        // declared on the listener's transport can never be the listener
+        // watcher's to publish (NET-121) or to withdraw (NET-081's
+        // sub-requirement). A port declared on the *other* transport
+        // alone is in the proof beside it — the one-transport declaration
+        // against the both-transport listener — where the verdict must
+        // fall to the rules rather than answer `Declared` under a forward
+        // that would never answer the listener's protocol.
+        //
+        // The listened transport rides the same two concrete variants the
+        // declaration can name (`two_declared_ports`): TCP and UDP are the
+        // only transports a declaration carries, so they bound every
+        // already-published shape there is; any other transport declares
+        // nothing and reduces to the range-and-stance check the proof
+        // covers without it.
+        //
+        // The half's own loops — the two declared-port scans, one in the
+        // decision and one in the oracle below — exit by their second
+        // check and compare scalars, not byte arrays, so the 4-trip
+        // `memcmp` bound rationale above is still the longest this
+        // function unwinds.
+        let listen: u16 = kani::any();
+        let listen_proto = if kani::any::<bool>() {
+            IpProto::Tcp
+        } else {
+            IpProto::Udp
+        };
+        let ingress = IngressRules::new(two_declared_ports(), a_range(), a_stance());
+        let declares = ingress
+            .declared
+            .iter()
+            .any(|(proto, port)| *proto == listen_proto && *port == listen);
+        let permitted = ingress
+            .permitted
+            .is_some_and(|(low, high)| low <= listen && listen <= high);
+        let published =
+            matches!(ingress.dynamic, Some(DynamicIngress::Allow)) && !declares && permitted;
+        let expected = if declares {
+            ListenVerdict::Declared
+        } else if published {
+            ListenVerdict::Publish
+        } else {
+            ListenVerdict::Deny
+        };
+        assert_eq!(ingress.listen_verdict(listen_proto, listen), expected);
     }
 
     /// NET-067's property, the rebinding half: **for every resolved answer

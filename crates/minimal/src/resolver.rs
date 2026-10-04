@@ -19,6 +19,13 @@
 //! "with no privilege prompt"; NET-123's interim arm: neither prompt nor
 //! hang).
 
+// The answerer-liveness query's wire codec: the same codec the VM host
+// daemon's answerer answers with, so the query and the answer agree by
+// construction instead of by copy.
+use hickory_proto::op::{Message, Query, ResponseCode};
+use hickory_proto::rr::rdata::A;
+use hickory_proto::rr::{Name, RData, RecordType};
+use minimald_rpc::ZoneAnswererStatus;
 use serde::Serialize;
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -1743,6 +1750,232 @@ pub(crate) async fn live_name_surfaces(
     surfaces
 }
 
+/// The host answerer's state as the two verbs consume it on a VM-backed
+/// host (NET-138): the port the VM host daemon's status read reported, the
+/// liveness proof this CLI ran itself against that port, and the machine
+/// fact that says this VM's names are not answered on the host at all.
+///
+/// The status read says *where to look and who holds the port*; the query
+/// proves the answerer is live — the pair the directive's condition (b)
+/// names, and the reason [`Self::answerer_bound`] is this CLI's own read
+/// and not the status's word: a holder that has since died still reports
+/// itself held, so the verdict pays one bounded query before it says
+/// native. [`Self::port`] is `None` while the acquisition loop has not run
+/// its first pass — the pre-acquisition state, which the verbs treat as
+/// "nothing to say yet" rather than a verdict, exactly as a daemon still
+/// bringing its answerer up is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostAnswererRead {
+    /// The port the VM host daemon reported, when its acquisition loop has
+    /// decided one.
+    pub port: Option<u16>,
+    /// Whether this CLI's own A query for [`minvmd::net::answerer::HOST_NAME`]
+    /// answered 127.0.0.1 from that port — the answerer-live proof.
+    pub answerer_bound: bool,
+    /// Whether the port is held by a process no zone-answerer channel
+    /// reaches: this VM's table is not in any daemon's answers, so this
+    /// VM's names are not answered on the host and the proxy is the
+    /// surface. The liveness query is not run in this arm — the status
+    /// already says the port is no daemon's answerer, so a reply from it
+    /// would be some other process's behaviour, not this zone's.
+    pub held_no_channel: bool,
+}
+
+/// [`HostAnswererRead`] from the status the VM host daemon's control
+/// socket answered: `Holder` and `Registered` name their port and earn the
+/// one bounded liveness query that proves it answers; `PortHeldNoChannel`
+/// names its port with no query to run; `Starting` claims nothing.
+pub(crate) async fn host_answerer_read(status: ZoneAnswererStatus) -> HostAnswererRead {
+    match status {
+        ZoneAnswererStatus::Starting => HostAnswererRead {
+            port: None,
+            answerer_bound: false,
+            held_no_channel: false,
+        },
+        ZoneAnswererStatus::PortHeldNoChannel { port } => HostAnswererRead {
+            port: Some(port),
+            answerer_bound: false,
+            held_no_channel: true,
+        },
+        ZoneAnswererStatus::Holder { port } | ZoneAnswererStatus::Registered { port } => {
+            HostAnswererRead {
+                port: Some(port),
+                answerer_bound: answerer_bound_at(port).await,
+                held_no_channel: false,
+            }
+        }
+    }
+}
+
+/// The liveness proof behind `answerer_bound` on a VM-backed host: this
+/// CLI's own bounded A query for the host's row —
+/// [`minvmd::net::answerer::HOST_NAME`], the name the answerer itself holds
+/// at 127.0.0.1 (NET-003's host half) — expecting the answer 127.0.0.1, in
+/// the same wire codec the answerer answers with, so the question and the
+/// answer agree by construction instead of by copy. `false` on anything
+/// else — no reply inside the window, a reply that does not decode, or one
+/// answering any other name or address — because every verb reading this
+/// may not say native without the proof.
+///
+/// One UDP datagram to the machine's own loopback, under
+/// [`ANSWERER_PROBE_BOUND`]: a status read, paid only on a VM-backed host
+/// whose status read named a holder, so `min ls` stays the status read it
+/// is. Blocking, so on a blocking thread; a task that panics or is lost
+/// reads as not bound.
+pub(crate) async fn answerer_bound_at(port: u16) -> bool {
+    tokio::task::spawn_blocking(move || answerer_bound_blocking(port))
+        .await
+        .unwrap_or_else(|join| {
+            tracing::warn!(
+                error = %join,
+                "the answerer liveness query did not run; treating the \
+                 answerer as not bound"
+            );
+            false
+        })
+}
+
+/// The bound on the answerer liveness query's reply window: generous for a
+/// loopback datagram — the answerer answers in well under the round trip —
+/// and short enough that a wedged holder costs the verb a fraction of its
+/// own detection budget ([`LIST_RESOLVECTL_BOUND`], the tighter of the two
+/// the verbs read under), never a wait of its own.
+const ANSWERER_PROBE_BOUND: Duration = Duration::from_millis(250);
+
+/// [`answerer_bound_at`]'s blocking half: one query datagram out, one
+/// bounded reply window, the answer decoded and judged.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "recv_from's length is bounded by the buffer it filled, so the \
+              slice is the reply and no more"
+)]
+fn answerer_bound_blocking(port: u16) -> bool {
+    let Ok(socket) = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)) else {
+        return false;
+    };
+    if socket.set_read_timeout(Some(ANSWERER_PROBE_BOUND)).is_err() {
+        return false;
+    }
+    let query = host_row_query();
+    if socket
+        .send_to(&query, (std::net::Ipv4Addr::LOCALHOST, port))
+        .is_err()
+    {
+        return false;
+    }
+    let mut buf = vec![0u8; MAX_ANSWERER_DATAGRAM];
+    match socket.recv_from(&mut buf) {
+        Ok((len, _)) => Message::from_vec(&buf[..len])
+            .map(|reply| reply_answers_host_row(&reply))
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// The largest reply the liveness query reads: the answer it wants is one A
+/// record, and a reply that does not fit here is not one it would accept
+/// either — larger than the classic minimal UDP datagram, so no real
+/// single-record answer is lost to it.
+const MAX_ANSWERER_DATAGRAM: usize = 512;
+
+/// The A query for the host's row, on the wire: the same scaffolding the
+/// answerer's own tests drive, so the query proves the same wire the
+/// answers are given by.
+fn host_row_query() -> Vec<u8> {
+    let name = Name::from_utf8(minvmd::net::answerer::HOST_NAME).expect("the host row name parses");
+    let mut query = Message::query();
+    query.add_query(Query::query(name, RecordType::A));
+    query.to_vec().expect("the liveness query encodes")
+}
+
+/// Whether `reply` is the proof the query was after: NoError, answering
+/// the host's row with 127.0.0.1. Anything else — a negative response, a
+/// different name, a different address — is not a live answerer, whatever
+/// the status said.
+fn reply_answers_host_row(reply: &Message) -> bool {
+    reply.metadata.response_code == ResponseCode::NoError
+        && reply.answers.iter().any(|record| {
+            record.record_type() == RecordType::A
+                && matches!(
+                    &record.data,
+                    RData::A(A(address)) if *address == std::net::Ipv4Addr::LOCALHOST
+                )
+        })
+}
+
+/// `min ls`'s ZONE ANSWERER line on a VM-backed host (NET-138): the line
+/// that says the zone is answered by the VM host daemon — the
+/// single-operator interim the answerer is — and names the holder the
+/// status read reported: this VM's minvmd when it holds the port, another
+/// VM host daemon when this one's table is registered with it. The third
+/// arm is the one that must not claim an answer: a port held by a process
+/// no channel reaches means this VM's names are not answered on the host,
+/// and the line says that instead. `None` for the pre-acquisition state —
+/// nothing to name yet, and the verb prints nothing for a listener still
+/// coming up, exactly as a native daemon's absent port does.
+#[must_use]
+pub fn vm_host_answerer_line(status: ZoneAnswererStatus) -> Option<String> {
+    match status {
+        ZoneAnswererStatus::Starting => None,
+        ZoneAnswererStatus::Holder { port } => Some(format!(
+            "answered by the VM host daemon (single-operator interim) · this \
+             VM's minvmd holds it on 127.0.0.1:{port} (UDP) · point the host's \
+             resolver at it for *.{ZONE}"
+        )),
+        ZoneAnswererStatus::Registered { port } => Some(format!(
+            "answered by the VM host daemon (single-operator interim) · \
+             another VM host daemon holds it on 127.0.0.1:{port} (UDP); this \
+             VM's table is registered with it · point the host's resolver at \
+             it for *.{ZONE}"
+        )),
+        ZoneAnswererStatus::PortHeldNoChannel { port } => Some(format!(
+            "not answered on the host · a process no zone-answerer channel \
+             reaches holds 127.0.0.1:{port}, so this VM's minvmd answers \
+             nothing and its names are not answered on the host"
+        )),
+    }
+}
+
+/// The live surface on a VM-backed host, from the status the VM host
+/// daemon's control socket answered — `min ls`'s form. The no-channel state
+/// settles the proxy by the status's own word, without paying the
+/// detection or the liveness query: the port is no daemon's answerer, so
+/// the two reads could only misreport native. The two decided states read
+/// the list's own bounded detection and this CLI's liveness query at the
+/// port the status named — the same facts the session start reads, at the
+/// list's own deadline, as [`live_name_surfaces`] does for a native host.
+/// The pre-acquisition state claims nothing: no port named, no verdict to
+/// print, exactly as a native daemon's absent port is.
+pub(crate) async fn vm_host_name_surface(status: ZoneAnswererStatus) -> Option<LiveSurface> {
+    match status {
+        ZoneAnswererStatus::Starting => None,
+        ZoneAnswererStatus::PortHeldNoChannel { .. } => Some(LiveSurface::Proxy),
+        ZoneAnswererStatus::Holder { port } | ZoneAnswererStatus::Registered { port } => {
+            let detection = ls_detection().await;
+            let answerer_bound = answerer_bound_at(port).await;
+            live_name_surface_at(&detection, Some(port), answerer_bound).await
+        }
+    }
+}
+
+/// The warning every session start on a VM-backed host prints when the
+/// answerer's port is held by a process no channel reaches (NET-138): this
+/// VM's names are not answered on the host, and the proxy remains the
+/// surface. Printed to stderr unconditionally — the directive's "at every
+/// session start, TTY and non-TTY" — because the fact it names is the one
+/// a user relying on the names needs before the first lookup fails; the
+/// verdict printed below it says which surface the names do route
+/// through. Pure, so tests assert the wording without capturing stderr.
+#[must_use]
+pub fn port_held_no_channel_warning(port: u16) -> String {
+    format!(
+        "warning: this VM's box names are not answered on the host: a \
+         process no zone-answerer channel reaches holds the zone answerer's \
+         port 127.0.0.1:{port}. The hostname proxy remains the surface the \
+         names route through."
+    )
+}
+
 /// Whether the reserved local range is present on *this* host's loopback:
 /// the same bind probe the daemon runs at session start (`switch::loopback`,
 /// one definition next to the range it probes), run where the verdict is
@@ -1908,6 +2141,115 @@ mod tests {
             format!("resolvectl domain {ZONE_LINK} '~{ZONE}'"),
             format!("resolvectl default-route {ZONE_LINK} false"),
         ]
+    }
+
+    // NET-138: the VM-backed host's answerer lines. The state the VM host
+    // daemon's control socket answers is the fact both verbs surface, and
+    // the wording is pinned here because the session e2e greps `min ls`
+    // for exactly this line.
+    #[test]
+    fn vm_host_answerer_line_names_the_holder() {
+        // The lone-holder shape: this VM's minvmd holds the port.
+        let line = vm_host_answerer_line(ZoneAnswererStatus::Holder { port: 7_656 })
+            .expect("the holder state prints its line");
+        assert_eq!(
+            line,
+            "answered by the VM host daemon (single-operator interim) · this \
+             VM's minvmd holds it on 127.0.0.1:7656 (UDP) · point the host's \
+             resolver at it for *.min.internal"
+        );
+        // The co-resident shape: another daemon holds, this one registered.
+        let line = vm_host_answerer_line(ZoneAnswererStatus::Registered { port: 7_656 })
+            .expect("the registered state prints its line");
+        assert_eq!(
+            line,
+            "answered by the VM host daemon (single-operator interim) · \
+             another VM host daemon holds it on 127.0.0.1:7656 (UDP); this \
+             VM's table is registered with it · point the host's resolver at \
+             it for *.min.internal"
+        );
+        // The arm that must not claim an answer: a port held by a process
+        // no channel reaches means this VM's names are not answered on the
+        // host, and saying "answered by" there would be the lie.
+        let line = vm_host_answerer_line(ZoneAnswererStatus::PortHeldNoChannel { port: 7_656 })
+            .expect("the no-channel state prints its line");
+        assert_eq!(
+            line,
+            "not answered on the host · a process no zone-answerer channel \
+             reaches holds 127.0.0.1:7656, so this VM's minvmd answers \
+             nothing and its names are not answered on the host"
+        );
+        assert!(
+            !line.contains("answered by the VM host daemon"),
+            "a port with no daemon behind it is not an answered zone: {line}"
+        );
+        // The pre-acquisition state prints nothing, like a daemon still
+        // bringing a listener up.
+        assert_eq!(vm_host_answerer_line(ZoneAnswererStatus::Starting), None);
+    }
+
+    /// NET-138's session-start warning: the fact and the surface, the exact
+    /// text every session start prints when the port is held by a process
+    /// no channel reaches — pinned because the warning rides stderr at
+    /// every start, TTY and non-TTY, and a wrong fact there strands the
+    /// user at the first failed lookup.
+    #[test]
+    fn port_held_no_channel_warning_says_the_fact_and_the_surface() {
+        assert_eq!(
+            port_held_no_channel_warning(7_656),
+            "warning: this VM's box names are not answered on the host: a \
+             process no zone-answerer channel reaches holds the zone \
+             answerer's port 127.0.0.1:7656. The hostname proxy remains the \
+             surface the names route through."
+        );
+    }
+
+    /// The verdict the status decides on its own, without reading this
+    /// host's files: the no-channel state settles the proxy by the status's
+    /// word (the port is no daemon's answerer, so no hook or range could
+    /// make it native), and the pre-acquisition state claims nothing. The
+    /// two decided states' arms read this host's own resolver state, so
+    /// they are the e2e's to prove on a real VM host, not a unit test's to
+    /// pin against whatever machine runs it.
+    #[tokio::test]
+    async fn vm_host_name_surface_decides_the_status_settled_arms_alone() {
+        assert_eq!(
+            vm_host_name_surface(ZoneAnswererStatus::Starting).await,
+            None,
+            "the pre-acquisition state names no surface"
+        );
+        assert_eq!(
+            vm_host_name_surface(ZoneAnswererStatus::PortHeldNoChannel { port: 7_656 }).await,
+            Some(LiveSurface::Proxy),
+            "a port held by a process no channel reaches is the proxy's verdict"
+        );
+    }
+
+    /// The liveness query's negative arms, the ones a unit test can pin
+    /// without the answerer: a port nothing answers — held by a silent
+    /// process, or free — is not a bound answerer, whatever the status
+    /// read said, because the query is the proof and the status only the
+    /// pointer. The positive arm (the answerer answering this exact query)
+    /// is the minvmd answerer tests' wire and the session e2e's dig.
+    #[tokio::test]
+    async fn answerer_bound_at_reads_silent_and_closed_ports_as_not_bound() {
+        // A silent holder: a socket bound on loopback that never answers.
+        let silent = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("the silent stand-in binds");
+        let port = silent.local_addr().expect("the port is named").port();
+        assert!(
+            !answerer_bound_at(port).await,
+            "a silent port is not a bound answerer"
+        );
+        // A free port: the query's datagram has nothing to reach.
+        let probe =
+            std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("the probe binds");
+        let free = probe.local_addr().expect("the port is named").port();
+        drop(probe);
+        assert!(
+            !answerer_bound_at(free).await,
+            "a port nothing holds is not a bound answerer"
+        );
     }
 
     /// Whether `/bin/sh` parses `script`: the shell a user pastes the whole
