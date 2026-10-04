@@ -559,7 +559,7 @@ pub(crate) async fn activate_session(
     // empty, rather than to four absent lists — a deny-all box declared by
     // flag must read in the record exactly like one declared by file, which
     // is the shape the host-address classifier decides its verdict on
-    // (NET-079) and the one `min session policy` names `deny all`. The parse
+    // (NET-079) and the one `min session policy` names `deny-all`. The parse
     // conflict (`cli.rs`) keeps it from combining with a rule flag, so the
     // arms cannot both run.
     let egress = if args.deny_all_egress {
@@ -2023,13 +2023,18 @@ pub fn print_classifier_advisory(
 
 /// Render a session's effective policy as its rules: the egress the gate
 /// enforces (NET-074/NET-075) — a declared section's dimensions each
-/// resolved to its list or its default (`allow all`; `deny subnets` reads
+/// resolved to its list or its default (`allow-all`; `deny subnets` reads
 /// `(none)` when nothing is denied), the declared deny-all section by name
-/// (`deny all` — every list empty would otherwise read as blankness, which
+/// (`deny-all` — every list empty would otherwise read as blankness, which
 /// is nothing, never a verdict), or, for a box that declared no egress
-/// at all, the default its daemon resolved to (`deny all` once the deny-all
-/// default is in force; `allow all` behind the opt-out or before it), with
-/// NET-079's per-box enforcement beside the egress rows when the daemon
+/// at all, the default its daemon resolved to (`deny-all` once the deny-all
+/// default is in force; `allow-all` behind the opt-out or before it),
+/// marked as a default and not as a declaration on the row itself —
+/// `deny-all (default)`, `allow-all (default)` — so a box the rollout
+/// silenced and a box that declared the same verdict never read the same;
+/// the declared deny-all row carries no mark, because the box chose it.
+/// Both spell with the requirement's own hyphenated tokens. The egress
+/// rows carry NET-079's per-box enforcement when the daemon
 /// reported one: a host-address box's verdict is decided on the host's
 /// cgroup tree, so the egress block that says what the box may reach also
 /// says whether this host can decide that per box — `none` beside a
@@ -2064,7 +2069,7 @@ pub fn print_classifier_advisory(
 /// than printed from a plan the session does not attach to. The modes
 /// without a surface to describe are held to the TUI's detail pane: a none
 /// box has no network at all, so it prints the pane's one-line note in
-/// place of both blocks (`allow all` egress would claim a reach a box with
+/// place of both blocks (`allow-all` egress would claim a reach a box with
 /// no network does not have), and a host-address session shares its host's
 /// namespace, so it has no per-session ingress policy — the block is
 /// omitted entirely, and with it the baseline set, which is a
@@ -2087,27 +2092,29 @@ pub fn format_policy(
     }
     writeln!(out, "egress")?;
     match &effective.egress {
-        sessions::EffectiveEgress::DenyAll => writeln!(out, "  deny all")?,
-        sessions::EffectiveEgress::AllowAll => writeln!(out, "  allow all")?,
+        sessions::EffectiveEgress::DenyAll => writeln!(out, "  deny-all (default)")?,
+        sessions::EffectiveEgress::AllowAll => writeln!(out, "  allow-all (default)")?,
         sessions::EffectiveEgress::Declared(egress) if declares_deny_all(egress) => {
             // The declared deny-all section, by name rather than as its
             // rows: every list empty renders as blankness, which reads as
             // nothing — the one rendering this block must never print
-            // (NET-075's "never nothing"). The name is the same row the
-            // resolved default prints, because it is the same verdict; the
-            // record and the JSON document carry which of the two it is.
-            writeln!(out, "  deny all")?;
+            // (NET-075's "never nothing"). The same verdict the default
+            // resolves to, spelled without the mark, because the box
+            // declared it: the mark is the difference between a verdict the
+            // box chose and the one the rollout chose for it, and the JSON
+            // document carries the same distinction as `source`.
+            writeln!(out, "  deny-all")?;
         }
         sessions::EffectiveEgress::Declared(egress) => {
-            write_rules(out, "subnets", egress.allow_subnets.as_ref(), "allow all")?;
+            write_rules(out, "subnets", egress.allow_subnets.as_ref(), "allow-all")?;
             write_rules(
                 out,
                 "dns hosts",
                 egress.allow_dns_hosts.as_ref(),
-                "allow all",
+                "allow-all",
             )?;
             match &egress.allow_protocols {
-                None => writeln!(out, "  protocols  allow all")?,
+                None => writeln!(out, "  protocols  allow-all")?,
                 Some(protos) => writeln!(
                     out,
                     "  protocols  {}",
@@ -2124,7 +2131,7 @@ pub fn format_policy(
     // NET-079's per-box enforcement, as the egress block's closing row: a
     // host-address box's verdict is decided on the host's cgroup tree, so
     // this is the row that says whether the rules above are decided per box
-    // at all — and a `deny all` printed beside an enforcement of `none` is
+    // at all — and a `deny-all` printed beside an enforcement of `none` is
     // the honest rendering, the posture the box declared beside the state it
     // actually runs in, rather than a verdict that looks decided and is not.
     // The value is the runtime-facts reply's, in the machine spelling: the
@@ -2170,17 +2177,17 @@ pub fn format_policy(
     // Ingress is an own-address surface: the switch's static forwarder is the
     // only per-session ingress minimald applies, and a host-address box
     // shares its host's namespace, so there is no per-session ingress policy
-    // to show for it — "deny all" there would claim a deny-rule exists.
+    // to show for it — "deny-all" there would claim a deny-rule exists.
     if network != sessions::NetworkMode::HostNet {
         writeln!(out, "ingress")?;
         match &effective.ingress {
-            None => writeln!(out, "  deny all")?,
+            None => writeln!(out, "  deny-all")?,
             Some(ingress) => {
                 if ingress.port_mappings.is_empty()
                     && ingress.dynamic_allowed_range.is_none()
                     && ingress.dynamic_ingress.is_none()
                 {
-                    writeln!(out, "  deny all")?;
+                    writeln!(out, "  deny-all")?;
                 }
                 for mapping in &ingress.port_mappings {
                     writeln!(
@@ -2253,7 +2260,7 @@ pub const POLICY_JSON_SCHEMA: &str = "min/v1/session-policy";
 
 /// The ingress block as the document carries it: the declared policy, or
 /// `deny_all` where the text rendering writes that reading — the same
-/// decision its "deny all" line makes, so the document never claims rules
+/// decision its "deny-all" line makes, so the document never claims rules
 /// the box never declared. Tagged by `kind` so a client branches on one
 /// field, with the declared policy's own keys flattened beside it.
 #[derive(serde::Serialize)]
@@ -2282,6 +2289,65 @@ impl<'a> PolicyIngressJson<'a> {
                 Self::DenyAll
             }
             Some(ingress) => Self::Declared(ingress),
+        }
+    }
+}
+
+/// The egress block as the document carries it: the posture the gate
+/// enforces, by the name the text rendering prints (`deny-all`,
+/// `allow-all`), and which of the two ways it came about — `default`, the
+/// rollout's resolution of a section the box never declared (NET-074), or
+/// `declared`, the box's own section (NET-075) — so a consumer reading the
+/// document never recomputes the default rule to tell a declared deny-all
+/// from the default's identical verdict: the mark the text rendering puts
+/// on the row, as a field. A declaration that admits something has no
+/// single name, so its rows ride under `rules` with
+/// `effective: "rules"` — the same lists the text rendering prints as its
+/// dimension rows.
+#[derive(serde::Serialize)]
+struct PolicyEgressJson<'a> {
+    /// The posture's name: `deny-all` or `allow-all` when the verdict has
+    /// one, `rules` when the declaration's own rows say it.
+    effective: &'static str,
+    /// `default` for the rollout's resolution of an absent section,
+    /// `declared` for the box's own.
+    source: &'static str,
+    /// The declared section, carried exactly when the box declared one —
+    /// the shape the strict record holds, empty lists and all, so a
+    /// declared deny-all is reconstructable from the document alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rules: Option<&'a sessions::EgressPolicy>,
+}
+
+impl<'a> PolicyEgressJson<'a> {
+    /// The document's form of the block [`format_policy`] prints: the same
+    /// named verdicts, the same declaration-versus-default distinction the
+    /// `(default)` mark carries, so the text and the document say one
+    /// thing about a box's egress.
+    fn from_effective(egress: &'a sessions::EffectiveEgress) -> Self {
+        match egress {
+            sessions::EffectiveEgress::DenyAll => Self {
+                effective: "deny-all",
+                source: "default",
+                rules: None,
+            },
+            sessions::EffectiveEgress::AllowAll => Self {
+                effective: "allow-all",
+                source: "default",
+                rules: None,
+            },
+            // The declared deny-all section keeps its name — the four
+            // present-and-empty lists it would print as blankness — and its
+            // `rules` ride beside the name the way every declaration's do.
+            sessions::EffectiveEgress::Declared(section) => Self {
+                effective: if declares_deny_all(section) {
+                    "deny-all"
+                } else {
+                    "rules"
+                },
+                source: "declared",
+                rules: Some(section),
+            },
         }
     }
 }
@@ -2320,7 +2386,7 @@ struct PolicyJson<'a> {
     schema: &'static str,
     network: sessions::NetworkMode,
     #[serde(skip_serializing_if = "Option::is_none")]
-    egress: Option<&'a sessions::EffectiveEgress>,
+    egress: Option<PolicyEgressJson<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ingress: Option<PolicyIngressJson<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2399,7 +2465,7 @@ pub fn write_policy_json(
         PolicyJson {
             schema: POLICY_JSON_SCHEMA,
             network,
-            egress: Some(&effective.egress),
+            egress: Some(PolicyEgressJson::from_effective(&effective.egress)),
             // Ingress is an own-address surface — the text rendering's gate:
             // a host-address box shares its host's namespace, so a key there
             // would claim a per-session policy that does not exist.
@@ -3347,8 +3413,8 @@ mod tests {
             "dynamic ingress row must be printed: {rendered}"
         );
         assert!(
-            !rendered.contains("  deny all"),
-            "a policy with an explicit dynamic ingress setting must not print 'deny all': {rendered}"
+            !rendered.contains("  deny-all"),
+            "a policy with an explicit dynamic ingress setting must not print 'deny-all': {rendered}"
         );
     }
 
@@ -3384,7 +3450,7 @@ mod tests {
         // A declared-but-empty section: the strict shape the daemon handed
         // down before NET-074, which still arrives as `Declared` when the
         // session or the box opted out of the default — and so keeps
-        // printing the per-dimension defaults, not `deny all`.
+        // printing the per-dimension defaults, not `deny-all`.
         let policy = EffectiveSessionPolicy {
             egress: EffectiveEgress::Declared(sessions::EgressPolicy::default()),
             ingress: None,
@@ -3393,20 +3459,25 @@ mod tests {
         format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains("egress\n"), "{rendered}");
-        assert!(rendered.contains("  allow all\n"), "{rendered}");
+        assert!(rendered.contains("  allow-all\n"), "{rendered}");
         assert!(rendered.contains("ingress\n"), "{rendered}");
-        assert!(rendered.contains("  deny all\n"), "{rendered}");
+        assert!(rendered.contains("  deny-all\n"), "{rendered}");
     }
 
     /// A declared deny-all section renders by name (NET-075): every allow
-    /// list present and empty is the verdict `deny all`, and the rows it
+    /// list present and empty is the verdict `deny-all`, and the rows it
     /// would print otherwise are four blanks — a rendering that reads as
-    /// nothing, the one this block must never produce. The name is the same
-    /// row the resolved default prints, because it is the same verdict; the
-    /// record and the JSON document carry which of the two it is. On a
-    /// host-address box the row sits beside the per-box enforcement value
-    /// (T73): declared deny-all beside `per_box` is the enforced posture,
-    /// and beside `none` the box's posture beside the state it runs in.
+    /// nothing, the one this block must never produce. The name is the
+    /// requirement's literal token, and it is bare: the `(default)` mark is
+    /// the one distinction between a verdict the box declared and the same
+    /// verdict the rollout resolved an absent section to, so the declared
+    /// row carries none and the default's carries it — asserted here as
+    /// the difference between the two renders, in the text and in the JSON
+    /// document, whose `source` field carries the same distinction for a
+    /// machine. On a host-address box the row sits beside the per-box
+    /// enforcement value (T73): declared deny-all beside `per_box` is the
+    /// enforced posture, and beside `none` the box's posture beside the
+    /// state it runs in.
     #[test]
     fn policy_shows_declared_deny_all() {
         let declared = EffectiveSessionPolicy {
@@ -3419,7 +3490,7 @@ mod tests {
         format_policy(&mut out, &declared, NetworkMode::OwnIp, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
-            rendered.contains("egress\n  deny all\n"),
+            rendered.contains("egress\n  deny-all\n"),
             "a declared deny-all box must show the deny-all name: {rendered}"
         );
         for row in ["  subnets", "  dns hosts", "  protocols", "  deny subnets"] {
@@ -3428,6 +3499,81 @@ mod tests {
                 "the deny-all verdict must not render as dimension rows: {rendered}"
             );
         }
+        assert!(
+            !rendered.contains("(default)"),
+            "a declared deny-all is a declaration, never a default, so its \
+             row carries no mark: {rendered}"
+        );
+
+        // The same verdict the in-force default resolves an absent section
+        // to, and the two rows differ by the mark alone: the declared row is
+        // what the box chose, the marked row what the rollout chose for a
+        // box that declared nothing (NET-075's "marked as a default and not
+        // as a declaration" is the mark's own half of the pair).
+        let defaulted = EffectiveSessionPolicy {
+            egress: EffectiveEgress::DenyAll,
+            ingress: None,
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &defaulted, NetworkMode::OwnIp, None, None).unwrap();
+        let default_rendered = String::from_utf8(out).unwrap();
+        assert!(
+            default_rendered.contains("egress\n  deny-all (default)\n"),
+            "a box the rollout resolved to deny-all shows the name, marked \
+             as the default: {default_rendered}"
+        );
+        assert_ne!(
+            rendered, default_rendered,
+            "the declared and the default renders must differ — the mark is \
+             the difference between them"
+        );
+
+        // The JSON document carries the same distinction (NET-075): the
+        // verdict's name in `effective`, its origin in `source`, so a
+        // consumer never recomputes the default rule to tell a declared
+        // deny-all from the default's identical verdict. The declared
+        // section rides with its name, empty lists and all, the shape the
+        // strict record holds; the default's carries no `rules`, because
+        // the box declared nothing to carry.
+        let egress_of = |policy: &EffectiveSessionPolicy| {
+            let mut out = Vec::new();
+            write_policy_json(&mut out, policy, NetworkMode::OwnIp, None, Ok(Vec::new())).unwrap();
+            serde_json_lenient::from_slice::<serde_json_lenient::Value>(&out).unwrap()["egress"]
+                .clone()
+        };
+        let declared_json = egress_of(&declared);
+        assert_eq!(
+            declared_json["effective"], "deny-all",
+            "the document names the declared verdict by the same token: {declared_json}"
+        );
+        assert_eq!(
+            declared_json["source"], "declared",
+            "a declared verdict says where it came from: {declared_json}"
+        );
+        assert_eq!(
+            declared_json["rules"]["allow_subnets"],
+            serde_json_lenient::Value::Array(Vec::new()),
+            "the declared section rides with its name, present-and-empty \
+             lists and all: {declared_json}"
+        );
+        let default_json = egress_of(&defaulted);
+        assert_eq!(
+            default_json["effective"], "deny-all",
+            "the default's verdict is the same name: {default_json}"
+        );
+        assert_eq!(
+            default_json["source"], "default",
+            "the rollout's resolution says so, so no consumer recomputes it: {default_json}"
+        );
+        assert!(
+            default_json.get("rules").is_none(),
+            "a box that declared nothing carries no section to carry: {default_json}"
+        );
+        assert_ne!(
+            declared_json, default_json,
+            "a declared deny-all and the default's never read the same in \
+             the document"
+        );
 
         // Host-address: the same name beside the per-box enforcement value.
         let mut out = Vec::new();
@@ -3441,7 +3587,7 @@ mod tests {
         .unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
-            rendered.contains("egress\n  deny all\n  per-box enforcement  per_box\n"),
+            rendered.contains("egress\n  deny-all\n  per-box enforcement  per_box\n"),
             "the deny-all row sits beside the per-box enforcement value: {rendered}"
         );
 
@@ -3465,8 +3611,21 @@ mod tests {
             "a section that allows a subnet keeps its rows: {rendered}"
         );
         assert!(
-            !rendered.contains("egress\n  deny all\n"),
+            !rendered.contains("egress\n  deny-all\n"),
             "an allow-listed section is not deny-all and must not read as it: {rendered}"
+        );
+        // And in the document it is the one shape that carries rows rather
+        // than a name: the verdict is the lists, spelled as the text
+        // rendering spells them.
+        let not_deny_all_json = egress_of(&not_deny_all);
+        assert_eq!(
+            not_deny_all_json["effective"], "rules",
+            "a declaration that admits something has no name; its rows are \
+             the verdict: {not_deny_all_json}"
+        );
+        assert_eq!(
+            not_deny_all_json["rules"]["allow_subnets"][0], "10.0.0.0/8",
+            "the named subnet rides the declared section: {not_deny_all_json}"
         );
     }
 
@@ -3474,7 +3633,7 @@ mod tests {
     fn format_policy_prints_the_effective_default_for_a_bare_own_ip_box() {
         // NET-075: once the deny-all default is in force, a box that
         // declared no egress prints the posture the gate enforces, not the
-        // absent section.
+        // absent section — by name, marked as the default it is.
         let deny_all = EffectiveSessionPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
@@ -3483,15 +3642,16 @@ mod tests {
         format_policy(&mut out, &deny_all, NetworkMode::OwnIp, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
-            rendered.contains("egress\n  deny all\n"),
-            "a bare own-address box must show deny-all: {rendered}"
+            rendered.contains("egress\n  deny-all (default)\n"),
+            "a bare own-address box must show deny-all, marked as the \
+             default: {rendered}"
         );
         assert!(
-            !rendered.contains("allow all"),
+            !rendered.contains("allow-all"),
             "deny-all must not also print the allow-all default row: {rendered}"
         );
         // The opt-out keeps the shipped default, so that box still reads
-        // allow-all (NET-077).
+        // allow-all (NET-077), under the same mark.
         let allow_all = EffectiveSessionPolicy {
             egress: EffectiveEgress::AllowAll,
             ingress: None,
@@ -3500,7 +3660,7 @@ mod tests {
         format_policy(&mut out, &allow_all, NetworkMode::OwnIp, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
-            rendered.contains("egress\n  allow all\n"),
+            rendered.contains("egress\n  allow-all (default)\n"),
             "an opted-out bare box must show allow-all: {rendered}"
         );
     }
@@ -3517,7 +3677,7 @@ mod tests {
     #[test]
     fn policy_render_carries_the_enforcement_row_when_the_host_reported_it() {
         let unenforced = EffectiveSessionPolicy {
-            egress: EffectiveEgress::DenyAll,
+            egress: EffectiveEgress::Declared(sessions::EgressPolicy::deny_all()),
             ingress: None,
         };
         let mut out = Vec::new();
@@ -3531,7 +3691,7 @@ mod tests {
         .unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
-            rendered.contains("egress\n  deny all\n  per-box enforcement  none\n"),
+            rendered.contains("egress\n  deny-all\n  per-box enforcement  none\n"),
             "a deny-all declaration beside an enforcement of none is the \
              state the box runs in, got: {rendered}"
         );
