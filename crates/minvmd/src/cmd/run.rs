@@ -1268,7 +1268,6 @@ fn verify_ports_dir(ports: &std::path::Path) -> Result<()> {
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 #[derive(Debug)]
 struct NodePortReservation {
-    port: u16,
     _lock: std::fs::File,
 }
 
@@ -1293,7 +1292,7 @@ impl NodePortReservation {
                 format!("opening the node-port reservation file {}", path.display())
             })?;
         match unsafe { libc::flock(_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } {
-            0 => Ok(Some(Self { port, _lock })),
+            0 => Ok(Some(Self { _lock })),
             _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock => {
                 Ok(None)
             }
@@ -1408,8 +1407,11 @@ struct NodePortAssignment {
     /// port taken fails the start instead of moving the surface.
     configured: bool,
     /// The host-wide reservation this supervisor holds on `port` for the
-    /// VM's life ([`NodePortReservation`]).
-    reservation: NodePortReservation,
+    /// VM's life ([`NodePortReservation`]). Held, never read: the
+    /// reservation is the assignment's to own, so dropping the assignment
+    /// — a redraw's move off the old port, or the supervisor's own end —
+    /// is what releases it.
+    _reservation: NodePortReservation,
 }
 
 /// Assigns the node's hostname-proxy TCP port. The operator's override
@@ -1451,7 +1453,7 @@ fn configured_node_port(port: u16) -> Result<NodePortAssignment> {
             preferred: port,
             skipped: None,
             configured: true,
-            reservation,
+            _reservation: reservation,
         }),
         CandidateCheck::Skip(reason) => Err(anyhow::anyhow!(
             "the operator-configured hostname-proxy port {port} is not available: {reason}. \
@@ -1570,7 +1572,7 @@ fn assign_node_port(preferred: u16, udp: bool) -> Result<NodePortAssignment> {
                 preferred,
                 skipped: None,
                 configured: false,
-                reservation,
+                _reservation: reservation,
             });
         }
         CandidateCheck::Skip(reason) => Some(reason),
@@ -1584,7 +1586,7 @@ fn assign_node_port(preferred: u16, udp: bool) -> Result<NodePortAssignment> {
         preferred,
         skipped,
         configured: false,
-        reservation,
+        _reservation: reservation,
     })
 }
 
@@ -2391,16 +2393,20 @@ mod tests {
             &first
         };
         // The loser's skip reason is whichever check it lost to: the
-        // reservation when both walks' probes passed, or a bind probe that
+        // reservation when both walks' probes passed, a bind probe that
         // collided with the winner's own probe — which holds the port
-        // momentarily. Both are the draw telling the host why it moved on;
-        // the invariant the test owns is the one above: the two walks never
-        // share a port, and the reservation (the test below) is what keeps
-        // it that way when the probes both pass.
+        // momentarily — or the connect probe finding the winner's
+        // momentary probe listener answering, the same collision seen from
+        // the other side. All three are the draw telling the host why it
+        // moved on; the invariant the test owns is the one above: the two
+        // walks never share a port, and the reservation (the test below) is
+        // what keeps it that way when the probes both pass.
         assert!(
             matches!(
                 loser.skipped,
-                Some(super::SKIP_RESERVED_BY_ANOTHER_VM) | Some(super::SKIP_BIND_REFUSED)
+                Some(super::SKIP_RESERVED_BY_ANOTHER_VM)
+                    | Some(super::SKIP_BIND_REFUSED)
+                    | Some(super::SKIP_LOOPBACK_ANSWERING)
             ),
             "the draw that moved on says why, got {:?}",
             loser.skipped
@@ -2423,7 +2429,6 @@ mod tests {
         let held = super::NodePortReservation::take(port)
             .unwrap()
             .expect("a free port's reservation is taken");
-        assert_eq!(held.port, port, "the reservation names the port it holds");
         assert!(
             super::NodePortReservation::take(port).unwrap().is_none(),
             "a second supervisor's reservation of the held port is refused"
