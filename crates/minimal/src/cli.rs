@@ -615,6 +615,30 @@ pub struct ActivateArgs {
     /// tcp). Repeatable. Requires `--network own_ip`.
     #[arg(long = "ingress", value_name = "EXT:INT[/PROTO]")]
     pub ingress: Vec<String>,
+    /// How dynamic ingress requests from inside this box are decided
+    /// (NET-043): `allow` publishes a port the box asks to expose (or
+    /// listens on inside `--dynamic-range`), `ask` routes the request to
+    /// the attached human, `deny` — like an unset flag — refuses every
+    /// one. Requires `--network own_ip`; the flags are the interim source
+    /// of the Box Spec `[network]` block's `dynamic_ingress` setting.
+    #[arg(
+        long = "dynamic-ingress",
+        value_name = "allow|ask|deny",
+        value_parser = parse_dynamic_ingress_mode
+    )]
+    pub dynamic_ingress: Option<sessions::DynamicIngress>,
+    /// Inclusive port range `lo-hi` (both ends included) within which
+    /// `--dynamic-ingress allow` accepts dynamic ingress requests; outside
+    /// it a request is refused with the out-of-range error. Only meaningful
+    /// beside `--dynamic-ingress`, so the range-without-mode spelling is
+    /// rejected rather than read as a deliberate allow.
+    #[arg(
+        long = "dynamic-range",
+        value_name = "LO-HI",
+        value_parser = parse_dynamic_range,
+        requires = "dynamic_ingress"
+    )]
+    pub dynamic_range: Option<(u16, u16)>,
     /// Allowed destination subnets in CIDR form (`egress.allow_subnets`),
     /// e.g. `10.0.0.0/8`. Repeatable; unset means allow-all subnets. Valid on
     /// an own-address (`--network own_ip`) or host-address
@@ -806,6 +830,62 @@ pub(crate) fn parse_ingress_proto(proto: &str) -> Result<sessions::IpProto, anyh
             "ingress: unsupported protocol '{other}' (use tcp or udp)"
         )),
     }
+}
+
+/// Parse a `--dynamic-ingress <allow|ask|deny>` value (NET-043) into the
+/// [`sessions::DynamicIngress`] stance the create request carries. The
+/// snake_case spellings are the record's own — the same words
+/// `min session policy` prints back — so what a person types to create the
+/// box is what they read from it later. `deny` parses the same as an unset
+/// flag reads: both are the deny-all default the policy module evaluates
+/// them as, but spelling it is still meaningful — it makes the ingress
+/// declaration, so `min session policy` shows the resolved row rather than
+/// no ingress block at all.
+pub(crate) fn parse_dynamic_ingress_mode(raw: &str) -> Result<sessions::DynamicIngress, String> {
+    match raw {
+        "allow" => Ok(sessions::DynamicIngress::Allow),
+        "deny" => Ok(sessions::DynamicIngress::Deny),
+        "ask" => Ok(sessions::DynamicIngress::Ask),
+        other => Err(format!(
+            "dynamic ingress: unknown mode '{other}' (expected allow, ask, or deny)"
+        )),
+    }
+}
+
+/// Parse a `--dynamic-range <lo>-<hi>` value (NET-043) into the inclusive
+/// `(lo, hi)` pair the create request's `dynamic_allowed_range` carries.
+/// A malformed value (no `-`, a non-numeric end, a port outside u16), an
+/// inverted one (`hi` below `lo`), or a privileged one (`lo` below
+/// [`sessions::MIN_DYNAMIC_INGRESS_PORT`]) is a create-time error here, at the flag,
+/// rather than a daemon-side refusal after the box's directory exists: the
+/// user sees what they typed named in the error, with no half-created
+/// session behind it.
+pub(crate) fn parse_dynamic_range(raw: &str) -> Result<(u16, u16), String> {
+    let (lo, hi) = raw
+        .split_once('-')
+        .ok_or_else(|| format!("dynamic range '{raw}': expected LO-HI (e.g. 8000-8443)"))?;
+    let lo = lo
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| format!("dynamic range '{raw}': '{lo}' is not a valid port number"))?;
+    let hi = hi
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| format!("dynamic range '{raw}': '{hi}' is not a valid port number"))?;
+    if hi < lo {
+        return Err(format!(
+            "dynamic range '{raw}': the upper end must not be below the lower end"
+        ));
+    }
+    // The launch check's own bound and wording (`validate_policy`), so a
+    // privileged range is refused here, at the flag, in the same words.
+    if lo < sessions::MIN_DYNAMIC_INGRESS_PORT {
+        return Err(format!(
+            "dynamic range '{raw}': {}",
+            sessions::PolicyError::PrivilegedDynamicRange { lo }
+        ));
+    }
+    Ok((lo, hi))
 }
 
 /// Parse an `--allow-protocols <PROTO>` spec into an [`sessions::IpProto`].

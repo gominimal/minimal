@@ -1849,6 +1849,70 @@ fn deny_all_egress_conflicts_with_every_egress_flag() {
     .expect("--deny-all-egress must combine with --credentialed-upstream");
 }
 
+/// The dynamic ingress flags parse at the flag (NET-043): a mode with a
+/// range lands as both, a mode alone lands with no range, an unknown mode
+/// is refused by the mode's parser, and a privileged range is refused by
+/// the range's parser in the launch check's own words.
+#[test]
+fn dynamic_ingress_flags_parse() {
+    use clap::Parser as _;
+
+    let activate = |argv: &[&str]| -> ActivateArgs {
+        let args = Cli::try_parse_from(argv)
+            .unwrap_or_else(|error| panic!("{argv:?} must parse: {error}"));
+        match args.command {
+            Some(Command::Session(SessionArgs {
+                command: SessionCommand::Activate(a),
+            })) => a,
+            _ => panic!("expected an activate command"),
+        }
+    };
+
+    let a = activate(&[
+        "min",
+        "session",
+        "activate",
+        "--dynamic-ingress",
+        "allow",
+        "--dynamic-range",
+        "8000-8443",
+    ]);
+    assert_eq!(a.dynamic_ingress, Some(sessions::DynamicIngress::Allow));
+    assert_eq!(a.dynamic_range, Some((8000, 8443)));
+
+    let a = activate(&["min", "session", "activate", "--dynamic-ingress", "ask"]);
+    assert_eq!(a.dynamic_ingress, Some(sessions::DynamicIngress::Ask));
+    assert_eq!(a.dynamic_range, None, "a mode alone carries no range");
+
+    let Err(err) =
+        Cli::try_parse_from(["min", "session", "activate", "--dynamic-ingress", "maybe"])
+    else {
+        panic!("an unknown dynamic ingress mode must not parse");
+    };
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("unknown mode 'maybe'"),
+        "the refusal must name the mode, got: {rendered}"
+    );
+
+    let Err(err) = Cli::try_parse_from([
+        "min",
+        "session",
+        "activate",
+        "--dynamic-ingress",
+        "allow",
+        "--dynamic-range",
+        "80-90",
+    ]) else {
+        panic!("a privileged dynamic range must not parse");
+    };
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains(&sessions::PolicyError::PrivilegedDynamicRange { lo: 80 }.to_string()),
+        "the refusal must use the launch check's words, got: {rendered}"
+    );
+}
+
 /// The CLI reference documents the network flags on `session activate`
 /// (NET-036), read from the real file so a docs edit cannot silently drop
 /// either row.
@@ -1869,6 +1933,8 @@ fn cli_reference_documents_network_flags() {
     for row in [
         "--network <none|host_ip|own_ip>",
         "--ingress <EXT:INT[/PROTO]>",
+        "--dynamic-ingress <allow|ask|deny>",
+        "--dynamic-range <LO-HI>",
     ] {
         assert!(
             section.contains(row),

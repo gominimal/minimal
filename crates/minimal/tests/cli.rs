@@ -455,6 +455,8 @@ async fn activate_creates_session() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        dynamic_ingress: None,
+        dynamic_range: None,
         allow_subnets: vec![],
         allow_dns_hosts: vec![],
         allow_protocols: vec![],
@@ -504,6 +506,8 @@ async fn activate_uploads_project_files() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        dynamic_ingress: None,
+        dynamic_range: None,
         allow_subnets: vec![],
         allow_dns_hosts: vec![],
         allow_protocols: vec![],
@@ -592,6 +596,8 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
         sync: Some(SyncMode::Tarball),
         network: CliNetworkMode::NoNet,
         ingress: vec![],
+        dynamic_ingress: None,
+        dynamic_range: None,
         allow_subnets: vec![],
         allow_dns_hosts: vec![],
         allow_protocols: vec![],
@@ -625,6 +631,343 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
     let sftp = client.open_sftp(session.id).await;
     let hello = sftp.read("/workbench/hello.txt").await.unwrap();
     assert_eq!(hello, b"hello world");
+}
+
+// --- dynamic ingress declaration (NET-043/NET-044) ---
+
+/// NET-043: `min session create` carries the box's dynamic ingress stance
+/// into the create request's `IngressPolicy`. `--dynamic-ingress allow
+/// --dynamic-range 8000-8443` reaches the record the daemon holds as
+/// exactly that — mode and range — and the stance alone makes the ingress
+/// declaration (no static mapping was given), while a create that set
+/// nothing keeps `ingress` `None`: the deny-all default, not an empty
+/// declaration. Read back through `GetSessionPolicy`, so what is asserted
+/// is the declaration the record stores, not the args the client parsed.
+#[tokio::test]
+async fn create_carries_dynamic_ingress() {
+    let (_daemon, args) = setup().await;
+
+    for (name, dynamic_ingress, dynamic_range) in [
+        (
+            "dyn-allow",
+            Some(sessions::DynamicIngress::Allow),
+            Some((8000, 8443)),
+        ),
+        // The mode alone, with no range and no static mapping, still makes
+        // the declaration.
+        ("dyn-ask", Some(sessions::DynamicIngress::Ask), None),
+        ("dyn-bare", None, None),
+    ] {
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(project.path().join(".git")).unwrap();
+        std::fs::write(
+            project.path().join("minimal.toml"),
+            "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
+        )
+        .unwrap();
+        cmd_activate(
+            &args,
+            ActivateArgs {
+                name: Some(name.to_string()),
+                path: Some(project.path().to_string_lossy().to_string()),
+                sync: Some(SyncMode::Tarball),
+                network: CliNetworkMode::OwnIp,
+                ingress: vec![],
+                dynamic_ingress,
+                dynamic_range,
+                allow_subnets: vec![],
+                allow_dns_hosts: vec![],
+                allow_protocols: vec![],
+                deny_subnets: vec![],
+                deny_all_egress: false,
+                credentialed_upstream: false,
+                loadout: vec![],
+                no_loadouts: false,
+                no_hooks: false,
+                no_prompt: false,
+                attach: false,
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("activating {name} must succeed: {error:#}"));
+    }
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::{GetSessionPolicy, GetSessionPolicyRequest};
+    for (name, declared) in [
+        (
+            "dyn-allow",
+            Some((sessions::DynamicIngress::Allow, Some((8000, 8443)))),
+        ),
+        ("dyn-ask", Some((sessions::DynamicIngress::Ask, None))),
+        ("dyn-bare", None),
+    ] {
+        let resp = client
+            .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Name(name.to_string()))
+            .await
+            .unwrap();
+        let policy = match resp {
+            minimald_rpc::Errorable::Ok(policy) => policy,
+            minimald_rpc::Errorable::Err { error } => {
+                panic!("GetSessionPolicy failed for {name}: {error}")
+            }
+        };
+        match declared {
+            Some((mode, range)) => {
+                let ingress = policy.ingress.unwrap_or_else(|| {
+                    panic!("the stance alone must make {name}'s ingress declaration")
+                });
+                assert_eq!(
+                    ingress.dynamic_ingress,
+                    Some(mode),
+                    "the record must hold the mode the flag named"
+                );
+                assert_eq!(
+                    ingress.dynamic_allowed_range, range,
+                    "the record must hold the range the flag named"
+                );
+                assert!(
+                    ingress.port_mappings.is_empty(),
+                    "no static mapping was given, so none may appear"
+                );
+            }
+            None => assert!(
+                policy.ingress.is_none(),
+                "nothing set must keep ingress None, the deny-all default"
+            ),
+        }
+    }
+}
+
+/// NET-043's create-time errors, each named at the flag it belongs to: a
+/// malformed range (no `-`, a non-numeric end) and an inverted one (`hi`
+/// below `lo`) are refused by the range's own parser, and a range with no
+/// mode is refused by the flag's `requires` — the half-declared stance can
+/// never read as a deliberate allow. Driven through the compiled binary so
+/// the assertion is on the create the user runs: the process exits nonzero
+/// with the reason on stderr, and no session is left behind a rejected
+/// flag.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn create_rejects_bad_dynamic_range() {
+    let (_daemon, args) = setup().await;
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join(".git")).unwrap();
+    std::fs::write(
+        project.path().join("minimal.toml"),
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
+    )
+    .unwrap();
+
+    let project_path = project.path().to_str().unwrap();
+    for (extra, needle) in [
+        (
+            &["--dynamic-ingress", "allow", "--dynamic-range", "8000"][..],
+            "expected LO-HI",
+        ),
+        (
+            &["--dynamic-ingress", "allow", "--dynamic-range", "abc-8443"][..],
+            "'abc' is not a valid port number",
+        ),
+        (
+            &["--dynamic-ingress", "allow", "--dynamic-range", "8443-8000"][..],
+            "the upper end must not be below the lower end",
+        ),
+        (
+            &["--dynamic-ingress", "allow", "--dynamic-range", "80-90"][..],
+            "minimald refuses to publish host ports below 1024",
+        ),
+        // A range with no mode: clap's `requires` names the missing flag, so
+        // the stance the range would imply is spelled by the person, not
+        // defaulted by the parser.
+        (&["--dynamic-range", "8000-8443"][..], "--dynamic-ingress"),
+    ] {
+        let mut argv = vec![
+            "session",
+            "activate",
+            project_path,
+            "--name",
+            "bad-range",
+            "--network",
+            "own_ip",
+            "--no-input",
+        ];
+        argv.extend(extra.iter().copied());
+        let out = run_min(&args, &argv).await;
+        assert!(
+            !out.status.success(),
+            "the create with {extra:?} must fail, but the binary exited \
+             {}:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(needle),
+            "the refusal must say {needle:?}, got:\n{stderr}"
+        );
+    }
+}
+
+/// NET-043/NET-044: `min session policy` shows the resolved dynamic ingress
+/// stance — in the text render and in the JSON document, on the deny-all
+/// default as much as on a declared one. The `allow` stance a box was
+/// created with over a range reads as its row and its key with the range
+/// beside it; a box that set nothing reads as deny, the evaluation the
+/// absent setting takes, in both surfaces — the deny_all kind and the
+/// text's deny-all line carry the resolved key too, so a parser of either
+/// surface answers "which stance does this box run under" without
+/// defaulting a null itself. An explicit `deny` reads the same, through
+/// the declared kind, minus the absent setting's `(default)` mark and with
+/// `dynamic_ingress_source` `declared` rather than `default`.
+#[tokio::test]
+async fn policy_shows_resolved_dynamic_ingress() {
+    let (daemon, args) = setup().await;
+    let allowed_id = create_session_with_policy(
+        &daemon,
+        "dyn-allow-policy",
+        sessions::NetworkMode::OwnIp,
+        sessions::SessionPolicy::new(
+            None,
+            Some(sessions::IngressPolicy {
+                port_mappings: vec![],
+                dynamic_allowed_range: Some((8000, 8443)),
+                dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+            }),
+        ),
+    )
+    .await;
+    let declared_deny_id = create_session_with_policy(
+        &daemon,
+        "dyn-explicit-deny-policy",
+        sessions::NetworkMode::OwnIp,
+        sessions::SessionPolicy::new(
+            None,
+            Some(sessions::IngressPolicy {
+                port_mappings: vec![],
+                dynamic_allowed_range: None,
+                dynamic_ingress: Some(sessions::DynamicIngress::Deny),
+            }),
+        ),
+    )
+    .await;
+    let bare_id = create_session_with_policy(
+        &daemon,
+        "dyn-bare-policy",
+        sessions::NetworkMode::OwnIp,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
+    for (name, id, (mode, range, declared)) in [
+        (
+            "the allow stance over a range",
+            allowed_id,
+            (
+                sessions::DynamicIngress::Allow,
+                Some((8000u16, 8443u16)),
+                true,
+            ),
+        ),
+        (
+            "the explicit deny stance",
+            declared_deny_id,
+            (sessions::DynamicIngress::Deny, None, true),
+        ),
+        (
+            "no dynamic flag given",
+            bare_id,
+            (sessions::DynamicIngress::Deny, None, false),
+        ),
+    ] {
+        let resp = client
+            .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(id))
+            .await
+            .unwrap();
+        let policy = match resp {
+            minimald_rpc::Errorable::Ok(policy) => policy,
+            minimald_rpc::Errorable::Err { error } => {
+                panic!("GetEffectiveSessionPolicy failed for {name}: {error}")
+            }
+        };
+
+        let mut out = Vec::new();
+        format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp, None, None).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let row = if declared {
+            format!("  dynamic ingress  {mode}\n")
+        } else {
+            format!("  dynamic ingress  {mode} (default)\n")
+        };
+        assert!(
+            text.contains(&row),
+            "{name}: the resolved stance, marked (default) only when absent, must show in \
+             the text:\n{text}"
+        );
+        if let Some((lo, hi)) = range {
+            assert!(
+                text.contains(&format!("  dynamic ports  {lo}–{hi}")),
+                "{name}: the range must show in the text:\n{text}"
+            );
+        }
+
+        let mut out = Vec::new();
+        write_policy_json(
+            &mut out,
+            &policy,
+            sessions::NetworkMode::OwnIp,
+            None,
+            Ok(vec![]),
+        )
+        .unwrap();
+        let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+        let ingress = &document["ingress"];
+        assert_eq!(
+            ingress["dynamic_ingress"],
+            mode.to_string(),
+            "{name}: the resolved stance must show in the document:\n{document}"
+        );
+        assert_eq!(
+            ingress["dynamic_ingress_source"],
+            if declared { "declared" } else { "default" },
+            "{name}: the stance's source must show in the document:\n{document}"
+        );
+        if declared {
+            assert_eq!(
+                ingress["kind"], "declared",
+                "{name}: a declared stance keeps the declared kind:\n{document}"
+            );
+        } else {
+            assert_eq!(
+                ingress["kind"], "deny_all",
+                "{name}: no declaration reads as the deny_all kind:\n{document}"
+            );
+        }
+        match range {
+            Some((lo, hi)) => {
+                let carried = ingress["dynamic_allowed_range"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{name}: the range rides as an array:\n{document}"));
+                assert_eq!(
+                    (carried[0].as_u64(), carried[1].as_u64(),),
+                    (Some(u64::from(lo)), Some(u64::from(hi))),
+                    "{name}: the range's ends must survive the document:\n{document}"
+                );
+            }
+            None => {
+                if declared {
+                    assert_eq!(
+                        ingress["dynamic_allowed_range"],
+                        Value::Null,
+                        "{name}: no range declared carries null, not a phantom \
+                         one:\n{document}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// `min session activate` puts a session id on stdout only for a session
@@ -1613,6 +1956,8 @@ async fn deny_all_egress_flag_declares_every_allow_list_empty() {
             sync: Some(SyncMode::Tarball),
             network: CliNetworkMode::HostNet,
             ingress: vec![],
+            dynamic_ingress: None,
+            dynamic_range: None,
             allow_subnets: vec![],
             allow_dns_hosts: vec![],
             allow_protocols: vec![],
@@ -1708,6 +2053,8 @@ async fn empty_egress_flag_value_is_a_validation_error() {
             sync: Some(SyncMode::Tarball),
             network: CliNetworkMode::HostNet,
             ingress: vec![],
+            dynamic_ingress: None,
+            dynamic_range: None,
             allow_subnets,
             allow_dns_hosts,
             allow_protocols,
@@ -1999,7 +2346,7 @@ async fn policy_shows_unset_egress_as_named_default() {
         "the declared box's row is the name, bare:\n{declared_text}"
     );
     assert!(
-        !declared_text.contains("(default)"),
+        !declared_text.contains("deny-all (default)"),
         "the declared row carries no default mark, so it never reads as \
          one:\n{declared_text}"
     );

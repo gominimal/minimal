@@ -95,6 +95,8 @@ the current directory).
 | `--sync <MODE>` | | How to load project files into the session: `tarball` (default: stream a tarball of your project and unpack it) or `none` (do not populate the worktree. The session starts from a default project configuration and does not apply the project's `minimal.toml`) |
 | `--network <none\|host_ip\|own_ip>` | | Network mode for the session: `none` gives it no network (every socket it opens to a destination outside itself fails), `host_ip` shares the host's network namespace (the default), and `own_ip` gives it an IP of its own on the host's switch so `--ingress` can publish ports. The old hyphenated spellings `no-net`, `host-net`, and `own-ip` still work for one release, with a one-line hint naming the current spelling |
 | `--ingress <EXT:INT[/PROTO]>` | | Static ingress port mapping `EXT:INT[/PROTO]` (PROTO = tcp or udp, default tcp). Repeatable. Requires `--network own_ip` |
+| `--dynamic-ingress <allow\|ask\|deny>` | | Sets the stance that decides the box's own requests to publish a port (`min net expose`, or a listen inside `--dynamic-range`). `allow` publishes them, `ask` asks the attached person, and `deny` refuses every one, the same as leaving the flag unset. Setting it declares ingress even with no `--ingress` mapping. Requires `--network own_ip`. A VM-backed host refuses `allow` and `ask` before it creates the box, until the host side can admit a publish the box requests ([gominimal/minimal#1897](https://github.com/gominimal/minimal/issues/1897)). Every macOS host is VM-backed |
+| `--dynamic-range <LO-HI>` | | Inclusive host port range, such as `8000-8443`, inside which `--dynamic-ingress allow` publishes. A port outside it gets the out-of-range refusal. Requires `--dynamic-ingress`. Setting it declares ingress even with no `--ingress` mapping. The flag refuses a range that starts below 1024, a privileged port |
 | `--loadout <NAME>` | | Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml` or `<config>/minimal/loadouts/<NAME>/loadout.toml`. Repeatable; if given, config-file `default_loadouts` are ignored |
 | `--no-loadouts` | | Apply no loadouts at all (also skips the config's `default_loadouts`). Conflicts with `--loadout` |
 | `--no-hooks` | | Run none of the session's [lifecycle hooks](./loadouts.md#lifecycle_hooks---scripts-at-session-transition-points), from either the loadouts or the project's `minimal.toml`. Recorded on the session, so it applies to the later attach, detach, and destroy transitions too |
@@ -267,12 +269,19 @@ marks an own-address box once the deny-all default is in force.
 its host's network namespace. The `(default)` mark distinguishes a verdict
 the box declared from the same verdict the default gave it. The ingress
 block lists the published port mappings the session's `--ingress` flags
-declared (or `deny-all` when none were). The `dynamic ports` row joins
-them when the ingress policy declares one:
+declared (or `deny-all` when the box leaves ingress undeclared). The
+`dynamic ports` row joins them when the box declared a `--dynamic-range`.
+The `dynamic ingress` row always prints, with the stance that decides the
+box's own publish requests. A box that set no `--dynamic-ingress`
+reads `deny (default)`, the deny the absence evaluates to, marked the way
+the egress block marks a default. A box that declared `deny` reads plain
+`deny`:
 
 ```
 ingress
   tcp  :8080 → :80
+  dynamic ports  8000–8443
+  dynamic ingress  allow
 ```
 
 A host-address (`--network host_ip`) session prints no ingress block at all:
@@ -310,7 +319,13 @@ state (`true`, `false`, or `null` for a daemon older than the field). The
 document leaves out the blocks the text output leaves out. A host-address
 session has no `ingress` key, and a `--network none` box has only `schema`
 and `network`. The `ingress` block has a `kind` tag, `deny_all` or
-`declared`, so a client reads one field to branch.
+`declared`, so a client reads one field to branch. Both kinds carry
+`dynamic_ingress`, the resolved stance: `allow`, `ask`, or `deny`, never
+`null`. Both also carry `dynamic_ingress_source`. It reads `declared` when
+the box set `--dynamic-ingress`, and `default` when the stance is the deny
+an absent setting gives. Both keys are new in the `min/v1/session-policy`
+shape. A client written against the earlier document ignores them. A
+client that reads them finds a value in every `ingress` object.
 
 With `-o json`, a failed run writes one `min/v1/error` object on stderr and
 exits non-zero, with no plain-text error line. The `code` field names the

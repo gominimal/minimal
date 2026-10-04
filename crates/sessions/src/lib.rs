@@ -460,6 +460,12 @@ pub fn effective_egress(
     }
 }
 
+/// The lowest host port a dynamic ingress range may start at: below it a
+/// port is privileged, and the rootless switch cannot publish one. One
+/// definition for the launch check ([`Record::validate_policy`]) and the
+/// CLI's `--dynamic-range` flag, so the two can never disagree.
+pub const MIN_DYNAMIC_INGRESS_PORT: u16 = 1024;
+
 /// Why a session's networking policy is incompatible with its network mode.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1061,7 +1067,7 @@ impl Record {
                 if lo > hi {
                     return Err(PolicyError::InvalidDynamicRange { lo, hi });
                 }
-                if lo < 1024 {
+                if lo < MIN_DYNAMIC_INGRESS_PORT {
                     return Err(PolicyError::PrivilegedDynamicRange { lo });
                 }
             }
