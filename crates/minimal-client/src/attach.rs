@@ -234,6 +234,28 @@ pub fn remote_command(command: &[String]) -> Option<String> {
     }
 }
 
+/// The largest encoded exec command `min session exec` will hand to ssh.
+///
+/// Two limits bound this. The box's own per-argument limit (`MAX_ARG_STRLEN`,
+/// 128 KiB on Linux) yields `E2BIG` (`Argument list too long`) below it, and
+/// an exec request that exceeds the SSH transport's packet limit tears down
+/// the connection rather than returning an error — indistinguishable from the
+/// command's own exit 255. Refusing here, before ssh is contacted, turns both
+/// into one clear client-side error.
+pub const MAX_EXEC_COMMAND_BYTES: usize = 128 * 1024;
+
+/// Refuse an encoded exec command that exceeds [`MAX_EXEC_COMMAND_BYTES`].
+pub fn ensure_exec_command_fits(wire: &str) -> Result<(), anyhow::Error> {
+    if wire.len() > MAX_EXEC_COMMAND_BYTES {
+        anyhow::bail!(
+            "the command is {} KiB; min session exec carries at most {} KiB of arguments — pass large data on stdin or in a file under /workbench",
+            wire.len().div_ceil(1024),
+            MAX_EXEC_COMMAND_BYTES / 1024,
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +520,22 @@ mod tests {
         assert!(
             hosts_file.contains(r#"q\"uote"#) && hosts_file.contains(r"back\\slash"),
             "path must reach ssh escaped, got: {hosts_file}"
+        );
+    }
+
+    /// A command that encodes to exactly the limit is accepted; one byte over
+    /// is refused before ssh is ever contacted.
+    #[test]
+    fn exec_command_size_guard_refuses_over_limit() {
+        let at_limit = "x".repeat(MAX_EXEC_COMMAND_BYTES);
+        assert!(ensure_exec_command_fits(&at_limit).is_ok());
+
+        let over = "x".repeat(MAX_EXEC_COMMAND_BYTES + 1);
+        let err = ensure_exec_command_fits(&over).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("min session exec carries at most 128 KiB"),
+            "unexpected message: {msg}"
         );
     }
 }

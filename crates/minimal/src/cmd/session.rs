@@ -1521,13 +1521,11 @@ pub async fn cmd_exec(global: &GlobalArgs, args: ExecArgs) -> Result<(), anyhow:
         "found session"
     );
 
-    session_via_ssh(
-        &sock,
-        r.id,
-        minimal_client::attach::remote_command(&args.command),
-        None,
-    )
-    .await
+    let remote = minimal_client::attach::remote_command(&args.command);
+    if let Some(wire) = remote.as_deref() {
+        minimal_client::attach::ensure_exec_command_fits(wire)?;
+    }
+    session_via_ssh(&sock, r.id, remote, None).await
 }
 
 /// Runs a task declared by the session's project, in that session.
