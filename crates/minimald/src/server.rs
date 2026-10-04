@@ -4234,6 +4234,26 @@ mod tests {
                 "a bind that did not relocate must hold the default, got: {logged}"
             );
         }
+        // Relocated bind or not, every failed publish proposed the port it
+        // bound: no walk, on either side of the publication.
+        let field = |line: &str, key: &str| -> Option<u16> {
+            line.split(key)
+                .nth(1)?
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
+        };
+        for line in logged
+            .lines()
+            .filter(|line| line.contains("could not publish on the host loopback"))
+        {
+            assert_eq!(
+                (field(line, " host_port="), field(line, " guest_port=")),
+                (Some(bound_port), Some(bound_port)),
+                "each failed publish must propose the bound port, got: {line}"
+            );
+        }
 
         // The port it keeps is the one it bound: the listener is serving
         // behind the still-failing publish — exactly the state a VM daemon
