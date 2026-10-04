@@ -383,9 +383,8 @@ pub enum EffectiveEgress {
     Declared(EgressPolicy),
 }
 
-/// A session's policy with its egress half resolved to what the gate
-/// enforces: the answer `GetEffectiveSessionPolicy` serves and
-/// `min session policy` renders (NET-075) — the shape that can carry
+/// The answer `GetEffectiveSessionPolicy` serves and `min session policy`
+/// renders (NET-075) — the shape that can carry
 /// [`EffectiveEgress::DenyAll`] without rewriting the strict
 /// [`SessionPolicy`] declaration. The ingress half is carried verbatim:
 /// ingress has no rollout default.
@@ -397,7 +396,12 @@ pub enum EffectiveEgress {
 // Same reason as the attribute on `SessionPolicy`: the response rides an
 // `#[serde(untagged)]` `Errorable`, and the daemon's `{"error": "..."}` reply
 // must fall through to the `Err` arm rather than decode as a valid policy —
-// a silent false negative on a security-introspection command.
+// a silent false negative on a security-introspection command. Its `egress`
+// is required, not an `Option`, so the error reply falls through on its own.
+// The strictness is also the wire contract with an older `min`: an old client
+// rejects a key it has no field for, so a fact that did not exist when it was
+// built must ride its own reply (`GetSessionRuntimeFacts`, the way live
+// ingress rides `GetLiveIngress`) rather than a new field here.
 #[serde(deny_unknown_fields)]
 pub struct EffectiveSessionPolicy {
     /// The effective egress: the declaration, or the default the rollout
@@ -716,6 +720,47 @@ pub struct BoxAddresses {
     pub loopback_address: Ipv4Addr,
 }
 
+/// The per-box egress enforcement state a host-address session's verdict runs
+/// under (NET-079): `per_box` when the session's own launch placed its box in
+/// a classifier leaf of the host's cgroup tree — the state a host that can
+/// decide per box gives the host-address boxes it launches — and `none` when
+/// the launch did not, because the host cannot decide per box at all, or
+/// because the box got no leaf to be decided on, and the box runs with the
+/// host's address and no verdict of its own.
+///
+/// Defined here — beside the [`Record`] field that carries a box's own launch
+/// outcome — rather than in the RPC crate that first spelled it, because the
+/// record is a session-plane type that crate already depends on; the RPC
+/// crate re-exports it under the path its clients spell, so no wire form
+/// changes.
+///
+/// The default is `none` — a daemon that has not read its host, or one whose
+/// host cannot decide, both spell the state the boxes on it run in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostIpEnforcement {
+    /// The box's launch placed it in a classifier leaf: its egress verdict is
+    /// decided on that leaf of its own.
+    PerBox,
+    /// The box runs with the host's address and no verdict of its own.
+    #[default]
+    None,
+}
+
+impl HostIpEnforcement {
+    /// The machine spelling the stringly surfaces carry — the create
+    /// response, the session runtime-facts reply, the daemon's log lines —
+    /// so a script that greps one surface for the state finds the same word
+    /// on every other.
+    #[must_use]
+    pub fn machine_str(self) -> &'static str {
+        match self {
+            Self::PerBox => "per_box",
+            Self::None => "none",
+        }
+    }
+}
+
 /// The on-disk row/record pertaining to a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
@@ -779,6 +824,30 @@ pub struct Record {
     /// exactly as they always have.
     #[serde(default)]
     pub box_addresses: Option<BoxAddresses>,
+
+    /// The per-box egress enforcement this session's own launch placed its
+    /// host-address box under (NET-079): `per_box` when the launch placed the
+    /// box in a classifier leaf of the host's cgroup tree, `none` when it did
+    /// not — the box's own record of its launch, kept on the session record
+    /// rather than in `attrs` so no client can assert it, and daemon-owned
+    /// from its first write: the create strips the key for every mode and
+    /// only a launch ever sets this field.
+    ///
+    /// The reading surfaces show this record, not the host's current state:
+    /// a box launched unenforced stays `none` for its life even after a later
+    /// launch decides per box, because the outcome is a fact about the launch
+    /// that produced it and never about the host as it stands now. Only the
+    /// display halves lower it — a host whose table has since stopped
+    /// deciding reads as `none` for every box on it — never raise it.
+    ///
+    /// `None` for a session that is not host-address (its verdict is decided
+    /// on address leases, never on the host's cgroup tree) and for a
+    /// host-address box that has not launched yet, whose reads fall back to
+    /// the host's state. Defaults to `None` for records that predate the
+    /// field: pre-existing sessions had no launch to record, and their reads
+    /// answer over the host's state exactly as they did before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip_enforcement: Option<HostIpEnforcement>,
 
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
@@ -912,6 +981,7 @@ mod tests {
             status: SessionStatus::default(),
             hooks_enabled: true,
             box_addresses: None,
+            host_ip_enforcement: None,
             attrs: BTreeMap::new(),
         }
     }
