@@ -564,12 +564,20 @@ pub(crate) async fn activate_session(
         allow_protocols: (!allow_protocols.is_empty()).then_some(allow_protocols),
         deny_subnets: (!args.deny_subnets.is_empty()).then(|| args.deny_subnets.clone()),
     });
+    // NET-043: any dynamic declaration makes the ingress policy too — a
+    // stance alone (with no range, no static mapping) still names how
+    // dynamic requests are decided, and a range without a stance cannot
+    // reach the create (the flag requires its mode). Nothing set keeps
+    // `None`: the deny-all default, which the policy module evaluates the
+    // same as an explicit deny.
+    let has_ingress =
+        !port_mappings.is_empty() || args.dynamic_ingress.is_some() || args.dynamic_range.is_some();
     let policy = sessions::SessionPolicy {
         egress,
-        ingress: (!port_mappings.is_empty()).then_some(sessions::IngressPolicy {
+        ingress: has_ingress.then_some(sessions::IngressPolicy {
             port_mappings,
-            dynamic_allowed_range: None,
-            dynamic_ingress: None,
+            dynamic_allowed_range: args.dynamic_range,
+            dynamic_ingress: args.dynamic_ingress,
         }),
         // NET-134: the lane is the box's own declaration, never a default —
         // a box that did not ask for a credentialed upstream keeps every
@@ -1718,6 +1726,8 @@ pub(crate) async fn activate_new_for_attach(global: &GlobalArgs) -> Result<(), a
             sync: None,
             network: CliNetworkMode::HostNet,
             ingress: Vec::new(),
+            dynamic_ingress: None,
+            dynamic_range: None,
             allow_subnets: Vec::new(),
             allow_dns_hosts: Vec::new(),
             allow_protocols: Vec::new(),
@@ -2148,6 +2158,22 @@ pub fn format_policy(
     // to show for it — "deny all" there would claim a deny-rule exists.
     if network != sessions::NetworkMode::HostNet {
         writeln!(out, "ingress")?;
+        // The dynamic row is the resolved stance, printed whether or not
+        // anything was declared (NET-043): an absent setting is the deny the
+        // policy module evaluates it as, and this render is where a person
+        // reads which stance a box runs under — silence would read as
+        // "unset" where there is no unset, only deny. The static half
+        // keeps its own deny-all line: it describes the declared mappings,
+        // not the dynamic stance.
+        let dynamic_ingress = effective
+            .ingress
+            .as_ref()
+            .and_then(|ingress| ingress.dynamic_ingress)
+            .unwrap_or(sessions::DynamicIngress::Deny);
+        let dynamic_range = effective
+            .ingress
+            .as_ref()
+            .and_then(|ingress| ingress.dynamic_allowed_range);
         match &effective.ingress {
             None => writeln!(out, "  deny all")?,
             Some(ingress) => {
@@ -2164,14 +2190,12 @@ pub fn format_policy(
                         mapping.proto, mapping.external_port, mapping.internal_port
                     )?;
                 }
-                if let Some((lo, hi)) = ingress.dynamic_allowed_range {
-                    writeln!(out, "  dynamic ports  {lo}–{hi}")?;
-                }
-                if let Some(mode) = ingress.dynamic_ingress {
-                    writeln!(out, "  dynamic ingress  {mode}")?;
-                }
             }
         }
+        if let Some((lo, hi)) = dynamic_range {
+            writeln!(out, "  dynamic ports  {lo}–{hi}")?;
+        }
+        writeln!(out, "  dynamic ingress  {dynamic_ingress}")?;
     }
     Ok(())
 }
@@ -2230,15 +2254,23 @@ pub const POLICY_JSON_SCHEMA: &str = "min/v1/session-policy";
 /// `deny_all` where the text rendering writes that reading — the same
 /// decision its "deny all" line makes, so the document never claims rules
 /// the box never declared. Tagged by `kind` so a client branches on one
-/// field, with the declared policy's own keys flattened beside it.
+/// field, with the declared policy's own keys flattened beside it. The
+/// `dynamic_ingress` key is the resolved stance in both variants (NET-043):
+/// the deny an absent setting evaluates as, never a null a parser would
+/// have to default itself — the document and the text rendering answer
+/// "which stance does this box run under" identically.
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PolicyIngressJson<'a> {
     /// Nothing is set, and the switch's default state is the deny: a claim
     /// about the switch, not about declared rules.
-    DenyAll,
+    DenyAll {
+        /// The dynamic stance the box runs under, resolved — deny, the
+        /// evaluation an absent setting takes (NET-043).
+        dynamic_ingress: sessions::DynamicIngress,
+    },
     /// The declared policy, carried as the wire's own shape.
-    Declared(&'a sessions::IngressPolicy),
+    Declared(PolicyDeclaredIngressJson<'a>),
 }
 
 impl<'a> PolicyIngressJson<'a> {
@@ -2248,17 +2280,37 @@ impl<'a> PolicyIngressJson<'a> {
     /// on purpose.
     fn from_effective(policy: Option<&'a sessions::IngressPolicy>) -> Self {
         match policy {
-            None => Self::DenyAll,
+            None => Self::DenyAll {
+                dynamic_ingress: sessions::DynamicIngress::Deny,
+            },
             Some(ingress)
                 if ingress.port_mappings.is_empty()
                     && ingress.dynamic_allowed_range.is_none()
                     && ingress.dynamic_ingress.is_none() =>
             {
-                Self::DenyAll
+                Self::DenyAll {
+                    dynamic_ingress: sessions::DynamicIngress::Deny,
+                }
             }
-            Some(ingress) => Self::Declared(ingress),
+            Some(ingress) => Self::Declared(PolicyDeclaredIngressJson {
+                port_mappings: &ingress.port_mappings,
+                dynamic_allowed_range: ingress.dynamic_allowed_range,
+                dynamic_ingress: ingress
+                    .dynamic_ingress
+                    .unwrap_or(sessions::DynamicIngress::Deny),
+            }),
         }
     }
+}
+
+/// The declared policy as the document carries it: the wire's own keys,
+/// with `dynamic_ingress` resolved to the stance the box runs under rather
+/// than the raw `None` the record stores.
+#[derive(serde::Serialize)]
+struct PolicyDeclaredIngressJson<'a> {
+    port_mappings: &'a [sessions::PortMapping],
+    dynamic_allowed_range: Option<(u16, u16)>,
+    dynamic_ingress: sessions::DynamicIngress,
 }
 
 /// The node-plane baseline set the helper enumerates (NET-130), as the
