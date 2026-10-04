@@ -201,12 +201,13 @@ pub fn classify(frame: &[u8]) -> Option<Segment> {
 /// The ones' complement sum of `bytes` as 16-bit big-endian words (RFC 1071):
 /// the accumulator widened so the carries survive to be folded back in.
 pub fn ones_sum(bytes: &[u8]) -> u32 {
-    let sum: u32 = bytes
-        .chunks_exact(2)
-        .map(|word| u32::from(u16::from_be_bytes([word[0], word[1]])))
+    let (words, tail) = bytes.as_chunks::<2>();
+    let sum: u32 = words
+        .iter()
+        .map(|word| u32::from(u16::from_be_bytes(*word)))
         .sum();
     // A trailing odd byte counts as the high half of a final word.
-    if let Some(tail) = bytes.chunks_exact(2).remainder().first() {
+    if let Some(tail) = tail.first() {
         sum + (u32::from(*tail) << 8)
     } else {
         sum
@@ -995,11 +996,12 @@ mod tests {
     /// than the builder's helper, so a wrong checksum in a built frame is
     /// caught by construction.
     fn rfc1071(bytes: &[u8]) -> u16 {
-        let mut sum: u32 = bytes
-            .chunks_exact(2)
-            .map(|word| u32::from(u16::from_be_bytes([word[0], word[1]])))
+        let (words, tail) = bytes.as_chunks::<2>();
+        let mut sum: u32 = words
+            .iter()
+            .map(|word| u32::from(u16::from_be_bytes(*word)))
             .sum();
-        if let Some(tail) = bytes.chunks_exact(2).remainder().first() {
+        if let Some(tail) = tail.first() {
             sum += u32::from(*tail) << 8;
         }
         while sum >> 16 != 0 {

@@ -1569,6 +1569,15 @@ pub(crate) struct Launched<P, G> {
     /// box. Carried to the host's attributes so a session can say which it
     /// runs under — the launch's own decision, not a re-derivation.
     host_ip_enforcement: Option<HostIpEnforcement>,
+    /// The listen plan the launch gathered for the box it launched: the
+    /// lease, the published address, the switch control channel, the gate
+    /// and the publication set its watcher publishes through. `None` when
+    /// the launch could build no plan — no lease, no published address or no
+    /// live gate — and a mock launch that builds none starts no watcher at
+    /// all. The plan rides here rather than a table between the two, so it
+    /// is this launch's own from the moment it is built: it never survives
+    /// to a spawn that did not gather it.
+    listen_plan: Option<crate::net::listeners::ListenPlan>,
 }
 
 /// Actor messages to a [`Host`].
@@ -2906,6 +2915,13 @@ pub(crate) struct SandboxLauncher {
     /// answers, it never fabricates one — no client or box input reaches
     /// it, and production passes `None`.
     pub(crate) classifier_mountinfo: Option<String>,
+    /// The box's runtime publications, built fresh for the spawn this
+    /// launcher is about to run: the one set this launch's listen plan and
+    /// the session actor's runtime expose path both read, so a port the
+    /// one published is never bound by the other (NET-047's never-contend
+    /// half, and the answer `min net expose` gets when the listener
+    /// watcher published its port first).
+    pub(crate) publications: crate::net::listeners::BoxPublications,
 }
 
 /// Reaps a freshly-spawned sandbox process if the launch is abandoned
@@ -4531,50 +4547,46 @@ impl SessionLauncher for SandboxLauncher {
             }
         };
 
-        // Step 4 (post-attach): stage the listen-publication plan (NET-016,
+        // Step 4 (post-attach): gather the listen-publication plan (NET-016,
         // NET-017) — everything the box's listener watcher needs, from what
         // this launch alone holds: the box's lease on the switch, the gvproxy
         // control channel its forwarder verbs ride (built the way the
         // provider's own-IP plan builds it), the published address the
-        // switch granted this session (NET-010), and the ingress gate the
-        // attach just registered for the relay. The host that takes the box
-        // starts the watcher when it builds and stops it with the session,
-        // so this is the one handoff: a box with no lease, no published
-        // address or no live gate stages nothing, and its ports stay
-        // unpublishable by listening — and it clears the table's entry for
-        // this session, so a plan a cancelled launch staged for it never
-        // reaches the host a later launch does build: that orphan names a
-        // lease, an address and a gate the cancelled launch's attach
-        // already tore down.
+        // switch granted this session (NET-010), the ingress gate the
+        // attach just registered for the relay, and the box's publication
+        // set, shared with the runtime expose surface so neither binds a
+        // port the other already holds. The plan rides [`Launched`] to the
+        // host that runs the box, which starts the watcher when it builds
+        // and stops it with the session — so a box with no lease, no
+        // published address or no live gate carries no plan, and its ports
+        // stay unpublishable by listening.
         let lease = plan.tap().map(|tap| tap.address);
         let published = own_address
             .as_ref()
             .and_then(|reporter| reporter.published_address());
         let gate = lease.and_then(crate::net::switch::live_gate);
-        if let (Some(lease), Some(published), Some(gate)) = (lease, published, gate) {
-            let switch = net_switch.lock().await;
-            let control = match switch.transport() {
-                crate::net::SwitchTransport::LocalSpawn => {
-                    crate::net::policy::ControlChannel::Unix(switch.control_socket())
-                }
-                crate::net::SwitchTransport::HostShuttle { cid, port } => {
-                    crate::net::policy::ControlChannel::Vsock { cid, port }
-                }
-            };
-            crate::net::listeners::stage_listen_plan(
-                session_id,
-                process.get_mut().id(),
-                crate::net::listeners::ListenPlan::new(
+        let listen_plan = match (lease, published, gate) {
+            (Some(lease), Some(published), Some(gate)) => {
+                let switch = net_switch.lock().await;
+                let control = match switch.transport() {
+                    crate::net::SwitchTransport::LocalSpawn => {
+                        crate::net::policy::ControlChannel::Unix(switch.control_socket())
+                    }
+                    crate::net::SwitchTransport::HostShuttle { cid, port } => {
+                        crate::net::policy::ControlChannel::Vsock { cid, port }
+                    }
+                };
+                Some(crate::net::listeners::ListenPlan::new(
                     session_label,
                     lease,
                     published,
                     control,
                     gate,
-                ),
-            );
-        } else {
-            crate::net::listeners::clear_listen_plan(session_id);
-        }
+                    self.publications,
+                ))
+            }
+            _ => None,
+        };
 
         Ok(Launched {
             master,
@@ -4596,6 +4608,10 @@ impl SessionLauncher for SandboxLauncher {
             // The copy the host keeps, so every process injected into the
             // session can join the same leaf.
             leaf,
+            // The box's listen plan, and with it the one handoff to the
+            // host that runs the box: taken when the host builds, so a
+            // cancelled launch's plan never reaches any host at all.
+            listen_plan,
         })
     }
 }
@@ -4690,6 +4706,11 @@ pub(crate) struct MockLauncher {
     /// placement's outcome; the real launcher's placement-to-record mapping
     /// is pinned where it is written, in this module's launch proofs.
     host_ip_enforcement: Option<HostIpEnforcement>,
+    /// The listen plan this mock launch carries in its [`Launched`], so a
+    /// test can drive the host's listener watcher over the mock box the way
+    /// a real launch drives one over a sandboxed box — and, left `None`,
+    /// prove a launch that carries no plan starts no watcher at all.
+    listen_plan: Option<crate::net::listeners::ListenPlan>,
 }
 
 #[cfg(test)]
@@ -4699,6 +4720,7 @@ impl MockLauncher {
         Self {
             net_guard: Some(net_guard),
             host_ip_enforcement: None,
+            listen_plan: None,
         }
     }
 
@@ -4721,6 +4743,21 @@ impl MockLauncher {
             ..self
         }
     }
+
+    /// This mock with `listen_plan` attached, so a test can drive a box's
+    /// listener watcher under whatever else its launch mirrors. The mock has
+    /// no sandbox and no network namespace of its own, so the watcher
+    /// resolves the box's leader as the sole child its shell runs — the
+    /// shape a real container's supervisor gives the resolution — and the
+    /// leader's socket table is the daemon's own, where the listening
+    /// sockets the test binds in its process are the box's.
+    pub(crate) fn and_listen_plan(
+        mut self,
+        listen_plan: crate::net::listeners::ListenPlan,
+    ) -> Self {
+        self.listen_plan = Some(listen_plan);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -4739,8 +4776,19 @@ impl SessionLauncher for MockLauncher {
     ) -> io::Result<Launched<MockProcess, ()>> {
         let pty = Pty::open(sz)?;
 
+        // A launch that carries a listen plan starts a watcher that
+        // resolves its box's leader, and a mock box's leader is the sole
+        // child of its shell — so the script runs one (`sleep`, doing
+        // nothing but holding the shape) beside its echo loop. The child
+        // is never a job-control one — the mock's shell is not interactive
+        // — so it reads no tty and touches no foreground rights.
+        let leader_child = if self.listen_plan.is_some() {
+            "sleep 60 & "
+        } else {
+            ""
+        };
         let script = format!(
-            r#"while read line; do [ "$line" = {MOCK_EXIT_LINE} ] && exit 0; printf 'got:%s\n' "$line"; done"#
+            r#"{leader_child}while read line; do [ "$line" = {MOCK_EXIT_LINE} ] && exit 0; printf 'got:%s\n' "$line"; done"#
         );
         let mut command = std::process::Command::new("/bin/sh");
         command.arg("-c").arg(&script);
@@ -4762,6 +4810,9 @@ impl SessionLauncher for MockLauncher {
             // The mock has no sandbox, so no classifier placed it anywhere.
             leaf: None,
             host_ip_enforcement: self.host_ip_enforcement,
+            // The plan the launch gathered, riding to the host the way a
+            // real launch's plan rides: taken when the host builds.
+            listen_plan: self.listen_plan,
         })
     }
 }
@@ -5073,15 +5124,6 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         // The launcher consumes `name`; the bindings need it too, to name the
         // archives the shell-exit prompt's save-then-delete lane writes.
         let session_name = name.clone();
-        // The staged listen plan this launch may leave (NET-016, NET-017):
-        // this build is that plan's one taker, so it holds the plan's end
-        // too — a build that ends without taking it (a launch that
-        // errored, or an attach abandoned with its launch in flight)
-        // clears the entry as it ends, so an abandoned attach leaves
-        // nothing in the table holding the lease, the address and the
-        // gate its own attach registered. The take below disarms the
-        // guard; the drop clears.
-        let staged_plan = crate::net::listeners::StagedPlanGuard::armed_for(session_id);
         let Launched {
             master,
             process,
@@ -5091,6 +5133,7 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             seal_injection,
             leaf,
             host_ip_enforcement,
+            listen_plan,
         } = launcher
             .launch(
                 crate::guest::is_microvm_daemon(),
@@ -5103,14 +5146,16 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
             .await?;
 
         // The listen-publication watcher (NET-016, NET-017): the plan this
-        // launch staged is the box's whole publication surface — its lease,
-        // the switch's published address, the gvproxy control channel, and
-        // the ingress gate the attach registered. It polls the listening
-        // sockets of the process the launch names the box's leader (whose
-        // `/proc` entry reads the whole box's network namespace) and keeps
-        // the box's published ports in step with them until the session
-        // ends. A box that staged no plan — no lease, no published address —
-        // runs no watcher, and none of its ports is published by listening.
+        // launch gathered is the box's whole publication surface — its
+        // lease, the switch's published address, the gvproxy control
+        // channel, the ingress gate the attach registered, and the
+        // publication set it shares with the runtime expose path. It polls
+        // the listening sockets of the process the launch names the box's
+        // leader (whose `/proc` entry reads the whole box's network
+        // namespace) and keeps the box's published ports in step with them
+        // until the session ends. A launch that carried no plan — no
+        // lease, no published address — starts no watcher, and none of its
+        // ports is published by listening.
         //
         // The leader itself is the watcher's to resolve, not this build's to
         // have resolved: a resolution that fails here — a shell that is
@@ -5120,27 +5165,14 @@ impl<P: SessionProcess, G: SessionGuard> Host<P, G> {
         // PID it holds and the watcher asks on every poll until the box's
         // program is there to be found (the module's nothing-is-one-shot
         // contract, held of its start).
-        //
-        // The take names the spawn this build runs — the container
-        // supervisor the launch handed it — so the plan it reads is the one
-        // its own launch staged: a respawn under the same session id never
-        // reads the spawn before it, whose lease, published address and
-        // gate its attach already tore down.
-        let listen_watcher =
-            crate::net::listeners::take_listen_plan(session_id, process.container_pid()).map(
-                |plan| {
-                    crate::net::listeners::ListenWatcher::start(
-                        plan,
-                        crate::net::listeners::Leader::Pending {
-                            container_pid: process.container_pid(),
-                        },
-                    )
+        let listen_watcher = listen_plan.map(|plan| {
+            crate::net::listeners::ListenWatcher::start(
+                plan,
+                crate::net::listeners::Leader::Pending {
+                    container_pid: process.container_pid(),
                 },
-            );
-        // The plan is the watcher's now — or there never was one — and the
-        // table's entry went with the take, so this build's own end has
-        // nothing left to clear.
-        staged_plan.taken();
+            )
+        });
 
         let (sender, receiver) = mpsc::channel(HOST_MAILBOX_CAPACITY);
         let handle = HostHandle { sender };

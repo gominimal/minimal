@@ -1589,6 +1589,9 @@ impl SessionLauncher for SealingMockLauncher {
             // This mock has no sandbox, so no classifier placed it anywhere.
             leaf: None,
             host_ip_enforcement: None,
+            // No launch this mock stands for gathered a listen plan, so
+            // the host it builds starts no listener watcher.
+            listen_plan: None,
         })
     }
 }
@@ -2544,6 +2547,10 @@ fn launcher_with(
         // same reason — the host's own mount table covers no stand-in tree,
         // so over it every stand-in reads as unconfined.
         classifier_mountinfo: None,
+        // The empty set a launch's publications start from: these launches
+        // run no runtime expose surface and carry no listen plan, so no
+        // publication ever enters it.
+        publications: Default::default(),
     }
 }
 

@@ -68,26 +68,36 @@
 //! connection's life it arrives, so there being no second request to read is
 //! what keeps the gate the only way a frame ever reaches the switch.
 //!
-//! Fail-closed is the posture. A frame whose source address no published
-//! namespace holds is NET-081's failure case, and its fate is the phase
-//! constant's ([`UNREGISTERED_SOURCE_PHASE`]): once the per-box default is in
-//! force it never leaves the VM, whatever the plan could have done with its
-//! address; the interim this build ships admits one class of it — an address
-//! inside the plan's lease block, the set an own-address box's lease is
-//! minted into by the in-VM daemon, which no host-side process can name until
-//! the creator-side registration (T66, #1711) supplies the rows. So the
-//! guarantee "a frame whose source address belongs to no box never leaves the
-//! VM" binds today **outside the plan's lease block only**, and everywhere
-//! the moment T66 flips the constant: under the interim a compromised in-VM
-//! process can still put any in-plan address on the wire, the reach the gate
-//! exists to contain, which is why the interim needs its rows and why every
-//! admit under it warns. The publish half of the gate decides by the same
-//! cutover: under the interim a publish at an in-plan address no row holds is
-//! applied — the reach the guest daemon's own publishes had before the gate
-//! existed — and refused everywhere else, so a compromise in the VM cannot
-//! point a forwarder or a zone name at the plan's infrastructure or anywhere
-//! outside the plan; once the default binds, only a published namespace's
-//! own records publish at all. A frame a published box did not declare is dropped
+//! Fail-closed is the posture, at the frame level unconditionally (NET-085):
+//! a frame whose source address no published namespace holds is NET-081's
+//! failure case, and it never leaves the VM, toward every destination alike —
+//! the baseline set included — whatever the plan could have done with the
+//! address. Two classes of it take two rules, so a host reading its log can
+//! tell them apart: an address outside the plan's lease block is nobody's to
+//! wear and drops under [`UNKNOWN_SOURCE_RULE`], while an address inside the
+//! run the plan hands leases from — the set an own-address box's lease is
+//! minted into by the in-VM daemon's own allocator, which no host-side
+//! process can name until the creator-side registration (T66, #1711)
+//! supplies the rows — drops under [`UNREGISTERED_SOURCE_RULE`], with the
+//! one remedy the host can offer spelled beside it: a source the gate's
+//! ledger holds an applied publish for is a live lease a namespace inside
+//! the VM is holding and serving through ([`PublishedForwards`]), a box
+//! that predates host registration, so its line says to restart it
+//! ([`UNREGISTERED_LIVE_LEASE_RULE`]). The publish half of the gate decides
+//! by the phase constant ([`UNREGISTERED_SOURCE_PHASE`]), which names the
+//! egress default's rollout and nothing at the frame level: under the
+//! announced interim this build ships a publish at an in-plan address no
+//! row holds is applied — the reach the guest daemon's own publishes had
+//! before the gate existed — and refused everywhere else, so a compromise
+//! in the VM cannot point a forwarder or a zone name at the plan's
+//! infrastructure or anywhere outside the plan; once the default binds,
+//! only a published namespace's own records publish at all. That is the
+//! egress default's phase, and its frame half — the gate's handling of a row
+//! with no egress section, an absent section still allowing all — is decided
+//! by the compiled row, so the two halves stay coupled through
+//! [`UnregisteredSourcePhase::into_sessions_phase`] and move together when
+//! T66 flips the constant. A frame a published
+//! box did not declare is dropped
 //! where it stands, silently — a drop is not a reset (NET-062) — with one
 //! rate-limited warn line per source address per rule, so a diagnostic
 //! bundle's daemon log tail carries what the host is dropping and why without
@@ -490,15 +500,30 @@ fn infrastructure_destination(
 /// rules ([`GateAdmit::ProxyLane`]).
 const PROXY_LANE_RULE: &str = "egress-uncredentialed-proxy-destination";
 
-/// The rule name for the interim's admitted-unregistered source: a frame
-/// whose source is an address the plan could hand to a box but no published
-/// namespace holds, admitted by the announced interim
-/// ([`UNREGISTERED_SOURCE_PHASE`]) rather than dropped. It is a rule name —
-/// and a warn, not an info — because this admit is the one frame the gate
-/// passes whose reach no row bounds, and a host running the interim must be
-/// able to see it in the log: the line names T66 (#1711), the creator-side
-/// registration whose rows end the interim.
+/// The rule name for the drop of an in-plan source no published namespace
+/// holds (NET-085): a frame whose source is an address the plan could hand
+/// to a box but no row does. It carries its own rule — beside rule 0's
+/// [`UNKNOWN_SOURCE_RULE`], the out-of-plan class it was folded into while
+/// the announced interim admitted these frames — because the two classes ask
+/// a host reading its log different questions: an out-of-plan source is
+/// nobody's to wear, while an in-plan one is a lease the guest daemon's own
+/// allocator could have minted — an own-address box's, or a task sandbox's —
+/// whose row the creator-side registration (T66, #1711) is the only thing
+/// that ever publishes. A warn, not an info, because the drop is the gate's
+/// containment working and a host must be able to see it in the log.
 const UNREGISTERED_SOURCE_RULE: &str = "egress-unregistered-source";
+
+/// The rule name for the drop of a live lease on the switch no published
+/// namespace holds: an address the gate's own ledger ([`PublishedForwards`])
+/// carries an applied publish for — a forwarder gvproxy holds for it, the
+/// one host-observable fact that a namespace inside the VM holds the lease
+/// and is serving through it — while no row names the box. Its line is the
+/// one drop the gate can name a remedy for: the box predates host
+/// registration, so restarting it registers it, and the line says so beside
+/// the lease it names. The publish informs the line and nothing else — the
+/// gate never registers a box from what the guest says it holds — so the
+/// frame drops exactly as the generic rule's does, whatever the line.
+const UNREGISTERED_LIVE_LEASE_RULE: &str = "egress-unregistered-live-lease";
 
 /// The rule name for a request head the gate refuses to relay. Three shapes
 /// share it: a request-target outside the gate's allow-list — gvproxy's
@@ -805,9 +830,10 @@ impl EgressGate {
     /// port at; a stale socket file from a previous run must be removed by the
     /// caller first, or the bind fails.
     ///
-    /// The unregistered-source phase is the build's own
-    /// ([`UNREGISTERED_SOURCE_PHASE`]) — no production caller chooses it. A
-    /// test that needs the phase's other arm builds its gate with
+    /// The egress default's phase is the build's own
+    /// ([`UNREGISTERED_SOURCE_PHASE`]) — no production caller chooses it, and
+    /// it decides the publish half alone. A test that needs the phase's other
+    /// arm builds its gate with
     /// [`spawn_with_phase`](Self::spawn_with_phase), which is also where the
     /// real work is.
     ///
@@ -836,13 +862,14 @@ impl EgressGate {
         )
     }
 
-    /// [`spawn`](Self::spawn) with the unregistered-source phase named: the
+    /// [`spawn`](Self::spawn) with the egress default's phase named: the
     /// parameter that lets a test build the gate under the phase's other arm
     /// ([`UnregisteredSourcePhase::InForce`], the one T66, #1711, flips the
-    /// shipped constant onto) and pin the per-box default at relay level, so
-    /// the flip has behaviour to turn green rather than tests to rewrite. The
-    /// relay threads the phase down to [`gate_verdict`]; the start-up line
-    /// logs the phase the gate was actually built with.
+    /// shipped constant onto) and pin the publish decision's in-force arm at
+    /// relay level, so the flip has behaviour to turn green rather than tests
+    /// to rewrite. The frame half needs no phase from here: the drop of an
+    /// unregistered source is unconditional ([`gate_verdict`] reads no phase),
+    /// and the start-up line logs the phase the gate was actually built with.
     ///
     /// `replies` is the gate's own reply-flow table (NET-040's answer half)
     /// beside the DNS admission table: one shared per-box table of the
@@ -868,14 +895,18 @@ impl EgressGate {
         phase: UnregisteredSourcePhase,
     ) -> io::Result<Self> {
         let listener = UnixListener::bind(&gate_sock)?;
-        // The posture for in-plan sources no row holds, stated at the moment
-        // the gate starts, is the closest this host process comes to surfacing
-        // the interim at all: the warns below say it again, once per source
-        // per interval, for as long as any box's frames pass under it.
+        // The two postures the gate starts under, named as the two fields they
+        // are and never one combined string, so a bundle's reader reads each
+        // off the one line every boot writes: the frame-level drop of a source
+        // no row holds — unconditional (NET-085), no phase gates it, and the
+        // warns below say it again once per source per interval — and the
+        // egress default's phase, which decides the publish half and a row
+        // with no egress section, never a frame's source.
         tracing::info!(
             gate_socket = %gate_sock.display(),
             switch_socket = %switch_sock.display(),
-            unregistered_in_plan_sources = phase.as_str(),
+            unregistered_sources = "dropped",
+            undeclared_box_default = phase.as_str(),
             "host-side egress gate listening",
         );
         // The node-plane baseline set the gate decides the in-VM daemon's own
@@ -1220,7 +1251,6 @@ async fn serve_connection(
                 baseline,
                 limiter,
                 forwards,
-                phase,
             )
             .await;
         }
@@ -1272,8 +1302,8 @@ fn refuse_head(limiter: &DropLimiter, refused: &RefusedHead) {
     clippy::too_many_arguments,
     reason = "the relay's full state in one place: both directions' halves, the \
               deciding table, the DNS admission table, the reply-flow tables and the \
-              node-plane baseline set, the limiter, the publish ledger, and the phase — \
-              splitting it would hide one of them"
+              node-plane baseline set, the limiter and the publish ledger — splitting \
+              it would hide one of them"
 )]
 async fn relay_frames(
     guest: Prefixed<OwnedReadHalf>,
@@ -1286,7 +1316,6 @@ async fn relay_frames(
     baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
     forwards: Arc<PublishedForwards>,
-    phase: UnregisteredSourcePhase,
 ) {
     let mut ingress = tokio::spawn(relay_switch_frames_to_guest(
         switch_rx,
@@ -1295,10 +1324,10 @@ async fn relay_frames(
         pins.clone(),
         replies.clone(),
         Arc::clone(&limiter),
-        forwards,
+        Arc::clone(&forwards),
     ));
     let egress = relay_guest_to_switch(
-        guest, switch_tx, table, pins, replies, baseline, limiter, phase,
+        guest, switch_tx, table, pins, replies, baseline, limiter, &forwards,
     );
     tokio::pin!(egress);
     // The two legs race, because neither can see the other's end. The egress
@@ -1487,6 +1516,10 @@ async fn relay_control(
         // The interim's admission is the one publish the gate applies whose
         // reach no row bounds, and the host must be able to see it pass.
         warn_interim_publish(&limiter, &decision);
+        // And the lease it named is one the guest daemon vouched for while
+        // no row held it, whatever the request published: the fact the
+        // live-lease drop line reads ([`PublishedForwards::lease_live_at`]).
+        forwards.note_vouched(decision.request.switch_addr());
     }
     // The applied request is filed with the publish ledger: a forwarder's
     // listener and the address its publish was applied at are what a later
@@ -1783,6 +1816,11 @@ struct ControlDecision {
 #[derive(Debug, Default)]
 struct PublishedForwards {
     applied: Mutex<Vec<AppliedPublish>>,
+    /// The rowless addresses an applied switch request named as the box's
+    /// own — a port publish, a zone name, a retraction alike — oldest first,
+    /// bounded at [`LEASES_VOUCHED_TRACKED`]. Each is a lease the guest
+    /// daemon vouched for while no row held it ([`Self::lease_live_at`]).
+    vouched: Mutex<Vec<[u8; 4]>>,
 }
 
 /// A forwarder listener: its loopback address and port.
@@ -1795,11 +1833,15 @@ type AppliedPublish = (Listener, [u8; 4], u16, u8);
 /// How many applied publishes' attributions the ledger keeps.
 const PUBLISHED_FORWARDS_TRACKED: usize = 1024;
 
+/// How many vouched rowless leases the ledger keeps.
+const LEASES_VOUCHED_TRACKED: usize = 1024;
+
 impl PublishedForwards {
     /// A ledger with no applied publishes in it.
     fn new() -> Self {
         Self {
             applied: Mutex::new(Vec::new()),
+            vouched: Mutex::new(Vec::new()),
         }
     }
 
@@ -1871,6 +1913,49 @@ impl PublishedForwards {
         self.lock()
             .iter()
             .any(|(_, at, port, p)| *at == addr && *port == inside && *p == proto)
+    }
+
+    /// Notes a rowless address an applied switch request named as the
+    /// box's own: the interim applied it, so the guest daemon vouched for
+    /// the lease while no row held it. Whatever the request carried — a
+    /// port publish, a zone name, a retraction — counts the same.
+    fn note_vouched(&self, addr: [u8; 4]) {
+        let mut vouched = self
+            .vouched
+            .lock()
+            .expect("the vouched set's lock is held only across a lookup or an update");
+        if vouched.contains(&addr) {
+            return;
+        }
+        if vouched.len() >= LEASES_VOUCHED_TRACKED {
+            vouched.remove(0);
+        }
+        vouched.push(addr);
+    }
+
+    /// Whether `addr` is a live guest lease: an applied switch request
+    /// named it as a box's own, whatever it published — a rowless address
+    /// the interim applied a port publish, a zone name or a retraction at,
+    /// or one an applied publish still stands at. This is the
+    /// host-observable fact that a live namespace holds the address, and
+    /// the only one: an ARP claim the guest sends for it is itself a frame
+    /// from a source no row holds, so it never reaches the switch to make a
+    /// lease live there. A lease that has spoken no switch request at all is
+    /// indistinguishable at the gate from a made-up one. The one drop line
+    /// it informs is the unregistered source's
+    /// ([`DropLimiter::warn_live_lease`]): a frame from such an address is
+    /// a live lease no published namespace holds — its box predates host
+    /// registration (T66, #1711) — and the line says so instead of the
+    /// generic one. It informs the line only, never the verdict: the frame
+    /// drops either way, and the gate registers no box from what the guest
+    /// says it holds.
+    fn lease_live_at(&self, addr: [u8; 4]) -> bool {
+        let vouched = self
+            .vouched
+            .lock()
+            .expect("the vouched set's lock is held only across a lookup or an update")
+            .contains(&addr);
+        vouched || self.lock().iter().any(|(_, at, _, _)| *at == addr)
     }
 
     fn lock(&self) -> MutexGuard<'_, Vec<AppliedPublish>> {
@@ -2600,12 +2685,13 @@ async fn relay_guest_to_switch(
     replies: ReplyTables,
     baseline: NodePlaneBaseline,
     limiter: Arc<DropLimiter>,
-    phase: UnregisteredSourcePhase,
+    forwards: &PublishedForwards,
 ) -> io::Result<()> {
     // Every admitted frame's source, deduplicated: the attribution this
-    // relay files at its end. Bounded by the plan — a lease run is 254
-    // addresses wide and the interim admits only inside it — so the vector
-    // is bounded by the plan, not by what a guest could push through it.
+    // relay files at its end. Bounded by the table, not by the guest — only
+    // a row the registry holds admits a frame now, the node's own address
+    // excepted out below, so the vector is bounded by the rows, never by
+    // what a guest could push through it.
     let mut attributed: Vec<[u8; 4]> = Vec::new();
     let outcome = relay_frames_to_switch(
         &mut guest,
@@ -2615,7 +2701,7 @@ async fn relay_guest_to_switch(
         &replies,
         &baseline,
         &limiter,
-        phase,
+        forwards,
         &mut attributed,
     )
     .await;
@@ -2660,9 +2746,9 @@ async fn relay_guest_to_switch(
 #[expect(
     clippy::too_many_arguments,
     reason = "the two socket halves, the table, the DNS admission table, the reply-flow \
-              tables, the baseline, the limiter, the phase and the attribution are each a \
-              distinct input to every frame the loop decides; grouping them would name the \
-              bundle without naming the members"
+              tables, the baseline, the limiter, the publish ledger and the attribution \
+              are each a distinct input to every frame the loop decides; grouping them \
+              would name the bundle without naming the members"
 )]
 async fn relay_frames_to_switch(
     guest: &mut Prefixed<OwnedReadHalf>,
@@ -2672,7 +2758,7 @@ async fn relay_frames_to_switch(
     replies: &ReplyTables,
     baseline: &NodePlaneBaseline,
     limiter: &DropLimiter,
-    phase: UnregisteredSourcePhase,
+    forwards: &PublishedForwards,
     attributed: &mut Vec<[u8; 4]>,
 ) -> io::Result<()> {
     let mut len_buf = [0u8; 2];
@@ -2711,55 +2797,80 @@ async fn relay_frames_to_switch(
         // the table's parse supplies them — the same allocation-free,
         // bounds-checked read the in-VM relay's is.
         let l4 = dns_pins::parse_ipv4_l4(&frame[..n]);
-        let admitted =
-            match gate_verdict(&summary, l4.as_ref(), table, baseline, pins, replies, phase) {
-                Ok(admitted) => admitted,
-                Err(GateDrop::SwitchControlSurface { src, dst_port }) => {
-                    limiter.warn_switch_surface(src, dst_port);
-                    continue;
+        let admitted = match gate_verdict(&summary, l4.as_ref(), table, baseline, pins, replies) {
+            Ok(admitted) => admitted,
+            Err(GateDrop::SwitchControlSurface { src, dst_port }) => {
+                limiter.warn_switch_surface(src, dst_port);
+                continue;
+            }
+            Err(GateDrop::Infrastructure { src, dst, dst_port }) => {
+                limiter.warn_infrastructure(src, dst, dst_port);
+                continue;
+            }
+            Err(GateDrop::ProxyLane { src, dst, dst_port }) => {
+                // The plan's diagnostics line wants the refusal to name the
+                // box, not only its address: the row the frame's source
+                // resolved to carries the name, when one did. The binding
+                // keeps the row alive for the borrow — and with no row, the
+                // address the line already names is all the identity there
+                // is.
+                let record = table.by_source(src);
+                let name = record.as_deref().map(BoxRecord::name);
+                limiter.warn_proxy_lane(src, dst, dst_port, name);
+                continue;
+            }
+            Err(GateDrop::UnregisteredSource { src }) => {
+                // The one drop whose line the gate's own ledger can point a
+                // host at a remedy through: an applied switch request that
+                // named the address — a port publish or only a zone name — is
+                // the host-observable fact that a live namespace holds the
+                // lease — the box predates host registration, so its line
+                // says to restart it. A source no request named takes the
+                // generic line, and both drop the frame exactly the same
+                // way: the request informs the line, never the verdict,
+                // and the gate registers no box from what the guest says it
+                // holds.
+                if forwards.lease_live_at(src) {
+                    limiter.warn_live_lease(src);
+                } else {
+                    limiter.warn_unregistered(src);
                 }
-                Err(GateDrop::Infrastructure { src, dst, dst_port }) => {
-                    limiter.warn_infrastructure(src, dst, dst_port);
-                    continue;
-                }
-                Err(GateDrop::ProxyLane { src, dst, dst_port }) => {
-                    // The plan's diagnostics line wants the refusal to name the
-                    // box, not only its address: the row the frame's source
-                    // resolved to carries the name, when one did. The binding
-                    // keeps the row alive for the borrow — and with no row, the
-                    // interim-admitted source this is, the address the line
-                    // already names is all the identity there is.
-                    let record = table.by_source(src);
-                    let name = record.as_deref().map(BoxRecord::name);
-                    limiter.warn_proxy_lane(src, dst, dst_port, name);
-                    continue;
-                }
-                Err(dropped) => {
-                    limiter.emit(summary.source(), dropped.rule());
-                    continue;
-                }
-            };
-        // The interim's admit is the one admission that owes a line: no row
-        // bounded this frame, and the host must be able to see that it passed.
-        if let GateAdmit::Unregistered { src } = admitted {
-            limiter.warn_unregistered(src);
-        }
+                continue;
+            }
+            Err(GateDrop::Verdict(reason @ DropReason::UndeclaredSubnet { dst, .. })) => {
+                // The row's own rules refused the destination, and the line
+                // names it beside the source and the rule: the destination
+                // address and the port the frame gave it, read off the frame
+                // the reason's own shape refuses — so a bundle's reader learns
+                // which reach was refused without cross-reading the rows.
+                limiter.warn_undeclared_subnet(
+                    summary.source(),
+                    dst,
+                    summary.destination_port(),
+                    reason.rule(),
+                );
+                continue;
+            }
+            Err(dropped) => {
+                limiter.emit(summary.source(), dropped.rule());
+                continue;
+            }
+        };
         // Whatever admitted the frame — the baseline set, a row's own rules
-        // or the interim — the address it came from was live traffic on this
-        // connection, and this connection's end retires it. The node plane's
-        // own address is the one exception: the row that decides its frames
-        // is the host's own registration for the VM's lifetime
+        // or a declared lane — the address it came from was live traffic on
+        // this connection, and this connection's end retires it. The node
+        // plane's own address is the one exception: the row that decides its
+        // frames is the host's own registration for the VM's lifetime
         // ([`BoxRegistry::register_node_namespace`], filed once at boot),
         // not a box's row that goes with its shuttle connection (NET-133),
-        // and nothing would ever give the address its reach back — the
-        // announced interim reaches lease-run addresses only, and the plan
-        // keeps the node's address outside that run. So the drainer must
-        // never see it: one relay's end retiring the node's row would leave
-        // the daemon frameless and unpublishable for the rest of the VM's
-        // life, over a shuttle close its control path rode out.
+        // and nothing would ever give the address its reach back — the plan
+        // keeps the node's address outside the lease run the gate drops
+        // unregistered sources in. So the drainer must never see it: one
+        // relay's end retiring the node's row would leave the daemon
+        // frameless and unpublishable for the rest of the VM's life, over a
+        // shuttle close its control path rode out.
         let src = match admitted {
             GateAdmit::Baseline | GateAdmit::Row | GateAdmit::ProxyLane => summary.source(),
-            GateAdmit::Unregistered { src } => Some(src),
         };
         if let Some(src) = src
             && src != baseline.node_addr()
@@ -2791,50 +2902,43 @@ async fn relay_frames_to_switch(
     }
 }
 
-/// The phase the per-box default for unregistered sources is at — the same
-/// cutover shape the guest's own egress-default rollout
+/// The phase the egress default's rollout is at — the same cutover shape the
+/// guest's own egress-default rollout
 /// ([`sessions::EGRESS_DEFAULT_PHASE`]) models: a named phase, read by the
 /// decision, flipped by one constant.
 ///
-/// NET-081's per-box rules are decided by rows the host-side creator supplies
-/// (design §7.1: facts delivered before a box's first connection, withdrawn at
-/// box end) — and no creator supplies them yet. The registration path that
-/// carries a client's box declarations into the host table is T66's (#1711),
-/// and the lease an own-address box holds is minted *inside* the VM, by the
-/// guest daemon's own allocator, so until that lands no host-side process can
-/// name a box's address. An own-address box's lease is, today, a source no
-/// row holds.
+/// Two postures this module carries, one unconditional and one phased, and
+/// the phase governs only the second: the frame-level drop of a source no row
+/// holds is unconditional (NET-085, T89 #1925) — no phase reaches
+/// [`gate_verdict`], so a source the table does not publish never leaves the
+/// VM whatever this constant says — while a box's *declared* egress is the
+/// phased thing: an undeclared own-address box's default, the gate's handling
+/// of a row with no egress section (an absent section still allows all while
+/// announced) and the publish decision a control request is decided by
+/// through [`Self::into_sessions_phase`], are both the egress default's, and
+/// the two halves read this one constant so neither can drift ahead of the
+/// other. T66 (#1711) — the creator-side registration that supplies each
+/// box's row before its first frame — is the change that flips it.
 ///
-/// [`UnregisteredSourcePhase::InForce`] is the conforming default: no row, no
-/// egress — NET-081's failure case, held to every address the table does not
-/// publish. [`UnregisteredSourcePhase::Announced`] is the interim that keeps
-/// those boxes on the wire in the meantime: a source inside the plan's lease
-/// block is admitted — the reach the box had before the gate existed, which
-/// the in-guest relay still bounds by the box's own declared rules — and every
-/// admit says so, rate-limited, naming T66. Sources outside the lease block
-/// are rule 0's under either phase: the plan never hands them out, so no row
-/// will ever hold them, and they are refused before any interim is consulted.
-///
-/// Two bounds the interim's admits carry, the same for as long as the
-/// announced arm is shipped: the phase is read once per build — one constant,
-/// [`UNREGISTERED_SOURCE_PHASE`] — and never changes while a VM runs, so a
-/// flip is the next release's boot and a bundle's logs read one posture per
-/// daemon lifetime; and the interim admits lease-run addresses only — the
-/// plan's ptask lease run is what in-plan means — never the node plane's own
-/// address and never the plan's reserved pair, the infrastructure the plan
-/// keeps for itself, which no lease run hands out and which are refused under
-/// either phase.
+/// The named half it still governs: under [`UnregisteredSourcePhase::Announced`],
+/// the arm this build ships, a publish at an in-plan address no row holds is
+/// applied as the interim's — the teardowns of publications whose rows are
+/// still to come are the ones that must work — while
+/// [`UnregisteredSourcePhase::InForce`] binds the deny-all default: only a
+/// published namespace's own records publish at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnregisteredSourcePhase {
-    /// The per-box default is announced, not yet binding: an unregistered
-    /// source inside the plan's lease block is admitted under the shipped
-    /// allow-all default, and every admit warns, naming T66 (#1711).
+    /// The coming default is announced, not yet binding: an undeclared box's
+    /// absent egress section still allows all, and a publish at an in-plan
+    /// address no row holds is applied under the interim, named on its own
+    /// rate-limited line.
     Announced,
-    /// The per-box default binds: a source no row holds is dropped, whatever
-    /// the plan could have done with its address.
+    /// The default binds: a row with no egress section reaches nothing
+    /// outside itself, and only a published namespace's own records
+    /// publish.
     ///
     /// Constructed today only by the tests that pin the phase's other arm —
-    /// the pure decision below, and the relay-level gate built with
+    /// the publish decision's, and the relay-level gate built with
     /// [`EgressGate::spawn_with_phase`] — the arm T66 (#1711) flips
     /// [`UNREGISTERED_SOURCE_PHASE`] onto, which is when this expectation goes
     /// unfulfilled and asks for its removal. After that flip the dead variant
@@ -2854,20 +2958,22 @@ pub(crate) enum UnregisteredSourcePhase {
 }
 
 impl UnregisteredSourcePhase {
-    /// The phase as the value the gate's start-up line logs: a host reads its
-    /// own posture off the one line every boot writes, so a host running the
-    /// interim can tell it is.
+    /// The phase as the value the gate's start-up line logs under
+    /// `undeclared_box_default`: a host reads the egress default's own
+    /// posture off the one line every boot writes, beside the unconditional
+    /// `unregistered_sources` field, so a host running the interim can tell
+    /// it is.
     fn as_str(self) -> &'static str {
         match self {
-            Self::Announced => "admitted-in-plan (per-box with T66, #1711)",
-            Self::InForce => "dropped (per-box default in force)",
+            Self::Announced => "announced",
+            Self::InForce => "in force",
         }
     }
 
     /// The same cutover, as the pure publish decision's own phase shape
-    /// ([`EgressDefaultPhase`]): the frame half and the publish half read
-    /// one phase, so T66's flip of [`UNREGISTERED_SOURCE_PHASE`] moves both
-    /// at once and neither can drift ahead of the other.
+    /// ([`EgressDefaultPhase`]): the publish half and the undeclared-row
+    /// half read one phase, so T66's flip of [`UNREGISTERED_SOURCE_PHASE`]
+    /// moves both at once and neither can drift ahead of the other.
     fn into_sessions_phase(self) -> EgressDefaultPhase {
         match self {
             Self::Announced => EgressDefaultPhase::Announced,
@@ -2879,24 +2985,26 @@ impl UnregisteredSourcePhase {
 /// The phase this build ships: announced, because the rows the default needs
 /// are not here to bind to. T66 (#1711) — the creator-side registration that
 /// supplies each box's row before its first frame — is the change that flips
-/// this constant, and this constant is the whole cutover: the decision reads
-/// it ([`gate_verdict`]), the start-up line logs it, and the tests pin both of
-/// its arms, so the flip is one line and nothing else. Two things the flip
-/// does not touch: what production can build — a production caller reaches
+/// this constant, and this constant is the whole cutover: the publish
+/// decision reads it
+/// ([`UnregisteredSourcePhase::into_sessions_phase`]), the start-up line logs
+/// it, and the tests pin both of its arms, so the flip is one line and
+/// nothing else. Three things the flip does not touch: the frame-level drop
+/// of an unregistered source, which reads no phase at all (NET-085, T89
+/// #1925); what production can build — a production caller reaches
 /// [`EgressGate::spawn`] and no other constructor, so the phase a shipped
-/// gate runs is the phase this build ships — and the relay-level test that
-/// pins the in-force arm through [`EgressGate::spawn_with_phase`], which is
-/// green before the flip and proves the shipped gate's default-deny after it,
-/// so T66's flip has its proof already standing rather than tests to rewrite.
+/// gate runs is the phase this build ships — and the relay-level tests that
+/// pin the in-force arm's publishes through [`EgressGate::spawn_with_phase`],
+/// which are green before the flip and stay green after it, so T66's flip
+/// has its proofs already standing rather than tests to rewrite.
 pub(crate) const UNREGISTERED_SOURCE_PHASE: UnregisteredSourcePhase =
     UnregisteredSourcePhase::Announced;
 
-/// What the gate decided one frame's admission by: which of the four ways in —
-/// the node-plane baseline set, a published namespace's own rules, a row's
-/// declared credentialed lane, or the announced interim's default for a source
-/// the plan could have leased but no row holds. The relay that feeds on this
-/// distinguishes the interim's admit for the one thing only it needs: a line
-/// that says it happened.
+/// What the gate decided one frame's admission by: which of the three ways in
+/// — the node-plane baseline set, a published namespace's own rules, or a
+/// row's declared credentialed lane. A source the plan could have leased but
+/// no row holds is none of these: it is dropped, unconditionally (NET-085),
+/// and the relay says so on its own line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateAdmit {
     /// The node-plane baseline's compiled set admitted the frame: its source
@@ -2917,14 +3025,6 @@ enum GateAdmit {
     /// decided by the reply-flow table ([`ReplyTables`]) ahead of every rule
     /// the row holds.
     Row,
-    /// The announced interim admitted the frame: its source is an address the
-    /// plan could hand to a box but no published namespace holds, so no rules
-    /// were consulted and no lease was checked. The relay warns, naming T66
-    /// (#1711), and writes the frame on.
-    Unregistered {
-        /// The source address no row holds.
-        src: [u8; 4],
-    },
     /// The frame named the Box Egress Proxy's listener — TCP to
     /// `bep_host::PROXY_PORT` at the proxy's address — and the source's row
     /// declared a credentialed upstream (NET-134): the one admission the
@@ -3401,12 +3501,12 @@ fn reply_tuple_of(pkt: &dns_pins::L4Packet) -> egress::FlowTuple {
 /// is refused under [`PROXY_LANE_RULE`], whatever the source: a row that
 /// declared no upstream, a row that declared the lane but sent another
 /// port or another protocol, neither of which the declaration ever opened,
-/// an interim-admitted source with no row at all, and the node plane's
-/// baseline set, which holds the address for no category. The lane arm sits
-/// after the attribution on purpose: it reads the row the frame's source
-/// resolved to, so a frame wearing a source the table does not hold is the
-/// unknown-source refusal's, and a frame to the listener from an address no
-/// row owns never rides a lane it never declared.
+/// and the node plane's baseline set, which holds the address for no
+/// category. The lane arm sits after the attribution on purpose: it reads
+/// the row the frame's source resolved to, so a frame wearing a source the
+/// table does not hold is one of the two source refusals', and a frame to
+/// the listener from an address no row owns never rides a lane it never
+/// declared.
 fn gate_verdict(
     summary: &FrameSummary,
     l4: Option<&dns_pins::L4Packet>,
@@ -3414,7 +3514,6 @@ fn gate_verdict(
     baseline: &NodePlaneBaseline,
     pins: &dns_pins::DnsPins,
     replies: &ReplyTables,
-    phase: UnregisteredSourcePhase,
 ) -> Result<GateAdmit, GateDrop> {
     let Some(src) = summary.source() else {
         return Err(GateDrop::Verdict(family_drop(summary.family())));
@@ -3451,23 +3550,23 @@ fn gate_verdict(
     // box's egress rules decide (design §4.1, §7.1). Every frame from a box
     // to the gateway — the address the resolver answers at, and the one
     // gvproxy's API listens on — is refused unless it is TCP or UDP to the
-    // resolver's port, whatever the rows and the phase would say about the
-    // rest of the frame: any other port, and any other protocol (ICMP has no
+    // resolver's port, whatever the rows would say about the rest of the
+    // frame: any other port, and any other protocol (ICMP has no
     // port to carve out by), points at the switch itself. A row's admitted
     // ports are no exception — they are the box's own ingress, what others
     // reach on the box's address through the switch's forwarders, and no
     // box-to-gateway flow at them exists. The check sits before the row's
-    // decision and before the interim, so no allow-all row and no announced
-    // concession can admit a frame at the switch's own address, and it reads
-    // no phase at all, so it binds unchanged when the per-box default binds.
+    // decision, so no allow-all row can admit a frame at the switch's own
+    // address, and it reads no phase at all, so it binds unchanged whatever
+    // the egress default's rollout does.
     // The one frame this check never sees is the reply the record above
     // admitted: a forwarder's dial arrives at the box from the switch's own
     // address, so the box's answer to it names the gateway — and that
     // answer, the exact reverse of a flow this gate delivered toward the
     // box's published port, is not a reach for the control surface but the
     // half of a connection the host itself opened. The resolver carve-out
-    // falls through to the decision behind this check — the row's own rules
-    // or the phase — which still decides it, so the carve-out admits
+    // falls through to the decision behind this check — the row's own
+    // rules — which still decides it, so the carve-out admits
     // exactly what it admitted before, and the refusal adds a ceiling
     // without moving any floor.
     if summary.destination() == Some(table.gateway()) {
@@ -3480,19 +3579,31 @@ fn gate_verdict(
             return Err(GateDrop::SwitchControlSurface { src, dst_port });
         }
     }
-    // No namespace holds the source. Inside the plan's lease block the
-    // announced interim admits it — an own-address box's lease is minted
-    // inside the VM, and the creator-side registration that will publish its
-    // row (T66, #1711) is the only thing that ever will — and the relay says
-    // so on every admit. Outside that block, or once the default binds,
-    // NET-081's failure case: an address no namespace holds never leaves the
-    // VM.
-    let record = table.by_source(src);
-    if record.is_none()
-        && !(phase == UnregisteredSourcePhase::Announced && table.is_allocatable(src))
-    {
-        return Err(GateDrop::UnknownSource { src });
-    }
+    // No namespace holds the source — NET-081's failure case, held
+    // unconditionally, under no phase (NET-085, T89 #1925): an address no
+    // namespace holds never leaves the VM, toward every destination alike,
+    // the baseline set included, because nothing on the host bounds the
+    // reach a frame from it would carry. Two classes, two rules, so a host
+    // reading its log can tell them apart: an address outside the plan's
+    // lease block is nobody's to wear — the plan never hands one out, so no
+    // row will ever hold it — and stays rule 0's
+    // ([`UNKNOWN_SOURCE_RULE`]); an address inside the run the plan hands
+    // leases from is a lease the guest daemon's own allocator could have
+    // minted — an own-address box's, whose row the creator-side registration
+    // (T66, #1711) is the only thing that ever publishes, or a task
+    // sandbox's, or an escapee's made-up one — and drops under its own rule
+    // ([`UNREGISTERED_SOURCE_RULE`]), whose line can even name the remedy
+    // when an applied switch request named the address as a box's own
+    // ([`PublishedForwards::lease_live_at`], a live lease whose box
+    // predates host registration). The relay picks the line; the drop is
+    // the same either way, and no phase the gate was built under reaches it.
+    let record = match table.by_source(src) {
+        Some(record) => record,
+        None if table.is_allocatable(src) => {
+            return Err(GateDrop::UnregisteredSource { src });
+        }
+        None => return Err(GateDrop::UnknownSource { src }),
+    };
     // The infrastructure deny set, decided for every row before the row's
     // own rules (design §5.3, NET-067): the host and the fabric, not
     // destinations — link-local and the metadata services in it, loopback,
@@ -3502,16 +3613,12 @@ fn gate_verdict(
     // row's `0.0.0.0/0` included, the CIDR-admitted direct-IP flow the set
     // names — and so that the pin arm below never sees it: an undeclared
     // destination inside the set is this drop, and no answer resolving into
-    // it ever becomes a pin. A source the announced interim admits without a
-    // row takes it too, as allow-all for RFC 1918 space: the set applies to
-    // every box-plane packet, and the interim concedes a row's absence, not
-    // the fabric.
+    // it ever becomes a pin. Only a row the registry holds reaches this arm
+    // now — the source check above returns before any other source — so the
+    // set applies to every box-plane packet, and no row's rules concede the
+    // fabric.
     if let Some(dst) = summary.destination()
-        && infrastructure_destination(
-            dst,
-            table.subnet(),
-            record.as_ref().and_then(|row| row.egress().allow_subnets()),
-        )
+        && infrastructure_destination(dst, table.subnet(), record.egress().allow_subnets())
     {
         return Err(GateDrop::Infrastructure {
             src,
@@ -3543,10 +3650,9 @@ fn gate_verdict(
     // rules would have allowed at the address: a declared allowance is not
     // a lane, the same way a `0.0.0.0/0` row admits no metadata service),
     // a row that declared the lane but sent another port or another
-    // protocol, neither of which the declaration ever opened, an interim
-    // source the announced phase admits without a row, which concedes a
-    // row's absence, never the fabric, and the node row under the interim
-    // baseline, which is the allow-all the in-force enumeration replaces.
+    // protocol, neither of which the declaration ever opened, and the node
+    // row under the announced baseline, which is the allow-all the in-force
+    // enumeration replaces.
     // The in-force baseline set needs no arm of its own: it never admits
     // the address for any category, so its compiled rules refuse the frame
     // where they refuse any undeclared destination.
@@ -3556,26 +3662,15 @@ fn gate_verdict(
         // minvmd is the one crate that sees both spellings of the listener's port.
         const _: () = assert!(egress::PROXY_LISTENER_PORT == switch::bep_host::PROXY_PORT);
         let listener = egress::ProxyListener::at(dst);
-        return match record.as_ref() {
-            Some(row)
-                if egress::proxy_lane_admits(
-                    row.declares_credentialed_upstream(),
-                    listener,
-                    summary,
-                ) =>
-            {
-                Ok(GateAdmit::ProxyLane)
-            }
-            _ => Err(GateDrop::ProxyLane {
-                src,
-                dst,
-                dst_port: summary.destination_port(),
-            }),
-        };
+        if egress::proxy_lane_admits(record.declares_credentialed_upstream(), listener, summary) {
+            return Ok(GateAdmit::ProxyLane);
+        }
+        return Err(GateDrop::ProxyLane {
+            src,
+            dst,
+            dst_port: summary.destination_port(),
+        });
     }
-    let Some(record) = record else {
-        return Ok(GateAdmit::Unregistered { src });
-    };
     // The namespace that holds the source decides its frames by its own
     // compiled rules — the shared verdict, unchanged, now made outside where
     // nothing inside can change it. One drop class the address rules cannot
@@ -3614,18 +3709,36 @@ fn gate_verdict(
 }
 
 /// Why the gate dropped a frame: the shared verdict's reason, or one of the
-/// four classes the host table adds — a source address no published
-/// namespace holds (NET-081's failure case), a frame the switch's own address
-/// would have received on a port nothing published answers, a frame headed
-/// into the infrastructure deny set, and a frame headed to the Box Egress
-/// Proxy's address the lane does not admit (NET-134).
+/// five classes the host table adds — a source address outside the plan's
+/// lease block that no published namespace could ever hold (NET-081's
+/// failure case), a source address inside the block no published namespace
+/// holds (NET-085), a frame the switch's own address would have received on
+/// a port nothing published answers, a frame headed into the infrastructure
+/// deny set, and a frame headed to the Box Egress Proxy's address the lane
+/// does not admit (NET-134).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateDrop {
     /// The shared frame verdict dropped it: the namespace's own rules, its
     /// lease check, or its family.
     Verdict(DropReason),
-    /// The frame's source address belongs to no published namespace.
+    /// The frame's source address belongs to no published namespace, and the
+    /// plan never hands one out either: outside the run its address plan
+    /// allocates leases from, so no row will ever be keyed by it
+    /// ([`UNKNOWN_SOURCE_RULE`], rule 0's).
     UnknownSource {
+        /// The source address no namespace holds.
+        src: [u8; 4],
+    },
+    /// The frame's source address belongs to no published namespace but sits
+    /// inside the run the plan allocates PTask leases from (NET-085): a lease
+    /// the guest daemon's own allocator could have minted — an own-address
+    /// box's, a task sandbox's, an escapee's made-up one — whose row the
+    /// creator-side registration (T66, #1711) is the only thing that ever
+    /// publishes. Dropped unconditionally, toward every destination, the
+    /// baseline set included, whatever the egress default's phase
+    /// ([`UNREGISTERED_SOURCE_RULE`]; a live lease at the address drops under
+    /// [`UNREGISTERED_LIVE_LEASE_RULE`] instead).
+    UnregisteredSource {
         /// The source address no namespace holds.
         src: [u8; 4],
     },
@@ -3653,8 +3766,8 @@ enum GateDrop {
     /// admit it (NET-134): its source carries no credentialed lane, or the
     /// frame is headed somewhere at the address the declaration never
     /// opened — another port, another protocol. The listener alone is the
-    /// lane's own, and it is not a destination any rules — rows', the
-    /// interim's, or the baseline set's — admit without one
+    /// lane's own, and it is not a destination any rules — rows' or the
+    /// baseline set's — admit without one
     /// ([`PROXY_LANE_RULE`]).
     ProxyLane {
         /// The source address the frame wore.
@@ -3674,6 +3787,7 @@ impl GateDrop {
             Self::Verdict(reason) => reason.rule(),
             Self::Infrastructure { .. } => INFRASTRUCTURE_RULE,
             Self::UnknownSource { .. } => UNKNOWN_SOURCE_RULE,
+            Self::UnregisteredSource { .. } => UNREGISTERED_SOURCE_RULE,
             Self::SwitchControlSurface { .. } => SWITCH_CONTROL_RULE,
             Self::ProxyLane { .. } => PROXY_LANE_RULE,
         }
@@ -3950,12 +4064,15 @@ impl DropLimiter {
         }
     }
 
-    /// Emits the interim's line for one admitted-unregistered source: the same
-    /// rate limit a drop's line answers to — one per source per interval —
-    /// because a box whose lease no row holds admits on every frame it sends,
-    /// and the point of the line is that a host running the interim can see
-    /// it, not that it can be flooded by it. Returns whether a line was
-    /// written.
+    /// Emits the drop's line for one frame whose source is an in-plan address
+    /// no published namespace holds (NET-085): the same rate limit every
+    /// drop's line answers to — one per source per interval — because a
+    /// source no row holds drops on every frame it sends, and the point of
+    /// the line is that a host can see the drop, not that it can be flooded
+    /// by it. The line names the source and the rule, the two fields
+    /// NET-081's observability asks of every drop line, so a host reads which
+    /// in-plan address a namespace-less frame wore. Returns whether a line
+    /// was written.
     fn warn_unregistered(&self, src: [u8; 4]) -> bool {
         match self.should_warn_at(Some(src), UNREGISTERED_SOURCE_RULE, Instant::now()) {
             WarnDecision::Silent => false,
@@ -3963,17 +4080,95 @@ impl DropLimiter {
                 tracing::warn!(
                     source = %Ipv4Addr::from(src),
                     rule_matched = UNREGISTERED_SOURCE_RULE,
-                    "admitted a frame leaving the VM from an in-plan address no published \
-                     namespace holds; per-box enforcement of it is T66 (#1711), the \
-                     creator-side registration that supplies the row",
+                    "dropped a frame leaving the VM from an in-plan address no published \
+                     namespace holds; nothing on the host bounds the reach a frame from \
+                     it would carry",
                 );
                 true
             }
             WarnDecision::Overflow => {
                 tracing::warn!(
                     rule_matched = UNREGISTERED_SOURCE_RULE,
-                    "admitting frames from more distinct unregistered addresses than the \
-                     gate keeps a window per source for; per-box enforcement is T66 (#1711)",
+                    "dropped frames from more distinct unregistered addresses than the \
+                     gate keeps a window per source for; one line per rule covers the rest",
+                );
+                true
+            }
+        }
+    }
+
+    /// Emits the drop's line for one live lease no published namespace
+    /// holds: a source an applied switch request named as a box's own
+    /// ([`PublishedForwards::lease_live_at`]), so a namespace the guest
+    /// daemon vouched for holds it, alive, while no row the registry holds
+    /// is keyed by it — its box predates host registration (T66, #1711). The
+    /// one unregistered source a host can do something about, and the line
+    /// says so, naming the lease and the remedy, where the generic line
+    /// ([`Self::warn_unregistered`]) names only the address. The same rate
+    /// limit every drop's line answers to, keyed by the source and its own
+    /// rule, so one address's two lines say their own things. Returns
+    /// whether a line was written.
+    fn warn_live_lease(&self, src: [u8; 4]) -> bool {
+        match self.should_warn_at(Some(src), UNREGISTERED_LIVE_LEASE_RULE, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named => {
+                tracing::warn!(
+                    source = %Ipv4Addr::from(src),
+                    rule_matched = UNREGISTERED_LIVE_LEASE_RULE,
+                    "dropped a frame leaving the VM from a live lease no published \
+                     namespace holds; the box predates host registration, so restarting \
+                     it registers it (T66, #1711)",
+                );
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    rule_matched = UNREGISTERED_LIVE_LEASE_RULE,
+                    "dropped frames from more distinct live leases than the gate keeps a \
+                     window per source for; one line per rule covers the rest",
+                );
+                true
+            }
+        }
+    }
+
+    /// Emits the drop's line for one frame the row's own rules refused toward
+    /// an undeclared subnet: the same rate limit every drop's line answers
+    /// to, and naming the destination address and the port the frame gave
+    /// it, beside the source and the rule — the line a host reads to learn
+    /// which address a box reached for that its row never declared, and at
+    /// which port, the way the infrastructure line names its destination.
+    /// Returns whether a line was written.
+    fn warn_undeclared_subnet(
+        &self,
+        src: Option<[u8; 4]>,
+        dst: [u8; 4],
+        dst_port: u16,
+        rule: &'static str,
+    ) -> bool {
+        match self.should_warn_at(src, rule, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named => {
+                let source =
+                    src.map_or_else(|| "none".to_string(), |src| Ipv4Addr::from(src).to_string());
+                tracing::warn!(
+                    source = %source,
+                    destination = %Ipv4Addr::from(dst),
+                    // The frame summary reads 0 when the protocol carries no
+                    // L4 port (ICMP, say): name that rather than a port 0.
+                    port = %if dst_port == 0 { "none".to_string() } else { dst_port.to_string() },
+                    rule_matched = rule,
+                    "dropped a frame leaving the VM toward a subnet its rules do not \
+                     declare",
+                );
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    rule_matched = rule,
+                    "dropped frames toward undeclared subnets from more distinct source \
+                     addresses than the gate keeps a window per source for; one line per \
+                     rule covers the rest",
                 );
                 true
             }
@@ -4382,23 +4577,89 @@ pub(crate) mod test_support {
         }
     }
 
+    /// [`gate_connected`] on a gate built through the production entry,
+    /// [`EgressGate::spawn`]: the entry `crate::net` calls, which builds its
+    /// own reply-flow tables and takes its phase from the shipped constant —
+    /// so the frame stream this harness backs is decided by a gate no test
+    /// parameter shaped, the entry a VM host actually runs. The harness's
+    /// `replies` is an empty stand-in rather than the tables the gate's
+    /// relays decide by, because `spawn` builds its own; a test that reads
+    /// the gate's reply records builds with
+    /// [`gate_connected_with_phase`] instead.
+    pub(crate) async fn gate_connected_shipped(registry: BoxRegistry) -> GateHarness {
+        let dir = TempDir::new().expect("a tempdir is creatable");
+        let switch_sock = dir.path().join("gvproxy-switch.sock");
+        let gate_sock = dir.path().join("gvproxy-gate.sock");
+        // The stand-in switch: a listener the gate's connection task dials,
+        // kept alive for the harness's lifetime so a later guest connection
+        // on the same gate has something to dial.
+        let listener = UnixListener::bind(&switch_sock).expect("binding the stand-in switch");
+
+        // Capture this thread's tracing output before the gate starts, so its
+        // drop lines are assertable. The gate runs on this test's
+        // current-thread runtime, so the thread-local default applies to its
+        // tasks too.
+        let (log, _guard) = capture_log();
+
+        // The gate's DNS admission table, built for the same plan the
+        // registry's rows were compiled against — the same construction the
+        // production gate is handed in [`crate::net`].
+        let pins = crate::net::dns_pins::DnsPins::new(registry.subnet());
+
+        let gate = EgressGate::spawn(
+            gate_sock.clone(),
+            switch_sock.clone(),
+            registry.table(),
+            pins.clone(),
+            crate::net::baseline::NodePlaneBaseline::built_in(registry.subnet()),
+        )
+        .expect("spawning the egress gate");
+
+        // The guest's connect: the shuttle's vsock connection, arrived…
+        let guest = UnixStream::connect(&gate_sock)
+            .await
+            .expect("connecting the guest end");
+        // …and the gate's dial of the switch it fronts, accepted before the
+        // guest speaks, so what it writes next is decided by a gate whose
+        // switch connection is already up.
+        let (switch, _) = listener.accept().await.expect("accepting the gate's dial");
+
+        GateHarness {
+            _gate: gate,
+            guest,
+            switch,
+            log,
+            table: registry.table(),
+            pins,
+            // The production entry built its own; this one is the harness's
+            // empty stand-in, consulted by nothing.
+            replies: ReplyTables::new(),
+            gate_sock,
+            switch_listener: listener,
+            _dir: dir,
+            _guard,
+        }
+    }
+
     /// Brings up one gate over a stand-in switch, deciding by `registry`'s
-    /// table, with the guest sending the plain upgrade head first.
+    /// table, at the shipped posture — the frame half no longer varies by
+    /// phase (NET-085), and the publish half the shipped constant governs —
+    /// with the guest sending the plain upgrade head first.
     pub(crate) async fn gate_over(registry: BoxRegistry) -> GateHarness {
-        gate_over_with_phase(registry, super::UNREGISTERED_SOURCE_PHASE).await
+        forward_upgrade_head(
+            gate_connected_with_phase(registry, super::UNREGISTERED_SOURCE_PHASE).await,
+        )
+        .await
     }
 
-    /// [`gate_over`] on a gate built with `phase`: the upgrade-completed
-    /// harness the in-force arm's relay-level pins run through
-    /// ([`EgressGate::spawn_with_phase`] for how the phase reaches the gate).
-    pub(crate) async fn gate_over_with_phase(
-        registry: BoxRegistry,
-        phase: UnregisteredSourcePhase,
-    ) -> GateHarness {
-        forward_upgrade_head(gate_connected_with_phase(registry, phase).await).await
+    /// [`gate_connected_shipped`]'s upgrade-completed harness: the frame
+    /// stream begins at a known point, decided by the gate the production
+    /// entry built.
+    pub(crate) async fn gate_over_shipped(registry: BoxRegistry) -> GateHarness {
+        forward_upgrade_head(gate_connected_shipped(registry).await).await
     }
 
-    /// [`gate_over_with_phase`] with the node-plane baseline set named: the
+    /// [`gate_over`] with the node-plane baseline set named: the
     /// upgrade-completed harness the baseline's in-force arm's relay-level
     /// pins run through.
     pub(crate) async fn gate_over_with_node_baseline(
@@ -4730,18 +4991,19 @@ mod tests {
     use super::test_support::{
         CaptureWriter, DEADLINE, arp_frame, capture_log, connect_control, connect_over,
         expect_frame, expect_silence, expect_teardown, expose_request, gate_connected,
-        gate_connected_with_phase, gate_over, gate_over_control, gate_over_with,
-        gate_over_with_node_baseline, gate_over_with_phase, ipv4_frame, ipv6_frame, read_within,
-        send_frame, unexpose_request, wait_for_log,
+        gate_connected_with_phase, gate_over, gate_over_control, gate_over_shipped, gate_over_with,
+        gate_over_with_node_baseline, ipv4_frame, ipv6_frame, read_within, send_frame,
+        unexpose_request, wait_for_log,
     };
     use super::{
         AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb, DROP_WARN_MAX_TRACKED_PAIRS,
         DROP_WARN_MIN_INTERVAL, DropLimiter, EgressGate, GateAdmit, GateDrop, GuestSource,
         GuestSpeak, HANDSHAKE_TIMEOUT, MALFORMED_PUBLISH_RULE, MAX_HEAD, MAX_LIVE_RELAYS,
         MAX_NAMED_TARGET, PROXY_LANE_RULE, PublishedForwards, Record, ReplyTables,
-        UNDECLARED_PUBLISH_RECORD_RULE, UNDECLARED_RETRACT_RULE, UNREGISTERED_PUBLISH_RULE,
-        UNREGISTERED_SOURCE_PHASE, UNREGISTERED_SOURCE_RULE, UnregisteredSourcePhase, WarnDecision,
-        accept_loop, dns_pins, gate_verdict, max_frame, render_record, serve_connection,
+        UNDECLARED_PUBLISH_RECORD_RULE, UNDECLARED_RETRACT_RULE, UNREGISTERED_LIVE_LEASE_RULE,
+        UNREGISTERED_PUBLISH_RULE, UNREGISTERED_SOURCE_PHASE, UNREGISTERED_SOURCE_RULE,
+        UnregisteredSourcePhase, WarnDecision, accept_loop, dns_pins, gate_verdict, max_frame,
+        render_record, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
     use crate::net::baseline::{BaselineCategory, NodeBaselinePhase, NodePlaneBaseline};
@@ -6270,15 +6532,7 @@ mod tests {
             let l4 = dns_pins::parse_ipv4_l4(frame)
                 .expect("the frame builder's IPv4 header always parses");
             let summary = sessions::core::egress::summarize(frame);
-            gate_verdict(
-                &summary,
-                Some(&l4),
-                &table,
-                &baseline,
-                &pins,
-                replies,
-                UNREGISTERED_SOURCE_PHASE,
-            )
+            gate_verdict(&summary, Some(&l4), &table, &baseline, &pins, replies)
         };
 
         // The forwarder's dial: a bare SYN from the gateway — the source
@@ -6413,15 +6667,7 @@ mod tests {
             let l4 = dns_pins::parse_ipv4_l4(frame)
                 .expect("the frame builder's IPv4 header always parses");
             let summary = sessions::core::egress::summarize(frame);
-            gate_verdict(
-                &summary,
-                Some(&l4),
-                &table,
-                &baseline,
-                &pins,
-                replies,
-                UNREGISTERED_SOURCE_PHASE,
-            )
+            gate_verdict(&summary, Some(&l4), &table, &baseline, &pins, replies)
         };
 
         // The node's own connect toward the gateway, from the proxy port
@@ -6580,15 +6826,7 @@ mod tests {
             let l4 = dns_pins::parse_ipv4_l4(frame)
                 .expect("the frame builder's IPv4 header always parses");
             let summary = sessions::core::egress::summarize(frame);
-            gate_verdict(
-                &summary,
-                Some(&l4),
-                &table,
-                &baseline,
-                &pins,
-                replies,
-                UNREGISTERED_SOURCE_PHASE,
-            )
+            gate_verdict(&summary, Some(&l4), &table, &baseline, &pins, replies)
         };
 
         // The whole proof runs on one hand-held clock — the same decision,
@@ -6857,6 +7095,15 @@ mod tests {
         // The handle the withdrawal below is spoken through: a clone of the
         // same registry the gate decides by.
         let handle = registry.clone();
+        // The node's own row, filed once at boot the way the run path files
+        // it: the one published namespace that survives the web box's
+        // withdrawal below, and the source the final arm's marker wears — an
+        // ARP announcing the withdrawn lease would wear an in-plan address no
+        // row holds, and that frame is the unregistered rule's drop now
+        // (NET-085), so it could no more prove the relay decided the answer
+        // than the answer itself.
+        let node = registry.register_node_namespace(7654);
+        let node_addr = node.switch_addr().octets();
         registry.register(
             BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
                 .with_admitted_ports([8080, 8081])
@@ -7004,7 +7251,12 @@ mod tests {
         // (NET-016/017's listen-publishing). The count above is the
         // purge's own evidence, the one thing this retraction changed.
         send_frame(&mut guest, &first_answer).await;
-        let marker = arp_frame(LEASE);
+        // The marker wears the node's address — the one row the withdrawal
+        // left standing — because the withdrawn lease's own announcement is
+        // an in-plan source no row holds, which the unregistered rule drops
+        // unconditionally now (NET-085), not a frame that can prove the
+        // relay is alive.
+        let marker = arp_frame(node_addr);
         send_frame(&mut guest, &marker).await;
         assert_eq!(
             expect_frame(&mut switch).await,
@@ -7304,17 +7556,16 @@ mod tests {
     /// the rebinding intersection's exemption holds it. Each drop names its
     /// destination and port under the rule, rate-limited per source, so the
     /// first refused frame of each source is the one whose line is read.
-    /// A source the announced interim admits without a row takes the same
-    /// rule: refused to the metadata service, admitted to private space as
-    /// the allow-all the interim concedes.
+    /// Only a row the registry holds reaches the infrastructure check now
+    /// (NET-085): a source no namespace holds is the unregistered-source
+    /// drop's before this arm can ever see it, so the rows here are every
+    /// source that can take this rule.
     #[tokio::test]
     async fn infrastructure_destinations_drop_on_the_host_for_every_row() {
         let registry = BoxRegistry::new(SUBNET);
         let open = [100, 64, 0, 10];
         let lan = [100, 64, 0, 11];
         let bare = [100, 64, 0, 12];
-        // Held by no row: the announced interim's source.
-        let unregistered = [100, 64, 0, 13];
         registry.register(
             BoxRegistration::new("weather", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
                 .with_admitted_ports([8080])
@@ -7351,7 +7602,6 @@ mod tests {
             ipv4_frame(open, 6, [10, 1, 2, 3], 80),
             ipv4_frame(lan, 6, [10, 1, 2, 3], 80),
             ipv4_frame(bare, 6, [10, 1, 2, 3], 80),
-            ipv4_frame(unregistered, 6, [10, 1, 2, 3], 80),
         ];
         for frame in &admitted {
             send_frame(&mut h.guest, frame).await;
@@ -7377,7 +7627,6 @@ mod tests {
             ipv4_frame(bare, 6, metadata, 80),
             ipv4_frame(lan, 6, metadata, 80),
             ipv4_frame(lan, 6, other_block, 80),
-            ipv4_frame(unregistered, 6, metadata, 80),
         ];
         for frame in &refused {
             send_frame(&mut h.guest, frame).await;
@@ -7403,7 +7652,6 @@ mod tests {
             "destination=169.254.169.254",
             "source=100.64.0.12",
             "destination=100.65.0.9",
-            "source=100.64.0.13",
             "port=80",
             "rule_matched=\"egress-infrastructure-destination\"",
         ] {
@@ -7673,12 +7921,12 @@ mod tests {
     /// admitted only when its source is the address a lane-declaring row
     /// holds. The same frame wearing any other source is dropped: a sibling
     /// row that declared no lane is refused at the listener; an in-plan
-    /// address no namespace holds is the interim's, whose admission concedes
-    /// a row's absence and never the fabric, so the proxy rule holds it too;
-    /// and an address outside the plan's run never reaches the lane arm at
-    /// all — the unknown-source refusal took it first, the same place a
-    /// spoofed lease would die on the relay leg. Only the laned box's own
-    /// address rides its lane.
+    /// address no namespace holds dies at the source check under its own
+    /// rule (NET-085), never reaching the lane arm; and an address outside
+    /// the plan's run never reaches the lane arm either — the
+    /// unknown-source refusal took it first, the same place a spoofed lease
+    /// would die on the relay leg. Only the laned box's own address rides
+    /// its lane.
     #[tokio::test]
     async fn spoofed_source_to_proxy_listener_dropped() {
         let registry = BoxRegistry::new(SUBNET);
@@ -7710,19 +7958,20 @@ mod tests {
         );
 
         // The same frame wearing each other source: the sibling's address —
-        // a published row, but one that declared no lane — the interim's —
-        // an address the plan could lease that no namespace holds — and a
+        // a published row, but one that declared no lane — an in-plan
+        // address the plan could lease that no namespace holds — and a
         // stranger's from outside the plan's run. None is the laned row's
         // address, so none rides its lane, whatever the row would have
-        // admitted had the frame come from it; and the stranger's never
-        // reaches the lane arm at all. The marker after them proves every
-        // one was decided before it, and none passed.
+        // admitted had the frame come from it; and neither the
+        // namespace-less sources ever reach the lane arm at all. The marker
+        // after them proves every one was decided before it, and none
+        // passed.
         let sibling = [100, 64, 0, 10];
-        let interim = [100, 64, 0, 99];
+        let unregistered = [100, 64, 0, 99];
         let stranger = [203, 0, 113, 7];
         let refused = [
             ipv4_frame(sibling, 6, proxy, 8118),
-            ipv4_frame(interim, 6, proxy, 8118),
+            ipv4_frame(unregistered, 6, proxy, 8118),
             ipv4_frame(stranger, 6, proxy, 8118),
         ];
         for frame in &refused {
@@ -7738,9 +7987,10 @@ mod tests {
         expect_silence(&mut h.switch).await;
 
         // The drops say so, each under the rule that decided it: the
-        // sibling's and the interim's under the proxy rule, the stranger's
-        // under the unknown-source rule, which runs before the lane arm can
-        // be reached at all.
+        // sibling's under the proxy rule, the stranger's under the
+        // unknown-source rule and the in-plan namespace-less one's under the
+        // unregistered-source rule — both of which run before the lane arm
+        // can be reached at all.
         wait_for_log(&h.log, "egress-unknown-source").await;
         let logged = h.log.contents();
         for needle in [
@@ -7750,6 +8000,7 @@ mod tests {
             "rule_matched=\"egress-uncredentialed-proxy-destination\"",
             "source=203.0.113.7",
             "rule_matched=\"egress-unknown-source\"",
+            "rule_matched=\"egress-unregistered-source\"",
         ] {
             assert!(
                 logged.contains(needle),
@@ -7802,15 +8053,7 @@ mod tests {
         let in_force = baseline.clone().in_force();
         for (proto, port) in [(6, 8118), (17, 8118)] {
             let frame = sessions::core::egress::summarize(&ipv4_frame(node, proto, proxy, port));
-            match gate_verdict(
-                &frame,
-                None,
-                &table,
-                &in_force,
-                &pins,
-                &ReplyTables::new(),
-                UNREGISTERED_SOURCE_PHASE,
-            ) {
+            match gate_verdict(&frame, None, &table, &in_force, &pins, &ReplyTables::new()) {
                 Ok(GateAdmit::Baseline) => panic!(
                     "the baseline set admitted the proxy's address at proto {proto} port {port}"
                 ),
@@ -7833,15 +8076,7 @@ mod tests {
         let frame = sessions::core::egress::summarize(&ipv4_frame(node, 6, proxy, 8118));
         assert!(
             matches!(
-                gate_verdict(
-                    &frame,
-                    None,
-                    &table,
-                    &baseline,
-                    &pins,
-                    &ReplyTables::new(),
-                    UNREGISTERED_SOURCE_PHASE
-                ),
+                gate_verdict(&frame, None, &table, &baseline, &pins, &ReplyTables::new()),
                 Err(GateDrop::ProxyLane { .. })
             ),
             "the interim node row carries no lane, so its frame to the proxy is the proxy \
@@ -7849,19 +8084,16 @@ mod tests {
         );
     }
 
-    /// NET-081's failure case, as the phase this build ships holds it: a frame
-    /// whose source address the plan could never hand to a box never leaves
-    /// the VM, and a frame whose source the plan *could* hand out but no
-    /// namespace holds is the interim's — admitted, under the announced
-    /// default, with a line that names the source and T66 on every admit —
-    /// until the creator-side registration (T66, #1711) supplies the rows the
-    /// per-box default binds to. Flipping `UNREGISTERED_SOURCE_PHASE` is what
-    /// T66 does, and this test is one of the ones that flip with it: the
-    /// admits below become drops, the interim's lines become rule 0's, and
-    /// nothing else moves. The in-force arm's own pins — what the shipped
-    /// gate decides once that flip has landed — are carried at relay level by
-    /// [`unregistered_sources_dropped_when_default_in_force`], built through
-    /// the phase parameter rather than waiting on the constant.
+    /// NET-081's failure case, held unconditionally: a frame whose source
+    /// address the plan could never hand to a box never leaves the VM, and
+    /// a frame whose source the plan *could* hand out but no namespace
+    /// holds never leaves it either (NET-085, T89 #1925) — two classes, two
+    /// rules, one posture, whatever the egress default's phase is. The
+    /// out-of-plan class keeps rule 0's ([`UNKNOWN_SOURCE_RULE`]); the
+    /// in-plan class drops under its own ([`UNREGISTERED_SOURCE_RULE`]),
+    /// whose relay-level pins — the line naming the source, once per source
+    /// per interval, the table left untouched, toward every destination —
+    /// are carried by [`unregistered_sources_dropped`].
     #[tokio::test]
     async fn unknown_source_default_deny() {
         let registry = BoxRegistry::new(SUBNET);
@@ -7891,46 +8123,48 @@ mod tests {
         let beyond_subnet = ipv4_frame(foreign, 6, [10, 1, 2, 3], 80);
         let foreign_arp = arp_frame(gateway);
         let v6 = ipv6_frame();
+        let marker = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
         for frame in [&outside_plan, &beyond_subnet, &foreign_arp, &v6] {
             send_frame(&mut h.guest, frame).await;
         }
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the published box's frame passes; no frame whose source the plan \
+             could never hand out did"
+        );
+        expect_silence(&mut h.switch).await;
 
-        // Two frames whose source the plan could hand out but no row holds: a
-        // made-up lease, and the withdrawn namespace's — withdrawal inside the
-        // plan's lease block costs an address no reach until the per-box
-        // default binds, because the interim exists to keep exactly these
-        // addresses' boxes on the wire. Both are admitted, and both say so.
+        // Two frames whose source the plan could hand out but no row holds:
+        // a made-up lease, and the withdrawn namespace's — in-plan both, so
+        // rule 0 is not theirs, and dropped toward a destination the one
+        // published row would itself admit, because the class of the
+        // source, not the destination, refuses them (NET-085). The marker
+        // after them proves both were decided and neither passed.
         let stranger = [100, 64, 0, 99];
         let made_up = ipv4_frame(stranger, 6, [10, 1, 2, 3], 80);
         let from_retired = ipv4_frame(withdrawn, 6, [10, 1, 2, 3], 80);
-        let marker = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
         for frame in [&made_up, &from_retired] {
             send_frame(&mut h.guest, frame).await;
         }
         send_frame(&mut h.guest, &marker).await;
-        let seen = expect_frame(&mut h.switch).await;
         assert_eq!(
-            seen, made_up,
-            "the made-up lease is admitted by the announced interim, not dropped"
-        );
-        let seen = expect_frame(&mut h.switch).await;
-        assert_eq!(
-            seen, from_retired,
-            "the withdrawn namespace's frames are the interim's until the default binds"
-        );
-        let seen = expect_frame(&mut h.switch).await;
-        assert_eq!(
-            seen, marker,
-            "the published box's frame passes; no other frame did"
+            expect_frame(&mut h.switch).await,
+            marker,
+            "an in-plan source no row holds is dropped like an out-of-plan one; \
+             the published box's frame is the only one that passed"
         );
         expect_silence(&mut h.switch).await;
 
-        // The drops are named: the out-of-plan sources under NET-081's own
-        // rule — the gateway's IPv4 frame and its ARP share one line, the
-        // foreign subnet's has its own — and the IPv6 family under its own,
-        // with no source to name.
+        // The drops are named, each under its own rule: the out-of-plan
+        // sources under NET-081's own — the gateway's IPv4 frame and its ARP
+        // share one line, the foreign subnet's has its own — the IPv6 family
+        // under its own, with no source to name, and the in-plan pair under
+        // the unregistered rule's line, one line per source.
         wait_for_log(&h.log, "egress-unknown-source").await;
         wait_for_log(&h.log, "egress-ipv6").await;
+        wait_for_log(&h.log, UNREGISTERED_SOURCE_RULE).await;
         let logged = h.log.contents();
         for src in [gateway, foreign] {
             assert!(
@@ -7953,52 +8187,40 @@ mod tests {
             1,
             "the family drop has its own line, got: {logged}"
         );
-
-        // The interim's admits are named too — one line per unregistered
-        // source, each naming the address and the task that ends the interim.
-        wait_for_log(&h.log, UNREGISTERED_SOURCE_RULE).await;
-        let logged = h.log.contents();
         for src in [stranger, withdrawn] {
             assert!(
                 logged.contains(&format!("source={}", Ipv4Addr::from(src))),
-                "the interim's line names the source address {src:?}, got: {logged}"
+                "the unregistered drop's line names the source address {src:?}, \
+                 got: {logged}"
             );
         }
-        assert!(
-            logged.contains("T66 (#1711)"),
-            "the interim's line names the registration path that ends it, got: {logged}"
-        );
         assert_eq!(
             logged.matches(UNREGISTERED_SOURCE_RULE).count(),
             2,
-            "one interim line per unregistered source, got: {logged}"
+            "one drop line per unregistered source, got: {logged}"
         );
 
         // And only one per source per interval: a second frame from the same
-        // made-up lease admits and adds no second line inside the window.
+        // made-up lease drops again and adds no second line inside the
+        // window.
         send_frame(&mut h.guest, &made_up).await;
         send_frame(&mut h.guest, &marker).await;
         let seen = expect_frame(&mut h.switch).await;
         assert_eq!(
-            seen, made_up,
-            "the interim's admit is not a reset: the same source's next frame passes"
-        );
-        let seen = expect_frame(&mut h.switch).await;
-        assert_eq!(
             seen, marker,
-            "the marker still arrives after the repeat admit"
+            "the same unregistered source's repeat frame drops again, passing nothing"
         );
         expect_silence(&mut h.switch).await;
         assert_eq!(
             h.log.contents().matches(UNREGISTERED_SOURCE_RULE).count(),
             2,
-            "one interim line per source per interval, got: {}",
+            "one drop line per source per interval, got: {}",
             h.log.contents()
         );
 
-        // What the admits did not do: publish. The made-up lease and the
+        // What the drops did not do: publish. The made-up lease and the
         // withdrawn namespace still hold no row — the table is filled on the
-        // host, never from the guest's wire, an admit included — and the one
+        // host, never from the guest's wire, a drop included — and the one
         // published box is still held.
         assert!(
             h.table.by_source(stranger).is_none(),
@@ -8006,7 +8228,7 @@ mod tests {
         );
         assert!(
             h.table.by_source(withdrawn).is_none(),
-            "an admit under the interim is not a re-registration"
+            "a drop at the gate is not a re-registration"
         );
         assert!(
             h.table.by_source(LEASE).is_some(),
@@ -8014,21 +8236,22 @@ mod tests {
         );
     }
 
-    /// NET-081's failure case as the per-box default holds it — the phase's
-    /// in-force arm, pinned **at relay level** on a live gate built through
-    /// [`EgressGate::spawn_with_phase`], the injection point the pure decision
-    /// alone never had: a frame whose source the plan could hand out but no
-    /// row holds is dropped, the interim's admit lines are absent, and the
-    /// drops are named, once per source, under [`UNKNOWN_SOURCE_RULE`]. The
-    /// pins the announced interim's test had to relax stand here, so T66's
-    /// (#1711) flip of [`UNREGISTERED_SOURCE_PHASE`] turns the shipped gate
-    /// into what this test already watches and nothing has to be rewritten
-    /// green: the made-up lease, the withdrawn namespace's address, and an
-    /// ARP announcing an unpublished in-plan address — the sender address an
-    /// ARP frame's source is read from, so resolution is no way in — all
-    /// drop, while the published box's frames are still decided by its row.
+    /// NET-085, the in-plan half of NET-081's failure case, pinned **at relay
+    /// level** on a live gate built under the shipped phase
+    /// ([`gate_over`]; the production entry's own pin is
+    /// [`shipped_gate_drops_unregistered_in_plan_source`]): a frame whose
+    /// source the plan could hand out but no row holds
+    /// is dropped toward every destination — a subnet the one published row
+    /// declares, and the node plane's own baseline set, the categories the
+    /// enumeration admits, included — whatever the egress default's phase
+    /// is, because no phase reaches the frame half. A made-up lease, the
+    /// withdrawn namespace's address, and an ARP announcing an unpublished
+    /// in-plan address — the sender address an ARP frame's source is read
+    /// from, so resolution is no way in — all drop, while the published
+    /// box's frames are still decided by its row, and the drops are named,
+    /// once per source, under [`UNREGISTERED_SOURCE_RULE`].
     #[tokio::test]
-    async fn unregistered_sources_dropped_when_default_in_force() {
+    async fn unregistered_sources_dropped() {
         let registry = BoxRegistry::new(SUBNET);
         tcp_lan_box(&registry, LEASE);
         // A namespace that was published and then withdrawn: its address is
@@ -8040,19 +8263,34 @@ mod tests {
             Ipv4Addr::LOCALHOST,
         ));
         assert!(registry.withdraw(retired.switch_addr()).is_some());
-        let mut h = gate_over_with_phase(registry, UnregisteredSourcePhase::InForce).await;
+        let mut h = gate_over(registry).await;
 
-        // Three frames whose source the plan could hand out but no row holds:
-        // a made-up lease, the withdrawn namespace's, and an ARP announcing
-        // the made-up lease — an unpublished in-plan address smuggled in as a
+        // Five frames whose source the plan could hand out but no row holds:
+        // a made-up lease and the withdrawn namespace's, each toward a
+        // destination the published row itself declares; the same two toward
+        // the baseline set's own destination, the host alias the node plane's
+        // categories enumerate — the drop's reach is every destination, that
+        // set included, because the class of the source refuses the frame
+        // before any destination is consulted; and an ARP announcing the
+        // made-up lease — an unpublished in-plan address smuggled in as a
         // sender protocol address. The marker after them is the one published
-        // box's, so its arrival proves all three were decided and none passed.
+        // box's, so its arrival proves all five were decided and none
+        // passed.
         let stranger = [100, 64, 0, 99];
+        let host_alias = SUBNET.host_alias().octets();
         let made_up = ipv4_frame(stranger, 6, [10, 1, 2, 3], 80);
         let from_retired = ipv4_frame(withdrawn, 6, [10, 1, 2, 3], 80);
+        let made_up_baseline = ipv4_frame(stranger, 6, host_alias, 80);
+        let retired_baseline = ipv4_frame(withdrawn, 6, host_alias, 80);
         let unpublished_arp = arp_frame(stranger);
         let marker = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
-        for frame in [&made_up, &from_retired, &unpublished_arp] {
+        for frame in [
+            &made_up,
+            &from_retired,
+            &made_up_baseline,
+            &retired_baseline,
+            &unpublished_arp,
+        ] {
             send_frame(&mut h.guest, frame).await;
         }
         send_frame(&mut h.guest, &marker).await;
@@ -8060,14 +8298,17 @@ mod tests {
         assert_eq!(
             seen, marker,
             "the published box's frame is the only one that passed: every \
-             unregistered source was dropped before the switch"
+             unregistered source was dropped before the switch, toward its \
+             declared destinations and the baseline set's alike"
         );
         expect_silence(&mut h.switch).await;
 
-        // The drops are named: one line per source under NET-081's own rule —
+        // The drops are named: one line per source under the unregistered
+        // rule — the four IPv4 frames of the two sources make two lines, and
         // the ARP announcing the made-up lease shares its source's window —
-        // and no interim line at all, because nothing was admitted.
-        wait_for_log(&h.log, "egress-unknown-source").await;
+        // and no unknown-source line at all, because every source here is
+        // in-plan.
+        wait_for_log(&h.log, UNREGISTERED_SOURCE_RULE).await;
         let logged = h.log.contents();
         for src in [stranger, withdrawn] {
             assert!(
@@ -8076,19 +8317,15 @@ mod tests {
             );
         }
         assert_eq!(
-            logged.matches("egress-unknown-source").count(),
+            logged.matches(UNREGISTERED_SOURCE_RULE).count(),
             2,
-            "three unregistered-source frames make two lines (the ARP shares its \
+            "five unregistered-source frames make two lines (the ARP shares its \
              source's window), got: {logged}"
         );
         assert!(
-            !logged.contains(UNREGISTERED_SOURCE_RULE),
-            "the in-force gate admits nothing unregistered, so the interim's \
-             line never fires, got: {logged}"
-        );
-        assert!(
-            !logged.contains("T66 (#1711)"),
-            "nothing here is waiting on the registration path any more, got: {logged}"
+            !logged.contains("egress-unknown-source"),
+            "every source here is inside the plan's lease run, so rule 0 is \
+             not theirs to drop under, got: {logged}"
         );
 
         // And what the drops did not do: touch the table. The made-up lease
@@ -8106,6 +8343,389 @@ mod tests {
             h.table.by_source(LEASE).is_some(),
             "the one published box is still held"
         );
+    }
+
+    /// The production entry pins the same drop: a gate built through
+    /// [`EgressGate::spawn`] — the entry `crate::net` calls, whose gate takes
+    /// its phase from the shipped constant and builds its own reply-flow
+    /// tables, so no test parameter shapes the decision — drops a frame
+    /// whose source is an in-plan address no row holds, toward a destination
+    /// the one published row itself declares, and the drop's line is the
+    /// unregistered rule's, naming the source. The entry takes no phase at
+    /// all, so this is the proof that the gate a VM host runs drops such a
+    /// frame by construction (NET-085).
+    #[tokio::test]
+    async fn shipped_gate_drops_unregistered_in_plan_source() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let mut h = gate_over_shipped(registry).await;
+
+        // One frame from an in-plan lease no row holds, toward a destination
+        // the published row itself declares, then the published row's own
+        // frame as the marker: its arrival proves the first was decided and
+        // dropped.
+        let stranger = [100, 64, 0, 99];
+        let made_up = ipv4_frame(stranger, 6, [10, 1, 2, 3], 80);
+        let marker = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
+        send_frame(&mut h.guest, &made_up).await;
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the gate the production entry built drops the in-plan source no \
+             row holds; the published box's frame is the only one that passed"
+        );
+        expect_silence(&mut h.switch).await;
+        wait_for_log(&h.log, UNREGISTERED_SOURCE_RULE).await;
+        assert!(
+            h.log
+                .contents()
+                .contains(&format!("source={}", Ipv4Addr::from(stranger))),
+            "the drop line names the made-up lease, got: {}",
+            h.log.contents()
+        );
+        assert!(
+            h.table.by_source(stranger).is_none(),
+            "the gate registered nothing from what the guest said it held"
+        );
+    }
+
+    /// The drop NET-085 adds governs the rowless source alone: a frame whose
+    /// source a row holds is still decided by that row under the shipped
+    /// phase — admitted where its rules admit, refused where they refuse,
+    /// under its own rules' lines — while the same destinations reached from
+    /// an in-plan source no row holds are the unregistered drop's. One
+    /// destination, two sources, two verdicts: the row's and the source
+    /// check's, and neither borrows the other's rule.
+    #[tokio::test]
+    async fn registered_box_decided_by_its_row_under_shipped_phase() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let mut h = gate_over(registry).await;
+
+        // The row's own verdicts hold: its declared egress reaches the
+        // switch untouched, and its refusal of an undeclared protocol is its
+        // own — under its own rule's line, not the unregistered one.
+        let declared = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
+        let undeclared_proto = ipv4_frame(LEASE, 17, [10, 1, 2, 3], 80);
+        send_frame(&mut h.guest, &declared).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            declared,
+            "the row's declared egress still reaches the switch, untouched"
+        );
+        send_frame(&mut h.guest, &undeclared_proto).await;
+        send_frame(&mut h.guest, &declared).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            declared,
+            "the row's undeclared protocol is the row's own refusal, and the \
+             declared frame after it still passes"
+        );
+        expect_silence(&mut h.switch).await;
+        wait_for_log(&h.log, "egress-undeclared-protocol").await;
+        assert!(
+            !h.log.contents().contains(UNREGISTERED_SOURCE_RULE),
+            "a registered box's refusals are its own rules', never the \
+             unregistered drop's, got: {}",
+            h.log.contents()
+        );
+
+        // The same declared destination from an in-plan source no row holds:
+        // the unregistered drop's, under its own rule — the rowless source's
+        // verdict, not the destination's and not the row's.
+        let stranger = [100, 64, 0, 99];
+        let made_up = ipv4_frame(stranger, 6, [10, 1, 2, 3], 80);
+        send_frame(&mut h.guest, &made_up).await;
+        send_frame(&mut h.guest, &declared).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            declared,
+            "toward the same destination the row's frame passes where the \
+             rowless source's dropped"
+        );
+        expect_silence(&mut h.switch).await;
+        wait_for_log(&h.log, UNREGISTERED_SOURCE_RULE).await;
+    }
+
+    /// The egress default's phase is untouched by the frame half's new drop
+    /// (NET-085): a row the registry holds that declared no egress section
+    /// still compiles to the shipped allow-all an absent section always did,
+    /// so its frames reach whatever the shared verdict admits — and the
+    /// publish decision still reads the shipped announced phase
+    /// ([`UnregisteredSourcePhase::into_sessions_phase`]), applying a publish
+    /// at an in-plan address no row holds and marking it interim. The
+    /// unregistered drop governs only the source no row holds; a registered
+    /// box keeps everything the section's absence conceded.
+    #[tokio::test]
+    async fn undeclared_own_ip_box_unchanged_by_unregistered_drop() {
+        let registry = BoxRegistry::new(SUBNET);
+        // A bare row: no egress section, the shipped allow-all an absent
+        // section compiles to.
+        let bare = [100, 64, 0, 10];
+        registry.register(
+            BoxRegistration::new("bare", Ipv4Addr::from(bare), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
+        let mut h = gate_over(registry).await;
+
+        // The bare row's frame still reaches whatever the allow-all admits —
+        // the frame half's new drop took nothing a declared section's
+        // absence ever conceded.
+        let admitted = ipv4_frame(bare, 6, [10, 1, 2, 3], 80);
+        send_frame(&mut h.guest, &admitted).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            admitted,
+            "a registered box with no egress section keeps the shipped allow-all"
+        );
+
+        // While an in-plan source no row holds drops, under the new rule —
+        // the frame half's drop and a declared section's absence are two
+        // different things, and only the rowless source takes the new line.
+        let stranger = [100, 64, 0, 99];
+        let made_up = ipv4_frame(stranger, 6, [10, 1, 2, 3], 80);
+        send_frame(&mut h.guest, &made_up).await;
+        send_frame(&mut h.guest, &admitted).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            admitted,
+            "the bare row's frame still passes where the rowless source's dropped"
+        );
+        expect_silence(&mut h.switch).await;
+        wait_for_log(&h.log, UNREGISTERED_SOURCE_RULE).await;
+
+        // And the publish half still reads the shipped announced phase: a
+        // publish at an in-plan lease no row holds is applied, marked as the
+        // interim's own line, under the unregistered publish rule. The
+        // default the row's absent section compiles from is the phase's,
+        // and NET-085's frame-level drop does not move it.
+        let expose = expose_request("127.0.0.1:8080", "100.64.0.11:8080", "tcp");
+        let (mut guest, mut switch) = connect_control(&h).await;
+        guest.write_all(&expose).await.expect("writing the expose");
+        let mut spoken = vec![0u8; expose.len()];
+        read_within(&mut switch, &mut spoken).await;
+        assert_eq!(spoken, expose, "the interim publish reached the switch");
+        wait_for_log(&h.log, UNREGISTERED_PUBLISH_RULE).await;
+        assert!(
+            h.log.contents().contains("interim=true"),
+            "an applied interim still says so on its own line, got: {}",
+            h.log.contents()
+        );
+    }
+
+    /// The one drop whose line the gate's own ledger can point a host at a
+    /// remedy through: an applied publish standing at an address no row
+    /// holds is the host-observable fact that a live namespace holds the
+    /// lease — the guest daemon vouched for the address in the publish's
+    /// own request — so a frame from it drops under the live-lease rule,
+    /// whose line names the lease and the remedy (the box predates host
+    /// registration, T66, #1711; restarting it registers it), while a
+    /// rowless source with no applied publish takes the generic
+    /// unregistered line. Both drop the frame exactly the same way, and
+    /// neither mints a row: the gate registers no box from what the guest
+    /// says it holds.
+    #[tokio::test]
+    async fn unregistered_live_lease_warns_box_predates_registration() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        // A gate whose first connection is the control leg, so the publish
+        // stands before any frame is decided.
+        let mut h = gate_connected(registry).await;
+
+        // The box's own publish, at an in-plan lease the plan could hand out
+        // and no row holds — the shape a box that predates host registration
+        // speaks (T66, #1711 is the registration that will publish its row).
+        // Applied, marked interim, so the gate's ledger holds an applied
+        // publish at the address: the host-observable fact that a live
+        // namespace holds the lease.
+        let lease = [100, 64, 0, 10];
+        let expose = expose_request("127.0.0.1:8080", "100.64.0.10:8080", "tcp");
+        h.guest
+            .write_all(&expose)
+            .await
+            .expect("writing the expose");
+        let mut spoken = vec![0u8; expose.len()];
+        read_within(&mut h.switch, &mut spoken).await;
+        assert_eq!(spoken, expose, "the box's publish reached the switch");
+        wait_for_log(&h.log, UNREGISTERED_PUBLISH_RULE).await;
+
+        // The box's frame from that lease: dropped — no row holds the
+        // source — and the drop's line is the live lease's, not the generic
+        // unregistered one, naming the lease and the remedy.
+        let (mut guest, mut switch) = connect_over(&h).await;
+        let from_lease = ipv4_frame(lease, 6, [10, 1, 2, 3], 80);
+        let marker = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
+        send_frame(&mut guest, &from_lease).await;
+        send_frame(&mut guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            marker,
+            "the live lease's frame drops: the publish informs the line, never \
+             the verdict"
+        );
+        expect_silence(&mut switch).await;
+        wait_for_log(&h.log, UNREGISTERED_LIVE_LEASE_RULE).await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains(&format!("source={}", Ipv4Addr::from(lease))),
+            "the live-lease line names the lease, got: {logged}"
+        );
+        assert!(
+            logged.contains("predates host registration"),
+            "the live-lease line names the remedy — the box predates host \
+             registration, so restarting it registers it — got: {logged}"
+        );
+
+        // A rowless source with no applied publish standing at it takes the
+        // generic unregistered line, under its own rule: the ledger's entry
+        // is what picks the line, and only the line — the drop is the same
+        // either way.
+        let stranger = [100, 64, 0, 99];
+        let made_up = ipv4_frame(stranger, 6, [10, 1, 2, 3], 80);
+        send_frame(&mut guest, &made_up).await;
+        send_frame(&mut guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            marker,
+            "the rowless source without a publish drops exactly the same way"
+        );
+        expect_silence(&mut switch).await;
+        wait_for_log(&h.log, UNREGISTERED_SOURCE_RULE).await;
+        let logged = h.log.contents();
+        assert_eq!(
+            logged.matches(UNREGISTERED_LIVE_LEASE_RULE).count(),
+            1,
+            "one live-lease line for the one lease, got: {logged}"
+        );
+        assert_eq!(
+            logged.matches(UNREGISTERED_SOURCE_RULE).count(),
+            1,
+            "one generic unregistered line for the publish-less source, got: {logged}"
+        );
+        assert!(
+            logged.contains(&format!("source={}", Ipv4Addr::from(stranger))),
+            "the generic unregistered line names the rowless source, got: {logged}"
+        );
+
+        // And neither drop minted a row: the publish informed a line, not a
+        // registration — the gate never registers a box from what the guest
+        // says it holds.
+        assert!(
+            h.table.by_source(lease).is_none(),
+            "an applied publish registers no box at the lease it named"
+        );
+    }
+
+    /// A guest lease that has published only its zone name — no port, so
+    /// no forward stands at it — is still a live lease the guest daemon
+    /// vouched for: the applied zone-name request named the address as the
+    /// box's own. A frame from it drops like any rowless source, and the
+    /// drop's line is the live lease's, naming the lease and the remedy,
+    /// not the generic unregistered one. The request informs the line only:
+    /// the frame drops, and no row is minted from it.
+    #[tokio::test]
+    async fn unregistered_lease_with_only_a_zone_name_warns() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let mut h = gate_connected(registry).await;
+
+        // The zone name alone, at an in-plan lease no row holds: the shape a
+        // box that predates host registration speaks before it publishes
+        // any port. Applied under the interim.
+        let lease = [100, 64, 0, 10];
+        let body = br#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.10"}]}"#;
+        let mut request = b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\n\
+                           Content-Type: application/json\r\n"
+            .to_vec();
+        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        request.extend_from_slice(body);
+        h.guest
+            .write_all(&request)
+            .await
+            .expect("writing the zone-name request");
+        let mut spoken = vec![0u8; request.len()];
+        read_within(&mut h.switch, &mut spoken).await;
+        assert_eq!(spoken, request, "the zone-name request reached the switch");
+        wait_for_log(&h.log, UNREGISTERED_PUBLISH_RULE).await;
+
+        // The lease's frame: dropped, under the live lease's line.
+        let (mut guest, mut switch) = connect_over(&h).await;
+        let from_lease = ipv4_frame(lease, 6, [10, 1, 2, 3], 80);
+        let marker = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
+        send_frame(&mut guest, &from_lease).await;
+        send_frame(&mut guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            marker,
+            "the zone-name-only lease's frame drops; the marker passes"
+        );
+        expect_silence(&mut switch).await;
+        wait_for_log(&h.log, UNREGISTERED_LIVE_LEASE_RULE).await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains(&format!("source={}", Ipv4Addr::from(lease))),
+            "the live-lease line names the lease, got: {logged}"
+        );
+        assert!(
+            logged.contains("predates host registration"),
+            "the live-lease line names the remedy, got: {logged}"
+        );
+        assert!(
+            !logged.contains(UNREGISTERED_SOURCE_RULE),
+            "the zone-name-only lease takes the live-lease line, not the generic \
+             one, got: {logged}"
+        );
+        assert!(
+            h.table.by_source(lease).is_none(),
+            "an applied zone name registers no box at the lease it named"
+        );
+    }
+
+    /// The undeclared-subnet drop line carries what the frame named beside
+    /// the source and the rule: the destination address and the port it
+    /// refused, the way the infrastructure line does, so a host reads which
+    /// address a box reached for that its row never declared — and at which
+    /// port — from the line alone, without grepping the switch for the frame
+    /// the gate dropped.
+    #[tokio::test]
+    async fn undeclared_subnet_drop_line_names_destination() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let mut h = gate_over(registry).await;
+
+        // The row's frame toward an address its declared subnet does not
+        // name — TEST-NET-2, outside `10.0.0.0/8`, a plain destination the
+        // row simply did not declare — then the marker, whose arrival proves
+        // the first was decided and dropped.
+        let frame = ipv4_frame(LEASE, 6, [198, 51, 100, 7], 443);
+        send_frame(&mut h.guest, &frame).await;
+        let marker = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "the undeclared destination's frame never reached the switch; the \
+             marker after it did"
+        );
+        expect_silence(&mut h.switch).await;
+
+        // The line names the four things the requirement asks for: the
+        // source, the destination address it refused, the port the frame gave
+        // it, and the rule.
+        wait_for_log(&h.log, "egress-undeclared-subnet").await;
+        let logged = h.log.contents();
+        for needle in [
+            "source=100.64.0.9",
+            "destination=198.51.100.7",
+            "port=443",
+            "rule_matched=\"egress-undeclared-subnet\"",
+        ] {
+            assert!(
+                logged.contains(needle),
+                "the undeclared-subnet drop line carries {needle}, got: {logged}"
+            );
+        }
     }
 
     /// The relay's framing and head handling: the upgrade head is forwarded
@@ -8181,7 +8801,11 @@ mod tests {
         // The exchange was decided, and admitted under the interim — which
         // says so, once, marked as the interim's own line and naming the
         // address the publish went out at. Nothing was dropped: a control
-        // exchange is not a frame, and no frame verdict ran on it.
+        // exchange is not a frame, and no frame verdict ran on it — no
+        // frame-drop line exists, which is what the needle below reads:
+        // the start-up line names the gate's postures (`unregistered_sources
+        // = "dropped"`), so the bare word is the gate's own vocabulary and
+        // the drop lines' opening words are the verdict's trace.
         wait_for_log(&h.log, "egress-unregistered-publish").await;
         let logged = h.log.contents();
         assert!(
@@ -8193,7 +8817,7 @@ mod tests {
             "the interim's line names the address the publish went out at, got: {logged}"
         );
         assert!(
-            !logged.contains("dropped"),
+            !logged.contains("dropped a frame"),
             "no frame was decided on this connection, got: {logged}"
         );
     }
@@ -8355,14 +8979,17 @@ mod tests {
 
         // Nothing was refused and nothing was scanned: the body was parsed as
         // the request its shape said it was, and the parse never met a
-        // request line.
+        // request line. A frame verdict never ran on this connection, so
+        // no frame-drop line exists — the needle reads the drop lines'
+        // own words, not the bare word "dropped", which the start-up line
+        // now uses to name the gate's unregistered-source posture.
         let logged = h.log.contents();
         assert!(
             !logged.contains("egress-control-upgrade"),
             "a body carrying the connect path was refused as an upgrade, got: {logged}"
         );
         assert!(
-            !logged.contains("dropped"),
+            !logged.contains("dropped a frame"),
             "a control exchange is not a frame, got: {logged}"
         );
     }
@@ -9682,10 +10309,11 @@ mod tests {
     /// readable source never reach the table — the shared verdict's own
     /// family drops decide them, whatever the rows hold — a held source is
     /// decided by its namespace's own rules, the shared verdict unchanged,
-    /// and a source no row holds is the phase's to decide, both of the
-    /// phase's arms pinned here so T66's flip of the constant is the whole
-    /// cutover. The node plane's own address is the baseline set's to decide
-    /// beside the rows: its shipped arm is pinned by
+    /// and a source no row holds is nobody's to admit: outside the plan's
+    /// lease block it is rule 0's refusal, inside it the unregistered drop's
+    /// (NET-085), both pinned here as two rules because no phase reaches
+    /// the frame half any more. The node plane's own address is the baseline
+    /// set's to decide beside the rows: its shipped arm is pinned by
     /// [`node_plane_source_decided_by_the_node_row_while_announced`], its
     /// in-force arm at relay level by
     /// [`unenrolled_baseline_set_from_helper_enumeration`].
@@ -9711,8 +10339,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
-                &ReplyTables::new(),
-                UNREGISTERED_SOURCE_PHASE
+                &ReplyTables::new()
             ),
             Ok(GateAdmit::Row)
         ));
@@ -9736,8 +10363,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
-                &ReplyTables::new(),
-                UNREGISTERED_SOURCE_PHASE
+                &ReplyTables::new()
             ),
             Err(GateDrop::Verdict(DropReason::UndeclaredSubnet {
                 dst: [203, 0, 113, 7],
@@ -9745,11 +10371,10 @@ mod tests {
             }))
         );
 
-        // The switch's own address is not a row's or the phase's to decide:
-        // a frame to the gateway that is not a resolver query is refused
-        // under either phase, whatever the rows hold — the gateway is a
-        // control surface, and the interim that would admit this source
-        // anywhere else never sees the frame.
+        // The switch's own address is not a row's to decide: a frame to the
+        // gateway that is not a resolver query is refused, whatever the rows
+        // hold — the gateway is a control surface, and the refusal sits ahead
+        // of the row's decision, so no rules are ever read for it.
         let surface = summarize(&ipv4_frame(LEASE, 6, SUBNET.gateway().octets(), 443));
         assert_eq!(
             gate_verdict(
@@ -9758,33 +10383,18 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
-                &ReplyTables::new(),
-                UNREGISTERED_SOURCE_PHASE
+                &ReplyTables::new()
             ),
             Err(GateDrop::SwitchControlSurface {
                 src: LEASE,
                 dst_port: 443
             })
         );
-        assert_eq!(
-            gate_verdict(
-                &surface,
-                None,
-                &table,
-                &baseline,
-                &pins,
-                &ReplyTables::new(),
-                UnregisteredSourcePhase::InForce
-            ),
-            Err(GateDrop::SwitchControlSurface {
-                src: LEASE,
-                dst_port: 443
-            })
-        );
-        // An unregistered in-plan source would be the interim's to admit, but
-        // not at the gateway: the refusal is not gated on the row, so the
-        // announced concession never reaches a frame naming the switch's own
-        // address on a port nothing published answers.
+        // An in-plan source no row holds naming the switch's own address is
+        // the control surface's drop too, not the unregistered rule's: the
+        // ceiling the control-surface refusal adds sits ahead of the source
+        // routing as well, so a frame that names a port nothing published
+        // answers is refused there whatever its source is.
         let unregistered_surface = summarize(&ipv4_frame(
             [100, 64, 0, 99],
             6,
@@ -9798,8 +10408,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
-                &ReplyTables::new(),
-                UNREGISTERED_SOURCE_PHASE
+                &ReplyTables::new()
             ),
             Err(GateDrop::SwitchControlSurface {
                 src: [100, 64, 0, 99],
@@ -9817,8 +10426,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
-                &ReplyTables::new(),
-                UNREGISTERED_SOURCE_PHASE
+                &ReplyTables::new()
             ),
             Ok(GateAdmit::Row)
         ));
@@ -9834,8 +10442,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
-                &ReplyTables::new(),
-                UNREGISTERED_SOURCE_PHASE
+                &ReplyTables::new()
             ),
             Err(GateDrop::SwitchControlSurface {
                 src: LEASE,
@@ -9843,11 +10450,12 @@ mod tests {
             })
         );
 
-        // A source no row holds is the phase's to decide, and the plan decides
-        // where the interim can reach: an address the plan could hand to a box
-        // is admitted as the announced interim's — its source named, so the
-        // relay can warn — and dropped under the per-box default that replaces
-        // the interim, the arm T66 (#1711) flips the constant onto.
+        // A source no row holds is nobody's to admit (NET-085): an address
+        // inside the run the plan allocates PTask leases from — the lease
+        // the guest daemon's own allocator could have minted — drops under
+        // the unregistered rule, toward every destination alike, whatever
+        // the egress default's phase is, because no phase reaches the frame
+        // half.
         let unknown = summarize(&ipv4_frame([100, 64, 0, 99], 6, [10, 1, 2, 3], 80));
         assert_eq!(
             gate_verdict(
@@ -9856,33 +10464,20 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
-                &ReplyTables::new(),
-                UnregisteredSourcePhase::Announced
+                &ReplyTables::new()
             ),
-            Ok(GateAdmit::Unregistered {
-                src: [100, 64, 0, 99]
-            })
-        );
-        assert_eq!(
-            gate_verdict(
-                &unknown,
-                None,
-                &table,
-                &baseline,
-                &pins,
-                &ReplyTables::new(),
-                UnregisteredSourcePhase::InForce
-            ),
-            Err(GateDrop::UnknownSource {
+            Err(GateDrop::UnregisteredSource {
                 src: [100, 64, 0, 99]
             })
         );
 
-        // The interim never reaches past the plan's lease block, under either
-        // phase: the gateway the resolver carve-out is keyed to is the plan's
-        // own infrastructure, and an ARP announcing it is no way to smuggle
-        // one past — in-guest, ARP is a declared path for every box, so the
-        // address it announces is the thing that has to be refused.
+        // The unregistered drop never borrows the plan's infrastructure as a
+        // source either: the gateway the resolver carve-out is keyed to is
+        // the plan's own infrastructure, and an ARP announcing it is no way
+        // to smuggle one past — in-guest, ARP is a declared path for every
+        // box, so the address it announces is the thing that has to be
+        // refused. Both are rule 0's, the refusal an out-of-plan source has
+        // always taken.
         let gateway = summarize(&ipv4_frame(
             SUBNET.dns_server().octets(),
             6,
@@ -9896,8 +10491,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
-                &ReplyTables::new(),
-                UnregisteredSourcePhase::Announced
+                &ReplyTables::new()
             ),
             Err(GateDrop::UnknownSource {
                 src: SUBNET.dns_server().octets()
@@ -9911,8 +10505,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
-                &ReplyTables::new(),
-                UnregisteredSourcePhase::Announced
+                &ReplyTables::new()
             ),
             Err(GateDrop::UnknownSource {
                 src: [203, 0, 113, 7]
@@ -9925,15 +10518,7 @@ mod tests {
         assert!(empty.is_empty());
         let v6 = summarize(&ipv6_frame());
         assert_eq!(
-            gate_verdict(
-                &v6,
-                None,
-                &empty,
-                &baseline,
-                &pins,
-                &ReplyTables::new(),
-                UNREGISTERED_SOURCE_PHASE
-            ),
+            gate_verdict(&v6, None, &empty, &baseline, &pins, &ReplyTables::new()),
             Err(GateDrop::Verdict(DropReason::Ipv6))
         );
         let truncated = summarize(&[0u8; 13]);
@@ -9944,8 +10529,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
-                &ReplyTables::new(),
-                UNREGISTERED_SOURCE_PHASE
+                &ReplyTables::new()
             ),
             Err(GateDrop::Verdict(DropReason::Truncated))
         );
@@ -9966,30 +10550,31 @@ mod tests {
     /// The table is the union's membership as T66 (#1711) will publish it:
     /// `web` and `db` with disjoint declared subnets, `locked` declaring
     /// nothing, and the run path's own node row. Every spoofed attempt is
-    /// recorded — source, destination, protocol, port, the phase, and the
-    /// verdict — and the record is printed one line per attempt, grouped by
-    /// spoofed source, in the gate's drop-line shape, so the bound a spoof
-    /// bought can be read straight off the output.
+    /// recorded — source, destination, protocol, port, the baseline's
+    /// phase, and the verdict — and the record is printed one line per
+    /// attempt, grouped by spoofed source, in the gate's drop-line shape, so
+    /// the bound a spoof bought can be read straight off the output.
     ///
     /// Where the shipped posture differs from the bound's shape the test
-    /// pins both arms, the way the relay tests do: while announced the node
-    /// row is allow-all and an in-plan source no row holds is admitted with
-    /// no rules at all — the gaps the baseline phase's flip (#1786) and
-    /// T66's flip (#1711) close, and the comments below name the in-force
-    /// arm each such admit becomes.
+    /// pins both arms, the way the relay tests do: while the node baseline
+    /// is announced the node row is allow-all — the gap the baseline
+    /// phase's flip (#1786) closes. An in-plan source no row holds is not a
+    /// posture any more (NET-085): it drops under the unregistered rule in
+    /// every list, the frame half having no interim, so the record's two
+    /// halves vary the baseline alone.
     #[test]
     fn spoofed_source_bounded_to_resident_union() {
         /// One spoofed attempt as the record holds it: the frame wore, and
-        /// what the gate decided, tagged by the decision's own source — a
-        /// box's row, the node row, the baseline set, the announced interim,
-        /// or a drop's rule.
+        /// what the gate decided, tagged by the node baseline's phase the
+        /// decision ran under — a box's row, the node row, the baseline
+        /// set, or a drop's rule.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         struct Attempt {
             src: [u8; 4],
             dst: [u8; 4],
             proto: u8,
             port: u16,
-            phase: UnregisteredSourcePhase,
+            phase: NodeBaselinePhase,
             verdict: Verdict,
         }
 
@@ -10007,9 +10592,6 @@ mod tests {
             /// The row's declared credentialed lane admitted the frame at
             /// the proxy's address (NET-134): the admission no rules made.
             AdmittedByProxyLane,
-            /// The announced interim admitted the frame without consulting
-            /// any rules: the shipped arm, until T66's flip (#1711).
-            AdmittedByInterim,
             /// The gate dropped the frame, by the rule whose name the drop
             /// warning carries.
             Dropped(&'static str),
@@ -10035,17 +10617,12 @@ mod tests {
 
         /// One spoofed attempt: summarizes the frame exactly as the gate's
         /// relay would hand it over, decides it with [`gate_verdict`], and
-        /// records the verdict under the decision's own name.
-        #[expect(
-            clippy::too_many_arguments,
-            reason = "the decision's own inputs, one per parameter, spelled out so the \
-                      attempts below read as the attempts they are"
-        )]
+        /// records the verdict under the decision's own name, tagged by the
+        /// baseline posture it ran under.
         fn decide(
             table: &BoxTable,
             baseline: &NodePlaneBaseline,
             pins: &dns_pins::DnsPins,
-            phase: UnregisteredSourcePhase,
             src: [u8; 4],
             proto: u8,
             dst: [u8; 4],
@@ -10055,29 +10632,21 @@ mod tests {
             // No reply-flow records exist for any of these attempts — nothing
             // was ever delivered toward a box's published port — so the empty
             // table is the one the pure decision reads, and the frame's verdict
-            // is the row's and the phase's alone.
-            let verdict = match gate_verdict(
-                &frame,
-                None,
-                table,
-                baseline,
-                pins,
-                &ReplyTables::new(),
-                phase,
-            ) {
-                Ok(GateAdmit::Baseline) => Verdict::AdmittedByBaseline,
-                Ok(GateAdmit::Row) if src == baseline.node_addr() => Verdict::AdmittedByNodeRow,
-                Ok(GateAdmit::Row) => Verdict::AdmittedByRow,
-                Ok(GateAdmit::ProxyLane) => Verdict::AdmittedByProxyLane,
-                Ok(GateAdmit::Unregistered { .. }) => Verdict::AdmittedByInterim,
-                Err(drop) => Verdict::Dropped(drop.rule()),
-            };
+            // is the row's and the baseline's alone.
+            let verdict =
+                match gate_verdict(&frame, None, table, baseline, pins, &ReplyTables::new()) {
+                    Ok(GateAdmit::Baseline) => Verdict::AdmittedByBaseline,
+                    Ok(GateAdmit::Row) if src == baseline.node_addr() => Verdict::AdmittedByNodeRow,
+                    Ok(GateAdmit::Row) => Verdict::AdmittedByRow,
+                    Ok(GateAdmit::ProxyLane) => Verdict::AdmittedByProxyLane,
+                    Err(drop) => Verdict::Dropped(drop.rule()),
+                };
             Attempt {
                 src,
                 dst,
                 proto,
                 port,
-                phase,
+                phase: baseline.phase(),
                 verdict,
             }
         }
@@ -10105,10 +10674,14 @@ mod tests {
         let baseline = NodePlaneBaseline::built_in(SUBNET);
         // The pin table the attempts are decided against: empty — no row
         // declared a name, so the pin arm is unreachable here and every
-        // attempt is decided by the rows, the baseline set and the phase.
+        // attempt is decided by the rows and the baseline set.
         let pins = dns_pins::DnsPins::new(SUBNET);
         let node = baseline.node_addr();
-        let shipped = UNREGISTERED_SOURCE_PHASE;
+        // The node-baseline posture this build ships: announced, the
+        // allow-all node row. The frame half's own posture has no arms
+        // (NET-085) — an unregistered in-plan source drops in every list —
+        // so the record's second list varies the baseline alone.
+        let shipped = NodeBaselinePhase::Announced;
         let resolver = SUBNET.dns_server().octets();
         let web_only = [10, 1, 2, 3];
         let db_only = [192, 0, 2, 5];
@@ -10137,12 +10710,12 @@ mod tests {
             .octets();
 
         // Every spoofed attempt, decided and recorded: the tuples are
-        // (phase, source, protocol, destination, port), and each is
-        // summarized, decided by [`gate_verdict`], and recorded exactly as
-        // the gate's relay would hand the frame over. The in-force world is
-        // the one both flips create — the compiled baseline set binding
-        // beside the per-box default — built here so the in-force arms have
-        // their proof before the flips land.
+        // (baseline posture, source, protocol, destination, port), and each
+        // is summarized, decided by [`gate_verdict`], and recorded exactly
+        // as the gate's relay would hand the frame over. The in-force world
+        // is the one the baseline flip creates — the compiled baseline set
+        // binding beside the rows — built here so the in-force arms have
+        // their proof before the flip lands.
         let baseline_in_force = baseline.clone().in_force();
         let shipped_attempts: Vec<Attempt> = [
             // web's address, spoofed: decided by web's own row — the lab
@@ -10179,57 +10752,35 @@ mod tests {
             // `host_ip` members, and that a revoked member's destinations no
             // longer admit.
             (shipped, node, 6, outside, 443),
-            // An in-plan address no row holds: announced, admitted with no
-            // rules at all — the gap T66's flip (#1711) closes, into the
-            // unknown-source drop the in-force list pins. An address outside
-            // the plan's lease block is refused under both phases: outside
-            // the plan there is no lease to spoof.
+            // An in-plan address no row holds: dropped under the
+            // unregistered rule, under no phase — NET-085's drop is the
+            // frame half's unconditional posture, so this list and the
+            // in-force one pin the same verdict for it. An address outside
+            // the plan's lease block is rule 0's under both baseline
+            // postures: outside the plan there is no lease to spoof.
             (shipped, stray, 6, web_only, 80),
             (shipped, out_of_plan_src, 6, web_only, 80),
         ]
         .into_iter()
-        .map(|(phase, src, proto, dst, port)| {
-            decide(&table, &baseline, &pins, phase, src, proto, dst, port)
-        })
+        .map(|(_, src, proto, dst, port)| decide(&table, &baseline, &pins, src, proto, dst, port))
         .collect();
         let in_force_attempts: Vec<Attempt> = [
             // The node plane's own address, under the in-force baseline set:
             // bounded by the enumeration, decided beside the boxes' rows, and
             // so a spoof of the daemon's address buys the set, not a box's
             // row.
-            (
-                UnregisteredSourcePhase::InForce,
-                node,
-                6,
-                baseline_endpoint,
-                443,
-            ),
-            (UnregisteredSourcePhase::InForce, node, 6, web_only, 80),
-            (UnregisteredSourcePhase::InForce, node, 6, outside, 443),
-            // The unrowed in-plan source under the per-box default: dropped
-            // as an unknown source, whatever the plan could have done with
-            // its address.
-            (UnregisteredSourcePhase::InForce, stray, 6, web_only, 80),
-            (
-                UnregisteredSourcePhase::InForce,
-                out_of_plan_src,
-                6,
-                web_only,
-                80,
-            ),
+            (NodeBaselinePhase::InForce, node, 6, baseline_endpoint, 443),
+            (NodeBaselinePhase::InForce, node, 6, web_only, 80),
+            (NodeBaselinePhase::InForce, node, 6, outside, 443),
+            // The unrowed in-plan source under the in-force baseline: the
+            // same unregistered drop the shipped list pins — the baseline's
+            // phase does not reach the frame half either (NET-085).
+            (NodeBaselinePhase::InForce, stray, 6, web_only, 80),
+            (NodeBaselinePhase::InForce, out_of_plan_src, 6, web_only, 80),
         ]
         .into_iter()
-        .map(|(phase, src, proto, dst, port)| {
-            decide(
-                &table,
-                &baseline_in_force,
-                &pins,
-                phase,
-                src,
-                proto,
-                dst,
-                port,
-            )
+        .map(|(_, src, proto, dst, port)| {
+            decide(&table, &baseline_in_force, &pins, src, proto, dst, port)
         })
         .collect();
         let attempts: Vec<Attempt> = shipped_attempts
@@ -10253,14 +10804,14 @@ mod tests {
             for attempt in group {
                 match attempt.verdict {
                     Verdict::Dropped(rule) => println!(
-                        "  destination={}:{}({}) phase={} action=drop rule_matched=\"{rule}\"",
+                        "  destination={}:{}({}) baseline={} action=drop rule_matched=\"{rule}\"",
                         Ipv4Addr::from(attempt.dst),
                         attempt.port,
                         proto_of(attempt.proto),
                         attempt.phase.as_str(),
                     ),
                     verdict => println!(
-                        "  destination={}:{}({}) phase={} action=admit decision={verdict:?}",
+                        "  destination={}:{}({}) baseline={} action=admit decision={verdict:?}",
                         Ipv4Addr::from(attempt.dst),
                         attempt.port,
                         proto_of(attempt.proto),
@@ -10305,41 +10856,35 @@ mod tests {
                     Ipv4Addr::from(attempt.dst),
                     attempt.port,
                 ),
-                // The shipped interim's admits are the gaps, each pinned to
-                // its in-force replacement by the verdict lookups below. A
-                // proxy-lane admit is none of this test's attempts — no
-                // attempt names the proxy's address — and the arm keeps the
-                // match exhaustive for the ones that will.
-                Verdict::AdmittedByNodeRow
-                | Verdict::AdmittedByInterim
-                | Verdict::AdmittedByProxyLane
-                | Verdict::Dropped(_) => {}
+                // The shipped allow-all node row's admits are the gap,
+                // pinned to its in-force replacement by the verdict lookups
+                // below. A proxy-lane admit is none of this test's attempts
+                // — no attempt names the proxy's address — and the arm
+                // keeps the match exhaustive for the ones that will.
+                Verdict::AdmittedByNodeRow | Verdict::AdmittedByProxyLane | Verdict::Dropped(_) => {
+                }
             }
         }
 
         // The universal the table makes cheap, beside the membership loop
         // above — NET-085 as a bound, not a list. Two halves:
         //
-        // - no attempt decided against the in-force baseline set carries an
-        //   interim arm's verdict: with the per-box default and the compiled
-        //   baseline binding there is no allow-all node row and no rules-free
-        //   admit to fall through to, whichever way a future edit reorders
-        //   the decision;
-        // - every admit any phase gave a frame is the row that holds the
-        //   source's own doing: the row `table.by_source(src)` holds is the
-        //   row whose rules admit the destination, never another box's row
-        //   and never a union read out of the table. The per-pair pins below
-        //   name the destinations; this binds the shape over the whole
-        //   record, so a future attempt is covered without being pinned.
+        // - no attempt decided against the in-force baseline set carries the
+        //   allow-all node row's verdict: with the compiled baseline binding
+        //   there is no interim node row to fall through to, whichever way a
+        //   future edit reorders the decision;
+        // - every admit a frame is given is the row that holds the source's
+        //   own doing: the row `table.by_source(src)` holds is the row whose
+        //   rules admit the destination, never another box's row and never a
+        //   union read out of the table. The per-pair pins below name the
+        //   destinations; this binds the shape over the whole record, so a
+        //   future attempt is covered without being pinned.
         for attempt in &attempts {
-            if attempt.phase == UnregisteredSourcePhase::InForce {
+            if attempt.phase == NodeBaselinePhase::InForce {
                 assert!(
-                    !matches!(
-                        attempt.verdict,
-                        Verdict::AdmittedByNodeRow | Verdict::AdmittedByInterim
-                    ),
-                    "an in-force attempt of {} carries an interim arm's verdict \
-                     ({:?}); the in-force decision has no interim arm",
+                    !matches!(attempt.verdict, Verdict::AdmittedByNodeRow),
+                    "an in-force attempt of {} carries the announced node row's \
+                     verdict ({:?}); the in-force decision has no allow-all node row",
                     Ipv4Addr::from(attempt.src),
                     attempt.verdict,
                 );
@@ -10455,55 +11000,44 @@ mod tests {
         // enumeration's endpoint admitted, everything else dropped — the
         // bound a spoof of the daemon's address buys, beside the boxes' rows.
         assert_eq!(
-            verdict_of(
-                UnregisteredSourcePhase::InForce,
-                node,
-                6,
-                baseline_endpoint,
-                443
-            ),
+            verdict_of(NodeBaselinePhase::InForce, node, 6, baseline_endpoint, 443),
             Verdict::AdmittedByBaseline,
         );
         assert_eq!(
-            verdict_of(UnregisteredSourcePhase::InForce, node, 6, web_only, 80),
+            verdict_of(NodeBaselinePhase::InForce, node, 6, web_only, 80),
             Verdict::Dropped("egress-undeclared-subnet"),
         );
         assert_eq!(
-            verdict_of(UnregisteredSourcePhase::InForce, node, 6, outside, 443),
+            verdict_of(NodeBaselinePhase::InForce, node, 6, outside, 443),
             Verdict::Dropped("egress-undeclared-subnet"),
         );
 
-        // The shipped interim's arms, with the in-force arms they become:
-        // the allow-all node row admits the outside destination today, and
-        // the baseline phase's flip (#1786) turns it into the drop above;
-        // the unrowed in-plan source is admitted with no rules today, and
-        // T66's flip (#1711) turns it into the unknown-source drop beside
-        // it. The out-of-plan source is refused under both phases, so the
-        // interim can never borrow the plan's infrastructure as a source.
+        // The allow-all node row's arm, with the in-force arm it becomes: the
+        // node row admits the outside destination today, and the baseline
+        // phase's flip (#1786) turns it into the drop above. The unrowed
+        // in-plan source drops under the unregistered rule under both
+        // baseline postures — NET-085's drop is unconditional, so no arm
+        // waits on a flip for it — and the out-of-plan source stays rule
+        // 0's under both, so nothing borrows the plan's infrastructure as a
+        // source.
         assert_eq!(
             verdict_of(shipped, node, 6, outside, 443),
             Verdict::AdmittedByNodeRow,
         );
         assert_eq!(
             verdict_of(shipped, stray, 6, web_only, 80),
-            Verdict::AdmittedByInterim,
+            Verdict::Dropped("egress-unregistered-source"),
         );
         assert_eq!(
-            verdict_of(UnregisteredSourcePhase::InForce, stray, 6, web_only, 80),
-            Verdict::Dropped("egress-unknown-source"),
+            verdict_of(NodeBaselinePhase::InForce, stray, 6, web_only, 80),
+            Verdict::Dropped("egress-unregistered-source"),
         );
         assert_eq!(
             verdict_of(shipped, out_of_plan_src, 6, web_only, 80),
             Verdict::Dropped("egress-unknown-source"),
         );
         assert_eq!(
-            verdict_of(
-                UnregisteredSourcePhase::InForce,
-                out_of_plan_src,
-                6,
-                web_only,
-                80
-            ),
+            verdict_of(NodeBaselinePhase::InForce, out_of_plan_src, 6, web_only, 80),
             Verdict::Dropped("egress-unknown-source"),
         );
 
@@ -10520,8 +11054,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
-                &ReplyTables::new(),
-                shipped
+                &ReplyTables::new()
             ),
             Ok(GateAdmit::Row)
         ));
@@ -10575,8 +11108,7 @@ mod tests {
                 &table,
                 &baseline,
                 &pins,
-                &ReplyTables::new(),
-                UNREGISTERED_SOURCE_PHASE
+                &ReplyTables::new()
             ),
             Ok(GateAdmit::Row),
             "announced, the interim node row decides the node plane's frames — \
