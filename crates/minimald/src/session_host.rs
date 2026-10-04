@@ -1573,40 +1573,41 @@ pub struct HostAttrs {
     /// When the last byte was sent to the process from a binding.
     pub(crate) stdin_last: Option<SystemTime>,
 
-    /// What the launch decided about this session's box and the host's
-    /// address (NET-079, design §7.2's "declared and enforced" attribute):
-    /// `PerBox` when the box's egress verdict is decided on a classifier
-    /// leaf of its own, `None` when the host could not decide per box
-    /// and the box runs with the host's address and no verdict of its own —
-    /// the state a session-start notice says to the person in the terminal.
-    ///
-    /// A launch-time attribute, set once by the launch and never updated:
-    /// no value for a none box or an own-IP box, whose verdicts are decided
-    /// on address leases rather than the host's cgroup tree.
+    /// The launch's own placement outcome for this session's host-address
+    /// box (NET-079, design §7.2's "declared and enforced" attribute):
+    /// `PerBox` when the launch placed the box in a classifier leaf of its
+    /// own, `None` when the box ran with the host's address and no leaf —
+    /// the value the session records on the box's record, which the read
+    /// surfaces then show lowered by the host's current fact
+    /// ([`displayed_host_ip_enforcement`]), never the node fact re-read at
+    /// launch. Nothing for a none box or an own-IP box, whose verdicts are
+    /// decided on address leases rather than the host's cgroup tree.
     pub(crate) host_ip_enforcement: Option<HostIpEnforcement>,
 }
 
-/// What the launch's leaf decision means for the box's egress verdict:
-/// a host-address box with a leaf is enforced — but only while this host
-/// can decide per box at all, the fresh fact the probe read at this
-/// launch: a leaf placed on a host whose table is not loaded decides
-/// nothing while looking decided, so a box in it runs
-/// unenforced and is recorded as such, never reported as enforced over a
-/// refusal that is not there. A host-address box without a leaf runs with
-/// the host's address and no verdict of its own, and any other network
-/// mode has no host address to decide on at all.
+/// What the launch's leaf placement means for the box's egress record: the
+/// placement is the outcome the launch records — `per_box` when this launch
+/// placed this host-address box in a classifier leaf of the host's tree,
+/// `none` when it did not — never the node fact re-read beside it, because
+/// the record is the box's own launch outcome, not the host's state as it
+/// stands now. A leaf placed over a table that is not refusing still carries
+/// the leaf: the reads lower it to the state the host can currently honour
+/// ([`displayed_host_ip_enforcement`]), and when the table comes back the
+/// box is in the leaf its launch placed it in, so the record says so without
+/// a relaunch. A host-address box without a leaf ran with the host's address
+/// and no verdict of its own, and any other network mode has no host address
+/// to decide on at all.
 ///
 /// Pure over its inputs, so the mapping is pinned where it is written.
 fn host_ip_enforcement(
     network_mode: NetworkMode,
     leaf: Option<&sandbox2::config::ClassifierLeaf>,
-    can_decide_per_box: bool,
 ) -> Option<HostIpEnforcement> {
     match network_mode {
-        NetworkMode::HostNet => match (leaf, can_decide_per_box) {
-            (Some(_), true) => Some(HostIpEnforcement::PerBox),
-            _ => Some(HostIpEnforcement::None),
-        },
+        NetworkMode::HostNet => Some(match leaf {
+            Some(_) => HostIpEnforcement::PerBox,
+            None => HostIpEnforcement::None,
+        }),
         _ => None,
     }
 }
@@ -2549,8 +2550,8 @@ fn launch_mountinfo(knob: Option<String>) -> Option<String> {
 /// exists. It is the node's half of every surface that shows a session: the
 /// create reply states it outright (no box has launched yet to have its own
 /// outcome), each read surface's refusal gate answers over its cause, and
-/// the listing and the effective-policy reply lower a box's own launch
-/// record by its state — never raise one to it.
+/// the listing and the runtime-facts reply lower a box's own launch record
+/// by its state — never raise one to it.
 ///
 /// `cause` rides beside the state because the two are one fact: the state a
 /// display shows and the advice the create reply carries both come from the
@@ -2645,14 +2646,17 @@ pub(crate) fn clear_host_ip_enforcement_fact() {
 /// a box the classifier refused at placement has no state to show, because
 /// the refusal is what its launch said.
 ///
-/// The record is lowered by the daemon's one node fact, never raised: a box
-/// launched `per_box` on a host whose table has since stopped deciding shows
-/// `none`, because the state the box's own record claims is not one this
-/// host can currently honour — and a box launched unenforced stays `none`
-/// for its life, whatever a later launch of another box decided, because
-/// the outcome belongs to the launch that produced it, not to the node as it
-/// stands now. Only a host-address box that has not launched yet — a created
-/// session, or one whose host never minted — shows the fact alone.
+/// The record is lowered by the daemon's one node fact, never raised above
+/// either half: a box whose launch placed it shows `per_box` only while
+/// this host can decide per box, and `none` whenever it cannot — whether
+/// the table stopped deciding after the placement or had not decided when
+/// the placement was made, because a leaf over a table that is not
+/// refusing decides nothing until it refuses again. A box its launch left
+/// unplaced stays `none` for its life, whatever a later launch of another
+/// box decided, because the outcome belongs to the launch that produced
+/// it, not to the node as it stands now. Only a host-address box that has
+/// not launched yet — a created session, or one whose launch never minted
+/// a host — shows the fact alone.
 ///
 /// The refusal half is the launch's own gate —
 /// [`refused_unenforced_host_address_box`] — so a display cannot disagree
@@ -2709,7 +2713,11 @@ pub(crate) fn displayed_host_ip_enforcement(
 /// also where a decided fact's box goes. `None` — a decided fact, or the
 /// cell's default — places, so a display's refusal inference reads a decided
 /// host as the placement its launches make.
-fn fact_places_a_leaf(cause: Option<crate::net::classifier::Cause>) -> bool {
+///
+/// `pub(crate)`: the test launcher's mock models its placement's outcome
+/// from the same cause the displays infer a launch's placement over, so
+/// the two never disagree about which causes place.
+pub(crate) fn fact_places_a_leaf(cause: Option<crate::net::classifier::Cause>) -> bool {
     !matches!(
         cause,
         Some(
@@ -2796,8 +2804,8 @@ fn classifier_reading(root: &std::path::Path) -> crate::net::classifier::Reading
 /// launch that decides a box over a table and then places it over another
 /// has read nothing.
 ///
-/// The launch's read — the decision the placement, the recorded enforcement,
-/// and the refusal all answer over — and the write that keeps the daemon's
+/// The launch's read — the decision the placement and the refusal answer
+/// over — and the write that keeps the daemon's
 /// one node fact ([`HOST_IP_ENFORCEMENT_FACT`]) current, in one move: the
 /// read is fresh rather than a kept start-time reading, because the fact
 /// the decision rests on is the table's *effect* (design §7.4) — a marker
@@ -2941,17 +2949,19 @@ async fn create_session_leaf(
             }
             // One info line per host-address box launch naming its classifier
             // identity (NET-079's observability): the subtree its declaration
-            // picked, the leaf that verdict placed it in, and whether this
-            // host can decide per box — the fresh fact this launch's probe
-            // just read from the table's effect. A leaf placed on a host
-            // whose table is not loaded decides nothing while looking
-            // decided, so the line never says `per_box` for one.
+            // picked, and the leaf that verdict placed it in. The outcome
+            // the launch records is the record line's to carry — it is
+            // session-attributed and spells `per_box` for every placement,
+            // while this line says where the leaf is; what this line adds
+            // is whether this host can decide per box, the fresh fact this
+            // launch's probe just read from the table's effect, which the
+            // prose below names for the box a placement put in a leaf
+            // whose table is not deciding.
             if can_decide_per_box {
                 tracing::info!(
                     session = session_name,
                     classifier = verdict.dir_name(),
                     leaf = %leaf.display(),
-                    host_ip_enforcement = %HostIpEnforcement::PerBox.machine_str(),
                     "the host-address box's egress verdict is decided on its \
                      classifier leaf, in the {} subtree",
                     verdict.dir_name()
@@ -2961,7 +2971,6 @@ async fn create_session_leaf(
                     session = session_name,
                     classifier = verdict.dir_name(),
                     leaf = %leaf.display(),
-                    host_ip_enforcement = %HostIpEnforcement::None.machine_str(),
                     "the host-address box's leaf is placed in the {} subtree, \
                      but this host's classifier table is not loaded, so its \
                      egress verdict is not decided per box",
@@ -3307,22 +3316,34 @@ fn refused_unenforced_host_address_box(
 /// The counterpart of [`refused_unenforced_host_address_box`]: an unenforced
 /// host-address box is the advisory posture on *either* kind of host —
 /// natively NET-079's exception, in the guest the interim's own state — so
-/// every *session* launch the record says `none` for says so, once per
-/// launch like the resolver advisory it is modelled on (design §7.1), never
-/// once per daemon. The refusals stand untouched beside it: a box the guest
-/// cannot place is refused and advises nothing (the refusal is that state's
-/// surface), and so is a deny-all box on a table the guest has not loaded,
-/// and natively a deny-all box over either probe cause — the advisory is the
-/// *other* host-address boxes' state, the ones that need no verdict
-/// enforced to run, and the ruling's ask is that their state be said at
-/// every session start, not left as a daemon log line alone. What this
-/// predicate does not carry is the launch's audience — a launch minted for
-/// lifecycle hooks advises nobody (a hook run is not a session start),
-/// which the launch itself folds in over
+/// every *session* launch whose box runs without a verdict of its own says
+/// so, once per launch like the resolver advisory it is modelled on
+/// (design §7.1), never once per daemon. The refusals stand untouched
+/// beside it: a box the guest cannot place is refused and advises nothing
+/// (the refusal is that state's surface), and so is a deny-all box on a
+/// table the guest has not loaded, and natively a deny-all box over either
+/// probe cause — the advisory is the *other* host-address boxes' state, the
+/// ones that need no verdict enforced to run, and the ruling's ask is that
+/// their state be said at every session start, not left as a daemon log
+/// line alone.
+///
+/// The state is read from the placement and the decision, not from the
+/// launch's record: the record carries the placement — `per_box` for a
+/// placed box, whatever the table decides — while the advisory is the box's
+/// *current* state, the one the notice names, so a leaf placed over a table
+/// that is not deciding advises exactly like a box nothing placed. What
+/// this predicate does not carry is the launch's audience — a launch
+/// minted for lifecycle hooks advises nobody (a hook run is not a session
+/// start), which the launch itself folds in over
 /// [`SandboxLauncher::for_hooks`]. Pure over its inputs, so the gate is
 /// pinned where it is written.
-fn advises_unenforced_placement(enforcement: Option<HostIpEnforcement>) -> bool {
-    enforcement == Some(HostIpEnforcement::None)
+fn advises_unenforced_placement(
+    network_mode: NetworkMode,
+    leaf: Option<&sandbox2::config::ClassifierLeaf>,
+    decision: Option<&crate::net::classifier::Decision>,
+) -> bool {
+    matches!(network_mode, NetworkMode::HostNet)
+        && !(leaf.is_some() && decision.is_some_and(|d| d.can_decide_per_box()))
 }
 
 /// The advisory text for a launch whose host-address box runs unenforced:
@@ -3497,17 +3518,14 @@ impl SessionLauncher for SandboxLauncher {
         };
         let mut leaf_guard = leaf.clone().map(BoxLeafGuard::new);
 
-        // What this launch's leaf decision means for the box's egress
-        // verdict: enforced only while this host can decide per box at all
-        // — the fresh fact the probe just read, the table's refusal in
-        // force — so a leaf placed on a host whose table is not loaded is
-        // recorded as the unenforced state it is, and the refusal and the
-        // advice below read the one decision.
-        let enforcement = host_ip_enforcement(
-            network_mode,
-            leaf.as_ref(),
-            decision.as_ref().is_some_and(|d| d.can_decide_per_box()),
-        );
+        // What this launch's placement means for the box's egress record:
+        // the leaf itself, never the node fact re-read beside it — the
+        // record is this box's own launch outcome, and the reads lower it by
+        // the fact (`displayed_host_ip_enforcement`), so a leaf placed over
+        // a table that is not refusing shows `none` while the host cannot
+        // decide and `per_box` once it can again, without a relaunch. The
+        // refusal and the advice below read the one decision.
+        let enforcement = host_ip_enforcement(network_mode, leaf.as_ref());
 
         // A host-address box this host cannot give a verdict of its own is
         // refused where the box's own declaration is the thing that cannot
@@ -3578,7 +3596,8 @@ impl SessionLauncher for SandboxLauncher {
         // A launch minted for lifecycle hooks advises on neither surface: a
         // hook run is not a session start, and its record would count one
         // hook run as one. The placement itself is not gated with it.
-        let advise = advises_unenforced_placement(enforcement) && !for_hooks;
+        let advise = advises_unenforced_placement(network_mode, leaf.as_ref(), decision.as_ref())
+            && !for_hooks;
         if advise {
             let notice = unenforced_placement_notice(guest, leaf.as_ref());
             tracing::info!(
@@ -3966,9 +3985,9 @@ impl SessionLauncher for SandboxLauncher {
             net_guard,
             tty_path,
             seal_injection,
-            // The launch's own decision about this box's egress verdict, so
-            // the session can say which it runs under without re-deriving
-            // it from things a person never sees.
+            // The launch's own placement outcome for this box, so the
+            // session can record it without re-deriving it from things a
+            // person never sees.
             host_ip_enforcement: enforcement,
             // The copy the host keeps, so every process injected into the
             // session can join the same leaf.
@@ -4057,13 +4076,15 @@ pub(crate) struct MockLauncher {
     /// observe network teardown; `None` for the plain mock (mirroring
     /// `HostNet`/`NoNet`).
     net_guard: Option<Box<dyn sandbox2::NetGuard>>,
-    /// The per-box egress enforcement this mock launch reports (NET-079):
-    /// seeded by the session's test launcher from the daemon's one node fact,
-    /// so a test that injects a classifier reading and re-reads the fact has
-    /// the launches it drives record each box's own outcome over it. The mock
-    /// has no sandbox, so it places nothing and models the placement's
-    /// outcome as the fact's state; the real launcher's placement-to-outcome
-    /// mapping is pinned where it is written, in this module's launch proofs.
+    /// The placement outcome this mock launch reports (NET-079): seeded by
+    /// the session's test launcher from the daemon's one node fact —
+    /// `per_box` when the fact's cause says the tree is there to place a
+    /// leaf in (`fact_places_a_leaf`), `none` when it does not — so a test
+    /// that injects a classifier reading and re-reads the fact has the
+    /// launches it drives record each box's own placement outcome over it.
+    /// The mock has no sandbox, so it places nothing and models the
+    /// placement's outcome; the real launcher's placement-to-record mapping
+    /// is pinned where it is written, in this module's launch proofs.
     host_ip_enforcement: Option<HostIpEnforcement>,
 }
 

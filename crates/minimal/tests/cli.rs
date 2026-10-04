@@ -922,7 +922,14 @@ async fn policy_shows_effective_egress() {
         }
     };
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet, None, None).unwrap();
+    format_policy(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::HostNet,
+        None,
+        None,
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -951,8 +958,9 @@ async fn policy_shows_effective_egress() {
             panic!("GetSessionRuntimeFacts failed: {error}")
         }
     };
-    let host_ip_enforcement =
-        facts.host_ip_enforcement.expect("a host-address session answers a state");
+    let host_ip_enforcement = facts
+        .host_ip_enforcement
+        .expect("a host-address session answers a state");
     let mut out = Vec::new();
     format_policy(
         &mut out,
@@ -1067,7 +1075,14 @@ async fn policy_shows_deny_all_default() {
         "the in-force default for a bare own-address box is deny-all"
     );
     let mut out = Vec::new();
-    format_policy(&mut out, &in_force, sessions::NetworkMode::OwnIp, None, None).unwrap();
+    format_policy(
+        &mut out,
+        &in_force,
+        sessions::NetworkMode::OwnIp,
+        None,
+        None,
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("egress\n  deny all\n"),
@@ -1117,7 +1132,14 @@ async fn policy_shows_deny_all_default() {
     };
     assert_eq!(policy.egress, sessions::EffectiveEgress::AllowAll);
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet, None, None).unwrap();
+    format_policy(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::HostNet,
+        None,
+        None,
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("egress\n  allow all\n"),
@@ -1238,7 +1260,14 @@ fn policy_shows_baseline_set() {
     // and the set is left out rather than printed from the microVM plan the
     // session does not attach to.
     let mut out = Vec::new();
-    format_policy(&mut out, &deny_all, sessions::NetworkMode::OwnIp, None, None).unwrap();
+    format_policy(
+        &mut out,
+        &deny_all,
+        sessions::NetworkMode::OwnIp,
+        None,
+        None,
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         !text.contains("node-plane baseline set"),

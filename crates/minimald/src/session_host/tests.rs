@@ -2119,18 +2119,20 @@ fn a_leftover_leaf_is_reclaimed_but_a_held_one_refuses_the_launch() {
     );
 }
 
-/// What the launch's leaf decision means for the box's egress verdict — the
+/// What the launch's leaf placement means for the box's egress record — the
 /// declared-and-enforced attribute a session carries from its launch
-/// (design §7.2): a host-address box with a leaf is enforced, but only while
-/// this host can decide per box at all — the start-time fact the loaded
-/// table's presence marker carries — so a leaf placed on a host whose table
-/// is not loaded is recorded as the unenforced state it is, never reported
-/// as enforced over a refusal that is not there. A host-address box without
-/// one runs with the host's address and no verdict of its own, and a none
-/// box or an own-IP box has no host address to decide on at all. Pure over
-/// its inputs, so each mapping is pinned where it is written — beside the
-/// refusal predicate, the two halves of what a launch says about the box it
-/// is about to run.
+/// (design §7.2): the placement is the outcome the launch records, never
+/// the node fact re-read beside it, because the record is the box's own
+/// launch outcome, not the host's state as it stands now. A host-address
+/// box with a leaf is recorded `per_box` whatever the table is doing — the
+/// reads lower it to the state the host can currently honour
+/// (`displayed_host_ip_enforcement`), and when the table comes back the box
+/// is in the leaf its launch placed it in. A host-address box without a
+/// leaf ran with the host's address and no verdict of its own, recorded
+/// `none` for its life; a none box or an own-IP box has no host address to
+/// decide on at all. Pure over its inputs, so each mapping is pinned where
+/// it is written — beside the refusal predicate, the two halves of what a
+/// launch says about the box it is about to run.
 #[test]
 fn host_ip_enforcement_says_what_the_launch_decided() {
     use sessions::NetworkMode;
@@ -2150,32 +2152,24 @@ fn host_ip_enforcement_says_what_the_launch_decided() {
         )
         .expect("the leaf the launch places its box in"),
     );
-    let decided =
-        |mode, leaf: Option<sandbox2::config::ClassifierLeaf>, can_decide_per_box: bool| {
-            super::host_ip_enforcement(mode, leaf.as_ref(), can_decide_per_box)
-        };
+    let placed = |mode, leaf: Option<sandbox2::config::ClassifierLeaf>| {
+        super::host_ip_enforcement(mode, leaf.as_ref())
+    };
 
     assert_eq!(
-        decided(NetworkMode::HostNet, Some(leaf.clone()), true),
+        placed(NetworkMode::HostNet, Some(leaf.clone())),
         Some(super::HostIpEnforcement::PerBox),
-        "a host-address box with a leaf has its egress verdict decided on it, \
-         while this host can decide per box"
+        "a host-address box its launch placed is recorded `per_box` — the \
+         leaf is the outcome, and the reads lower it to the state the host \
+         can currently honour, never raise a placement the tree did not make"
     );
     assert_eq!(
-        decided(NetworkMode::HostNet, Some(leaf.clone()), false),
+        placed(NetworkMode::HostNet, None),
         Some(super::HostIpEnforcement::None),
-        "a leaf placed on a host whose table is not loaded decides nothing \
-         while looking decided: the record says the state it is, never \
-         `per_box` over a refusal that is not there"
+        "a host-address box its launch left unplaced is recorded `none` — it \
+         ran with the host's address and no verdict of its own, and no \
+         later host state is that launch's to raise it with"
     );
-    for can_decide_per_box in [true, false] {
-        assert_eq!(
-            decided(NetworkMode::HostNet, None, can_decide_per_box),
-            Some(super::HostIpEnforcement::None),
-            "a host-address box with no leaf runs with the host's address and \
-             no verdict of its own — the state the session-start notice names"
-        );
-    }
     for (mode, why) in [
         (NetworkMode::NoNet, "a none box has no traffic to decide"),
         (
@@ -2183,9 +2177,9 @@ fn host_ip_enforcement_says_what_the_launch_decided() {
             "an own-IP box's verdict is its own, on the address it holds",
         ),
     ] {
-        for (leaf, can_decide_per_box) in [(Some(leaf.clone()), true), (None, false)] {
+        for leaf in [Some(leaf.clone()), None] {
             assert_eq!(
-                decided(mode, leaf, can_decide_per_box),
+                placed(mode, leaf),
                 None,
                 "{why}: there is no host address to decide on, leaf or no leaf"
             );
@@ -2711,7 +2705,7 @@ async fn unenforcing_native_host_runs_host_ip_box_unenforced() {
         );
     }
     assert_eq!(
-        super::host_ip_enforcement(NetworkMode::HostNet, None, false),
+        super::host_ip_enforcement(NetworkMode::HostNet, None),
         Some(super::HostIpEnforcement::None),
         "a host-address box with no leaf is recorded unenforced, whatever it \
          declared"
@@ -3245,12 +3239,13 @@ async fn a_hook_launch_does_not_advise_unenforced_placement() {
 }
 
 /// The guest's unenforced host-address box is not a silent state: whatever
-/// host it runs on, a box the record says `none` for is said at its session
-/// start. The gate keys on the enforcement alone, and the guest's refusal
-/// predicate keys on the placement and the declaration — an unplaceable box,
-/// a deny-all box with no table to enforce it — so the two never overlap:
-/// what reaches the gate runs, and what is refused never reaches it. The
-/// notice is the interim's own words, because no installer exists inside a
+/// host it runs on, a box that runs without a verdict of its own is said at
+/// its session start. The gate keys on the placement and the decision, and
+/// the guest's refusal predicate keys on the placement and the declaration
+/// — an unplaceable box, a deny-all box with no table to enforce it — so
+/// the two never overlap: what reaches the gate runs, and what is refused
+/// never reaches it. The notice is the interim's own words, because no
+/// installer exists inside a
 /// microVM: the person to tell is the image's builder, not whoever holds
 /// the session, so no command is named. Pinned as data, so the gate and
 /// the text are decided where they are written.
@@ -3260,26 +3255,45 @@ fn the_guests_unenforced_host_address_box_advises_with_the_interim() {
     use sessions::NetworkMode;
     use std::path::Path;
 
-    // The gate: the enforcement alone, never the host kind. A refusal is
-    // `refused_unenforced_host_address_box`'s business, and a box that runs
-    // unenforced advises wherever it runs.
-    assert!(super::advises_unenforced_placement(Some(
-        super::HostIpEnforcement::None
-    )));
-    assert!(!super::advises_unenforced_placement(Some(
-        super::HostIpEnforcement::PerBox
-    )));
-    assert!(!super::advises_unenforced_placement(None));
-    // The mapping that feeds the gate says `none` on either host kind for
-    // a box this host cannot decide per box — the state the guest's placed
-    // boxes share with the native host's.
-    assert_eq!(
-        super::host_ip_enforcement(NetworkMode::HostNet, None, false),
-        Some(super::HostIpEnforcement::None)
+    // The gate: the placement and the decision, never the host kind. A
+    // refusal is `refused_unenforced_host_address_box`'s business, and a
+    // box that runs without a verdict of its own advises wherever it runs.
+    let undecidable = crate::net::classifier::Decision::undecidable(
+        crate::net::classifier::Cause::GuestTableNotLoaded,
     );
+    let decided = crate::net::classifier::Decision::decided();
+    let leaf = sandbox2::config::ClassifierLeaf::under(
+        Path::new(sandbox2::classifier::TREE_ROOT),
+        "a session",
+        Verdict::Allow,
+    );
+    assert!(
+        super::advises_unenforced_placement(NetworkMode::HostNet, None, Some(&undecidable)),
+        "a box nothing placed runs unenforced and says so"
+    );
+    assert!(
+        super::advises_unenforced_placement(NetworkMode::HostNet, Some(&leaf), Some(&undecidable)),
+        "the guest's own state: a leaf placed over a table that is not \
+         deciding runs unenforced now, and that is what the notice names"
+    );
+    assert!(
+        !super::advises_unenforced_placement(NetworkMode::HostNet, Some(&leaf), Some(&decided)),
+        "a placed box on a host that decides per box runs enforced, and has \
+         no unenforced state to say"
+    );
+    assert!(
+        !super::advises_unenforced_placement(NetworkMode::OwnIp, Some(&leaf), Some(&undecidable)),
+        "a box with no host address has no unenforced state to advise about"
+    );
+    // The record the same placement writes: the leaf is the outcome — the
+    // reads lower it to `none` while the guest cannot decide, never the
+    // guest's fact re-read beside it — and an unplaced box records the
+    // state it ran in, which no later host state raises.
     assert_eq!(
-        super::host_ip_enforcement(NetworkMode::HostNet, None, true),
-        Some(super::HostIpEnforcement::None)
+        super::host_ip_enforcement(NetworkMode::HostNet, None),
+        Some(super::HostIpEnforcement::None),
+        "a box the launch left unplaced is recorded unenforced — the state \
+         the guest's unplaced boxes share with the native host's"
     );
 
     // The guest's notice: the interim's words, the machine spelling of the
@@ -3304,11 +3318,6 @@ fn the_guests_unenforced_host_address_box_advises_with_the_interim() {
     );
     // Whatever its leaf looks like: the guest's state is the table's
     // absence, never the leaf's, so the notice is one text.
-    let leaf = sandbox2::config::ClassifierLeaf::under(
-        Path::new(sandbox2::classifier::TREE_ROOT),
-        "a session",
-        Verdict::Allow,
-    );
     assert_eq!(
         super::unenforced_placement_notice(true, Some(&leaf)),
         notice,
@@ -3451,11 +3460,12 @@ async fn a_guests_refused_host_address_box_is_refused_and_not_advised() {
 /// sandbox2's own proof), so a launch-driven placed-guest box exists only on
 /// a microVM image that built its tree and skipped its table. Rather than
 /// skip on every lane, this proof runs the placed box's assertions where the
-/// launch decides them, on every host: the enforcement its placed leaf maps
-/// to when the guest cannot decide per box, the machine spelling the record
-/// and the pty banner carry, the gate that refuses exactly the deny-all
-/// sibling with the interim's words, and the state a host that decides per
-/// box has no advisory for. The halves that need the tree itself stay with
+/// launch decides them, on every host: the outcome its placed leaf records,
+/// the state the reads lower it to when the guest cannot decide per box and
+/// the machine spelling the record and the pty banner carry, the gate that
+/// refuses exactly the deny-all sibling with the interim's words, and the
+/// state a host that decides per box has no advisory for. The halves that
+/// need the tree itself stay with
 /// the launches that run everywhere: the unplaced guest's refusal and
 /// silence
 /// (`a_guests_refused_host_address_box_is_refused_and_not_advised`) and the
@@ -3479,24 +3489,45 @@ fn a_guests_placed_unenforced_host_address_box_advises_at_its_start() {
         crate::net::classifier::Cause::GuestTableNotLoaded,
     );
 
-    // The state a guest without its table puts its placed boxes in:
-    // unenforced, never `per_box` — the leaf looks decided and decides
-    // nothing — so the start-up record spells it `none` and the advisory
-    // fires at every session start of the box.
-    let enforcement = super::host_ip_enforcement(NetworkMode::HostNet, Some(&leaf), false);
+    // The state a guest without its table puts its placed boxes in: the
+    // launch records the placement — `per_box`, the leaf is the outcome,
+    // whatever the table is doing — and the reads lower it to the
+    // unenforced state the table leaves the box in while it cannot decide,
+    // never raise the placement to a verdict nothing is enforcing, so the
+    // banner spells `none` and the advisory fires at every session start
+    // of the box.
+    let recorded = super::host_ip_enforcement(NetworkMode::HostNet, Some(&leaf));
     assert_eq!(
-        enforcement,
-        Some(super::HostIpEnforcement::None),
-        "a box placed on a guest that has not loaded its table runs \
-         unenforced, never enforced over a refusal that is not there"
+        recorded,
+        Some(super::HostIpEnforcement::PerBox),
+        "a box placed on a guest that has not loaded its table is recorded \
+         by its placement — the leaf is the outcome, never the node fact \
+         re-read beside it"
+    );
+    let shown = super::displayed_host_ip_enforcement(
+        true,
+        NetworkMode::HostNet,
+        Verdict::Allow,
+        &super::HostIpEnforcementFact {
+            enforcement: super::HostIpEnforcement::None,
+            cause: Some(crate::net::classifier::Cause::GuestTableNotLoaded),
+        },
+        recorded,
     );
     assert_eq!(
-        enforcement.map(super::HostIpEnforcement::machine_str),
+        shown,
+        Some(super::HostIpEnforcement::None),
+        "the reads lower the placed box's record to the state its host can \
+         currently honour: unenforced, never `per_box` over a refusal that \
+         is not there"
+    );
+    assert_eq!(
+        shown.map(super::HostIpEnforcement::machine_str),
         Some("none"),
         "the record and the banner carry the state in the machine spelling"
     );
     assert!(
-        super::advises_unenforced_placement(enforcement),
+        super::advises_unenforced_placement(NetworkMode::HostNet, Some(&leaf), Some(&undecidable)),
         "the placed box's unenforced state is said at its own session start"
     );
 
@@ -3543,12 +3574,26 @@ fn a_guests_placed_unenforced_host_address_box_advises_at_its_start() {
     );
 
     // A host that decides per box has no unenforced state to say: its
-    // boxes run enforced, and the advisory has nothing to fire for.
-    let enforced = super::host_ip_enforcement(NetworkMode::HostNet, Some(&leaf), true);
+    // boxes run enforced — the same record, shown as it stands — and the
+    // advisory has nothing to fire for.
+    let enforced = super::displayed_host_ip_enforcement(
+        true,
+        NetworkMode::HostNet,
+        Verdict::Allow,
+        &super::HostIpEnforcementFact {
+            enforcement: super::HostIpEnforcement::PerBox,
+            cause: None,
+        },
+        recorded,
+    );
     assert_eq!(
         enforced,
         Some(super::HostIpEnforcement::PerBox),
         "a placed box on a host that decided per box runs enforced"
     );
-    assert!(!super::advises_unenforced_placement(enforced));
+    assert!(!super::advises_unenforced_placement(
+        NetworkMode::HostNet,
+        Some(&leaf),
+        Some(&crate::net::classifier::Decision::decided())
+    ));
 }

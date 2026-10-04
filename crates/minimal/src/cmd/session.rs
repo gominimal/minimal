@@ -1838,7 +1838,13 @@ pub async fn cmd_session_policy(
             let fabric = (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
                 .then_some(switch::SwitchSubnet::default());
             let mut out = std::io::stdout();
-            format_policy(&mut out, &policy, record.network, host_ip_enforcement, fabric)?;
+            format_policy(
+                &mut out,
+                &policy,
+                record.network,
+                host_ip_enforcement,
+                fabric,
+            )?;
             write_live_ingress(&mut out, &live)?;
             out.flush().context("Failed to write policy")?;
             Ok(())

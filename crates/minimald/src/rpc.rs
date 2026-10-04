@@ -1115,14 +1115,13 @@ async fn serve_get_session_runtime_facts(
                     error: "no session found".to_string(),
                 }),
                 Some(record) => {
-                    let host_ip_enforcement =
-                        crate::session_host::displayed_host_ip_enforcement(
-                            s.in_microvm().await,
-                            record.network,
-                            classifier::verdict_of(record.policy.egress.as_ref()),
-                            &crate::session_host::host_ip_enforcement_fact(),
-                            record.host_ip_enforcement,
-                        );
+                    let host_ip_enforcement = crate::session_host::displayed_host_ip_enforcement(
+                        s.in_microvm().await,
+                        record.network,
+                        classifier::verdict_of(record.policy.egress.as_ref()),
+                        &crate::session_host::host_ip_enforcement_fact(),
+                        record.host_ip_enforcement,
+                    );
                     Ok(Errorable::Ok(minimald_rpc::SessionRuntimeFacts {
                         host_ip_enforcement,
                     }))
@@ -3890,17 +3889,20 @@ mod tests {
 
     /// NET-079's "recorded as such" belongs to the box, not the node: each
     /// host-address box's own launch records its placement outcome on the
-    /// session record, and every read surface shows that record — lowered
-    /// to `none` when the host can no longer decide per box, never raised to
-    /// `per_box` by a host that has since decided. Driven end to end over the
-    /// daemon's own attach path, the launches a session's start takes: box A
-    /// while the injected classifier reads undecided, box B after it reads
-    /// per_box, and the fact read back to `none` after both. A shows `none`
-    /// on the listing and the policy reply for its life — beside B's
-    /// `per_box`, which is what proves the reads answer over the box's own
-    /// record and not the host's state — and the moment the fact reads
-    /// `none` again, B is lowered beside it, while A never had further to
-    /// fall.
+    /// session record, and every read surface shows that record — lowered to
+    /// `none` when the host cannot decide per box, never raised above the
+    /// placement the launch made. Driven end to end over the daemon's own
+    /// attach path, the launches a session's start takes: boxes A and B
+    /// placed — A while the injected classifier reads undecided, B once it
+    /// reads per_box — and box C left unplaced by the step's absence. A
+    /// records the placement its launch made over a table that was not
+    /// refusing, and shows `none` while the host cannot decide, `per_box`
+    /// the moment the table refuses again — the box is in the leaf its
+    /// launch placed it in. C records `none` and shows `none` beside its
+    /// siblings' `per_box` on the same host, whatever the host has since
+    /// decided — which is what proves the reads answer over the box's own
+    /// record and not the host's state — and when the fact reads `none`
+    /// again, every box on it is lowered beside it.
     // The guard is taken before the server is even built and held across
     // every launch and read on purpose: the fact the launches record over
     // and the reads lower by is process-global, so under libtest another
@@ -3911,7 +3913,7 @@ mod tests {
                   awaited launches and reads it is held for"
     )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_unenforced_launch_stays_none_after_the_host_decides() {
+    async fn an_unplaced_launch_stays_none_after_the_host_decides() {
         let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let server = TestServer::new().await;
         let mut client = server.connect().await;
@@ -3924,8 +3926,10 @@ mod tests {
         let (tree, root, mountinfo) = installed_cohort_tree();
 
         // Box A's host reads undecided: the marker stands over a table whose
-        // refusal is gone, so this host cannot decide per box and A's own
-        // launch places it in no deciding state.
+        // refusal is gone, so this host cannot decide per box — but the step's
+        // tree is still there for a launch to place a box in, and the
+        // placement is the outcome A's launch records; the table's state is
+        // the reads' to lower it by, never the launch's to record.
         crate::session_host::install_classifier_reading_standin(classifier::Reading::NotRefused {
             because: "the injected reading stands in for a probe whose \
                           every leg completed"
@@ -3952,6 +3956,35 @@ mod tests {
             .unwrap();
         let mut channel_a = client.open_shell(created_a.id).await;
         await_launch_echo(&mut channel_a, "probe-a").await;
+
+        // Box A's own record, read back while its host still cannot decide:
+        // the placement its launch made, not the table's state — and every
+        // read surface lowers it to `none` over the fact, never shows a
+        // `per_box` nothing is enforcing.
+        let record_a = client
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(created_a.id))
+            .await
+            .record
+            .expect("box A's record is readable");
+        assert_eq!(
+            record_a.host_ip_enforcement,
+            Some(minimald_rpc::HostIpEnforcement::PerBox),
+            "box A's own launch recorded the placement it made over the \
+             table that was not refusing, got: {:?}",
+            record_a.host_ip_enforcement
+        );
+        assert_eq!(
+            listed_enforcement(&mut client, created_a.id).await,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the listing lowers box A's record to the state its host is in \
+             now — a leaf over a table that is not refusing decides nothing"
+        );
+        assert_eq!(
+            facts_enforcement(&mut client, created_a.id).await,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the runtime-facts reply lowers box A's record beside the rules \
+             it runs under"
+        );
 
         // Box B's host reads per_box: the table's refusal is in force, so
         // this host can decide a box's verdict on a leaf of its own.
@@ -3981,40 +4014,28 @@ mod tests {
         // The boxes' own records: each launch's outcome, each on the box it
         // launched — the daemon-owned field a create left empty and only a
         // launch wrote.
-        let record_a = client
-            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(created_a.id))
-            .await
-            .record
-            .expect("box A's record is readable");
         let record_b = client
             .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(created_b.id))
             .await
             .record
             .expect("box B's record is readable");
         assert_eq!(
-            record_a.host_ip_enforcement,
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "box A's own launch recorded the undecidable state it launched \
-             under, got: {:?}",
-            record_a.host_ip_enforcement
-        );
-        assert_eq!(
             record_b.host_ip_enforcement,
             Some(minimald_rpc::HostIpEnforcement::PerBox),
-            "box B's own launch recorded the per-box state its host decided, \
+            "box B's own launch recorded the placement its host decided, \
              got: {:?}",
             record_b.host_ip_enforcement
         );
 
-        // The reads show the boxes' own records while the host can decide:
-        // A stays `none` beside B's `per_box` — on the listing and the
-        // runtime-facts reply both, and whatever the host now decides for
-        // boxes it has yet to launch.
+        // The reads while the host decides: A's recorded placement is one
+        // this host can honour again — the table refuses per the leaf A's
+        // launch placed it in, so A shows `per_box` beside B, without a
+        // relaunch — on the listing and the runtime-facts reply both.
         assert_eq!(
             listed_enforcement(&mut client, created_a.id).await,
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "the listing shows box A's own launch record — the host's \
-             current state is not box A's to show"
+            Some(minimald_rpc::HostIpEnforcement::PerBox),
+            "the listing shows box A's record as it stands while the table \
+             refuses again — the box is in the leaf its launch placed it in"
         );
         assert_eq!(
             listed_enforcement(&mut client, created_b.id).await,
@@ -4024,9 +4045,9 @@ mod tests {
         );
         assert_eq!(
             facts_enforcement(&mut client, created_a.id).await,
-            Some(minimald_rpc::HostIpEnforcement::None),
-            "the runtime-facts reply shows box A's own launch record beside \
-             the rules it runs under"
+            Some(minimald_rpc::HostIpEnforcement::PerBox),
+            "the runtime-facts reply shows box A's placement beside the \
+             rules it runs under, once the table enforces it again"
         );
         assert_eq!(
             facts_enforcement(&mut client, created_b.id).await,
@@ -4035,20 +4056,71 @@ mod tests {
              its host can still decide per box"
         );
 
+        // Box C's host reads the step's absence: a cause the cohort tree
+        // cannot produce — it has the step's whole half — so the fact is
+        // set the way a host without it reads, which is the only half the
+        // test launcher's placement consults. Nothing places a leaf for C:
+        // its launch records the outcome of a placement that did not
+        // happen.
+        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+            classifier::Cause::StepNotInstalled,
+        ));
+
+        // Box C: the same create-and-attach, on the host whose tree is not
+        // there to place it.
+        let created_c = client
+            .call::<CreateSession>(&req("launch-proof-c", "/uwu"))
+            .await
+            .unwrap();
+        let mut channel_c = client.open_shell(created_c.id).await;
+        await_launch_echo(&mut channel_c, "probe-c").await;
+
+        let record_c = client
+            .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(created_c.id))
+            .await
+            .record
+            .expect("box C's record is readable");
+        assert_eq!(
+            record_c.host_ip_enforcement,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "box C's own launch recorded the placement it could not make, \
+             got: {:?}",
+            record_c.host_ip_enforcement
+        );
+        assert_eq!(
+            listed_enforcement(&mut client, created_c.id).await,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the listing shows box C's own record — the outcome of a launch \
+             that placed nothing"
+        );
+        assert_eq!(
+            facts_enforcement(&mut client, created_c.id).await,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the runtime-facts reply shows box C's own record beside the \
+             rules it runs under"
+        );
+
         // The observability half: one info line per host-address box launch,
         // each carrying the outcome its own launch recorded, attributed to
-        // the session it belongs to.
+        // the session it belongs to — the placement for A and B, the
+        // placement that did not happen for C.
         let logged = capture.contents();
         for (id, expected, label) in [
             (
                 created_a.id,
-                "host_ip_enforcement=none",
-                "the launch that ran unenforced",
+                "host_ip_enforcement=per_box",
+                "the launch that placed its box over a table that was not \
+                 refusing",
             ),
             (
                 created_b.id,
                 "host_ip_enforcement=per_box",
                 "the launch whose host decided per box",
+            ),
+            (
+                created_c.id,
+                "host_ip_enforcement=none",
+                "the launch that placed nothing",
             ),
         ] {
             assert!(
@@ -4167,7 +4239,9 @@ mod tests {
              assertion or not: its verdict is decided on address leases"
         );
         assert!(
-            facts_enforcement(&mut client, own_address.id).await.is_none(),
+            facts_enforcement(&mut client, own_address.id)
+                .await
+                .is_none(),
             "an own-address box shows no enforcement on the runtime-facts \
              reply either, assertion or not"
         );
