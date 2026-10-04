@@ -322,6 +322,15 @@ fake readelf -l "$READELF_L_SYSTEM"
 fake readelf -d "$READELF_D_CLEAN"
 table 0 "resolves only system libraries" "the Linux table's all-system case passes (a multiarch dir is a whole component)"
 
+# glibc ldd's missing-exec-bit warning heads an otherwise normal listing; it
+# is skipped, not refused as an unrecognized line.
+new_table Linux
+fake ldd - "ldd: warning: you do not have execution permission for \`/tmp/answerer'
+$LDD_ALL_SYSTEM"
+fake readelf -l "$READELF_L_SYSTEM"
+fake readelf -d "$READELF_D_CLEAN"
+table 0 "resolves only system libraries" "ldd's missing-exec-bit warning is not read as a dependency"
+
 # The program interpreter, through the same rule.
 new_table Linux
 fake ldd - "$LDD_ALL_SYSTEM"

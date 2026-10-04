@@ -236,6 +236,9 @@ linux_check() {
             awk '
                 function emit(s, i, p) { print s "\t" i "\t" p }
                 NF == 0 { next }
+                # glibc ldd warns about a missing exec bit, then lists the
+                # dependencies as usual: the warning is not one of them.
+                /^ldd: warning: you do not have execution permission/ { next }
                 $1 ~ /^linux-vdso/ { emit("vdso", $1, ""); next }
                 $2 == "=>" && $3 == "not" && $4 == "found" {
                     emit("missing", $1 " => not found", "")
