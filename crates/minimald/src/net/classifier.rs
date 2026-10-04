@@ -130,8 +130,8 @@ pub enum Cause {
     /// here. A deny-all host-address box over this cause is refused on
     /// either kind of host: its declaration promises a refusal this host is
     /// not making, and it must not run looking decided while nothing
-    /// refuses it. Reloading the table ends it, so the install command is
-    /// named.
+    /// refuses it. The step is installed, so the step is not what is
+    /// missing, and no install command is named.
     TableNotEffective,
     /// The table's effect could not be read: the daemon's own control-leg
     /// connection to the probe's listener failed, or no probe child could be
@@ -233,16 +233,18 @@ impl Cause {
     /// the step over that tree would leave the cause standing, or for a
     /// guest whose table its own image never loaded, because the person to
     /// tell is the image's builder and no installer exists there. A table
-    /// the marker vouches for but the probe does not ends with the same
-    /// command — the install is the one thing that reloads it — while a
-    /// probe that could not read the table names nothing: no command is
-    /// known to make a probe run.
+    /// the marker vouches for but the probe does not names nothing either:
+    /// the step is installed, so the step is not what is missing, and no
+    /// re-run of it is known to make the table refuse — and a probe that
+    /// could not read the table names nothing, because no command is known
+    /// to make a probe run.
     pub fn install_command(self) -> Option<String> {
         match self {
-            Self::StepNotInstalled | Self::TableNotEffective => {
-                Some(sandbox2::classifier::install_hint())
-            }
-            Self::CannotConfine | Self::GuestTableNotLoaded | Self::ProbeUnreadable => None,
+            Self::StepNotInstalled => Some(sandbox2::classifier::install_hint()),
+            Self::CannotConfine
+            | Self::GuestTableNotLoaded
+            | Self::TableNotEffective
+            | Self::ProbeUnreadable => None,
         }
     }
 }
@@ -2881,12 +2883,10 @@ mod tests {
             detail.contains("marked loaded") && detail.contains("was not refused"),
             "the cause names what the marker said and what the probe read: {detail}"
         );
-        let command = cause
-            .install_command()
-            .expect("reloading the table is the command that ends it");
         assert!(
-            command.contains("install-host-classifier.sh"),
-            "the command is the one thing that reloads the table: {command}"
+            cause.install_command().is_none(),
+            "the step is installed, so no install command is named for a \
+             table the probe does not see refusing"
         );
 
         // And a probe that could not read the table at all claims nothing:
@@ -2915,6 +2915,32 @@ mod tests {
         assert!(
             cause.install_command().is_none(),
             "no install command is named for a probe that could not run"
+        );
+    }
+
+    /// NET-079 names the install command only "when that step is what is
+    /// missing": the one cause that says the step is missing is the one cause
+    /// that names a command, and every other cause — the step installed but
+    /// its table not refusing among them — names none.
+    #[test]
+    fn install_command_is_named_only_when_the_step_is_missing() {
+        for cause in [
+            Cause::StepNotInstalled,
+            Cause::CannotConfine,
+            Cause::GuestTableNotLoaded,
+            Cause::TableNotEffective,
+            Cause::ProbeUnreadable,
+        ] {
+            assert_eq!(
+                cause.install_command().is_some(),
+                cause == Cause::StepNotInstalled,
+                "{cause:?}: only the missing step names the install command"
+            );
+        }
+        assert_eq!(
+            Cause::StepNotInstalled.install_command(),
+            Some(sandbox2::classifier::install_hint()),
+            "the command named is the step's own install, spelled as the hint"
         );
     }
 
