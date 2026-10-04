@@ -511,6 +511,13 @@ impl Config {
     #[must_use]
     pub fn command_env(&self) -> BTreeMap<String, String> {
         let mut env = BTreeMap::new();
+        // The layout default `PATH`; a composed `PATH` expands `$PATH`/`${PATH}`
+        // against it.
+        let default_path = if let WdSetup::Session { .. } = &self.wd {
+            "/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin" // adds /home/.local/bin
+        } else {
+            "/usr/bin:/bin:/usr/sbin:/sbin"
+        };
         let mut set = |k: &str, v: &str| {
             env.insert(k.to_string(), v.to_string());
         };
@@ -520,7 +527,7 @@ impl Config {
             set("XDG_STATE_HOME", "/home/.local/state");
             set("XDG_CONFIG_HOME", "/home/.config");
             set("XDG_DATA_HOME", "/home/.local/share");
-            set("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin"); // adds /home/.local/bin
+            set("PATH", default_path);
             // A styled default shell prompt for interactive sessions. Set as a
             // plain default here (not forced) so a user's composition var can
             // override it: the composed `env_vars` are applied further down and
@@ -543,7 +550,7 @@ impl Config {
             set("XDG_STATE_HOME", "/state/state");
             set("XDG_CONFIG_HOME", "/state/home");
             set("XDG_DATA_HOME", "/state/data");
-            set("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+            set("PATH", default_path);
         }
         set("XDG_CACHE_HOME", "/state/cache");
         set("XDG_RUNTIME_DIR", "/run");
@@ -557,15 +564,17 @@ impl Config {
             set("PYTHONHASHSEED", "0");
         }
 
-        // Locale. Sessions get a safe, always-present `C.UTF-8` floor: it's
-        // built into glibc so it never triggers "cannot set locale" warnings
-        // the way `en_US.utf8` does when that locale isn't generated in the
-        // rootfs, and setting only `LANG` (the lowest-precedence locale knob,
-        // no `LC_ALL`) lets a session's composed `env_vars` or a client's
-        // forwarded `LANG`/`LC_*` override it. Build/task sandboxes keep the
-        // fixed `en_US.utf8` + `LC_ALL` they always had, for output stability.
+        // Locale. Sessions get an `en_US.UTF-8` floor: it is the locale the
+        // session rootfs actually ships (`locale -a` lists `en_US.utf8`, not
+        // `C.UTF-8`), so it never triggers "cannot set locale" warnings the
+        // way `C.UTF-8` does. Setting only `LANG` (the lowest-precedence
+        // locale knob, no `LC_ALL`) lets a session's composed `env_vars` or a
+        // client's forwarded `LANG`/`LC_*` override it. Build/task sandboxes
+        // keep the fixed `en_US.utf8` + `LC_ALL` they always had, for output
+        // stability. glibc normalizes the `UTF-8` codeset to `utf8`, so both
+        // spellings resolve to the same shipped locale.
         if let WdSetup::Session { .. } = &self.wd {
-            set("LANG", "C.UTF-8");
+            set("LANG", "en_US.UTF-8");
         } else {
             set("LANG", "en_US.utf8");
             set("LC_ALL", "en_US.utf8");
@@ -580,7 +589,16 @@ impl Config {
             }
         }
 
-        self.env_vars.iter().for_each(|(var, val)| set(var, val));
+        // A composed `PATH` may extend the layout default by referring to it
+        // as `$PATH` or `${PATH}`; expand that reference so the default
+        // directories are not lost. Every other variable stays literal.
+        self.env_vars.iter().for_each(|(var, val)| {
+            if var == "PATH" {
+                set(var, &expand_path_reference(val, default_path));
+            } else {
+                set(var, val);
+            }
+        });
         env
     }
 
@@ -928,6 +946,31 @@ impl Config {
     }
 }
 
+/// Replaces each `${PATH}` and `$PATH` reference in `value` with `default`.
+/// A `$PATH` followed by a character that continues a variable name (such as
+/// `$PATH_SUFFIX`) is a different variable and stays literal.
+fn expand_path_reference(value: &str, default: &str) -> String {
+    let expanded = value.replace("${PATH}", default);
+    let mut expanded_path = String::with_capacity(expanded.len());
+    let mut remaining = expanded.as_str();
+    while let Some(index) = remaining.find("$PATH") {
+        expanded_path.push_str(&remaining[..index]);
+        let after_reference = &remaining[index + "$PATH".len()..];
+        let continues_variable = after_reference
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        if continues_variable {
+            expanded_path.push_str("$PATH");
+        } else {
+            expanded_path.push_str(default);
+        }
+        remaining = after_reference;
+    }
+    expanded_path.push_str(remaining);
+    expanded_path
+}
+
 /// Fits a box name into `budget` bytes. A name that fits is kept as is; a
 /// longer one is cut at a char boundary and suffixed with `-` and the first 8
 /// hex digits of the full name's SHA-256, so two long names sharing a prefix
@@ -1016,7 +1059,7 @@ mod tests {
         let env = config.command_env();
         assert_eq!(env.get("HOME").map(String::as_str), Some("/home"));
         assert_eq!(env.get("USER").map(String::as_str), Some("dev"));
-        assert_eq!(env.get("LANG").map(String::as_str), Some("C.UTF-8"));
+        assert_eq!(env.get("LANG").map(String::as_str), Some("en_US.UTF-8"));
     }
 
     /// Composed variables are policy; the layout defaults are only a floor.
@@ -1034,6 +1077,80 @@ mod tests {
 
         assert_eq!(env.get("LANG").map(String::as_str), Some("en_GB.UTF-8"));
         assert_eq!(env.get("EDITOR").map(String::as_str), Some("hx"));
+    }
+
+    /// A composed `PATH` that refers to `$PATH` (or `${PATH}`) extends the
+    /// layout default instead of replacing it verbatim; a `PATH` without a
+    /// reference, and any other variable, stay literal.
+    #[test]
+    fn a_composed_path_expands_its_self_reference() {
+        let mut config = session_config();
+        config
+            .env_vars
+            .insert("PATH".to_string(), "/opt/bin:$PATH".to_string());
+        config
+            .env_vars
+            .insert("EDITOR".to_string(), "hx:$PATH".to_string());
+
+        let env = config.command_env();
+
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/opt/bin:/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin"),
+        );
+        // A non-PATH variable containing `$PATH` stays literal.
+        assert_eq!(env.get("EDITOR").map(String::as_str), Some("hx:$PATH"));
+
+        let mut braced = session_config();
+        braced
+            .env_vars
+            .insert("PATH".to_string(), "/opt/bin:${PATH}".to_string());
+        assert_eq!(
+            braced.command_env().get("PATH").map(String::as_str),
+            Some("/opt/bin:/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin"),
+        );
+
+        let mut literal = session_config();
+        literal
+            .env_vars
+            .insert("PATH".to_string(), "/opt/bin".to_string());
+        assert_eq!(
+            literal.command_env().get("PATH").map(String::as_str),
+            Some("/opt/bin"),
+        );
+    }
+
+    /// A non-session sandbox expands a composed `PATH` against its own layout
+    /// default, which has no `/home/.local/bin`.
+    #[test]
+    fn a_build_sandbox_expands_a_composed_path_against_its_default() {
+        let mut config = Config::new("test");
+        config
+            .env_vars
+            .insert("PATH".to_string(), "/opt/bin:$PATH".to_string());
+
+        assert_eq!(
+            config.command_env().get("PATH").map(String::as_str),
+            Some("/opt/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
+        );
+    }
+
+    /// A `$PATH` reference is expanded only when the following character cannot
+    /// continue a variable name, so a longer reference such as `$PATH_SUFFIX`
+    /// stays literal instead of being corrupted into the default path.
+    #[test]
+    fn a_composed_path_keeps_longer_variable_references_literal() {
+        let mut config = session_config();
+        config
+            .env_vars
+            .insert("PATH".to_string(), "/opt/bin:$PATH_SUFFIX".to_string());
+
+        let env = config.command_env();
+
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/opt/bin:$PATH_SUFFIX"),
+        );
     }
 
     /// A build sandbox keeps the layout it always had — the extraction of this

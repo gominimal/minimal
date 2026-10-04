@@ -393,6 +393,7 @@ async fn register_box_for_activation(
             })
             .unwrap_or_default(),
         egress: policy.egress.clone(),
+        credentialed_upstream: policy.credentialed_upstream.clone(),
     };
     let registration = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
@@ -511,6 +512,13 @@ pub(crate) async fn activate_session(
             dynamic_allowed_range: None,
             dynamic_ingress: None,
         }),
+        // NET-134: the lane is the box's own declaration, never a default —
+        // a box that did not ask for a credentialed upstream keeps every
+        // frame it sends to the proxy's address refused at the host-side
+        // gate, whatever its egress rules say.
+        credentialed_upstream: args
+            .credentialed_upstream
+            .then(sessions::CredentialedUpstream::default),
     };
 
     // A session with no `--name` still deserves a typable handle, so mint
@@ -556,7 +564,9 @@ pub(crate) async fn activate_session(
     // Scaffold-offer a missing `minimal.toml` only after loadouts resolve:
     // a bad `--loadout` must error before anything prints, so the user is
     // never told the session is proceeding and then that it is not.
-    if offer_scaffold {
+    // `--sync none` never sends a `minimal.toml`, so offering to create
+    // one there would only write a file the session then ignores.
+    if offer_scaffold && !matches!(args.sync, Some(SyncMode::None)) {
         offer_mfile_scaffold(
             &utf8_path,
             global,
@@ -1022,7 +1032,16 @@ pub(crate) async fn activate_session(
     // the daemon then composes against an empty workspace and the
     // caller is on their own for getting files there.
     match sync_mode {
-        SyncMode::None => {}
+        SyncMode::None => {
+            // `--sync none` skips the upload, so the daemon composes against
+            // an empty workspace and the project's `minimal.toml` — packages,
+            // vars, patches, hooks — is silently dropped. Say so when there
+            // is a config to lose, so the default-config session is not a
+            // surprise.
+            if let Some(notice) = sync_none_notice(&utf8_path) {
+                eprintln!("{notice}");
+            }
+        }
         SyncMode::Tarball if skip_empty_or_home => {
             // An empty directory has nothing to sync, and `$HOME` is far
             // too much to ship on a stray confirmation keypress — and if
@@ -1619,6 +1638,7 @@ pub(crate) async fn activate_new_for_attach(global: &GlobalArgs) -> Result<(), a
             allow_dns_hosts: Vec::new(),
             allow_protocols: Vec::new(),
             deny_subnets: Vec::new(),
+            credentialed_upstream: false,
             loadout: Vec::new(),
             no_loadouts: false,
             no_hooks: false,
@@ -2956,6 +2976,7 @@ mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
             }),
+            credentialed_upstream: None,
         };
 
         // The successful shape, driven the way the activation drives it:
@@ -3056,6 +3077,7 @@ mod tests {
                 name: "db".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
+                credentialed_upstream: None,
             },
         )
         .await

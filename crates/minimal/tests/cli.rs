@@ -22,7 +22,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 #[tokio::test]
 async fn version_succeeds_with_daemon_running() {
     let (_daemon, args) = setup().await;
-    cmd_version(&args).await.unwrap();
+    cmd_version(&args, &mut std::io::stdout()).await.unwrap();
 }
 
 #[tokio::test]
@@ -36,7 +36,40 @@ async fn version_succeeds_without_daemon() {
         vm: None,
     };
     // Should print client version and note daemon is unreachable, but return Ok.
-    cmd_version(&args).await.unwrap();
+    cmd_version(&args, &mut std::io::stdout()).await.unwrap();
+}
+
+/// A writer whose reader has gone away, as `min version | head -1` leaves
+/// stdout once `head` exits.
+struct ClosedPipe;
+
+impl std::io::Write for ClosedPipe {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn version_reports_broken_pipe_when_output_is_closed() {
+    let args = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(std::path::PathBuf::from("/nonexistent")),
+        config_dir: None,
+        provider: None,
+        no_input: false,
+        vm: None,
+    };
+    // The first line fails before any daemon contact, so no daemon is needed.
+    let err = cmd_version(&args, &mut ClosedPipe).await.unwrap_err();
+    assert!(err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    }));
 }
 
 // --- ls ---
@@ -281,7 +314,7 @@ async fn activate_creates_session() {
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
-        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
     )
     .unwrap();
 
@@ -295,6 +328,7 @@ async fn activate_creates_session() {
         allow_dns_hosts: vec![],
         allow_protocols: vec![],
         deny_subnets: vec![],
+        credentialed_upstream: false,
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -325,7 +359,7 @@ async fn activate_uploads_project_files() {
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
-        "# test\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+        "# test\n[stack]\nuse = \"shell\"\n",
     )
     .unwrap();
     std::fs::write(project.path().join("hello.txt"), "hello world").unwrap();
@@ -342,6 +376,7 @@ async fn activate_uploads_project_files() {
         allow_dns_hosts: vec![],
         allow_protocols: vec![],
         deny_subnets: vec![],
+        credentialed_upstream: false,
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -411,7 +446,7 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
-        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
     )
     .unwrap();
     std::fs::write(project.path().join("hello.txt"), "hello world").unwrap();
@@ -428,6 +463,7 @@ async fn activate_uses_repo_dir_when_no_positional_path() {
         allow_dns_hosts: vec![],
         allow_protocols: vec![],
         deny_subnets: vec![],
+        credentialed_upstream: false,
         loadout: vec![],
         no_loadouts: false,
         no_hooks: false,
@@ -1223,7 +1259,7 @@ async fn deny_all_announcement_printed() {
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
-        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
     )
     .unwrap();
 
@@ -1490,7 +1526,7 @@ async fn listener_failure_reported_with_remedy() {
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
-        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
     )
     .unwrap();
     let activate_stderr = run_min_stderr(
@@ -1748,7 +1784,7 @@ async fn activate_and_ls_report_native_surface() {
     std::fs::create_dir(project.path().join(".git")).unwrap();
     std::fs::write(
         project.path().join("minimal.toml"),
-        "# test minimal.toml\n[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\nbranch = \"main\"\n\n[stack]\nuse = \"shell\"\n",
+        "# test minimal.toml\n[stack]\nuse = \"shell\"\n",
     )
     .unwrap();
     let activate_stderr = run_min_stderr(
