@@ -16,17 +16,18 @@
 # What it refuses, per OS:
 #
 #   * Linux (`readelf -l`, then `ldd`, then `readelf -d`): the program
-#     interpreter (PT_INTERP) must be a system loader path — root runs it
-#     before any library, so it is the first thing checked, and a binary
-#     that is statically linked has none and passes. Every ldd entry must
-#     resolve inside the loader's default dirs (/lib, /lib64, /usr/lib,
-#     /usr/lib64 — their multiarch subdirs included) or be the kernel's
-#     vDSO (linux-vdso, or linux-gate on 32-bit x86), and an entry that
-#     resolves from nowhere is an offender too (nothing is "system" until
-#     it is shown to resolve from a system dir). The binary must also
-#     carry no RPATH and no RUNPATH entry at all: an embedded search path decides where root loads libraries
-#     from, and every system library is already on the loader's default
-#     path, so there is no legitimate use for one here.
+#     interpreter (PT_INTERP) must be a system loader path — root runs
+#     it before any library, so it is the first thing checked, and a
+#     binary that is statically linked has none and passes. Every ldd
+#     entry must resolve inside the loader's default dirs (/lib, /lib64,
+#     /usr/lib, /usr/lib64 — their multiarch subdirs included) or be the
+#     kernel's vDSO (linux-vdso, or linux-gate on 32-bit x86), and an
+#     entry that resolves from nowhere is an offender too (nothing is
+#     "system" until it is shown to resolve from a system dir). The
+#     binary must also carry no RPATH and no RUNPATH entry at all: an
+#     embedded search path decides where root loads libraries from, and
+#     every system library is already on the loader's default path, so
+#     there is no legitimate use for one here.
 #   * macOS (`otool -L` + `otool -l`): every entry must live under /usr/lib
 #     or /System, and the binary must carry no LC_RPATH load command at all
 #     (minvmd's dev-build @loader_path rpath is exactly the shape a root
