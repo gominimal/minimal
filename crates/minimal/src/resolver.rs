@@ -236,7 +236,10 @@ const ANSWERER_UNIT_PATHS: &[&str] = &[ANSWERER_UNIT_SOCKET_PATH, ANSWERER_UNIT_
 /// of this operator could ever publish to — and the two sockets launchd
 /// itself holds and hands over at socket activation: the `Listener`
 /// datagram at [`minvmd::net::answerer::DEFAULT_ANSWERER_PORT`] on the
-/// host loopback and the `Channel` unix stream at the channel's path,
+/// host loopback (`SockType dgram`: launchd's default type is `stream`,
+/// which it cannot pair with UDP, and the name then activates no socket;
+/// `SockNodeName`, the key launchd binds by, else the port takes every
+/// interface) and the `Channel` unix stream at the channel's path,
 /// named exactly as [`minvmd::cmd::answerer::LISTENER_SOCKET_NAME`] and
 /// [`minvmd::cmd::answerer::CHANNEL_SOCKET_NAME`] spell them in code, so
 /// the names the service asks launchd for and the names this unit
@@ -268,9 +271,11 @@ const ANSWERER_PLIST_TEMPLATE: &str = "\
 \t\t<dict>
 \t\t\t<key>SockFamily</key>
 \t\t\t<string>IPv4</string>
+\t\t\t<key>SockType</key>
+\t\t\t<string>dgram</string>
 \t\t\t<key>SockProtocol</key>
 \t\t\t<string>UDP</string>
-\t\t\t<key>SockNode</key>
+\t\t\t<key>SockNodeName</key>
 \t\t\t<string>127.0.0.1</string>
 \t\t\t<key>SockServiceName</key>
 \t\t\t<string>7656</string>
@@ -5427,6 +5432,14 @@ mod tests {
                 install.operator
             )),
             "the service runs as the operator: {plist}"
+        );
+        assert!(
+            plist.contains(
+                "<key>SockType</key>\n\t\t\t<string>dgram</string>\n\t\t\t\
+                 <key>SockProtocol</key>\n\t\t\t<string>UDP</string>\n\t\t\t\
+                 <key>SockNodeName</key>\n\t\t\t<string>127.0.0.1</string>"
+            ),
+            "the listener is a loopback-only datagram socket launchd can create: {plist}"
         );
         assert!(
             !plist.contains('\''),
