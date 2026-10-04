@@ -277,6 +277,7 @@ BEPB_SEED_DIR_A="" # seeded by the proxy-source proof below; removed on teardown
 BEPB_SEED_DIR_B="" # its second box's seed; removed on teardown
 PO_OWNIP_SEED_DIR="" # the port-publish proof's own-address box seed; removed on teardown
 PO_OUTLIVE_SEED_DIR="" # its detach-half box seed; removed on teardown
+PO_OUTLIVE_CLIENT_SEED_DIR="" # its detach-half outside client's seed (VM lanes); removed on teardown
 PO_TASK_SEED_DIR="" # its run-half seed; removed on teardown
 PO_TASK_PID="" # its `min task run` client; KILLed on teardown (it owns a box)
 CRED_LANE_SEED_DIR="" # seeded by the credentialed-lane proof below; removed on teardown
@@ -657,6 +658,7 @@ teardown() {
   # the client owned can outlive this run.
   [ -n "$PO_OWNIP_SEED_DIR" ] && rm -rf "$PO_OWNIP_SEED_DIR"
   [ -n "$PO_OUTLIVE_SEED_DIR" ] && rm -rf "$PO_OUTLIVE_SEED_DIR"
+  [ -n "$PO_OUTLIVE_CLIENT_SEED_DIR" ] && rm -rf "$PO_OUTLIVE_CLIENT_SEED_DIR"
   [ -n "$PO_TASK_SEED_DIR" ] && rm -rf "$PO_TASK_SEED_DIR"
   if [ -n "$PO_TASK_PID" ]; then
     kill -9 "$PO_TASK_PID" 2>/dev/null || true
@@ -11242,14 +11244,14 @@ proof_own_ip_deny_all_box_answers_published_port() {
 #     it must stay unpublished, refused by name as NOT PERMITTED — `403`
 #     with a body saying the port is not published, never a nothing-
 #     listening hang — and, where the daemon's log is readable, the listen
-#     watcher's own record of leaving it unpublished. NET-016's permitted
-#     arm — a listen inside the dynamic allow range, published and then
-#     answered by name — has no user surface to drive end to end yet:
-#     `min session activate` cannot set that range (dynamic_ingress resolves
-#     to none), and the proxy's by-name routes are built from the
-#     declaration, so a watcher-published port has no name to reach through;
-#     that arm stays proven in the daemon's own unit layer (net/listeners.rs
-#     and net/proxy.rs), not here. Gated on the switch and the tap device
+#     watcher's own record of leaving it unpublished. This half claims
+#     NET-016's refusal arm only. Its permitted arm — a listen inside the
+#     dynamic allow range, published on the box's address and reached by
+#     name through the host answerer at that published address, not through
+#     this proxy — needs a user surface that sets the range, which no create
+#     flag offers yet; the flags and that end-to-end leg are T82's (#1895),
+#     and until then the arm is proven in the daemon's own unit layer
+#     (net/listeners.rs and net/proxy.rs). Gated on the switch and the tap device
 #     like the deny-all answer proof: a target without them has no port
 #     surface to drive, and a skip says so rather than failing a lane that
 #     was never the audience.
