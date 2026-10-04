@@ -84,19 +84,53 @@ async fn control_request_with_vm_host(
     Ok(reply)
 }
 
+/// What a successful registration with the VM host daemon hands the
+/// activating client back (T66, NET-133): the addresses the create request
+/// carries, and the box's own id when the daemon's reply named one — the
+/// id the published row holds and its attachment carries, which the client
+/// presents at a re-registration so the box stays the identity its first
+/// registration created it as. A reply that carries no id — from a daemon
+/// that predates ids — is still a successful registration: the client
+/// simply holds no id to present next time, and the row and its attachment
+/// name the box host-side as ever.
+#[derive(Debug)]
+struct RegisteredWithVmHost {
+    /// The addresses the create request carries, so the in-VM daemon
+    /// attaches with the handed switch address instead of drawing its own.
+    addresses: sessions::BoxAddresses,
+    /// The box's own id the reply returned — 32 hex digits on the wire,
+    /// the one spelling the row, the attachment and a diagnostic all name
+    /// it by — or `None` when the answering daemon predates ids.
+    box_id: Option<minimald_rpc::BoxId>,
+}
+
 /// Registers an own-address box with the VM host daemon over its control
-/// socket (T66), returning the addresses it handed back.
+/// socket (T66), returning what it handed back.
 async fn register_box_with_vm_host(
     sock_path: &std::path::Path,
     request: minimald_rpc::RegisterBoxRequest,
-) -> anyhow::Result<sessions::BoxAddresses> {
+) -> anyhow::Result<RegisteredWithVmHost> {
     match control_request_with_vm_host(
         sock_path,
         minimald_rpc::BoxControlRequest::Register(request),
     )
     .await?
     {
-        minimald_rpc::BoxControlReply::Addresses(addresses) => Ok(addresses),
+        // The answer a daemon this build boots beside sends: the addresses
+        // beside the id the published row holds.
+        minimald_rpc::BoxControlReply::Registered(web) => Ok(RegisteredWithVmHost {
+            addresses: sessions::BoxAddresses {
+                switch_address: web.switch_address,
+                loopback_address: web.loopback_address,
+            },
+            box_id: Some(web.box_id),
+        }),
+        // A daemon that predates ids answers with the bare pair the
+        // registration has always been answered with.
+        minimald_rpc::BoxControlReply::Addresses(addresses) => Ok(RegisteredWithVmHost {
+            addresses,
+            box_id: None,
+        }),
         minimald_rpc::BoxControlReply::Error { error } => {
             anyhow::bail!("the VM host daemon refused the box registration: {error}")
         }
@@ -317,6 +351,17 @@ pub(crate) async fn withdraw_box_row(
                      answerer status; the row stays published"
                 );
             }
+            // A withdrawal is never answered with a registered box — but a
+            // daemon that speaks another shape here is still not answering
+            // the withdrawal, so the row stays published and the line says
+            // so.
+            minimald_rpc::BoxControlReply::Registered(_) => {
+                tracing::warn!(
+                    box = %name,
+                    "the VM host daemon answered the box row withdrawal with a \
+                     registration; the row stays published"
+                );
+            }
         },
         Ok(Err(error)) => {
             tracing::warn!(
@@ -337,8 +382,8 @@ pub(crate) async fn withdraw_box_row(
 }
 
 /// Registers this activation's box with the VM host daemon, when the daemon
-/// this invocation talks to is minvmd-backed (T66), returning the addresses
-/// it handed back — `Ok(None)` when there is nothing to register.
+/// this invocation talks to is minvmd-backed (T66), returning what it handed
+/// back — `Ok(None)` when there is nothing to register.
 ///
 /// The box this activation creates is registerable only when the daemon
 /// connection resolves through minvmd — [`daemon_provider_kind`], never
@@ -348,6 +393,16 @@ pub(crate) async fn withdraw_box_row(
 /// it is an own-address box: a `host_ip` box shares the node's own row in
 /// the host table, and a `none` box has no switch address at all — both
 /// register nothing and attach exactly as they always have.
+///
+/// The box's own id rides with it (NET-133): the request presents
+/// `held_box_id` when the client holds one — the autospawn retry's
+/// re-registration, presenting the identity its first registration minted
+/// — and a first registration presents none, letting the host mint one for
+/// this creation. The reply returns the id the published row holds, so the
+/// CLI, the row and the attachment all carry the one id per box: the id a
+/// delivered connection is attributed by. A daemon that predates ids
+/// answers with the bare pair; that registration succeeded too, and the
+/// client holds no id to present next time.
 ///
 /// A registration that cannot be made — an unresolvable provider dir, a
 /// refusal, the deadline — fails the activation with its cause rather than
@@ -362,7 +417,8 @@ async fn register_box_for_activation(
     network: sessions::NetworkMode,
     name: &str,
     policy: &sessions::SessionPolicy,
-) -> anyhow::Result<Option<sessions::BoxAddresses>> {
+    held_box_id: Option<minimald_rpc::BoxId>,
+) -> anyhow::Result<Option<RegisteredWithVmHost>> {
     if kind != paths::ProviderKind::Minvmd || network != sessions::NetworkMode::OwnIp {
         return Ok(None);
     }
@@ -378,7 +434,11 @@ async fn register_box_for_activation(
         .ok_or_else(|| anyhow::anyhow!("no provider dir resolved for the ssh socket"))?;
     // The declaration, as this activation expanded it: the ingress rules
     // reduced to the external ports they admit — the shape the host row
-    // holds — and the egress policy verbatim.
+    // holds — and the egress policy verbatim. The box's own id rides the
+    // request when the client holds one (NET-133): a re-registration
+    // presents the identity its first registration minted, so the box
+    // stays the identity it was created as; a first registration holds
+    // none, and the host mints one for this creation.
     let request = minimald_rpc::RegisterBoxRequest {
         name: name.to_string(),
         ingress_ports: policy
@@ -394,6 +454,7 @@ async fn register_box_for_activation(
             .unwrap_or_default(),
         egress: policy.egress.clone(),
         credentialed_upstream: policy.credentialed_upstream.clone(),
+        box_id: held_box_id,
     };
     let registration = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
@@ -401,15 +462,19 @@ async fn register_box_for_activation(
     )
     .await;
     match registration {
-        Ok(Ok(addresses)) => {
+        Ok(Ok(web)) => {
             tracing::info!(
                 box = %name,
-                switch_address = %addresses.switch_address,
-                loopback_address = %addresses.loopback_address,
+                box_id = %web
+                    .box_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+                switch_address = %web.addresses.switch_address,
+                loopback_address = %web.addresses.loopback_address,
                 "registered the box with the VM host daemon; its addresses are \
                  the host table's to decide by"
             );
-            Ok(Some(addresses))
+            Ok(Some(web))
         }
         Ok(Err(error)) => Err(error.context(
             "registering the box with the VM host daemon failed; the session \
@@ -696,7 +761,7 @@ pub(crate) async fn activate_session(
     // resolved once, here, and the withdrawals ride on it.
     let kind = daemon_provider_kind(global);
     let control_sock = vm_host_control_sock(kind, global.minimal_dir.as_deref());
-    config.box_addresses = register_box_for_activation(
+    let registered = register_box_for_activation(
         kind,
         global.minimal_dir.as_deref(),
         config.network,
@@ -705,8 +770,18 @@ pub(crate) async fn activate_session(
             .as_deref()
             .expect("the session name is minted before the create"),
         &config.policy,
+        // A first registration holds no id; the host mints one for this
+        // creation and the reply returns it.
+        None,
     )
     .await?;
+    config.box_addresses = registered
+        .as_ref()
+        .map(|registration| registration.addresses);
+    // The id the reply returned (NET-133): the box's own, held across the
+    // create for the re-registration an autospawn retry makes, so the box
+    // stays the identity this registration created it as.
+    let mut held_box_id = registered.and_then(|registration| registration.box_id);
 
     use minimald_rpc::{
         ConfigureLoadout, ConfigureLoadoutRequest, CreateSession, CreateSessionRequest,
@@ -767,15 +842,23 @@ pub(crate) async fn activate_session(
                     // no row behind. The re-registration can itself fail —
                     // the plan can be exhausted by then — and that failure
                     // ends the retry loop the same way the first one would
-                    // have, with its cause.
-                    config.box_addresses = register_box_for_activation(
+                    // have, with its cause. It presents the id the first
+                    // registration minted (NET-133): the withdrawn row
+                    // holds it nowhere in the live set, and the box stays
+                    // the identity it was created as.
+                    let re_registered = register_box_for_activation(
                         kind,
                         global.minimal_dir.as_deref(),
                         config.network,
                         config.name.as_deref().expect("just re-minted"),
                         &config.policy,
+                        held_box_id,
                     )
                     .await?;
+                    config.box_addresses = re_registered
+                        .as_ref()
+                        .map(|registration| registration.addresses);
+                    held_box_id = re_registered.and_then(|registration| registration.box_id);
                     continue;
                 }
                 // A create failure that is not a retryable autogen collision
@@ -3004,16 +3087,19 @@ mod tests {
             NetworkMode::OwnIp,
             "web",
             &policy,
+            // A first registration holds no id; the daemon this stand-in
+            // plays predates them, so none comes back either.
+            None,
         )
         .await
         .expect("a registration that cannot be made is the activation's error")
         .expect("an own-address box on a VM-backed host registers");
         assert_eq!(
-            handed.switch_address,
+            handed.addresses.switch_address,
             std::net::Ipv4Addr::new(100, 64, 0, 2)
         );
         assert_eq!(
-            handed.loopback_address,
+            handed.addresses.loopback_address,
             std::net::Ipv4Addr::new(127, 0, 64, 0)
         );
         {
@@ -3041,6 +3127,7 @@ mod tests {
                 NetworkMode::OwnIp,
                 "web",
                 &policy,
+                None,
             )
             .await
             .expect("a native host answers the activation, not the control socket")
@@ -3054,6 +3141,7 @@ mod tests {
                 NetworkMode::HostNet,
                 "web",
                 &policy,
+                None,
             )
             .await
             .expect("a host-ip box registers nothing, and that is no failure")
@@ -3079,6 +3167,7 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
+                box_id: None,
             },
         )
         .await
@@ -3086,6 +3175,126 @@ mod tests {
         assert!(
             refused.to_string().contains("address plan is exhausted"),
             "the refusal surfaces with its reason: {refused}"
+        );
+    }
+
+    /// NET-133/BEP-070: the CLI, the row and the attachment carry one id per
+    /// box. The first registration presents no id, so the host mints one for
+    /// this creation and the reply returns it — and the id the CLI then holds
+    /// is the id the published row's attachment carries, the one a delivered
+    /// connection is attributed by. The autospawn retry's shape — the row
+    /// withdrawn, then a re-registration presenting the held id — is answered
+    /// with the same id, and the re-registered box's attachment carries it
+    /// too: the box stays the identity its first registration created it as.
+    #[tokio::test]
+    async fn attachment_carries_the_registered_box_id() {
+        let policy = sessions::SessionPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: None,
+        };
+
+        // The real host tables and the real control server the daemon boots
+        // beside them — a registry feeding real attachments — so the id the
+        // CLI holds is compared against the attachment a real registration
+        // issued, not a stand-in's reply.
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let sock_path = provider_dir.join("control.sock");
+        let subnet = switch::SwitchSubnet::default();
+        let attachments = minvmd::bep_attach::Attachments::new();
+        let registry = minvmd::box_registry::BoxRegistry::new(subnet)
+            .feeding_proxy_attachments(attachments.clone());
+        let _server = minvmd::control::spawn(
+            sock_path.clone(),
+            registry.clone(),
+            minvmd::net::answerer::AnswererStatus::starting(),
+        )
+        .expect("the control server binds its socket");
+        let global = GlobalArgs {
+            provider: Some(Provider::LocalMinvmd),
+            minimal_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        // The first registration: the CLI holds no id, the host mints one
+        // for this creation, and the reply returns it.
+        let first = register_box_for_activation(
+            paths::ProviderKind::Minvmd,
+            global.minimal_dir.as_deref(),
+            NetworkMode::OwnIp,
+            "web",
+            &policy,
+            None,
+        )
+        .await
+        .expect("the real control server answers the registration")
+        .expect("an own-address box on a VM-backed host registers");
+        let id = first
+            .box_id
+            .expect("the daemon's reply returned the box's own id");
+        assert_ne!(
+            id.to_bytes(),
+            [0u8; 16],
+            "the id is the box's own minted UUIDv7, never the all-zero non-id"
+        );
+
+        // The attachment the registration issued carries that id, and so
+        // does the row the reply speaks for: the CLI, the row and the
+        // attachment hold the one id per box.
+        let attachment = attachments
+            .by_source(first.addresses.switch_address.octets())
+            .expect("the registration issued the box's attachment");
+        assert_eq!(
+            id,
+            minimald_rpc::BoxId::from_bytes(attachment.box_id()),
+            "the id the CLI holds is the id the attachment carries"
+        );
+        let row = registry
+            .table()
+            .by_source(first.addresses.switch_address.octets())
+            .expect("the registration published the row the reply speaks for");
+        assert_eq!(
+            id,
+            minimald_rpc::BoxId::from_bytes(row.box_id()),
+            "the id the CLI holds is the id the row holds"
+        );
+
+        // The autospawn retry's shape: the row is withdrawn — its creator
+        // presents the pair it was handed — and the re-registration under
+        // the re-minted name presents the id the CLI held.
+        withdraw_box_row(Some(sock_path.clone()), Some("web"), Some(first.addresses)).await;
+        let again = register_box_for_activation(
+            paths::ProviderKind::Minvmd,
+            global.minimal_dir.as_deref(),
+            NetworkMode::OwnIp,
+            "web-again",
+            &policy,
+            Some(id),
+        )
+        .await
+        .expect("an ended row holds its id nowhere in the live set")
+        .expect("the re-registration registers under the re-minted name");
+        assert_eq!(
+            again.box_id,
+            Some(id),
+            "the re-registration returned the identity the CLI presented: the \
+             box stays the identity its first registration created it as"
+        );
+        assert_ne!(
+            again.addresses.switch_address, first.addresses.switch_address,
+            "the recreation spent the run's next address, never a spent one again"
+        );
+
+        // And the re-registered box's attachment carries the one id too.
+        let reattached = attachments
+            .by_source(again.addresses.switch_address.octets())
+            .expect("the re-registration issued the box's attachment");
+        assert_eq!(
+            id,
+            minimald_rpc::BoxId::from_bytes(reattached.box_id()),
+            "the re-registered box's attachment carries the one id per box"
         );
     }
 
@@ -3372,12 +3581,13 @@ mod tests {
             NetworkMode::OwnIp,
             "web",
             &policy,
+            None,
         )
         .await
         .expect("a minvmd-backed own-address box registers")
         .expect("the registration hands addresses back");
         assert_eq!(
-            handed.switch_address,
+            handed.addresses.switch_address,
             std::net::Ipv4Addr::new(100, 64, 0, 2)
         );
         assert!(
@@ -3387,6 +3597,7 @@ mod tests {
                 NetworkMode::OwnIp,
                 "web",
                 &policy,
+                None,
             )
             .await
             .expect("the native kind registers nothing, and that is no failure")

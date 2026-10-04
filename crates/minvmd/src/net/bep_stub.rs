@@ -896,10 +896,7 @@ mod tests {
             String::from_utf8_lossy(&answer),
             format!(
                 "source={}:{} destination={}:{}\n",
-                cohort_ip,
-                FIRST_CLIENT_PORT,
-                proxy_ip,
-                PROXY_PORT
+                cohort_ip, FIRST_CLIENT_PORT, proxy_ip, PROXY_PORT
             ),
             "the cohort's connection was delivered and answered, arriving as \
              the cohort from its own address"
@@ -1175,7 +1172,11 @@ mod tests {
             "an all-zero box id is answered with nothing"
         );
         assert!(
-            stub.refusals().iter().filter(|reason| **reason == "box_id").count() >= 2,
+            stub.refusals()
+                .iter()
+                .filter(|reason| **reason == "box_id")
+                .count()
+                >= 2,
             "the all-zero id was audited for the box_id reason, like the mismatch: {:?}",
             stub.refusals()
         );

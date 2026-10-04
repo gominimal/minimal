@@ -551,7 +551,9 @@ mod tests {
         match reply {
             BoxControlReply::Registered(web) => web,
             BoxControlReply::Addresses(addresses) => {
-                panic!("a registration is answered with the registered box, got bare addresses {addresses:?}")
+                panic!(
+                    "a registration is answered with the registered box, got bare addresses {addresses:?}"
+                )
             }
             BoxControlReply::Error { error } => {
                 panic!("a valid request is answered with the registered box, refused with {error}")
