@@ -159,6 +159,195 @@ const COMMAND_RESERVES_THE_RANGE: bool = true;
 #[cfg(not(target_os = "macos"))]
 const COMMAND_RESERVES_THE_RANGE: bool = false;
 
+/// The label of the box-zone answerer service the advisory command
+/// installs (NET-122's host service): launchd's job label on macOS,
+/// systemd's unit name on Linux — the one service the machine's service
+/// manager holds the answerer's two sockets under and runs as the
+/// operator, so the zone keeps answering between sessions and across
+/// them, from a program no user can write to. The unit files, the
+/// command that installs them, and the custody checks over them all name
+/// this one label beside [`RANGE_UNIT_LABEL`]'s step — one definition, so
+/// the service the command installs, the step the advisory re-surfaces
+/// until it holds, and the unit the bundle records cannot drift apart.
+pub(crate) const ANSWERER_UNIT_LABEL: &str = "dev.minimal.zone-answerer";
+
+/// The root-owned path the answerer program is copied to — never a
+/// user-writable binary: `/Library/PrivilegedHelperTools` beside the range
+/// program, every component of it root's, so a user can neither replace
+/// the copy the service runs nor read what the step wrote before the
+/// ownership converged ([`answerer_step_over`] walks every component).
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) const ANSWERER_PROGRAM_PATH: &str =
+    "/Library/PrivilegedHelperTools/dev.minimal.zone-answerer";
+
+/// The plist the answerer step installs: the file launchd scans at boot,
+/// which is what makes the service hold the sockets at every one.
+#[cfg(any(test, target_os = "macos"))]
+const ANSWERER_PLIST_PATH: &str = "/Library/LaunchDaemons/dev.minimal.zone-answerer.plist";
+
+/// The root-owned path the answerer program is copied to on Linux — never
+/// a user-writable binary, the same rule as [`ANSWERER_PROGRAM_PATH`]'s
+/// macOS arm: `/usr/local/lib/minimal` is root's alone, and the walk over
+/// it is what custody means here.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) const ANSWERER_PROGRAM_PATH: &str = "/usr/local/lib/minimal/dev.minimal.zone-answerer";
+
+/// The directory [`ANSWERER_PROGRAM_PATH`] lives in, which the command
+/// makes before it copies.
+#[cfg(any(test, not(target_os = "macos")))]
+const ANSWERER_PROGRAM_DIR: &str = "/usr/local/lib/minimal";
+
+/// The systemd socket unit the answerer step installs: the unit that
+/// holds both of the answerer's sockets for the machine — the datagram
+/// listener at the answerer's port on the host loopback and the unix
+/// stream channel at the channel's path — and hands them to the service
+/// at socket activation.
+#[cfg(any(test, not(target_os = "macos")))]
+const ANSWERER_UNIT_SOCKET_PATH: &str = "/etc/systemd/system/dev.minimal.zone-answerer.socket";
+
+/// The systemd service unit the answerer step installs: the unit that
+/// runs the root-owned program copy as the operator and receives the
+/// sockets the socket unit holds.
+#[cfg(any(test, not(target_os = "macos")))]
+const ANSWERER_UNIT_SERVICE_PATH: &str = "/etc/systemd/system/dev.minimal.zone-answerer.service";
+
+/// The unit files the step installs — launchd's one plist on macOS,
+/// systemd's socket+service pair on Linux — in the order the custody
+/// facts carry them and the walk covers them.
+#[cfg(any(test, target_os = "macos"))]
+const ANSWERER_UNIT_PATHS: &[&str] = &[ANSWERER_PLIST_PATH];
+#[cfg(any(test, not(target_os = "macos")))]
+const ANSWERER_UNIT_PATHS: &[&str] = &[ANSWERER_UNIT_SOCKET_PATH, ANSWERER_UNIT_SERVICE_PATH];
+
+/// The launchd unit the answerer step installs, as the command writes
+/// it: label [`ANSWERER_UNIT_LABEL`], `ProgramArguments` the root-owned
+/// program copy with its one argument `answerer`, `UserName` the operator
+/// the service manager runs it as — never root: the channel's uid gate
+/// serves the uid the unit names, so a root-run service is one no daemon
+/// of this operator could ever publish to — and the two sockets launchd
+/// itself holds and hands over at socket activation: the `Listener`
+/// datagram at [`minvmd::net::answerer::DEFAULT_ANSWERER_PORT`] on the
+/// host loopback and the `Channel` unix stream at the channel's path,
+/// named exactly as [`minvmd::cmd::answerer::LISTENER_SOCKET_NAME`] and
+/// [`minvmd::cmd::answerer::CHANNEL_SOCKET_NAME`] spell them in code, so
+/// the names the service asks launchd for and the names this unit
+/// carries cannot drift apart. `SockPathMode 0666`: every daemon the
+/// operator runs must be able to connect and publish, and the
+/// answerer's own gate — the peer uid check — decides who may, so the
+/// socket's mode grants only the connect.
+///
+/// Like [`RANGE_UNIT_PLIST`], the body carries no apostrophe: the command
+/// rides inside one pair of single quotes, and one inside a body closes
+/// them.
+#[cfg(any(test, target_os = "macos"))]
+const ANSWERER_PLIST_TEMPLATE: &str = "\
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+\t<key>Label</key>
+\t<string>dev.minimal.zone-answerer</string>
+\t<key>ProgramArguments</key>
+\t<array>
+\t\t<string>__PROGRAM__</string>
+\t\t<string>answerer</string>
+\t</array>
+\t<key>UserName</key>
+\t<string>__OPERATOR__</string>
+\t<key>Sockets</key>
+\t<dict>
+\t\t<key>Listener</key>
+\t\t<dict>
+\t\t\t<key>SockFamily</key>
+\t\t\t<string>IPv4</string>
+\t\t\t<key>SockProtocol</key>
+\t\t\t<string>UDP</string>
+\t\t\t<key>SockNode</key>
+\t\t\t<string>127.0.0.1</string>
+\t\t\t<key>SockServiceName</key>
+\t\t\t<string>7656</string>
+\t\t</dict>
+\t\t<key>Channel</key>
+\t\t<dict>
+\t\t\t<key>SockFamily</key>
+\t\t\t<string>Unix</string>
+\t\t\t<key>SockPathName</key>
+\t\t\t<string>__CHANNEL__</string>
+\t\t\t<key>SockPathMode</key>
+\t\t\t<integer>438</integer>
+\t\t</dict>
+\t</dict>
+\t<key>RunAtLoad</key>
+\t<true/>
+\t<key>KeepAlive</key>
+\t<true/>
+</dict>
+</plist>
+";
+
+/// The systemd socket unit the answerer step installs, as the command
+/// writes it: both sockets held by the machine's service manager — the
+/// datagram listener at [`minvmd::net::answerer::DEFAULT_ANSWERER_PORT`]
+/// on the host loopback, the unix stream channel at the channel's path —
+/// with `SocketMode 0666` for the channel (the connect is what every
+/// daemon of the operator needs; the answerer's uid gate decides who may
+/// publish), and `RequiresMountsFor` on the channel's directory, because
+/// a channel under the operator's home cannot be bound before the home
+/// is mounted. `WantedBy=sockets.target` is what makes `enable` hold the
+/// sockets at every boot after the step runs.
+///
+/// The body carries no `$`, no backtick and no double quote: the Linux
+/// command rides inside one pair of double quotes, and any of the three
+/// would leave it before the root shell reads it.
+#[cfg(any(test, not(target_os = "macos")))]
+const ANSWERER_SOCKET_TEMPLATE: &str = "\
+[Unit]
+Description=The Minimal box-zone answerer sockets
+RequiresMountsFor=__CHANNEL_DIR__
+
+[Socket]
+ListenDatagram=127.0.0.1:7656
+ListenStream=__CHANNEL__
+SocketMode=0666
+Service=dev.minimal.zone-answerer.service
+
+[Install]
+WantedBy=sockets.target
+";
+
+/// The systemd service unit the answerer step installs, as the command
+/// writes it: the root-owned program copy with its one argument
+/// `answerer`, run as the operator — `User=` is the uid the channel's
+/// gate serves, the one whose daemons may publish — and restarted when
+/// it dies, because the sockets it serves belong to the socket unit, not
+/// the process: a service that comes back serves from the same
+/// manager-held sockets without a session's action.
+///
+/// The same body ban as [`ANSWERER_SOCKET_TEMPLATE`]'s: no `$`, no
+/// backtick, no double quote.
+#[cfg(any(test, not(target_os = "macos")))]
+const ANSWERER_SERVICE_TEMPLATE: &str = "\
+[Unit]
+Description=The Minimal box-zone answerer, run by the operator
+
+[Service]
+Type=simple
+ExecStart=__PROGRAM__ answerer
+User=__OPERATOR__
+Restart=on-failure
+";
+
+/// The heredoc delimiters the command carries the unit files' bytes
+/// under, beside [`RANGE_PROGRAM_HEREDOC`]'s pair: quoted delimiters, so
+/// the bodies write byte for byte — the plist is XML and the unit files
+/// are INI, and neither can spell these.
+#[cfg(any(test, target_os = "macos"))]
+const ANSWERER_PLIST_HEREDOC: &str = "MINIMAL_ANSWERER_PLIST_EOF";
+#[cfg(any(test, not(target_os = "macos")))]
+const ANSWERER_SOCKET_HEREDOC: &str = "MINIMAL_ANSWERER_SOCKET_EOF";
+#[cfg(any(test, not(target_os = "macos")))]
+const ANSWERER_SERVICE_HEREDOC: &str = "MINIMAL_ANSWERER_SERVICE_EOF";
+
 /// The range program, rendered from [`RANGE_PROGRAM_TEMPLATE`] with every
 /// usable host address of the reserved range
 /// ([`switch::loopback::range_hosts`], host parts 1 to 254 — the addresses
@@ -554,6 +743,335 @@ async fn read_range_step() -> RangeStep {
     } else {
         RangeStep::not_needed()
     }
+}
+
+/// The box-zone answerer's step on this host, as the detection reads it
+/// beside the hook and the advisory, the session-start note, and the
+/// bundle print it: the one-line view of the service NET-122's privileged
+/// step installs — a host service whose two sockets the machine's service
+/// manager holds, running as the operator, from a root-owned program copy
+/// ([`ANSWERER_PROGRAM_PATH`]).
+///
+/// The states are the range step's ([`RangeStepState`]) with one the
+/// range never carries: the installed copy can *fall behind* — speak a
+/// channel protocol this daemon no longer understands — and that state
+/// re-surfaces the advisory exactly like a custody failure, so an
+/// upgrade that changes the wire re-runs the step and re-copies the
+/// program the new daemon speaks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) enum AnswererStep {
+    /// The service is installed and holds: root-owned program copy and
+    /// unit files, the unit naming the copy, and the copy answering the
+    /// channel protocol probe with this daemon's version.
+    Installed,
+    /// Nothing at the service's paths: no host service, so the zone
+    /// answers only while a session's daemon holds it.
+    Absent,
+    /// A custody check failed — `failed_check` names the first one, in
+    /// the range step's wording.
+    CustodyFailed {
+        /// The first check that did not hold.
+        failed_check: String,
+    },
+    /// The installed copy speaks another channel protocol than this
+    /// daemon — or did not answer the probe at all (`installed` `None`:
+    /// a program from before the probe existed). The step re-runs to
+    /// re-copy the program this daemon ships.
+    ProtocolMismatch {
+        /// The protocol version the installed copy answered with, when
+        /// it answered.
+        installed: Option<u32>,
+        /// The protocol version this daemon speaks.
+        daemon: u32,
+    },
+}
+
+impl AnswererStep {
+    /// Whether the step is done — the service is there, root-owned, and
+    /// speaks this daemon's channel protocol. This is the fact the
+    /// advisory's quiet arm needs beside the hook and the range: the
+    /// advisory re-surfaces until the host service exists, and
+    /// re-surfaces again the moment the installed copy falls behind.
+    pub(crate) fn holds(&self) -> bool {
+        matches!(self, AnswererStep::Installed)
+    }
+}
+
+/// The facts the answerer service's checks decide on, as the detection
+/// gathers them and [`answerer_step_over`] reads them — the answerer's
+/// counterpart of [`RangeFacts`]. Pure data, so the checks over it are
+/// unit-tested on every platform the suite runs on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+pub(crate) struct AnswererFacts {
+    /// The owner and mode of every directory component of the program
+    /// copy's path and every unit's, from `/` down, in walk order. A
+    /// component with no entry here did not read; the verdict treats it
+    /// as unverified, never as passing.
+    pub components: Vec<(String, FileCustody)>,
+    /// The program copy's owner and mode, when it exists.
+    pub program: Option<FileCustody>,
+    /// The unit files' owner and mode, in [`ANSWERER_UNIT_PATHS`] order,
+    /// each when it exists.
+    pub units: Vec<Option<FileCustody>>,
+    /// The program path the unit that runs the program names — the
+    /// plist's `ProgramArguments` on macOS, the service unit's
+    /// `ExecStart` on Linux — when it names one.
+    pub unit_program: Option<String>,
+    /// The channel protocol version the installed copy answered the
+    /// probe with, when it exists, runs, and answers a number.
+    pub installed_version: Option<u32>,
+}
+
+/// The program path a systemd service unit's `ExecStart=` names: the
+/// first word of the first such line, as systemd reads it. `None` when
+/// no `ExecStart=` line is there. Pure over the file's bytes, so the
+/// parse is unit-tested on every platform the suite runs on.
+pub(crate) fn service_exec_start(text: &str) -> Option<&str> {
+    let line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("ExecStart="))?;
+    let start = line.trim_start().strip_prefix("ExecStart=")?;
+    start.split_whitespace().next()
+}
+
+/// The program path the unit that runs the answerer names: the plist's
+/// `ProgramArguments` on macOS, the service unit's `ExecStart` on Linux —
+/// the one fact that says the installed service runs the root-owned
+/// copy, not some other program.
+#[cfg(target_os = "macos")]
+fn unit_program_argument(text: &str) -> Option<&str> {
+    plist_program_argument(text)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unit_program_argument(text: &str) -> Option<&str> {
+    service_exec_start(text)
+}
+
+/// The answerer step the facts decide (`daemon` is the channel protocol
+/// version this daemon speaks — [`minvmd::net::answerer::CHANNEL_PROTOCOL_VERSION`],
+/// the version of the daemon this CLI links and spawns): absent when
+/// neither the program copy nor any unit file is installed; installed
+/// when every check holds — every directory component of every path
+/// root-owned with no group or other write, the copy and every unit
+/// file root-owned the same, the unit naming the copy — *and* the copy
+/// answers the probe with this daemon's version; custody failed, naming
+/// the first check that did not hold; protocol mismatch when the copy
+/// answers anything else, or nothing at all.
+///
+/// Pure over the facts, so every check is unit-tested on every platform
+/// the suite runs on; the detection is the reader that gathers them
+/// ([`read_answerer_step`]).
+pub(crate) fn answerer_step_over(facts: &AnswererFacts, daemon: u32) -> AnswererStep {
+    // Nothing at any path: the service is not installed, and no custody
+    // question arises.
+    if facts.program.is_none() && facts.units.iter().all(Option::is_none) {
+        return AnswererStep::Absent;
+    }
+    let mut walked = Vec::new();
+    for path in std::iter::once(ANSWERER_PROGRAM_PATH).chain(ANSWERER_UNIT_PATHS.iter().copied()) {
+        for component in path_components(path) {
+            if !walked.contains(&component) {
+                walked.push(component);
+            }
+        }
+    }
+    let mut checks = Vec::new();
+    for component in &walked {
+        let Some(custody) = facts
+            .components
+            .iter()
+            .find(|(path, _)| path == component)
+            .map(|(_, custody)| custody)
+        else {
+            checks.push(format!("its directory {component} did not read"));
+            continue;
+        };
+        if !custody.root_owned() {
+            checks.push(not_root_owned("its directory", component, custody));
+        }
+    }
+    match facts.program {
+        None => checks.push(format!("its program {ANSWERER_PROGRAM_PATH} is missing")),
+        Some(custody) if !custody.root_owned() => {
+            checks.push(not_root_owned(
+                "its program",
+                ANSWERER_PROGRAM_PATH,
+                &custody,
+            ));
+        }
+        Some(_) => {}
+    }
+    for (what, path, custody) in ANSWERER_UNIT_PATHS
+        .iter()
+        .copied()
+        .zip(&facts.units)
+        .map(|(path, custody)| ("its unit", path, *custody))
+    {
+        match custody {
+            None => checks.push(format!("{what} {path} is missing")),
+            Some(custody) if !custody.root_owned() => {
+                checks.push(not_root_owned(what, path, &custody));
+            }
+            Some(_) => {}
+        }
+    }
+    match facts.unit_program.as_deref() {
+        None => checks.push(format!(
+            "its unit names no program, not the root-owned {ANSWERER_PROGRAM_PATH}"
+        )),
+        Some(ANSWERER_PROGRAM_PATH) => {}
+        Some(other) => checks.push(format!(
+            "its unit names {other}, not the root-owned {ANSWERER_PROGRAM_PATH}"
+        )),
+    }
+    match checks.first() {
+        None => match facts.installed_version {
+            Some(installed) if installed == daemon => AnswererStep::Installed,
+            installed => AnswererStep::ProtocolMismatch { installed, daemon },
+        },
+        Some(check) => AnswererStep::CustodyFailed {
+            failed_check: check.clone(),
+        },
+    }
+}
+
+/// The inputs the answerer install renders from that only the running
+/// machine knows, gathered once per render: the operator the unit runs
+/// the service as, the channel path the unit holds, and the answerer
+/// program on this machine the step copies — the minvmd this CLI's
+/// autospawn runs, found the same way it finds it, on `PATH`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AnswererInstall {
+    /// The user the unit runs the service as.
+    pub operator: String,
+    /// The channel socket's path, absolute.
+    pub channel: String,
+    /// The channel socket's directory — what must exist before the
+    /// manager can hold the socket in it.
+    pub channel_dir: String,
+    /// The answerer program the step copies: the minvmd on this
+    /// machine's `PATH`, or the bare name when no directory of `PATH`
+    /// carries one — a copy the shell resolves visibly or the command
+    /// dies saying it cannot.
+    pub source: String,
+}
+
+/// The operator the answerer unit runs the service as: the user this CLI
+/// runs as, read the way launchd and every login shell record it
+/// (`USER`, then `LOGNAME`), falling back to the password database for
+/// the uid the process carries — never root by choice, and empty only
+/// when no name reads at all, a unit the manager refuses to load rather
+/// than a service run as the wrong user.
+fn operator_name() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()
+        .or_else(|| {
+            nix::unistd::User::from_uid(nix::unistd::getuid())
+                .ok()
+                .flatten()
+                .map(|user| user.name.to_string())
+        })
+        .unwrap_or_default()
+}
+
+/// The answerer program this machine's step copies: the first `minvmd`
+/// on `PATH` — the same binary the autospawn runs, one resolution, so
+/// the service the step installs and the daemon the session spawns are
+/// the same program — else the bare name, for the shell to resolve
+/// visibly or the command to die naming it.
+fn answerer_source() -> String {
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join("minvmd");
+            if candidate.is_file() {
+                return candidate.display().to_string();
+            }
+        }
+    }
+    "minvmd".to_string()
+}
+
+/// [`AnswererInstall`] for this machine, as the render and the reader
+/// agree on it: the channel path is the daemon's own resolution —
+/// [`minvmd::net::answerer::resolve_channel_sock`], the same path the
+/// daemon publishes to — so the socket the unit holds and the socket
+/// the daemons connect to are one path by one definition.
+pub(crate) fn answerer_install() -> AnswererInstall {
+    let channel = minvmd::net::answerer::resolve_channel_sock();
+    AnswererInstall {
+        operator: operator_name(),
+        channel_dir: channel.parent().unwrap_or(&channel).display().to_string(),
+        channel: channel.display().to_string(),
+        source: answerer_source(),
+    }
+}
+
+/// The deadline on the installed copy's one protocol probe: the second
+/// the detection's other bounded reads carry, so a copy that wedges —
+/// or a program from before the probe, one that starts serving instead
+/// of answering — costs one second of the verb that read it, never the
+/// verb itself.
+const ANSWERER_PROBE_BOUND: Duration = Duration::from_secs(1);
+
+/// The channel protocol version the installed copy speaks, asked of the
+/// copy itself: `{ANSWERER_PROGRAM_PATH} answerer --protocol-version`,
+/// which prints the version and exits — never serving, never binding.
+/// `None` when the copy is missing, does not answer within
+/// [`ANSWERER_PROBE_BOUND`], or does not name a number: a program from
+/// before the probe reads the same as one that speaks no protocol, and
+/// the advisory re-runs the step for both.
+async fn installed_protocol_version() -> Option<u32> {
+    let output = tokio::time::timeout(
+        ANSWERER_PROBE_BOUND,
+        tokio::process::Command::new(ANSWERER_PROGRAM_PATH)
+            .arg("answerer")
+            .arg("--protocol-version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+}
+
+/// The answerer service's step on this host, read where the hook is
+/// detected (NET-122's host service): the program copy's and the unit
+/// files' presence, owner and mode; every directory component of their
+/// paths, from `/` down; the program the unit names; and the channel
+/// protocol version the installed copy speaks, asked of the copy itself.
+/// Read-only, bounded, and nothing prompts: the same discipline as the
+/// range step it sits beside, and the command that fixes what it finds
+/// is the user's to run, never the session start's.
+pub(crate) async fn read_answerer_step() -> AnswererStep {
+    let mut paths = vec![ANSWERER_PROGRAM_PATH];
+    paths.extend(ANSWERER_UNIT_PATHS.iter().copied());
+    let mut units = Vec::new();
+    for path in ANSWERER_UNIT_PATHS {
+        units.push(file_custody(path).await);
+    }
+    let unit_text = tokio::fs::read_to_string(ANSWERER_UNIT_PATHS[ANSWERER_UNIT_PATHS.len() - 1])
+        .await
+        .ok();
+    let facts = AnswererFacts {
+        components: path_component_custody(&paths).await,
+        program: file_custody(ANSWERER_PROGRAM_PATH).await,
+        units,
+        unit_program: unit_text
+            .as_deref()
+            .and_then(unit_program_argument)
+            .map(str::to_string),
+        installed_version: installed_protocol_version().await,
+    };
+    answerer_step_over(&facts, minvmd::net::answerer::CHANNEL_PROTOCOL_VERSION)
 }
 
 /// `/etc/resolv.conf`: the file every host process's lookup reads (through
@@ -1294,6 +1812,7 @@ async fn host_hook() -> Hook {
 #[cfg(any(test, target_os = "macos"))]
 pub(crate) fn macos_command(port: u16) -> String {
     let program = range_program();
+    let install = answerer_install();
     format!(
         "sudo sh -c 'set -e; mkdir -p /etc/resolver {RANGE_PROGRAM_DIR} {RANGE_PLIST_DIR} \
          ; printf \"nameserver 127.0.0.1\\nport {port}\\n\" > {RESOLVER_FILE} \
@@ -1306,40 +1825,139 @@ cat > {RANGE_PLIST_PATH} <<\\{RANGE_PLIST_HEREDOC}\n\
 chown root:wheel {RANGE_PROGRAM_PATH} {RANGE_PLIST_PATH} \
          ; chmod 0755 {RANGE_PROGRAM_PATH} ; chmod 0644 {RANGE_PLIST_PATH} \
          ; (launchctl bootout system/{RANGE_UNIT_LABEL} 2>/dev/null || true) \
-         ; launchctl bootstrap system {RANGE_PLIST_PATH}'"
+         ; launchctl bootstrap system {RANGE_PLIST_PATH} \
+         ; mkdir -p \"{install_channel_dir}\" \
+         ; cp \"{install_source}\" \"{ANSWERER_PROGRAM_PATH}\" \
+         ; cat > {ANSWERER_PLIST_PATH} <<\\{ANSWERER_PLIST_HEREDOC}\n\
+{answerer_plist}\
+{ANSWERER_PLIST_HEREDOC}\n\
+chown root:wheel \"{ANSWERER_PROGRAM_PATH}\" {ANSWERER_PLIST_PATH} \
+         ; chmod 0755 \"{ANSWERER_PROGRAM_PATH}\" ; chmod 0644 {ANSWERER_PLIST_PATH} \
+         ; (launchctl bootout system/{ANSWERER_UNIT_LABEL} 2>/dev/null || true) \
+         ; launchctl bootstrap system {ANSWERER_PLIST_PATH}'",
+        install_channel_dir = install.channel_dir,
+        install_source = install.source,
+        answerer_plist = answerer_unit_plist(&install),
     )
 }
 
-/// The exact command that points systemd-resolved at the answerer: one
-/// `sudo` configuring [`ZONE_LINK`] and nothing else. The dedicated link
-/// exists because `resolvectl dns` and `resolvectl domain` *replace* a
-/// link's server and domain lists: on the host's general-purpose link they
-/// would wipe its upstream resolvers and search domains, and a link whose
-/// only server is the answerer — which holds just the zone and forwards
-/// nothing — must not carry the host's other queries either.
+/// The answerer's launchd unit, rendered from [`ANSWERER_PLIST_TEMPLATE`]
+/// for this host: the root-owned program copy the step installs, the
+/// operator the unit runs it as, and the channel path the daemon this CLI
+/// spawns publishes to — the same three facts the step's checks read back
+/// ([`answerer_step_over`]).
+#[cfg(any(test, target_os = "macos"))]
+fn answerer_unit_plist(install: &AnswererInstall) -> String {
+    ANSWERER_PLIST_TEMPLATE
+        .replace("__PROGRAM__", ANSWERER_PROGRAM_PATH)
+        .replace("__OPERATOR__", &install.operator)
+        .replace("__CHANNEL__", &install.channel)
+}
+
+/// The answerer's systemd socket unit, rendered from
+/// [`ANSWERER_SOCKET_TEMPLATE`] for this host: the channel path and its
+/// directory ([`answerer_unit_plist`]'s three facts, Linux's pair — the
+/// program is a constant path on this platform too).
+#[cfg(any(test, not(target_os = "macos")))]
+fn answerer_socket_unit(install: &AnswererInstall) -> String {
+    ANSWERER_SOCKET_TEMPLATE
+        .replace("__CHANNEL_DIR__", &install.channel_dir)
+        .replace("__CHANNEL__", &install.channel)
+}
+
+/// The answerer's systemd service unit, rendered from
+/// [`ANSWERER_SERVICE_TEMPLATE`] for this host: the root-owned program copy
+/// and the operator.
+#[cfg(any(test, not(target_os = "macos")))]
+fn answerer_service_unit(install: &AnswererInstall) -> String {
+    ANSWERER_SERVICE_TEMPLATE
+        .replace("__PROGRAM__", ANSWERER_PROGRAM_PATH)
+        .replace("__OPERATOR__", &install.operator)
+}
+
+/// The exact command that points systemd-resolved at the answerer *and*
+/// installs the box-zone answerer as the host service the machine's
+/// service manager holds (NET-122's privileged step): one `sudo`, one
+/// payload, one privilege elevation, for one host's configuration.
 ///
-/// The steps, in the order they run: create the dedicated link if this host
+/// The dedicated link exists because `resolvectl dns` and `resolvectl
+/// domain` *replace* a link's server and domain lists: on the host's
+/// general-purpose link they would wipe its upstream resolvers and search
+/// domains, and a link whose only server is the answerer — which holds
+/// just the zone and forwards nothing — must not carry the host's other
+/// queries either.
+///
+/// The steps, in the order they run: `set -e;` first, and every step its
+/// own statement — separated by `;` or by the newline a heredoc ends,
+/// never by `&&`: POSIX ignores `-e` for every command of an `&&` list
+/// except its last, so a step that failed inside one would short-circuit
+/// its list silently and the script would run on, configuring a resolver
+/// over a service that did not install, and the command exiting 0 over a
+/// host it half-configured. As statements, the first step that fails
+/// stops the script itself. Then create the dedicated link if this host
 /// does not have it yet (a re-run after `resolvectl revert`, which undoes
-/// the DNS configuration but not the link, must not die on `File exists` —
-/// the guard covers the link, and `ip addr replace` covers its address),
-/// bring it up, give it [`ZONE_LINK_ADDR`] — the fact that makes resolved
-/// treat the link as routable and ever consult its routing domain — take it
-/// off the default route, then give it the answerer as its server and the
-/// zone as its routing domain. `default-route false` comes *before* the
-/// server because a link with servers and no routing domain is a
-/// default-route link implicitly — the flag first means no partially-run
-/// command ever routes non-zone queries here. `~{ZONE}` is single-quoted so
-/// the inner shell does not expand the tilde.
+/// the DNS configuration but not the link, must not die on `File exists`
+/// — the guard covers the link, and `ip addr replace` covers its
+/// address), bring it up, give it [`ZONE_LINK_ADDR`] — the fact that
+/// makes resolved treat the link as routable and ever consult its routing
+/// domain — take it off the default route, then give it the answerer as
+/// its server and the zone as its routing domain. `default-route false`
+/// comes *before* the server because a link with servers and no routing
+/// domain is a default-route link implicitly — the flag first means no
+/// partially-run command ever routes non-zone queries here.
+///
+/// Then the answerer service, beside the resolver it serves: make the
+/// channel's directory and the program's, copy this machine's answerer
+/// program to [`ANSWERER_PROGRAM_PATH`] — the copy is the install, the
+/// program is the daemon's own binary and cannot ride in a command the
+/// way [`RANGE_PROGRAM_TEMPLATE`] does; the rule the range steps carry
+/// (nothing copied in from anywhere, user-writable or not) is the
+/// *destination's* custody here: root-owned at a path no user can write,
+/// which is what [`answerer_step_over`] checks back. Write the two unit
+/// files from the bytes the command carries, make root the owner of all
+/// three before the manager ever reads them, reload the manager, enable
+/// the socket unit at every boot after, and restart it — the one step
+/// that both starts the service the first time and re-creates its
+/// sockets from the new unit files on a re-run, handing the running
+/// service back the same two manager-held sockets. A re-run over a
+/// running service is the upgrade path: the unit files are re-written,
+/// the copy re-copied, and the restart re-holds.
+///
+/// The whole payload rides inside one pair of double quotes, so no step
+/// and no body it writes may carry `$`, a backtick or a double quote —
+/// the outer shell would expand or end the payload at the first of
+/// either. `~{ZONE}` is single-quoted so the inner shell does not
+/// expand the tilde; the copy's paths are single-quoted the same way.
 #[cfg(any(test, not(target_os = "macos")))]
 pub(crate) fn linux_command(port: u16) -> String {
+    let install = answerer_install();
     format!(
-        "sudo sh -c \"[ -e /sys/class/net/{ZONE_LINK} ] \
+        "sudo sh -c \"set -e; [ -e /sys/class/net/{ZONE_LINK} ] \
          || ip link add {ZONE_LINK} type dummy \
-         && ip link set {ZONE_LINK} up \
-         && ip addr replace {ZONE_LINK_ADDR}/32 dev {ZONE_LINK} \
-         && resolvectl default-route {ZONE_LINK} false \
-         && resolvectl dns {ZONE_LINK} 127.0.0.1:{port} \
-         && resolvectl domain {ZONE_LINK} '~{ZONE}'\""
+         ; ip link set {ZONE_LINK} up \
+         ; ip addr replace {ZONE_LINK_ADDR}/32 dev {ZONE_LINK} \
+         ; resolvectl default-route {ZONE_LINK} false \
+         ; resolvectl dns {ZONE_LINK} 127.0.0.1:{port} \
+         ; resolvectl domain {ZONE_LINK} '~{ZONE}' \
+         ; mkdir -p '{install_channel_dir}' {ANSWERER_PROGRAM_DIR} \
+         ; cp '{install_source}' '{ANSWERER_PROGRAM_PATH}' \
+         ; cat > {ANSWERER_UNIT_SOCKET_PATH} <<\\{ANSWERER_SOCKET_HEREDOC}\n\
+{answerer_socket}\
+{ANSWERER_SOCKET_HEREDOC}\n\
+cat > {ANSWERER_UNIT_SERVICE_PATH} <<\\{ANSWERER_SERVICE_HEREDOC}\n\
+{answerer_service}\
+{ANSWERER_SERVICE_HEREDOC}\n\
+chown root:root '{ANSWERER_PROGRAM_PATH}' {ANSWERER_UNIT_SOCKET_PATH} \
+         {ANSWERER_UNIT_SERVICE_PATH} \
+         ; chmod 0755 '{ANSWERER_PROGRAM_PATH}' \
+         ; chmod 0644 {ANSWERER_UNIT_SOCKET_PATH} {ANSWERER_UNIT_SERVICE_PATH} \
+         ; systemctl daemon-reload \
+         ; systemctl enable {ANSWERER_UNIT_LABEL}.socket \
+         ; systemctl restart {ANSWERER_UNIT_LABEL}.socket\"",
+        install_channel_dir = install.channel_dir,
+        install_source = install.source,
+        answerer_socket = answerer_socket_unit(&install),
+        answerer_service = answerer_service_unit(&install),
     )
 }
 
@@ -1357,30 +1975,45 @@ pub(crate) fn command(port: u16) -> String {
 
 /// The advisory for one session start, as a function of the hook state, the
 /// daemon's interim verdict, whether the reserved local range read present
-/// on this host's own loopback, the range step this host's detection read
-/// beside the hook, and whether anything blocks the command (NET-122,
-/// NET-123). Pure.
+/// on this host's own loopback, the range step and the answerer step this
+/// host's detection read beside the hook, and whether anything blocks the
+/// command (NET-122, NET-123). Pure.
 ///
 /// `None` — nothing to say — when the hook already routes the zone to this
 /// answerer, the daemon did not publish at the interim, the range read
-/// present on this host's own loopback, the range step holds custody,
-/// *and* nothing blocks the command. Otherwise the advisory says what is
-/// missing and names the exact command. The interim re-surfaces the advisory
-/// even when the hook routes (NET-123: "re-surface the advisory of
-/// NET-122"): a session on the interim is a fact the user has no other way
-/// to see. The interim fact names the step that ends it — installing the
-/// range on the host — and whose job that step is is the platform's: on
-/// macOS the same advisory command does it ([`COMMAND_RESERVES_THE_RANGE`]'s
-/// platform — [`macos_command`]'s one `sudo sh -c` installs the range unit
-/// beside the resolver file it writes), so the fact says the command below
-/// installs the range and ends the interim; on Linux the whole `127/8` is
-/// local to `lo`, no install is needed, and the fact names the range as
-/// what is missing and stops there. Either way the command the advisory
-/// names is the whole of the host's missing configuration: the lead-in says
-/// what it does — on macOS "configure the host's resolver and reserve the
-/// local range", on Linux "configure the host's resolver for the zone" —
-/// and nothing the note asks for stands beside that command unprovided.
-/// String assembly only.
+/// present on this host's own loopback, the range step holds custody, the
+/// answerer service is installed and speaks this daemon's channel
+/// protocol, *and* nothing blocks the command. Otherwise the advisory says
+/// what is missing and names the exact command. The interim re-surfaces
+/// the advisory even when the hook routes (NET-123: "re-surface the
+/// advisory of NET-122"): a session on the interim is a fact the user has
+/// no other way to see. The interim fact names the step that ends it —
+/// installing the range on the host — and whose job that step is is the
+/// platform's: on macOS the same advisory command does it
+/// ([`COMMAND_RESERVES_THE_RANGE`]'s platform — [`macos_command`]'s one
+/// `sudo sh -c` installs the range unit beside the resolver file it
+/// writes), so the fact says the command below installs the range and
+/// ends the interim; on Linux the whole `127/8` is local to `lo`, no
+/// install is needed, and the fact names the range as what is missing
+/// and stops there.
+///
+/// `answerer` is the box-zone answerer service's step (see
+/// [`AnswererStep`]) — NET-122's host service, installed by the same
+/// privileged step the command carries. Its holding is part of the quiet
+/// arm, so the advisory re-surfaces until the service exists and again
+/// the moment the installed copy falls behind this daemon's channel
+/// protocol: an upgrade that changes the wire re-runs the step and
+/// re-copies the program. The Absent fact says what the service is for —
+/// the zone answers only while a session's daemon holds it, and the
+/// command below installs the one service that answers between sessions
+/// and across them — and the CustodyFailed and ProtocolMismatch facts
+/// name their check and their versions the way the range's do. Either way
+/// the command the advisory names is the whole of the host's missing
+/// configuration: the lead-in says what it does — on macOS "configure
+/// the host's resolver, reserve the local range, and install the
+/// box-zone answerer service", on Linux "configure the host's resolver
+/// and install the box-zone answerer service" — and nothing the note
+/// asks for stands beside that command unprovided. String assembly only.
 ///
 /// `range_step` is what the detection read beside the hook: the range
 /// unit's state and custody where the host's OS installs one, the no-step
@@ -1422,6 +2055,7 @@ pub(crate) fn advisory_at(
     interim: bool,
     range_present: Option<bool>,
     range_step: &RangeStep,
+    answerer: &AnswererStep,
     blocker: Option<&str>,
 ) -> Option<String> {
     // A hook routing this answerer's port is configured, but only on a
@@ -1435,12 +2069,17 @@ pub(crate) fn advisory_at(
     // range's own quiet condition (NET-123), so a unit whose files are not
     // root's does not let the note fall quiet on a probe that reads
     // present: that is a range the next boot does not re-apply, not a
-    // host whose missing configuration has nothing left to name.
+    // host whose missing configuration has nothing left to name. The
+    // answerer service is the same half of its own condition (NET-122's
+    // host service): a host without it is one whose zone answers only
+    // while a session holds it, which is a fact the note says, not one
+    // it hides.
     if hook.routes(port)
         && !interim
         && !matches!(range_present, Some(false))
         && blocker.is_none()
         && range_step.custody_holds()
+        && answerer.holds()
     {
         return None;
     }
@@ -1508,6 +2147,51 @@ pub(crate) fn advisory_at(
             _ => {}
         }
     }
+    match answerer {
+        // The answerer service's own state, beside the range's. Every arm
+        // but the first is a fact the user has no other way to see, and
+        // the command below is the one that installs the service — or, for
+        // the last two, reinstalls it over what the step left behind: a
+        // unit a user can write to, or a copy that speaks a wire this
+        // daemon no longer understands.
+        AnswererStep::Installed => {}
+        AnswererStep::Absent => {
+            facts.push(
+                "the box-zone answerer is not installed as a host service, \
+                 so the zone answers only while a session holds it; the \
+                 command below installs the service the service manager \
+                 holds, run by the operator from a root-owned copy"
+                    .to_string(),
+            );
+        }
+        AnswererStep::CustodyFailed { failed_check } => {
+            facts.push(format!(
+                "the installed box-zone answerer service {ANSWERER_UNIT_LABEL} \
+                 fails custody: {failed_check}; the command below reinstalls it"
+            ));
+        }
+        AnswererStep::ProtocolMismatch {
+            installed: None,
+            daemon,
+        } => {
+            facts.push(format!(
+                "the installed box-zone answerer service does not answer \
+                 this daemon's channel protocol {daemon}; the command below \
+                 reinstalls it from this machine's own answerer program"
+            ));
+        }
+        AnswererStep::ProtocolMismatch {
+            installed: Some(installed),
+            daemon,
+        } => {
+            facts.push(format!(
+                "the installed box-zone answerer service speaks channel \
+                 protocol {installed}, not this daemon's {daemon}; the \
+                 command below reinstalls it from this machine's own answerer \
+                 program"
+            ));
+        }
+    }
     if !hook.routes(port) {
         facts.push(format!(
             "*.{ZONE} does not resolve in host processes: the host's \
@@ -1526,11 +2210,15 @@ pub(crate) fn advisory_at(
             let command = command(port);
             // The lead-in says what the command does on this platform:
             // reserves the local range beside the resolver file where the
-            // OS needs a step for it, the resolver alone where it does not.
+            // OS needs a step for it, the resolver alone where it does not
+            // — and installs the box-zone answerer service on both, the
+            // step that answers the zone between sessions.
             let lead_in = if range_step.state == RangeStepState::NotNeeded {
-                "Configure the host's resolver for the zone with:"
+                "Configure the host's resolver and install the box-zone \
+                 answerer service with:"
             } else {
-                "Configure the host's resolver and reserve the local range with:"
+                "Configure the host's resolver, reserve the local range, and \
+                 install the box-zone answerer service with:"
             };
             Some(format!("note: {facts}. {lead_in}\n  {command}"))
         }
