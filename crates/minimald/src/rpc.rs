@@ -895,7 +895,12 @@ async fn serve_get_live_ingress(
                                         policy,
                                         mapping.proto,
                                     );
-                                    mapping.pending = !admitted.contains(&mapping.internal_port);
+                                    // The daemon knows the state, so it says
+                                    // it: `Some`, never the unknown a reply
+                                    // from a daemon older than the field
+                                    // decodes as.
+                                    mapping.pending =
+                                        Some(!admitted.contains(&mapping.internal_port));
                                     mapping
                                 })
                                 .collect(),

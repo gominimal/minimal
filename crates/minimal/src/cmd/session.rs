@@ -1971,8 +1971,11 @@ pub fn format_policy(
 /// admitted yet says so rather than reading as reachable: the publish is
 /// bound on the host, but a connection to it is answered by the relay, not by
 /// the box, until the gate's admitted set grows to include runtime-published
-/// ports. A box that published nothing prints no section: an empty header
-/// would claim a distinction between "nothing published" and "nothing
+/// ports. A row from a daemon older than the `pending` field — one that
+/// could not classify the port either way — says *unknown* and why, never
+/// the reachable reading a missing state must not default itself into. A
+/// box that published nothing prints no section: an empty header would
+/// claim a distinction between "nothing published" and "nothing
 /// publishable" the listing has no way to draw — the declaration above
 /// already says what is permitted, and silence says the box used none of it.
 ///
@@ -1987,10 +1990,12 @@ pub fn write_live_ingress(
     }
     writeln!(out, "live ingress (published at runtime)")?;
     for mapping in live {
-        let reachability = if mapping.pending {
-            "  (pending; not yet reachable)"
-        } else {
-            ""
+        let reachability = match mapping.pending {
+            Some(true) => "  (pending; not yet reachable)",
+            Some(false) => "",
+            // A reply from a daemon that predates the field: the state is
+            // unknown, not reachable — the row says both.
+            None => "  (unknown; daemon predates this field)",
         };
         writeln!(
             out,
@@ -3166,7 +3171,7 @@ mod tests {
             local: "127.0.64.21:3000".to_string(),
             internal_port: 3000,
             proto: IpProto::Tcp,
-            pending: false,
+            pending: Some(false),
         }];
 
         // Beside the declaration: the declared dynamic surface first, then
@@ -3204,13 +3209,13 @@ mod tests {
                     local: "127.0.64.21:3000".to_string(),
                     internal_port: 3000,
                     proto: IpProto::Tcp,
-                    pending: false,
+                    pending: Some(false),
                 },
                 minimald_rpc::LiveMapping {
                     local: "127.0.64.21:5353".to_string(),
                     internal_port: 5353,
                     proto: IpProto::Udp,
-                    pending: false,
+                    pending: Some(false),
                 },
             ],
         )
@@ -3245,13 +3250,13 @@ mod tests {
             local: "127.0.64.21:3000".to_string(),
             internal_port: 3000,
             proto: IpProto::Tcp,
-            pending: true,
+            pending: Some(true),
         };
         let admitted = minimald_rpc::LiveMapping {
             local: "127.0.64.21:5353".to_string(),
             internal_port: 5353,
             proto: IpProto::Udp,
-            pending: false,
+            pending: Some(false),
         };
 
         // The text: the pending row says so — bound, but the box's gate has
@@ -3279,6 +3284,53 @@ mod tests {
         assert!(
             admitted_json.contains("\"pending\":false"),
             "the admitted mapping's JSON says so: {admitted_json}"
+        );
+    }
+
+    /// A reply from a daemon that predates the `pending` field carries no
+    /// `pending` key, and that absence must not fail open into the reachable
+    /// reading: the row decodes as `None` — unknown — the text row says
+    /// unknown and why, and the JSON document carries `null`, so nothing
+    /// parsing either surface reads a runtime publish as reachable that the
+    /// daemon could not classify.
+    #[test]
+    fn policy_marks_a_pre_field_pending_reply_unknown() {
+        let encoded = serde_json_lenient::to_string(&minimald_rpc::LiveMapping {
+            local: "127.0.64.21:3000".to_string(),
+            internal_port: 3000,
+            proto: IpProto::Tcp,
+            pending: Some(false),
+        })
+        .unwrap();
+        // The key, removed: the shape a daemon older than the field writes.
+        let mut object: serde_json_lenient::Value = serde_json_lenient::from_str(&encoded).unwrap();
+        object
+            .as_object_mut()
+            .expect("a mapping encodes as an object")
+            .remove("pending");
+        let pre_field = serde_json_lenient::to_string(&object).unwrap();
+        let decoded: minimald_rpc::LiveMapping = serde_json_lenient::from_str(&pre_field).unwrap();
+        assert_eq!(
+            decoded.pending, None,
+            "a reply from a pre-field daemon decodes as unknown: {pre_field}"
+        );
+
+        // The text row: unknown, and why — never the bare row of a
+        // reachable mapping.
+        let mut out = Vec::new();
+        write_live_ingress(&mut out, std::slice::from_ref(&decoded)).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  tcp  127.0.64.21:3000 → :3000  (unknown; daemon predates this field)\n"),
+            "a mapping the daemon could not classify reads as unknown, not as reachable: {rendered}"
+        );
+
+        // The JSON document: the unknown state rides as `null`, so a client
+        // parsing it branches on absence of the fact, not on a guess.
+        let json = serde_json_lenient::to_string(&decoded).unwrap();
+        assert!(
+            json.contains("\"pending\":null"),
+            "the document carries the unknown state as null, not as a bool: {json}"
         );
     }
 

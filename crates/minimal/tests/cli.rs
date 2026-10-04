@@ -896,13 +896,13 @@ async fn policy_json_carries_schema_and_pending() {
             local: "127.0.0.1:3200".to_string(),
             internal_port: 3200,
             proto: sessions::IpProto::Tcp,
-            pending: true,
+            pending: Some(true),
         },
         minimald_rpc::LiveMapping {
             local: "127.0.0.1:3000".to_string(),
             internal_port: 3000,
             proto: sessions::IpProto::Tcp,
-            pending: false,
+            pending: Some(false),
         },
     ];
 
@@ -950,6 +950,27 @@ async fn policy_json_carries_schema_and_pending() {
         pending_of(3000).as_bool(),
         Some(false),
         "the port the declaration named is carried as admitted:\n{document}"
+    );
+
+    // A row from a daemon that predates the field — one that carried no
+    // `pending` key — rides the document as `null`, the JSON surface's own
+    // way of saying the state is unknown rather than reachable (NET-044).
+    let pre_field = minimald_rpc::LiveMapping {
+        local: "127.0.0.1:3400".to_string(),
+        internal_port: 3400,
+        proto: sessions::IpProto::Tcp,
+        pending: None,
+    };
+    let mut out = Vec::new();
+    write_policy_json(&mut out, &policy, sessions::NetworkMode::OwnIp, None, &[pre_field]).unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    let rows = document["live_ingress"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the live mappings ride as an array: {document}"));
+    assert_eq!(
+        rows[0]["pending"],
+        Value::Null,
+        "a pre-field row's unknown state rides the document as null, never as a bool:\n{document}"
     );
 }
 

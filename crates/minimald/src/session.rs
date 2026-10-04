@@ -2351,9 +2351,10 @@ impl Session {
             proto: sessions::IpProto::Tcp,
             // A fact about the box's relay gate, not about the bind: the
             // serving handler fills it on every read, from the gate's
-            // compile set. Stored false here — never rendered from the
-            // stored cell.
-            pending: false,
+            // compile set. Stored as `Some(false)` here — never rendered
+            // from the stored cell, and never the unknown `None` that a
+            // reply from a daemon older than the field decodes as.
+            pending: Some(false),
         };
         if !self.has_live_host() {
             crate::net::policy::remove_ingress(&control, &[forwarder]).await;

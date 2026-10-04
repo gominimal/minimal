@@ -1092,11 +1092,16 @@ pub struct LiveMapping {
     /// Filled by the daemon at read time (the serving handler compares the
     /// mapping against the gate's compile set), never stored with the
     /// forwarder — the state is a fact about the box, not about the bind.
-    /// Defaults to `false` on the wire so a reply from a daemon older than
-    /// the field still decodes, reading as "not pending" rather than failing
-    /// the whole list.
+    ///
+    /// An `Option`, defaulted on the wire, so a reply from a daemon older
+    /// than the field — one that carries no `pending` key — still decodes,
+    /// as `None`: the row's state reads as *unknown*, and never as the
+    /// reachable reading a missing key must not default itself into. Both
+    /// renderings `min session policy` writes spell that (`unknown` in the
+    /// text row, `null` in the JSON document); a daemon that does carry the
+    /// field answers `Some(true)` or `Some(false)`, and only those.
     #[serde(default)]
-    pub pending: bool,
+    pub pending: Option<bool>,
 }
 
 impl LiveMapping {
@@ -1662,13 +1667,13 @@ mod tests {
                 proto: IpProto::Tcp,
                 // A runtime publish the relay gate has not admitted yet:
                 // bound on the host, but the box's own gate still refuses it.
-                pending: true,
+                pending: Some(true),
             },
             LiveMapping {
                 local: "127.0.64.2:5353".to_string(),
                 internal_port: 5353,
                 proto: IpProto::Udp,
-                pending: false,
+                pending: Some(false),
             },
         ];
         assert_eq!(
@@ -1682,6 +1687,26 @@ mod tests {
         assert!(
             json.contains("\"pending\":true"),
             "the mapping's pending state is part of its wire shape: {json}"
+        );
+
+        // A reply from a daemon older than the field carries no `pending`
+        // key: it decodes as `None` — unknown, the renderings' own spelling
+        // — never as the reachable reading a missing key could default
+        // itself into.
+        let mut pre_field: serde_json_lenient::Value =
+            serde_json_lenient::from_str(&json).unwrap();
+        pre_field
+            .as_object_mut()
+            .expect("a mapping encodes as an object")
+            .remove("pending");
+        let decoded: LiveMapping = serde_json_lenient::from_str(&serde_json_lenient::to_string(
+            &pre_field,
+        )
+        .unwrap())
+        .unwrap();
+        assert_eq!(
+            decoded.pending, None,
+            "a pre-field reply decodes as unknown, not as not-pending: {json}"
         );
 
         let decoded: Errorable<Vec<LiveMapping>> =
@@ -1699,7 +1724,7 @@ mod tests {
             local: "127.0.64.2:3000".to_string(),
             internal_port: 3000,
             proto: IpProto::Tcp,
-            pending: false,
+            pending: Some(false),
         };
         assert_eq!(mapping.host_port(), Some(("127.0.64.2", 3000)));
     }

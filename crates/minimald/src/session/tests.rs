@@ -5296,7 +5296,7 @@ async fn expose_allow_publishes_and_lists() {
         local: "127.0.64.21:3000".to_string(),
         internal_port: 3000,
         proto: sessions::IpProto::Tcp,
-        pending: false,
+        pending: Some(false),
     };
     assert_eq!(
         mapping, expected,
@@ -5323,7 +5323,7 @@ async fn expose_allow_publishes_and_lists() {
     // relay gate admits the ports the *declaration* named, and this port
     // was published at runtime, outside it.
     let listed = minimald_rpc::LiveMapping {
-        pending: true,
+        pending: Some(true),
         ..mapping.clone()
     };
     let by_name: minimald_rpc::Errorable<Vec<minimald_rpc::LiveMapping>> = client
@@ -5458,7 +5458,7 @@ async fn expose_self_allocated_box_publishes_at_its_registered_address() {
             local: format!("{published}:3000"),
             internal_port: 3000,
             proto: sessions::IpProto::Tcp,
-            pending: false,
+            pending: Some(false),
         },
         "the mapping names the box's registered address at its own port number"
     );
@@ -5499,7 +5499,7 @@ async fn expose_self_allocated_box_publishes_at_its_registered_address() {
     assert_eq!(
         live,
         minimald_rpc::Errorable::Ok(vec![minimald_rpc::LiveMapping {
-            pending: true,
+            pending: Some(true),
             ..mapping
         }]),
         "the live mapping is listed beside the declaration"
@@ -5961,7 +5961,7 @@ async fn expose_colliding_on_shared_address_is_a_bind_error() {
             proto: sessions::IpProto::Tcp,
             // The box declared no port mappings, so its relay gate admits
             // nothing: the runtime publish reads pending.
-            pending: true,
+            pending: Some(true),
         }]),
         "the first box's publish is untouched by the collision"
     );
@@ -6091,7 +6091,7 @@ async fn expose_publishes_at_the_registered_address() {
             proto: sessions::IpProto::Tcp,
             // The box declared no port mappings, so its relay gate admits
             // nothing: the runtime publish reads pending.
-            pending: true,
+            pending: Some(true),
         }]),
         "the live mapping names the registered address the publish bound at"
     );
