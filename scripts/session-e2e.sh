@@ -7555,12 +7555,29 @@ for row in json.load(open(sys.argv[1])):
 
   # ---- 3. node B follows the handover onto the service ----------------------
   # B's connection to A's interim closed with the release; with the marker
-  # now present it reconnects to the machine-global channel only.
-  if ! asr_wait_more "$ASR_STATE2_DIR" 'the manager-held answerer service' 0; then
-    echo "::error::node B never re-published to the manager-held answerer service after the handover"
-    asr_dump_log "$ASR_STATE2_DIR"
-    fail
-  fi
+  # now present it reconnects to the machine-global channel only. Its own
+  # `min ls` says so: the start info line names the first answerer only, so
+  # the re-publish is read from B's status, not its log.
+  local asr_b_ls=""
+  for _ in $(seq 1 60); do
+    asr_b_ls="$(mnl2 ls 2>/dev/null || true)"
+    case "$asr_b_ls" in
+      *"manager-held: answered by the answerer host service"*"$asr_channel"*) break ;;
+    esac
+    sleep 0.5
+  done
+  case "$asr_b_ls" in
+    *"manager-held: answered by the answerer host service"*"$asr_channel"*)
+      echo "  node B re-published to the manager-held service after the handover"
+      printf '%s\n' "$asr_b_ls" | grep -F -- 'ZONE ANSWERER' | sed 's/^/  /'
+      ;;
+    *)
+      echo "::error::node B never re-published to the manager-held answerer service after the handover"
+      echo "--- min ls (node B) ---"; printf '%s\n' "$asr_b_ls"
+      asr_dump_log "$ASR_STATE2_DIR"
+      fail
+      ;;
+  esac
   if [ "$(asr_count "$ASR_STATE2_DIR" 'holds the host loopback')" != 0 ]; then
     echo "::error::node B hosted the answerer itself"
     asr_dump_log "$ASR_STATE2_DIR"
