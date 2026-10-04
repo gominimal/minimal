@@ -385,11 +385,30 @@ impl BoxRecord {
         self.dynamic_range
     }
 
+    /// The row's runtime-admitted port numbers recorded under `proto`, in
+    /// report order: the runtime half of the set the gate admits the box's
+    /// publications in that protocol by — the declared half is
+    /// [`Self::admitted_ports`]. Keyed on the (port, protocol) pair the
+    /// report named, so a port admitted for udp never admits its tcp twin.
+    #[must_use]
+    pub fn runtime_port_numbers_in(&self, proto: IpProto) -> Vec<u16> {
+        let runtime = self
+            .runtime_ports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runtime
+            .ports
+            .iter()
+            .filter(|reported| reported.proto == proto)
+            .map(|reported| reported.port)
+            .collect()
+    }
+
     /// The row's runtime-admitted ports, distinct port numbers in report
-    /// order: the runtime half of the set the gate admits the box's
-    /// publications by — the declared half is [`Self::admitted_ports`] —
-    /// and the read-only row verb's answer's runtime dimension. Reported
-    /// by the in-VM daemon within the grant the registration holds
+    /// order, across both protocols: the read-only row verb's answer's
+    /// runtime dimension. The gate decides by the protocol-keyed half
+    /// ([`Self::runtime_port_numbers_in`]). Reported by the in-VM daemon
+    /// within the grant the registration holds
     /// ([`BoxRegistry::admit_runtime_port`]), removed by its withdrawal
     /// reports, and gone with the row itself when the row is withdrawn.
     #[must_use]
@@ -695,8 +714,24 @@ pub enum PortReportRefusal {
         /// The protocol the report carried.
         proto: IpProto,
     },
-    /// The row's stance is `allow` or `ask` but its declaration named no
-    /// allowed range, and an absent range permits nothing.
+    /// The row's stance is `ask`, and a guest's admit report is not the
+    /// attached human's yes: an `ask` admission records only from the host
+    /// side, where the answer is seen, so the guest's report records
+    /// nothing under it.
+    #[error(
+        "box {name} declared dynamic ingress ask; ask-yes must be host-recorded, so the \
+         guest's report of port {port} records nothing"
+    )]
+    AskNotHostRecorded {
+        /// The name the row was registered under.
+        name: String,
+        /// The port the report carried.
+        port: u16,
+        /// The protocol the report carried.
+        proto: IpProto,
+    },
+    /// The row's stance is `allow` but its declaration named no allowed
+    /// range, and an absent range permits nothing.
     #[error("box {name} declared no dynamic allowed range; no runtime port is permitted")]
     NoAllowedRange {
         /// The name the row was registered under.
@@ -1279,8 +1314,10 @@ impl BoxRegistry {
     ///
     /// 1. **A row exists** at the switch address the registration handed
     ///    back — a report keyed anywhere else is no row's and is refused.
-    /// 2. **The stance** is `allow` or `ask`: `deny`, the default an absent
-    ///    declaration carries, admits nothing.
+    /// 2. **The stance** is `allow`: `deny`, the default an absent
+    ///    declaration carries, admits nothing, and `ask` admits nothing a
+    ///    guest reports — ask-yes must be host-recorded, because only the
+    ///    host sees the attached human's answer.
     /// 3. **The port is inside the row's allowed range**, inclusively at
     ///    both ends; a row that declared no range permits nothing.
     /// 4. **The row holds fewer than [`RUNTIME_PORT_CAP`] runtime ports** —
@@ -1335,11 +1372,14 @@ impl BoxRegistry {
             DynamicIngress::Deny => {
                 return Err(PortReportRefusal::DenyStance { name, port, proto });
             }
-            // `ask` records a report the attached human answered yes to
-            // (NET-045): the host cannot see the human's answer, so the
-            // stance's grant is the recording bound the daemon's report
-            // answers to.
-            DynamicIngress::Allow | DynamicIngress::Ask => {}
+            // `ask` records only what the attached human answered yes to
+            // (NET-045), and the guest's report is not that answer: ask-yes
+            // must be host-recorded, so a guest report under `ask` is
+            // refused and records nothing.
+            DynamicIngress::Ask => {
+                return Err(PortReportRefusal::AskNotHostRecorded { name, port, proto });
+            }
+            DynamicIngress::Allow => {}
         }
         let range = record
             .dynamic_range()
@@ -1426,18 +1466,32 @@ impl BoxRegistry {
     }
 
     /// The live row registered under `name` (the read-only row verb's
-    /// resolution, NET-138): a box's id on the host is its name, so the
-    /// name is the whole key, and liveness is the table's own fact — a box
-    /// whose row is withdrawn is gone, not archived, so a name no live box
-    /// holds answers no row, never a destroyed box's last row. `None` when
-    /// no live row carries the name.
+    /// resolution, NET-138), under the alias rule: a name is an alias,
+    /// never identity — the box's identity is its id (BEP-070) — so the
+    /// name resolves to the live box that holds it, and liveness is the
+    /// table's own fact. A box whose row is withdrawn is gone, not
+    /// archived, so a name no live row holds answers no row, never a
+    /// destroyed box's last row. `None` when no live row carries the name.
+    ///
+    /// Exact match alone is not the rule: the table does not hold names
+    /// unique. Rows are keyed by switch address, and a box recreated under
+    /// its name gets a new row beside the old one, which stays until its
+    /// withdrawal lands (up to NET-138's 60 s for an attachment's end).
+    /// While both are held, the alias resolves to the newest creation —
+    /// the row with the greatest id, because every id is a UUIDv7 this
+    /// process minted ([`crate::bep_attach::mint_box_id`]), and the crate
+    /// orders those by creation within a process. The name carries no
+    /// other alias form: it is matched in its registered spelling.
     #[must_use]
     pub fn row_by_name(&self, name: &str) -> Option<Arc<BoxRecord>> {
         let rows = self
             .rows
             .read()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
-        rows.values().find(|record| record.name() == name).cloned()
+        rows.values()
+            .filter(|record| record.name() == name)
+            .max_by_key(|record| record.box_id())
+            .cloned()
     }
 
     /// Marks the namespace published at `switch_addr` stopped: its row
@@ -2775,7 +2829,7 @@ mod tests {
         );
         let db = registry.register(
             BoxRegistration::new("db", Ipv4Addr::new(100, 64, 0, 10), Ipv4Addr::LOCALHOST)
-                .with_dynamic_ingress(DynamicIngress::Ask, Some((5000, 5999))),
+                .with_dynamic_ingress(DynamicIngress::Allow, Some((5000, 5999))),
         );
 
         // The derived allow-list: the declaration's own spelling where the
@@ -2826,8 +2880,8 @@ mod tests {
         );
 
         // One port number under two protocols is two admissions — the pair
-        // the report names is the unit — and the ask stance records what
-        // the attached human answered yes to, inside its own grant.
+        // the report names is the unit — and a second `allow` row records
+        // inside its own grant.
         registry
             .admit_runtime_port(web.switch_addr(), 3000, IpProto::Udp, now)
             .expect("the same port under another protocol is another admission");
@@ -2838,8 +2892,95 @@ mod tests {
         );
         registry
             .admit_runtime_port(db.switch_addr(), 5000, IpProto::Tcp, now)
-            .expect("an ask stance records the report the human answered yes to");
+            .expect("an allow stance records a report inside its own grant");
         assert_eq!(db.runtime_port_numbers(), [5000]);
+    }
+
+    /// NET-045: under `ask` a guest's admit report is refused — ask-yes
+    /// must be host-recorded, because only the host sees the attached
+    /// human's answer — with a typed refusal naming the box, and nothing is
+    /// recorded: not the port, not a rate timestamp.
+    #[test]
+    fn ask_admit_from_guest_refused_without_host_record() {
+        let registry = BoxRegistry::new(SUBNET);
+        let asked = registry.register(
+            BoxRegistration::new("ask-box", Ipv4Addr::new(100, 64, 0, 9), Ipv4Addr::LOCALHOST)
+                .with_dynamic_ingress(DynamicIngress::Ask, Some((3000, 3999))),
+        );
+
+        let refused = registry
+            .admit_runtime_port(asked.switch_addr(), 3000, IpProto::Tcp, Instant::now())
+            .expect_err("a guest report under ask is refused");
+        assert_eq!(
+            refused,
+            PortReportRefusal::AskNotHostRecorded {
+                name: "ask-box".to_string(),
+                port: 3000,
+                proto: IpProto::Tcp,
+            }
+        );
+        assert!(
+            refused
+                .to_string()
+                .contains("ask-yes must be host-recorded"),
+            "the refusal's reason names the rule: {refused}"
+        );
+        assert!(
+            asked.runtime_port_numbers().is_empty(),
+            "the refused report records no port"
+        );
+        assert!(
+            asked
+                .runtime_ports
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .admits
+                .is_empty(),
+            "the refused report records no rate timestamp"
+        );
+    }
+
+    /// NET-138: the alias rule resolves a name held by two live rows — a box
+    /// recreated under its name while the old row's withdrawal is pending —
+    /// to the newest creation, never the old row, whatever the switch
+    /// addresses' order; once the newest row is withdrawn the old one is the
+    /// name's live box, and once both are gone the name answers no row.
+    #[test]
+    fn row_by_name_resolves_newest_live_creation() {
+        let registry = BoxRegistry::new(SUBNET);
+        // The newer creation sits at the lower address, so the map's own
+        // order would answer it last.
+        let old = registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 20),
+            Ipv4Addr::LOCALHOST,
+        ));
+        let new = registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            Ipv4Addr::LOCALHOST,
+        ));
+        assert!(new.box_id() > old.box_id(), "ids order by creation");
+        let resolved = registry.row_by_name("web").expect("the name is live");
+        assert_eq!(
+            resolved.box_id(),
+            new.box_id(),
+            "the alias resolves to the newest creation"
+        );
+        let _ = registry.withdraw(new.switch_addr());
+        assert_eq!(
+            registry
+                .row_by_name("web")
+                .expect("the old row is still live")
+                .box_id(),
+            old.box_id()
+        );
+        let _ = registry.withdraw(old.switch_addr());
+        assert!(registry.row_by_name("web").is_none());
+        assert!(
+            registry.row_by_name("Web").is_none(),
+            "no alias form but the name"
+        );
     }
 
     /// NET-138, NET-045: every grant check refuses its own case, naming the

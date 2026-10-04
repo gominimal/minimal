@@ -30,11 +30,12 @@
 //! nothing, because a withdrawn row is gone, not archived.
 //!
 //! Two doors, because two peers (NET-138). The host's control socket takes
-//! the registrations, their withdrawals, and both read-only verbs; beside
-//! it the daemon binds a second socket — [`GUEST_CONTROL_SOCK_FILE`] — the
-//! in-VM daemon's control channel, bridged to the guest over vsock at
-//! [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`], and it takes the port reports
-//! alone: `admit_port`, the guest's report that one of its boxes published
+//! the registrations, their withdrawals, and both read-only verbs; the
+//! second door — [`GUEST_CONTROL_SOCK_FILE`] — is the in-VM daemon's
+//! control channel, bridged to the guest over vsock at
+//! [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] (bound by T94 together with
+//! that bridge; this module serves its verbs but binds no socket for it
+//! yet), and it takes the port reports alone: `admit_port`, the guest's report that one of its boxes published
 //! a runtime port, and `withdraw_port`, its withdrawal. The verb decides
 //! which door answers it, never the peer: a registration that arrives on
 //! the guest's channel is refused the same way a port report that arrives
@@ -140,7 +141,16 @@ enum ControlDoor {
     /// The host's control socket, in the provider dir beside the ssh
     /// socket: registrations, withdrawals, and both read-only verbs.
     Host,
-    /// The in-VM daemon's control channel: the port reports alone.
+    /// The in-VM daemon's control channel: the port reports alone. No
+    /// runtime socket serves it until T94 binds it with the vsock bridge;
+    /// the tests drive it directly.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the guest door is bound by T94 with the vsock bridge"
+        )
+    )]
     GuestReports,
 }
 
@@ -418,20 +428,21 @@ pub fn resolve_control_sock() -> std::io::Result<PathBuf> {
 /// Bind the control socket at `sock_path` and serve box control requests
 /// — registrations, their withdrawals, both read-only verbs — against
 /// `boxes` on a dedicated thread, whose handle the caller holds for as
-/// long as the daemon lives, and bind the in-VM daemon's report channel
-/// beside it: a second socket in the same dir (see
-/// [`GUEST_CONTROL_SOCK_FILE`]), served on its own thread, that carries
-/// the port reports alone (NET-138).
+/// long as the daemon lives.
 ///
-/// Both binds happen on the calling thread so their failure surfaces to
-/// the supervisor's own startup error handling; only the accept loops
-/// move to their threads. Both sockets get the bridge socket's posture:
-/// path-length check (libkrun aborts on over-long socket paths), a 0700
-/// parent dir, a stale socket removed, and 0600 on the socket itself —
-/// the guest door's peer is the same-uid bridge that connects it to the
-/// vsock, so the uid check holds for it exactly as it does for the host's
-/// own client. The report thread lives with the process like the
-/// withdrawal drainer does; the handle this returns is the host door's.
+/// The in-VM daemon's report channel ([`GUEST_CONTROL_SOCK_FILE`]) is not
+/// bound here: T94 binds the guest door together with the vsock bridge at
+/// [`minimald_rpc::VM_HOST_BOX_REPORT_PORT`] (7352) that is its only peer.
+/// Until then the port-report verbs (`admit_port`, `withdraw_port`) are
+/// served only on [`ControlDoor::GuestReports`], which no runtime socket
+/// carries, so a report reaching the host's socket is refused as the
+/// wrong door.
+///
+/// The bind happens on the calling thread so its failure surfaces to the
+/// supervisor's own startup error handling; only the accept loop moves to
+/// its thread. The socket gets the bridge socket's posture: path-length
+/// check (libkrun aborts on over-long socket paths), a 0700 parent dir, a
+/// stale socket removed, and 0600 on the socket itself.
 pub fn spawn(
     sock_path: PathBuf,
     boxes: BoxRegistry,
@@ -447,42 +458,10 @@ pub fn spawn(
     crate::sock::remove_stale_socket(&sock_path)?;
     let listener = UnixListener::bind(&sock_path)?;
     crate::sock::enforce_socket_permissions(&sock_path)?;
-    // The in-VM daemon's report channel: same dir, same posture, served on
-    // its own thread so a report can never hold a registration's turn (and
-    // the reverse — the serial doors never share a serving slot).
-    let guest_sock_path = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
-    crate::sock::check_uds_path_len(&guest_sock_path)?;
-    crate::sock::remove_stale_socket(&guest_sock_path)?;
-    let guest_listener = UnixListener::bind(&guest_sock_path)?;
-    crate::sock::enforce_socket_permissions(&guest_sock_path)?;
-    // The audit copy's path, kept under the state dir the sockets live in;
-    // only the guest door appends to it, but both doors carry it so the
+    // The audit copy's path, kept under the state dir the socket lives in;
+    // only the guest door appends to it, but every door carries it so the
     // signature is one.
     let audit_path = audit_log_path(&sock_path);
-    let guest_audit_path = audit_path.clone();
-    let guest_boxes = boxes.clone();
-    let guest_answerer = answerer.clone();
-    let guest_publish = proxy_publish.clone();
-    let guest_spawned = std::thread::Builder::new()
-        .name("minvmd-guest-control".to_string())
-        .spawn(move || {
-            accept_loop(
-                guest_listener,
-                guest_boxes,
-                guest_answerer,
-                guest_publish,
-                ControlDoor::GuestReports,
-                &guest_audit_path,
-            )
-        });
-    if let Err(error) = guest_spawned {
-        // A daemon that cannot serve its guest channel is a daemon whose
-        // boxes cannot publish a runtime port: the start says so rather
-        // than coming up half-bridged.
-        return Err(std::io::Error::other(format!(
-            "could not spawn the in-VM daemon's control channel: {error}"
-        )));
-    }
     std::thread::Builder::new()
         .name("minvmd-control".to_string())
         .spawn(move || {
@@ -1112,7 +1091,8 @@ struct AdmittedPortAudit {
 /// grant already admitted. The parent dirs are created when absent (the
 /// first admission on a fresh state dir), and the append is a plain
 /// one-line write, since this file is host-side state the guest cannot
-/// reach.
+/// reach. The file is created owner-only (0600), the posture the sockets
+/// beside it carry: it names every box and port a guest admitted.
 fn append_audit_copy(
     path: &Path,
     record: &Arc<crate::box_registry::BoxRecord>,
@@ -1137,9 +1117,11 @@ fn append_audit_copy(
             std::fs::create_dir_all(parent)?;
         }
         use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(path)?;
         writeln!(file, "{json}")
     })();
@@ -1230,7 +1212,39 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(2));
         }
+        spawn_guest_door(&sock_path, &boxes, &answerer, &proxy_publish)?;
         Ok((sock_path, handle, boxes, answerer, proxy_publish))
+    }
+
+    /// Serves [`ControlDoor::GuestReports`] on a test-only socket beside
+    /// `sock_path` — the runtime binds no guest door until T94 brings the
+    /// vsock bridge — so the per-door verb enforcement is driven with the
+    /// door value directly, through the same accept loop and audit path the
+    /// daemon's door will use.
+    fn spawn_guest_door(
+        sock_path: &std::path::Path,
+        boxes: &BoxRegistry,
+        answerer: &AnswererStatus,
+        proxy_publish: &ProxyPublishStatus,
+    ) -> std::io::Result<()> {
+        let guest_sock_path = sock_path.with_file_name(GUEST_CONTROL_SOCK_FILE);
+        let listener = UnixListener::bind(&guest_sock_path)?;
+        let audit_path = audit_log_path(sock_path);
+        let (boxes, answerer, proxy_publish) =
+            (boxes.clone(), answerer.clone(), proxy_publish.clone());
+        std::thread::Builder::new()
+            .name("minvmd-guest-control-test".to_string())
+            .spawn(move || {
+                accept_loop(
+                    listener,
+                    boxes,
+                    answerer,
+                    proxy_publish,
+                    ControlDoor::GuestReports,
+                    &audit_path,
+                )
+            })?;
+        Ok(())
     }
 
     /// A client that writes the request and reads the reply line back,
@@ -2193,7 +2207,7 @@ mod tests {
         assert!(TestStream::connect(&sock_path).is_ok());
     }
 
-    /// A box registered with the grant — the ask stance and its range — and
+    /// A box registered with the grant — the allow stance and its range — and
     /// one admit report recorded through the guest door: the read-only row
     /// verb answers the row's switch address, its derived egress allow-list
     /// and its declared and runtime-admitted ports, the report answers one
@@ -2220,7 +2234,7 @@ mod tests {
                         deny_subnets: None,
                     }),
                     credentialed_upstream: None,
-                    dynamic_ingress: Some(sessions::DynamicIngress::Ask),
+                    dynamic_ingress: Some(sessions::DynamicIngress::Allow),
                     dynamic_allowed_range: Some((3000, 3999)),
                 },
             )
@@ -2235,7 +2249,7 @@ mod tests {
                 switch_address: web.switch_address,
                 port: 3000,
                 proto: sessions::IpProto::Tcp,
-                source: PortReportSource::Ask,
+                source: PortReportSource::Expose,
             }),
         )
         .expect("the report is answered");
@@ -2288,7 +2302,7 @@ mod tests {
         assert!(
             log.contains("box=web")
                 && log.contains("port=3000")
-                && log.contains("source=ask")
+                && log.contains("source=expose")
                 && log.contains(&format!("switch_address={}", web.switch_address)),
             "the info line names the box, the port, the source and the row key: {log}"
         );
@@ -2302,11 +2316,43 @@ mod tests {
             audit.contains(r#""box":"web""#)
                 && audit.contains(r#""port":3000"#)
                 && audit.contains(r#""proto":"tcp""#)
-                && audit.contains(r#""source":"ask""#)
+                && audit.contains(r#""source":"expose""#)
                 && audit.contains(&format!(r#""switch_address":"{}""#, web.switch_address)),
             "the audit line names the box, the row key, the port, the protocol and the \
              source: {audit}"
         );
+    }
+
+    /// The host-side audit copy is created owner-only (0600): it names
+    /// every box and port a guest admitted, so it carries the posture the
+    /// sockets beside it do.
+    #[test]
+    fn audit_copy_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = audit_log_path(&dir.path().join(CONTROL_SOCK_FILE));
+        let registry = BoxRegistry::new(SUBNET);
+        let record = registry.register(crate::box_registry::BoxRegistration::new(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            Ipv4Addr::LOCALHOST,
+        ));
+        append_audit_copy(
+            &path,
+            &record,
+            &AdmitPortRequest {
+                switch_address: record.switch_addr(),
+                port: 3000,
+                proto: sessions::IpProto::Tcp,
+                source: PortReportSource::Expose,
+            },
+        );
+        let mode = std::fs::metadata(&path)
+            .expect("the audit copy was created")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the audit copy is owner-only, got {mode:o}");
     }
 
     /// The doors are the verb's access control (NET-138): the read-only row
