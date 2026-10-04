@@ -229,6 +229,10 @@ pub fn register_box(
     match serde_json_lenient::from_str(reply.trim())
         .map_err(|e| format!("parse the box registration's reply {reply:?}: {e}"))?
     {
+        minimald_rpc::BoxControlReply::Registered(registered) => Ok(minimald_rpc::BoxAddresses {
+            switch_address: registered.switch_address,
+            loopback_address: registered.loopback_address,
+        }),
         minimald_rpc::BoxControlReply::Addresses(addresses) => Ok(addresses),
         other => Err(format!(
             "the VM host refused the box registration: {other:?}"
