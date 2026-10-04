@@ -1474,9 +1474,14 @@ async fn relay_control(
             // answer half). The body is one the decision already admitted,
             // so the remote it read parses here too; a body that somehow did
             // not is left unnoted, which records nothing for it — fail
-            // closed, the same posture an unapplied publish has.
-            if let Some(inside) = published_inside(&request) {
-                forwards.note_published(listener, decision.request.switch_addr(), inside);
+            // closed, the same posture an unapplied publish has. The
+            // protocol is noted with them: the records the inside port earns
+            // are keyed by it, so a later retraction ends them under the
+            // protocol they were opened at, whatever its own body spells.
+            if let Some(inside) = published_inside(&request)
+                && let Some(proto) = published_protocol(&request)
+            {
+                forwards.note_published(listener, decision.request.switch_addr(), inside, proto);
             }
         }
         (ControlVerb::Unexpose, Some(listener)) => {
@@ -1487,16 +1492,15 @@ async fn relay_control(
             // on one of them is decided by the rules, not by the record a
             // publication that no longer stands opened. The records at the
             // box's other published ports stay standing: a retraction ends
-            // a publication, never the box. The protocol is read from the
-            // same body the decision admitted — the client's own spelling,
-            // the number the records are keyed by — and the attribution
-            // from the ledger, which held it for exactly this: a retraction
+            // a publication, never the box. The attribution and the protocol
+            // both come from the ledger, which noted them at the publish the
+            // records were opened under — never from the retraction's own
+            // spelling, which could name a protocol the publish did not —
+            // and which held them for exactly this: a retraction
             // the ledger could not attribute was already refused, and a
             // row the retraction ends nothing of simply has no entry to
             // end.
-            if let Some((addr, inside)) = forwards.note_retracted(listener)
-                && let Some(proto) = published_protocol(&request)
-            {
+            if let Some((addr, inside, proto)) = forwards.note_retracted(listener) {
                 replies.end_port_at(addr, proto, inside);
             }
         }
@@ -1740,11 +1744,15 @@ struct ControlDecision {
 /// record opens.
 #[derive(Debug, Default)]
 struct PublishedForwards {
-    applied: Mutex<Vec<(Listener, [u8; 4], u16)>>,
+    applied: Mutex<Vec<AppliedPublish>>,
 }
 
 /// A forwarder listener: its loopback address and port.
 type Listener = ([u8; 4], u16);
+
+/// One applied publish in the ledger: its listener, the address it was
+/// applied at, the inside port its forward dials and the protocol it named.
+type AppliedPublish = (Listener, [u8; 4], u16, u8);
 
 /// How many applied publishes' attributions the ledger keeps.
 const PUBLISHED_FORWARDS_TRACKED: usize = 1024;
@@ -1757,20 +1765,20 @@ impl PublishedForwards {
         }
     }
 
-    /// Notes an applied publish: the address its listener was applied at and
-    /// the inside port its forward dials. The listener is keyed first —
+    /// Notes an applied publish: the address its listener was applied at,
+    /// the inside port its forward dials and the protocol it published. The listener is keyed first —
     /// gvproxy binds one forwarder per loopback listener, so a second publish
     /// for a held listener never becomes live — and the ledger is bounded
     /// oldest-first, so the honest handful never reaches the bound.
-    fn note_published(&self, listener: Listener, addr: [u8; 4], inside: u16) {
+    fn note_published(&self, listener: Listener, addr: [u8; 4], inside: u16, proto: u8) {
         let mut applied = self.lock();
-        if applied.iter().any(|(held, _, _)| *held == listener) {
+        if applied.iter().any(|(held, _, _, _)| *held == listener) {
             return;
         }
         if applied.len() >= PUBLISHED_FORWARDS_TRACKED {
             applied.remove(0);
         }
-        applied.push((listener, addr, inside));
+        applied.push((listener, addr, inside, proto));
     }
 
     /// Drops the attribution an applied retraction's listener carried, and
@@ -1782,14 +1790,14 @@ impl PublishedForwards {
     /// holds one attribution per listener), so the one removal is the whole
     /// retraction; `None` is a retraction the ledger had no attribution for,
     /// which the decision already refused as unattributed.
-    fn note_retracted(&self, listener: Listener) -> Option<([u8; 4], u16)> {
+    fn note_retracted(&self, listener: Listener) -> Option<([u8; 4], u16, u8)> {
         let mut applied = self.lock();
         applied
             .iter()
-            .position(|(held, _, _)| *held == listener)
+            .position(|(held, _, _, _)| *held == listener)
             .map(|at| {
-                let (_, addr, inside) = applied.remove(at);
-                (addr, inside)
+                let (_, addr, inside, proto) = applied.remove(at);
+                (addr, inside, proto)
             })
     }
 
@@ -1798,8 +1806,8 @@ impl PublishedForwards {
     fn address_of(&self, listener: Listener) -> Option<[u8; 4]> {
         self.lock()
             .iter()
-            .find(|(held, _, _)| *held == listener)
-            .map(|(_, addr, _)| *addr)
+            .find(|(held, _, _, _)| *held == listener)
+            .map(|(_, addr, _, _)| *addr)
     }
 
     /// Whether an applied publish's forward dials `addr` at `port`: the
@@ -1814,10 +1822,10 @@ impl PublishedForwards {
     fn inside_published(&self, addr: [u8; 4], port: u16) -> bool {
         self.lock()
             .iter()
-            .any(|(_, at, inside)| *at == addr && *inside == port)
+            .any(|(_, at, inside, _)| *at == addr && *inside == port)
     }
 
-    fn lock(&self) -> MutexGuard<'_, Vec<(Listener, [u8; 4], u16)>> {
+    fn lock(&self) -> MutexGuard<'_, Vec<AppliedPublish>> {
         self.applied.lock().expect(
             "the ledger's lock is held only across a lookup or an update, never across a panic",
         )
@@ -2334,12 +2342,13 @@ fn published_inside(body: &[u8]) -> Option<u16> {
     .map(|(_, port)| port)
 }
 
-/// The protocol a retraction names — the client's own two spellings, as the
+/// The protocol a publish names — the client's own two spellings, as the
 /// numbers the reply-flow records are keyed by — read from the same body the
-/// decision admitted ([`summarize_unexpose`] checks the spelling), for the
-/// retraction's end of the records the publication it retracts earned
-/// ([`ReplyTables::end_port_at`]): the records are keyed by protocol and port
-/// together, so the retraction ends the pair the publish opened them at.
+/// decision admitted, and noted in the ledger beside the publish's
+/// attribution ([`PublishedForwards::note_published`]): the records are keyed
+/// by protocol and port together, so the retraction ends
+/// ([`ReplyTables::end_port_at`]) the pair the publish opened them at, under
+/// the protocol the ledger holds rather than the one the retraction spells.
 /// `None` for a body that does not parse or a protocol the client does not
 /// spell — one the decision already refused, which is never applied.
 fn published_protocol(body: &[u8]) -> Option<u8> {
@@ -5951,7 +5960,12 @@ mod tests {
         // listener the switch binds and the inside port its forward dials —
         // the port the recording is bounded by, pinned from the outside.
         let forwards = PublishedForwards::new();
-        forwards.note_published(([127, 0, 0, 1], 8080), LEASE, 18080);
+        forwards.note_published(
+            ([127, 0, 0, 1], 8080),
+            LEASE,
+            18080,
+            super::egress::IPPROTO_TCP,
+        );
         assert!(
             forwards.inside_published(LEASE, 18080),
             "the mapping's inside port is the port the recording is bounded by"
@@ -6094,7 +6108,12 @@ mod tests {
         // The publish's note for the proxy port, taken as the applied
         // publish takes it.
         let forwards = PublishedForwards::new();
-        forwards.note_published(([127, 0, 0, 1], 7654), node_addr, 7654);
+        forwards.note_published(
+            ([127, 0, 0, 1], 7654),
+            node_addr,
+            7654,
+            super::egress::IPPROTO_TCP,
+        );
         assert!(
             forwards.inside_published(node_addr, 7654),
             "the proxy port is the port the node's recording is bounded by"
@@ -6256,7 +6275,12 @@ mod tests {
                 }),
         );
         let forwards = PublishedForwards::new();
-        forwards.note_published(([127, 0, 0, 1], 8080), LEASE, 18080);
+        forwards.note_published(
+            ([127, 0, 0, 1], 8080),
+            LEASE,
+            18080,
+            super::egress::IPPROTO_TCP,
+        );
         assert!(
             forwards.inside_published(LEASE, 18080),
             "the mapping's inside port is the port the recording is bounded by"
@@ -10504,8 +10528,8 @@ mod tests {
         );
 
         let ledger = super::PublishedForwards::new();
-        ledger.note_published(a, [100, 64, 0, 9], 18080);
-        ledger.note_published(b, [100, 64, 0, 10], 18081);
+        ledger.note_published(a, [100, 64, 0, 9], 18080, super::egress::IPPROTO_TCP);
+        ledger.note_published(b, [100, 64, 0, 10], 18081, super::egress::IPPROTO_UDP);
         assert_eq!(ledger.address_of(a), Some([100, 64, 0, 9]));
         assert_eq!(
             ledger.address_of(b),
@@ -10527,7 +10551,11 @@ mod tests {
             "the mapping's external port opens nothing: no publish dials it"
         );
 
-        ledger.note_retracted(b);
+        assert_eq!(
+            ledger.note_retracted(b),
+            Some(([100, 64, 0, 10], 18081, super::egress::IPPROTO_UDP)),
+            "a retraction hands back the protocol its publish was noted under"
+        );
         assert_eq!(
             ledger.address_of(b),
             None,
