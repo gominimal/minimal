@@ -2204,6 +2204,53 @@ pub(crate) fn command(port: u16, install: Option<&AnswererInstall>) -> String {
     linux_command(port, install)
 }
 
+/// The answerer service's own state as an advisory fact, beside the
+/// range's. Every state but the first two is a fact the user has no other
+/// way to see; `carried` is whether the command below carries the service
+/// step, and only then does the fact say the command installs or reinstalls
+/// it — a command rendered without the step must never claim it.
+fn answerer_fact(answerer: &AnswererStep, carried: bool) -> Option<String> {
+    let remedy = |verb: &str| {
+        if carried {
+            format!("; the command below {verb}")
+        } else {
+            String::new()
+        }
+    };
+    match answerer {
+        AnswererStep::Installed | AnswererStep::NotOffered => None,
+        AnswererStep::Absent => Some(format!(
+            "the box-zone answerer is not installed as a host service, so the zone answers \
+             only while a session holds it{}",
+            remedy(
+                "installs the service the service manager holds, run by the operator from a \
+                 root-owned copy"
+            )
+        )),
+        AnswererStep::CustodyFailed { failed_check } => Some(format!(
+            "the installed box-zone answerer service {ANSWERER_UNIT_LABEL} fails custody: \
+             {failed_check}{}",
+            remedy("reinstalls it")
+        )),
+        AnswererStep::ProtocolMismatch {
+            installed: None,
+            daemon,
+        } => Some(format!(
+            "the installed box-zone answerer service does not answer this daemon's channel \
+             protocol {daemon}{}",
+            remedy("reinstalls it from this machine's own answerer program")
+        )),
+        AnswererStep::ProtocolMismatch {
+            installed: Some(installed),
+            daemon,
+        } => Some(format!(
+            "the installed box-zone answerer service speaks channel protocol {installed}, not \
+             this daemon's {daemon}{}",
+            remedy("reinstalls it from this machine's own answerer program")
+        )),
+    }
+}
+
 /// The advisory for one session start, as a function of the hook state, the
 /// daemon's interim verdict, whether the reserved local range read present
 /// on this host's own loopback, the range step and the answerer step this
@@ -2386,55 +2433,20 @@ pub(crate) fn advisory_at(
         None
     };
     if answerer.offered() && !answerer.holds() && install.is_none() {
-        facts.push(format!(
-            "the box-zone answerer program {ANSWERER_PROGRAM_NAME} is not beside min or on \
-             PATH, so the command below cannot install the answerer service"
-        ));
+        facts.push(if answerer_source().is_none() {
+            format!(
+                "the box-zone answerer program {ANSWERER_PROGRAM_NAME} is not beside min or \
+                 on PATH, so the command below cannot install the answerer service"
+            )
+        } else {
+            "a path the answerer service step would carry holds a quote, `$`, a backtick, \
+             a backslash or a line break, which the privileged command cannot quote safely, \
+             so the command below leaves the answerer service out"
+                .to_string()
+        });
     }
-    match answerer {
-        // The answerer service's own state, beside the range's. Every arm
-        // but the first is a fact the user has no other way to see, and
-        // the command below is the one that installs the service — or, for
-        // the last two, reinstalls it over what the step left behind: a
-        // unit a user can write to, or a copy that speaks a wire this
-        // daemon no longer understands.
-        AnswererStep::Installed | AnswererStep::NotOffered => {}
-        AnswererStep::Absent => {
-            facts.push(
-                "the box-zone answerer is not installed as a host service, \
-                 so the zone answers only while a session holds it; the \
-                 command below installs the service the service manager \
-                 holds, run by the operator from a root-owned copy"
-                    .to_string(),
-            );
-        }
-        AnswererStep::CustodyFailed { failed_check } => {
-            facts.push(format!(
-                "the installed box-zone answerer service {ANSWERER_UNIT_LABEL} \
-                 fails custody: {failed_check}; the command below reinstalls it"
-            ));
-        }
-        AnswererStep::ProtocolMismatch {
-            installed: None,
-            daemon,
-        } => {
-            facts.push(format!(
-                "the installed box-zone answerer service does not answer \
-                 this daemon's channel protocol {daemon}; the command below \
-                 reinstalls it from this machine's own answerer program"
-            ));
-        }
-        AnswererStep::ProtocolMismatch {
-            installed: Some(installed),
-            daemon,
-        } => {
-            facts.push(format!(
-                "the installed box-zone answerer service speaks channel \
-                 protocol {installed}, not this daemon's {daemon}; the \
-                 command below reinstalls it from this machine's own answerer \
-                 program"
-            ));
-        }
+    if let Some(fact) = answerer_fact(&answerer, install.is_some()) {
+        facts.push(fact);
     }
     if !hook.routes(port) {
         facts.push(format!(
@@ -3219,6 +3231,38 @@ mod tests {
     // daemon's control socket answers is the fact both verbs surface, and
     // the wording is pinned here because the session e2e greps `min ls`
     // for exactly this line.
+    #[test]
+    fn answerer_fact_claims_the_step_only_when_the_command_carries_it() {
+        let states = [
+            AnswererStep::Absent,
+            AnswererStep::CustodyFailed {
+                failed_check: "the plist is group-writable".to_string(),
+            },
+            AnswererStep::ProtocolMismatch {
+                installed: None,
+                daemon: 2,
+            },
+            AnswererStep::ProtocolMismatch {
+                installed: Some(1),
+                daemon: 2,
+            },
+        ];
+        for state in &states {
+            let carried = answerer_fact(state, true).expect("the state is a fact");
+            assert!(
+                carried.contains("the command below"),
+                "a carried step names its remedy: {carried}"
+            );
+            let left_out = answerer_fact(state, false).expect("the state is still a fact");
+            assert!(
+                !left_out.contains("the command below"),
+                "a command without the step never claims it: {left_out}"
+            );
+        }
+        assert_eq!(answerer_fact(&AnswererStep::Installed, true), None);
+        assert_eq!(answerer_fact(&AnswererStep::NotOffered, false), None);
+    }
+
     #[test]
     fn answerer_install_refuses_unquotable_paths() {
         let base = AnswererInstall {
