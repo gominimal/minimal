@@ -548,6 +548,25 @@ fn refuse_dynamic_ingress_on_vm(
     Ok(())
 }
 
+/// Refuses a dynamic ingress declaration on a box that is not `own_ip`:
+/// only an own-IP box has a published address a runtime publish could
+/// apply to, so a stance or range on a `host_ip` or `none` box would be a
+/// declaration `min session policy` shows and nothing ever honours. The
+/// CLI reference documents the flags as requiring `--network own_ip`.
+fn refuse_dynamic_ingress_off_own_ip(
+    network: crate::cli::CliNetworkMode,
+    mode: Option<sessions::DynamicIngress>,
+    range: Option<(u16, u16)>,
+) -> Result<(), anyhow::Error> {
+    if network != crate::cli::CliNetworkMode::OwnIp && (mode.is_some() || range.is_some()) {
+        anyhow::bail!(
+            "--dynamic-ingress and --dynamic-range need --network own_ip: only an own-IP box \
+             has a published address to apply them to"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) async fn activate_session(
     global: &GlobalArgs,
     args: ActivateArgs,
@@ -556,6 +575,7 @@ pub(crate) async fn activate_session(
     ensure_daemon(global)?;
     // Before anything is created: a VM-backed host cannot keep an allow/ask
     // stance yet, so the activation ends here with the reason.
+    refuse_dynamic_ingress_off_own_ip(args.network, args.dynamic_ingress, args.dynamic_range)?;
     refuse_dynamic_ingress_on_vm(daemon_provider_kind(global), args.dynamic_ingress)?;
 
     let effective_path = match (&args.path, &global.repo_dir) {
@@ -3515,6 +3535,29 @@ mod tests {
         DynamicIngress, EffectiveEgress, EffectiveSessionPolicy, IngressPolicy, IpProto,
         NetworkMode, PortMapping,
     };
+
+    #[test]
+    fn dynamic_ingress_needs_own_ip() {
+        use crate::cli::CliNetworkMode::{HostNet, NoNet, OwnIp};
+        for network in [HostNet, NoNet] {
+            for (mode, range) in [
+                (Some(DynamicIngress::Allow), Some((8000, 8443))),
+                (Some(DynamicIngress::Deny), None),
+                (None, Some((8000, 8443))),
+            ] {
+                let error = refuse_dynamic_ingress_off_own_ip(network, mode, range)
+                    .expect_err("a dynamic declaration off own_ip is refused");
+                assert!(
+                    error.to_string().contains("need --network own_ip"),
+                    "{error}"
+                );
+            }
+            refuse_dynamic_ingress_off_own_ip(network, None, None)
+                .expect("no dynamic declaration is never refused");
+        }
+        refuse_dynamic_ingress_off_own_ip(OwnIp, Some(DynamicIngress::Allow), Some((8000, 8443)))
+            .expect("an own-IP box keeps its dynamic declaration");
+    }
 
     #[test]
     fn vm_backed_activate_refuses_dynamic_allow_until_host_admission() {
