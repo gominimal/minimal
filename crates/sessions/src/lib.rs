@@ -1584,7 +1584,7 @@ mod tests {
         };
         for network in [NetworkMode::OwnIp, NetworkMode::HostNet] {
             let record = record_with(network, SessionPolicy::new(Some(egress.clone()), None));
-            assert!(record.validate_policy().is_ok());
+            assert!(record.validate_new_policy().is_ok());
         }
     }
 
