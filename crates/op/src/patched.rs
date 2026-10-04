@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use anyhow::anyhow;
 use graph::{BuildSpecRef, Transitives};
-use lcache::{EntryMeta, MetaInner, PendingDir};
+use lcache::{CacheErr, EntryMeta, MetaInner, PendingDir};
 
 use crate::{Error, Options, Runnable, SpecBuild};
 
@@ -50,13 +50,17 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
             let dep_build = opts.graph.get(bsr).unwrap();
             let cache_dir = match opts.cache.unsafe_get_build_by_name(&dep_build.name) {
                 Ok(entry) => entry,
-                Err(_) => match opts.cache.read_dir(&opts.graph.spec_hash(bsr)) {
-                    Ok(entry) => entry,
-                    Err(_) => {
-                        missing.push(dep_build.name.clone());
-                        continue;
+                Err(by_name) => {
+                    warn_unless_not_found(&dep_build.name, "by name", &by_name);
+                    match opts.cache.read_dir(&opts.graph.spec_hash(bsr)) {
+                        Ok(entry) => entry,
+                        Err(by_hash) => {
+                            warn_unless_not_found(&dep_build.name, "by spec hash", &by_hash);
+                            missing.push(dep_build.name.clone());
+                            continue;
+                        }
                     }
-                },
+                }
             };
             dependencies.insert(cache_dir.path().to_path_buf());
         }
@@ -92,6 +96,14 @@ impl<'a, SF: crate::SourceFetcher> Runnable for PatchedBuild<'a, SF> {
             outputs: res.outputs,
             build_ms: res.build_ms,
         })
+    }
+}
+
+/// Logs a dependency lookup failure that is not a plain cache miss, so an IO
+/// error or a corrupt cache is not mistaken for an unbuilt dependency.
+fn warn_unless_not_found(name: &str, lookup: &str, err: &CacheErr) {
+    if !matches!(err, CacheErr::NotFound) {
+        tracing::warn!(dep = name, lookup, error = ?err, "patched-build dependency lookup failed");
     }
 }
 
