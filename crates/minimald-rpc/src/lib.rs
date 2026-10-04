@@ -714,7 +714,7 @@ pub enum BoxControlRequest {
 /// forgeable from inside the escape boundary, and the answerer's port is
 /// held on the host's loopback, where only the host's own client can read
 /// it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ZoneAnswererStatus {
     /// The answerer's acquisition has not finished its first pass: the
@@ -747,6 +747,56 @@ pub enum ZoneAnswererStatus {
     PortHeldNoChannel {
         /// The machine's answerer port, held by a process with no channel.
         port: u16,
+    },
+    /// The hostname proxy this VM host daemon reserved for its VM is not
+    /// serving, and this is the host-side cause (T93): the port the
+    /// supervisor drew or was pinned and what kept it from publishing. It
+    /// rides the answerer's read because that read is already the one
+    /// host-side fact the CLI asks this daemon for — the proxy's publish
+    /// outcome is a host fact the same way the answerer's state is, never
+    /// something the guest could vouch for, and it is the CLI's only way to
+    /// say *why* the proxy is down rather than that it merely is.
+    ProxyNotServing {
+        /// The port the supervisor reserved and the guest could not publish.
+        port: u16,
+        /// What kept the proxy from serving on that port.
+        cause: ProxyDownCause,
+    },
+}
+
+/// Why a VM host daemon says its VM's hostname proxy is not serving (T93):
+/// the terminal publish outcomes the supervisor itself reached — the port
+/// it reserved is held by another process on the host, or the draws to find
+/// a free one ran out — or that its publish is unconfirmed, the one
+/// non-terminal state: the VM is up, the publish is not one the host saw. A
+/// host that merely has no switch to publish through says nothing here: that
+/// boot's proxy never attempted a publish, and its story stays the daemon
+/// log's, not a cause this status could name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyDownCause {
+    /// Another process on the host holds the published port — for a port
+    /// the operator pinned this fails the start outright; for a drawn one
+    /// it is what every redraw skipped.
+    PortHeld,
+    /// The drawn port's publish tries ran out: every port the reservation
+    /// drew was already taken when the guest tried to publish it.
+    RedrawsRanOut,
+    /// The VM came up but the guest never reported the publish, and the
+    /// supervisor could not attribute the port to this VM's own forwarder:
+    /// nothing answers on it, or its holder is one the host does not let
+    /// this user see. Not a failure — the VM stays up — but not a publish
+    /// the host can vouch for either, so the surfaces say "unconfirmed"
+    /// rather than "serving" until the guest's late report clears it.
+    PublishUnconfirmed,
+    /// The VM came up with its publish unconfirmed, and the guest's late
+    /// report then said the port is held: the VM stays up with no hostname
+    /// proxy — not a start failure, so it never reads like one. Names the
+    /// holder as the host saw it when the report landed (`pid <pid>
+    /// (<exe>)`), or `None` when the host would not name it.
+    PortHeldAfterStart {
+        /// Who holds the port, when the host let the supervisor see it.
+        holder: Option<String>,
     },
 }
 

@@ -25,7 +25,7 @@
 use hickory_proto::op::{Message, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{Name, RData, RecordType};
-use minimald_rpc::ZoneAnswererStatus;
+use minimald_rpc::{ProxyDownCause, ZoneAnswererStatus};
 use serde::Serialize;
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -2505,12 +2505,22 @@ pub(crate) fn session_advisory_at(
 /// the names resolve on — so `min session activate` and `min ls` both
 /// print from the one function that reads it and cannot disagree about
 /// one host. T65's verbs inherit it unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveSurface {
     /// Native DNS: the host resolver answers `*.{ZONE}` from the answerer.
     Native,
     /// The hostname proxy: names resolve only through it.
     Proxy,
+    /// The hostname proxy, with the named cause for its *not serving* —
+    /// the terminal publish outcome the VM host daemon reports (T93): the
+    /// port another process on the host holds, or the redraws that ran
+    /// out — or that its publish is unconfirmed (the VM is up, the publish
+    /// is not one the host saw land). Carries its own port because the
+    /// status that reported it named the port the failure is about, which
+    /// is not the serving port a reply's discovery field would carry — and
+    /// names the cause because "not serving" alone does not tell a user
+    /// which thing to free.
+    ProxyNotServing { port: u16, cause: ProxyDownCause },
 }
 
 /// Design §7.1's supersession condition, as the three facts it is: this
@@ -2676,7 +2686,7 @@ pub(crate) async fn live_name_surfaces(
 /// its first pass — the pre-acquisition state, which the verbs treat as
 /// "nothing to say yet" rather than a verdict, exactly as a daemon still
 /// bringing its answerer up is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HostAnswererRead {
     /// The port the VM host daemon reported, when its acquisition loop has
     /// decided one.
@@ -2691,23 +2701,35 @@ pub(crate) struct HostAnswererRead {
     /// already says the port is no daemon's answerer, so a reply from it
     /// would be some other process's behaviour, not this zone's.
     pub held_no_channel: bool,
+    /// The terminal hostname-proxy publish outcome the VM host daemon
+    /// reported (T93): the port the failure is about and its named cause —
+    /// another process on the host holds the port, or the redraws ran out.
+    /// `None` in every other state, where the status says nothing about
+    /// the proxy. In this arm nothing else is read: the status is the VM
+    /// host daemon's own verdict on the proxy's publication, and no host
+    /// probe can move it.
+    pub proxy_down: Option<(u16, ProxyDownCause)>,
 }
 
 /// [`HostAnswererRead`] from the status the VM host daemon's control
 /// socket answered: `Holder` and `Registered` name their port and earn the
 /// one bounded liveness query that proves it answers; `PortHeldNoChannel`
-/// names its port with no query to run; `Starting` claims nothing.
+/// names its port with no query to run; `ProxyNotServing` carries the
+/// terminal hostname-proxy failure's port and cause for the session start
+/// to name, claiming no answerer facts; `Starting` claims nothing.
 pub(crate) async fn host_answerer_read(status: ZoneAnswererStatus) -> HostAnswererRead {
     match status {
         ZoneAnswererStatus::Starting => HostAnswererRead {
             port: None,
             answerer_bound: false,
             held_no_channel: false,
+            proxy_down: None,
         },
         ZoneAnswererStatus::PortHeldNoChannel { port } => HostAnswererRead {
             port: Some(port),
             answerer_bound: false,
             held_no_channel: true,
+            proxy_down: None,
         },
         ZoneAnswererStatus::Holder { port }
         | ZoneAnswererStatus::Registered { port }
@@ -2715,6 +2737,13 @@ pub(crate) async fn host_answerer_read(status: ZoneAnswererStatus) -> HostAnswer
             port: Some(port),
             answerer_bound: answerer_bound_at(port).await,
             held_no_channel: false,
+            proxy_down: None,
+        },
+        ZoneAnswererStatus::ProxyNotServing { port, cause } => HostAnswererRead {
+            port: None,
+            answerer_bound: false,
+            held_no_channel: false,
+            proxy_down: Some((port, cause)),
         },
     }
 }
@@ -2867,6 +2896,13 @@ pub(crate) fn vm_host_answerer_line_at(
              reaches holds 127.0.0.1:{port}, so this VM's minvmd answers \
              nothing and its names are not answered on the host"
         )),
+        // The status that carries the hostname proxy's terminal publish
+        // failure says nothing about the zone answerer, so the answerer
+        // row claims nothing for it — the same silence the
+        // pre-acquisition state keeps. The proxy's own named cause
+        // prints in the NAME SURFACE row below, which is where the
+        // directive puts it.
+        ZoneAnswererStatus::ProxyNotServing { .. } => None,
     }
 }
 
@@ -2879,11 +2915,19 @@ pub(crate) fn vm_host_answerer_line_at(
 /// port the status named — the same facts the session start reads, at the
 /// list's own deadline, as [`live_name_surfaces`] does for a native host.
 /// The pre-acquisition state claims nothing: no port named, no verdict to
-/// print, exactly as a native daemon's absent port is.
+/// print, exactly as a native daemon's absent port is. The terminal
+/// hostname-proxy failure settles the proxy with its named cause carried
+/// whole — no detection or liveness query runs, because the VM host
+/// daemon's verdict on the proxy's publication is the fact, and the row
+/// below must name why the proxy is not serving, not re-derive that it
+/// is not (T93).
 pub(crate) async fn vm_host_name_surface(status: ZoneAnswererStatus) -> Option<LiveSurface> {
     match status {
         ZoneAnswererStatus::Starting => None,
         ZoneAnswererStatus::PortHeldNoChannel { .. } => Some(LiveSurface::Proxy),
+        ZoneAnswererStatus::ProxyNotServing { port, cause } => {
+            Some(LiveSurface::ProxyNotServing { port, cause })
+        }
         ZoneAnswererStatus::Holder { port }
         | ZoneAnswererStatus::Registered { port }
         | ZoneAnswererStatus::ManagerHeld { port } => {
@@ -2959,6 +3003,46 @@ pub fn name_surface_line(surface: LiveSurface, proxy_port: Option<u16>) -> Strin
                  routes through it on 127.0.0.1:{port}"
             ),
             None => "the hostname proxy is the live name surface; it is not serving".to_string(),
+        },
+        // The named cause replaces the bare "not serving": the port the
+        // failure is about and the thing to free — another process on the
+        // host, or a redraw that ran out of tries — because a user who
+        // cannot resolve a name needs which port to check, not the fact
+        // that something failed (T93). The port comes from the verdict,
+        // not `proxy_port`: a reply whose proxy never published carries
+        // no serving port to name.
+        LiveSurface::ProxyNotServing { port, cause } => match cause {
+            ProxyDownCause::PortHeld => format!(
+                "the hostname proxy is the live name surface; it is not serving — \
+                 another process on the host holds 127.0.0.1:{port}"
+            ),
+            ProxyDownCause::RedrawsRanOut => format!(
+                "the hostname proxy is the live name surface; it is not serving — \
+                 its publication was redrawn and the redraws ran out; the last \
+                 port was 127.0.0.1:{port}"
+            ),
+            // The VM is up, but the VM host daemon never saw the publish
+            // land: no report from the guest, and no listener on the port
+            // it could attribute to this VM. Said as unconfirmed, never as
+            // serving, until the guest's report clears it.
+            ProxyDownCause::PublishUnconfirmed => format!(
+                "hostname proxy publish unconfirmed · the VM is up, but the VM \
+                 host daemon has not seen the hostname proxy publish on \
+                 127.0.0.1:{port}; names may not route through it until the \
+                 guest reports the publish"
+            ),
+            // The guest's late report refused the port after the VM came
+            // up: the VM keeps running with no hostname proxy, so this is
+            // said as a running VM's state, never in the start failure's
+            // words — the port, who holds it, and that the VM is up.
+            ProxyDownCause::PortHeldAfterStart { holder } => {
+                let holder = holder.as_deref().unwrap_or("another process on the host");
+                format!(
+                    "the hostname proxy is not serving · the VM is up without a hostname \
+                     proxy: {holder} holds 127.0.0.1:{port}; free the port and restart \
+                     the VM to publish it"
+                )
+            }
         },
     }
 }
@@ -3696,6 +3780,140 @@ mod tests {
         assert!(
             !proxy.contains("native DNS is the live name surface"),
             "the proxy arm must not say the native words: {proxy}"
+        );
+    }
+
+    /// T93: the NAME SURFACE row and the session-start message name *why*
+    /// the hostname proxy is not serving — the port the failure is about
+    /// and the cause the VM host daemon reported — instead of a bare "not
+    /// serving". The two named causes are the two terminal publish
+    /// outcomes: a port another process on the host holds, and a redraw
+    /// that ran out of tries. The answerer row beside them claims nothing
+    /// the status did not say, and the session start's read carries the
+    /// cause whole, claiming no answerer facts of its own.
+    #[tokio::test]
+    async fn name_surface_names_why_the_proxy_is_not_serving() {
+        let held = ZoneAnswererStatus::ProxyNotServing {
+            port: 7_654,
+            cause: ProxyDownCause::PortHeld,
+        };
+        let line = name_surface_line(
+            vm_host_name_surface(held)
+                .await
+                .expect("the terminal proxy failure settles a surface"),
+            None,
+        );
+        assert!(
+            line.contains("it is not serving — another process on the host holds 127.0.0.1:7654"),
+            "the held port is named with its cause: {line}"
+        );
+
+        let redrawn = ZoneAnswererStatus::ProxyNotServing {
+            port: 19_911,
+            cause: ProxyDownCause::RedrawsRanOut,
+        };
+        let line = name_surface_line(
+            vm_host_name_surface(redrawn.clone())
+                .await
+                .expect("the terminal proxy failure settles a surface"),
+            None,
+        );
+        assert!(
+            line.contains("the redraws ran out; the last port was 127.0.0.1:19911"),
+            "the exhausted redraw is named with its last port: {line}"
+        );
+        assert!(
+            !line.contains("still serves"),
+            "a proxy the VM host daemon reported down must not be said to serve: {line}"
+        );
+
+        // The session start's read of the same status: the named cause is
+        // the machine fact, and no answerer fact is claimed beside it.
+        let read = host_answerer_read(redrawn.clone()).await;
+        assert_eq!(
+            read.proxy_down,
+            Some((19_911, ProxyDownCause::RedrawsRanOut)),
+            "the cause rides the session start's read whole"
+        );
+        assert_eq!(read.port, None, "a proxy failure carries no answerer port");
+        assert!(!read.answerer_bound, "and no liveness proof is claimed");
+        assert!(!read.held_no_channel, "it is not the no-channel arm");
+        assert_eq!(
+            vm_host_answerer_line(redrawn),
+            None,
+            "the answerer row claims nothing the status did not say"
+        );
+    }
+
+    /// T93: a VM whose publish the VM host daemon could not confirm — no
+    /// report from the guest, and no listener on the port it could
+    /// attribute to this VM — is shown as unconfirmed on the NAME SURFACE
+    /// row, never as serving, even beside a serving port the reply carries.
+    #[tokio::test]
+    async fn name_surface_shows_an_unconfirmed_publish_as_unconfirmed() {
+        let unconfirmed = ZoneAnswererStatus::ProxyNotServing {
+            port: 19_917,
+            cause: ProxyDownCause::PublishUnconfirmed,
+        };
+        let line = name_surface_line(
+            vm_host_name_surface(unconfirmed)
+                .await
+                .expect("an unconfirmed publish settles a surface"),
+            Some(19_917),
+        );
+        assert!(
+            line.starts_with("hostname proxy publish unconfirmed"),
+            "the row says the publish is unconfirmed: {line}"
+        );
+        assert!(
+            line.contains("127.0.0.1:19917"),
+            "the row names the port: {line}"
+        );
+        assert!(
+            !line.contains("still serves") && !line.contains("routes through it on"),
+            "an unconfirmed publish must not be said to serve: {line}"
+        );
+    }
+
+    /// T93: a refusal the guest reports after an unconfirmed start leaves
+    /// the VM up with no hostname proxy. The row and the session start say
+    /// so — the port, its holder, and that the VM is up — never in the
+    /// start failure's words.
+    #[tokio::test]
+    async fn name_surface_names_a_late_refusal_as_a_running_vm_without_a_proxy() {
+        let late = ZoneAnswererStatus::ProxyNotServing {
+            port: 19_918,
+            cause: ProxyDownCause::PortHeldAfterStart {
+                holder: Some("pid 4242 (python3)".to_string()),
+            },
+        };
+        let line = name_surface_line(
+            vm_host_name_surface(late)
+                .await
+                .expect("a late refusal settles a surface"),
+            None,
+        );
+        assert_eq!(
+            line,
+            "the hostname proxy is not serving · the VM is up without a hostname proxy: \
+             pid 4242 (python3) holds 127.0.0.1:19918; free the port and restart the VM \
+             to publish it",
+            "the row names the port, the holder, and that the VM is up"
+        );
+        assert!(
+            !line.contains("the live name surface; it is not serving —"),
+            "a late refusal must not recycle the start failure's words: {line}"
+        );
+
+        let unnamed = LiveSurface::ProxyNotServing {
+            port: 19_918,
+            cause: ProxyDownCause::PortHeldAfterStart { holder: None },
+        };
+        let line = name_surface_line(unnamed, None);
+        assert!(
+            line.contains("another process on the host holds 127.0.0.1:19918")
+                && line.contains("the VM is up"),
+            "an unnamed holder still names the port and the running VM: {line}"
         );
     }
 

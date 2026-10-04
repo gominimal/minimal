@@ -2477,11 +2477,11 @@ impl AnswererStatus {
     /// The state the acquisition loop last wrote.
     #[must_use]
     pub fn get(&self) -> ZoneAnswererStatus {
-        *self
-            .0
+        self.0
             .status
             .lock()
             .expect("the answerer status lock is never held across a panic")
+            .clone()
     }
 
     /// The acquisition loop's own writer: called at every pass, with the
@@ -2919,7 +2919,7 @@ fn acquire(
             match registration.send(zone_rows(&registry)) {
                 Ok(refused) => {
                     erroring = false;
-                    status.set(held_status);
+                    status.set(held_status.clone());
                     warn_refused(node, refused);
                     held = wait_out_wake(
                         &mut pings,
@@ -2965,7 +2965,7 @@ fn acquire(
                 retry = CHANNEL_RETRY;
                 erroring = false;
                 held_status = registered_status(&published.holder, port);
-                status.set(held_status);
+                status.set(held_status.clone());
                 warn_refused(node, published.refused);
                 if !published_once {
                     published_once = true;
@@ -3047,7 +3047,7 @@ fn acquire(
                     erroring = false;
                     retry = CHANNEL_RETRY;
                     held_status = registered_status(&published.holder, port);
-                    status.set(held_status);
+                    status.set(held_status.clone());
                     warn_refused(node, published.refused);
                     held = wait_out_wake(
                         &mut pings,
