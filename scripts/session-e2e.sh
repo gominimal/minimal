@@ -2060,9 +2060,10 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   # cannot enforce per box — every deny_subnets entry, every allow list
   # that narrows — is refused at the create while this host decides per
   # box, which the launch record above just said it does. The refusal's
-  # words name the rule by its field and say own-address boxes enforce
-  # them, and the error a person reads is the proof: the create never
-  # launches, so it holds no leaf and no record either.
+  # words name the rule by its field, say own-address boxes enforce them,
+  # and end with what to do about the rules they named, and the error a
+  # person reads is the proof: the create never launches, so it holds no
+  # leaf and no record either.
   if (cd "$NET080_SEED_DIR" && mnl session activate . --no-prompt \
       --name e2e-net080-refused-range --network host_ip \
       --deny-subnets 0.0.0.0/0) >/dev/null 2>"$WORK/net080-refused-range.err"; then
@@ -2073,6 +2074,8 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
     || { echo "::error::the refused create does not name the rule it refused over (deny_subnets 0.0.0.0/0)"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
   grep -q "own-address boxes enforce them" "$WORK/net080-refused-range.err" \
     || { echo "::error::the refused create does not say own-address boxes enforce these rules"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
+  grep -q "remove these rules" "$WORK/net080-refused-range.err" \
+    || { echo "::error::the refused create does not end with what to do (remove these rules)"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
   if (cd "$NET080_SEED_DIR" && mnl session activate . --no-prompt \
       --name e2e-net080-refused-list --network host_ip \
       --allow-subnets 10.0.0.0/8) >/dev/null 2>"$WORK/net080-refused-list.err"; then
