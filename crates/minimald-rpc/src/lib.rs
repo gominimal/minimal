@@ -786,8 +786,10 @@ pub struct BoxRow {
 /// (`minimald`'s `VM_HOST_MARKER_PORT`, 7350), one port per purpose: the
 /// marker is one-way and fire-and-forget, this one answers, because a report
 /// the grant refused must be refused *to the reporter* for the publish to
-/// unwind (NET-138).
-pub const VM_HOST_BOX_REPORT_PORT: u32 = 7351;
+/// unwind (NET-138). Not 7351: the timekeep bridge owns that number, in the
+/// opposite direction — the host dials *into* the guest on it — and one
+/// number serving two purposes is two channels one misroute away.
+pub const VM_HOST_BOX_REPORT_PORT: u32 = 7352;
 
 /// The one request line the control socket takes: which verb the client
 /// wants, tagged in the line itself.
@@ -2945,9 +2947,10 @@ mod tests {
         // The report port is the wire contract between the two ends that
         // depend on this crate — the in-VM daemon that dials it and the VM
         // host daemon that bridges it — pinned beside the guest's boot
-        // marker, one port per purpose.
+        // marker, one port per purpose, and clear of the timekeep bridge's
+        // own number, which runs the opposite direction.
         assert_eq!(
-            VM_HOST_BOX_REPORT_PORT, 7351,
+            VM_HOST_BOX_REPORT_PORT, 7352,
             "the report port is wire contract; changing it breaks both ends"
         );
     }
