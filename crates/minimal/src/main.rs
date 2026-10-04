@@ -111,6 +111,10 @@ async fn run() -> ExitCode {
     // failure with its own contract rather than a plain-text line.
     let output_mode = machine_output_mode(&cli);
 
+    // Only `version` writes its output through a fallible writer; a broken
+    // pipe from any other command (e.g. a daemon socket) is a real failure.
+    let quiet_on_closed_pipe = matches!(cli.command, Some(minimal::Command::Version));
+
     if let Err(e) = minimal::run(cli).await {
         // A task's non-zero exit (`min task run`) is a status to relay, not
         // an error to print — the task's own output already streamed through
@@ -133,10 +137,26 @@ async fn run() -> ExitCode {
             emit_machine_mode_error(failure);
             return ExitCode::FAILURE;
         }
+        // A reader that went away (`min version | head -1`) is not an error
+        // worth reporting: exit quietly with the shell's SIGPIPE convention.
+        if quiet_on_closed_pipe && is_broken_pipe(&e) {
+            return ExitCode::from(141);
+        }
         eprintln!("error: {e:#}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// Whether the error's root cause is a broken pipe: the writer's reader
+/// closed before all output was written. Rust ignores SIGPIPE by default, so
+/// this surfaces as an `io::Error` of kind `BrokenPipe` instead of a signal.
+fn is_broken_pipe(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
 }
 
 /// A cheaply clonable writer over the dash log file: every clone writes
@@ -394,5 +414,17 @@ mod tests {
             1,
             "one object, one line, nothing else: {line}"
         );
+    }
+
+    /// A broken pipe anywhere in the error chain is classified as such, so
+    /// `min version | head -1` can exit quietly instead of printing an error.
+    #[test]
+    fn broken_pipe_is_detected_through_the_chain() {
+        let io = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed");
+        let wrapped = anyhow::Error::new(io).context("writing version output");
+        assert!(is_broken_pipe(&wrapped));
+
+        let other = anyhow::anyhow!("something else");
+        assert!(!is_broken_pipe(&other));
     }
 }

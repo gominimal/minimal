@@ -18,8 +18,8 @@ pub mod taskenv;
 pub mod trace;
 
 pub use sessions::{
-    BoxAddresses, DynamicIngress, EffectiveEgress, EffectiveSessionPolicy, EgressPolicy,
-    IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy,
+    BoxAddresses, CredentialedUpstream, DynamicIngress, EffectiveEgress, EffectiveSessionPolicy,
+    EgressPolicy, IngressPolicy, IpProto, NetworkMode, PortMapping, SessionPolicy,
 };
 
 pub const RPC_SUBSYSTEM_PREFIX: &str = "minimald-v1-";
@@ -469,6 +469,16 @@ pub struct RegisterBoxRequest {
     /// carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressPolicy>,
+    /// The box's declaration of a credentialed upstream (NET-134), carried
+    /// from the session's policy: `Some` marks the Box Egress Proxy's
+    /// listener as the box's infrastructure — the one destination its
+    /// egress rules never decide — and `None`, the default, is no lane: the
+    /// row the host publishes refuses the box's frames to the proxy's
+    /// address under the box-to-host default-deny. The minimum of the proxy
+    /// document's field schema; a client that predates the field declares
+    /// nothing, exactly as one that never asked for a lane does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentialed_upstream: Option<CredentialedUpstream>,
 }
 
 /// The withdrawal a destroyed session's client sends for the row its
@@ -1605,6 +1615,7 @@ mod tests {
         let policy = SessionPolicy {
             egress: None,
             ingress: Some(IngressPolicy::default()),
+            credentialed_upstream: None,
         };
         let json = serde_json_lenient::to_string(&policy).unwrap();
         assert!(json.contains("\"egress\":null"), "got: {json}");
@@ -1648,7 +1659,8 @@ mod tests {
             decoded,
             Errorable::Ok(SessionPolicy {
                 egress: None,
-                ingress: None
+                ingress: None,
+                credentialed_upstream: None
             })
         );
     }

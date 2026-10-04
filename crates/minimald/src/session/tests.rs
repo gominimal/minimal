@@ -2741,6 +2741,7 @@ fn own_ip_session_req(name: &str) -> minimald_rpc::CreateSessionRequest {
                     }],
                     ..Default::default()
                 }),
+                credentialed_upstream: None,
             },
             box_addresses: None,
             hooks_enabled: true,
@@ -4902,7 +4903,7 @@ async fn register_hostname_promotes_an_interim_to_its_vouched_hand() {
 /// tests below pin the decision and the publish it leads to, not the
 /// plumbing around them. `mode: None` is the deny-all default a box that
 /// declared nothing runs under.
-fn dynamic_ingress_session_req(
+pub(crate) fn dynamic_ingress_session_req(
     name: &str,
     switch: std::net::Ipv4Addr,
     loopback: std::net::Ipv4Addr,
@@ -4928,7 +4929,7 @@ fn dynamic_ingress_session_req(
 
 /// Drives Create → ConfigureLoadout → FinalizeSession for a
 /// [`dynamic_ingress_session_req`] box and returns its id.
-async fn finalize_dynamic_ingress_session(
+pub(crate) async fn finalize_dynamic_ingress_session(
     client: &mut TestClient,
     name: &str,
     switch: std::net::Ipv4Addr,

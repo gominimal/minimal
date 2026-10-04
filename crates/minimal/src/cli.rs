@@ -607,6 +607,16 @@ pub struct ActivateArgs {
     /// denied.
     #[arg(long = "deny-subnets", value_name = "CIDR")]
     pub deny_subnets: Vec<String>,
+    /// Declare a credentialed upstream for this box (NET-134): the Box
+    /// Egress Proxy's listener becomes the box's infrastructure, reachable
+    /// whatever its `--allow-*`/`--deny-*` rules say. Without the flag every
+    /// frame this box sends to the proxy's address is dropped — by the VM
+    /// host's egress gate on a VM-backed host, by the relay's own
+    /// `egress-uncredentialed-proxy-destination` drop on a native one. The
+    /// steering the proxy applies and the credentials it redeems are the
+    /// proxy document's; this declares the lane, nothing more.
+    #[arg(long)]
+    pub credentialed_upstream: bool,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
     /// Repeatable. If any `--loadout` is specified, defaults from
     /// `[loadouts].default_loadouts` in the client config are ignored.
@@ -738,6 +748,11 @@ pub(crate) fn parse_ingress_mapping(spec: &str) -> Result<sessions::PortMapping,
     let internal_port = int
         .parse::<u16>()
         .map_err(|_| anyhow::anyhow!("ingress '{spec}': invalid internal port '{int}'"))?;
+    if internal_port == 0 {
+        anyhow::bail!(
+            "ingress '{spec}': internal port 0 is reserved — choose an internal port >= 1"
+        );
+    }
     Ok(sessions::PortMapping {
         external_port,
         internal_port,

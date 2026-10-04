@@ -1564,6 +1564,12 @@ impl SessionChannel {
     /// and until then the relay answers, not the box — or the typed
     /// refusal's own reason.
     ///
+    /// A box decided `ask` makes this wait (NET-045): the session routes the
+    /// ask to whoever is attached — this peer's own terminal, when it is the
+    /// client the human answered from — and the reply that lands here is the
+    /// applied answer: the mapping the human allowed, or the typed refusal
+    /// for a deny and for nobody being attached to answer.
+    ///
     /// One info line per request on every path (NET-044's observability): the
     /// actor logs each request it sees, and this channel logs the ones no
     /// actor can — a port that is not a number, a session that is gone, an

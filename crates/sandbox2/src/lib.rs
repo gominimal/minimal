@@ -397,6 +397,10 @@ pub struct Container {
     /// confined-families one), shared by every container running under that
     /// seal; nothing is leaked per sandbox.
     socket_family_filter: &'static SocketFamilyFilter,
+    /// Whether the launch unshares a fresh network namespace for the box, so
+    /// its pre-exec closure brings that namespace's `lo` up.  A box sharing
+    /// the host's (or VM's) namespace leaves its `lo` alone.
+    fresh_netns: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -455,6 +459,7 @@ impl Container {
             &self.container,
             &mut command,
             self.socket_family_filter,
+            self.fresh_netns,
             sandbox.config.classifier_leaf.clone(),
             sandbox.config.force_cover_fallback,
         )?;
@@ -935,28 +940,28 @@ pub mod classifier {
     }
 
     /// The command a person runs on this host to give this daemon a
-    /// classifier tree: the installer takes the account the daemon runs as
-    /// and the two source identities the classification rests on (NET-078 —
-    /// what the boxes cohort leaves as, and what the rest of the slice
-    /// leaves as; the step refuses to render one without the other, so a
-    /// hint that named neither is a command the step itself refuses). The
+    /// classifier tree. A stock install does not ship the installer (the
+    /// release stages only the apparmor one), so the hint names where the
+    /// script lives in the source repository rather than a `scripts/` path
+    /// the host does not have. The installer takes the account the daemon
+    /// runs as and the two source identities the classification rests on
+    /// (NET-078 — what the boxes cohort leaves as, and what the rest of the
+    /// slice leaves as; the step refuses to render one without the other, so
+    /// a hint that named neither is a command the step itself refuses). The
     /// hint spells the whole command, so the advisory that carries it never
     /// has to name a placeholder for the one thing the daemon knows — only
     /// for the two things this host does.
     #[cfg(target_os = "linux")]
     #[must_use]
     pub fn install_hint() -> String {
-        match own_account() {
-            Some(account) => format!(
-                "sudo scripts/install-host-classifier.sh --user {account} \
-                 --cohort-address <cohort address> --node-plane-address \
-                 <node-plane address>"
-            ),
-            None => "sudo scripts/install-host-classifier.sh --user \
-                 <the account this daemon runs as> --cohort-address \
-                 <cohort address> --node-plane-address <node-plane address>"
-                .to_string(),
-        }
+        let account =
+            own_account().unwrap_or_else(|| "<the account this daemon runs as>".to_string());
+        format!(
+            "run: curl -fsSLO \
+             https://raw.githubusercontent.com/gominimal/minimal/main/scripts/install-host-classifier.sh \
+             && sudo bash ./install-host-classifier.sh --user {account} \
+             --cohort-address <cohort address> --node-plane-address <node-plane address>"
+        )
     }
 
     /// Makes one level of the classifier layout, taking `AlreadyExists` as
@@ -1158,6 +1163,7 @@ fn install_box_credentials(
     container: &hakoniwa::Container,
     command: &mut hakoniwa::Command,
     socket_family_filter: &'static SocketFamilyFilter,
+    fresh_netns: bool,
     classifier_leaf: Option<config::ClassifierLeaf>,
     force_cover_fallback: bool,
 ) -> Result<(), Error> {
@@ -1204,6 +1210,7 @@ fn install_box_credentials(
                 &program,
                 &args,
                 socket_family_filter,
+                fresh_netns,
                 classifier_join.as_deref(),
                 force_cover_fallback,
                 closure_report.as_deref(),
@@ -1241,14 +1248,34 @@ fn install_box_credentials(
 /// the daemon says so when the report never appears.
 #[cfg(target_os = "linux")]
 fn write_closure_report(report: Option<&Path>, line: &str) {
+    replace_closure_report(report, &format!("{line}\n"));
+}
+
+/// Adds a line to the closure report below whatever it already holds, for a
+/// finding that must not replace the cover line before it: a `lo-down` line
+/// leaves the closure heading for its exec just as a cover line does, so the
+/// daemon reads both.  A later [`write_closure_report`] (a `failed` line)
+/// still replaces everything, which is the line worth reading then.
+#[cfg(target_os = "linux")]
+fn append_closure_report(report: Option<&Path>, line: &str) {
+    let Some(path) = report else { return };
+    let mut content = std::fs::read_to_string(path).unwrap_or_default();
+    content.push_str(line);
+    content.push('\n');
+    replace_closure_report(report, &content);
+}
+
+/// Replaces the closure report with `content` atomically (see
+/// [`write_closure_report`]).
+#[cfg(target_os = "linux")]
+fn replace_closure_report(report: Option<&Path>, content: &str) {
     let Some(report) = report else { return };
     let name = report
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("closure-report");
     let temp = report.with_file_name(format!("{name}.tmp{}", std::process::id()));
-    let written =
-        std::fs::write(&temp, format!("{line}\n")).and_then(|()| std::fs::rename(&temp, report));
+    let written = std::fs::write(&temp, content).and_then(|()| std::fs::rename(&temp, report));
     // A rename that failed leaves the line nowhere — the state the daemon's
     // watch already names — so the temp never lingers either.
     if written.is_err() {
@@ -1280,6 +1307,72 @@ fn set_box_cover_marker(cover: &'static str) {
     }
 }
 
+/// Brings the loopback interface up in the current network namespace.
+///
+/// A fresh network namespace starts with `lo` down.  The networked path
+/// brings it up from outside the box (`switch.rs:207`), but a none box has
+/// no provider to do that — so the pre-exec closure does it here, before
+/// the socket-family filter is installed (the `AF_INET` socket the ioctl
+/// needs would be refused by the filter).  Best-effort: a none box whose
+/// `lo` stays down still runs, just without loopback; the caller reports the
+/// error so the daemon can warn.
+#[cfg(target_os = "linux")]
+fn bring_lo_up() -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // SAFETY: socket(2) with valid arguments; async-signal-safe.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd is a fresh, valid, owned socket fd.
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+    let fd = sock.as_raw_fd();
+
+    #[repr(C)]
+    struct IfReqFlags {
+        name: [libc::c_char; libc::IFNAMSIZ],
+        flags: libc::c_short,
+        _pad: [u8; 22],
+    }
+
+    let mut name_buf = [0 as libc::c_char; libc::IFNAMSIZ];
+    for (dst, b) in name_buf.iter_mut().zip(b"lo".iter()) {
+        *dst = *b as libc::c_char;
+    }
+
+    let mut flags = IfReqFlags {
+        name: name_buf,
+        flags: 0,
+        _pad: [0; 22],
+    };
+
+    // SAFETY: fd open; ifreq sized for the flags ioctls.
+    if unsafe {
+        libc::ioctl(
+            fd,
+            libc::SIOCGIFFLAGS as _,
+            std::ptr::from_mut(&mut flags).cast::<libc::c_void>(),
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    flags.flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+    // SAFETY: fd open; ifreq sized for the flags ioctls.
+    if unsafe {
+        libc::ioctl(
+            fd,
+            libc::SIOCSIFFLAGS as _,
+            std::ptr::from_mut(&mut flags).cast::<libc::c_void>(),
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// The body of the launch closure in [`install_box_credentials`]: place the
 /// box in its classifier leaf, cover the tree the join went through, take
 /// the box's credentials, install the box's socket-family seal, then exec
@@ -1294,6 +1387,7 @@ fn exec_box_program(
     program: &str,
     args: &[String],
     socket_family_filter: &'static SocketFamilyFilter,
+    fresh_netns: bool,
     classifier_join: Option<&Path>,
     force_cover_fallback: bool,
     closure_report: Option<&Path>,
@@ -1396,6 +1490,20 @@ fn exec_box_program(
                 );
             }
         }
+    }
+    // Bring loopback up before taking the box credentials: the ioctl needs
+    // CAP_NET_ADMIN, which `assume_box_credentials` drops from the bounding
+    // set.  A none box has no provider to do this from outside; the networked
+    // path does it in `switch.rs:207`.  Only in a fresh namespace of the
+    // box's own: a box sharing the host's (or VM's) leaves that `lo` alone.
+    // Best-effort: a box whose lo stays down still runs, just without
+    // loopback, and the failure is appended to the closure report, which
+    // the daemon logs at warn.
+    if fresh_netns && let Err(e) = bring_lo_up() {
+        append_closure_report(
+            closure_report,
+            &format!("lo-down errno {}", e.raw_os_error().unwrap_or(0)),
+        );
     }
     // SAFETY: `assume_box_credentials` is async-signal-safe; this is the
     // pre-exec moment it is for, with the namespace built and CAP_SETPCAP in
@@ -1670,6 +1778,16 @@ impl<C: Channel> Sandbox<C> {
             .tmpfsmount("/tmp")
             .runctl(hakoniwa::Runctl::IgnoreCgroupSetupFailed);
 
+        // The IPC namespace is part of box isolation, whatever the network
+        // plan: every box gets its own System V message queues, semaphores
+        // and shared memory segments, and its own POSIX message queues. Every
+        // box maps onto the daemon's one kernel uid, so IPC permission bits
+        // cannot keep boxes apart; only the namespace does. A `host_ip` box
+        // shares the network namespace, never this one. An mqueue filesystem
+        // is bound to the namespace it was mounted in, so a box that ever
+        // mounts `/dev/mqueue` has to do it after this unshare.
+        container.unshare(hakoniwa::Namespace::Ipc);
+
         // The cgroup namespace, whose root decides what the box can ever
         // reach. A box with no classifier leaf takes it here, in the one
         // `unshare()` every namespace goes through: its root is then the
@@ -1790,9 +1908,15 @@ impl<C: Channel> Sandbox<C> {
         // Socket-family seal for every plan. A fresh network namespace blocks
         // IP/UNIX flows, but AF_VSOCK is not subject to the network namespace,
         // so a process in any box could still reach the host over vsock.  The
-        // seal is an allowlist: the `none` plan's seal admits AF_UNIX alone,
-        // and every other plan's seal admits the families the box's own
-        // network namespace confines, so a family that reaches past the
+        // seal is an allowlist: the `none` plan's seal admits the families its
+        // own network namespace confines (unix, inet, inet6, netlink), so the
+        // box can use its own loopback — but only when `isolate` says this
+        // launch unshares that namespace (hakoniwa fails the spawn if the
+        // unshare fails), and AF_UNIX alone otherwise, so a none box never
+        // holds inet sockets in a namespace that is not its own
+        // (`SocketSeal::in_netns`).  Every other plan's seal adds
+        // AF_PACKET (refused by the missing CAP_NET_RAW no box holds, per
+        // NET-083, not by this filter).  A family that reaches past the
         // namespace is refused in every box.  The filter is installed in the
         // child after hakoniwa has set up namespaces and credentials but
         // before exec, using `prctl` + `seccomp` via libc only.  A caller on
@@ -1802,7 +1926,7 @@ impl<C: Channel> Sandbox<C> {
         // ABI, or x32, dies with SIGSYS on its first syscall.
         #[cfg(target_os = "linux")]
         let socket_family_filter = {
-            let filter = socket_family_filter_for_plan(plan);
+            let filter = socket_family_filter_for_plan(plan, isolate);
             tracing::info!(
                 network_plan = %plan,
                 socket_seal = %filter.seal,
@@ -2019,6 +2143,7 @@ impl<C: Channel> Sandbox<C> {
         Ok(Container {
             container,
             socket_family_filter,
+            fresh_netns: isolate,
         })
     }
 
@@ -2761,13 +2886,12 @@ const SOCKETCALL_SOCKETPAIR: u32 = 8;
 /// Build the socket-family filter for a seal: a classic BPF seccomp program
 /// that admits the `socket()`/`socketpair()` calls whose address family the
 /// seal lists and refuses the rest with `EAFNOSUPPORT`.  Both seals are
-/// allowlists.  The `none` seal admits `AF_UNIX` alone, which stays working
-/// so the in-sandbox `min` helper and the minenv socket keep functioning;
-/// the confined-families seal admits the families the box's own network
-/// namespace confines — `AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK`,
-/// `AF_PACKET` — so no family that reaches past the namespace survives it.
-/// `AF_PACKET` sits on the admitted list because its refusal is the missing
-/// `CAP_NET_RAW` no box holds (NET-083), not this filter's.
+/// allowlists.  The `none` seal admits the families its own network
+/// namespace confines — `AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK` —
+/// so the box can use its own loopback; the confined-families seal adds
+/// `AF_PACKET` (refused by the missing `CAP_NET_RAW` no box holds, per
+/// NET-083, not by this filter).  No family that reaches past the namespace
+/// survives either seal.
 ///
 /// This program is the first instalment of the seccomp profile applied
 /// inside boxes (architecture.md AT9, open gap 2): the family list is
@@ -2794,10 +2918,18 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
     let kill_action = libc::SECCOMP_RET_KILL_PROCESS;
 
     // The families the seal admits, in the order the verdict tail compares
-    // them.  The `none` seal admits `AF_UNIX` alone; the confined-families
-    // seal admits the namespace-confined set.
+    // them.  The `none` seal admits the families its own network namespace
+    // confines — unix, inet, inet6, netlink — so the box can use its own
+    // loopback; the confined-families seal adds `AF_PACKET` (refused by the
+    // missing `CAP_NET_RAW` no box holds, per NET-083, not by this filter).
     let admitted: &[u32] = match seal {
-        network::SocketSeal::Full => &[libc::AF_UNIX as u32],
+        network::SocketSeal::Full => &[
+            libc::AF_UNIX as u32,
+            libc::AF_INET as u32,
+            libc::AF_INET6 as u32,
+            libc::AF_NETLINK as u32,
+        ],
+        network::SocketSeal::UnixOnly => &[libc::AF_UNIX as u32],
         network::SocketSeal::ConfinedFamilies => &[
             libc::AF_UNIX as u32,
             libc::AF_INET as u32,
@@ -2935,7 +3067,8 @@ fn build_socket_family_filter(seal: network::SocketSeal) -> SocketFamilyFilter {
         program: filter,
         seal,
         refused_families: match seal {
-            network::SocketSeal::Full => "every family but unix",
+            network::SocketSeal::Full => "every family but unix, inet, inet6, netlink",
+            network::SocketSeal::UnixOnly => "every family but unix",
             network::SocketSeal::ConfinedFamilies => {
                 "every family but unix, inet, inet6, netlink, packet"
             }
@@ -3007,15 +3140,39 @@ pub fn socket_family_filter_for_confined_families() -> &'static SocketFamilyFilt
     FILTER.get_or_init(|| build_socket_family_filter(network::SocketSeal::ConfinedFamilies))
 }
 
-/// The socket-family filter a box runs under, decided by its plan: the full
-/// `none` seal for [`NetPlan::none`], the confined-families seal for every
-/// other plan.
+/// Returns a pointer to the built-in unix-only socket-family filter: it
+/// admits `AF_UNIX` alone and refuses everything else with `EAFNOSUPPORT`.
+/// The fail-closed seal a `none` box runs under wherever it is not in a
+/// fresh network namespace of its own (see [`SocketSeal::in_netns`]).
 #[cfg(target_os = "linux")]
-fn socket_family_filter_for_plan(plan: &network::NetPlan) -> &'static SocketFamilyFilter {
-    match plan.seal() {
+#[must_use]
+pub fn socket_family_filter_for_unix_only() -> &'static SocketFamilyFilter {
+    static FILTER: std::sync::OnceLock<SocketFamilyFilter> = std::sync::OnceLock::new();
+    FILTER.get_or_init(|| build_socket_family_filter(network::SocketSeal::UnixOnly))
+}
+
+/// Returns a pointer to the built-in socket-family filter for `seal`.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn socket_family_filter_for_seal(seal: network::SocketSeal) -> &'static SocketFamilyFilter {
+    match seal {
         network::SocketSeal::Full => socket_family_filter_for_none_box(),
+        network::SocketSeal::UnixOnly => socket_family_filter_for_unix_only(),
         network::SocketSeal::ConfinedFamilies => socket_family_filter_for_confined_families(),
     }
+}
+
+/// The socket-family filter a box runs under, decided by its plan and by
+/// whether the launch unshares a fresh network namespace for it: the full
+/// `none` seal for [`NetPlan::none`] in that namespace, the unix-only seal
+/// for a `none` plan without one (fail closed, [`SocketSeal::in_netns`]),
+/// and the confined-families seal for every other plan.
+#[cfg(target_os = "linux")]
+fn socket_family_filter_for_plan(
+    plan: &network::NetPlan,
+    fresh_netns: bool,
+) -> &'static SocketFamilyFilter {
+    socket_family_filter_for_seal(plan.seal().in_netns(fresh_netns))
 }
 
 /// Puts the plan's resolver into `<rootfs>/etc/resolv.conf`. The host's is
@@ -3955,7 +4112,8 @@ ff02::2\tip6-allrouters
 
     /// NET-038. The none-box filter refuses `AF_VSOCK` sockets (which bypass the
     /// network namespace) while still allowing the local `AF_UNIX` sockets the
-    /// sandbox's own minenv socket depends on, leaves every other syscall alone,
+    /// sandbox's own minenv socket depends on and the `AF_INET`/`AF_INET6`
+    /// sockets the box's own loopback needs, leaves every other syscall alone,
     /// admits the 32-bit compat ABI under the same family rules as the native
     /// ABI, and kills a caller on a truly foreign ABI rather than letting it
     /// through.  The production runtime effect is proved by
@@ -4020,6 +4178,88 @@ ff02::2\tip6-allrouters
         );
     }
 
+    /// The fail-closed gate on the none seal: it admits inet and netlink only
+    /// because the box's own fresh network namespace confines them, so
+    /// wherever the box is not in one it falls back to `AF_UNIX` alone, and
+    /// no other seal moves.
+    #[test]
+    fn none_seal_relaxes_only_inside_a_fresh_netns() {
+        use network::SocketSeal;
+        assert_eq!(SocketSeal::Full.in_netns(true), SocketSeal::Full);
+        assert_eq!(
+            SocketSeal::Full.in_netns(false),
+            SocketSeal::UnixOnly,
+            "a none box outside a fresh netns must keep the unix-only seal"
+        );
+        for fresh in [true, false] {
+            assert_eq!(
+                SocketSeal::ConfinedFamilies.in_netns(fresh),
+                SocketSeal::ConfinedFamilies
+            );
+            assert_eq!(SocketSeal::UnixOnly.in_netns(fresh), SocketSeal::UnixOnly);
+        }
+        assert_eq!(SocketSeal::UnixOnly.to_string(), "unix-only");
+    }
+
+    /// The gate as the launch applies it: the filter a none plan gets with
+    /// no fresh netns refuses inet, inet6 and netlink and admits unix alone;
+    /// inside one, the relaxed none seal admits them.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn none_plan_without_fresh_netns_gets_the_unix_only_filter() {
+        let plan = network::NetPlan::none();
+        let refuse = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
+
+        let gated = socket_family_filter_for_plan(&plan, false);
+        assert_eq!(gated.seal, network::SocketSeal::UnixOnly);
+        assert_eq!(gated.refused_families, "every family but unix");
+        let run = |family: i32| {
+            run_seccomp_program(
+                &gated.program,
+                libc::SYS_socket as u32,
+                AUDIT_ARCH,
+                family as u32,
+            )
+        };
+        assert_eq!(run(libc::AF_UNIX), libc::SECCOMP_RET_ALLOW);
+        for family in [
+            libc::AF_INET,
+            libc::AF_INET6,
+            libc::AF_NETLINK,
+            libc::AF_VSOCK,
+        ] {
+            assert_eq!(
+                run(family),
+                refuse,
+                "family {family} must be refused outside a fresh netns"
+            );
+        }
+
+        let relaxed = socket_family_filter_for_plan(&plan, true);
+        assert_eq!(relaxed.seal, network::SocketSeal::Full);
+        let run = |family: i32| {
+            run_seccomp_program(
+                &relaxed.program,
+                libc::SYS_socket as u32,
+                AUDIT_ARCH,
+                family as u32,
+            )
+        };
+        for family in [
+            libc::AF_UNIX,
+            libc::AF_INET,
+            libc::AF_INET6,
+            libc::AF_NETLINK,
+        ] {
+            assert_eq!(
+                run(family),
+                libc::SECCOMP_RET_ALLOW,
+                "family {family} must be admitted inside the box's fresh netns"
+            );
+        }
+        assert_eq!(run(libc::AF_VSOCK), refuse);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn none_plan_refuses_vsock_family() {
@@ -4047,7 +4287,7 @@ ff02::2\tip6-allrouters
         let filter = build_socket_family_filter(network::SocketSeal::Full);
         assert_eq!(filter.seal, network::SocketSeal::Full);
         assert_eq!(
-            filter.refused_families, "every family but unix",
+            filter.refused_families, "every family but unix, inet, inet6, netlink",
             "the launch log must name what the seal refuses"
         );
 
@@ -4066,8 +4306,8 @@ ff02::2\tip6-allrouters
         );
         assert_eq!(
             run(libc::SYS_socketpair, AUDIT_ARCH, libc::AF_INET as u32),
-            refuse,
-            "socketpair(AF_INET) must fail with EAFNOSUPPORT"
+            libc::SECCOMP_RET_ALLOW,
+            "socketpair(AF_INET) must stay allowed — the none seal admits inet"
         );
         assert_eq!(
             run(libc::SYS_socket, AUDIT_ARCH, libc::AF_UNIX as u32),
@@ -4090,8 +4330,8 @@ ff02::2\tip6-allrouters
         );
         assert_eq!(
             run(compat_socketpair, COMPAT_AUDIT_ARCH, libc::AF_INET as u32),
-            refuse,
-            "the compat ABI must refuse socketpair(AF_INET) with EAFNOSUPPORT"
+            libc::SECCOMP_RET_ALLOW,
+            "the compat ABI must keep socketpair(AF_INET) allowed"
         );
         assert_eq!(
             run(compat_socket, COMPAT_AUDIT_ARCH, libc::AF_UNIX as u32),
@@ -4163,14 +4403,12 @@ ff02::2\tip6-allrouters
             "the filter must keep AF_UNIX sockets working (errno {unix})"
         );
         assert_eq!(
-            inet,
-            libc::EAFNOSUPPORT as u8,
-            "the filter must refuse AF_INET with EAFNOSUPPORT"
+            inet, 0,
+            "the filter must keep AF_INET sockets working (errno {inet})"
         );
         assert_eq!(
-            inet6,
-            libc::EAFNOSUPPORT as u8,
-            "the filter must refuse AF_INET6 with EAFNOSUPPORT"
+            inet6, 0,
+            "the filter must keep AF_INET6 sockets working (errno {inet6})"
         );
         assert_eq!(
             vsock,
@@ -4197,20 +4435,21 @@ ff02::2\tip6-allrouters
     /// confine, whatever its network mode.  The plan picks the seal — the
     /// full `none` seal for [`NetPlan::none`], the confined-families seal for
     /// every other plan — and the seal picks the filter.  Both are
-    /// allowlists: the none seal admits `AF_UNIX` alone; the
-    /// confined-families seal admits the families the box's own network
-    /// namespace confines (`AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK`,
-    /// `AF_PACKET`), so it refuses `AF_VSOCK` — the family that reaches the
-    /// host whatever namespace the caller sits in — along with every other
-    /// family outside its list, without needing any of them named: the
-    /// simulated families below include `AF_BLUETOOTH` and `AF_ALG`, refused
-    /// because the allowlist does not carry them.  The confined seal's
-    /// program is what ships; these probes run the shipped filter against
-    /// the kernel this test executes on, exactly the way a host-address or
-    /// own-address box experiences it: install via `prctl` + `seccomp`, then
-    /// call `socket(2)` for real.  A control child runs unfiltered, so a
-    /// family the kernel itself cannot create (no AF_VSOCK driver, say) is
-    /// told apart from one the filter refused.
+    /// allowlists: the none seal admits the families its own network
+    /// namespace confines (`AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK`);
+    /// the confined-families seal adds `AF_PACKET` (refused by the missing
+    /// `CAP_NET_RAW` no box holds, per NET-083, not by this filter).  Both
+    /// refuse `AF_VSOCK` — the family that reaches the host whatever
+    /// namespace the caller sits in — along with every other family outside
+    /// their lists, without needing any of them named: the simulated
+    /// families below include `AF_BLUETOOTH` and `AF_ALG`, refused because
+    /// the allowlist does not carry them.  The confined seal's program is
+    /// what ships; these probes run the shipped filter against the kernel
+    /// this test executes on, exactly the way a host-address or own-address
+    /// box experiences it: install via `prctl` + `seccomp`, then call
+    /// `socket(2)` for real.  A control child runs unfiltered, so a family
+    /// the kernel itself cannot create (no AF_VSOCK driver, say) is told
+    /// apart from one the filter refused.
     #[cfg(target_os = "linux")]
     #[test]
     fn every_box_refuses_namespace_bypass_families() {
@@ -4220,37 +4459,29 @@ ff02::2\tip6-allrouters
             gateway: std::net::Ipv4Addr::new(10, 0, 0, 1),
             mtu: 1500,
         };
-        let plans: [(&str, network::NetPlan, network::SocketSeal, bool); 4] = [
+        let plans: [(&str, network::NetPlan, network::SocketSeal); 4] = [
             (
                 "host_ip",
                 network::NetPlan::host(),
                 network::SocketSeal::ConfinedFamilies,
-                true,
             ),
             (
                 "isolated",
                 network::NetPlan::isolated(),
                 network::SocketSeal::ConfinedFamilies,
-                true,
             ),
             (
                 "own_ip",
                 network::NetPlan::isolated_with_tap(tap),
                 network::SocketSeal::ConfinedFamilies,
-                true,
             ),
-            (
-                "none",
-                network::NetPlan::none(),
-                network::SocketSeal::Full,
-                false,
-            ),
+            ("none", network::NetPlan::none(), network::SocketSeal::Full),
         ];
         let refuse = libc::SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
-        for (name, plan, seal, admits_inet) in plans {
+        for (name, plan, seal) in plans {
             assert_eq!(plan.to_string(), name, "the plan under test");
             assert_eq!(plan.seal(), seal, "plan {name} must run under its seal");
-            let filter = socket_family_filter_for_plan(&plan);
+            let filter = socket_family_filter_for_plan(&plan, plan.isolates_netns());
             assert_eq!(
                 filter.seal, seal,
                 "plan {name}: the seal selects the filter"
@@ -4291,27 +4522,16 @@ ff02::2\tip6-allrouters
             );
             let compat_inet = run(compat_socket, COMPAT_AUDIT_ARCH, libc::AF_INET as u32);
             let compat_inet6 = run(compat_socket, COMPAT_AUDIT_ARCH, libc::AF_INET6 as u32);
-            if admits_inet {
-                assert_eq!(
-                    compat_inet,
-                    libc::SECCOMP_RET_ALLOW,
-                    "{name}: a networked box must keep compat inet sockets"
-                );
-                assert_eq!(
-                    compat_inet6,
-                    libc::SECCOMP_RET_ALLOW,
-                    "{name}: a networked box must keep compat inet6 sockets"
-                );
-            } else {
-                assert_eq!(
-                    compat_inet, refuse,
-                    "{name}: the none seal must refuse compat AF_INET"
-                );
-                assert_eq!(
-                    compat_inet6, refuse,
-                    "{name}: the none seal must refuse compat AF_INET6"
-                );
-            }
+            assert_eq!(
+                compat_inet,
+                libc::SECCOMP_RET_ALLOW,
+                "{name}: a box must keep compat inet sockets"
+            );
+            assert_eq!(
+                compat_inet6,
+                libc::SECCOMP_RET_ALLOW,
+                "{name}: a box must keep compat inet6 sockets"
+            );
             // The allowlist is what meets "every family the namespace does
             // not confine" without enumerating it: a family outside the
             // list is refused whatever it is, the bypass families the old
@@ -4327,28 +4547,28 @@ ff02::2\tip6-allrouters
                      no family outside the seal's list may survive it"
                 );
             }
-            if admits_inet {
-                assert_eq!(
-                    run(libc::SYS_socket, AUDIT_ARCH, libc::AF_INET as u32),
-                    libc::SECCOMP_RET_ALLOW,
-                    "{name}: a networked box must keep its inet sockets"
-                );
-                assert_eq!(
-                    run(libc::SYS_socket, AUDIT_ARCH, libc::AF_INET6 as u32),
-                    libc::SECCOMP_RET_ALLOW,
-                    "{name}: a networked box must keep its inet6 sockets"
-                );
-                assert_eq!(
-                    run(libc::SYS_socket, AUDIT_ARCH, libc::AF_UNIX as u32),
-                    libc::SECCOMP_RET_ALLOW,
-                    "{name}: a networked box must keep its unix sockets"
-                );
-                assert_eq!(
-                    run(libc::SYS_socket, AUDIT_ARCH, libc::AF_NETLINK as u32),
-                    libc::SECCOMP_RET_ALLOW,
-                    "{name}: a networked box must keep its netlink sockets — \
-                     the namespace confines them"
-                );
+            assert_eq!(
+                run(libc::SYS_socket, AUDIT_ARCH, libc::AF_INET as u32),
+                libc::SECCOMP_RET_ALLOW,
+                "{name}: a box must keep its inet sockets"
+            );
+            assert_eq!(
+                run(libc::SYS_socket, AUDIT_ARCH, libc::AF_INET6 as u32),
+                libc::SECCOMP_RET_ALLOW,
+                "{name}: a box must keep its inet6 sockets"
+            );
+            assert_eq!(
+                run(libc::SYS_socket, AUDIT_ARCH, libc::AF_UNIX as u32),
+                libc::SECCOMP_RET_ALLOW,
+                "{name}: a box must keep its unix sockets"
+            );
+            assert_eq!(
+                run(libc::SYS_socket, AUDIT_ARCH, libc::AF_NETLINK as u32),
+                libc::SECCOMP_RET_ALLOW,
+                "{name}: a box must keep its netlink sockets — \
+                 the namespace confines them"
+            );
+            if seal == network::SocketSeal::ConfinedFamilies {
                 assert_eq!(
                     run(libc::SYS_socket, AUDIT_ARCH, libc::AF_PACKET as u32),
                     libc::SECCOMP_RET_ALLOW,
@@ -4358,9 +4578,9 @@ ff02::2\tip6-allrouters
                 );
             } else {
                 assert_eq!(
-                    run(libc::SYS_socket, AUDIT_ARCH, libc::AF_INET as u32),
+                    run(libc::SYS_socket, AUDIT_ARCH, libc::AF_PACKET as u32),
                     refuse,
-                    "{name}: the none seal must refuse AF_INET with EAFNOSUPPORT"
+                    "{name}: the none seal must refuse AF_PACKET with EAFNOSUPPORT"
                 );
             }
         }
@@ -4458,6 +4678,34 @@ ff02::2\tip6-allrouters
     // ---------------------------------------------------------------------
     // NET-079: each host-address box in its own classifier leaf, kept there.
     // ---------------------------------------------------------------------
+
+    /// A stock install does not ship the classifier installer, so the hint
+    /// says where to fetch it — the raw file, not GitHub's HTML viewer page,
+    /// which a `curl` of the URL would save and `sudo` would then run — rather
+    /// than name a checkout-relative `scripts/` path, and still spells the
+    /// `--user` the daemon knows.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_install_hint_names_where_the_installer_lives() {
+        let hint = classifier::install_hint();
+        assert!(
+            hint.contains(
+                "https://raw.githubusercontent.com/gominimal/minimal/main/scripts/install-host-classifier.sh"
+            ),
+            "{hint}"
+        );
+        assert!(!hint.contains("/blob/"), "{hint}");
+        assert!(!hint.contains("sudo scripts/"), "{hint}");
+        // The fetch saves the file under its own name, so the run that
+        // follows finds it; a downloaded file has no executable bit, so the
+        // hint runs it via bash.
+        assert!(hint.contains("curl -fsSLO https://"), "{hint}");
+        assert!(
+            hint.contains("sudo bash ./install-host-classifier.sh"),
+            "{hint}"
+        );
+        assert!(hint.contains("--user "), "{hint}");
+    }
 
     /// The mount-table half of the confinement: which cgroup2 mounts a host's
     /// `mountinfo` names, which one a classifier tree lives on, and whether
@@ -4605,7 +4853,8 @@ ff02::2\tip6-allrouters
     /// the box can read there, which migration paths open for writing — and
     /// can hold the box in its leaf until a release file appears, so the
     /// test can read the host's side of the tree while the box is still in
-    /// it.
+    /// it. The IPC namespace proof runs it too: it reports the box's
+    /// namespaces and creates or looks up System V and POSIX IPC objects.
     #[cfg(target_os = "linux")]
     const CGROUP_PROBE_C: &str = r#"
 #include <errno.h>
@@ -4613,7 +4862,12 @@ ff02::2\tip6-allrouters
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+#include <sys/sem.h>
+#include <sys/shm.h>
 #include <sys/statfs.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -4664,8 +4918,22 @@ int main(int argc, char **argv) {
                         cgroup.procs, which the kernel empties the moment the
                         box's last process exits — while the box is still in
                         it. The hold runs last, when every line of the report
-                        is already out. */
+                        is already out.
+       and, for the IPC namespace proof:
+         NS:<kind>      the namespace the box is in, /proc/self/ns/<kind>;
+         SYSV:<key>     create a System V message queue, semaphore set and
+                        shared memory segment under that key, removed again
+                        at exit;
+         SYSVGET:<key>  look the three up by key without creating them;
+         MQ:<name>      create a POSIX message queue under that name, unlinked
+                        again at exit (the raw syscall, which takes the name
+                        without its leading slash, so no -lrt is needed);
+         MQOPEN:<name>  open that queue without creating it;
+         MARK:<path>    create that file, telling the test the operations
+                        before it have run. */
     const char *release = NULL;
+    int msq = -1, sem = -1, shm = -1;
+    const char *mq = NULL;
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "STATFS:", 7) == 0) {
             const char *path = argv[i] + 7;
@@ -4694,6 +4962,44 @@ int main(int argc, char **argv) {
             }
         } else if (strncmp(argv[i], "HOLD:", 5) == 0) {
             release = argv[i] + 5;
+        } else if (strncmp(argv[i], "NS:", 3) == 0) {
+            char path[64], link[128];
+            snprintf(path, sizeof path, "/proc/self/ns/%s", argv[i] + 3);
+            ssize_t n = readlink(path, link, sizeof link - 1);
+            if (n >= 0) {
+                link[n] = 0;
+                printf("ns %s: %s\n", argv[i] + 3, link);
+            } else {
+                printf("ns %s: errno %d\n", argv[i] + 3, errno);
+            }
+        } else if (strncmp(argv[i], "SYSV:", 5) == 0) {
+            key_t key = (key_t)strtol(argv[i] + 5, NULL, 0);
+            msq = msgget(key, IPC_CREAT | IPC_EXCL | 0600);
+            printf("sysv create msg: errno %d\n", msq >= 0 ? 0 : errno);
+            sem = semget(key, 1, IPC_CREAT | IPC_EXCL | 0600);
+            printf("sysv create sem: errno %d\n", sem >= 0 ? 0 : errno);
+            shm = shmget(key, 4096, IPC_CREAT | IPC_EXCL | 0600);
+            printf("sysv create shm: errno %d\n", shm >= 0 ? 0 : errno);
+        } else if (strncmp(argv[i], "SYSVGET:", 8) == 0) {
+            key_t key = (key_t)strtol(argv[i] + 8, NULL, 0);
+            printf("sysv get msg: errno %d\n", msgget(key, 0) >= 0 ? 0 : errno);
+            printf("sysv get sem: errno %d\n", semget(key, 0, 0) >= 0 ? 0 : errno);
+            printf("sysv get shm: errno %d\n", shmget(key, 0, 0) >= 0 ? 0 : errno);
+        } else if (strncmp(argv[i], "MQ:", 3) == 0) {
+            long fd = syscall(SYS_mq_open, argv[i] + 3, O_RDWR | O_CREAT | O_EXCL, 0600, NULL);
+            printf("mq create: errno %d\n", fd >= 0 ? 0 : errno);
+            if (fd >= 0) {
+                mq = argv[i] + 3;
+                close((int)fd);
+            }
+        } else if (strncmp(argv[i], "MQOPEN:", 7) == 0) {
+            long fd = syscall(SYS_mq_open, argv[i] + 7, O_RDWR, 0, NULL);
+            printf("mq open: errno %d\n", fd >= 0 ? 0 : errno);
+            if (fd >= 0) close((int)fd);
+        } else if (strncmp(argv[i], "MARK:", 5) == 0) {
+            int fd = open(argv[i] + 5, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+            printf("mark: errno %d\n", fd >= 0 ? 0 : errno);
+            if (fd >= 0) close(fd);
         }
     }
 
@@ -4706,6 +5012,13 @@ int main(int argc, char **argv) {
             nanosleep(&ts, 0);
         }
     }
+
+    /* What SYSV: and MQ: created, removed so a run never leaves them behind
+       in whatever IPC namespace the box was in. */
+    if (msq >= 0) msgctl(msq, IPC_RMID, NULL);
+    if (sem >= 0) semctl(sem, 0, IPC_RMID);
+    if (shm >= 0) shmctl(shm, IPC_RMID, NULL);
+    if (mq) syscall(SYS_mq_unlink, mq);
     return 0;
 }
 "#;
@@ -4927,6 +5240,19 @@ int main(int argc, char **argv) {
         probe_args: &[String],
         force_cover_fallback: bool,
     ) -> HeldProbe {
+        launch_box_probe_under(name, leaf, probe_args, force_cover_fallback, None).await
+    }
+
+    /// [`launch_box_probe`], with the box launched under `plan` in place of
+    /// the sandbox's own built-in plan when one is given.
+    #[cfg(target_os = "linux")]
+    async fn launch_box_probe_under(
+        name: &str,
+        leaf: Option<config::ClassifierLeaf>,
+        probe_args: &[String],
+        force_cover_fallback: bool,
+        plan: Option<network::NetPlan>,
+    ) -> HeldProbe {
         use std::io::Read as _;
 
         let base_dir = box_base_dir(name);
@@ -4952,7 +5278,7 @@ int main(int argc, char **argv) {
             .await
             .expect("building the box");
 
-        let plan = sandbox.built_in_plan();
+        let plan = plan.unwrap_or_else(|| sandbox.built_in_plan());
         let container = sandbox
             .new_container(&plan)
             .expect("building the box's container");
@@ -5044,6 +5370,144 @@ int main(int argc, char **argv) {
         let held = launch_box_probe(name, leaf, probe_args, false).await;
         held.release_hold();
         held.report().await
+    }
+
+    /// Every box has its own IPC namespace, whatever its network plan: a
+    /// `host_ip` box, which shares the network namespace, and a `none` box
+    /// each sit in a namespace of their own, distinct from each other and
+    /// from this process's. Box A creates a System V message queue,
+    /// semaphore set and shared memory segment under one key, and a POSIX
+    /// message queue under one name, and finds all four again from inside;
+    /// box B, launched while A still holds them, finds none of them. Run in
+    /// both directions, so neither plan can reach the other's objects.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_box_has_its_own_ipc_namespace() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping every_box_has_its_own_ipc_namespace: this host \
+                 denies the unprivileged user namespace every sandbox starts \
+                 by unsharing: {reason}"
+            );
+            return;
+        }
+
+        let own_ipc = std::fs::read_link("/proc/self/ns/ipc")
+            .expect("reading this process's IPC namespace")
+            .to_string_lossy()
+            .into_owned();
+        let enoent = format!("errno {}", libc::ENOENT);
+        let pairs = [
+            (
+                "host_ip",
+                network::NetPlan::host(),
+                "none",
+                network::NetPlan::none(),
+            ),
+            (
+                "none",
+                network::NetPlan::none(),
+                "host_ip",
+                network::NetPlan::host(),
+            ),
+        ];
+        for (round, (a_name, a_plan, b_name, b_plan)) in pairs.into_iter().enumerate() {
+            // Unique per run, so a stale object from an earlier run cannot
+            // stand in for the one this run creates.
+            let key = 0x4d49_0000 + (std::process::id() & 0x0fff) * 4 + round as u32;
+            let mq = format!("minimal-ipc-{}-{round}", std::process::id());
+            let a_args = vec![
+                "NS:ipc".to_string(),
+                format!("SYSV:{key}"),
+                format!("SYSVGET:{key}"),
+                format!("MQ:{mq}"),
+                format!("MQOPEN:{mq}"),
+                "MARK:/run/ipc-ready".to_string(),
+                "HOLD:/run/ipc-release".to_string(),
+            ];
+            let a = launch_box_probe_under(
+                &format!("ipc-a{round}"),
+                None,
+                &a_args,
+                false,
+                Some(a_plan),
+            )
+            .await;
+            // Box B starts only once A's objects exist, so B finding none of
+            // them is the namespace's doing, never a race with A's creation.
+            let ready = a.base.join("run").join("ipc-ready");
+            for _ in 0..200 {
+                if ready.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let b_args = vec![
+                "NS:ipc".to_string(),
+                format!("SYSVGET:{key}"),
+                format!("MQOPEN:{mq}"),
+            ];
+            let b = launch_box_probe_under(
+                &format!("ipc-b{round}"),
+                None,
+                &b_args,
+                false,
+                Some(b_plan),
+            )
+            .await
+            .release_and_report()
+            .await;
+            let a = a.release_and_report().await;
+
+            let a_ipc = a.get("ns ipc").expect("box A reports its IPC namespace");
+            let b_ipc = b.get("ns ipc").expect("box B reports its IPC namespace");
+            assert_ne!(
+                a_ipc, &own_ipc,
+                "the {a_name} box must not share this process's IPC namespace"
+            );
+            assert_ne!(
+                b_ipc, &own_ipc,
+                "the {b_name} box must not share this process's IPC namespace"
+            );
+            assert_ne!(
+                a_ipc, b_ipc,
+                "the {a_name} and {b_name} boxes must not share an IPC namespace"
+            );
+            for kind in ["msg", "sem", "shm"] {
+                assert_eq!(
+                    a.get(&format!("sysv create {kind}")).map(String::as_str),
+                    Some("errno 0"),
+                    "the {a_name} box creates a System V {kind} object: {a:?}"
+                );
+                assert_eq!(
+                    a.get(&format!("sysv get {kind}")).map(String::as_str),
+                    Some("errno 0"),
+                    "the {a_name} box finds its own System V {kind} object: {a:?}"
+                );
+                assert_eq!(
+                    b.get(&format!("sysv get {kind}")),
+                    Some(&enoent),
+                    "the {b_name} box must not find the {a_name} box's System \
+                     V {kind} object: {b:?}"
+                );
+            }
+            assert_eq!(
+                a.get("mq create").map(String::as_str),
+                Some("errno 0"),
+                "the {a_name} box creates a POSIX message queue: {a:?}"
+            );
+            assert_eq!(
+                a.get("mq open").map(String::as_str),
+                Some("errno 0"),
+                "the {a_name} box opens its own POSIX message queue: {a:?}"
+            );
+            assert_eq!(
+                b.get("mq open"),
+                Some(&enoent),
+                "the {b_name} box must not open the {a_name} box's POSIX \
+                 message queue: {b:?}"
+            );
+        }
     }
 
     /// The daemon-side probe: a throwaway child of this process migrates
