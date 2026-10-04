@@ -104,6 +104,10 @@ fn package_suggestions(g: &Graph, input: &str) -> Vec<String> {
     use common::fuzzy_search::fuzzy_match;
 
     let input = input.trim().to_lowercase();
+    // An empty name is a prefix of every package, so it has no close match.
+    if input.is_empty() {
+        return Vec::new();
+    }
     let mut exact: Vec<&str> = Vec::new();
     let mut prefix_of_input: Vec<&str> = Vec::new();
     let mut input_prefix_of: Vec<&str> = Vec::new();
@@ -1976,6 +1980,13 @@ mod tests {
             err.to_string(),
             "No such package: nodejs (did you mean: node?)"
         );
+    }
+
+    #[test]
+    fn empty_package_name_gets_no_suggestions() {
+        let graph = suggestion_graph(&["node", "python"]);
+        assert!(package_suggestions(&graph, "").is_empty());
+        assert!(package_suggestions(&graph, "  ").is_empty());
     }
 
     #[test]
