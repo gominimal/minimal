@@ -15,7 +15,7 @@ use sessions::SessionId;
 use minimald::test_harness::unwrap_ready;
 
 use serde_json_lenient::Value;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
 
 // --- version ---
 
@@ -2346,6 +2346,69 @@ async fn net_forward_closes_with_session() {
         .expect("the forward must end once its session is destroyed")
         .expect("the forward task must not panic")
         .expect("the forward must exit cleanly");
+    echo.abort();
+}
+
+/// A local port of 0 asks the OS to pick a free port, and the forward must
+/// announce the port it actually bound — not `localhost:0`, which names
+/// nothing the user can connect to. The compiled binary is driven so the
+/// assertion reads the same stderr line the user sees.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn net_forward_announces_the_bound_local_port() {
+    let (daemon, args) = setup().await;
+    let _id = create_session_with_policy(
+        &daemon,
+        "web",
+        sessions::NetworkMode::HostNet,
+        sessions::SessionPolicy::default(),
+    )
+    .await;
+
+    let (box_port, echo) = spawn_echo_server().await;
+    let minimal_dir = args
+        .minimal_dir
+        .as_ref()
+        .expect("setup points at a tempdir");
+    let config_dir = tempfile::TempDir::new().unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_min"))
+        .args(["--minimal-dir".as_ref(), minimal_dir.as_os_str()])
+        .args(["--config-dir".as_ref(), config_dir.path().as_os_str()])
+        .arg("--no-input")
+        .args(["net", "forward", "web", &format!("0:{box_port}")])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the min binary should be invocable");
+
+    let mut stderr = tokio::io::BufReader::new(child.stderr.take().expect("stderr is piped"));
+    let mut line = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stderr.read_line(&mut line),
+    )
+    .await
+    .expect("the forward must announce its listener")
+    .expect("reading the forward's announcement");
+
+    let announced = line
+        .split_once("localhost:")
+        .and_then(|(_, rest)| rest.split_once(' ').map(|(port, _)| port))
+        .unwrap_or_else(|| panic!("announcement must name the bound port: {line}"));
+    let announced_port: u16 = announced
+        .parse()
+        .unwrap_or_else(|_| panic!("announced port must be numeric: {line}"));
+    assert_ne!(announced_port, 0, "the bound port must be non-zero: {line}");
+
+    let mut conn = connect_with_retry(announced_port).await;
+    conn.write_all(b"ping").await.expect("write to the forward");
+    let mut echoed = [0u8; 4];
+    conn.read_exact(&mut echoed)
+        .await
+        .expect("read the box's answer back through the forward");
+    assert_eq!(echoed, *b"ping", "the forward must relay on the bound port");
+
+    child.kill().await.ok();
     echo.abort();
 }
 
