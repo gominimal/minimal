@@ -28,8 +28,8 @@
 //! long-lived host services whose failures must not take the daemon down
 //! with them: a failed registration answers the client with the reason and
 //! keeps serving, and a client that never reaches the socket (a supervisor
-//! predating this module) still activates, handed no addresses, under the
-//! egress gate's announced interim.
+//! predating this module) still activates, handed no addresses — with the
+//! egress gate dropping its frames under the unregistered rule (NET-085).
 //!
 //! The v1 posture, stated: the trust is the uid. The bind tightens the
 //! provider dir to 0700 when the daemon owns it, refuses one it does not
@@ -44,10 +44,10 @@
 //! are served serially, one connection at a time, each read bounded by a
 //! 30-second timeout. That is what v1 ships, not a design endpoint.
 //!
-//! The interim is also where a box whose row is gone runs — never
-//! registered, or withdrawn at destroy — and putting the per-box default
-//! that eventually refuses it in force is the flip that lands with the last
-//! row source (T66's follow-up), not a change this socket makes.
+//! A box whose row is gone — never registered, or withdrawn at destroy —
+//! is dropped by the gate's unregistered rule unconditionally (NET-085);
+//! the flip that lands with the last row source (T66's follow-up) decides
+//! only what the publish half admits, not a change this socket makes.
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
@@ -762,14 +762,12 @@ mod tests {
     /// (T66): it registers the box, presents the pair the registration
     /// handed back to prove it is the row's creator, and the daemon removes
     /// the row from its table — at both addresses. What the gate then
-    /// decides at the withdrawn switch address is the phase's to say, and
-    /// both arms are pinned at relay level through the phase parameter (not
-    /// the shipped constant), so the flip that ends the interim breaks
-    /// nothing here: the announced interim admits the withdrawn address's
-    /// frame under its warn, the in-force per-box default drops it.
+    /// decides at the withdrawn switch address is unconditional: the
+    /// unregistered drop (NET-085) refuses the frame — the row's rules
+    /// ended with the row — so no flip of the per-box default changes it.
     #[tokio::test]
     async fn host_row_withdrawn_on_destroy() {
-        use crate::net::egress_gate::{UnregisteredSourcePhase, test_support};
+        use crate::net::egress_gate::test_support;
 
         let capture = server_capture();
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -952,61 +950,33 @@ mod tests {
         );
 
         // The gate shares the registry's table, as production does: the
-        // announced interim admits the withdrawn address's frame under its
-        // warn — the row's rules ended with the row — while a published
-        // box's frame is the marker that proves nothing else slipped.
+        // unregistered drop (NET-085) refuses the withdrawn address's frame —
+        // the row's rules ended with the row — while a published box's frame
+        // is the marker that proves nothing else slipped. No phase reaches
+        // this, so the shipped gate is the whole proof.
         let marker = test_support::ipv4_frame(db.switch_address.octets(), 6, [10, 1, 2, 3], 80);
         let from_withdrawn =
             test_support::ipv4_frame(web.switch_address.octets(), 6, [10, 1, 2, 3], 80);
-        let mut h = test_support::gate_over_with_phase(
-            registry.clone(),
-            UnregisteredSourcePhase::Announced,
-        )
-        .await;
-        test_support::send_frame(&mut h.guest, &from_withdrawn).await;
-        test_support::send_frame(&mut h.guest, &marker).await;
-        let seen = test_support::expect_frame(&mut h.switch).await;
-        assert_eq!(
-            seen, from_withdrawn,
-            "the announced interim admits the withdrawn address's frame"
-        );
-        let seen = test_support::expect_frame(&mut h.switch).await;
-        assert_eq!(seen, marker, "the published box's frame is the marker");
-        test_support::expect_silence(&mut h.switch).await;
-        test_support::wait_for_log(&h.log, "egress-unregistered-source").await;
-        let logged = h.log.contents();
-        assert!(
-            logged.contains(&format!("source={}", web.switch_address)),
-            "the interim's line names the withdrawn source, got: {logged}"
-        );
-        assert!(
-            logged.contains("T66 (#1711)"),
-            "the interim's line names the path that ends it, got: {logged}"
-        );
-
-        // And the in-force arm drops the same frame — the per-box default
-        // the flip puts in force — while the marker still passes.
-        let mut h =
-            test_support::gate_over_with_phase(registry.clone(), UnregisteredSourcePhase::InForce)
-                .await;
+        let mut h = test_support::gate_over(registry.clone()).await;
         test_support::send_frame(&mut h.guest, &from_withdrawn).await;
         test_support::send_frame(&mut h.guest, &marker).await;
         let seen = test_support::expect_frame(&mut h.switch).await;
         assert_eq!(
             seen, marker,
-            "the in-force default drops the withdrawn address's frame and \
-             passes the published box's"
+            "the gate drops the withdrawn address's frame and passes the \
+             published box's"
         );
         test_support::expect_silence(&mut h.switch).await;
-        test_support::wait_for_log(&h.log, "egress-unknown-source").await;
+        test_support::wait_for_log(&h.log, "egress-unregistered-source").await;
         let logged = h.log.contents();
         assert!(
             logged.contains(&format!("source={}", web.switch_address)),
             "the drop line names the withdrawn source, got: {logged}"
         );
         assert!(
-            !logged.contains("egress-unregistered-source"),
-            "the in-force arm fires no interim line, got: {logged}"
+            !logged.contains("egress-unknown-source"),
+            "the withdrawn address is in-plan, so its drop is the \
+             unregistered rule's, got: {logged}"
         );
     }
 
