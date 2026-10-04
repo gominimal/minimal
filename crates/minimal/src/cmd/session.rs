@@ -1986,11 +1986,6 @@ pub async fn cmd_session_hooks(global: &GlobalArgs, args: HooksArgs) -> Result<(
     ensure_daemon(global)?;
     let mut client = connect_daemon(global).await?;
 
-    // Resolve the session first so a missing name produces the shared
-    // `No session found matching '<name>'` error, like every other session
-    // command, instead of the daemon's bare `no session found`.
-    resolve_session(&mut client, &args.session).await?;
-
     use minimald_rpc::{GetSessionHooks, GetSessionHooksRequest};
     let lookup: GetSessionHooksRequest = SessionLookup::parse(&args.session).into();
     let resp = client
@@ -2000,11 +1995,13 @@ pub async fn cmd_session_hooks(global: &GlobalArgs, args: HooksArgs) -> Result<(
 
     let hooks = match resp {
         minimald_rpc::Errorable::Ok(hooks) => hooks,
-        // A session that disappears between the lookup and this call still
-        // names what was asked for.
-        minimald_rpc::Errorable::Err { error: _ } => {
+        // Name the session that was asked for, like every other session
+        // command, instead of the daemon's bare `no session found`. Any
+        // other daemon error passes through unchanged.
+        minimald_rpc::Errorable::Err { error } if error == "no session found" => {
             bail!("No session found matching '{}'", args.session)
         }
+        minimald_rpc::Errorable::Err { error } => bail!("{error}"),
     };
 
     if args.json {

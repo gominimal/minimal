@@ -1366,9 +1366,8 @@ async fn setup_opted_out() -> (
 // --- session hooks ---
 
 /// `min session hooks` names the session it could not find, like every other
-/// session command: a missing name resolves through `resolve_session` first,
-/// so the error is `No session found matching '<name>'` rather than the
-/// daemon's bare `no session found`.
+/// session command: the error is `No session found matching '<name>'` rather
+/// than the daemon's bare `no session found`.
 #[tokio::test]
 async fn session_hooks_missing_session_names_the_lookup() {
     let (_daemon, args) = setup().await;
