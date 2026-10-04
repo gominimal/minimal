@@ -1123,6 +1123,7 @@ async fn serve_get_session_runtime_facts(
                         record.host_ip_enforcement,
                     );
                     Ok(Errorable::Ok(minimald_rpc::SessionRuntimeFacts {
+                        id: record.id,
                         host_ip_enforcement,
                     }))
                 }

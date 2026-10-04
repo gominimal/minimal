@@ -1248,20 +1248,20 @@ pub enum GetSessionRuntimeFactsRequest {
 }
 
 /// The runtime facts [`GetSessionRuntimeFacts`] answers with.
-/// `deny_unknown_fields` is load-bearing, not tidiness, for the same reason
-/// [`FinalizeSessionResponse`]'s is: the reply rides an
-/// `#[serde(untagged)]` [`Errorable`], which tries `Ok(S)` first and takes
-/// it if it parses — and serde reads a missing `Option` field as `None`, so
-/// an all-optional struct would parse *any* object, including the daemon's
-/// `{"error": "..."}`. Without this, every failed facts read would decode
-/// as a successful one with nothing to report. The strictness costs nothing
-/// an older client can feel: only a client that asks for this reply ever
-/// decodes it, and one that fails to decode a later fact loses the optional
-/// row, never the rules — which is the whole reason the fact rides its own
-/// reply rather than a field on the policy.
+///
+/// Not `deny_unknown_fields`: runtime facts grow, and a client built before
+/// a later fact must still read the ones it knows, so an unknown key is
+/// ignored. What keeps the untagged [`Errorable`] honest instead is the
+/// required `id`: serde reads a missing `Option` as `None`, so an
+/// all-optional struct would parse *any* object, the daemon's
+/// `{"error": "..."}` included, as a facts reply with nothing to report. A
+/// field the error object never carries makes that reply fail the `Ok(S)`
+/// arm and fall through to `Err`, without refusing a key it does not know.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct SessionRuntimeFacts {
+    /// The session these facts are about: the record the daemon read them
+    /// from. Required, so the daemon's error reply never decodes as facts.
+    pub id: SessionId,
     /// The per-box egress enforcement the session's box actually runs under
     /// (NET-079): the box's own launch record —
     /// [`Record::host_ip_enforcement`](sessions::Record) — lowered to `none`
@@ -2188,13 +2188,14 @@ mod tests {
         );
 
         // The runtime-facts reply keeps the property the strict shapes
-        // exist for: the reply is all-optional and serde reads a missing
-        // `Option` as `None`, so only `deny_unknown_fields` — rejecting the
-        // `error` key, the same load-bearing anchor
-        // [`FinalizeSessionResponse`] carries — makes the daemon's error
-        // answers fall through the untagged decode to `Err` rather than
-        // decoding as a facts object with nothing to report.
+        // exist for without being strict: its required `id` is a field the
+        // daemon's `{"error":...}` never carries, so an error answer falls
+        // through the untagged decode to `Err` rather than decoding as a
+        // facts object with nothing to report — while a facts reply that
+        // grew a key this client has no field for still decodes, because
+        // runtime facts grow and an older client keeps the ones it knows.
         let facts = SessionRuntimeFacts {
+            id: SessionId::nil(),
             host_ip_enforcement: Some(HostIpEnforcement::None),
         };
         assert_eq!(round_trip(&facts), facts);
@@ -2206,6 +2207,23 @@ mod tests {
             Errorable::Err { error } => assert_eq!(error, "no session found"),
             Errorable::Ok(facts) => {
                 panic!("an error reply must not decode as facts, got {facts:?}")
+            }
+        }
+        match serde_json_lenient::from_str::<Errorable<SessionRuntimeFacts>>(
+            r#"{"id":"00000000-0000-0000-0000-000000000000","host_ip_enforcement":"per_box","a_later_fact":true}"#,
+        )
+        .expect("a facts reply with a key this client does not know still decodes")
+        {
+            Errorable::Ok(decoded) => assert_eq!(
+                decoded,
+                SessionRuntimeFacts {
+                    id: SessionId::nil(),
+                    host_ip_enforcement: Some(HostIpEnforcement::PerBox),
+                },
+                "the facts this client knows decode beside a key it does not"
+            ),
+            Errorable::Err { error } => {
+                panic!("a facts reply must not decode as an error, got {error}")
             }
         }
     }
