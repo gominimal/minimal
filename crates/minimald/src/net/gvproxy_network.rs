@@ -1966,6 +1966,11 @@ mod tests {
                     local: forwarder.local().to_string(),
                     internal_port: forwarder.internal_port(),
                     proto: sessions::IpProto::Tcp,
+                    // The gate-less runtime publish this test drives reads
+                    // as reachable — there is no relay gate to have
+                    // admitted the port — so the field says so outright
+                    // rather than defaulting to the unknown.
+                    pending: Some(false),
                 },
                 forwarder,
             })

@@ -184,6 +184,28 @@
 #                                    its own box's switch address — two boxes
 #                                    live at once, and each answer names its
 #                                    own box, never the other's
+#   deny_all_box_reaches_proxy_and_no_other_host_port
+#                                    NET-134: a deny-all box on a
+#                                    credentialed lane reaches the proxy's
+#                                    address alone — no other host address
+#                                    or port answers, and nothing else at
+#                                    the proxy's own address does either
+#   box_without_credentialed_lane_cannot_reach_proxy
+#                                    NET-134's lane clause: a box without
+#                                    the credentialed lane gets silence at
+#                                    the proxy's address, dropped inside
+#                                    the guest with the host gate silent,
+#                                    while its control probe through the
+#                                    same fabric is reset as usual
+#   proxy_sees_boxes_by_address      NET-132/133/134 together, end to end:
+#                                    each of two lane boxes' connections is
+#                                    answered from its own switch address,
+#                                    a host process connecting straight to
+#                                    the acceptor is refused and audited,
+#                                    one attachment is issued per live box
+#                                    host-side and withdrawn with the ended
+#                                    box, and a laneless box alone is silent
+#                                    at the proxy's address
 #   published_proxy_routes_from_host
 #                                    NET-059/081: a HOST request through the
 #                                    VM's published loopback proxy port
@@ -216,16 +238,17 @@ E2E_VM="${E2E_VM:-}"
 # The VM-backed cases documented as such above and invoked directly by their
 # task test lines: the fresh-install KVM activation proofs (NET-049/NET-051),
 # the stock-install integration case, the two-named-VMs integration case
-# (NET-052..059), and the unpublished-port refusal proof, which is one by its
-# own subject (NET-014 on the VM host). When called that way, behave as if the
-# caller exported the KVM lane environment variables: E2E_VM=1 and
-# E2E_MINIMAL_ARGS="--provider local-minvmd". Without this the script's
+# (NET-052..059), the unpublished-port refusal proof, which is one by its own
+# subject (NET-014 on the VM host), and the proxy-views proof, which reads the
+# VM host daemon's proxy surfaces (NET-132/133/134). When called that way,
+# behave as if the caller exported the KVM lane environment variables: E2E_VM=1
+# and E2E_MINIMAL_ARGS="--provider local-minvmd". Without this the script's
 # min_daemon probe defaults to minimald on Linux and the standalone case fails
 # before it reaches the proof.
 case "${1:-}" in
   fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes | two_named_vms_on_one_machine \
-    | unpublished_port_refused_on_vm_host)
+    | unpublished_port_refused_on_vm_host | proxy_sees_boxes_by_address)
     E2E_VM="${E2E_VM:-1}"
     if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
       E2E_MINIMAL_ARGS="--provider local-minvmd"
@@ -307,6 +330,9 @@ PO_TASK_SEED_DIR="" # its run-half seed; removed on teardown
 PO_TASK_PID="" # its `min task run` client; KILLed on teardown (it owns a box)
 CRED_LANE_SEED_DIR="" # seeded by the credentialed-lane proof below; removed on teardown
 CRED_NO_LANE_SEED_DIR="" # the no-lane proof's seed; removed on teardown
+PSBA_SEED_DIR_A="" # the proxy-views proof's box A; removed on teardown
+PSBA_SEED_DIR_B="" # its box B's seed; removed on teardown
+PSBA_SEED_DIR_C="" # its laneless box C's seed; removed on teardown
 PUBP_SEED_DIR="" # seeded by the published-proxy proof below; removed on teardown
 ESU_A_SEED_DIR="" # the escape-union proof's box A seed; removed on teardown
 ESU_B_SEED_DIR="" # its box B seed; removed on teardown
@@ -713,6 +739,10 @@ teardown() {
   # place that always sees them.
   [ -n "$CRED_LANE_SEED_DIR" ] && rm -rf "$CRED_LANE_SEED_DIR"
   [ -n "$CRED_NO_LANE_SEED_DIR" ] && rm -rf "$CRED_NO_LANE_SEED_DIR"
+  # The proxy-views proof's three boxes, same reasoning again.
+  [ -n "$PSBA_SEED_DIR_A" ] && rm -rf "$PSBA_SEED_DIR_A"
+  [ -n "$PSBA_SEED_DIR_B" ] && rm -rf "$PSBA_SEED_DIR_B"
+  [ -n "$PSBA_SEED_DIR_C" ] && rm -rf "$PSBA_SEED_DIR_C"
   # The published-proxy proof's box: the same arrangement, for the same reason.
   [ -n "$PUBP_SEED_DIR" ] && rm -rf "$PUBP_SEED_DIR"
   # The escape-union proof's seeds follow the same rule, and its host listener
@@ -1722,15 +1752,20 @@ proof_own_ip_egress_declared_and_enforced() {
 
 # ---------------------------------------------------------------------------
 # NET-080 end to end under the real table: the daemon's own package fetch
-# survives a deny-all host-address box on the same host and is recorded as
+# survives a host-address box on the same host and is recorded as
 # node-plane traffic, naming the box it fetched for. Every other proof in
 # this script runs on a host whose classifier step has not run — the daemon
 # places no box, and every box is unenforced — so this one installs the real
 # thing and drives the user path across it: the privileged step's tree and
 # table at the /sys/fs/cgroup/minimald.slice the daemon itself looks for, a
-# host-address box declared deny-all, an in-box `min add` of a registry
-# package (never a source build: that leg is issue #1872, outside this
-# proof), and the node-plane record naming the box and the package.
+# host-address box declared with no egress section, an in-box `min add` of
+# a registry package (never a source build: that leg is issue #1872,
+# outside this proof), and the node-plane record naming the box and the
+# package. Under the same loaded table the proof drives the refusal too: a
+# declaration that names rules the per-box classifier cannot enforce —
+# every deny_subnets entry, every allow list that narrows — is refused at
+# the create, with the words naming each rule and saying own-address boxes
+# enforce them.
 #
 # The install is this proof's own and this proof's to remove: the happy path
 # uninstalls before it returns and checks that it took, and the teardown
@@ -1755,16 +1790,18 @@ proof_own_ip_egress_declared_and_enforced() {
 # only by admitting no destination at all — the strict `deny all` shape
 # (allow_subnets, allow_dns_hosts and allow_protocols each an empty list),
 # which the shipped CLI cannot type, because every egress flag maps an
-# empty list to an unset field (crates/minimal/src/cmd/session.rs) — so a
-# CLI-declared box, this one with deny 0.0.0.0/0 included, lands in
-# boxes/allow, where the loaded table refuses nothing. The live refusal
-# this proof does pin is the daemon's own: host_ip_enforcement=per_box is
-# the verdict a host gets only when the daemon's probe connection out of a
+# empty list to an unset field (crates/minimal/src/cmd/session.rs). This
+# proof's box declares no section and so lands in boxes/allow, where the
+# loaded table refuses nothing on a box's behalf; a CLI declaration that
+# names rules the table cannot enforce lands nowhere now — the refusal
+# legs inside this proof refuse it at the create. The live refusal this
+# proof does pin is the daemon's own: host_ip_enforcement=per_box is the
+# verdict a host gets only when the daemon's probe connection out of a
 # deny leaf was refused by this table, read fresh before this box's
-# launch. The deny subtree's refusal of a box's own connection is owned
-# live by the root lane: deny_all_host_ip_box_answers_the_proxy_over_a_
-# loaded_table, with snat_identity_is_seen_by_the_peer for the node
-# plane's identity.
+# launch. The
+# deny subtree's refusal of a box's own connection is owned live by the
+# root lane: deny_all_host_ip_box_answers_the_proxy_over_a_loaded_table,
+# with snat_identity_is_seen_by_the_peer for the node plane's identity.
 proof_daemon_fetch_under_deny_all_host_address_box() {
   echo "::group::the daemon's own fetch under a loaded classifier table (NET-080)"
 
@@ -1961,18 +1998,24 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
 
   # ---- the box: the activate launches it, into a leaf of the placed
   # daemon's tree, under the table this proof loaded. The daemon is up
-  # already, so this call runs at the lane's own filter. deny 0.0.0.0/0 is
-  # the CLI's deny-all spelling for a host-address box, the same explicit
-  # stand-in NET-074's e2e case names for the in-force default the phase
-  # does not yet ship.
-  net080_sid="$(cd "$NET080_SEED_DIR" && mnl session activate . --no-prompt --name e2e-net080-deny-all \
-    --network host_ip --deny-subnets 0.0.0.0/0 2>"$WORK/net080-activate.err")" || {
-    echo "::error::'min session activate --network host_ip --deny-subnets 0.0.0.0/0' failed under the loaded table"
+  # already, so this call runs at the lane's own filter. The box declares
+  # no egress section — the one shape a host that decides per box has a
+  # verdict for. `--deny-subnets 0.0.0.0/0` is not the CLI's deny-all
+  # spelling (the strict deny-all shape is three empty allow lists, which
+  # the shipped CLI cannot type: every egress flag maps an empty list to
+  # an unset field, crates/minimal/src/cmd/session.rs) — a deny entry
+  # names a rule the per-box classifier cannot enforce, so under this
+  # table the create refuses it, the legs after the launch record say.
+  # Either way the box lands in boxes/allow, where the table refuses
+  # nothing on a box's behalf; the refusal is the difference.
+  net080_sid="$(cd "$NET080_SEED_DIR" && mnl session activate . --no-prompt --name e2e-net080 \
+    --network host_ip 2>"$WORK/net080-activate.err")" || {
+    echo "::error::'min session activate --network host_ip' failed under the loaded table"
     cat "$WORK/net080-activate.err" 2>/dev/null || true
     fail
   }
   net080_sid="$(printf '%s\n' "$net080_sid" | tail -n1 | tr -d '\r')"
-  echo "activate: the host-address box $net080_sid is declared deny-all (deny 0.0.0.0/0), launched by a daemon already inside the slice"
+  echo "activate: the host-address box $net080_sid is declared with no egress section, launched by a daemon already inside the slice"
 
   # ---- the capability gate: this proof drives a box, so a host that cannot
   # run one cannot run it. Observed fact, degraded on a developer host, a
@@ -2013,21 +2056,59 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   fi
   echo "launch: the box is placed in its own leaf boxes/allow/$net080_sid, in the allow subtree, and the host decides per box — the daemon's probe connection out of a deny leaf was refused by the loaded table before this launch"
 
+  # ---- the refusal half: a declaration that names a rule the loaded table
+  # cannot enforce per box — every deny_subnets entry, every allow list
+  # that narrows — is refused at the create while this host decides per
+  # box, which the launch record above just said it does. The refusal's
+  # words name the rule by its field, say own-address boxes enforce them,
+  # and end with what to do about the rules they named, and the error a
+  # person reads is the proof: the create never launches, so it holds no
+  # leaf and no record either.
+  if (cd "$NET080_SEED_DIR" && mnl session activate . --no-prompt \
+      --name e2e-net080-refused-range --network host_ip \
+      --deny-subnets 0.0.0.0/0) >/dev/null 2>"$WORK/net080-refused-range.err"; then
+    echo "::error::'min session activate --network host_ip --deny-subnets 0.0.0.0/0' was not refused on a host the record above says decides per box"
+    fail
+  fi
+  grep -q "deny_subnets 0.0.0.0/0" "$WORK/net080-refused-range.err" \
+    || { echo "::error::the refused create does not name the rule it refused over (deny_subnets 0.0.0.0/0)"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
+  grep -q "own-address boxes enforce them" "$WORK/net080-refused-range.err" \
+    || { echo "::error::the refused create does not say own-address boxes enforce these rules"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
+  grep -q "remove these rules" "$WORK/net080-refused-range.err" \
+    || { echo "::error::the refused create does not end with what to do (remove these rules)"; cat "$WORK/net080-refused-range.err" 2>/dev/null || true; fail; }
+  if (cd "$NET080_SEED_DIR" && mnl session activate . --no-prompt \
+      --name e2e-net080-refused-list --network host_ip \
+      --allow-subnets 10.0.0.0/8) >/dev/null 2>"$WORK/net080-refused-list.err"; then
+    echo "::error::'min session activate --network host_ip --allow-subnets 10.0.0.0/8' was not refused on a host the record above says decides per box"
+    fail
+  fi
+  grep -q "allow_subnets" "$WORK/net080-refused-list.err" \
+    || { echo "::error::the refused create does not name the rule it refused over (allow_subnets)"; cat "$WORK/net080-refused-list.err" 2>/dev/null || true; fail; }
+  echo "refusal: a declaration that names rules the loaded table cannot enforce per box (deny_subnets 0.0.0.0/0, allow_subnets 10.0.0.0/8) is refused at the create with each rule named — this host decides per box, and its classifier enforces deny-all or nothing on a box's leaf"
+
   # ---- the box's own egress, before: the declaration as `min session policy`
-  # reads it back, and one connection out of the box — printed either way
-  # (weather cannot be told from enforcement from this seat), and asserted
-  # after only where this before-half answered.
+  # reads it back — a box that declared no section reads the daemon's
+  # resolved default, allow all for a host-address box (the deny-all
+  # default is an own-address one, NET-074/NET-077) — and one connection
+  # out of the box, printed either way (weather cannot be told from
+  # enforcement from this seat), and asserted after only where this
+  # before-half answered.
   net080_policy_before="$(mnl session policy "$net080_sid" 2>"$WORK/net080-policy-before.err")" || {
-    echo "::error::'min session policy' failed for the deny-all host-address box"
+    echo "::error::'min session policy' failed for the host-address box"
     cat "$WORK/net080-policy-before.err" 2>/dev/null || true
     fail
   }
-  if [[ "$net080_policy_before" != *"0.0.0.0/0"* ]]; then
-    echo "::error::the box's policy does not read back the declared deny 0.0.0.0/0"
+  if [[ "$net080_policy_before" != *"allow all"* ]]; then
+    echo "::error::the box's policy does not read back the resolved default its no-section declaration carries (allow all)"
     printf '%s\n' "$net080_policy_before"
     fail
   fi
-  echo "policy: the box's declaration reads back deny 0.0.0.0/0"
+  if [[ "$net080_policy_before" != *"per-box enforcement  per_box"* ]]; then
+    echo "::error::the box's policy does not say per_box beside its rules: the host's fact dropped, or the box never recorded"
+    printf '%s\n' "$net080_policy_before"
+    fail
+  fi
+  echo "policy: the box's no-section declaration reads back allow all, with per-box enforcement per_box beside it"
   net080_answered=0
   mnl session exec "$net080_sid" \
     "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://example.com" \
@@ -2112,7 +2193,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
     diff <(printf '%s\n' "$net080_policy_before") <(printf '%s\n' "$net080_policy_after") || true
     fail
   fi
-  echo "egress unchanged: 'min session policy' reads back the same declaration as before the fetch (deny 0.0.0.0/0, and the box still in the allow subtree)"
+  echo "egress unchanged: 'min session policy' reads back the same declaration as before the fetch (allow all beside per-box enforcement per_box, and the box still in the allow subtree)"
   if [ "$net080_answered" -eq 1 ]; then
     mnl session exec "$net080_sid" \
       "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://example.com" \
@@ -2129,7 +2210,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   fi
 
   # ---- the half this seat cannot drive, said rather than skipped -----------
-  echo "refused-connect half: pinned here only through the daemon's own probe — the per_box verdict above is the host's fresh fact that the loaded table refuses a connection out of a deny leaf. A connection from THIS box cannot be driven: the classifier's deny subtree is reached only by a box that admits no destination at all, the strict 'deny all' shape the shipped CLI cannot type (every egress flag maps an empty list to an unset field, crates/minimal/src/cmd/session.rs), so a CLI-declared box lands in boxes/allow, where the loaded table refuses nothing. The deny subtree's refusal of a box's own connection is owned live by the root lane's deny_all_host_ip_box_answers_the_proxy_over_a_loaded_table, with snat_identity_is_seen_by_the_peer for the node plane's identity"
+  echo "refused-connect half: pinned here only through the daemon's own probe — the per_box verdict above is the host's fresh fact that the loaded table refuses a connection out of a deny leaf. A connection from THIS box cannot be driven: it declared no egress section, so it sits in boxes/allow, where the loaded table refuses nothing on a box's behalf; and a CLI declaration that names rules the table cannot enforce no longer lands anywhere — the legs above refused it at the create. What still cannot be typed is the one box the deny subtree is for: a box that admits no destination at all, the strict 'deny all' shape, which the shipped CLI cannot express (every egress flag maps an empty list to an unset field, crates/minimal/src/cmd/session.rs). The deny subtree's refusal of a box's own connection is owned live by the root lane's deny_all_host_ip_box_answers_the_proxy_over_a_loaded_table, with snat_identity_is_seen_by_the_peer for the node plane's identity"
 
   # ---- the proof's own uninstall, and the check that it took ---------------
   if ! net080_unwind; then
@@ -2143,7 +2224,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   fi
   rm -rf "$NET080_SEED_DIR"; NET080_SEED_DIR=""
   echo "cleanup: the tree and the table this proof installed are gone; the host is as this proof found it"
-  echo "daemon's own fetch under a loaded classifier table OK (NET-080: the box sits in the allow subtree, the host decides per_box over the loaded table, and the daemon's own fetch left from its own leaf and is recorded as node-plane traffic naming the box and the package)"
+  echo "daemon's own fetch under a loaded classifier table OK (NET-080: the box sits in the allow subtree, the host decides per_box over the loaded table, the daemon's own fetch left from its own leaf and is recorded as node-plane traffic naming the box and the package, and a declaration naming rules the table cannot enforce is refused at the create with the rule named)"
   echo "::endgroup::"
 }
 
@@ -10450,6 +10531,515 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
   echo "::endgroup::"
 }
 
+# The Box Egress Proxy's view of a box, whole: the three cases above each
+# proved one half of it against one box at a time; this one runs one
+# scenario, on one daemon, that reads every half together — the delivery's
+# identity, the attachment's lifecycle, the lane's necessity, and the host
+# process's absence, each named in the VM host daemon's own log.
+#
+#   * the delivery's identity (NET-132): two deny-all boxes on credentialed
+#     lanes connect at once, and the stand-in acceptor's answer names each
+#     one's own switch address as its connection's source, never the other
+#     box's — the case prints each answer, the source as the acceptor saw
+#     it;
+#   * the attachment's lifecycle (NET-133): the host daemon's log holds one
+#     attachment issued per live box, from the host-side registration that
+#     published the row — the credentialed lane travelling with the lane
+#     boxes' attachment and absent from the laneless box's — each issued
+#     ahead of the box's first delivered connection, and the ended box's
+#     withdrawn with its row while its sibling's second connection is
+#     still answered from its own address;
+#   * the lane's necessity (NET-134): a third box with no lane — allow-all
+#     rules, so only the lane's absence can refuse — gets silence at the
+#     proxy's address while its control probe to the node's own address is
+#     reset through the same fabric, the host gate's log says nothing, and
+#     no delivery is ever recorded for its address;
+#   * the host process's (NET-132's IF-clause): a process outside every
+#     box — this script — connects straight to the acceptor's own unix
+#     socket, which only the same user may hold, and is refused before it
+#     is presented: on Linux the kernel names the unix peer's process and
+#     this script's is not the host daemon's; off Linux no pid comes with
+#     the credentials, so the per-boot token is the whole of what a host
+#     process must hold, and this one holds none. Either way the acceptor
+#     answers with no bytes and audits the refusal.
+#
+# The daemon's log is the diagnostics this run owes: the case asserts and
+# prints each attachment (issue and withdrawal) and each delivery, scoped
+# by cred_case_log to the lines this case's own daemon wrote. Every
+# surface it reads is the VM host daemon's — the stand-in acceptor
+# MINVMD_BEP_STUB binds, the attachment table the host-side registration
+# issues into, the box-egress pool that dials the delivery — so a native
+# target skips the whole case (the unpublished-port case's native
+# reasoning, the same shape here), and the KVM and gvproxy gates follow.
+proof_proxy_sees_boxes_by_address() {
+  echo "::group::the Box Egress Proxy sees each box by its own address, end to end (NET-132, NET-133, NET-134)"
+  if [ -z "$E2E_VM" ]; then
+    echo "proxy_sees_boxes_by_address SKIPPED (native target: the stand-in acceptor, the per-box attachments and the box-egress pool are the VM host daemon's, and a native host runs none of them)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ "$(uname -s)" = Linux ] && { [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
+    echo "proxy_sees_boxes_by_address SKIPPED (no writable /dev/kvm: a Linux VM boots on KVM and this host has none — the case reads the VM host daemon's proxy surfaces, and no VM host daemon means nothing to read)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "proxy_sees_boxes_by_address SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so no box has an address to be seen by)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  local probe_start_ms probe_ms
+  cred_begin
+  export MINVMD_BEP_STUB=1
+  CRED_STUB=1
+  # One directive wider than cred_begin's: the pool's per-delivery record is
+  # a DEBUG one, and the delivery assertions below read it, so widen the
+  # filter before the first activation autospawns this case's daemon.
+  # cred_restore puts the lane's own filter back on every exit.
+  export RUST_LOG="warn,minimald::exec=info,minvmd=info,switch::bep_host=debug"
+
+  local proxy_ip proxy_port node_ip sock sock_wait
+  local psba_sid_a psba_sid_b psba_sid_c
+  local psba_ip_a psba_ip_b psba_ip_c
+  local psba_reason psba_wait psba_seen psba_line
+  local psba_pos_issue psba_pos_delivered
+  local psba_box psba_want_lane psba_ip_var psba_sid_var
+  proxy_ip="100.64.255.252"
+  proxy_port="8118"
+  node_ip="100.64.255.253"
+  # The refusal reason a same-uid host process earns at the acceptor, per
+  # OS: on Linux the kernel names the unix peer's process and this script's
+  # is not the host daemon's; off Linux no pid comes with the credentials,
+  # so the per-boot token is the whole of what a host process must hold —
+  # and the one below holds none, presenting nothing.
+  psba_reason="short"
+  if [ "$(uname -s)" = Linux ]; then
+    psba_reason="pid"
+  fi
+
+  # The host daemon's own receipt of one box's attachment, newest naming
+  # $1's switch address: one info line per box, written by the host-side
+  # registration. Callers poll this.
+  psba_attachment_line() {
+    cred_case_log | grep -F -- 'issued a box egress proxy attachment' \
+      | grep -F -- "\"switch_addr\":\"$1\"" | tail -n1 || true
+  }
+  # The pool's own record of one delivered connection, newest naming $1 as
+  # the source it dialled the acceptor from. The filter above is what lets
+  # it through. Callers poll this.
+  psba_delivered_line() {
+    cred_case_log | grep -F -- 'box egress proxy: connection delivered to the acceptor' \
+      | grep -F -- "\"source\":\"$1:" | tail -n1 || true
+  }
+  # The 1-based position of the first line of this case's window holding
+  # both the message and the field: how the ordering assertion reads
+  # "ahead of" off the daemon's own log.
+  psba_line_pos() {
+    cred_case_log | grep -n -F -- "$1" | grep -F -- "$2" | head -n1 | cut -d: -f1
+  }
+
+  # Three boxes: A and B deny-all over the credentialed lane — the
+  # strictest declaration, so each of their connections crosses BOTH gates
+  # (the box's own relay admitting the proxy's address as the lane's
+  # infrastructure under 0.0.0.0/0, and the VM host's gate under the row's
+  # declared lane) and still arrives attributed to the box's own address; C
+  # declares nothing — no lane, allow-all rules — so nothing but the lane's
+  # absence can refuse the proxy's address for it.
+  PSBA_SEED_DIR_A="$(hook_mktemp /tmp/mnlpsba.XXXXXX)"
+  hook_seed_preamble > "$PSBA_SEED_DIR_A/minimal.toml"
+  mkdir "$PSBA_SEED_DIR_A/.git"
+  PSBA_SEED_DIR_B="$(hook_mktemp /tmp/mnlpsbb.XXXXXX)"
+  hook_seed_preamble > "$PSBA_SEED_DIR_B/minimal.toml"
+  mkdir "$PSBA_SEED_DIR_B/.git"
+  PSBA_SEED_DIR_C="$(hook_mktemp /tmp/mnlpsbc.XXXXXX)"
+  hook_seed_preamble > "$PSBA_SEED_DIR_C/minimal.toml"
+  mkdir "$PSBA_SEED_DIR_C/.git"
+
+  psba_sid_a="$(cd "$PSBA_SEED_DIR_A" && mnl session activate . --no-prompt \
+    --name e2e-psba-a --network own_ip \
+    --deny-subnets 0.0.0.0/0 \
+    --credentialed-upstream \
+    2>"$WORK/psba-box-a.err")" || {
+    echo "::error::'min session activate --network own_ip --deny-subnets 0.0.0.0/0 --credentialed-upstream' failed for the proxy-views case's box A"
+    cat "$WORK/psba-box-a.err" 2>/dev/null || true
+    cred_fail
+  }
+  psba_sid_a="$(printf '%s\n' "$psba_sid_a" | tail -n1 | tr -d '\r')"
+  cred_wait_registered "the proxy-views case's box A" "e2e-psba-a"
+  psba_sid_b="$(cd "$PSBA_SEED_DIR_B" && mnl session activate . --no-prompt \
+    --name e2e-psba-b --network own_ip \
+    --deny-subnets 0.0.0.0/0 \
+    --credentialed-upstream \
+    2>"$WORK/psba-box-b.err")" || {
+    echo "::error::'min session activate --network own_ip --deny-subnets 0.0.0.0/0 --credentialed-upstream' failed for the proxy-views case's box B"
+    cat "$WORK/psba-box-b.err" 2>/dev/null || true
+    cred_fail
+  }
+  psba_sid_b="$(printf '%s\n' "$psba_sid_b" | tail -n1 | tr -d '\r')"
+  cred_wait_registered "the proxy-views case's box B" "e2e-psba-b"
+  psba_sid_c="$(cd "$PSBA_SEED_DIR_C" && mnl session activate . --no-prompt \
+    --name e2e-psba-nolane --network own_ip 2>"$WORK/psba-box-c.err")" || {
+    echo "::error::'min session activate --network own_ip' failed for the proxy-views case's laneless box"
+    cat "$WORK/psba-box-c.err" 2>/dev/null || true
+    cred_fail
+  }
+  psba_sid_c="$(printf '%s\n' "$psba_sid_c" | tail -n1 | tr -d '\r')"
+  cred_wait_registered "the proxy-views case's laneless box" "e2e-psba-nolane"
+
+  # The stand-in's socket, the flag's receipt on the filesystem, then the
+  # daemon's own records of both halves of the proxy's host surface: the
+  # acceptor's and the pool's peer on the switch. Assert them before any
+  # probe, so a daemon that came up without the flag — or a switch that
+  # never started — fails here naming the cause instead of in a blank
+  # probe answer far below.
+  sock="$XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-bep.sock"
+  sock_wait=0
+  until [ -S "$sock" ]; do
+    sock_wait=$((sock_wait + 1))
+    if [ "$sock_wait" -gt 15 ]; then
+      echo "::error::the host daemon bound no stand-in socket at $sock — this case's activation autospawned a daemon that did not carry MINVMD_BEP_STUB"
+      cred_fail
+    fi
+    sleep 1
+  done
+  psba_seen=0
+  psba_wait=0
+  while [ "$psba_wait" -le 15 ]; do
+    if cred_case_log | grep -q 'box egress proxy stand-in acceptor up' \
+      && cred_case_log | grep -q 'host gvproxy switch up; box egress proxy peer started'; then
+      psba_seen=1
+      break
+    fi
+    if cred_case_log | grep -q -e 'failed to spawn host gvproxy switch' -e 'gvproxy binary not found'; then
+      echo "::error::this case's daemon came up without the box egress proxy's peer — the switch never started, so the probes below would fail against a host that is not there. The daemon's log says:"
+      cred_case_log | grep -e 'failed to spawn host gvproxy switch' -e 'gvproxy binary not found' | tail -n5 | sed 's/^/  /'
+      cred_fail
+    fi
+    psba_wait=$((psba_wait + 1))
+    sleep 1
+  done
+  if [ "$psba_seen" -ne 1 ]; then
+    echo "::error::the daemon's log never named its box egress proxy surface (waited ${psba_wait}s among this case's lines for the stand-in's and the peer's own records)"
+    cred_fail
+  fi
+
+  # Each box's own switch address, read the way the cases above read it (no
+  # iproute2 in a session rootfs), for every assertion below that names it.
+  psba_ip_a="$(cred_box_ip "$psba_sid_a" "$WORK/psba-box-a-fib.out" "$WORK/psba-box-a-fib.err")"
+  if [ -z "$psba_ip_a" ]; then
+    echo "::error::could not determine box A's switch address from /proc/net/fib_trie"
+    echo "--- fib_trie ---"; cat "$WORK/psba-box-a-fib.out" 2>/dev/null || true
+    cred_fail
+  fi
+  psba_ip_b="$(cred_box_ip "$psba_sid_b" "$WORK/psba-box-b-fib.out" "$WORK/psba-box-b-fib.err")"
+  if [ -z "$psba_ip_b" ]; then
+    echo "::error::could not determine box B's switch address from /proc/net/fib_trie"
+    echo "--- fib_trie ---"; cat "$WORK/psba-box-b-fib.out" 2>/dev/null || true
+    cred_fail
+  fi
+  psba_ip_c="$(cred_box_ip "$psba_sid_c" "$WORK/psba-box-c-fib.out" "$WORK/psba-box-c-fib.err")"
+  if [ -z "$psba_ip_c" ]; then
+    echo "::error::could not determine the laneless box's switch address from /proc/net/fib_trie"
+    echo "--- fib_trie ---"; cat "$WORK/psba-box-c-fib.out" 2>/dev/null || true
+    cred_fail
+  fi
+
+  # socat carries every probe below (a launcher baseline package every box
+  # ships at /usr/bin); its absence would fail three probes with errors
+  # that name nothing. Assert it once, per box.
+  for psba_sid_var in psba_sid_a psba_sid_b psba_sid_c; do
+    if ! mnl session exec "${!psba_sid_var}" 'test -x /usr/bin/socat' >/dev/null 2>&1; then
+      echo "::error::a box of this case has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"
+      cred_fail
+    fi
+  done
+
+  # NET-133's issue half: one attachment per live box, issued by the
+  # host-side registration that published the row — the proxy's own
+  # receipts, this daemon's records of them. The lane travels with the
+  # addressing: A and B declared the credentialed upstream, C declared
+  # nothing, so its attachment carries the lane's absence.
+  for psba_box in a b c; do
+    case "$psba_box" in
+      a | b) psba_want_lane="true" ;;
+      c) psba_want_lane="false" ;;
+    esac
+    psba_ip_var="psba_ip_$psba_box"
+    psba_seen=0
+    psba_wait=0
+    while [ "$psba_wait" -le 10 ]; do
+      psba_line="$(psba_attachment_line "${!psba_ip_var}")"
+      if [ -n "$psba_line" ]; then
+        psba_seen=1
+        break
+      fi
+      psba_wait=$((psba_wait + 1))
+      sleep 1
+    done
+    if [ "$psba_seen" -ne 1 ]; then
+      echo "::error::the host daemon's log never named ${!psba_ip_var}'s attachment — the proxy holds nothing for that address, so no connection of that box's could be attributed to it. This case's attachment lines say:"
+      cred_case_log | grep -F -- 'egress proxy attachment' | tail -n5 | sed 's/^/  /'
+      cred_fail
+    fi
+    if ! printf '%s\n' "$psba_line" | grep -qF -- "\"credentialed_upstream\":$psba_want_lane"; then
+      echo "::error::the attachment for ${!psba_ip_var} does not carry the box's lane (wanted credentialed_upstream=$psba_want_lane)"
+      echo "  $psba_line"
+      cred_fail
+    fi
+    echo "attachment: $psba_line"
+  done
+
+  # The two lane boxes connect, each through the fabric the peer-up gate
+  # just proved, and each answer is read back inside the box: socat's left
+  # address is an empty pipe and -t 10 holds the connection open for the
+  # stand-in's one answer line — the source the acceptor was presented
+  # from, which is what this case exists to see.
+  mnl session exec "$psba_sid_a" \
+    "printf '' | /usr/bin/socat -t 10 - TCP:$proxy_ip:$proxy_port,connect-timeout=15" \
+    >"$WORK/psba-box-a-answer.out" 2>"$WORK/psba-box-a-answer.err" || {
+    echo "::error::box A's connection to the proxy's address did not complete — the demand crosses both gates: the box's own relay must admit the proxy's address as the lane's infrastructure under the box's own 0.0.0.0/0, and the VM host's gate under the row's declared lane"
+    cat "$WORK/psba-box-a-answer.err" 2>/dev/null || true
+    cred_fail
+  }
+  mnl session exec "$psba_sid_b" \
+    "printf '' | /usr/bin/socat -t 10 - TCP:$proxy_ip:$proxy_port,connect-timeout=15" \
+    >"$WORK/psba-box-b-answer.out" 2>"$WORK/psba-box-b-answer.err" || {
+    echo "::error::box B's connection to the proxy's address did not complete — the demand crosses both gates: the box's own relay must admit the proxy's address as the lane's infrastructure under the box's own 0.0.0.0/0, and the VM host's gate under the row's declared lane"
+    cat "$WORK/psba-box-b-answer.err" 2>/dev/null || true
+    cred_fail
+  }
+
+  # Each answer names its own box's switch address as the source and the
+  # proxy's address as the destination — and never the other box's
+  # address, which is what makes the delivery's identity worth having.
+  for psba_box in a b; do
+    psba_ip_var="psba_ip_$psba_box"
+    if ! grep -q -- "source=${!psba_ip_var}:" "$WORK/psba-box-$psba_box-answer.out"; then
+      echo "::error::the acceptor did not see box $psba_box's connection from its own switch address (${!psba_ip_var})"
+      echo "--- answer ---"; cat "$WORK/psba-box-$psba_box-answer.out" 2>/dev/null || true
+      echo "--- stderr ---"; cat "$WORK/psba-box-$psba_box-answer.err" 2>/dev/null || true
+      cred_fail
+    fi
+    if ! grep -q -- "destination=$proxy_ip:$proxy_port" "$WORK/psba-box-$psba_box-answer.out"; then
+      echo "::error::box $psba_box's answer does not name the proxy's address as the destination"
+      echo "--- answer ---"; cat "$WORK/psba-box-$psba_box-answer.out" 2>/dev/null || true
+      cred_fail
+    fi
+  done
+  if grep -q -- "source=$psba_ip_b:" "$WORK/psba-box-a-answer.out"; then
+    echo "::error::the acceptor answered box A's connection presenting box B's address ($psba_ip_b) as its source — a box's connection must be presented from its own address, never another box's"
+    cat "$WORK/psba-box-a-answer.out" 2>/dev/null || true
+    cred_fail
+  fi
+  if grep -q -- "source=$psba_ip_a:" "$WORK/psba-box-b-answer.out"; then
+    echo "::error::the acceptor answered box B's connection presenting box A's address ($psba_ip_a) as its source — a box's connection must be presented from its own address, never another box's"
+    cat "$WORK/psba-box-b-answer.out" 2>/dev/null || true
+    cred_fail
+  fi
+  echo "the acceptor saw box A's connection as: $(tr -d '\r\n' < "$WORK/psba-box-a-answer.out")"
+  echo "the acceptor saw box B's connection as: $(tr -d '\r\n' < "$WORK/psba-box-b-answer.out")"
+
+  # The pool's own record of each delivery, one per connection, naming the
+  # source it dialled the acceptor from — the box's own address again, this
+  # time as the delivery's own trace. And the ordering NET-133 states is
+  # read off the same window: the attachment's issue line precedes even the
+  # box's first delivered connection.
+  for psba_box in a b; do
+    psba_ip_var="psba_ip_$psba_box"
+    psba_seen=0
+    psba_wait=0
+    while [ "$psba_wait" -le 10 ]; do
+      psba_line="$(psba_delivered_line "${!psba_ip_var}")"
+      if [ -n "$psba_line" ]; then
+        psba_seen=1
+        break
+      fi
+      psba_wait=$((psba_wait + 1))
+      sleep 1
+    done
+    if [ "$psba_seen" -ne 1 ]; then
+      echo "::error::the pool never recorded the delivery of box $psba_box's connection (no 'connection delivered' line naming ${!psba_ip_var} as its source among this case's lines)"
+      cred_case_log | grep -F -- 'box egress proxy' | tail -n8 | sed 's/^/  /'
+      cred_fail
+    fi
+    echo "delivery: $psba_line"
+    psba_pos_issue="$(psba_line_pos 'issued a box egress proxy attachment' "\"switch_addr\":\"${!psba_ip_var}\"")"
+    psba_pos_delivered="$(psba_line_pos 'box egress proxy: connection delivered to the acceptor' "\"source\":\"${!psba_ip_var}:")"
+    if [ -z "$psba_pos_issue" ] || [ -z "$psba_pos_delivered" ] \
+      || [ "$psba_pos_issue" -ge "$psba_pos_delivered" ]; then
+      echo "::error::box $psba_box's attachment was not issued ahead of its first delivered connection (issue at line ${psba_pos_issue:-<none>}, first delivery at line ${psba_pos_delivered:-<none>})"
+      cred_fail
+    fi
+  done
+
+  # The laneless box, against the fabric the two answers just proved live:
+  # its control probe to the node's own address on the switch is reset by
+  # the VM's own stack — resolution, the fabric and the gate's admit path
+  # all answer this box — and its probe to the proxy's address runs out its
+  # window with no reset: the box's own relay dropped the SYN inside the
+  # guest, before the switch, exactly the no-lane refusal. The acceptor
+  # never saw it, so the pool never recorded a delivery for its address,
+  # and the host gate's log says nothing about the frame.
+  mnl session exec "$psba_sid_c" \
+    "/usr/bin/socat /dev/null TCP:$node_ip:$proxy_port,connect-timeout=8" \
+    >/dev/null 2>"$WORK/psba-nolane-control.err"
+  if ! grep -q 'Connection refused' "$WORK/psba-nolane-control.err" 2>/dev/null; then
+    echo "::error::the laneless box's control probe to the node's own address was not reset — the fabric or the gate is not answering this box, so its silence at the proxy's address below would prove nothing. Control stderr:"
+    cat "$WORK/psba-nolane-control.err" 2>/dev/null || true
+    cred_fail
+  fi
+  probe_start_ms="$(now_ms)"
+  mnl session exec "$psba_sid_c" \
+    "/usr/bin/socat /dev/null TCP:$proxy_ip:$proxy_port,connect-timeout=15" \
+    >/dev/null 2>"$WORK/psba-nolane-probe.err" && {
+    echo "::error::a box with no credentialed lane completed a connection to the proxy's address $proxy_ip:$proxy_port"
+    cat "$WORK/psba-nolane-probe.err" 2>/dev/null || true
+    cred_fail
+  }
+  probe_ms=$(( $(now_ms) - probe_start_ms ))
+  if grep -q 'Connection refused' "$WORK/psba-nolane-probe.err" 2>/dev/null; then
+    echo "::error::the laneless box's connection to the proxy's address was reset — the frame reached the host's stack, so no gate refused it as the lane's absence demands"
+    cat "$WORK/psba-nolane-probe.err" 2>/dev/null || true
+    cred_fail
+  fi
+  if [ "$probe_ms" -lt 5000 ]; then
+    echo "::error::the laneless box's connection to the proxy's address failed in ${probe_ms}ms — a fast failure with no reset is neither weather (the control above was reset through the same fabric) nor the silent drop being asserted"
+    cat "$WORK/psba-nolane-probe.err" 2>/dev/null || true
+    cred_fail
+  fi
+  if [ -n "$(psba_delivered_line "$psba_ip_c")" ]; then
+    echo "::error::the pool recorded a delivery for the laneless box's address ($psba_ip_c) — a box no lane admitted reached the acceptor"
+    cred_case_log | grep -F -- 'connection delivered' | tail -n5 | sed 's/^/  /'
+    cred_fail
+  fi
+  if cred_case_log | grep -q -- "egress-uncredentialed-proxy-destination"; then
+    echo "::error::the minvmd gate logged a proxy-lane drop for the laneless box — the box's own relay must refuse the frame before the switch, so the host gate never sees it"
+    cred_case_log | grep -- "egress-uncredentialed-proxy-destination" | tail -n5 | sed 's/^/  /'
+    cred_fail
+  fi
+  echo "the laneless box ($psba_ip_c, allow-all, no lane) was silent at $proxy_ip:$proxy_port for ${probe_ms}ms; the host gate stayed silent"
+
+  # The host process's leg: NET-132's IF-clause, end to end. A process
+  # outside every box connects straight to the acceptor's own unix socket
+  # — only the same user may hold it (a 0600 socket inside a 0700 dir), and
+  # the same user is not enough: on Linux the kernel names the peer's
+  # process too and it is not the daemon's; off Linux the per-boot token is
+  # the whole of what a host process must hold. This one presents nothing,
+  # reads its answer, and must get no bytes — refused before it is
+  # presented, audited in the daemon's own log with the reason this OS
+  # gives it. python3 is a prerequisite of this script on every host (the
+  # pty driver needs it), so its absence is a failure, not a skip.
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "::error::python3 is a prerequisite of this script on every host, and this host has none — the host-process leg below cannot run without it"
+    cred_fail
+  fi
+  if ! python3 - "$sock" >"$WORK/psba-host-answer.out" 2>"$WORK/psba-host-answer.err" <<'PY'
+import socket
+import sys
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+s.connect(sys.argv[1])
+s.shutdown(socket.SHUT_WR)  # present nothing: a host process holds no token
+answer = b""
+while True:
+    try:
+        chunk = s.recv(4096)
+    except socket.timeout:
+        print("the acceptor held the connection open without answering",
+              file=sys.stderr)
+        sys.exit(1)
+    if not chunk:
+        break
+    answer += chunk
+print("read %d bytes" % len(answer))
+sys.stdout.write(answer.decode("utf-8", "replace"))
+PY
+  then
+    echo "::error::the host process's connect to the acceptor's socket could not be driven"
+    cat "$WORK/psba-host-answer.err" 2>/dev/null || true
+    cred_fail
+  fi
+  if ! grep -q '^read 0 bytes$' "$WORK/psba-host-answer.out"; then
+    echo "::error::the acceptor answered a host process's connection — a process outside every box must never be presented, let alone from a box address"
+    echo "--- what the host process read ---"
+    cat "$WORK/psba-host-answer.out" 2>/dev/null || true
+    cred_fail
+  fi
+  psba_seen=0
+  psba_wait=0
+  while [ "$psba_wait" -le 10 ]; do
+    psba_line="$(cred_case_log | grep -F -- 'box egress proxy stand-in refused a connection' \
+      | grep -F -- "\"reason\":\"$psba_reason\"" | tail -n1 || true)"
+    if [ -n "$psba_line" ]; then
+      psba_seen=1
+      break
+    fi
+    psba_wait=$((psba_wait + 1))
+    sleep 1
+  done
+  if [ "$psba_seen" -ne 1 ]; then
+    echo "::error::the acceptor's log never named the host process's refusal (wanted reason=$psba_reason, the one a same-uid host process earns on this OS)"
+    cred_case_log | grep -F -- 'stand-in refused' | tail -n5 | sed 's/^/  /'
+    cred_fail
+  fi
+  echo "refusal: $psba_line"
+
+  # NET-133's withdrawal half: box A ends — its creator destroys it — and
+  # its attachment goes with its row, the record the withdrawal measured
+  # itself by (since_box_end, the host's own observation of the box's end).
+  # B's attachment is untouched by its sibling's end, and its second
+  # connection below is answered from its own address still: the
+  # per-box-ness of the whole table.
+  mnl session destroy --force "$psba_sid_a" >/dev/null 2>&1 || {
+    echo "::error::could not destroy box A ($psba_sid_a)"
+    cred_fail
+  }
+  psba_seen=0
+  psba_wait=0
+  while [ "$psba_wait" -le 20 ]; do
+    psba_line="$(cred_case_log | grep -F -- 'withdrew a box egress proxy attachment' \
+      | grep -F -- "\"switch_addr\":\"$psba_ip_a\"" | tail -n1 || true)"
+    if [ -n "$psba_line" ]; then
+      psba_seen=1
+      break
+    fi
+    psba_wait=$((psba_wait + 1))
+    sleep 1
+  done
+  if [ "$psba_seen" -ne 1 ]; then
+    echo "::error::the host daemon's log never named box A's withdrawn attachment (waited ${psba_wait}s for the withdrawal record naming $psba_ip_a)"
+    cred_case_log | grep -F -- 'egress proxy attachment' | tail -n5 | sed 's/^/  /'
+    cred_fail
+  fi
+  echo "withdrawal: $psba_line"
+
+  mnl session exec "$psba_sid_b" \
+    "printf '' | /usr/bin/socat -t 10 - TCP:$proxy_ip:$proxy_port,connect-timeout=15" \
+    >"$WORK/psba-box-b-answer2.out" 2>"$WORK/psba-box-b-answer2.err" || {
+    echo "::error::box B's second connection to the proxy's address did not complete after box A's end"
+    cat "$WORK/psba-box-b-answer2.err" 2>/dev/null || true
+    cred_fail
+  }
+  if ! grep -q -- "source=$psba_ip_b:" "$WORK/psba-box-b-answer2.out"; then
+    echo "::error::the acceptor did not see box B's second connection from its own switch address ($psba_ip_b) after box A's end"
+    echo "--- answer ---"; cat "$WORK/psba-box-b-answer2.out" 2>/dev/null || true
+    cred_fail
+  fi
+  echo "the acceptor saw box B's second connection, after box A's end, as: $(tr -d '\r\n' < "$WORK/psba-box-b-answer2.out")"
+
+  mnl session destroy --force "$psba_sid_b" >/dev/null 2>&1 || true
+  mnl session destroy --force "$psba_sid_c" >/dev/null 2>&1 || true
+  rm -rf "$PSBA_SEED_DIR_A" "$PSBA_SEED_DIR_B" "$PSBA_SEED_DIR_C"
+  PSBA_SEED_DIR_A=""
+  PSBA_SEED_DIR_B=""
+  PSBA_SEED_DIR_C=""
+  cred_restore
+  echo "the Box Egress Proxy sees each box by its own address OK (A's connection presented from $psba_ip_a, B's from $psba_ip_b — twice, the second after A's end — each the acceptor's own answer; the host process refused for '$psba_reason' and presented as nothing; the laneless $psba_ip_c silent at $proxy_ip:$proxy_port; one attachment per live box issued host-side, A's withdrawn with its end)"
+  echo "::endgroup::"
+}
+
 # NET-085, at the VM boundary, end to end — the bound an escapee meets: a
 # process with root inside the VM spoofing another box's address reaches
 # nothing beyond the resident union of declared egress plus the node-plane
@@ -15779,6 +16369,7 @@ case "${1:-}" in
     proof_proxy_sees_each_vm_box_by_its_switch_address
     proof_deny_all_box_reaches_proxy_and_no_other_host_port
     proof_box_without_credentialed_lane_cannot_reach_proxy
+    proof_proxy_sees_boxes_by_address
     proof_published_proxy_routes_from_host
     # Runs after the proxy-source proof and ahead of the daemon-fetch proof
     # on purpose: it stops the daemon pair and autospawns a fresh VM host
@@ -15810,6 +16401,7 @@ case "${1:-}" in
     | proxy_sees_each_vm_box_by_its_switch_address \
     | deny_all_box_reaches_proxy_and_no_other_host_port \
     | box_without_credentialed_lane_cannot_reach_proxy \
+    | proxy_sees_boxes_by_address \
     | published_proxy_routes_from_host \
     | escape_reaches_only_declared_union \
     | daemon_fetch_under_deny_all_host_address_box)
@@ -15837,6 +16429,7 @@ case "${1:-}" in
     echo "         proxy_sees_each_vm_box_by_its_switch_address"
     echo "         deny_all_box_reaches_proxy_and_no_other_host_port"
     echo "         box_without_credentialed_lane_cannot_reach_proxy"
+    echo "         proxy_sees_boxes_by_address"
     echo "         published_proxy_routes_from_host"
     echo "         escape_reaches_only_declared_union"
     echo "         daemon_fetch_under_deny_all_host_address_box"

@@ -2270,6 +2270,11 @@ impl Session {
     /// here, through [`Self::answer_expose`], which writes the one info line
     /// every request logs and the decision's own audit record (NET-046)
     /// beside it.
+    ///
+    /// The one path this actor cannot name a box on is a record that does not
+    /// read — the box's name lives in it — so that path answers its own typed
+    /// failure, and the env channel, which knows the name without the record,
+    /// writes the info line that request owes the log.
     async fn expose_dynamic(
         &mut self,
         port: u16,
@@ -2282,14 +2287,15 @@ impl Session {
         let record = match self.record.record().await {
             Ok(record) => record,
             // The request could not be read back to be decided, so no
-            // decision was made and there is nothing to log or audit
-            // (NET-046): the typed failure is the whole answer.
+            // decision was made and there is nothing to audit (NET-046): the
+            // typed failure is the whole answer, and the env channel writes
+            // the info line, naming the box from its own copy of the name.
             Err(e) => {
                 #[expect(
                     clippy::let_underscore_must_use,
                     reason = "the asker may already be gone; there is nothing to answer then"
                 )]
-                let _ = reply.send(Err(ExposeFailure::Publish { port, source: e }));
+                let _ = reply.send(Err(ExposeFailure::RecordUnreadable { port, source: e }));
                 return;
             }
         };
@@ -2532,6 +2538,29 @@ impl Session {
                     Some(source.to_string()),
                 )
             }
+            // Neither reaches this path: the record-read failure is answered
+            // in [`Self::expose_dynamic`] before a decision exists, and
+            // `ActorGone` is what the asker's handle answers when this actor
+            // dropped before replying. Logged and audited all the same, so
+            // the one-line-per-request promise holds whatever calls this.
+            Err(
+                failure @ (crate::net::policy::ExposeFailure::RecordUnreadable { .. }
+                | crate::net::policy::ExposeFailure::ActorGone { .. }),
+            ) => {
+                tracing::info!(
+                    name = %box_name,
+                    port,
+                    decision = %decision,
+                    decided_by = %decided_by,
+                    outcome = "refused",
+                    reason = %failure,
+                    "dynamic ingress expose"
+                );
+                (
+                    crate::audit::DecisionOutcome::Refused,
+                    Some(failure.to_string()),
+                )
+            }
         };
         crate::audit::append(
             self.minimal_state_dir.as_utf8_path().as_std_path(),
@@ -2551,6 +2580,18 @@ impl Session {
             reason = "the asker may already be gone; there is nothing to answer then"
         )]
         let _ = reply.send(outcome);
+    }
+
+    /// The actor's own answer to "is a box running behind this session": an
+    /// `active` session holding a live host. A stopped box's record still
+    /// reads `active`, but the actor resurrected for it holds no host — so
+    /// this, not the record's status, is what a publish must consult (and
+    /// what `IsBusy` consults for the same reason).
+    fn has_live_host(&self) -> bool {
+        matches!(
+            &self.inner,
+            SessionInner::Active { host: Some((h, _)), .. } if h.is_alive()
+        )
     }
 
     /// The publish half of a runtime port-publish request (NET-043): the
@@ -2578,35 +2619,56 @@ impl Session {
             )));
         }
 
-        // The publish rides the address pair the box's declared ports bind
-        // with: the loopback address its declaration publishes on, and the
-        // switch address its forwards deliver to. A VM host's registration
-        // handed the box that pair (T66). A native host's self-allocated box
-        // was handed none, so it rides what the hostname registry holds for
-        // its session instead (design §7.1): the address the box published
-        // at — where its declared ports bind and its name answers — and the
-        // lease its running PTask reported, which those same forwards
-        // deliver to. The two halves are refused apart, so the box's
-        // `min net expose` says which one is missing: nothing published is a
-        // capability gap — the daemon has no default of its own to stand in
-        // with (NET-010), so the request is refused rather than bound at an
-        // address nobody chose for this box — while no lease, or a spawn
-        // that has ended, is a box not attached yet, which starting it fixes.
-        let (loopback_address, switch_address) = match record.box_addresses {
-            Some(addresses) => (addresses.loopback_address, addresses.switch_address),
-            None => {
-                let registry = self
-                    .hostnames
-                    .read()
-                    .expect("hostname registry lock poisoned");
-                let Some(published) = registry.published_own_address(record.id) else {
-                    return Err(ExposeFailure::Refused(ExposeRefusal::NoPublishedAddress));
-                };
-                let Some(lease) = registry.own_lease(record.id) else {
-                    return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
-                };
-                (published, lease)
-            }
+        // A publish needs a box standing behind it. A stopped box's record
+        // still reads `active` — Stop keeps the grant, the publish row and
+        // the record (NET-013) — but the actor this request reached holds no
+        // host, and a forward bound for its lease would name an address
+        // nothing answers for. Refused here, before the registry is read or
+        // the switch asked anything, so a stopped box asks nothing and
+        // holds nothing (NET-047); starting the box again is what fixes it.
+        if !self.has_live_host() {
+            return Err(ExposeFailure::Refused(ExposeRefusal::NotRunning));
+        }
+
+        // The publish rides the address the box's declared ports bind at and
+        // its name answers at (NET-010): the hostname registry's published
+        // own address, the one source the declared path reads too, through
+        // `OwnAddressReporter::published_address`. Never the raw handed
+        // loopback address: a hand the loopback verdict has not vouched for
+        // publishes at the `127.0.0.1` interim (NET-123 §7.1), and a hand a
+        // landed verdict overrules is moved off by the landing's sweep — the
+        // registry row is the address that actually binds, so the runtime
+        // publish and the declaration answer at the one address a connection
+        // reaches. The hand's `switch_address` (T66) — or, for a native
+        // host's self-allocated box, the lease its running PTask reported
+        // (design §7.1) — is what the forward delivers to, and it is taken
+        // from the record and the registry without preference between the
+        // two ways a box came by it.
+        //
+        // The two halves are refused apart, so the box's `min net expose`
+        // says which one is missing: nothing published is a capability gap —
+        // the daemon has no default of its own to stand in with (NET-010),
+        // so the request is refused rather than bound at an address nobody
+        // chose for this box — while no lease is a box not attached yet,
+        // which starting it fixes.
+        let (loopback_address, switch_address) = {
+            let registry = self
+                .hostnames
+                .read()
+                .expect("hostname registry lock poisoned");
+            let Some(published) = registry.published_own_address(record.id) else {
+                return Err(ExposeFailure::Refused(ExposeRefusal::NoPublishedAddress));
+            };
+            let switch_address = match record.box_addresses {
+                Some(addresses) => addresses.switch_address,
+                None => {
+                    let Some(lease) = registry.own_lease(record.id) else {
+                        return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
+                    };
+                    lease
+                }
+            };
+            (published, switch_address)
         };
         // The lease is per-spawn: the registry keeps the last one reported
         // until the box is destroyed, so a spawn that has ended leaves it
@@ -2634,14 +2696,28 @@ impl Session {
         // Recorded only now, with the switch's acceptance in hand: a publish
         // that failed leaves nothing in the list (NET-047), so the rows the
         // policy surfaces read never name a port the switch is not holding.
-        // A spawn that ended while the publish was in flight took the
-        // runtime forwards down already; this one is unbound here instead
-        // of recorded, so nothing outlives the lease it delivers to.
+        // The liveness read and the record push are one synchronous step —
+        // nothing is awaited between them — so the stopped-box answer and the
+        // push cannot disagree, and `stop_running`'s unexpose sweep (which
+        // runs in this actor's own turn, over `take_all`) stays complete: a
+        // box that went down in the window the bind was in flight has its
+        // just-bound forward unbound here instead of recorded, so nothing
+        // outlives the lease it delivers to.
         let mapping = minimald_rpc::LiveMapping {
             local: forwarder.local().to_string(),
             internal_port: forwarder.internal_port(),
             proto: sessions::IpProto::Tcp,
+            // A fact about the box's relay gate, not about the bind: the
+            // serving handler fills it on every read, from the gate's
+            // compile set. Stored as `Some(false)` here — never rendered
+            // from the stored cell, and never the unknown `None` that a
+            // reply from a daemon older than the field decodes as.
+            pending: Some(false),
         };
+        if !self.has_live_host() {
+            crate::net::policy::remove_ingress(&control, &[forwarder]).await;
+            return Err(ExposeFailure::Refused(ExposeRefusal::NotRunning));
+        }
         if let Err(stale) = self
             .live_ingress
             .record(crate::net::provider::LiveIngressForward {
@@ -4070,9 +4146,10 @@ impl SessionHandle {
     /// Publishes `port` for this box at runtime (NET-043) — the request the
     /// in-box `min net expose` sends, decided against the box's
     /// `dynamic_ingress` setting. Answers with the published mapping, or the
-    /// typed reason the request was refused. A dead actor lands on the
-    /// publish-failure arm: the box that would own the mapping is gone, so no
-    /// publish could be made.
+    /// typed reason the request was refused. A dead actor is its own typed
+    /// failure — `ActorGone`, not `Publish` — because it never reached the
+    /// bind: the box that would own the mapping is gone, so no publish was
+    /// attempted and none could be reported as failed.
     pub(crate) async fn expose_dynamic(
         &self,
         port: u16,
@@ -4089,13 +4166,7 @@ impl SessionHandle {
             .await;
         match recv.await {
             Ok(reply) => reply,
-            Err(_) => Err(crate::net::policy::ExposeFailure::Publish {
-                port,
-                source: std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "session actor is gone",
-                ),
-            }),
+            Err(_) => Err(crate::net::policy::ExposeFailure::ActorGone { port }),
         }
     }
 
@@ -4422,6 +4493,44 @@ impl WeakSessionHandle {
         drop(tx);
         Self(weak)
     }
+
+    /// A handle to a stand-in "actor" that answers each expose request with
+    /// the next of `answers`, and drops the reply channel for any request
+    /// past them — the dead-actor path no live actor can be made to take on
+    /// demand. Test-only: lets the env channel's tests drive the typed
+    /// failures [`SessionHandle::expose_dynamic`] hands back, without
+    /// standing up a session whose publish genuinely fails. The stand-in
+    /// keeps its strong sender alive for the test's runtime, so `upgrade()`
+    /// holds; only messages it answers reach a reply.
+    #[cfg(test)]
+    pub(crate) fn answering(
+        answers: Vec<Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>>,
+    ) -> Self {
+        let (tx, mut rx) = mpsc::channel::<SessionMessage>(1);
+        let weak = tx.downgrade();
+        tokio::spawn(async move {
+            // Hold the strong sender for the runtime the test lives in:
+            // without a live sender the channel closes and the asker's
+            // `upgrade()` fails before any answer is reached.
+            let _hold = tx;
+            let mut answers = answers.into_iter();
+            while let Some(message) = rx.recv().await {
+                // Past the script, no answer is sent: `reply` drops
+                // unanswered, which the asker types as the actor being gone.
+                if let SessionMessage::ExposeDynamic { reply, .. } = message
+                    && let Some(answer) = answers.next()
+                {
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "the asker whose request was answered is the env \
+                                  channel, which has no use for a send receipt"
+                    )]
+                    let _ = reply.send(answer);
+                }
+            }
+        });
+        Self(weak)
+    }
 }
 
 /// The write-lock promotion of a registration headed for the interim: the
@@ -4504,8 +4613,10 @@ pub(crate) mod launch_record_seam {
     }
 }
 
-/// `pub(crate)` so the session-host tests — which host the runtime
-/// port-publish ask tests (NET-045) and drive them through the session
-/// actor's own flow — can reuse this module's fixtures.
+// `pub(crate)`: the env channel's tests reach the stand-in forwarder and the
+// session fixtures this module owns, so a reply's honesty is read against a
+// real session's publish rather than a parallel fixture of it; and the
+// session-host tests, which host the runtime port-publish ask tests (NET-045)
+// and drive them through the session actor's own flow, reuse them too.
 #[cfg(test)]
 pub(crate) mod tests;
