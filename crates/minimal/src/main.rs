@@ -235,6 +235,11 @@ fn machine_mode_error_line(failure: &minimal::MachineModeFailure) -> anyhow::Res
 /// nothing else; the walk's own kinds name the code, message and hint, and
 /// this turns them into the object. `min ls --json` and its kin are
 /// untouched: their failure stays the plain-text line it always was.
+#[expect(
+    clippy::let_underscore_must_use,
+    reason = "a closed stderr has no reader left to tell; the exit status is \
+              the failure's answer either way"
+)]
 fn emit_machine_mode_error(failure: &minimal::MachineModeFailure) {
     let mut err = std::io::stderr();
     match machine_mode_error_line(failure) {
