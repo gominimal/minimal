@@ -778,6 +778,124 @@ async fn a_kill_tells_the_binding_nothing() {
     );
 }
 
+/// Builds a mock host under `name`, so a test can pick its own lines out of
+/// the process-wide log capture.
+async fn reap_log_host(name: &str) -> (Host<MockProcess, ()>, HostHandle) {
+    Host::build(
+        MockLauncher::default(),
+        HostParams {
+            name: name.to_string(),
+            username: "user".to_string(),
+            paths: test_paths(),
+            sz: DEFAULT_SIZE,
+            channel: None,
+            control: None,
+            delta: None,
+            archives_dir: std::env::temp_dir(),
+            session_id: sessions::SessionId::nil(),
+            composition: None,
+            connection_env: ConnectionEnv::new(),
+            #[cfg(target_os = "linux")]
+            name_marker: None,
+        },
+    )
+    .await
+    .expect("failed to build host")
+}
+
+/// The captured log lines that name session `name`.
+fn reap_lines(capture: &crate::test_harness::CaptureWriter, name: &str) -> Vec<String> {
+    let field = format!("session={name} ");
+    capture
+        .contents()
+        .lines()
+        .filter(|l| l.contains(&field) && l.contains("session process reaped"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// A destroy kills the leader, and the reap then reports the same SIGKILL an
+/// OOM kill does. The kill was asked for, so the reap is logged at info as a
+/// requested teardown, never as the warn a real abnormal death gets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_requested_kill_logs_its_reap_at_info() {
+    let capture = captured_log();
+    let (host, handle) = reap_log_host("reap-requested").await;
+    let task = tokio::spawn(host.mainloop());
+
+    handle
+        .kill(false)
+        .await
+        .expect("kill should reach the host");
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("host mainloop should terminate after kill")
+        .expect("host task should not panic during teardown")
+        .expect("mainloop should return the reaped exit status");
+
+    let lines = reap_lines(&capture, "reap-requested");
+    assert_eq!(lines.len(), 1, "exactly one reap line: {lines:?}");
+    let line = &lines[0];
+    assert!(
+        line.contains(" INFO ") && line.contains("session process reaped after requested teardown"),
+        "a requested kill reaps at info: {line}",
+    );
+}
+
+/// The other half: a leader killed by something nobody asked — an OOM kill,
+/// an external SIGKILL — still reaps with the warn and `abnormal=true`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unrequested_kill_still_warns_abnormal() {
+    let capture = captured_log();
+    let (mut host, _handle) = reap_log_host("reap-unrequested").await;
+    let pid = host.container_pid();
+    let mut rx = watch_binding(&mut host);
+    let stdin = host.remote_tx.clone();
+    let task = tokio::spawn(host.mainloop());
+
+    // Kill only once the loop is parked in `step`, as it is for a live
+    // session: killed before its first `try_wait`, the shell is reaped there
+    // and never reaches the pty/step path this test is about.
+    stdin
+        .send(stdin_bytes(b"ready\n".to_vec()))
+        .await
+        .expect("failed to send a line to the shell");
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !String::from_utf8_lossy(&seen).contains("got:ready") {
+            match rx.recv().await {
+                Some(BindingMsg::Stdin(b)) => seen.extend_from_slice(&b),
+                Some(_) => {}
+                None => panic!("the binding closed before the shell echoed"),
+            }
+        }
+    })
+    .await
+    .expect("the shell should echo before it is killed");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let pid = libc::pid_t::try_from(pid).expect("pid fits in pid_t");
+    // SAFETY: `kill` takes plain integers; `pid` is the mock shell this test
+    // spawned, which has not been reaped yet.
+    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(rc, 0, "failed to SIGKILL the mock shell");
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("host mainloop should terminate after the shell dies")
+        .expect("host task should not panic during teardown")
+        .expect("mainloop should return the reaped exit status");
+
+    let lines = reap_lines(&capture, "reap-unrequested");
+    assert_eq!(lines.len(), 1, "exactly one reap line: {lines:?}");
+    let line = &lines[0];
+    assert!(
+        line.contains(" WARN ")
+            && line.contains("session process reaped after pty/step error")
+            && line.contains("abnormal=true"),
+        "an unrequested SIGKILL reaps as an abnormal warn: {line}",
+    );
+}
+
 /// Precedence: the launcher `baseline` sits below the client-forwarded
 /// `inherited`, which sits below the composition, which sits below the
 /// per-connection `connection` facts. Later layers win on a shared key;
