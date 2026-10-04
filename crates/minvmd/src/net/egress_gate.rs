@@ -4154,7 +4154,9 @@ impl DropLimiter {
                 tracing::warn!(
                     source = %source,
                     destination = %Ipv4Addr::from(dst),
-                    port = dst_port,
+                    // The frame summary reads 0 when the protocol carries no
+                    // L4 port (ICMP, say): name that rather than a port 0.
+                    port = %if dst_port == 0 { "none".to_string() } else { dst_port.to_string() },
                     rule_matched = rule,
                     "dropped a frame leaving the VM toward a subnet its rules do not \
                      declare",
