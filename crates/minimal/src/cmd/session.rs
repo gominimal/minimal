@@ -553,17 +553,29 @@ pub(crate) async fn activate_session(
     }
     // Any egress flag makes the declaration; a field with no values stays
     // `None` — its allow-all/none-denied default — so `--deny-subnets` alone
-    // records an allow-all policy that denies one range.
-    let has_egress = !args.allow_subnets.is_empty()
-        || !allow_protocols.is_empty()
-        || !args.allow_dns_hosts.is_empty()
-        || !args.deny_subnets.is_empty();
-    let egress = has_egress.then_some(sessions::EgressPolicy {
-        allow_subnets: (!args.allow_subnets.is_empty()).then(|| args.allow_subnets.clone()),
-        allow_dns_hosts: (!args.allow_dns_hosts.is_empty()).then(|| args.allow_dns_hosts.clone()),
-        allow_protocols: (!allow_protocols.is_empty()).then_some(allow_protocols),
-        deny_subnets: (!args.deny_subnets.is_empty()).then(|| args.deny_subnets.clone()),
-    });
+    // records an allow-all policy that denies one range. `--deny-all-egress`
+    // is the whole declaration on its own: it maps to
+    // `sessions::EgressPolicy::deny_all()`, every allow list present and
+    // empty, rather than to four absent lists — a deny-all box declared by
+    // flag must read in the record exactly like one declared by file, which
+    // is the shape the host-address classifier decides its verdict on
+    // (NET-079) and the one `min session policy` names `deny all`. The parse
+    // conflict (`cli.rs`) keeps it from combining with a rule flag, so the
+    // arms cannot both run.
+    let egress = if args.deny_all_egress {
+        Some(sessions::EgressPolicy::deny_all())
+    } else {
+        let has_egress = !args.allow_subnets.is_empty()
+            || !allow_protocols.is_empty()
+            || !args.allow_dns_hosts.is_empty()
+            || !args.deny_subnets.is_empty();
+        has_egress.then_some(sessions::EgressPolicy {
+            allow_subnets: (!args.allow_subnets.is_empty()).then(|| args.allow_subnets.clone()),
+            allow_dns_hosts: (!args.allow_dns_hosts.is_empty()).then(|| args.allow_dns_hosts.clone()),
+            allow_protocols: (!allow_protocols.is_empty()).then_some(allow_protocols),
+            deny_subnets: (!args.deny_subnets.is_empty()).then(|| args.deny_subnets.clone()),
+        })
+    };
     let policy = sessions::SessionPolicy {
         egress,
         ingress: (!port_mappings.is_empty()).then_some(sessions::IngressPolicy {
@@ -1722,6 +1734,7 @@ pub(crate) async fn activate_new_for_attach(global: &GlobalArgs) -> Result<(), a
             allow_dns_hosts: Vec::new(),
             allow_protocols: Vec::new(),
             deny_subnets: Vec::new(),
+            deny_all_egress: false,
             credentialed_upstream: false,
             loadout: Vec::new(),
             no_loadouts: false,
@@ -2010,7 +2023,9 @@ pub fn print_classifier_advisory(
 /// Render a session's effective policy as its rules: the egress the gate
 /// enforces (NET-074/NET-075) — a declared section's dimensions each
 /// resolved to its list or its default (`allow all`; `deny subnets` reads
-/// `(none)` when nothing is denied), or, for a box that declared no egress
+/// `(none)` when nothing is denied), the declared deny-all section by name
+/// (`deny all` — every list empty would otherwise read as blankness, which
+/// is nothing, never a verdict), or, for a box that declared no egress
 /// at all, the default its daemon resolved to (`deny all` once the deny-all
 /// default is in force; `allow all` behind the opt-out or before it), with
 /// NET-079's per-box enforcement beside the egress rows when the daemon
@@ -2073,6 +2088,15 @@ pub fn format_policy(
     match &effective.egress {
         sessions::EffectiveEgress::DenyAll => writeln!(out, "  deny all")?,
         sessions::EffectiveEgress::AllowAll => writeln!(out, "  allow all")?,
+        sessions::EffectiveEgress::Declared(egress) if declares_deny_all(egress) => {
+            // The declared deny-all section, by name rather than as its
+            // rows: every list empty renders as blankness, which reads as
+            // nothing — the one rendering this block must never print
+            // (NET-075's "never nothing"). The name is the same row the
+            // resolved default prints, because it is the same verdict; the
+            // record and the JSON document carry which of the two it is.
+            writeln!(out, "  deny all")?;
+        }
         sessions::EffectiveEgress::Declared(egress) => {
             write_rules(out, "subnets", egress.allow_subnets.as_ref(), "allow all")?;
             write_rules(
@@ -2582,6 +2606,22 @@ async fn session_policy_as_json(global: &GlobalArgs, session: &str) -> Result<()
     write_policy_json(&mut out, &policy, record.network, fabric, live).context(OutputWriteError)?;
     out.flush().context(OutputWriteError)?;
     Ok(())
+}
+
+/// Whether a declared egress section is the deny-all shape: every allow
+/// list present and empty, nothing admitted on any dimension. The same
+/// shape [`sessions::EgressPolicy::deny_all`] writes and `--deny-all-egress`
+/// maps to, and the one the host-address classifier decides its deny verdict
+/// on — `deny_subnets` is not consulted, because a box that allows nothing
+/// has nothing to deny on top. The rendering's own predicate rather than a
+/// shared one in `sessions`, so [`format_policy`] states its reading of the
+/// section where it renders it: present-and-empty reads as deny-all, the
+/// absence `None` reads as the dimension's allow-all default, and the two
+/// must not render the same.
+fn declares_deny_all(egress: &sessions::EgressPolicy) -> bool {
+    egress.allow_subnets.as_ref().is_some_and(Vec::is_empty)
+        && egress.allow_dns_hosts.as_ref().is_some_and(Vec::is_empty)
+        && egress.allow_protocols.as_ref().is_some_and(Vec::is_empty)
 }
 
 /// One egress rule row: the CIDR or hostname list, or the default the policy
@@ -3355,6 +3395,78 @@ mod tests {
         assert!(rendered.contains("  allow all\n"), "{rendered}");
         assert!(rendered.contains("ingress\n"), "{rendered}");
         assert!(rendered.contains("  deny all\n"), "{rendered}");
+    }
+
+    /// A declared deny-all section renders by name (NET-075): every allow
+    /// list present and empty is the verdict `deny all`, and the rows it
+    /// would print otherwise are four blanks — a rendering that reads as
+    /// nothing, the one this block must never produce. The name is the same
+    /// row the resolved default prints, because it is the same verdict; the
+    /// record and the JSON document carry which of the two it is. On a
+    /// host-address box the row sits beside the per-box enforcement value
+    /// (T73): declared deny-all beside `per_box` is the enforced posture,
+    /// and beside `none` the box's posture beside the state it runs in.
+    #[test]
+    fn policy_shows_declared_deny_all() {
+        let declared = EffectiveSessionPolicy {
+            egress: EffectiveEgress::Declared(sessions::EgressPolicy::deny_all()),
+            ingress: None,
+        };
+
+        // Own-address: the name, and no dimension rows — never blankness.
+        let mut out = Vec::new();
+        format_policy(&mut out, &declared, NetworkMode::OwnIp, None, None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("egress\n  deny all\n"),
+            "a declared deny-all box must show the deny-all name: {rendered}"
+        );
+        for row in ["  subnets", "  dns hosts", "  protocols", "  deny subnets"] {
+            assert!(
+                !rendered.contains(row),
+                "the deny-all verdict must not render as dimension rows: {rendered}"
+            );
+        }
+
+        // Host-address: the same name beside the per-box enforcement value.
+        let mut out = Vec::new();
+        format_policy(
+            &mut out,
+            &declared,
+            NetworkMode::HostNet,
+            Some(sessions::HostIpEnforcement::PerBox),
+            None,
+        )
+        .unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("egress\n  deny all\n  per-box enforcement  per_box\n"),
+            "the deny-all row sits beside the per-box enforcement value: {rendered}"
+        );
+
+        // A section that allows something is not deny-all and keeps its
+        // rows: one allowed subnet makes the verdict "10.0.0.0/8 and
+        // nothing else", not deny-all, so it must not collapse to the name.
+        let not_deny_all = EffectiveSessionPolicy {
+            egress: EffectiveEgress::Declared(sessions::EgressPolicy {
+                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                allow_dns_hosts: Some(vec![]),
+                allow_protocols: Some(vec![]),
+                deny_subnets: None,
+            }),
+            ingress: None,
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &not_deny_all, NetworkMode::OwnIp, None, None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  subnets  10.0.0.0/8"),
+            "a section that allows a subnet keeps its rows: {rendered}"
+        );
+        assert!(
+            !rendered.contains("egress\n  deny all\n"),
+            "an allow-listed section is not deny-all and must not read as it: {rendered}"
+        );
     }
 
     #[test]
