@@ -5211,9 +5211,16 @@ enum GateAnswer {
 /// sequential phases each open and close one in-flight bind of their own.
 /// Returns the server, the record of every request it served, and the
 /// gate a test advances to resolve the holds.
+///
+/// The script is keyed by port: a request is answered by the first entry
+/// left for the port its `local` names, and a request for any other port is
+/// answered 200 without touching the script. The watcher reads the host's
+/// whole socket table, so a wildcard listener another test holds inside the
+/// box's range is published too; keyed, its request can never take the
+/// answer — or the hold — a phase scripted for its own port.
 async fn gated_forwarder(
     sock: std::path::PathBuf,
-    script: Vec<GateAnswer>,
+    script: Vec<(u16, GateAnswer)>,
 ) -> (
     tokio::task::JoinHandle<()>,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
@@ -5226,16 +5233,14 @@ async fn gated_forwarder(
     let listener = tokio::net::UnixListener::bind(&sock).expect("bind the control socket");
     let served = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let recorded = served.clone();
-    let (gate_tx, mut gate_rx) = tokio::sync::watch::channel(0u64);
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(0u64);
     let server = tokio::spawn(async move {
-        let mut script: std::collections::VecDeque<GateAnswer> = script.into();
-        // The last answer answers anything past the script, so a stand-in
-        // scripted for four requests still answers a fifth.
-        let last = script.back().cloned().unwrap_or(GateAnswer::With(500));
-        // Sequential on purpose: the publish verbs open a fresh connection
-        // per request, so one connection served at a time is their shape —
-        // and one held request at a time is the gate's, so each hold is
-        // resolved before the next request is even read.
+        let mut script = script;
+        // Requests are read and recorded one at a time, in arrival order,
+        // and each hold is numbered in that order; the answers are sent from
+        // a task per connection, so a held bind never parks a request for
+        // any other port behind it — the watcher's publish of a listener
+        // another test holds is answered while a phase's hold is open.
         let mut held: u64 = 0;
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
@@ -5244,40 +5249,58 @@ async fn gated_forwarder(
             let Some(request) = read_control_request(&mut stream).await else {
                 continue;
             };
+            let port = request_port(&request);
             recorded.lock().expect("served lock").push(request);
-            let status = match script.pop_front().unwrap_or_else(|| last.clone()) {
-                GateAnswer::With(status) => status,
+            let scripted = script
+                .iter()
+                .position(|(scripted, _)| Some(*scripted) == port)
+                .map(|at| script.remove(at).1);
+            let (status, hold) = match scripted.unwrap_or(GateAnswer::With(200)) {
+                GateAnswer::With(status) => (status, None),
                 GateAnswer::Held(status) => {
                     // This is held request number `held + 1`: it waits for
-                    // the gate to pass the `held` resolved before it. A
-                    // dropped gate (the test gone) answers rather than
-                    // parks the stand-in forever.
-                    while *gate_rx.borrow() <= held {
+                    // the gate to pass the `held` resolved before it.
+                    held += 1;
+                    (status, Some(held - 1))
+                }
+            };
+            let mut gate_rx = gate_rx.clone();
+            tokio::spawn(async move {
+                if let Some(before) = hold {
+                    // A dropped gate (the test gone) answers rather than
+                    // parks the answer forever.
+                    while *gate_rx.borrow() <= before {
                         if gate_rx.changed().await.is_err() {
                             break;
                         }
                     }
-                    held += 1;
-                    status
                 }
-            };
-            let reason = if (200..300).contains(&status) {
-                "OK"
-            } else {
-                "Internal Server Error"
-            };
-            #[expect(
-                clippy::let_underscore_must_use,
-                reason = "the answer's fate is not what the stand-in records; the request is"
-            )]
-            let _ = stream
-                .write_all(
-                    format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
-                )
-                .await;
+                let reason = if (200..300).contains(&status) {
+                    "OK"
+                } else {
+                    "Internal Server Error"
+                };
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the answer's fate is not what the stand-in records; the request is"
+                )]
+                let _ = stream
+                    .write_all(
+                        format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\n\r\n")
+                            .as_bytes(),
+                    )
+                    .await;
+            });
         }
     });
     (server, served, gate_tx)
+}
+
+/// The port a control request's `local` names, if it names one.
+fn request_port(request: &str) -> Option<u16> {
+    let (_, rest) = request.split_once("\"local\":\"")?;
+    let (local, _) = rest.split_once('"')?;
+    local.rsplit_once(':')?.1.parse().ok()
 }
 
 /// NET-043: a port-publish request from inside a box is decided against the
@@ -6723,24 +6746,16 @@ async fn box_with_listen_plan(
     std::sync::Arc<crate::net::switch::SessionGate>,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 ) {
-    let (handle, gate, served, _gate, _id) = box_with_scripted_plan(
-        client,
-        manager,
-        name,
-        switch,
-        loopback,
-        range,
-        vec![GateAnswer::With(200)],
-    )
-    .await;
+    let (handle, gate, served, _gate, _id) =
+        box_with_scripted_plan(client, manager, name, switch, loopback, range, Vec::new()).await;
     (handle, gate, served)
 }
 
 /// [`box_with_listen_plan`], over a gated stand-in: the forwarder bound
-/// before the launch answers each request with the next answer of
-/// `script` — held answers wait on the gate a test advances, so a test can
-/// hold one surface's bind in flight while the other races it for the port
-/// — and the box's session id comes back with it, so a test can reach the
+/// before the launch answers each request with the next answer `script`
+/// holds for its port — held answers wait on the gate a test advances, so a
+/// test can hold one surface's bind in flight while the other races it for
+/// the port — and the box's session id comes back with it, so a test can reach the
 /// publication set its launch is running on through the seam.
 async fn box_with_scripted_plan(
     client: &mut TestClient,
@@ -6749,7 +6764,7 @@ async fn box_with_scripted_plan(
     switch: std::net::Ipv4Addr,
     loopback: std::net::Ipv4Addr,
     range: (u16, u16),
-    script: Vec<GateAnswer>,
+    script: Vec<(u16, GateAnswer)>,
 ) -> (
     crate::session::SessionHandle,
     std::sync::Arc<crate::net::switch::SessionGate>,
@@ -7375,8 +7390,8 @@ async fn concurrent_expose_and_listen_publish_bind_once() {
     drop(probes);
     let switch = std::net::Ipv4Addr::new(100, 64, 128, 81);
     let loopback = std::net::Ipv4Addr::new(127, 0, 64, 81);
-    // The stand-in's answers, one per request in the order the phases send
-    // them: the expose's bind on `a` and the watcher's bind on `b` are
+    // The stand-in's answers, keyed by port, in the order each port's
+    // requests are sent: the expose's bind on `a` and the watcher's bind on `b` are
     // held — each a reservation's in-flight window, wide enough to observe
     // the other surface losing inside it — and the expose's bind on `c` is
     // refused, the watcher's publish of `c` accepted.
@@ -7388,10 +7403,10 @@ async fn concurrent_expose_and_listen_publish_bind_once() {
         loopback,
         range,
         vec![
-            GateAnswer::Held(200), // 1: the expose's bind on `a`
-            GateAnswer::Held(200), // 2: the watcher's bind on `b`
-            GateAnswer::With(500), // 3: the expose's bind on `c`, refused
-            GateAnswer::With(200), // 4: the watcher's publish of `c`
+            (a_port, GateAnswer::Held(200)), // 1: the expose's bind on `a`
+            (b_port, GateAnswer::Held(200)), // 2: the watcher's bind on `b`
+            (c_port, GateAnswer::With(500)), // 3: the expose's bind on `c`, refused
+            (c_port, GateAnswer::With(200)), // 4: the watcher's publish of `c`
         ],
     )
     .await;
@@ -7555,15 +7570,16 @@ async fn concurrent_expose_and_listen_publish_bind_once() {
         "the refusal names the owner holding the port and the reason it \
          gave: {b_refusal}"
     );
-    assert!(
-        logged.lines().any(|line| {
+    // The watcher admits before it says so, so the line is awaited too.
+    soon(|| {
+        capture.contents().lines().any(|line| {
             line.contains("session=ownrace")
                 && line.contains("published a listening port on the box's address")
                 && line.contains("owner=listen")
                 && line.contains(&format!("port={b_port}"))
-        }),
-        "the watcher's publish of the port it won is one line: {logged}"
-    );
+        })
+    })
+    .await;
 
     // A winner's bind can fail: the switch refuses the expose's bind on
     // `c`, the failure releases the reservation it held, and the box's
@@ -7601,16 +7617,16 @@ async fn concurrent_expose_and_listen_publish_bind_once() {
         c_records[1].starts_with("POST /services/forwarder/expose "),
         "the watcher's publish is the bind that stood: {c_records:?}"
     );
-    let logged = capture.contents();
-    assert!(
-        logged.lines().any(|line| {
+    // The watcher's next observation publishes the port the failed bind
+    // released; it admits before it says so, so the line is awaited.
+    soon(|| {
+        capture.contents().lines().any(|line| {
             line.contains("session=ownrace")
                 && line.contains("published a listening port on the box's address")
                 && line.contains(&format!("port={c_port}"))
-        }),
-        "the watcher's next observation publishes the port the failed bind \
-         released: {logged}"
-    );
+        })
+    })
+    .await;
     assert!(
         served_naming(&served, loopback, denied_port).is_empty(),
         "the unpermitted listener never rode on any of it: {:?}",
@@ -7652,7 +7668,7 @@ async fn cancelled_publish_releases_its_reservation() {
         switch,
         loopback,
         (port, port),
-        vec![GateAnswer::With(200)],
+        Vec::new(),
     )
     .await;
     let publications = crate::session::listen_plan_seam::publications_of(id)
@@ -7711,15 +7727,17 @@ async fn cancelled_publish_releases_its_reservation() {
         records[0].starts_with("POST /services/forwarder/expose "),
         "the one request is the watcher's publish: {records:?}"
     );
-    let logged = capture.contents();
-    assert!(
-        logged.lines().any(|line| {
+    // The watcher's next observation publishes the freed port; it admits
+    // before it says so, so the line is awaited.
+    soon(|| {
+        capture.contents().lines().any(|line| {
             line.contains("session=owncancel")
                 && line.contains("published a listening port on the box's address")
                 && line.contains(&format!("port={port}"))
-        }),
-        "the watcher's next observation publishes the freed port: {logged}"
-    );
+        })
+    })
+    .await;
+    let logged = capture.contents();
     assert!(
         !logged.lines().any(|line| {
             line.contains("session=owncancel")
@@ -7773,7 +7791,7 @@ async fn revocation_withdraws_regardless_of_owner() {
         switch,
         loopback,
         range,
-        vec![GateAnswer::With(200)],
+        Vec::new(),
     )
     .await;
 
@@ -7853,7 +7871,7 @@ async fn respawn_frees_published_ports() {
         switch,
         loopback,
         (port, port),
-        vec![GateAnswer::With(200)],
+        Vec::new(),
     )
     .await;
 
