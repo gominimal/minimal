@@ -235,7 +235,7 @@ Renames an existing session.
 ### `session policy`
 
 ```
-min session policy <SESSION>
+min session policy <SESSION> [-o json]
 ```
 
 Prints the effective networking rules for `SESSION` (a UUID or session
@@ -268,6 +268,43 @@ ingress
 A host-address (`--network host_ip`) session prints no ingress block at all:
 it shares its host's network namespace, so minimald applies no per-session
 ingress to it and there is no rule to state.
+
+The `live ingress` block lists the ports the box published at runtime with
+`min net expose`. Each row shows the address the forward binds on and the
+in-box port it delivers to:
+
+```
+live ingress (published at runtime)
+  tcp  127.0.64.21:3000 → :3000
+```
+
+The host binds a runtime publish at once. A frame reaches the box only
+through the relay gate its attach installed, and that gate admits only the
+ports the declaration named. So a port the box published at runtime reads
+`(pending; not yet reachable)` until the gate admits it. A row from a daemon
+older than the `pending` field reads `(unknown; daemon predates this field)`.
+The CLI never shows such a row as reachable.
+
+`-o json` (`--output json`) prints one `min/v1/session-policy` document on
+stdout instead of text. Each block the text output prints becomes a key:
+`network`, `egress`, `ingress`, and `live_ingress`. Each `live_ingress` row
+is the daemon's mapping object, with its `pending` state (`true`, `false`,
+or `null` for a daemon older than the field). The document leaves out the
+blocks the text output leaves out. A host-address session has no `ingress`
+key, and a `--network none` box has only `schema` and `network`. The
+`ingress` block has a `kind` tag, `deny_all` or `declared`, so a client
+reads one field to branch.
+
+With `-o json`, a failed run writes one `min/v1/error` object on stderr and
+exits non-zero, with no plain-text error line. The `code` field names the
+failure: `not_found` for a missing session, `daemon_unreachable`, or
+`policy_unavailable`. The code is `output_failed` when the CLI cannot write
+its own document to stdout, such as on a full disk. Any other failure has
+the code `unspecified`. The `message` field holds the text mode's error
+chain, and `hint` says what to do next. An `unspecified` object has no
+`hint`. When the
+reader closes stdout early, the run writes nothing and exits 141,
+the shell's SIGPIPE convention.
 
 ### `session hooks`
 
