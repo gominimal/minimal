@@ -298,8 +298,11 @@ reads one field to branch.
 With `-o json`, a failed run writes one `min/v1/error` object on stderr and
 exits non-zero, with no plain-text error line. The `code` field names the
 failure: `not_found` for a missing session, `daemon_unreachable`, or
-`policy_unavailable`. The `message` field holds the text mode's error chain,
-and `hint` says what to do next.
+`policy_unavailable`. The code is `output_failed` when the CLI cannot write
+its own document to stdout, such as on a full disk. The `message` field
+holds the text mode's error chain, and `hint` says what to do next. When the
+reader closes stdout early, the run writes nothing and exits 141,
+the shell's SIGPIPE convention.
 
 ### `session hooks`
 
