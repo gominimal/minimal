@@ -629,6 +629,15 @@ pub struct Session {
     /// none — and one that is not running — holds an empty list.
     live_ingress: crate::net::provider::RuntimeIngress,
 
+    /// This box's runtime publications, whichever of the two runtime surfaces
+    /// made them — the `min net expose` path or the listen watcher the
+    /// launch's plan starts — each port with its owner. Built fresh by the
+    /// session's launcher for the spawn it is about to run, so a respawn
+    /// starts empty and the expose path below reads the same set the box's
+    /// watcher does: a port the one published is answered by the other as
+    /// published already, and never bound twice.
+    publications: crate::net::listeners::BoxPublications,
+
     /// The runtime port-publish requests this box decided `ask`, parked until
     /// the attached human answers them (NET-045). Empty for a box with
     /// nothing waiting on a human; drained fail-closed by
@@ -765,6 +774,10 @@ impl Session {
             // The same for the ports the box publishes at runtime: nothing is
             // live until a `min net expose` inside it lands (NET-044).
             live_ingress: Default::default(),
+            // And for the publications every runtime surface reads: empty
+            // until a launch hands its box one, and then whatever the spawn
+            // it launched publishes.
+            publications: Default::default(),
             // And for the asks routed to a human: nothing waits until a
             // request decided `ask` lands (NET-045), and the first of those
             // takes the first id.
@@ -2471,10 +2484,11 @@ impl Session {
 
     /// Finishes one runtime port-publish request (or one parked ask now
     /// answered): one info line naming the box, the port, the decision the
-    /// box's `dynamic_ingress` setting made, who actually decided it, and the
-    /// outcome — the line a diagnostics bundle's daemon log tail carries every
-    /// request with — and the decision's own audit record (NET-046) written
-    /// beside it, then the caller's answer.
+    /// box's `dynamic_ingress` setting made, who actually decided it, the
+    /// outcome, and — where the request met a publication, made or held —
+    /// the publication's owner — the line a diagnostics bundle's daemon
+    /// log tail carries every request with — and the decision's own audit
+    /// record (NET-046) written beside it, then the caller's answer.
     async fn answer_expose(
         &mut self,
         box_name: &str,
@@ -2495,9 +2509,39 @@ impl Session {
                     decided_by = %decided_by,
                     outcome = "published",
                     local = %mapping.local,
+                    owner = %crate::net::listeners::PublicationOwner::Expose.as_str(),
                     "dynamic ingress expose"
                 );
                 (crate::audit::DecisionOutcome::Published, None)
+            }
+            // The one refusal that names a publication: the port is held,
+            // live, by one of the box's two runtime surfaces, and the set
+            // the box's launches hand around says whose — this surface's
+            // own on a true duplicate, the listen watcher's when the box's
+            // process published first — so the line a diagnostics bundle's
+            // log tail reads tells the two apart.
+            Err(crate::net::policy::ExposeFailure::Refused(
+                refusal @ crate::net::policy::ExposeRefusal::AlreadyPublished(_),
+            )) => {
+                let holder = self
+                    .publications
+                    .held_by(port)
+                    .map(crate::net::listeners::PublicationOwner::as_str)
+                    .unwrap_or("withdrawn");
+                tracing::info!(
+                    name = %box_name,
+                    port,
+                    decision = %decision,
+                    decided_by = %decided_by,
+                    outcome = "refused",
+                    reason = %refusal,
+                    owner = %holder,
+                    "dynamic ingress expose"
+                );
+                (
+                    crate::audit::DecisionOutcome::Refused,
+                    Some(refusal.to_string()),
+                )
             }
             Err(crate::net::policy::ExposeFailure::Refused(refusal)) => {
                 tracing::info!(
@@ -2586,29 +2630,22 @@ impl Session {
     }
 
     /// The publish half of a runtime port-publish request (NET-043): the
-    /// duplicate check, the address pair the publish needs, and the switch
-    /// bind, run once the request is decided — by the box's own `allow` in
-    /// [`Session::expose_dynamic`], or by the attached human's answer to an
-    /// `ask` in [`Session::resume_ask`]. Everything the box can refuse
-    /// without asking the switch runs first, so a refused request is refused
-    /// with nothing bound and nothing asked (NET-047). Only then is the
-    /// switch asked to bind, and the forwarder is recorded only once it
-    /// accepted.
+    /// live-box check, the duplicate check the box's shared publication set
+    /// answers — naming a port published by this surface or by the listen
+    /// watcher the launch started, whichever got there first — the address
+    /// pair the publish needs, and the switch bind, run once the request is
+    /// decided — by the box's own `allow` in [`Session::expose_dynamic`], or
+    /// by the attached human's answer to an `ask` in [`Session::resume_ask`].
+    /// Everything the box can refuse without asking the switch runs first,
+    /// so a refused request is refused with nothing bound and nothing asked
+    /// (NET-047). Only then is the switch asked to bind, and the forwarder
+    /// is recorded only once it accepted.
     async fn publish_exposed_port(
         &mut self,
         record: &Record,
         port: u16,
     ) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
         use crate::net::policy::{ExposeFailure, ExposeRefusal, expose_dynamic};
-
-        // The port is published already, live, by this box: a second request
-        // for it would double-bind the same address, so it is refused as the
-        // duplicate it is.
-        if self.live_ingress.publishes(port) {
-            return Err(ExposeFailure::Refused(ExposeRefusal::AlreadyPublished(
-                port,
-            )));
-        }
 
         // A publish needs a box standing behind it. A stopped box's record
         // still reads `active` — Stop keeps the grant, the publish row and
@@ -2619,6 +2656,20 @@ impl Session {
         // holds nothing (NET-047); starting the box again is what fixes it.
         if !self.has_live_host() {
             return Err(ExposeFailure::Refused(ExposeRefusal::NotRunning));
+        }
+
+        // The port is published already, live, by this box — by whichever of
+        // its two runtime surfaces did it: another `min net expose` (NET-044)
+        // or the listen watcher its launch started (NET-016). Both are
+        // written into the box's one publication set, and a second request
+        // for the port — from either surface — would double-bind the same
+        // address, so it is refused as the duplicate it is. The read comes
+        // after the live-box one, so a stopped box answers what stopped it
+        // and not an entry left over from the spawn before.
+        if self.publications.held_by(port).is_some() {
+            return Err(ExposeFailure::Refused(ExposeRefusal::AlreadyPublished(
+                port,
+            )));
         }
 
         // The publish rides the address the box's declared ports bind at and
@@ -2709,6 +2760,24 @@ impl Session {
             crate::net::policy::remove_ingress(&control, &[forwarder]).await;
             return Err(ExposeFailure::Refused(ExposeRefusal::NotRunning));
         }
+        // Written into the box's shared publication set beside the list, as
+        // the expose surface's own: the watcher the launch started reads the
+        // same set before it binds, so the port this request just published
+        // is never asked of the switch again — and the race the read at the
+        // top could not see, the watcher publishing while this bind was in
+        // flight, is closed the same way both surfaces close it: this
+        // forward comes straight back down, and the request is answered as
+        // the duplicate it now is.
+        if self
+            .publications
+            .record(port, crate::net::listeners::PublicationOwner::Expose)
+            .is_err()
+        {
+            crate::net::policy::remove_ingress(&control, &[forwarder]).await;
+            return Err(ExposeFailure::Refused(ExposeRefusal::AlreadyPublished(
+                port,
+            )));
+        }
         if let Err(stale) = self
             .live_ingress
             .record(crate::net::provider::LiveIngressForward {
@@ -2716,6 +2785,11 @@ impl Session {
                 mapping: mapping.clone(),
             })
         {
+            // The spawn ended while the bind was in flight, so the entry
+            // this publish just wrote names a forward that is coming down:
+            // the set gives the port back with the forward it named.
+            self.publications
+                .withdraw(port, crate::net::listeners::PublicationOwner::Expose);
             crate::net::policy::remove_ingress(&control, &[stale.forwarder]).await;
             return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
         }
@@ -2762,7 +2836,12 @@ impl Session {
         // unbind each forward the switch accepted, so a box that stops leaves
         // no live publish behind. Best-effort, like the declared forwards'
         // teardown — `remove_ingress` logs a failed unexpose and moves on,
-        // since there is no caller left to propagate to.
+        // since there is no caller left to propagate to. The box's shared
+        // publication set is left as it stands: the entries name ports a
+        // publish behind the live-box check never reads while the box is
+        // down, and the launch that next runs a box hands the session a
+        // fresh set, so nothing a dead spawn published can answer for its
+        // respawn.
         let forwarders = self.live_ingress.take_all();
         if !forwarders.is_empty() {
             let control = self.switch_control().await;
@@ -3652,6 +3731,14 @@ impl Session {
             sessions::EGRESS_DEFAULT_PHASE,
             self.deny_all_opt_out,
         );
+        // One publication set for the spawn this launch is about to run:
+        // the runtime expose path reads it in this actor, and the listen
+        // plan the launcher gathers shares it with the watcher the host it
+        // launches starts — so the box's two runtime publishing surfaces
+        // never bind one port twice, whichever reaches the switch first.
+        // Built here, per launch, so a respawn starts from an empty set and
+        // nothing a dead spawn published can answer for its successor.
+        self.publications = Default::default();
         Ok(session_host::SandboxLauncher {
             ctx: match phase {
                 LaunchPhase::Attached => self.context(true).await,
@@ -3700,6 +3787,9 @@ impl Session {
             // the daemon's own, read live on every launch; see the field's
             // doc.
             classifier_mountinfo: None,
+            // The spawn's publication set, shared with the listen plan the
+            // launch gathers; see the assignment above.
+            publications: self.publications.clone(),
         })
     }
 
@@ -3726,6 +3816,11 @@ impl Session {
         record
             .validate_policy()
             .map_err(AttachError::InvalidPolicy)?;
+        // One publication set per launch, built the way the production
+        // launcher builds one, so a test's runtime exposes and the watcher
+        // its launch carries read the same set the way the real box's two
+        // surfaces do.
+        self.publications = Default::default();
         // Mirror the production classifier half too, as the placement's
         // outcome alone: a mock launch records what its own placement would
         // — `per_box` when the fact's cause says this host has the step's
@@ -3741,24 +3836,38 @@ impl Session {
         // that is not host-address keeps the plain mock — its verdict is
         // decided on address leases, never on the host's cgroup tree, so
         // there is no per-box outcome for its launches to record.
-        if record.network == sessions::NetworkMode::HostNet {
+        let mut launcher = if record.network == sessions::NetworkMode::HostNet {
             let fact = crate::session_host::host_ip_enforcement_fact();
             let placement = if crate::session_host::fact_places_a_leaf(fact.cause) {
                 minimald_rpc::HostIpEnforcement::PerBox
             } else {
                 minimald_rpc::HostIpEnforcement::None
             };
-            let launcher = session_host::MockLauncher::with_host_ip_enforcement(placement);
-            // A session whose launch-record write a test fails also carries
-            // the guard that test watches, so the box's teardown is
-            // observable after the launch kills it.
-            Ok(match launch_record_seam::teardown_guard(record.id) {
-                Some(guard) => launcher.and_net_guard(guard),
-                None => launcher,
-            })
+            session_host::MockLauncher::with_host_ip_enforcement(placement)
         } else {
-            Ok(session_host::MockLauncher::default())
+            session_host::MockLauncher::default()
+        };
+        // A listen plan a test seeded ([`listen_plan_seam`]) rides the
+        // mock's `Launched` the way the launch's own gathered plan rides a
+        // real one — and a launch a test seeded no plan for starts no
+        // watcher at all, the way a launch that could gather none does.
+        if let Some(seeded) = listen_plan_seam::take(record.id) {
+            launcher = launcher.and_listen_plan(crate::net::listeners::ListenPlan::new(
+                record.name.clone().unwrap_or_else(|| record.id.to_string()),
+                seeded.lease,
+                seeded.published,
+                seeded.control,
+                seeded.gate,
+                self.publications.clone(),
+            ));
         }
+        // A session whose launch-record write a test fails also carries
+        // the guard that test watches, so the box's teardown is
+        // observable after the launch kills it.
+        Ok(match launch_record_seam::teardown_guard(record.id) {
+            Some(guard) => launcher.and_net_guard(guard),
+            None => launcher,
+        })
     }
 
     /// Return this session's workspace-rooted [`mctx::Context`].
@@ -4601,6 +4710,62 @@ pub(crate) mod launch_record_seam {
             self.0.store(true, Ordering::SeqCst);
             Box::pin(async {})
         }
+    }
+}
+
+/// The test seam for a launch that carries a listen plan: a test seeds the
+/// facts a real launch gathers for one — the box's lease, its published
+/// address (NET-010), the switch's control channel and its ingress gate —
+/// and the session's test launcher builds the plan from them for the spawn
+/// it is about to run, sharing the box's publication set the way a real
+/// launch's plan does. The take is once: a plan belongs to the launch that
+/// reads it, and a session a test seeded nothing for launches with no
+/// watcher at all, the way a launch that could gather no plan does. Keyed
+/// by session id, like the launch-record seam, so tests running beside each
+/// other in one process never answer each other's launches.
+#[cfg(test)]
+pub(crate) mod listen_plan_seam {
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+    use std::sync::{Arc, Mutex};
+
+    use sessions::SessionId;
+
+    use crate::net::policy::ControlChannel;
+    use crate::net::switch::SessionGate;
+
+    /// The facts a test hands the mock launch it seeds.
+    pub(crate) struct Seeded {
+        /// The box's lease on the switch — where a publication's forward
+        /// delivers.
+        pub(crate) lease: Ipv4Addr,
+        /// The box's published address (NET-010) — where a publication
+        /// binds.
+        pub(crate) published: Ipv4Addr,
+        /// The gvproxy control channel the watcher's forwarder verbs ride.
+        pub(crate) control: ControlChannel,
+        /// The box's session gate: the permit decision and the admission.
+        pub(crate) gate: Arc<SessionGate>,
+    }
+
+    static SEEDED: Mutex<Option<HashMap<SessionId, Seeded>>> = Mutex::new(None);
+
+    /// Seeds `id`'s next launch with these plan facts, taken by that launch
+    /// alone.
+    pub(crate) fn seed(id: SessionId, seeded: Seeded) {
+        SEEDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, seeded);
+    }
+
+    pub(super) fn take(id: SessionId) -> Option<Seeded> {
+        SEEDED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|seeded| seeded.remove(&id))
     }
 }
 

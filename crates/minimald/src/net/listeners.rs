@@ -30,6 +30,27 @@
 //! the runtime-published set (NET-081's sub-requirement), which is why the
 //! two halves are tracked apart all the way down to the gate.
 //!
+//! But the runtime-published set has two publishers. The runtime
+//! `min net expose` (NET-044) publishes a port on the user's own request,
+//! and the watcher publishes one because the box's process listens on it —
+//! and both bind at the box's published address, on whatever port they were
+//! each asked for, so one port can be asked of the switch twice. It never
+//! is: both surfaces read one per-box publication set
+//! ([`BoxPublications`]) before they bind, a port the other surface already
+//! holds is answered — by the expose path with the typed
+//! already-published refusal, by the watcher with a silent skip that never
+//! retries, because a publication that stands is not a failure — and
+//! withdrawal belongs to whoever published: the watcher never withdraws a
+//! port the expose path holds, and the expose path never asks down a port
+//! the watcher published. Every publication the two surfaces make is one
+//! entry with one owner, so a port is bound once however many surfaces ask
+//! for it.
+//!
+//! The plan a launch gathers rides [`crate::session_host::Launched`] to the
+//! host that runs its box — no process-global table between them — so a
+//! plan is the launch's own from the moment it is built, and a launch that
+//! built none starts no watcher at all.
+//!
 //! Two properties the story's shape rides on, beside the diff itself. The
 //! table is read as the forward reads the box: a listener counts only when
 //! its bind can answer the dial a publication makes — to the box's lease —
@@ -67,13 +88,13 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::Path;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::watch;
 
+use sessions::IpProto;
 use sessions::core::egress::ListenVerdict;
-use sessions::{IpProto, SessionId};
 
 use super::policy::{ControlChannel, ExposedMapping, expose_mapping, unexpose_mapping};
 use super::switch::SessionGate;
@@ -104,10 +125,11 @@ const PUBLISH_RETRY_CAP: Duration = Duration::from_secs(30);
 /// switch lease (the address a publication's forward delivers to), the
 /// published address the forward binds — the box's own address (NET-010),
 /// wherever it was granted, read back the same way the attach path reads
-/// it — the gvproxy control channel the forwarder verbs ride, and the box's
+/// it — the gvproxy control channel the forwarder verbs ride, the box's
 /// session gate, which holds the shared permit decision
 /// ([`SessionGate::listen_verdict`]) and the admission a published port is
-/// given through.
+/// given through, and the box's publication set, shared with the runtime
+/// expose surface so neither binds a port the other already holds.
 pub struct ListenPlan {
     /// The box's name, as the daemon's own session lines name it.
     box_name: String,
@@ -121,13 +143,19 @@ pub struct ListenPlan {
     control: ControlChannel,
     /// The box's session gate: the permit decision and the admission.
     gate: Arc<SessionGate>,
+    /// The box's publications, shared with the runtime expose surface
+    /// ([`crate::session::Session`]): the one set both read before they
+    /// bind, and the one place a publication's owner is written down.
+    publications: BoxPublications,
 }
 
 impl ListenPlan {
     /// Assembles the plan from the facts its launch holds. The gate must be
     /// the one the box's relay registered — the gate the connections a
     /// publication forwards are admitted by on their way through the
-    /// relay.
+    /// relay — and the publication set must be the one the session's
+    /// runtime expose surface reads, so the two surfaces never bind the
+    /// same port.
     #[must_use]
     pub fn new(
         box_name: String,
@@ -135,6 +163,7 @@ impl ListenPlan {
         published: Ipv4Addr,
         control: ControlChannel,
         gate: Arc<SessionGate>,
+        publications: BoxPublications,
     ) -> Self {
         Self {
             box_name,
@@ -142,143 +171,98 @@ impl ListenPlan {
             published,
             control,
             gate,
+            publications,
         }
     }
 }
 
-/// The plans launches have built and hosts have not taken: the handoff from
-/// a session's launcher (which holds the lease, the switch and the gate the
-/// attach registered) to the host about to run the box, keyed by the
-/// session id both hold and pinned to the spawn the launch ran. A launch
-/// stages its plan as its last act, the host takes it as its first —
-/// [`Host::build`](crate::session_host::Host::build) — so the plan never
-/// rides a struct every launcher would have to name, and a mock launch that
-/// stages nothing starts no watcher at all.
-///
-/// The take is destructive on purpose: a plan belongs to the one host that
-/// runs its box, and a reattach's launch stages a fresh one. The build that
-/// could take a plan holds [`StagedPlanGuard`] across its launch and its
-/// take, so a build that ends without taking it — a launch that errored, or
-/// an attach abandoned with its launch in flight — clears the entry as it
-/// ends: a plan holds a lease, an address and the gate an attach registered,
-/// and none of them serves anything once that attach is gone. No entry
-/// outlives the build it was staged for, so the table is bounded by the
-/// host builds in flight — never grown one abandoned launch at a time over
-/// the daemon's life.
-///
-/// The entry carries the spawn it was staged for, and a take names the spawn
-/// it runs, so a respawn of the same session can never read the spawn before
-/// it: a plan is only ever taken by the box it was staged for, and one whose
-/// spawn has gone is refused — dropped, and said — rather than handed to the
-/// respawn to publish on a lease, an address and a gate the dead spawn's
-/// attach already tore down.
-static STAGED_PLANS: LazyLock<Mutex<HashMap<SessionId, StagedListenPlan>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// One plan in the table: the launch's plan, and the container supervisor —
-/// the spawn — the launch ran it for. The spawn is the plan's own identity
-/// the session id alone cannot give: a session respawns under the same id,
-/// and only the spawn tells this launch's plan from the one the spawn
-/// before it might still have left.
-struct StagedListenPlan {
-    /// The container supervisor this plan was staged for — the same PID the
-    /// host that takes it reports as its box's.
-    spawn: u32,
-    /// The plan itself.
-    plan: ListenPlan,
+/// Which of the box's two runtime ingress surfaces owns a publication: the
+/// runtime `min net expose` (NET-044), or the listen watcher this module
+/// runs (NET-016). Ownership decides who may withdraw — a publication comes
+/// down with whoever published it, never with the other surface that
+/// declined to bind it — and it is the field the publication and refusal
+/// lines carry, so a daemon log's tail reads whose publication every port
+/// is from either surface's lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationOwner {
+    /// The runtime expose path: a publication the user asked for with
+    /// `min net expose`.
+    Expose,
+    /// The listen watcher: a publication the box's own listening process
+    /// earned.
+    Listen,
 }
 
-/// Leaves the plan a launch built for the host about to run its box, pinned
-/// to the spawn — the container supervisor — that launch runs, replacing
-/// any a cancelled build left behind.
-pub(crate) fn stage_listen_plan(session_id: SessionId, spawn: u32, plan: ListenPlan) {
-    STAGED_PLANS
-        .lock()
-        .expect("staged listen-plan lock poisoned")
-        .insert(session_id, StagedListenPlan { spawn, plan });
-}
-
-/// Clears the table's entry for a launch that staged no plan — the box has
-/// no lease, no published address or no live gate, so none of its ports can
-/// be published by listening. The clear is the launch's own work, because
-/// what it removes is a *previous* launch's plan for the same session id: a
-/// cancelled launch staged one and never handed its box to a host, and the
-/// host the next launch does build must not take that orphan and start a
-/// watcher on a lease, an address and a gate the cancelled launch's attach
-/// already tore down.
-pub(crate) fn clear_listen_plan(session_id: SessionId) {
-    STAGED_PLANS
-        .lock()
-        .expect("staged listen-plan lock poisoned")
-        .remove(&session_id);
-}
-
-/// Takes the plan staged for `session_id` — once, so the host that runs the
-/// box owns its box's publications and a second host cannot stop its
-/// watcher — and only for the spawn it was staged for: the host names the
-/// container supervisor its own launch runs, so a respawn under the same
-/// session id reads only the plan its own launch staged. A plan staged for
-/// a spawn that is not the caller's is refused — the entry is dropped, and
-/// the refusal said — so the respawn fails closed (no watcher, nothing
-/// published by listening) rather than publishing on a dead spawn's lease,
-/// address and gate.
-pub(crate) fn take_listen_plan(session_id: SessionId, spawn: u32) -> Option<ListenPlan> {
-    let staged = STAGED_PLANS
-        .lock()
-        .expect("staged listen-plan lock poisoned")
-        .remove(&session_id)?;
-    if staged.spawn != spawn {
-        tracing::warn!(
-            session = %staged.plan.box_name,
-            session_id = %session_id,
-            spawn,
-            staged_for = staged.spawn,
-            "discarded a listen plan staged for an earlier spawn of this session"
-        );
-        return None;
+impl PublicationOwner {
+    /// How the owner is named on the lines its publications and their
+    /// refusals carry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Expose => "expose",
+            Self::Listen => "listen",
+        }
     }
-    Some(staged.plan)
 }
 
-/// The hold the host build that could take a session's plan has on it: the
-/// build is a plan's one taker, so it owns the plan's end too. A build is a
-/// future, and the abandonment a cancelled attach leaves is a drop, not a
-/// return — a launch cancelled after it staged leaves no host behind, so
-/// nothing else ever comes for the plan — which is why the clear rides
-/// [`Drop`]: the build that ends without taking its plan takes the plan
-/// with it, and a plan's facts — a lease, an address, a gate an attach
-/// registered — never outlive the attach that gathered them.
+/// The box's runtime publications, one entry per port the switch holds a
+/// forward for, carrying the surface that owns it. Both surfaces that
+/// publish at runtime — the expose path and the listen watcher — read this
+/// one set before they bind, so a port the other surface already holds is
+/// never asked of the switch twice, and the set is the one place the answer
+/// to "who owns this publication" lives, so withdrawal can be refused
+/// everywhere it does not belong.
 ///
-/// [`Self::taken`] disarms the guard on the one ending a plan survives: the
-/// take, which is destructive and leaves the table with nothing for the
-/// drop to clear.
-pub(crate) struct StagedPlanGuard {
-    session_id: SessionId,
-    armed: bool,
+/// The set belongs to one *launch*, not to the session for good: the
+/// session's launcher ([`crate::session::Session::session_launcher`])
+/// builds a fresh one for the spawn it is about to run, hands it to the
+/// launcher beside the plan, and the session actor reads the same one — so
+/// a respawn starts with an empty set by construction, never with the
+/// entries of a spawn whose box has gone, and the set is bounded by the
+/// ports one box has published, never grown over the daemon's life.
+#[derive(Debug, Default, Clone)]
+pub struct BoxPublications {
+    /// The ports this box's two surfaces have published, each with its
+    /// owner. The lock is a plain mutex held for map reads and writes only,
+    /// never across a switch round trip.
+    ports: Arc<Mutex<HashMap<u16, PublicationOwner>>>,
 }
 
-impl StagedPlanGuard {
-    /// Takes the hold: the build about to launch is the one that could take
-    /// this session's plan.
-    #[must_use]
-    pub(crate) fn armed_for(session_id: SessionId) -> Self {
-        Self {
-            session_id,
-            armed: true,
+impl BoxPublications {
+    /// The surface that owns `port`'s publication, if the box has one: the
+    /// answer both surfaces read before they bind, and the answer a
+    /// refusal line names when the other surface already holds the port.
+    pub fn held_by(&self, port: u16) -> Option<PublicationOwner> {
+        self.ports
+            .lock()
+            .expect("box publications lock poisoned")
+            .get(&port)
+            .copied()
+    }
+
+    /// Writes `port` down as `owner`'s publication. Fails, naming the owner
+    /// that holds it, when the other surface published while this caller
+    /// was binding — the race both surfaces close the same way: unbind, and
+    /// answer as the duplicate the switch never doubled.
+    pub fn record(&self, port: u16, owner: PublicationOwner) -> Result<(), PublicationOwner> {
+        let mut ports = self.ports.lock().expect("box publications lock poisoned");
+        match ports.get(&port) {
+            Some(&held) if held != owner => Err(held),
+            _ => {
+                ports.insert(port, owner);
+                Ok(())
+            }
         }
     }
 
-    /// The plan is taken — the watcher owns it now, and the table's entry
-    /// went with the take, so the guard's own end clears nothing.
-    pub(crate) fn taken(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for StagedPlanGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            clear_listen_plan(self.session_id);
+    /// Withdraws `port` from the set — `owner`'s own publication only. The
+    /// other surface's entry is left standing whatever the caller meant,
+    /// because the publisher is the one who withdraws: a port held by
+    /// `Expose` here is never taken down by the watcher, and one held by
+    /// `Listen` is never taken down by the expose path.
+    pub fn withdraw(&self, port: u16, owner: PublicationOwner) {
+        let mut ports = self.ports.lock().expect("box publications lock poisoned");
+        if ports.get(&port).is_some_and(|held| *held == owner) {
+            ports.remove(&port);
         }
     }
 }
@@ -638,11 +622,15 @@ impl WatchState {
     }
 
     /// NET-016: one listening port appeared. The shared verdict decides
-    /// what the appearance is worth before anything is bound. Returns
-    /// whether the appearance is settled — `false` only for a permitted
-    /// port whose forward failed to bind, the one appearance
-    /// [`Self::poll`] hands back to the next poll as appeared again, on
-    /// the backoff its refusals have earned.
+    /// what the appearance is worth before anything is bound, and the box's
+    /// publication set decides it with them: a port the runtime expose
+    /// already published is settled the way one the rules do not permit is
+    /// — left alone, never bound, never withdrawn, never retried —
+    /// because a publication that already stands is not this watcher's to
+    /// double. Returns whether the appearance is settled — `false` only
+    /// for a permitted port whose forward failed to bind, the one
+    /// appearance [`Self::poll`] hands back to the next poll as appeared
+    /// again, on the backoff its refusals have earned.
     ///
     /// `refusals` counts the attempts this port's publish streak has
     /// already been refused, so the failure is said once per streak — the
@@ -678,6 +666,28 @@ impl WatchState {
                     );
                     return true;
                 }
+                // The box's other runtime surface may already hold this
+                // port: a `min net expose` published it live, and its
+                // forward stands until the box does (NET-044). A second
+                // bind would double-bind the box's own address at the same
+                // port, and the publication is not this watcher's to
+                // withdraw — so the appearance is settled the way one the
+                // rules do not permit settles: said once, never bound,
+                // never withdrawn, and never retried, because the
+                // settlement enters the port in the poll's book and a
+                // backoff is for a publish that failed, not for a
+                // publication that already stands.
+                if self.plan.publications.held_by(port) == Some(PublicationOwner::Expose) {
+                    tracing::info!(
+                        session = %self.plan.box_name,
+                        host = %self.plan.published,
+                        port,
+                        verdict = "permitted",
+                        owner = %PublicationOwner::Expose.as_str(),
+                        "left a listening port the runtime expose already published"
+                    );
+                    return true;
+                }
                 // The forward binds before the gate admits — the order the
                 // declaration's own apply holds (NET-121), so a port is
                 // never admitted while nothing answers for it, and a bind
@@ -694,6 +704,28 @@ impl WatchState {
                 .await
                 {
                     Ok(mapping) => {
+                        // The publication is written down as this
+                        // watcher's before the port is served, and the race
+                        // the check above could not see — the expose
+                        // surface binding across the await — is closed
+                        // here: the expose won the port while this bind was
+                        // in flight, so this forward comes straight back
+                        // down, said with the reason it came down, and the
+                        // appearance is settled the way the skip above
+                        // settles it.
+                        if let Err(_holder) = self
+                            .plan
+                            .publications
+                            .record(port, PublicationOwner::Listen)
+                        {
+                            self.forwards.insert(port, mapping);
+                            self.close(
+                                port,
+                                "the runtime expose published while the watcher was binding",
+                            )
+                            .await;
+                            return true;
+                        }
                         self.plan.gate.admit_published(port);
                         self.forwards.insert(port, mapping);
                         tracing::info!(
@@ -701,6 +733,7 @@ impl WatchState {
                             host = %self.plan.published,
                             port,
                             verdict = "permitted",
+                            owner = %PublicationOwner::Listen.as_str(),
                             refusals,
                             "published a listening port on the box's address"
                         );
@@ -754,12 +787,17 @@ impl WatchState {
     /// `reason` names what ended the publication: the listener closing under
     /// the box's own life, the box's stop taking every publication with it,
     /// or a poll asking again for a forward whose unexpose failed while the
-    /// box still runs.
+    /// box still runs. A port the runtime expose published never reaches
+    /// the unexpose here — it is not in the watcher's forwards — so a
+    /// publication comes down with whoever published it, never with the
+    /// other surface that declined to bind it.
     async fn close(&mut self, port: u16, reason: &'static str) {
         let Some(mapping) = self.forwards.remove(&port) else {
             // Never published by the watcher: a declared port, whose
-            // forward is the declaration's (NET-121), or one the rules did
-            // not permit, whose publication never existed.
+            // forward is the declaration's (NET-121), one the rules did
+            // not permit, whose publication never existed — or one the
+            // runtime expose holds, whose forward is the expose path's and
+            // whose withdrawal is the expose path's alone.
             return;
         };
         // The gate withdraws before the forward comes down, and the order is
@@ -773,6 +811,14 @@ impl WatchState {
         let terminated = self.plan.gate.withdraw_published(port);
         match unexpose_mapping(&self.plan.control, &mapping).await {
             Ok(()) => {
+                // The publication is the watcher's own and it came down, so
+                // the set gives the port back: the next surface that wants
+                // it — this watcher, when the box's next server binds the
+                // same number, or the expose path on a runtime request —
+                // finds it free to publish.
+                self.plan
+                    .publications
+                    .withdraw(port, PublicationOwner::Listen);
                 // The withdrawal came down, so the streak of its failures —
                 // if it had one — is over and a later failure is its own.
                 self.reported_withdrawal_failures.remove(&port);
@@ -804,7 +850,10 @@ impl WatchState {
                 }
                 // The unexpose failed and said so. The gate already refuses
                 // the port, so nothing reaches the box through the forward
-                // left standing; keep it in the published set — the next
+                // left standing; keep it in the published set — and in the
+                // box's publication set, whose entry says the watcher owns
+                // a forward that is still bound, so no second surface asks
+                // the switch for a port the first still holds — the next
                 // poll asks for it again while the box runs, the stop's
                 // withdrawal passes retry it before the watcher ends, and a
                 // listener that comes back first re-admits the forward it
@@ -1140,6 +1189,9 @@ mod tests {
 
     /// The box's watcher against the fake forwarder bound at `sock`, with
     /// its gate answering the given policy and the leader the test names.
+    /// The box's publication set is the watcher's alone here — no expose
+    /// surface shares it in these proofs — so an empty one stands in for
+    /// the set the launch would share.
     fn watcher_with(
         sock: PathBuf,
         policy: &sessions::SessionPolicy,
@@ -1157,6 +1209,7 @@ mod tests {
             PUBLISHED,
             ControlChannel::Unix(sock),
             Arc::clone(&gate),
+            BoxPublications::default(),
         );
         (ListenWatcher::start(plan, leader), gate)
     }
@@ -1187,6 +1240,41 @@ mod tests {
         let sock = dir.path().join("gvproxy.sock");
         let (server, served) = spawn_forwarder(sock.clone());
         let (watcher, gate) = watcher_at(sock, policy);
+        (watcher, gate, server, served)
+    }
+
+    /// [`started_watcher`], with the box's publication set seeded by `seed`
+    /// before the watcher starts — the way a launch hands its host the set
+    /// already holding what the expose surface published.
+    fn started_watcher_with_publications(
+        dir: &tempfile::TempDir,
+        policy: &sessions::SessionPolicy,
+        seed: impl FnOnce(&BoxPublications),
+    ) -> (
+        ListenWatcher,
+        Arc<SessionGate>,
+        tokio::task::JoinHandle<()>,
+        mpsc::Receiver<Served>,
+    ) {
+        let sock = dir.path().join("gvproxy.sock");
+        let (server, served) = spawn_forwarder(sock.clone());
+        let publications = BoxPublications::default();
+        seed(&publications);
+        let gate = Arc::new(SessionGate::for_session(
+            "listen-box".into(),
+            LEASE,
+            policy,
+            SwitchSubnet::default(),
+        ));
+        let plan = ListenPlan::new(
+            "listen-box".into(),
+            LEASE,
+            PUBLISHED,
+            ControlChannel::Unix(sock),
+            Arc::clone(&gate),
+            publications,
+        );
+        let watcher = ListenWatcher::start(plan, Leader::Resolved(std::process::id()));
         (watcher, gate, server, served)
     }
 
@@ -2226,238 +2314,129 @@ mod tests {
         server.abort();
     }
 
-    /// A launch that stages no plan still clears the table's entry for its
-    /// session, so the host a later launch builds never takes the plan a
-    /// cancelled launch left behind — one naming a lease, an address and a
-    /// gate that launch's attach already tore down.
-    #[test]
-    fn a_launch_that_stages_no_plan_clears_the_one_before_it() {
-        let cleared = SessionId::parse_str("00000000-0000-0000-0000-00000000a5c1").unwrap();
-        let kept = SessionId::parse_str("00000000-0000-0000-0000-00000000a5c2").unwrap();
-        // The container supervisors the two launches run — the spawns their
-        // hosts' takes name.
-        let cleared_spawn = 4201;
-        let kept_spawn = 4202;
-        let gate = Arc::new(SessionGate::for_session(
-            "listen-box".into(),
-            LEASE,
-            &permit_policy(8080),
-            SwitchSubnet::default(),
-        ));
-        let plan = || {
-            ListenPlan::new(
-                "listen-box".into(),
-                LEASE,
-                PUBLISHED,
-                ControlChannel::Unix(PathBuf::from("/nowhere")),
-                Arc::clone(&gate),
-            )
-        };
-        stage_listen_plan(cleared, cleared_spawn, plan());
-        stage_listen_plan(kept, kept_spawn, plan());
-
-        // The new path: a launch that stages nothing removes what its
-        // session still holds.
-        clear_listen_plan(cleared);
-        assert!(
-            take_listen_plan(cleared, cleared_spawn).is_none(),
-            "the cancelled launch's plan is gone, so no later host takes it"
+    /// A port the runtime expose already published is treated as published
+    /// by the watcher too: the appearance is settled — never bound, so the
+    /// switch is never asked for a second forward onto the one address —
+    /// and the settlement is said once, never retried under a backoff a
+    /// publication that stands does not earn, and never withdrawn, because
+    /// the publication is the expose surface's to take down: closing the
+    /// listener the box held on the port changes nothing the switch holds.
+    #[tokio::test]
+    async fn a_port_the_runtime_expose_published_is_never_bound_or_withdrawn() {
+        let listener = listening_socket();
+        let port = port_of(&listener);
+        let dir = tempfile::tempdir().unwrap();
+        let (_watcher, _gate, server, mut served) = started_watcher_with_publications(
+            &dir,
+            &permit_policy(port),
+            // The expose surface's own publication of the port, standing
+            // before the watcher ever polls: the set both surfaces read,
+            // holding the port the way a runtime `min net expose` does.
+            |publications| {
+                publications
+                    .record(port, PublicationOwner::Expose)
+                    .expect("nothing holds the port yet");
+            },
         );
-        assert!(
-            take_listen_plan(kept, kept_spawn).is_some(),
-            "the plan nobody cleared is still there to take"
-        );
-    }
-
-    /// No staged plan outlives the host build that could take it: a build
-    /// cancelled after its launch staged — the abandonment an attach that
-    /// gives up leaves, where no host ever comes for the plan — takes the
-    /// plan with it, and a build abandoned before its launch reached the
-    /// staging step clears the orphan an earlier cancelled launch left. The
-    /// build that does take its plan disarms the guard, and the plan is the
-    /// watcher's — a plan never holds its gate and its control channel
-    /// past the attach that gathered them.
-    #[test]
-    fn no_staged_plan_outlives_the_build_that_could_take_it() {
-        let cancelled = SessionId::parse_str("00000000-0000-0000-0000-00000000a5c3").unwrap();
-        let taken = SessionId::parse_str("00000000-0000-0000-0000-00000000a5c4").unwrap();
-        // The spawns the two launches run.
-        let cancelled_spawn = 4203;
-        let taken_spawn = 4204;
-        let gate = Arc::new(SessionGate::for_session(
-            "listen-box".into(),
-            LEASE,
-            &permit_policy(8080),
-            SwitchSubnet::default(),
-        ));
-        let plan = || {
-            ListenPlan::new(
-                "listen-box".into(),
-                LEASE,
-                PUBLISHED,
-                ControlChannel::Unix(PathBuf::from("/nowhere")),
-                Arc::clone(&gate),
-            )
-        };
-
-        // The launch cancelled after it staged: the plan is in the table,
-        // no host ever comes for it, and the build's own end clears it —
-        // not the next launch for the session, which may never come.
-        let guard = StagedPlanGuard::armed_for(cancelled);
-        stage_listen_plan(cancelled, cancelled_spawn, plan());
-        drop(guard);
-        assert!(
-            take_listen_plan(cancelled, cancelled_spawn).is_none(),
-            "a plan no build took leaves the table with the build that could have"
-        );
-
-        // A build abandoned before its launch reached the staging step
-        // clears the orphan an earlier cancelled launch left behind: a
-        // later host must never take a plan whose attach is already gone.
-        stage_listen_plan(cancelled, cancelled_spawn, plan());
-        drop(StagedPlanGuard::armed_for(cancelled));
-        assert!(
-            take_listen_plan(cancelled, cancelled_spawn).is_none(),
-            "the next build clears an earlier launch's orphan"
-        );
-
-        // The build that takes its plan: the guard disarms at the take,
-        // and the take's own destructiveness is what emptied the table —
-        // no second host takes what the first now runs its watcher on.
-        stage_listen_plan(taken, taken_spawn, plan());
-        let guard = StagedPlanGuard::armed_for(taken);
-        assert!(
-            take_listen_plan(taken, taken_spawn).is_some(),
-            "the plan a launch staged is there for its host build to take"
-        );
-        guard.taken();
-        assert!(
-            take_listen_plan(taken, taken_spawn).is_none(),
-            "the take is destructive: the plan went with the host that took it"
-        );
-    }
-
-    /// Every failed or aborted launch leaves no plan behind: the build that
-    /// could have taken it arms its guard before it launches, and a build
-    /// that ends without a take — a launch that errored out, an attach
-    /// abandoned with its launch in flight — clears the entry as it ends.
-    /// The clear is the whole entry, so no spawn's take can read it back:
-    /// a plan whose build is gone serves nobody, whichever of the session's
-    /// spawns staged it.
-    #[test]
-    fn a_failed_launch_leaves_no_staged_plan() {
-        let session = SessionId::parse_str("00000000-0000-0000-0000-00000000a5c5").unwrap();
-        // The spawn a cancelled launch before the failed one ran, and the
-        // spawn the failing launch itself was to run.
-        let orphan_spawn = 4205;
-        let failed_spawn = 4206;
-        let gate = Arc::new(SessionGate::for_session(
-            "listen-box".into(),
-            LEASE,
-            &permit_policy(8080),
-            SwitchSubnet::default(),
-        ));
-        let plan = || {
-            ListenPlan::new(
-                "listen-box".into(),
-                LEASE,
-                PUBLISHED,
-                ControlChannel::Unix(PathBuf::from("/nowhere")),
-                Arc::clone(&gate),
-            )
-        };
-
-        // The cancelled launch's plan is in the table when the box's next
-        // host build arms its guard and launches.
-        stage_listen_plan(session, orphan_spawn, plan());
-        let guard = StagedPlanGuard::armed_for(session);
-
-        // The launch fails: no `Ok(Launched)`, no take. The build's own end
-        // — its guard's drop — is the clear, and it takes the orphan with
-        // it, so even the spawn that staged it cannot read it back.
-        drop(guard);
-        assert!(
-            take_listen_plan(session, orphan_spawn).is_none(),
-            "a failed build clears the table's whole entry: the cancelled \
-             launch's plan is not waiting for a spawn-matched take"
-        );
-        assert!(
-            take_listen_plan(session, failed_spawn).is_none(),
-            "the failed launch staged nothing of its own"
-        );
-    }
-
-    /// A respawn under the same session id reads only the plan its own
-    /// launch staged. The take names the spawn it runs, so an entry the
-    /// spawn before it left is refused — dropped, and said — rather than
-    /// handed to the respawn to publish on a dead spawn's lease, address
-    /// and gate: the respawn fails closed, its ports unpublished by
-    /// listening, which is the safe side of the two.
-    #[test]
-    fn a_respawn_never_reads_the_previous_spawns_plan() {
-        let session = SessionId::parse_str("00000000-0000-0000-0000-00000000a5c6").unwrap();
-        // The two spawns of one session id: the box's first life, and the
-        // respawn that follows it.
-        let first = 4207;
-        let second = 4208;
-        let gate = Arc::new(SessionGate::for_session(
-            "listen-box".into(),
-            LEASE,
-            &permit_policy(8080),
-            SwitchSubnet::default(),
-        ));
-        let plan = || {
-            ListenPlan::new(
-                "listen-box".into(),
-                LEASE,
-                PUBLISHED,
-                ControlChannel::Unix(PathBuf::from("/nowhere")),
-                Arc::clone(&gate),
-            )
-        };
-
-        // The first spawn staged its plan and never handed its box to a
-        // host: its attach is gone, and with it the lease, the address and
-        // the gate the plan names.
-        stage_listen_plan(session, first, plan());
-
-        // The session respawns under the same id: the new launch runs a
-        // new container supervisor, and its host build's take names that
-        // spawn — so the stale plan is refused, said, and dropped.
         let (lines, _guard) = captured_lines();
+
+        // Several poll intervals with the listener standing: the watcher
+        // reads its port, sees whose publication it is, and asks nothing —
+        // one skip line, and no expose the fake forwarder would record.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let log = lines.contents();
+        let skipped = lines_saying(
+            &log,
+            "left a listening port the runtime expose already published",
+        );
+        assert_eq!(
+            skipped.len(),
+            1,
+            "the skip is said once, never retried under backoff: {log}"
+        );
         assert!(
-            take_listen_plan(session, second).is_none(),
-            "the respawn never reads the previous spawn's plan"
+            skipped[0].contains("owner=expose"),
+            "the refusal line names whose publication holds the port: {}",
+            skipped[0]
+        );
+        assert!(
+            skipped[0].contains(&format!("port={port}")),
+            "the refusal line names the port the other surface holds: {}",
+            skipped[0]
+        );
+
+        // The box's listener on the port closes, and the publication is
+        // the expose surface's — so nothing comes down: no unexpose is
+        // asked, across several more poll intervals, and the skip stays
+        // the one line the port ever wrote.
+        drop(listener);
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let records = drained(&mut served);
+        assert!(
+            records.is_empty(),
+            "the watcher neither published the port nor withdrew the expose \
+             surface's publication: {records:?}"
         );
         let log = lines.contents();
-        let refused = lines_saying(&log, "discarded a listen plan staged for an earlier spawn");
         assert_eq!(
-            refused.len(),
+            lines_saying(
+                &log,
+                "left a listening port the runtime expose already published"
+            )
+            .len(),
             1,
-            "the refusal is said, so a stale plan never leaves silently: {log}"
+            "the settlement is one line, not one per poll: {log}"
         );
         assert!(
-            refused[0].contains(&format!("spawn={second}")),
-            "the line names the spawn that refused it: {}",
-            refused[0]
+            lines_saying(&log, "published a listening port on the box's address").is_empty(),
+            "the port the expose surface holds is never bound by the watcher: {log}"
         );
-        assert!(
-            refused[0].contains(&format!("staged_for={first}")),
-            "the line names the spawn the plan was staged for: {}",
-            refused[0]
-        );
-        assert!(
-            take_listen_plan(session, first).is_none(),
-            "the refused entry is dropped, not left for a third spawn to find"
-        );
+        server.abort();
+    }
 
-        // The respawn's own launch stages its own plan, and its take reads
-        // it: the key was built not to disturb the happy path.
-        stage_listen_plan(session, second, plan());
+    /// The two halves of the shared set's ownership rule: a publication is
+    /// withdrawn by whoever published it and by nobody else — a `Listen`
+    /// entry ignores an `Expose` withdrawal and an `Expose` entry ignores a
+    /// `Listen` one — and a record refuses the other owner's port, so the
+    /// bind races both surfaces close are answered the same way the
+    /// duplicate checks are.
+    #[test]
+    fn publications_withdraw_with_their_owner_only() {
+        let publications = BoxPublications::default();
         assert!(
-            take_listen_plan(session, second).is_some(),
-            "a plan is there for the spawn that staged it"
+            publications.held_by(8080).is_none(),
+            "a fresh box's set holds nothing"
         );
+        for (holder, other) in [
+            (PublicationOwner::Listen, PublicationOwner::Expose),
+            (PublicationOwner::Expose, PublicationOwner::Listen),
+        ] {
+            publications
+                .record(8080, holder)
+                .expect("the first surface to publish wins the port");
+            assert_eq!(
+                publications.record(8080, other),
+                Err(holder),
+                "the other surface's record names the owner that holds the port"
+            );
+            assert_eq!(publications.held_by(8080), Some(holder));
+            // The other surface's withdrawal is refused by the rule, not
+            // by an error: the entry stands, because the publisher is the
+            // one who withdraws.
+            publications.withdraw(8080, other);
+            assert_eq!(
+                publications.held_by(8080),
+                Some(holder),
+                "the other surface's withdrawal leaves the publication standing"
+            );
+            // And the owner's own withdrawal is the one that clears it, so
+            // the next publisher finds the port free.
+            publications.withdraw(8080, holder);
+            assert!(
+                publications.held_by(8080).is_none(),
+                "the publisher's withdrawal gives the port back"
+            );
+        }
     }
 
     /// The kernel socket table's rows read as the watcher reads them: a
@@ -2655,6 +2634,7 @@ mod tests {
                 PUBLISHED,
                 ControlChannel::Unix(sock.clone()),
                 Arc::clone(&gate),
+                BoxPublications::default(),
             ),
             Leader::Resolved(std::process::id()),
         );
