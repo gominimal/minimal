@@ -110,6 +110,15 @@
 #                                    client through the forwarder, the
 #                                    hostname proxy and a sibling box, while
 #                                    its own outbound connect still drops
+#   port_publishes_on_listen_and_box_outlives_client
+#                                    NET-016/121/014/015/131: a declared
+#                                    port refuses fast until a listen, then
+#                                    answers by name at once; a live
+#                                    undeclared listen is refused by name
+#                                    as not-published; a detached box
+#                                    keeps serving; a run's box ends with
+#                                    its run's command, its client killed
+#                                    mid-command
 #   proxy_refuses_like_direct        the proxy refuses exactly as the switch
 #                                    does: paired direct/proxied attempts,
 #                                    h2 closed, h2c stripped (NET-069..071, 135)
@@ -283,6 +292,11 @@ BOXREG_CTRLC_SEED_DIR="" # its Ctrl-C seed (carries bulk data); removed on teard
 BOXREG_CTRLC_PID="" # its interrupted activate; INT then KILL on teardown
 BEPB_SEED_DIR_A="" # seeded by the proxy-source proof below; removed on teardown
 BEPB_SEED_DIR_B="" # its second box's seed; removed on teardown
+PO_OWNIP_SEED_DIR="" # the port-publish proof's own-address box seed; removed on teardown
+PO_OUTLIVE_SEED_DIR="" # its detach-half box seed; removed on teardown
+PO_OUTLIVE_CLIENT_SEED_DIR="" # its detach-half outside client's seed (VM lanes); removed on teardown
+PO_TASK_SEED_DIR="" # its run-half seed; removed on teardown
+PO_TASK_PID="" # its `min task run` client; KILLed on teardown (it owns a box)
 CRED_LANE_SEED_DIR="" # seeded by the credentialed-lane proof below; removed on teardown
 CRED_NO_LANE_SEED_DIR="" # the no-lane proof's seed; removed on teardown
 PUBP_SEED_DIR="" # seeded by the published-proxy proof below; removed on teardown
@@ -672,6 +686,17 @@ teardown() {
   # trap is the one place that always sees them.
   [ -n "$BEPB_SEED_DIR_A" ] && rm -rf "$BEPB_SEED_DIR_A"
   [ -n "$BEPB_SEED_DIR_B" ] && rm -rf "$BEPB_SEED_DIR_B"
+  # The port-publish proof's own seed dirs, same reasoning as every proof's:
+  # the trap is the one place a mid-beat failure is sure to reach. Its task
+  # client is KILLed outright — the box it created ends with it, so nothing
+  # the client owned can outlive this run.
+  [ -n "$PO_OWNIP_SEED_DIR" ] && rm -rf "$PO_OWNIP_SEED_DIR"
+  [ -n "$PO_OUTLIVE_SEED_DIR" ] && rm -rf "$PO_OUTLIVE_SEED_DIR"
+  [ -n "$PO_OUTLIVE_CLIENT_SEED_DIR" ] && rm -rf "$PO_OUTLIVE_CLIENT_SEED_DIR"
+  [ -n "$PO_TASK_SEED_DIR" ] && rm -rf "$PO_TASK_SEED_DIR"
+  if [ -n "$PO_TASK_PID" ]; then
+    kill -9 "$PO_TASK_PID" 2>/dev/null || true
+  fi
   # The credentialed-lane proofs' seeds, same reasoning: the trap is the one
   # place that always sees them.
   [ -n "$CRED_LANE_SEED_DIR" ] && rm -rf "$CRED_LANE_SEED_DIR"
@@ -11387,6 +11412,820 @@ proof_own_ip_deny_all_box_answers_published_port() {
 }
 
 # ---------------------------------------------------------------------------
+# A declared port refuses fast until something listens, then answers by
+# name; a live listen the rules do not publish is refused as not-published;
+# a detached box keeps serving; and a run's box ends with its run (NET-121,
+# NET-014, NET-016, NET-015, NET-131).
+#
+# Three beats, one box each, every listen, publish, detach and probe printed
+# with its outcome — and a failing run's `min bug` bundle (see `fail`) carries
+# the zone dump and the daemon log whose records this case reads: the daemon's
+# own net/zone.json and minimald log ride inside the bundle's nested
+# daemon-diag archive (providers/local-minimald0/guest/daemon-diag.tar.zst),
+# with the daemon log again at the bundle's top level.
+#
+#   * the port half drives an own-address box whose ingress declaration names
+#     one port. The declaration binds its forwarder BEFORE the box's name is
+#     registered (NET-121), so the case connects FIRST — before anything in
+#     the box listens — and demands a fast refusal: refused by the box, never
+#     a timeout at the host (NET-014). Then socat listens inside the box on
+#     the declared port, and the very next request BY NAME — through the
+#     shipped hostname proxy, the name surface every lane has — must answer
+#     with the box's own marker: the declaration's forward, serving at once
+#     (NET-121). A second listener, LIVE inside the box on a port its rules
+#     permit no publication for, is the NET-016 half this half can reach:
+#     it must stay unpublished, refused by name as NOT PERMITTED — `403`
+#     with a body saying the port is not published, never a nothing-
+#     listening hang — and, where the daemon's log is readable, the listen
+#     watcher's own record of leaving it unpublished. This half claims
+#     NET-016's refusal arm only. Its permitted arm — a listen inside the
+#     dynamic allow range, published on the box's address and reached by
+#     name through the host answerer at that published address, not through
+#     this proxy — needs a user surface that sets the range, which no create
+#     flag offers yet; the flags and that end-to-end leg are T82's (#1895),
+#     and until then the arm is proven in the daemon's own unit layer
+#     (net/listeners.rs and net/proxy.rs). Gated on the switch and the tap device
+#     like the deny-all answer proof: a target without them has no port
+#     surface to drive, and a skip says so rather than failing a lane that
+#     was never the audience.
+#
+#   * the detach half attaches — over a real pty — to a host-address box that
+#     is serving a port, reads the box's answer from inside the attached
+#     shell, leaves by the session detach chord, and demands the box still
+#     listed and still serving (NET-015): the box outlives the client that
+#     walked away from it. Runs wherever a session sandbox can spawn — the
+#     server is on the shared loopback, so the harness's own curl is the
+#     outside client before and after the detach.
+#
+#   * the run half starts `min task run` of a task that prints a marker and
+#     then exits by itself a few seconds later, SIGKILLs the client while
+#     the command still runs, and demands the run's box leave `min ls`
+#     after the command exits (NET-131: a box created for a run ends with
+#     its run's COMMAND — the destroy keys on the exec's exit status, never
+#     on the client — so a lost client strands no session; a command the
+#     daemon ends because its client's stdio closed is the command exiting,
+#     and counts). Its box IS a session sandbox, so the earlier beats' gate
+#     verdict carries to it: a host that cannot spawn one skips it, a lane
+#     that exists to run it fails.
+proof_port_publishes_on_listen_and_box_outlives_client() {
+  echo "::group::a declared port answers by name; a live listen the rules do not publish is refused as not-published; the box outlives its client (NET-121, NET-014, NET-016, NET-015, NET-131)"
+
+  # The names, ports and markers. Ports are fixed on purpose — the execs that
+  # start and probe each listener must agree — and clear of every band the
+  # proofs around this one use (18080-18088, 18090-18093, 19090/19091).
+  PO_BOX_NAME="e2e-port-publish"       # the own-address box the port half drives
+  PO_OUTLIVE_NAME="e2e-port-outlive"   # the host-address box the detach half drives
+  PO_OUTLIVE_CLIENT_NAME="e2e-port-out-client" # the detach half's outside client, on a VM lane
+  PO_EXT=18096                         # the declared — published — port
+  PO_UNDECLARED=18097                  # a listen no declaration names
+  PO_DETACH_PORT=18098                 # the detach box's server, on the shared loopback
+  PO_MARKER="PO_PUBLISH_OK"            # what the port half's box answers with
+  PO_OUTLIVE_MARKER="PO_OUTLIVE_OK"    # what the detach box answers with
+  PO_RUN_MARKER="PO_RUN_BOX_LIVE"      # what the run task prints from inside its box
+  PO_SAVED_RUST_LOG=""
+  # The run half's own pin, set when it restarts the daemon for its record
+  # (see the beat below): kept beside the port half's for the same reason.
+  PO_RUN_SAVED_RUST_LOG=""
+  # One verdict, read by the beats that need a session sandbox: the port and
+  # detach halves' exec gates set it to 0 when this host cannot spawn one, and
+  # the run half — whose box IS a session — skips on it rather than failing a
+  # host that was never the audience (the same split the deny-all answer
+  # proof's gates hold; on CI or a VM lane the gate fails instead).
+  PO_SANDBOX_OK=1
+
+  # The daemon's newest log file, where this lane can read it at all (see
+  # hook_log_readable for the lanes that cannot).
+  po_daemon_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f 2>/dev/null \
+      | sort | tail -n1
+  }
+
+  # ---- beat 1: the port half, on the box its declaration publishes --------
+  # The half is a function so a lane that cannot run it can skip it without
+  # taking the two lane-wide beats below with it.
+  po_port_half() {
+    if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+      echo "port-publish half SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch)"
+      return 0
+    fi
+    if [ ! -c /dev/net/tun ]; then
+      echo "port-publish half SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+      return 0
+    fi
+
+    # The claim on the host's loopback, checked the way the deny-all answer
+    # proof checks its own: a host that already answers on the port owes the
+    # case a failure, not a silent wrong-port run.
+    if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$PO_EXT/" 2>/dev/null; then
+      echo "::error::127.0.0.1:$PO_EXT already answers on this host; the port-publish half needs it free"
+      fail
+    fi
+
+    # The watcher's records and the expose record both live at info under
+    # modules the lane's `warn` filter drops, so a readable-log lane restarts
+    # the daemon with them at info — the same restart the deny-all answer
+    # proof runs — and puts the lane's filter back afterwards. A VM lane
+    # keeps its records (they are the guest's) and its filter. The run half
+    # below reads its own record off this same daemon but pins its own module
+    # (it restarts for it): this half's pin is skipped along with this half
+    # on a lane with no switch, so nothing below may lean on it.
+    if hook_log_readable; then
+      mnl stop >/dev/null 2>&1 || true # a standalone run has no daemon yet
+      PO_SAVED_RUST_LOG="${RUST_LOG:-}"
+      export RUST_LOG="warn,minimald::exec=info,minimald::net::gvproxy_network=info,minimald::net::listeners=info"
+    fi
+    po_restore_log() {
+      if [ -n "$PO_SAVED_RUST_LOG" ]; then export RUST_LOG="$PO_SAVED_RUST_LOG"; else unset RUST_LOG; fi
+    }
+
+    PO_OWNIP_SEED_DIR="$(hook_mktemp /tmp/mnlpo.XXXXXX)"
+    hook_seed_preamble > "$PO_OWNIP_SEED_DIR/minimal.toml"
+    mkdir "$PO_OWNIP_SEED_DIR/.git"
+    po_sid="$(cd "$PO_OWNIP_SEED_DIR" && mnl session activate . --no-prompt \
+      --name "$PO_BOX_NAME" --network own_ip \
+      --ingress "$PO_EXT:$PO_EXT" 2>"$WORK/po-activate.err")" || {
+      echo "::error::'min session activate --network own_ip --ingress $PO_EXT:$PO_EXT' failed"
+      echo "--- stderr ---"; cat "$WORK/po-activate.err" 2>/dev/null || true
+      fail
+    }
+    po_sid="$(printf '%s\n' "$po_sid" | tail -n1 | tr -d '\r')"
+
+    # Capability gates, the two the deny-all answer proof runs: this half
+    # needs a session sandbox AND this run's daemon owning the proxy, and a
+    # host can lack either. A skip is honest only on a developer host — a
+    # lane that exists to run these assertions and cannot is a red lane.
+    po_can_skip() { [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; }
+    if ! mnl session exec "$po_sid" 'true' >"$WORK/po-execgate.err" 2>&1 \
+       && ! { sleep 1; mnl session exec "$po_sid" 'true' >"$WORK/po-execgate.err" 2>&1; }; then
+      if po_can_skip; then
+        echo "::warning::port-publish half SKIPPED — this host cannot run a session sandbox"
+        echo "  (exec: $(head -n1 "$WORK/po-execgate.err" 2>/dev/null || true))"
+        echo "  on CI or a VM lane this gate fails instead"
+        PO_SANDBOX_OK=0
+        mnl session destroy --force "$po_sid" >/dev/null 2>&1 || true
+        rm -rf "$PO_OWNIP_SEED_DIR"; PO_OWNIP_SEED_DIR=""
+        po_restore_log
+        return 0
+      fi
+      echo "::error::this lane cannot run a session sandbox, so no probe inside a box can run: nothing this half asserts can be asserted"
+      echo "  (exec: $(head -n1 "$WORK/po-execgate.err" 2>/dev/null || true))"
+      fail
+    fi
+    po_bind_taken=0
+    for po_try in 1 2 3 4 5; do
+      po_ls="$(mnl ls 2>&1)"
+      case "$po_ls" in
+        *"session hostnames will not route"*) po_bind_taken=1 ;;
+        *) po_bind_taken=0; break ;;
+      esac
+      [ "$po_try" = 5 ] || sleep 3
+    done
+    if [ "$po_bind_taken" -eq 1 ]; then
+      if po_can_skip; then
+        echo "::warning::port-publish half SKIPPED — another daemon owns 127.0.0.1:7654 on this host"
+        echo "  the by-name leg needs this run's daemon to own the proxy; on CI or a VM lane this gate fails instead"
+        mnl session destroy --force "$po_sid" >/dev/null 2>&1 || true
+        rm -rf "$PO_OWNIP_SEED_DIR"; PO_OWNIP_SEED_DIR=""
+        po_restore_log
+        return 0
+      fi
+      echo "::error::another daemon owns 127.0.0.1:7654, so this run's daemon cannot route session hostnames"
+      echo "--- min ls ---"; printf '%s\n' "$po_ls"
+      fail
+    fi
+
+    # The address the declaration published at, read the way the deny-all
+    # answer proof reads it: from the expose record where the daemon's log is
+    # readable (NET-040's observability record, one per mapping), from the
+    # host's own socket table where /proc reaches it, and nowhere otherwise —
+    # the by-name legs below still run there.
+    po_addr=""
+    if hook_log_readable; then
+      po_log="$(po_daemon_log)"
+      po_rec=""
+      for _ in $(seq 1 10); do
+        po_rec="$(grep -h -- 'exposed ingress port on the host loopback' "$po_log" 2>/dev/null \
+          | grep -F -- "\"session\":\"$PO_BOX_NAME\"" | tail -n1)"
+        [ -n "$po_rec" ] && break
+        sleep 0.25
+      done
+      if [ -z "$po_rec" ]; then
+        echo "::error::no expose record in the daemon log names the box's session — the declared port has no host address to dial (NET-121)"
+        echo "--- daemon log (tail) ---"; tail -20 "$po_log" 2>/dev/null || true
+        fail
+      fi
+      po_addr="$(published_loopback_host "$po_log" "$PO_BOX_NAME")"
+      echo "declaration: published ingress port $PO_EXT:$PO_EXT at ${po_addr:-<no address in the record>} — bound before the box's name was registered (NET-121)"
+      echo "daemon log: $po_rec"
+    elif [ -r /proc/net/tcp ]; then
+      po_row=""
+      for _ in $(seq 1 40); do
+        po_row="$(awk -v want="$(printf '%04X' "$PO_EXT")" \
+          'substr($2, 7, 2) == "7F" && substr($2, 5, 2) == "40" && substr($2, 3, 2) == "00" \
+           && $4 == "0A" && index($2, ":" want) == 9 { print $2 }' /proc/net/tcp 2>/dev/null | tail -n1)"
+        if [ -z "$po_row" ]; then
+          po_row="$(awk -v want="$(printf '%04X' "$PO_EXT")" \
+            'substr($2, 1, 8) == "0100007F" \
+             && $4 == "0A" && index($2, ":" want) == 9 { print $2 }' /proc/net/tcp 2>/dev/null | tail -n1)"
+        fi
+        [ -n "$po_row" ] && break
+        sleep 0.25
+      done
+      if [ -z "$po_row" ]; then
+        echo "::error::no listener in the host's socket table sits on this host's loopback at port $PO_EXT — the switch never bound the declared port (NET-121)"
+        echo "--- /proc/net/tcp (loopback listeners) ---"
+        awk 'substr($2, 7, 2) == "7F" && $4 == "0A" { print }' \
+          /proc/net/tcp 2>/dev/null | head -20
+        fail
+      fi
+      po_addr="$(printf '%d.%d.%d.%d' \
+        "0x${po_row:6:2}" "0x${po_row:4:2}" "0x${po_row:2:2}" "0x${po_row:0:2}")"
+      echo "host listener: the declared port's forwarder at $po_addr:$PO_EXT (read from the host's own socket table — this lane's daemon log is the guest's)"
+    else
+      echo "address legs SKIPPED on this lane: the daemon's expose record is the guest's and this host has no /proc to read its socket table from — the by-name legs still run"
+    fi
+
+    # NET-121 + NET-014: the declared forwarder is bound and NOTHING in the
+    # box listens yet, so a connection must be refused — by the box, fast,
+    # never a timeout at the host.
+    if [ -n "$po_addr" ]; then
+      po_t0=$(now_ms)
+      curl -sS --max-time 8 -o /dev/null "http://$po_addr:$PO_EXT/" \
+        >/dev/null 2>"$WORK/po-refused.err"
+      po_ref_rc=$?
+      po_t1=$(now_ms)
+      echo "before any listen: GET http://$po_addr:$PO_EXT/ -> curl exit $po_ref_rc in $((po_t1 - po_t0))ms ($(head -n1 "$WORK/po-refused.err" 2>/dev/null || true))"
+      if [ "$po_ref_rc" -eq 0 ]; then
+        echo "::error::the declared port answered before anything in the box listened"
+        fail
+      fi
+      if [ "$po_ref_rc" -eq 28 ]; then
+        echo "::error::the refused connection to the declared port TIMED OUT (curl exit 28) — a declaration's forward must refuse, not hang (NET-014)"
+        cat "$WORK/po-refused.err" 2>/dev/null || true
+        fail
+      fi
+      if [ $((po_t1 - po_t0)) -ge 4000 ]; then
+        echo "::error::the refused connection to the declared port took $((po_t1 - po_t0))ms — a refusal must be fast, not a timeout (NET-014)"
+        cat "$WORK/po-refused.err" 2>/dev/null || true
+        fail
+      fi
+      echo "declared port refused fast while nothing listened — by the box, not timed out at the host (NET-121, NET-014)"
+    fi
+
+    # The listen on the permitted port: socat, one fixed 200 whose body is
+    # the marker — written by the SESSION's shell so the Content-Length can
+    # never drift — and `nohup ... &`, the documented detach form, so the
+    # listener outlives the exec that starts it.
+    mnl session exec "$po_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 \
+      || { echo "::error::the box has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"; fail; }
+    mnl session exec "$po_sid" \
+      "body=$PO_MARKER; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/po-http200" \
+      >/dev/null 2>"$WORK/po-responder.err" \
+      || { echo "::error::could not write the in-box responder's response"; cat "$WORK/po-responder.err" 2>/dev/null || true; fail; }
+    mnl session exec "$po_sid" \
+      "nohup /usr/bin/socat TCP-LISTEN:$PO_EXT,reuseaddr,fork SYSTEM:\"cat /home/po-http200\" >/dev/null 2>&1 &" \
+      >/dev/null 2>>"$WORK/po-responder.err" \
+      || { echo "::error::could not start the in-box responder on the declared port"; cat "$WORK/po-responder.err" 2>/dev/null || true; fail; }
+    po_listening=""
+    for _ in $(seq 1 40); do
+      if [ "$(mnl session exec "$po_sid" \
+        "curl -sS --max-time 5 -o /home/po-ready.body -w '%{http_code}' http://127.0.0.1:$PO_EXT/" \
+        2>/dev/null || true)" = "200" ]; then
+        po_listening=1
+        break
+      fi
+      sleep 0.25
+    done
+    if [ -z "$po_listening" ]; then
+      echo "::error::the in-box responder on the declared port never answered a direct curl — no client is in the picture yet, so this is the box's own loopback"
+      echo "--- socat exec stderr ---"; cat "$WORK/po-responder.err" 2>/dev/null || true
+      fail
+    fi
+    echo "listen: socat now serves the declared port $PO_EXT inside the box (its own loopback answers $PO_MARKER)"
+
+    # NET-121's forward, by name, AT ONCE: the port the box's declaration
+    # publishes, its listener now up, and the next request — the FIRST
+    # by-name request, no retry behind it — through the shipped hostname
+    # proxy must already carry the box's own answer. The proxy is the name
+    # surface every lane has, so this leg runs wherever the half runs.
+    po_proxy_port="$(printf '%s\n' "$po_ls" \
+      | sed -n 's/^HOSTNAME PROXY: *listening on 127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' | head -n1)"
+    if [ -z "$po_proxy_port" ]; then
+      po_ls="$(mnl ls 2>&1 || true)"
+      po_proxy_port="$(printf '%s\n' "$po_ls" \
+        | sed -n 's/^HOSTNAME PROXY: *listening on 127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' | head -n1)"
+    fi
+    if [ -z "$po_proxy_port" ]; then
+      echo "::error::min ls did not name the port the hostname proxy listens on"
+      echo "--- min ls ---"; printf '%s\n' "$po_ls"
+      fail
+    fi
+    po_t0=$(now_ms)
+    # Every proxy env var the runner may carry is cleared, the way the
+    # min.internal proof clears them: `-x` overrides the positive ones, but
+    # NO_PROXY/no_proxy OVERRIDES `-x`, so one that is set sends this leg
+    # resolving the name itself instead of through the proxy it names.
+    po_name_code="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+      curl -sS --max-time 20 -x "http://127.0.0.1:$po_proxy_port" \
+      -o "$WORK/po-name.body" -w '%{http_code}' \
+      "http://$PO_BOX_NAME.min.internal:$PO_EXT/" 2>"$WORK/po-name.err")"
+    po_name_rc=$?
+    po_t1=$(now_ms)
+    echo "by name: GET http://$PO_BOX_NAME.min.internal:$PO_EXT/ (proxy 127.0.0.1:$po_proxy_port) -> HTTP ${po_name_code:-<none>} (curl exit $po_name_rc) in $((po_t1 - po_t0))ms"
+    if [ "$po_name_rc" -ne 0 ] || [ "$po_name_code" != "200" ]; then
+      echo "::error::the declared port did not answer by name once its listen was up (NET-121)"
+      echo "--- curl stderr ---"; cat "$WORK/po-name.err" 2>/dev/null || true
+      echo "--- body ---"; cat "$WORK/po-name.body" 2>/dev/null || true
+      fail
+    fi
+    if [[ "$(cat "$WORK/po-name.body" 2>/dev/null)" != *"$PO_MARKER"* ]]; then
+      echo "::error::the by-name answer does not carry the box's marker (got: '$(cat "$WORK/po-name.body" 2>/dev/null)')"
+      fail
+    fi
+    echo "the declared port answers by name at once — its declaration's forward serving the listen (NET-121, NET-001)"
+
+    # The listen no declaration names must stay unpublished. socat again, on
+    # a port the box's rules permit no publication for — no declaration names
+    # it, and the CLI has no flag for a dynamic allow range, so NET-016's
+    # verdict for it is deny.
+    mnl session exec "$po_sid" \
+      "nohup /usr/bin/socat TCP-LISTEN:$PO_UNDECLARED,reuseaddr,fork SYSTEM:\"cat /home/po-http200\" >/dev/null 2>&1 &" \
+      >/dev/null 2>>"$WORK/po-responder.err" \
+      || { echo "::error::could not start the in-box responder on the undeclared port"; cat "$WORK/po-responder.err" 2>/dev/null || true; fail; }
+    po_undeclared=""
+    for _ in $(seq 1 40); do
+      if [ "$(mnl session exec "$po_sid" \
+        "curl -sS --max-time 5 -o /home/po-undeclared.body -w '%{http_code}' http://127.0.0.1:$PO_UNDECLARED/" \
+        2>/dev/null || true)" = "200" ]; then
+        po_undeclared=1
+        break
+      fi
+      sleep 0.25
+    done
+    if [ -z "$po_undeclared" ]; then
+      echo "::error::the in-box responder on the undeclared port never answered a direct curl"
+      echo "--- socat exec stderr ---"; cat "$WORK/po-responder.err" 2>/dev/null || true
+      fail
+    fi
+    echo "listen: socat also serves the UNDECLARED port $PO_UNDECLARED inside the box — no declaration names it, so nothing may publish it (NET-016)"
+
+    # Refused by name, instantly — and the refusal must say NOT PERMITTED,
+    # never nothing-listening: the listen is LIVE inside the box (the direct
+    # curl just read its 200), so a refusal here is the box's rules refusing
+    # to publish, not a dead listener. The proxy answers with its own
+    # published-port refusal rather than dialing (NET-016, NET-014): `403`
+    # and a body that says the port is not published.
+    po_t0=$(now_ms)
+    # The same proxy-env clearing as the permitted leg above: this request
+    # goes through the proxy `-x` names, whatever the runner inherited.
+    po_und_code="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+      curl -sS --max-time 20 -x "http://127.0.0.1:$po_proxy_port" \
+      -o "$WORK/po-undeclared-name.body" -w '%{http_code}' \
+      "http://$PO_BOX_NAME.min.internal:$PO_UNDECLARED/" 2>"$WORK/po-undeclared-name.err")"
+    po_und_rc=$?
+    po_t1=$(now_ms)
+    echo "by name: GET http://$PO_BOX_NAME.min.internal:$PO_UNDECLARED/ -> HTTP ${po_und_code:-<none>} (curl exit $po_und_rc) in $((po_t1 - po_t0))ms"
+    if [ "$po_und_code" != "403" ]; then
+      echo "::error::the undeclared port was not refused by name with the proxy's published-port refusal (HTTP ${po_und_code:-<none>}, NET-014/NET-016)"
+      echo "--- body ---"; cat "$WORK/po-undeclared-name.body" 2>/dev/null || true
+      fail
+    fi
+    if [[ "$(cat "$WORK/po-undeclared-name.body" 2>/dev/null)" \
+          != *"the box has not published this port"* ]]; then
+      echo "::error::the by-name refusal does not say the port is not published — a refusal of a LIVE listen must read not permitted, not nothing listening (NET-016)"
+      echo "--- body ---"; cat "$WORK/po-undeclared-name.body" 2>/dev/null || true
+      fail
+    fi
+    # Refused at the address too: nothing is bound there for this port.
+    if [ -n "$po_addr" ]; then
+      po_t0=$(now_ms)
+      curl -sS --max-time 8 -o /dev/null "http://$po_addr:$PO_UNDECLARED/" \
+        >/dev/null 2>"$WORK/po-undeclared-addr.err"
+      po_und_addr_rc=$?
+      po_t1=$(now_ms)
+      echo "at the address: GET http://$po_addr:$PO_UNDECLARED/ -> curl exit $po_und_addr_rc in $((po_t1 - po_t0))ms"
+      if [ "$po_und_addr_rc" -eq 0 ]; then
+        echo "::error::the undeclared port answered at the box's address — the listen was published without permission (NET-016)"
+        fail
+      fi
+      if [ "$po_und_addr_rc" -eq 28 ]; then
+        echo "::error::the undeclared port TIMED OUT at the address instead of being refused (NET-014)"
+        fail
+      fi
+    fi
+    # The watcher's own record, where the log is readable: the deny arm is
+    # the listen-publication record this half can reach through the user
+    # surface (the half's head names why the permitted arm cannot be).
+    if hook_log_readable; then
+      po_deny_rec=""
+      for _ in $(seq 1 40); do
+        po_deny_rec="$(grep -h -- 'left a listening port unpublished' "$(po_daemon_log)" 2>/dev/null \
+          | grep -F -- "\"session\":\"$PO_BOX_NAME\"" \
+          | grep -E -- "\"port\":$PO_UNDECLARED([^0-9]|$)|port=$PO_UNDECLARED([^0-9]|$)" \
+          | tail -n1 || true)"
+        [ -n "$po_deny_rec" ] && break
+        sleep 0.25
+      done
+      if [ -z "$po_deny_rec" ]; then
+        echo "::error::no listen-watcher record of the undeclared port being left unpublished — the box's kernel tables say it listens, and the watcher never said what it did with it (NET-016)"
+        echo "--- daemon log (tail) ---"; tail -20 "$(po_daemon_log)" 2>/dev/null || true
+        fail
+      fi
+      echo "daemon log: $po_deny_rec"
+    else
+      echo "watcher-record check skipped (guest-side daemon log on VM lane) — the refusal statuses carry the assertion there"
+    fi
+
+    # NET-015 in its strongest form: the client that walks away is a real
+    # attached terminal, and the box it leaves keeps serving its permitted
+    # port by name. The typed curl is the attached shell reading the box's
+    # own answer; the chord is the shipped detach. The pty echoes the typed
+    # command, but only the answer carries the marker, so the transcript's
+    # marker is the body the box served the attached shell.
+    # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+    po_attach_out="$(E2E_PTY_COMMANDS="curl -sS --max-time 10 http://127.0.0.1:$PO_EXT/" \
+      E2E_PTY_DETACH=1 TERM=xterm-256color python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+      min ${E2E_MINIMAL_ARGS:-} session attach "$po_sid" \
+      2>"$WORK/po-attach.err")" || {
+      echo "::error::pty attach to the port-publish box failed"
+      echo "--- transcript ---"; printf '%s\n' "$po_attach_out"
+      echo "--- stderr ---"; cat "$WORK/po-attach.err" 2>/dev/null || true
+      fail
+    }
+    if [[ "$po_attach_out" != *"$PO_MARKER"* ]]; then
+      echo "::error::the attached shell did not read the box's own answer"
+      echo "--- transcript ---"; printf '%s\n' "$po_attach_out"
+      fail
+    fi
+    echo "detach: the attached shell read $PO_MARKER and left by the detach chord"
+    # Capture-then-glob, never `mnl ls | grep -q`: grep's early exit SIGPIPEs
+    # the ls under pipefail and the leftover check would falsely pass.
+    po_ls_after="$(mnl ls 2>/dev/null)"
+    if [[ "$po_ls_after" != *"$PO_BOX_NAME"* ]]; then
+      echo "::error::the box is gone after the detach — a box must outlive the client that walked away (NET-015)"
+      fail
+    fi
+    po_t0=$(now_ms)
+    # And the same clearing here: this leg is the NET-015 answer, and a
+    # NO_PROXY the runner set must not take the request out of the proxy.
+    po_name2_code="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+      curl -sS --max-time 20 -x "http://127.0.0.1:$po_proxy_port" \
+      -o "$WORK/po-name2.body" -w '%{http_code}' \
+      "http://$PO_BOX_NAME.min.internal:$PO_EXT/" 2>"$WORK/po-name2.err")"
+    po_name2_rc=$?
+    po_t1=$(now_ms)
+    echo "by name, after the detach: GET http://$PO_BOX_NAME.min.internal:$PO_EXT/ -> HTTP ${po_name2_code:-<none>} (curl exit $po_name2_rc) in $((po_t1 - po_t0))ms"
+    if [ "$po_name2_rc" -ne 0 ] || [ "$po_name2_code" != "200" ] \
+       || [[ "$(cat "$WORK/po-name2.body" 2>/dev/null)" != *"$PO_MARKER"* ]]; then
+      echo "::error::the box did not keep serving its permitted port by name after the client detached (NET-015)"
+      echo "--- curl stderr ---"; cat "$WORK/po-name2.err" 2>/dev/null || true
+      echo "--- body ---"; cat "$WORK/po-name2.body" 2>/dev/null || true
+      fail
+    fi
+    echo "the box outlived its detached client and still serves by name (NET-015)"
+
+    mnl session destroy --force "$po_sid" >/dev/null 2>&1 || true
+    rm -rf "$PO_OWNIP_SEED_DIR"; PO_OWNIP_SEED_DIR=""
+    po_restore_log
+    echo "port-publish half OK (declared port: refused fast before the listen, then its declaration's forward answering by name at once (NET-121); live undeclared listen: refused by name as not-published, left unpublished by the watcher (NET-016); box: outlives its detached client)"
+  }
+  po_port_half
+
+  # ---- beat 2: the detach half, on a plain host-address box ---------------
+  po_outlive_half() {
+    if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$PO_DETACH_PORT/" 2>/dev/null; then
+      echo "::error::127.0.0.1:$PO_DETACH_PORT already answers on this host; the detach half needs it free"
+      fail
+    fi
+    PO_OUTLIVE_SEED_DIR="$(hook_mktemp /tmp/mnlou.XXXXXX)"
+    hook_seed_preamble > "$PO_OUTLIVE_SEED_DIR/minimal.toml"
+    mkdir "$PO_OUTLIVE_SEED_DIR/.git"
+    po_out_sid="$(cd "$PO_OUTLIVE_SEED_DIR" && mnl session activate . --no-prompt \
+      --name "$PO_OUTLIVE_NAME" 2>"$WORK/po-out-activate.err")" || {
+      echo "::error::'min session activate' for the detach half's box failed"
+      echo "--- stderr ---"; cat "$WORK/po-out-activate.err" 2>/dev/null || true
+      fail
+    }
+    po_out_sid="$(printf '%s\n' "$po_out_sid" | tail -n1 | tr -d '\r')"
+    # The same sandbox gate the port half runs: a dev host that cannot run a
+    # session sandbox skips the beat, a lane that exists for it fails.
+    if ! mnl session exec "$po_out_sid" 'true' >"$WORK/po-out-execgate.err" 2>&1 \
+       && ! { sleep 1; mnl session exec "$po_out_sid" 'true' >"$WORK/po-out-execgate.err" 2>&1; }; then
+      if [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; then
+        echo "::warning::detach half SKIPPED — this host cannot run a session sandbox"
+        echo "  (exec: $(head -n1 "$WORK/po-out-execgate.err" 2>/dev/null || true))"
+        PO_SANDBOX_OK=0
+        mnl session destroy --force "$po_out_sid" >/dev/null 2>&1 || true
+        rm -rf "$PO_OUTLIVE_SEED_DIR"; PO_OUTLIVE_SEED_DIR=""
+        return 0
+      fi
+      echo "::error::this lane cannot run a session sandbox, so the detach beat cannot run"
+      echo "  (exec: $(head -n1 "$WORK/po-out-execgate.err" 2>/dev/null || true))"
+      fail
+    fi
+
+    # The client that is outside the box's process tree, by lane. A
+    # host-address box shares its host's network namespace, so on a NATIVE
+    # lane the harness's own curl is one: it lives on the host the box lives
+    # on. On a VM lane it is not — the box's loopback is the GUEST's, and the
+    # harness runs on the host, so its `127.0.0.1` is the host's own, where
+    # nothing of the box's listens and no host curl can ever reach the server.
+    # There the outside client is a curl inside a SECOND box on the same node:
+    # another host-address box in the same guest, sharing the loopback the
+    # server listens on, and a process the detach box has never heard of. Both
+    # are outside the box's process tree; the native lane keeps its host-side
+    # curl exactly as it was.
+    po_out_client_sid=""
+    if [ -n "$E2E_VM" ]; then
+      PO_OUTLIVE_CLIENT_SEED_DIR="$(hook_mktemp /tmp/mnloc.XXXXXX)"
+      hook_seed_preamble > "$PO_OUTLIVE_CLIENT_SEED_DIR/minimal.toml"
+      mkdir "$PO_OUTLIVE_CLIENT_SEED_DIR/.git"
+      po_out_client_sid="$(cd "$PO_OUTLIVE_CLIENT_SEED_DIR" && mnl session activate . --no-prompt \
+        --name "$PO_OUTLIVE_CLIENT_NAME" 2>"$WORK/po-out-client-activate.err")" || {
+        echo "::error::'min session activate' for the outside client box failed — on a VM lane the client that reaches the box's loopback must come from inside the guest"
+        echo "--- stderr ---"; cat "$WORK/po-out-client-activate.err" 2>/dev/null || true
+        fail
+      }
+      po_out_client_sid="$(printf '%s\n' "$po_out_client_sid" | tail -n1 | tr -d '\r')"
+      # The same exec gate the detach box above passed, so a client box that
+      # came up but cannot exec fails naming itself, not the server it dials.
+      if ! mnl session exec "$po_out_client_sid" 'true' >"$WORK/po-out-client-execgate.err" 2>&1 \
+         && ! { sleep 1; mnl session exec "$po_out_client_sid" 'true' >"$WORK/po-out-client-execgate.err" 2>&1; }; then
+        echo "::error::the outside client box cannot run an exec, so no client outside the detach box can reach it on this lane"
+        echo "  (exec: $(head -n1 "$WORK/po-out-client-execgate.err" 2>/dev/null || true))"
+        fail
+      fi
+    fi
+    # One GET by the outside client, whichever side of the VM it runs from.
+    # $1 = the scratch name this request's diagnostics go under in $WORK.
+    po_out_get() {
+      po_out_tag="$1"
+      if [ -z "$E2E_VM" ]; then
+        po_out_from="(from the harness on the host)"
+        po_out_code="$(curl -sS --max-time 8 -o "$WORK/$po_out_tag.body" -w '%{http_code}' \
+          "http://127.0.0.1:$PO_DETACH_PORT/" 2>"$WORK/$po_out_tag.err")"
+        po_out_rc=$?
+        po_out_body="$(cat "$WORK/$po_out_tag.body" 2>/dev/null || true)"
+      else
+        po_out_from="(from the box $PO_OUTLIVE_CLIENT_NAME, inside the guest)"
+        po_out_reply="$(mnl session exec "$po_out_client_sid" \
+          "curl -sS --max-time 8 -o /home/po-out.body -w '%{http_code}' http://127.0.0.1:$PO_DETACH_PORT/" \
+          2>"$WORK/$po_out_tag.err")"
+        po_out_rc=$?
+        po_out_code="$(printf '%s\n' "$po_out_reply" | tail -n1 | tr -d '\r\n')"
+        po_out_body="$(mnl session exec "$po_out_client_sid" 'cat /home/po-out.body' 2>/dev/null || true)"
+      fi
+    }
+
+    # The server, started by an exec and detached from it the documented way:
+    # `nohup ... &`, so the listener outlives the exec that started it — the
+    # box's first outlives-its-client, before any terminal is attached.
+    mnl session exec "$po_out_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 \
+      || { echo "::error::the box has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"; fail; }
+    mnl session exec "$po_out_sid" \
+      "body=$PO_OUTLIVE_MARKER; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/po-out-http200" \
+      >/dev/null 2>"$WORK/po-out-responder.err" \
+      || { echo "::error::could not write the detach box's response"; cat "$WORK/po-out-responder.err" 2>/dev/null || true; fail; }
+    mnl session exec "$po_out_sid" \
+      "nohup /usr/bin/socat TCP-LISTEN:$PO_DETACH_PORT,reuseaddr,fork SYSTEM:\"cat /home/po-out-http200\" >/dev/null 2>&1 &" \
+      >/dev/null 2>>"$WORK/po-out-responder.err" \
+      || { echo "::error::could not start the detach box's server"; cat "$WORK/po-out-responder.err" 2>/dev/null || true; fail; }
+    po_out_up=""
+    for _ in $(seq 1 40); do
+      if [ "$(mnl session exec "$po_out_sid" \
+        "curl -sS --max-time 5 -o /home/po-out-ready.body -w '%{http_code}' http://127.0.0.1:$PO_DETACH_PORT/" \
+        2>/dev/null || true)" = "200" ]; then
+        po_out_up=1
+        break
+      fi
+      sleep 0.25
+    done
+    if [ -z "$po_out_up" ]; then
+      echo "::error::the detach box's server never answered a direct curl — no client is in the picture yet, so this is the box's own loopback"
+      echo "--- socat exec stderr ---"; cat "$WORK/po-out-responder.err" 2>/dev/null || true
+      fail
+    fi
+    # The first outside client, before any terminal is attached: the GET must
+    # carry the box's own marker, so the server answers a client that is
+    # neither the exec that started it nor anything attached to the box.
+    po_out_get po-out
+    echo "before the detach: GET http://127.0.0.1:$PO_DETACH_PORT/ $po_out_from -> HTTP ${po_out_code:-<none>} (curl exit $po_out_rc)"
+    if [ "$po_out_rc" -ne 0 ] || [ "$po_out_code" != "200" ] \
+       || [[ "$po_out_body" != *"$PO_OUTLIVE_MARKER"* ]]; then
+      echo "::error::the detach box's server did not answer a client outside its process tree"
+      echo "--- curl stderr ---"; cat "$WORK/po-out.err" 2>/dev/null || true
+      echo "--- body ---"; printf '%s\n' "$po_out_body"
+      fail
+    fi
+    echo "listen: the box serves $PO_OUTLIVE_MARKER on the shared loopback, started by an exec that has already returned"
+
+    # The client that will walk away: a REAL pty attach, its shell reading
+    # the box's own answer, then the shipped detach chord.
+    # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+    po_out_attach="$(E2E_PTY_COMMANDS="curl -sS --max-time 10 http://127.0.0.1:$PO_DETACH_PORT/" \
+      E2E_PTY_DETACH=1 TERM=xterm-256color python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+      min ${E2E_MINIMAL_ARGS:-} session attach "$po_out_sid" \
+      2>"$WORK/po-out-attach.err")" || {
+      echo "::error::pty attach to the detach box failed"
+      echo "--- transcript ---"; printf '%s\n' "$po_out_attach"
+      echo "--- stderr ---"; cat "$WORK/po-out-attach.err" 2>/dev/null || true
+      fail
+    }
+    if [[ "$po_out_attach" != *"$PO_OUTLIVE_MARKER"* ]]; then
+      echo "::error::the attached shell did not read the box's own answer"
+      echo "--- transcript ---"; printf '%s\n' "$po_out_attach"
+      fail
+    fi
+    echo "detach: the attached shell read $PO_OUTLIVE_MARKER and left by the detach chord"
+    po_out_ls="$(mnl ls 2>/dev/null)"
+    if [[ "$po_out_ls" != *"$PO_OUTLIVE_NAME"* ]]; then
+      echo "::error::the box is gone after the detach — a box must outlive the client that walked away (NET-015)"
+      fail
+    fi
+    po_out_get po-out2
+    echo "after the detach: GET http://127.0.0.1:$PO_DETACH_PORT/ $po_out_from -> HTTP ${po_out_code:-<none>} (curl exit $po_out_rc)"
+    if [ "$po_out_rc" -ne 0 ] || [ "$po_out_code" != "200" ] \
+       || [[ "$po_out_body" != *"$PO_OUTLIVE_MARKER"* ]]; then
+      echo "::error::the box did not keep serving after its client detached (NET-015)"
+      echo "--- curl stderr ---"; cat "$WORK/po-out2.err" 2>/dev/null || true
+      echo "--- body ---"; printf '%s\n' "$po_out_body"
+      fail
+    fi
+    echo "the box outlived its detached client and kept serving (NET-015)"
+
+    mnl session destroy --force "$po_out_sid" >/dev/null 2>&1 || true
+    if [ -n "$po_out_client_sid" ]; then
+      mnl session destroy --force "$po_out_client_sid" >/dev/null 2>&1 || true
+    fi
+    rm -rf "$PO_OUTLIVE_SEED_DIR" "${PO_OUTLIVE_CLIENT_SEED_DIR:-}"; PO_OUTLIVE_SEED_DIR=""; PO_OUTLIVE_CLIENT_SEED_DIR=""
+    echo "detach half OK (server outlived the exec that started it, the terminal that attached, and answered an outside client throughout)"
+  }
+  po_outlive_half
+
+  # ---- beat 3: the run half — a box created for a run ends with the run --
+  po_run_half() {
+    # A run's box IS a session sandbox, so a host the earlier beats found
+    # unable to spawn one has nothing for this beat to drive: skip on such a
+    # host, fail on a lane that exists to run it.
+    if [ "$PO_SANDBOX_OK" -ne 1 ]; then
+      echo "::warning::run half SKIPPED — this host cannot run a session sandbox, and a run's box is one"
+      echo "  (the same verdict the earlier beats' exec gates reached; on CI or a VM lane the gate fails instead)"
+      return 0
+    fi
+
+    # The `run box ended` record this half reads at its end is at info under
+    # `minimald::exec`, and a daemon's filter is fixed at its spawn — so the
+    # half that reads a record pins the module it lives in, the way the port
+    # half pins its two above. The port half's restart cannot stand in for
+    # this one: a lane with no switch skips that half outright, leaving the
+    # daemon running under whatever filter an earlier proof left it (the
+    # min.internal proof's drops this module's records and restores nothing),
+    # and a record the filter dropped has this half asserting a destroy with
+    # no record of firing. So pin this half's own module wherever the log is
+    # readable, and put the lane's filter back afterwards as the port half
+    # does. Nothing is live across the restart: both beats' boxes are
+    # destroyed by the time this beat starts, and sessions survive a daemon
+    # restart anyway (the restart proof pins that).
+    if hook_log_readable; then
+      mnl stop >/dev/null 2>&1 || true # a standalone run has no daemon yet
+      PO_RUN_SAVED_RUST_LOG="${RUST_LOG:-}"
+      export RUST_LOG="warn,minimald::exec=info"
+    fi
+    po_run_restore_log() {
+      # Guarded on the same predicate the pin was: a lane this half never
+      # pinned keeps the filter it arrived with.
+      if hook_log_readable; then
+        if [ -n "$PO_RUN_SAVED_RUST_LOG" ]; then export RUST_LOG="$PO_RUN_SAVED_RUST_LOG"; else unset RUST_LOG; fi
+      fi
+    }
+
+    PO_TASK_SEED_DIR="$(mktemp -d /tmp/mnlpors.XXXXXX)"
+    {
+      awk '
+        /^\[upstream\]/            { grab = 1; print; next }
+        grab && (/^$/ || /^\[/)    { exit }
+        grab                       { print }
+      ' "$ROOT/.minimal/minimal.toml"
+      printf '\n[stack]\nuse = "shell"\n'
+      # The run's command prints the marker and then exits BY ITSELF a few
+      # seconds later. NET-131's trigger is that exit — the destroy keys on
+      # the exec's exit status, not on the client — so the beat kills the
+      # client INSIDE the command's running window (the marker gates it: the
+      # command is up, the sleep still has its seconds to run) and then
+      # demands the box delisted after the command exits. A client the
+      # daemon sees vanish ends the exec'd command first — the lost-client
+      # contract `lost_exec_client_kills_only_its_own_process` pins the
+      # daemon killing the child when the client's channel closes, then
+      # waiting for it — and a command ended that way is the command
+      # exiting: the exit the destroy keys on either way. Five seconds is
+      # the window: short enough that the run ends shortly after the kill
+      # (the 90 s delist poll below holds it), long enough that the marker
+      # read, the `min ls` and the kill all land while the command runs.
+      printf '\n[tasks.e2e-port-run]\nbash = "echo %s; sleep 5"\n' "$PO_RUN_MARKER"
+    } > "$PO_TASK_SEED_DIR/minimal.toml"
+    mkdir "$PO_TASK_SEED_DIR/.git"
+    # `exec` inside the subshell makes $! the min client's own pid, so the KILL
+    # below reaches the client and not a shell that would leave it alive.
+    # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+    ( cd "$PO_TASK_SEED_DIR" && exec min ${E2E_MINIMAL_ARGS:-} task run e2e-port-run ) \
+      >"$WORK/po-task.out" 2>"$WORK/po-task.err" &
+    PO_TASK_PID=$!
+    po_run_started=""
+    for _ in $(seq 1 120); do
+      if grep -q -- "$PO_RUN_MARKER" "$WORK/po-task.out" 2>/dev/null; then
+        po_run_started=1
+        break
+      fi
+      if ! kill -0 "$PO_TASK_PID" 2>/dev/null; then
+        break
+      fi
+      sleep 1
+    done
+    if [ -z "$po_run_started" ]; then
+      echo "::error::the run task never printed its marker — its box either never came up or the client died first"
+      echo "--- task stdout ---"; cat "$WORK/po-task.out" 2>/dev/null || true
+      echo "--- task stderr ---"; cat "$WORK/po-task.err" 2>/dev/null || true
+      fail
+    fi
+    echo "run: the task is inside its box and printed $PO_RUN_MARKER"
+    po_task_ls="$(mnl ls 2>/dev/null)"
+    po_task_box="$(printf '%s\n' "$po_task_ls" | grep -o 'task-e2e-port-run-[0-9a-f]\{4\}' | head -n1)"
+    if [ -z "$po_task_box" ]; then
+      echo "::error::the run's box was not listed while its task ran"
+      echo "--- min ls ---"; printf '%s\n' "$po_task_ls"
+      fail
+    fi
+    echo "run: box $po_task_box is listed — created for the run, serving it"
+    # The client vanishes while the command still runs. The daemon ends the
+    # command the run was carrying — it kills the child when the client's
+    # channel closes, then waits for the exit — and NET-131's destroy runs
+    # from the daemon side of that exit, whatever became of the client: the
+    # destroy used to be the client's, which is what strands a session whose
+    # client never comes back.
+    kill -9 "$PO_TASK_PID" 2>/dev/null || true
+    PO_TASK_PID=""
+    echo "run: SIGKILLed the client while the command still ran — the box's end must key on the command's exit, not on the client"
+    po_box_ended=""
+    po_task_ls=""
+    for _ in $(seq 1 90); do
+      po_task_ls_now="$(mnl ls 2>/dev/null)"
+      # An EMPTY listing is no answer at all: an `mnl ls` that answers nothing
+      # — the daemon momentarily busy destroying the very box this wait reads,
+      # say — reads as "no box listed" to the glob, which would green the
+      # NET-131 assertion below without ever observing the delist. Only a
+      # listing that says something counts as a verdict, so an empty one
+      # leaves it untouched and keeps the last listing that did answer for the
+      # failure arm.
+      if [ -n "$po_task_ls_now" ]; then
+        po_task_ls="$po_task_ls_now"
+        if [[ "$po_task_ls_now" != *task-e2e-port-run-* ]]; then
+          po_box_ended=1
+          break
+        fi
+      fi
+      sleep 1
+    done
+    if [ -z "$po_box_ended" ]; then
+      echo "::error::the run's box is STILL listed after its command exited — a box created for a run must end with its run's command, never with its client (NET-131)"
+      echo "--- min ls (the last listing that answered) ---"; printf '%s\n' "${po_task_ls:-<min ls never answered a listing this wait could read>}"
+      fail
+    fi
+    echo "run: the box ended with its run's command — the end keyed on the exit, not on the client's death (NET-131)"
+    # The daemon-side end's own record, where the lane can read it: one line
+    # naming the session, the run and the exit its box ended with — at info
+    # under the module this half pinned the daemon to above, whatever filter
+    # the lane's earlier proofs left it running under.
+    if hook_log_readable; then
+      po_end_rec=""
+      for _ in $(seq 1 20); do
+        po_end_rec="$(grep -h -- 'run box ended' "$(po_daemon_log)" 2>/dev/null \
+          | grep -F -- '"task":"e2e-port-run"' | tail -n1 || true)"
+        [ -n "$po_end_rec" ] && break
+        sleep 0.25
+      done
+      if [ -z "$po_end_rec" ]; then
+        echo "::error::no 'run box ended' record names the task's run — the daemon-side destroy NET-131 moved has no record of firing"
+        echo "--- daemon log (tail) ---"; tail -20 "$(po_daemon_log)" 2>/dev/null || true
+        fail
+      fi
+      echo "daemon log: $po_end_rec"
+    else
+      echo "run-box-ended log check skipped (guest-side daemon log on VM lane)"
+    fi
+    rm -rf "$PO_TASK_SEED_DIR"; PO_TASK_SEED_DIR=""
+    po_run_restore_log
+    echo "run half OK (box created for the run, delisted when the run's command exited — the client died mid-command and the end keyed on the exit)"
+  }
+  po_run_half
+
+  echo "port publishes on listen and the box outlives its client OK"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # The hostname proxy honours the switch's rules, end to end (NET-069, NET-070,
 # NET-071, NET-135). The rule is parity, and parity is proved by PAIRS: the
 # same target attempted directly and through the proxy, the two attempts
@@ -13746,6 +14585,7 @@ case "${1:-}" in
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
     proof_own_ip_deny_all_box_answers_published_port
+    proof_port_publishes_on_listen_and_box_outlives_client
     proof_proxy_refuses_like_direct
     proof_retired_surfaces_gone
     proof_switch_steers_proxy_mac_frames_to_the_host_stack
@@ -13772,6 +14612,7 @@ case "${1:-}" in
     | box_name_resolves_natively_without_proxy \
     | hostnames_recover_and_two_daemons_route \
     | min_internal_names_through_proxy | own_ip_deny_all_box_answers_published_port \
+    | port_publishes_on_listen_and_box_outlives_client \
     | proxy_refuses_like_direct | retired_surfaces_gone \
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes | two_named_vms_on_one_machine \
@@ -13798,6 +14639,7 @@ case "${1:-}" in
     echo "         linux_stock_install_runs_vm_boxes"
     echo "         hostnames_recover_and_two_daemons_route"
     echo "         min_internal_names_through_proxy own_ip_deny_all_box_answers_published_port"
+    echo "         port_publishes_on_listen_and_box_outlives_client"
     echo "         proxy_refuses_like_direct retired_surfaces_gone"
     echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
     echo "         two_named_vms_on_one_machine"
