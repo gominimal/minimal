@@ -1840,6 +1840,32 @@ mod tests {
     /// (loose tracking is the host's, never this table's to tighten), and
     /// the same admission in any other chain would admit replies a subtree
     /// never asked for.
+    /// The install replaces the table rather than adding to it: its batch
+    /// opens by declaring the table and deleting it, inside the one `nft -f`
+    /// transaction that re-declares it. That prelude is why re-running the
+    /// install reloads a table that is installed but not refusing, the
+    /// remedy [`Cause::TableNotEffective`] names; were the load ever made
+    /// add-only, that remedy would silently become a false one, so it is
+    /// pinned on the batch a host actually loads.
+    #[test]
+    fn rendered_ruleset_replaces_the_table_it_loads() {
+        let ruleset = rendered_ruleset();
+        let mut statements = ruleset
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'));
+        assert_eq!(
+            statements.next(),
+            Some("add table inet minimal_class"),
+            "the batch opens by declaring the table: {ruleset}"
+        );
+        assert_eq!(
+            statements.next(),
+            Some("delete table inet minimal_class"),
+            "and deletes it before re-declaring it, in the same transaction: {ruleset}"
+        );
+    }
+
     #[test]
     fn rendered_ruleset_admits_only_reply_direction_in_deny_subtree() {
         let ruleset = rendered_ruleset();
@@ -2728,7 +2754,7 @@ mod tests {
             "the command is the privileged step's install: {command}"
         );
         assert!(
-            command.starts_with("sudo "),
+            command.contains("sudo bash ./install-host-classifier.sh"),
             "the command is the one a person runs, spelled exactly: {command}"
         );
 

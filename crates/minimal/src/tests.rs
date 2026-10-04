@@ -475,6 +475,7 @@ fn twin_entry(
         project_path: path.map(|p| paths::HostAbsPath::try_new(p).unwrap()),
         status,
         git: None,
+        host_ip_enforcement: None,
         attrs: None,
     }
 }
@@ -1248,6 +1249,16 @@ fn forward_spec_rejects_out_of_range_and_malformed() {
     );
 }
 
+#[test]
+fn ingress_spec_rejects_box_port_zero() {
+    let err = parse_ingress_mapping("8080:0").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("port 0 is reserved"),
+        "box port 0 must be rejected: {msg}"
+    );
+}
+
 /// Regression: a config in the `.minimal/` layout must be detected so
 /// `activate` returns without prompting and never scaffolds over it.
 /// The old naive `join(MFILE_NAME)` check missed this path.
@@ -1277,6 +1288,44 @@ fn project_has_mfile_false_when_absent() {
     let dir = tempfile::tempdir().unwrap();
     let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
     assert!(!project_has_mfile(path));
+}
+
+/// `--sync none` drops a config only when one exists up the tree: a
+/// `minimal.toml` at the project root is detected from a nested subdir,
+/// so the notice fires for the case that would otherwise silently lose
+/// the project's packages, vars, patches and hooks.
+#[test]
+fn sync_none_drops_project_config_true_when_mfile_up_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(mfile::MFILE_NAME),
+        "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+    )
+    .unwrap();
+    let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+    let subdir = root.join("nested/deep");
+    std::fs::create_dir_all(&subdir).unwrap();
+
+    assert!(sync_none_drops_project_config(&subdir));
+    let notice = sync_none_notice(&subdir).expect("a config to drop gets a notice");
+    assert!(notice.contains("minimal.toml is not sent"), "{notice}");
+}
+
+/// With no mfile anywhere up the tree, `--sync none` has nothing to
+/// drop, so the notice stays silent. Anchored in `$HOME` for the same
+/// reason as [`resolve_upload_root_returns_input_when_no_mfile`]: the
+/// upward walk stops there, so "no mfile up the tree" is guaranteed.
+#[test]
+fn sync_none_drops_project_config_false_when_no_mfile() {
+    let Some(home) = std::env::home_dir() else {
+        return; // no HOME: no walk boundary to anchor the test to
+    };
+    let Ok(dir) = tempfile::tempdir_in(&home) else {
+        return; // can't create temp dir in HOME, such as on a read only file system
+    };
+    let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+    assert!(!sync_none_drops_project_config(path));
+    assert_eq!(sync_none_notice(path), None);
 }
 
 /// With no mfile anywhere up the tree, `resolve_upload_root` returns the
@@ -1910,10 +1959,19 @@ async fn ls_shows_vm_per_box() {
     // line says which surface its own names answer through — here fed
     // straight to the formatter, the way the verdict a configured host's
     // reads decide arrives at it, with the host daemon answering through
-    // its proxy and the named VM through native DNS.
+    // its proxy and the named VM through native DNS. NET-138's answerer row
+    // is per VM for the same reason's host half: each VM's own control
+    // socket read decides its own row, so a VM whose minvmd holds the
+    // machine's port says so while a sibling registered with another
+    // daemon names that holder instead — one `Holder` and one `Registered`
+    // here, fed the same way.
     let surfaces = vec![
         Some(crate::resolver::LiveSurface::Proxy),
         Some(crate::resolver::LiveSurface::Native),
+    ];
+    let answerers = vec![
+        Some(minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 }),
+        Some(minimald_rpc::ZoneAnswererStatus::Registered { port: 7_656 }),
     ];
     let mut out = Vec::new();
     format_ls_across_vms(
@@ -1924,6 +1982,7 @@ async fn ls_shows_vm_per_box() {
         },
         &listings,
         &surfaces,
+        &answerers,
     )
     .expect("rendering the two-VM listing");
     let table = String::from_utf8(out).expect("the listing is UTF-8");
@@ -1955,10 +2014,35 @@ async fn ls_shows_vm_per_box() {
         surface_line_of("alpha").contains("native DNS is the live name surface"),
         "the VM the hook routes to is named native:\n{table}"
     );
+    let answerer_row_of = |vm: &str| {
+        table
+            .lines()
+            .find(|l| l.starts_with("ZONE ANSWERER:") && l.contains(vm))
+            .unwrap_or_else(|| panic!("a ZONE ANSWERER line for {vm} in:\n{table}"))
+            .to_string()
+    };
+    assert!(
+        answerer_row_of("default").contains("this VM's minvmd holds it on 127.0.0.1:7656"),
+        "the VM whose minvmd holds the port says so, in its own row:\n{table}"
+    );
+    assert!(
+        answerer_row_of("alpha").contains("another VM host daemon holds it on 127.0.0.1:7656"),
+        "the registered VM names the holder, in its own row:\n{table}"
+    );
+    assert!(
+        !answerer_row_of("alpha").contains("this VM's minvmd holds it"),
+        "a VM registered with another daemon must not claim its own minvmd \
+         holds the port:\n{table}"
+    );
+    assert!(
+        !answerer_row_of("default").contains("another VM host daemon"),
+        "a holder must not be named as a sibling's registration:\n{table}"
+    );
 
     // One VM listed renders exactly the single-VM listing `min ls` has always
-    // printed — the surface line included, verdict and all: the column is a
-    // fact about a multi-VM host, not a new format.
+    // printed — the surface line included, verdict and all, and the VM's own
+    // answerer row with it: the column is a fact about a multi-VM host, not a
+    // new format.
     let single = &listings[1..];
     let mut delegated = Vec::new();
     format_ls_across_vms(
@@ -1969,6 +2053,7 @@ async fn ls_shows_vm_per_box() {
         },
         single,
         &surfaces[1..],
+        &answerers[1..],
     )
     .expect("rendering the single-VM listing");
     let mut direct = Vec::new();
@@ -1980,6 +2065,7 @@ async fn ls_shows_vm_per_box() {
         },
         &single[0].resp,
         surfaces[1],
+        answerers[1],
     )
     .expect("format_ls on the same listing");
     assert_eq!(
@@ -2001,6 +2087,7 @@ async fn ls_shows_vm_per_box() {
             json: true,
         },
         &listings,
+        &[],
         &[],
     )
     .expect("rendering the two-VM listing as JSON");
@@ -2210,6 +2297,50 @@ async fn a_stopped_vm_does_not_hold_a_listing() {
         elapsed < std::time::Duration::from_secs(1),
         "a stopped VM's stale socket must not charge the listing its \
          connect-retry window ({elapsed:?})"
+    );
+}
+
+/// The fallback listing's control-sock gate keys on the backend the daemon
+/// connection resolves through, never on `use_minvmd()` — the same rule every
+/// other VM-backed gate keys on: the flag is how Linux asks for the VM host,
+/// while macOS reaches it with no flag at all, so a gate keyed on the flag
+/// would find no control socket for exactly the host whose every invocation
+/// is VM-backed, and the one entry `min ls` falls back to there would carry
+/// no answerer state to read.
+#[test]
+fn fallback_listing_control_sock_keys_on_provider_kind() {
+    let state = tempfile::tempdir().expect("a temp minimal state dir");
+    let sock = state.path().join("ssh.sock");
+    // The unflagged invocation resolves through the platform's default
+    // backend, so the expectation is that backend's — `client_provider_kind`'s
+    // own reading, whatever host this runs on: on Linux the native backend
+    // hosts no VM host daemon, while macOS has no native backend at all and
+    // every invocation is minvmd-backed, flag or no flag.
+    let unflagged = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(state.path().to_path_buf()),
+        config_dir: None,
+        provider: None,
+        no_input: true,
+        vm: None,
+    };
+    assert_eq!(
+        fallback_control_sock(&unflagged, &sock).is_some(),
+        client::client_provider_kind(false) == paths::ProviderKind::Minvmd,
+        "an unflagged fallback carries a control socket exactly when the \
+         backend it resolves through is minvmd"
+    );
+    // `--provider local-minvmd` asks for the VM host whatever the platform's
+    // default backend is, so the fallback always resolves the control socket
+    // beside the daemon socket it just listed through.
+    let control = fallback_control_sock(&vm_globals(state.path(), None), &sock)
+        .expect("`--provider local-minvmd` always resolves a control socket");
+    assert_eq!(
+        control,
+        sock.parent()
+            .unwrap()
+            .join(minvmd::control::CONTROL_SOCK_FILE),
+        "the control socket sits beside the daemon socket the listing resolved"
     );
 }
 
@@ -2481,6 +2612,10 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
         VmListing {
             vm: vm.to_owned(),
             resp,
+            // A synthetic listing: no VM host daemon sits behind it, so
+            // there is no control socket to read a state from — the shape
+            // this render is fed, same as a listing that read none.
+            control_sock: None,
         }
     };
 
@@ -2505,6 +2640,7 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
             json: false,
         },
         &listings,
+        &[],
         &[],
     )
     .expect("rendering the two-VM listing");
@@ -2595,6 +2731,7 @@ async fn walked_proxy_port_reported_at_start_and_in_ls() {
                 json: false,
             },
             &native_resp,
+            None,
             None,
         )
         .expect("rendering the single-VM listing");

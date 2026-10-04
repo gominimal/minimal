@@ -39,6 +39,7 @@ mod tests {
             project_path: Some(paths::HostAbsPath::try_new(project).unwrap()),
             status: sessions::SessionStatus::Active,
             git: None,
+            host_ip_enforcement: None,
             attrs: None,
         }
     }

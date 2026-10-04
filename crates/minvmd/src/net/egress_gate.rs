@@ -110,6 +110,21 @@
 //! before they can become pins, and the infrastructure drop is the host's
 //! own, whatever the row.
 //!
+//! The Box Egress Proxy's listener is the third destination no row's rules
+//! decide (NET-134): the proxy is a **credentialed lane's** infrastructure —
+//! the one host-side listener a box reaches by declaring the upstream, not by
+//! allowing an address — so the listener, and the listener alone — TCP to
+//! [`switch::bep_host::PROXY_PORT`] at the proxy's address, one of §5.3's
+//! port-scoped openings — is admitted for a row that declared one, and every
+//! other frame to the proxy's address is refused for everything else, a
+//! deny-all row included
+//! (`egress-uncredentialed-proxy-destination`, [`PROXY_LANE_RULE`]). The
+//! decision reads the row's own declaration, never its rules: a lane is not
+//! an egress dimension, and nothing a box says inside the VM can grant one —
+//! the declaration travelled the host's registration, reduced to a fact in
+//! the row ([`BoxRecord::declares_credentialed_upstream`]), and the node
+//! plane's baseline set admits the proxy's address for no category at all.
+//!
 //! Fail-closed faces the guest; the gate itself is what the host is left
 //! holding, so it stays up where it can. An accept failure the host can ride
 //! out — a momentary fd or memory shortage, a connection that died before it
@@ -456,6 +471,24 @@ fn infrastructure_destination(
     ranges.rfc1918.iter().any(|cidr| cidr.contains(dst))
         && !allow.is_none_or(|list| list.iter().any(|cidr| cidr.contains(dst)))
 }
+
+/// The rule name for a frame headed to the Box Egress Proxy's address that
+/// the lane does not admit (NET-134): the proxy's listener is a credentialed
+/// lane's infrastructure — the one host-side destination a box reaches by
+/// *declaring* the upstream, never by allowing its address — and it is the
+/// listener the declaration opens, TCP to [`switch::bep_host::PROXY_PORT`],
+/// one of §5.3's port-scoped openings, not the address. So the frame is
+/// refused for every source that carries no lane — a row whose declaration
+/// named none, whatever its rules would say about the address; an
+/// unregistered source the announced interim admits, which concedes a row's
+/// absence and never the fabric; and the node plane, whose baseline set
+/// admits the address for no category at all — and for the one source that
+/// carries a lane, every frame at the address that is not the listener:
+/// another port, another protocol, either way past the box-to-host
+/// default-deny the lane never lifted. A row that declares the upstream is
+/// the one exception, admitted at the listener as infrastructure, beside its
+/// rules ([`GateAdmit::ProxyLane`]).
+const PROXY_LANE_RULE: &str = "egress-uncredentialed-proxy-destination";
 
 /// The rule name for the interim's admitted-unregistered source: a frame
 /// whose source is an address the plan could hand to a box but no published
@@ -1202,6 +1235,7 @@ async fn serve_connection(
                 body,
                 table,
                 limiter,
+                replies,
                 &forwards,
                 handshake_timeout,
                 phase,
@@ -1366,8 +1400,9 @@ async fn relay_frames(
 #[expect(
     clippy::too_many_arguments,
     reason = "the four socket halves, the framed request, the table, the limiter, the \
-              publish ledger and the drain bound are each a distinct input to one leg; \
-              grouping them would name the bundle without naming the members"
+              reply-flow tables, the publish ledger and the drain bound are each a \
+              distinct input to one leg; grouping them would name the bundle without \
+              naming the members"
 )]
 async fn relay_control(
     mut guest: Prefixed<OwnedReadHalf>,
@@ -1379,6 +1414,7 @@ async fn relay_control(
     body: usize,
     table: BoxTable,
     limiter: Arc<DropLimiter>,
+    replies: ReplyTables,
     forwards: &PublishedForwards,
     drain_timeout: Duration,
     phase: UnregisteredSourcePhase,
@@ -1457,7 +1493,9 @@ async fn relay_control(
     // retraction of it is keyed by, and an applied retraction's listener
     // leaves the ledger with it — the publication is gone. The note is taken
     // after the write: a forward the gate could not deliver published
-    // nothing, and attributes nothing.
+    // nothing, and attributes nothing. A retraction's note is read back, not
+    // dropped: the attribution it carried names the box whose records the
+    // publication earned, which end with the publication (below).
     match (verb, forward_listener(verb, &request)) {
         (ControlVerb::Expose, Some(listener)) => {
             // The publish's own two ends go to the ledger together: the
@@ -1469,12 +1507,41 @@ async fn relay_control(
             // answer half). The body is one the decision already admitted,
             // so the remote it read parses here too; a body that somehow did
             // not is left unnoted, which records nothing for it — fail
-            // closed, the same posture an unapplied publish has.
-            if let Some(inside) = published_inside(&request) {
-                forwards.note_published(listener, decision.request.switch_addr(), inside);
+            // closed, the same posture an unapplied publish has. The
+            // protocol is noted with them: the records the inside port earns
+            // are keyed by it, so a later retraction ends them under the
+            // protocol they were opened at, whatever its own body spells.
+            if let Some(inside) = published_inside(&request)
+                && let Some(proto) = published_protocol(&request)
+            {
+                forwards.note_published(listener, decision.request.switch_addr(), inside, proto);
             }
         }
-        (ControlVerb::Unexpose, Some(listener)) => forwards.note_retracted(listener),
+        (ControlVerb::Unexpose, Some(listener)) => {
+            // The retraction takes the publication's records with it: the
+            // records a publish's inside port earned are admissions *of*
+            // that publish, so they end in the same step the ledger drops
+            // the publish's attribution — the next frame the box sends back
+            // on one of them is decided by the rules, not by the record a
+            // publication that no longer stands opened. The records at the
+            // box's other published ports stay standing: a retraction ends
+            // a publication, never the box. The attribution and the protocol
+            // both come from the ledger, which noted them at the publish the
+            // records were opened under — never from the retraction's own
+            // spelling, which could name a protocol the publish did not —
+            // and which held them for exactly this: a retraction
+            // the ledger could not attribute was already refused, and a
+            // row the retraction ends nothing of simply has no entry to
+            // end. Two listeners can dial one inside port, and the records
+            // are keyed by protocol and inside port, not by listener: while
+            // another applied publish still dials the same port in the same
+            // protocol, the records are that publication's too, so they stay.
+            if let Some((addr, inside, proto)) = forwards.note_retracted(listener)
+                && !forwards.still_published(addr, inside, proto)
+            {
+                replies.end_port_at(addr, proto, inside);
+            }
+        }
         _ => {}
     }
     let mut response = tokio::spawn(copy_switch_to_guest(switch_rx, guest_tx));
@@ -1715,11 +1782,15 @@ struct ControlDecision {
 /// record opens.
 #[derive(Debug, Default)]
 struct PublishedForwards {
-    applied: Mutex<Vec<(Listener, [u8; 4], u16)>>,
+    applied: Mutex<Vec<AppliedPublish>>,
 }
 
 /// A forwarder listener: its loopback address and port.
 type Listener = ([u8; 4], u16);
+
+/// One applied publish in the ledger: its listener, the address it was
+/// applied at, the inside port its forward dials and the protocol it named.
+type AppliedPublish = (Listener, [u8; 4], u16, u8);
 
 /// How many applied publishes' attributions the ledger keeps.
 const PUBLISHED_FORWARDS_TRACKED: usize = 1024;
@@ -1732,28 +1803,40 @@ impl PublishedForwards {
         }
     }
 
-    /// Notes an applied publish: the address its listener was applied at and
-    /// the inside port its forward dials. The listener is keyed first —
+    /// Notes an applied publish: the address its listener was applied at,
+    /// the inside port its forward dials and the protocol it published. The listener is keyed first —
     /// gvproxy binds one forwarder per loopback listener, so a second publish
     /// for a held listener never becomes live — and the ledger is bounded
     /// oldest-first, so the honest handful never reaches the bound.
-    fn note_published(&self, listener: Listener, addr: [u8; 4], inside: u16) {
+    fn note_published(&self, listener: Listener, addr: [u8; 4], inside: u16, proto: u8) {
         let mut applied = self.lock();
-        if applied.iter().any(|(held, _, _)| *held == listener) {
+        if applied.iter().any(|(held, _, _, _)| *held == listener) {
             return;
         }
         if applied.len() >= PUBLISHED_FORWARDS_TRACKED {
             applied.remove(0);
         }
-        applied.push((listener, addr, inside));
+        applied.push((listener, addr, inside, proto));
     }
 
-    /// Drops the attribution an applied retraction's listener carried: the
-    /// publication is gone — its inside port stops opening reply-flow records
-    /// with it — and a later retraction of the same listener has nothing
-    /// left to name.
-    fn note_retracted(&self, listener: Listener) {
-        self.lock().retain(|(held, _, _)| *held != listener);
+    /// Drops the attribution an applied retraction's listener carried, and
+    /// hands it back: the publication is gone — its inside port stops
+    /// opening reply-flow records with it, and the ones it already opened
+    /// end with it ([`ReplyTables::end_port_at`], from [`relay_control`]) —
+    /// and a later retraction of the same listener has nothing left to
+    /// name. The listener is unique in the ledger ([`Self::note_published`]
+    /// holds one attribution per listener), so the one removal is the whole
+    /// retraction; `None` is a retraction the ledger had no attribution for,
+    /// which the decision already refused as unattributed.
+    fn note_retracted(&self, listener: Listener) -> Option<([u8; 4], u16, u8)> {
+        let mut applied = self.lock();
+        applied
+            .iter()
+            .position(|(held, _, _, _)| *held == listener)
+            .map(|at| {
+                let (_, addr, inside, proto) = applied.remove(at);
+                (addr, inside, proto)
+            })
     }
 
     /// The address the applied publish of `listener` was applied at, when
@@ -1761,8 +1844,8 @@ impl PublishedForwards {
     fn address_of(&self, listener: Listener) -> Option<[u8; 4]> {
         self.lock()
             .iter()
-            .find(|(held, _, _)| *held == listener)
-            .map(|(_, addr, _)| *addr)
+            .find(|(held, _, _, _)| *held == listener)
+            .map(|(_, addr, _, _)| *addr)
     }
 
     /// Whether an applied publish's forward dials `addr` at `port`: the
@@ -1777,10 +1860,20 @@ impl PublishedForwards {
     fn inside_published(&self, addr: [u8; 4], port: u16) -> bool {
         self.lock()
             .iter()
-            .any(|(_, at, inside)| *at == addr && *inside == port)
+            .any(|(_, at, inside, _)| *at == addr && *inside == port)
     }
 
-    fn lock(&self) -> MutexGuard<'_, Vec<(Listener, [u8; 4], u16)>> {
+    /// Whether an applied publish still dials `addr` at `inside` in
+    /// `proto`: a retraction's records stay while another listener's
+    /// publication stands at the same inside port, because they are its
+    /// records too ([`relay_control`]).
+    fn still_published(&self, addr: [u8; 4], inside: u16, proto: u8) -> bool {
+        self.lock()
+            .iter()
+            .any(|(_, at, port, p)| *at == addr && *port == inside && *p == proto)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<AppliedPublish>> {
         self.applied.lock().expect(
             "the ledger's lock is held only across a lookup or an update, never across a panic",
         )
@@ -2297,6 +2390,26 @@ fn published_inside(body: &[u8]) -> Option<u16> {
     .map(|(_, port)| port)
 }
 
+/// The protocol a publish names — the client's own two spellings, as the
+/// numbers the reply-flow records are keyed by — read from the same body the
+/// decision admitted, and noted in the ledger beside the publish's
+/// attribution ([`PublishedForwards::note_published`]): the records are keyed
+/// by protocol and port together, so the retraction ends
+/// ([`ReplyTables::end_port_at`]) the pair the publish opened them at, under
+/// the protocol the ledger holds rather than the one the retraction spells.
+/// `None` for a body that does not parse or a protocol the client does not
+/// spell — one the decision already refused, which is never applied.
+fn published_protocol(body: &[u8]) -> Option<u8> {
+    let protocol = serde_json_lenient::from_slice::<ExposeBody>(body)
+        .ok()?
+        .protocol;
+    match protocol.as_str() {
+        "tcp" => Some(egress::IPPROTO_TCP),
+        "udp" => Some(egress::IPPROTO_UDP),
+        _ => None,
+    }
+}
+
 /// Whether `addr` falls in [`RESERVED_LOCAL_RANGE`] — the block published
 /// addresses are granted from, read from the switch crate so the number
 /// every component shares stays the one number. The same membership rule
@@ -2609,6 +2722,18 @@ async fn relay_frames_to_switch(
                     limiter.warn_infrastructure(src, dst, dst_port);
                     continue;
                 }
+                Err(GateDrop::ProxyLane { src, dst, dst_port }) => {
+                    // The plan's diagnostics line wants the refusal to name the
+                    // box, not only its address: the row the frame's source
+                    // resolved to carries the name, when one did. The binding
+                    // keeps the row alive for the borrow — and with no row, the
+                    // interim-admitted source this is, the address the line
+                    // already names is all the identity there is.
+                    let record = table.by_source(src);
+                    let name = record.as_deref().map(BoxRecord::name);
+                    limiter.warn_proxy_lane(src, dst, dst_port, name);
+                    continue;
+                }
                 Err(dropped) => {
                     limiter.emit(summary.source(), dropped.rule());
                     continue;
@@ -2633,7 +2758,7 @@ async fn relay_frames_to_switch(
         // the daemon frameless and unpublishable for the rest of the VM's
         // life, over a shuttle close its control path rode out.
         let src = match admitted {
-            GateAdmit::Baseline | GateAdmit::Row => summary.source(),
+            GateAdmit::Baseline | GateAdmit::Row | GateAdmit::ProxyLane => summary.source(),
             GateAdmit::Unregistered { src } => Some(src),
         };
         if let Some(src) = src
@@ -2766,11 +2891,12 @@ impl UnregisteredSourcePhase {
 pub(crate) const UNREGISTERED_SOURCE_PHASE: UnregisteredSourcePhase =
     UnregisteredSourcePhase::Announced;
 
-/// What the gate decided one frame's admission by: which of the three ways in —
-/// the node-plane baseline set, a published namespace's own rules, or the
-/// announced interim's default for a source the plan could have leased but no
-/// row holds. The relay that feeds on this distinguishes the interim's admit
-/// for the one thing only it needs: a line that says it happened.
+/// What the gate decided one frame's admission by: which of the four ways in —
+/// the node-plane baseline set, a published namespace's own rules, a row's
+/// declared credentialed lane, or the announced interim's default for a source
+/// the plan could have leased but no row holds. The relay that feeds on this
+/// distinguishes the interim's admit for the one thing only it needs: a line
+/// that says it happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateAdmit {
     /// The node-plane baseline's compiled set admitted the frame: its source
@@ -2799,6 +2925,16 @@ enum GateAdmit {
         /// The source address no row holds.
         src: [u8; 4],
     },
+    /// The frame named the Box Egress Proxy's listener — TCP to
+    /// `bep_host::PROXY_PORT` at the proxy's address — and the source's row
+    /// declared a credentialed upstream (NET-134): the one admission the
+    /// row's compiled rules never made, because the proxy's listener is the
+    /// lane's own infrastructure — reached by declaring the upstream, not by
+    /// allowing an address — so a deny-all row's frame to the listener passes
+    /// where the same frame anywhere else on the host does not. The lane is
+    /// the row's own fact; nothing the guest says grants one, and nothing in
+    /// it opens the address's other ports or protocols.
+    ProxyLane,
 }
 
 /// The gate's reply-flow records (NET-040's answer half): one [`BoxReplies`]
@@ -2968,9 +3104,24 @@ impl ReplyTables {
             .flows
             .lock()
             .expect("the reply-flow table's lock is held only across one decision");
+        let before = flows.len();
         let outcome = flows.observe_inbound(reply_tuple_of(pkt), pkt.tcp_flags, now);
+        let recorded = usize::from(matches!(outcome, egress::InboundFlow::Recorded { .. }));
+        note_flows_ended(
+            record,
+            before + recorded - flows.len(),
+            "expired or closed by the client",
+        );
         match outcome {
             egress::InboundFlow::Recorded { filled } => {
+                tracing::debug!(
+                    switch_addr = %record.switch_addr(),
+                    namespace = %record.name(),
+                    port = pkt.dst.port(),
+                    client = %pkt.src,
+                    live = flows.len(),
+                    "recorded an inbound flow at the box's published port"
+                );
                 if entry.claim_first_record() {
                     tracing::info!(
                         switch_addr = %record.switch_addr(),
@@ -3024,7 +3175,10 @@ impl ReplyTables {
             .flows
             .lock()
             .expect("the reply-flow table's lock is held only across one decision");
-        flows.reply_admits(reply_tuple_of(pkt), pkt.tcp_flags, now)
+        let before = flows.len();
+        let admits = flows.reply_admits(reply_tuple_of(pkt), pkt.tcp_flags, now);
+        note_flows_ended(record, before - flows.len(), "expired or closed by the box");
+        admits
     }
 
     /// Retires the entries of the boxes whose traffic the relay that ended
@@ -3041,8 +3195,75 @@ impl ReplyTables {
             .lock()
             .expect("the reply-flow table's lock is held only across one decision");
         for src in sources {
-            boxes.remove(src);
+            if let Some(entry) = boxes.remove(src) {
+                let ended = entry
+                    .flows
+                    .lock()
+                    .expect("the reply-flow table's lock is held only across one decision")
+                    .len();
+                note_flows_ended(&entry.record, ended, "the box's row was withdrawn");
+            }
         }
+    }
+
+    /// Ends the box's records at one protocol and port — the records a
+    /// publication's retraction takes with its publication
+    /// ([`relay_control`]): they were opened only because the publish's
+    /// forward dialed that port, so they end now, in the same step the
+    /// ledger drops the publish's attribution, and not at the next sweep or
+    /// the row's next end — the next frame the box sends back on one of them
+    /// is decided by the rules, not by the record a publication that no
+    /// longer stands opened. The retracted publish's inside port is the
+    /// records' destination half, so the box's other published ports keep
+    /// theirs ([`egress::ReplyFlows::end_port`], the shared decision, retains
+    /// the records whose protocol or port differ), and a box no entry holds
+    /// has nothing to end.
+    pub(crate) fn end_port_at(&self, src: [u8; 4], proto: u8, port: u16) {
+        let Some(entry) = self.entry_of(src) else {
+            return;
+        };
+        let mut flows = entry
+            .flows
+            .lock()
+            .expect("the reply-flow table's lock is held only across one decision");
+        let before = flows.len();
+        flows.end_port(proto, port);
+        note_flows_ended(
+            &entry.record,
+            before - flows.len(),
+            "its publication was retracted",
+        );
+    }
+
+    /// How many inbound flows the gate holds records for, across every box —
+    /// the live-flow gauge a status surface reads beside the drop counters.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the status surface that reads it is a follow-up outside this gate; the \
+                      count is the tables' own length, live in every build"
+        )
+    )]
+    pub(crate) fn live_flows(&self) -> usize {
+        let boxes: Vec<_> = self
+            .inner
+            .boxes
+            .lock()
+            .expect("the reply-flow table's lock is held only across one decision")
+            .values()
+            .cloned()
+            .collect();
+        boxes
+            .iter()
+            .map(|entry| {
+                entry
+                    .flows
+                    .lock()
+                    .expect("the reply-flow table's lock is held only across one decision")
+                    .len()
+            })
+            .sum()
     }
 
     /// How many of the box's inbound flows have been refused at its
@@ -3095,6 +3316,21 @@ impl ReplyTables {
     }
 }
 
+/// The debug line for `ended` of the box's inbound-flow records leaving its
+/// table — a window that passed, a close, or a retraction — so a daemon log
+/// at debug reads each recorded flow's end beside its recording.
+fn note_flows_ended(record: &BoxRecord, ended: usize, why: &str) {
+    if ended > 0 {
+        tracing::debug!(
+            switch_addr = %record.switch_addr(),
+            namespace = %record.name(),
+            ended,
+            why,
+            "ended inbound-flow records"
+        );
+    }
+}
+
 /// The reply-flow identity one L4 packet's addressing spells, in the
 /// direction the packet itself traveled — the same key the in-guest relay's
 /// table builds, so the shared decision's reverse lookup means the same thing
@@ -3137,10 +3373,10 @@ fn reply_tuple_of(pkt: &dns_pins::L4Packet) -> egress::FlowTuple {
 /// so a row's `allow_subnets` admits nothing in it — RFC 1918 under an
 /// explicit allowance excepted — and the pin arm a name-declaring row earns
 /// for its undeclared destinations never reaches it. The order is the
-/// contract: the reply-flow record, then the control surface, then the source
-/// (a baseline-decided node frame, a row, or the phase's unknown-source
-/// decision), then the infrastructure set, then the row's rules, then the pin
-/// arm.
+/// contract: the reply-flow record, then the control surface, then the
+/// source's attribution (a baseline-decided node frame, a row, or the phase's
+/// unknown-source decision), then the infrastructure set, then the proxy
+/// lane, then the row's rules, then the pin arm.
 ///
 /// The reply-flow record goes ahead of the control-surface check because the
 /// answer to a host-published port's connection is a frame *to the gateway*:
@@ -3153,6 +3389,24 @@ fn reply_tuple_of(pkt: &dns_pins::L4Packet) -> egress::FlowTuple {
 /// them refused, whatever it dials. Nothing else moves — the lease check the
 /// shared verdict carries still governs every frame, and a destination no
 /// record names keeps every drop it ever took.
+///
+/// One destination is decided beside the rules instead of refused outright:
+/// the Box Egress Proxy's listener (NET-134), the third thing the frame's
+/// destination is checked against after the source's routing. The proxy's
+/// listener is a credentialed lane's infrastructure — a box reaches it by
+/// declaring the upstream, not by allowing its address — so the listener,
+/// TCP to `bep_host::PROXY_PORT`, is admitted for the one row that declared
+/// the lane, whatever its compiled rules say about the frame
+/// ([`GateAdmit::ProxyLane`]), and every other frame to the proxy's address
+/// is refused under [`PROXY_LANE_RULE`], whatever the source: a row that
+/// declared no upstream, a row that declared the lane but sent another
+/// port or another protocol, neither of which the declaration ever opened,
+/// an interim-admitted source with no row at all, and the node plane's
+/// baseline set, which holds the address for no category. The lane arm sits
+/// after the attribution on purpose: it reads the row the frame's source
+/// resolved to, so a frame wearing a source the table does not hold is the
+/// unknown-source refusal's, and a frame to the listener from an address no
+/// row owns never rides a lane it never declared.
 fn gate_verdict(
     summary: &FrameSummary,
     l4: Option<&dns_pins::L4Packet>,
@@ -3206,16 +3460,16 @@ fn gate_verdict(
     // decision and before the interim, so no allow-all row and no announced
     // concession can admit a frame at the switch's own address, and it reads
     // no phase at all, so it binds unchanged when the per-box default binds.
-    // The one frame it does not see is the reply the record above admitted:
-    // a forwarder's dial arrives at the box from the switch's own address,
-    // so the box's answer to it names the gateway — and that answer, the
-    // exact reverse of a flow this gate delivered toward the box's admitted
-    // port, is not a reach for the control surface but the half of a
-    // connection the host itself opened. The resolver carve-out falls
-    // through to the decision behind this check
-    // — the row's own rules or the phase — which still decides it, so the
-    // carve-out admits exactly what it admitted before, and the refusal adds
-    // a ceiling without moving any floor.
+    // The one frame this check never sees is the reply the record above
+    // admitted: a forwarder's dial arrives at the box from the switch's own
+    // address, so the box's answer to it names the gateway — and that
+    // answer, the exact reverse of a flow this gate delivered toward the
+    // box's published port, is not a reach for the control surface but the
+    // half of a connection the host itself opened. The resolver carve-out
+    // falls through to the decision behind this check — the row's own rules
+    // or the phase — which still decides it, so the carve-out admits
+    // exactly what it admitted before, and the refusal adds a ceiling
+    // without moving any floor.
     if summary.destination() == Some(table.gateway()) {
         let dst_port = summary.destination_port();
         let resolver_query = summary
@@ -3265,6 +3519,60 @@ fn gate_verdict(
             dst_port: summary.destination_port(),
         });
     }
+    // The Box Egress Proxy's listener, decided beside every rule (NET-134):
+    // the proxy is a credentialed lane's infrastructure — the one host-side
+    // listener a box reaches by declaring the upstream, never by allowing
+    // its address — so this is the one destination whose admission the
+    // frame rules cannot carry, decided from the row's own declaration the
+    // way the DNS name dimension is. What the declaration opens is the
+    // listener, one of §5.3's port-scoped openings: TCP to
+    // `bep_host::PROXY_PORT`, the port the proxy's acceptor listens at read
+    // from the stack that runs it, so the gate cannot drift from the
+    // listener it guards, over the protocol of the acceptor the relay leg
+    // pins too (`egress::PROXY_LISTENER_PROTOCOL`) — and the predicate
+    // itself is the one function the relay leg decides the same
+    // destination by (`egress::proxy_lane_admits`, handed the listener as
+    // `egress::ProxyListener::at` builds it), so the two legs admit the
+    // same frame or refuse it together by construction rather than by
+    // parallel spellings of one triple. A row that declared the lane
+    // is admitted here, whatever its rules would say about the address: a
+    // deny-all row included, because the credentials the proxy redeems are
+    // the lane's own and no egress rule of the box's says anything about
+    // them. Everything else at the address is refused under the
+    // box-to-host default-deny — a row that declared nothing (whatever its
+    // rules would have allowed at the address: a declared allowance is not
+    // a lane, the same way a `0.0.0.0/0` row admits no metadata service),
+    // a row that declared the lane but sent another port or another
+    // protocol, neither of which the declaration ever opened, an interim
+    // source the announced phase admits without a row, which concedes a
+    // row's absence, never the fabric, and the node row under the interim
+    // baseline, which is the allow-all the in-force enumeration replaces.
+    // The in-force baseline set needs no arm of its own: it never admits
+    // the address for any category, so its compiled rules refuse the frame
+    // where they refuse any undeclared destination.
+    if let Some(dst) = summary.destination()
+        && dst == table.subnet().box_egress_proxy_address().octets()
+    {
+        // minvmd is the one crate that sees both spellings of the listener's port.
+        const _: () = assert!(egress::PROXY_LISTENER_PORT == switch::bep_host::PROXY_PORT);
+        let listener = egress::ProxyListener::at(dst);
+        return match record.as_ref() {
+            Some(row)
+                if egress::proxy_lane_admits(
+                    row.declares_credentialed_upstream(),
+                    listener,
+                    summary,
+                ) =>
+            {
+                Ok(GateAdmit::ProxyLane)
+            }
+            _ => Err(GateDrop::ProxyLane {
+                src,
+                dst,
+                dst_port: summary.destination_port(),
+            }),
+        };
+    }
     let Some(record) = record else {
         return Ok(GateAdmit::Unregistered { src });
     };
@@ -3306,10 +3614,11 @@ fn gate_verdict(
 }
 
 /// Why the gate dropped a frame: the shared verdict's reason, or one of the
-/// three classes the host table adds — a source address no published
+/// four classes the host table adds — a source address no published
 /// namespace holds (NET-081's failure case), a frame the switch's own address
-/// would have received on a port nothing published answers, and a frame
-/// headed into the infrastructure deny set.
+/// would have received on a port nothing published answers, a frame headed
+/// into the infrastructure deny set, and a frame headed to the Box Egress
+/// Proxy's address the lane does not admit (NET-134).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateDrop {
     /// The shared frame verdict dropped it: the namespace's own rules, its
@@ -3340,6 +3649,21 @@ enum GateDrop {
         /// The port the frame named there, `0` when it carried none.
         dst_port: u16,
     },
+    /// The frame named the Box Egress Proxy's address and the lane does not
+    /// admit it (NET-134): its source carries no credentialed lane, or the
+    /// frame is headed somewhere at the address the declaration never
+    /// opened — another port, another protocol. The listener alone is the
+    /// lane's own, and it is not a destination any rules — rows', the
+    /// interim's, or the baseline set's — admit without one
+    /// ([`PROXY_LANE_RULE`]).
+    ProxyLane {
+        /// The source address the frame wore.
+        src: [u8; 4],
+        /// The proxy's address on the switch, the destination refused.
+        dst: [u8; 4],
+        /// The port the frame named there, `0` when it carried none.
+        dst_port: u16,
+    },
 }
 
 impl GateDrop {
@@ -3351,6 +3675,7 @@ impl GateDrop {
             Self::Infrastructure { .. } => INFRASTRUCTURE_RULE,
             Self::UnknownSource { .. } => UNKNOWN_SOURCE_RULE,
             Self::SwitchControlSurface { .. } => SWITCH_CONTROL_RULE,
+            Self::ProxyLane { .. } => PROXY_LANE_RULE,
         }
     }
 }
@@ -3576,6 +3901,49 @@ impl DropLimiter {
                     "dropped frames to infrastructure destinations from more distinct \
                      source addresses than the gate keeps a window per source for; one \
                      line per rule covers the rest",
+                );
+                true
+            }
+        }
+    }
+
+    /// Emits the warning for one frame headed to the Box Egress Proxy's
+    /// address that the lane does not admit (NET-134) — a source that
+    /// carries no credentialed lane, or a frame at the address that is not
+    /// the listener a lane opens: the same rate limit a drop's line answers
+    /// to, keyed by the source and the rule, and naming the destination and
+    /// the port the frame gave it — the line a host reads to learn which box
+    /// was reaching for the proxy, the box named by the row that holds its
+    /// source when one does, and the reason by the rule. Returns whether a
+    /// line was written.
+    fn warn_proxy_lane(
+        &self,
+        src: [u8; 4],
+        dst: [u8; 4],
+        dst_port: u16,
+        box_name: Option<&str>,
+    ) -> bool {
+        match self.should_warn_at(Some(src), PROXY_LANE_RULE, Instant::now()) {
+            WarnDecision::Silent => false,
+            WarnDecision::Named => {
+                tracing::warn!(
+                    source = %Ipv4Addr::from(src),
+                    destination = %Ipv4Addr::from(dst),
+                    port = dst_port,
+                    box = box_name,
+                    rule_matched = PROXY_LANE_RULE,
+                    "dropped a frame to the box egress proxy's address; the proxy's \
+                     listener is a credentialed lane's infrastructure, and this box's \
+                     declaration did not admit this frame",
+                );
+                true
+            }
+            WarnDecision::Overflow => {
+                tracing::warn!(
+                    rule_matched = PROXY_LANE_RULE,
+                    "dropped frames to the box egress proxy's address from more distinct \
+                     source addresses than the gate keeps a window per source for; one line \
+                     per rule covers the rest",
                 );
                 true
             }
@@ -4140,6 +4508,19 @@ pub(crate) mod test_support {
         request
     }
 
+    /// The forwarder's retraction verb, spelled as the CLI the guest runs
+    /// spells it. The body carries the listener being closed — the host
+    /// side's own "local" end — and the protocol that listener bound,
+    /// which is the number the reply-flow records below are keyed by.
+    pub(crate) fn unexpose_request(local: &str, protocol: &str) -> Vec<u8> {
+        let body = format!(r#"{{"local":"{local}","protocol":"{protocol}"}}"#);
+        let mut request =
+            b"POST /services/forwarder/unexpose HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        request.extend_from_slice(body.as_bytes());
+        request
+    }
+
     /// Opens one more guest connection on the harness's gate and completes the
     /// upgrade on it, returning the guest's end and the switch end the gate
     /// dialed for it: the shape [`gate_over`] builds for a gate's first
@@ -4339,7 +4720,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use sessions::EgressPolicy;
-    use sessions::core::egress::{DropReason, FrameFamily, FrameVerdict, Ipv4Cidr};
+    use sessions::core::egress::{DropReason, FrameFamily, FrameVerdict, InboundFlow, Ipv4Cidr};
     use switch::SwitchSubnet;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -4351,16 +4732,16 @@ mod tests {
         expect_frame, expect_silence, expect_teardown, expose_request, gate_connected,
         gate_connected_with_phase, gate_over, gate_over_control, gate_over_with,
         gate_over_with_node_baseline, gate_over_with_phase, ipv4_frame, ipv6_frame, read_within,
-        send_frame, wait_for_log,
+        send_frame, unexpose_request, wait_for_log,
     };
     use super::{
         AcceptFailure, CONNECT_REQUEST, CONTROL_VERBS, ControlVerb, DROP_WARN_MAX_TRACKED_PAIRS,
         DROP_WARN_MIN_INTERVAL, DropLimiter, EgressGate, GateAdmit, GateDrop, GuestSource,
         GuestSpeak, HANDSHAKE_TIMEOUT, MALFORMED_PUBLISH_RULE, MAX_HEAD, MAX_LIVE_RELAYS,
-        MAX_NAMED_TARGET, PublishedForwards, Record, ReplyTables, UNDECLARED_PUBLISH_RECORD_RULE,
-        UNDECLARED_RETRACT_RULE, UNREGISTERED_PUBLISH_RULE, UNREGISTERED_SOURCE_PHASE,
-        UNREGISTERED_SOURCE_RULE, UnregisteredSourcePhase, WarnDecision, accept_loop, dns_pins,
-        gate_verdict, max_frame, render_record, serve_connection,
+        MAX_NAMED_TARGET, PROXY_LANE_RULE, PublishedForwards, Record, ReplyTables,
+        UNDECLARED_PUBLISH_RECORD_RULE, UNDECLARED_RETRACT_RULE, UNREGISTERED_PUBLISH_RULE,
+        UNREGISTERED_SOURCE_PHASE, UNREGISTERED_SOURCE_RULE, UnregisteredSourcePhase, WarnDecision,
+        accept_loop, dns_pins, gate_verdict, max_frame, render_record, serve_connection,
     };
     use crate::box_registry::{BoxRegistration, BoxRegistry, BoxTable};
     use crate::net::baseline::{BaselineCategory, NodeBaselinePhase, NodePlaneBaseline};
@@ -5523,6 +5904,11 @@ mod tests {
             Some(2),
             "one record per admitted inbound flow, TCP and UDP alike"
         );
+        assert_eq!(
+            h.replies.live_flows(),
+            2,
+            "the live-flow gauge counts the same records across the gate's boxes"
+        );
 
         // The recording's bound, pinned from the outside: a dial at the
         // mapping's *external* end — the port the row declares, and the only
@@ -5823,6 +6209,1083 @@ mod tests {
         );
     }
 
+    /// NET-059's forwarder path, pinned at the decision itself: the
+    /// reply-flow record's admission runs ahead of every other check the
+    /// egress leg makes, so the box's answer to a connection the switch's
+    /// forwarder opened is admitted as a row's admit — flat, no rule
+    /// consulted — where the same frame without the record is refused twice
+    /// over. The forwarder's dial arrives NAT'd from the switch's own
+    /// address, so the answer names the gateway, the control-surface rule's
+    /// own target, and the row below is deny-all by destination besides:
+    /// only the record — opened by the dial the gate delivered toward the
+    /// mapping's inside port, the one port the publish's note bounds the
+    /// recording to ([`ReplyTables::observe_delivered`], the same shared
+    /// table every other inbound flow rides) — can carry it. The record
+    /// admits its exact reverse and nothing else: an answer to a client
+    /// port no recorded flow opened, and the box's answer from the
+    /// mapping's *external* end, both fall to the control-surface refusal
+    /// the row's rules never reach.
+    #[test]
+    fn gate_verdict_admits_forwarder_reply_from_admitted_port() {
+        let registry = BoxRegistry::new(SUBNET);
+        // Deny-all by destination, every protocol allowed as a dimension:
+        // no rule of this row's can admit the answer below, so the admit
+        // that carries it is the record's and nothing else's.
+        let record = registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: None,
+                    allow_subnets: Some(vec![]),
+                    allow_dns_hosts: None,
+                    deny_subnets: None,
+                }),
+        );
+        // The publish's note, taken as the applied publish takes it: the
+        // listener the switch binds and the inside port its forward dials —
+        // the port the recording is bounded by, pinned from the outside.
+        let forwards = PublishedForwards::new();
+        forwards.note_published(
+            ([127, 0, 0, 1], 8080),
+            LEASE,
+            18080,
+            super::egress::IPPROTO_TCP,
+        );
+        assert!(
+            forwards.inside_published(LEASE, 18080),
+            "the mapping's inside port is the port the recording is bounded by"
+        );
+
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let replies = ReplyTables::new();
+        let limiter = Arc::new(DropLimiter::new());
+
+        // One frame decided as the egress leg decides it: summarized and
+        // parsed exactly as the relay hands them over, against whichever
+        // table the attempt names — the one the dial filled, or the empty
+        // one a box's ingress never reached.
+        let decide = |replies: &ReplyTables, frame: &[u8]| {
+            let l4 = dns_pins::parse_ipv4_l4(frame)
+                .expect("the frame builder's IPv4 header always parses");
+            let summary = sessions::core::egress::summarize(frame);
+            gate_verdict(
+                &summary,
+                Some(&l4),
+                &table,
+                &baseline,
+                &pins,
+                replies,
+                UNREGISTERED_SOURCE_PHASE,
+            )
+        };
+
+        // The forwarder's dial: a bare SYN from the gateway — the source
+        // the forwarder's connections arrive NAT'd under — at the mapping's
+        // inside port. The ingress leg delivered it, and the shared table
+        // records the flow it delivered, by the same decision any other
+        // client's dial is recorded by.
+        let forwarder = SUBNET.gateway();
+        let dial = dns_pins::tests::tcp_frame(
+            forwarder,
+            40000,
+            Ipv4Addr::from(LEASE),
+            18080,
+            sessions::core::egress::TCP_SYN,
+        );
+        let dial_l4 =
+            dns_pins::parse_ipv4_l4(&dial).expect("the frame builder's IPv4 header always parses");
+        assert!(
+            matches!(
+                replies.observe_delivered(&record, &dial_l4, &limiter, Instant::now()),
+                Some(InboundFlow::Recorded { filled: false })
+            ),
+            "the forwarder's opening dial is the frame that records the flow"
+        );
+
+        // The box's answer — the exact reverse of the recorded flow — is
+        // admitted as the row's, though neither the row's deny-all nor the
+        // control-surface check is ever reached: the record answers first.
+        let answer = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(LEASE),
+            18080,
+            forwarder,
+            40000,
+            sessions::core::egress::TCP_SYN | sessions::core::egress::TCP_ACK,
+        );
+        assert_eq!(
+            decide(&replies, &answer),
+            Ok(GateAdmit::Row),
+            "the record admits the box's answer to the forwarder ahead of \
+             every other check, as a row's admit"
+        );
+
+        // The same frame with no record behind it is the control-surface
+        // refusal: the answer names the gateway, and no row's rules are
+        // consulted for it — the ceiling the record alone lifts.
+        assert_eq!(
+            decide(&ReplyTables::new(), &answer),
+            Err(GateDrop::SwitchControlSurface {
+                src: LEASE,
+                dst_port: 40000
+            }),
+            "without the record the same answer is refused at the switch's \
+             own address, before the row's deny-all is ever read"
+        );
+
+        // The record admits its exact reverse and nothing else: the box's
+        // answer to a client port no recorded flow opened, and its answer
+        // from the mapping's external end — the port the row declares,
+        // which no applied publish dials — are both refused the same way.
+        let unopened = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(LEASE),
+            18080,
+            forwarder,
+            39999,
+            sessions::core::egress::TCP_SYN | sessions::core::egress::TCP_ACK,
+        );
+        assert_eq!(
+            decide(&replies, &unopened),
+            Err(GateDrop::SwitchControlSurface {
+                src: LEASE,
+                dst_port: 39999
+            }),
+            "an answer to a client port no recorded flow opened is not the \
+             record's reverse"
+        );
+        let from_external = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(LEASE),
+            8080,
+            forwarder,
+            40000,
+            sessions::core::egress::TCP_SYN | sessions::core::egress::TCP_ACK,
+        );
+        assert_eq!(
+            decide(&replies, &from_external),
+            Err(GateDrop::SwitchControlSurface {
+                src: LEASE,
+                dst_port: 40000
+            }),
+            "an answer from the mapping's external end reverses no recorded \
+             flow: no publish dials that port"
+        );
+    }
+
+    /// The forwarder's reach is one-directional on the node row too: the
+    /// node proxy's published port answers the connections the switch's
+    /// forwarder opens, and the node's own connects toward the gateway are
+    /// refused whatever the table holds. The node row is allow-all — the
+    /// widest rules there are — so the control-surface rule is the only
+    /// floor beneath the proxy's answer to the gateway, and the record the
+    /// only thing that lifts it: the same frame, from the same proxy port,
+    /// is refused without a flow behind it, and so is a frame from the
+    /// answerer port the record's tuple never named. The resolver carve-out
+    /// is unchanged — a UDP query to the resolver's port still falls through
+    /// to the row's rules and passes, whatever the table holds.
+    #[test]
+    fn gate_verdict_refuses_gateway_dial_from_admitted_port_without_inbound_flow() {
+        let registry = BoxRegistry::new(SUBNET);
+        // The node row, as the run path registers it: allow-all, at the
+        // node's own address, with the proxy port admitted.
+        let node = registry.register_node_namespace(7654);
+        let node_addr = node.switch_addr().octets();
+        // The publish's note for the proxy port, taken as the applied
+        // publish takes it.
+        let forwards = PublishedForwards::new();
+        forwards.note_published(
+            ([127, 0, 0, 1], 7654),
+            node_addr,
+            7654,
+            super::egress::IPPROTO_TCP,
+        );
+        assert!(
+            forwards.inside_published(node_addr, 7654),
+            "the proxy port is the port the node's recording is bounded by"
+        );
+
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let replies = ReplyTables::new();
+        let limiter = Arc::new(DropLimiter::new());
+        let decide = |replies: &ReplyTables, frame: &[u8]| {
+            let l4 = dns_pins::parse_ipv4_l4(frame)
+                .expect("the frame builder's IPv4 header always parses");
+            let summary = sessions::core::egress::summarize(frame);
+            gate_verdict(
+                &summary,
+                Some(&l4),
+                &table,
+                &baseline,
+                &pins,
+                replies,
+                UNREGISTERED_SOURCE_PHASE,
+            )
+        };
+
+        // The node's own connect toward the gateway, from the proxy port
+        // itself: refused under the control-surface rule, and the table
+        // holds no entry — the node's own egress records nothing.
+        let own_connect = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(node_addr),
+            7654,
+            SUBNET.gateway(),
+            50000,
+            sessions::core::egress::TCP_SYN,
+        );
+        assert_eq!(
+            decide(&replies, &own_connect),
+            Err(GateDrop::SwitchControlSurface {
+                src: node_addr,
+                dst_port: 50000
+            }),
+            "the node's own connect to the gateway is refused, no record \
+             notwithstanding"
+        );
+        assert_eq!(
+            replies.record_count_of(node_addr),
+            None,
+            "a box's own egress records nothing: only the ingress leg records"
+        );
+
+        // The forwarder's dial at the proxy port — the connect a host
+        // request through the node's published proxy takes — records, and
+        // the proxy's answer passes as the row's admit.
+        let dial = dns_pins::tests::tcp_frame(
+            SUBNET.gateway(),
+            51000,
+            Ipv4Addr::from(node_addr),
+            7654,
+            sessions::core::egress::TCP_SYN,
+        );
+        let dial_l4 =
+            dns_pins::parse_ipv4_l4(&dial).expect("the frame builder's IPv4 header always parses");
+        assert!(
+            matches!(
+                replies.observe_delivered(&node, &dial_l4, &limiter, Instant::now()),
+                Some(InboundFlow::Recorded { filled: false })
+            ),
+            "the forwarder's dial at the proxy port is the frame that records"
+        );
+        let answer = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(node_addr),
+            7654,
+            SUBNET.gateway(),
+            51000,
+            sessions::core::egress::TCP_SYN | sessions::core::egress::TCP_ACK,
+        );
+        assert_eq!(
+            decide(&replies, &answer),
+            Ok(GateAdmit::Row),
+            "the node proxy's answer to the forwarder is the record's admit, \
+             flat past the row's own allow-all"
+        );
+
+        // Nothing else from the node toward the gateway passes: a fresh
+        // connect from the proxy port to another port, and a frame from
+        // the answerer port, are both refused — the record admits its exact
+        // reverse and nothing else, the node's allow-all notwithstanding.
+        let fresh_connect = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(node_addr),
+            7654,
+            SUBNET.gateway(),
+            50001,
+            sessions::core::egress::TCP_SYN,
+        );
+        assert_eq!(
+            decide(&replies, &fresh_connect),
+            Err(GateDrop::SwitchControlSurface {
+                src: node_addr,
+                dst_port: 50001
+            }),
+            "the record does not license the node's own reaches to other ports"
+        );
+        let from_answerer = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(node_addr),
+            7656,
+            SUBNET.gateway(),
+            51000,
+            sessions::core::egress::TCP_ACK,
+        );
+        assert_eq!(
+            decide(&replies, &from_answerer),
+            Err(GateDrop::SwitchControlSurface {
+                src: node_addr,
+                dst_port: 51000
+            }),
+            "the answerer port is not the record's reverse: the record's \
+             tuple names the proxy port"
+        );
+
+        // The resolver carve-out, unchanged: a UDP query to the gateway's
+        // resolver port falls through the control-surface check to the
+        // row's own rules and passes, whatever the table holds.
+        let query = dns_pins::tests::udp_payload_frame(
+            Ipv4Addr::from(node_addr),
+            40000,
+            SUBNET.gateway(),
+            53,
+            b"resolve this",
+        );
+        assert_eq!(
+            decide(&replies, &query),
+            Ok(GateAdmit::Row),
+            "the resolver carve-out falls through to the row's rules, as before"
+        );
+    }
+
+    /// The forwarder's records live under the shared table's own windows —
+    /// no window of the forwarder's own. A TCP record is refreshed by the
+    /// last frame either way, and the record that goes quiet past the
+    /// shared idle cap is removed by the very lookup that would have
+    /// admitted it, so the answer that passed a moment ago is the
+    /// control-surface refusal now — the honest consequence shown at the
+    /// decision the gate itself runs, which reads the real clock and so
+    /// cannot be handed one here. The bound is per flow, never per box:
+    /// the forwarder's next dial records again. And the box's own end —
+    /// the relay's connection end — retires the entry whole, so the next
+    /// dial a re-attached box receives answers from nothing.
+    #[test]
+    fn forwarder_flow_expires_and_table_is_bounded() {
+        let registry = BoxRegistry::new(SUBNET);
+        let record = registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: None,
+                    allow_subnets: Some(vec![]),
+                    allow_dns_hosts: None,
+                    deny_subnets: None,
+                }),
+        );
+        let forwards = PublishedForwards::new();
+        forwards.note_published(
+            ([127, 0, 0, 1], 8080),
+            LEASE,
+            18080,
+            super::egress::IPPROTO_TCP,
+        );
+        assert!(
+            forwards.inside_published(LEASE, 18080),
+            "the mapping's inside port is the port the recording is bounded by"
+        );
+
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let replies = ReplyTables::new();
+        let limiter = Arc::new(DropLimiter::new());
+        let decide = |replies: &ReplyTables, frame: &[u8]| {
+            let l4 = dns_pins::parse_ipv4_l4(frame)
+                .expect("the frame builder's IPv4 header always parses");
+            let summary = sessions::core::egress::summarize(frame);
+            gate_verdict(
+                &summary,
+                Some(&l4),
+                &table,
+                &baseline,
+                &pins,
+                replies,
+                UNREGISTERED_SOURCE_PHASE,
+            )
+        };
+
+        // The whole proof runs on one hand-held clock — the same decision,
+        // the table's own, at the instants it would read — because the
+        // expiry is a window, and five real minutes of a test is not a
+        // proof.
+        let t0 = Instant::now();
+        let forwarder = SUBNET.gateway();
+        let dial = dns_pins::tests::tcp_frame(
+            forwarder,
+            40000,
+            Ipv4Addr::from(LEASE),
+            18080,
+            sessions::core::egress::TCP_SYN,
+        );
+        let dial_l4 =
+            dns_pins::parse_ipv4_l4(&dial).expect("the frame builder's IPv4 header always parses");
+        assert!(
+            matches!(
+                replies.observe_delivered(&record, &dial_l4, &limiter, t0),
+                Some(InboundFlow::Recorded { filled: false })
+            ),
+            "the forwarder's dial records under the shared windows"
+        );
+
+        let answer = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(LEASE),
+            18080,
+            forwarder,
+            40000,
+            sessions::core::egress::TCP_SYN | sessions::core::egress::TCP_ACK,
+        );
+        let answer_l4 = dns_pins::parse_ipv4_l4(&answer)
+            .expect("the frame builder's IPv4 header always parses");
+        // The conversation's first answer is admitted, and refreshes the
+        // record: TCP's window runs from the last frame either way.
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(
+            replies.reply_admits(&record, &answer_l4, t1),
+            "the answer admits and refreshes the record"
+        );
+
+        // The idle cap passes with no frame after t1: the next lookup
+        // removes the expired record and admits nothing — the table is
+        // bounded by the conversation it was opened for, and the record is
+        // gone, not merely refused.
+        let expired = t1 + sessions::core::egress::REPLY_TCP_IDLE_CAP + Duration::from_secs(1);
+        assert!(
+            !replies.reply_admits(&record, &answer_l4, expired),
+            "the record is gone with the conversation that went quiet"
+        );
+        assert_eq!(
+            replies.record_count_of(LEASE),
+            Some(0),
+            "the expired record is removed by the lookup that refused it"
+        );
+
+        // The honest consequence at the decision the gate runs, which reads
+        // the real clock: the answer that passed a moment ago is refused
+        // now, because the record really is gone.
+        assert_eq!(
+            decide(&replies, &answer),
+            Err(GateDrop::SwitchControlSurface {
+                src: LEASE,
+                dst_port: 40000
+            }),
+            "the same answer is the control-surface refusal once its record \
+             has expired"
+        );
+
+        // The bound is per flow, never per box: the forwarder's next dial
+        // records again, and its answer passes again.
+        let second_dial = dns_pins::tests::tcp_frame(
+            forwarder,
+            40001,
+            Ipv4Addr::from(LEASE),
+            18080,
+            sessions::core::egress::TCP_SYN,
+        );
+        let second_dial_l4 = dns_pins::parse_ipv4_l4(&second_dial)
+            .expect("the frame builder's IPv4 header always parses");
+        assert!(
+            matches!(
+                replies.observe_delivered(&record, &second_dial_l4, &limiter, Instant::now()),
+                Some(InboundFlow::Recorded { filled: false })
+            ),
+            "a fresh dial opens a fresh record: the box is not barred by its \
+             quiet flow's expiry"
+        );
+        let second_answer = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(LEASE),
+            18080,
+            forwarder,
+            40001,
+            sessions::core::egress::TCP_SYN | sessions::core::egress::TCP_ACK,
+        );
+        assert_eq!(
+            decide(&replies, &second_answer),
+            Ok(GateAdmit::Row),
+            "the forwarder's next conversation answers as the first did"
+        );
+
+        // The box's own end retires the entry whole — the same event that
+        // withdraws the row — so the next dial a re-attached box receives
+        // answers from nothing.
+        replies.retire(&[LEASE]);
+        assert_eq!(
+            replies.record_count_of(LEASE),
+            None,
+            "the relay's end retires the entry whole, records and all"
+        );
+    }
+
+    /// The cap the shared table keeps fails closed on the forwarder path: a
+    /// second forwarder dial at a box whose reply-flow table is full is
+    /// refused *at ingress* — the connect fails, the frame never reaches
+    /// the box — and the refusal is counted per box and said once, while
+    /// the recorded flow keeps refreshing and keeps answering. Nothing is
+    /// evicted to make room ([`egress::ReplyFlows`] refuses at the cap
+    /// rather than evicting a live one), and the refused flow's answer is
+    /// refused in turn: no record was opened for it to reverse.
+    #[tokio::test]
+    async fn forwarder_flow_table_full_refuses_new_flow() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: None,
+                    allow_subnets: Some(vec![]),
+                    allow_dns_hosts: None,
+                    deny_subnets: None,
+                }),
+        );
+        let publish = expose_request("127.0.0.1:8080", "100.64.0.9:18080", "tcp");
+        let h = gate_over_control(registry, publish).await;
+        let (mut guest, mut switch) = connect_over(&h).await;
+
+        // The cap, shrunk to the one flow the box is about to hold: the
+        // hook the relay proofs shrink by, so the proof does not hold a
+        // thousand records first.
+        let row = h
+            .table
+            .by_source(LEASE)
+            .expect("the box's row is registered");
+        h.replies.shrink_cap_of(&row, 1);
+
+        // The first forwarder dial records and fills the table — the
+        // once-per-box line says the transition — and its answer passes.
+        let forwarder = SUBNET.gateway();
+        let first = dns_pins::tests::tcp_frame(
+            forwarder,
+            40000,
+            Ipv4Addr::from(LEASE),
+            18080,
+            sessions::core::egress::TCP_SYN,
+        );
+        send_frame(&mut switch, &first).await;
+        assert_eq!(
+            expect_frame(&mut guest).await,
+            first,
+            "the gate delivers the first forwarder dial toward the box's \
+             published port"
+        );
+        wait_for_log(&h.log, "the box's reply-flow table has filled").await;
+        assert_eq!(
+            h.replies.record_count_of(LEASE),
+            Some(1),
+            "the one flow the cap holds is the first forwarder's"
+        );
+        let answer = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(LEASE),
+            18080,
+            forwarder,
+            40000,
+            sessions::core::egress::TCP_SYN | sessions::core::egress::TCP_ACK,
+        );
+        send_frame(&mut guest, &answer).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            answer,
+            "the box's answer to the recorded flow passes at the cap"
+        );
+
+        // The second forwarder dial is refused at the cap: the frame is not
+        // delivered — the client's connect fails rather than the box's
+        // session — and the frame behind it on the same leg is, so the
+        // refusal is a decision, not a loss. The refusal is the per-box
+        // counter a status surface reads, and the live record is kept, not
+        // evicted for the refused flow: the cap fails closed.
+        let second = dns_pins::tests::tcp_frame(
+            forwarder,
+            40001,
+            Ipv4Addr::from(LEASE),
+            18080,
+            sessions::core::egress::TCP_SYN,
+        );
+        send_frame(&mut switch, &second).await;
+        let noise = arp_frame(forwarder.octets());
+        send_frame(&mut switch, &noise).await;
+        assert_eq!(
+            expect_frame(&mut guest).await,
+            noise,
+            "the refused dial never reached the box; the frame behind it did"
+        );
+        wait_for_log(
+            &h.log,
+            "refused an inbound flow at the box's reply-flow cap",
+        )
+        .await;
+        assert_eq!(
+            h.replies.refused_at_cap_of(LEASE),
+            Some(1),
+            "the refusal at the cap is the per-box counter a status surface \
+             reads"
+        );
+        assert_eq!(
+            h.replies.record_count_of(LEASE),
+            Some(1),
+            "the live record is kept, not evicted for the refused flow — the \
+             cap fails closed"
+        );
+
+        // The refused flow's answer is refused in turn — no record was
+        // opened for it — while the live flow's answer still passes: the
+        // cap protects the recorded conversation, at the cost of the new
+        // one.
+        let refused_answer = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(LEASE),
+            18080,
+            forwarder,
+            40001,
+            sessions::core::egress::TCP_SYN | sessions::core::egress::TCP_ACK,
+        );
+        send_frame(&mut guest, &refused_answer).await;
+        send_frame(&mut guest, &answer).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            answer,
+            "the refused flow's answer never arrived; the live flow's did"
+        );
+        expect_silence(&mut switch).await;
+    }
+
+    /// The retraction takes the publication's records with it. Two mappings
+    /// published on one box, two forwarder dials recorded: the unexpose of
+    /// the first mapping ends the records *its* publish's inside port
+    /// earned, in the same step the ledger drops the publication's
+    /// attribution, and the other mapping's record stands — the count is
+    /// the purge's own evidence, read through the same table the frame
+    /// stream decides by.
+    ///
+    /// The retraction is applied under the interim, because the row that
+    /// held the mapping was withdrawn first: a retraction at a live row's
+    /// address is refused until the row's runtime-published set exists
+    /// (NET-016/017), so the drive withdraws the row — and says plainly
+    /// that in today's tree the row's absence refuses the box's answers on
+    /// its own, ahead of any record: the *frame-level* difference the purge
+    /// makes is the next task's to see, the day a live row's published set
+    /// can be non-empty. What this proof pins is the record-level half —
+    /// the one thing this retraction changed — and that the other
+    /// mapping's record survived it.
+    #[tokio::test]
+    async fn forwarder_reply_dropped_after_admitted_port_withdrawn() {
+        let registry = BoxRegistry::new(SUBNET);
+        // The handle the withdrawal below is spoken through: a clone of the
+        // same registry the gate decides by.
+        let handle = registry.clone();
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080, 8081])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: None,
+                    allow_subnets: Some(vec![]),
+                    allow_dns_hosts: None,
+                    deny_subnets: None,
+                }),
+        );
+        // Both mappings published, as the daemon's own client spells them:
+        // the external ends the row declares and the inside ends their
+        // forwards dial.
+        let first_publish = expose_request("127.0.0.1:8080", "100.64.0.9:18080", "tcp");
+        let h = gate_over_control(registry, first_publish).await;
+        let (mut control_guest, mut control_switch) = connect_control(&h).await;
+        let second_publish = expose_request("127.0.0.1:8081", "100.64.0.9:18081", "tcp");
+        control_guest
+            .write_all(&second_publish)
+            .await
+            .expect("writing the second mapping's publish");
+        let mut spoken = vec![0u8; second_publish.len()];
+        read_within(&mut control_switch, &mut spoken).await;
+        assert_eq!(
+            spoken, second_publish,
+            "the gate forwards the second mapping's publish verbatim"
+        );
+
+        // The frame connection the dials and answers ride.
+        let (mut guest, mut switch) = connect_over(&h).await;
+
+        // Two forwarder dials, one at each mapping's inside port: two
+        // records, one per admitted flow, and both answers pass while both
+        // publications stand.
+        let forwarder = SUBNET.gateway();
+        let first_dial = dns_pins::tests::tcp_frame(
+            forwarder,
+            40000,
+            Ipv4Addr::from(LEASE),
+            18080,
+            sessions::core::egress::TCP_SYN,
+        );
+        let second_dial = dns_pins::tests::tcp_frame(
+            forwarder,
+            40001,
+            Ipv4Addr::from(LEASE),
+            18081,
+            sessions::core::egress::TCP_SYN,
+        );
+        send_frame(&mut switch, &first_dial).await;
+        assert_eq!(
+            expect_frame(&mut guest).await,
+            first_dial,
+            "the gate delivers the first mapping's dial"
+        );
+        send_frame(&mut switch, &second_dial).await;
+        assert_eq!(
+            expect_frame(&mut guest).await,
+            second_dial,
+            "the gate delivers the second mapping's dial"
+        );
+        assert_eq!(
+            h.replies.record_count_of(LEASE),
+            Some(2),
+            "one record per published mapping the forwarder dialed"
+        );
+        let first_answer = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(LEASE),
+            18080,
+            forwarder,
+            40000,
+            sessions::core::egress::TCP_SYN | sessions::core::egress::TCP_ACK,
+        );
+        let second_answer = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(LEASE),
+            18081,
+            forwarder,
+            40001,
+            sessions::core::egress::TCP_SYN | sessions::core::egress::TCP_ACK,
+        );
+        send_frame(&mut guest, &first_answer).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            first_answer,
+            "the first mapping's answer passes while its publication stands"
+        );
+        send_frame(&mut guest, &second_answer).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            second_answer,
+            "the second mapping's answer passes while its publication stands"
+        );
+
+        // The withdrawal that makes the retraction applicable — and that
+        // retires nothing of the reply-flow tables: only a connection's
+        // end does, and the connections here are alive.
+        handle.withdraw(Ipv4Addr::from(LEASE));
+        assert_eq!(
+            h.replies.record_count_of(LEASE),
+            Some(2),
+            "the row's withdrawal alone retires nothing: the connections are \
+             alive"
+        );
+
+        // The retraction of the first mapping, spoken as the client spells
+        // it: applied under the interim — the once-per-address line says
+        // so — and forwarded verbatim, and the records its publication
+        // earned end in the same step.
+        let (mut retract_guest, mut retract_switch) = connect_control(&h).await;
+        let retraction = unexpose_request("127.0.0.1:8080", "tcp");
+        retract_guest
+            .write_all(&retraction)
+            .await
+            .expect("writing the first mapping's retraction");
+        let mut spoken = vec![0u8; retraction.len()];
+        read_within(&mut retract_switch, &mut spoken).await;
+        assert_eq!(
+            spoken, retraction,
+            "the gate forwards the applied retraction verbatim"
+        );
+        wait_for_log(
+            &h.log,
+            "applied a switch request at an in-plan address no published \
+             namespace holds",
+        )
+        .await;
+
+        // The purge, read through the table the frame stream decides by:
+        // the retracted mapping's record is gone, the other mapping's
+        // stands — a retraction ends a publication, never a box.
+        assert_eq!(
+            h.replies.record_count_of(LEASE),
+            Some(1),
+            "the retraction ended the records its publication earned, and \
+             retained the other mapping's"
+        );
+
+        // The next answer on the retracted port does not arrive. Said
+        // plainly, because this proof owes it: the withdrawal that made
+        // the retraction applicable refuses this answer on its own — no
+        // row holds the source, so the record lookup never runs and the
+        // control-surface rule decides — so the *frame-level* difference
+        // the purge makes is not here to be seen in today's tree, and will
+        // be the day a live row's published set can be non-empty
+        // (NET-016/017's listen-publishing). The count above is the
+        // purge's own evidence, the one thing this retraction changed.
+        send_frame(&mut guest, &first_answer).await;
+        let marker = arp_frame(LEASE);
+        send_frame(&mut guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            marker,
+            "the answer on the retracted port never arrived; the marker did"
+        );
+        expect_silence(&mut switch).await;
+    }
+
+    /// The SYN-only rule on the forwarder path: a record is opened only by
+    /// an *opening* packet at the published inside port, so the gateway's
+    /// mid-stream segment at that port — delivered, as all ingress the
+    /// box's ingress admits is — opens nothing, and neither does a SYN at
+    /// the mapping's external end, which no applied publish dials. The
+    /// forwarder's own SYN records, its answer passes, and the flow's end
+    /// is read on the answer side: the box's FIN is admitted *and* ends
+    /// the record — the close is part of the conversation — so nothing
+    /// the box sends on the flow after it is a reply the record admits.
+    #[tokio::test]
+    async fn forwarder_flow_not_adopted_mid_stream() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_egress_policy(EgressPolicy {
+                    allow_protocols: None,
+                    allow_subnets: Some(vec![]),
+                    allow_dns_hosts: None,
+                    deny_subnets: None,
+                }),
+        );
+        let publish = expose_request("127.0.0.1:8080", "100.64.0.9:18080", "tcp");
+        let h = gate_over_control(registry, publish).await;
+        let (mut guest, mut switch) = connect_over(&h).await;
+
+        let forwarder = SUBNET.gateway();
+        // The gateway's mid-stream segment at the published inside port:
+        // delivered like any ingress frame, and it opens nothing — only an
+        // opening packet records, so no amount of traffic the box never
+        // answered a connect of can mint the admission an answer needs.
+        let mid_stream = dns_pins::tests::tcp_frame(
+            forwarder,
+            40000,
+            Ipv4Addr::from(LEASE),
+            18080,
+            sessions::core::egress::TCP_ACK,
+        );
+        send_frame(&mut switch, &mid_stream).await;
+        assert_eq!(
+            expect_frame(&mut guest).await,
+            mid_stream,
+            "the mid-stream segment is delivered toward the box's published port"
+        );
+        assert_eq!(
+            h.replies.record_count_of(LEASE),
+            Some(0),
+            "a mid-stream segment opens no record: only an opening packet does"
+        );
+
+        // A SYN at the mapping's external end — the port the row declares,
+        // which no applied publish dials — is delivered too, and records
+        // nothing: the recording's bound is the publish's inside port.
+        let external_dial = dns_pins::tests::tcp_frame(
+            forwarder,
+            40002,
+            Ipv4Addr::from(LEASE),
+            8080,
+            sessions::core::egress::TCP_SYN,
+        );
+        send_frame(&mut switch, &external_dial).await;
+        assert_eq!(
+            expect_frame(&mut guest).await,
+            external_dial,
+            "the external-end dial is delivered like any ingress frame"
+        );
+        assert_eq!(
+            h.replies.record_count_of(LEASE),
+            Some(0),
+            "a dial at the mapping's external end opens no record: no publish \
+             dials it"
+        );
+
+        // The forwarder's own SYN at the inside port records, and its
+        // answer passes — the only thing that changed is that the gate
+        // delivered the opening of the flow the answer reverses.
+        let dial = dns_pins::tests::tcp_frame(
+            forwarder,
+            40000,
+            Ipv4Addr::from(LEASE),
+            18080,
+            sessions::core::egress::TCP_SYN,
+        );
+        send_frame(&mut switch, &dial).await;
+        assert_eq!(
+            expect_frame(&mut guest).await,
+            dial,
+            "the forwarder's opening dial is delivered toward the box's \
+             published port"
+        );
+        assert_eq!(
+            h.replies.record_count_of(LEASE),
+            Some(1),
+            "the bare SYN at the published inside port is the one frame that \
+             records"
+        );
+        let answer = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(LEASE),
+            18080,
+            forwarder,
+            40000,
+            sessions::core::egress::TCP_SYN | sessions::core::egress::TCP_ACK,
+        );
+        send_frame(&mut guest, &answer).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            answer,
+            "the box's answer to the flow the SYN opened passes"
+        );
+
+        // The box's FIN on the flow is admitted and ends the record — the
+        // close passes, and the frame behind it does not: the flow is
+        // over, and the box's next frame on it is new traffic the rules
+        // decide.
+        let close = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(LEASE),
+            18080,
+            forwarder,
+            40000,
+            sessions::core::egress::TCP_FIN,
+        );
+        send_frame(&mut guest, &close).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            close,
+            "the box's FIN on the recorded flow passes, and ends the record"
+        );
+        assert_eq!(
+            h.replies.record_count_of(LEASE),
+            Some(0),
+            "the FIN ended the record it closed"
+        );
+        send_frame(&mut guest, &answer).await;
+        let marker = arp_frame(LEASE);
+        send_frame(&mut guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            marker,
+            "the frame behind the FIN never arrived; the marker did"
+        );
+        expect_silence(&mut switch).await;
+    }
+
+    /// The e2e case's unit of behavior, at relay level: on a VM-backed host
+    /// a host request through the node's published hostname proxy dials the
+    /// proxy port, and the node proxy's answer to the forwarder reaches
+    /// the switch — the record the dial earned, the same shared decision
+    /// every other inbound flow rides. Nothing else from the node toward
+    /// the gateway passes: the node's own connect from the proxy port is
+    /// refused without a flow behind it, and so is a frame from the
+    /// answerer port the record's tuple never named. The flow's close is
+    /// admitted and ends the record, so the frame behind it is refused.
+    #[tokio::test]
+    async fn node_proxy_reply_to_forwarder_reaches_switch() {
+        let registry = BoxRegistry::new(SUBNET);
+        let node = registry.register_node_namespace(7654);
+        let node_addr = node.switch_addr().octets();
+        // The proxy port published at the node's own address, as the
+        // daemon's client spells it: the row holds the port, so the publish
+        // applies to it.
+        let publish = expose_request(
+            "127.0.0.1:7654",
+            &format!("{}:7654", SUBNET.daemon_ip()),
+            "tcp",
+        );
+        let h = gate_over_control(registry, publish).await;
+        let (mut guest, mut switch) = connect_over(&h).await;
+
+        // The forwarder's dial at the proxy port — the connect a host
+        // request through the published proxy takes — is delivered toward
+        // the node and records the flow it delivered.
+        let forwarder = SUBNET.gateway();
+        let dial = dns_pins::tests::tcp_frame(
+            forwarder,
+            51000,
+            Ipv4Addr::from(node_addr),
+            7654,
+            sessions::core::egress::TCP_SYN,
+        );
+        send_frame(&mut switch, &dial).await;
+        assert_eq!(
+            expect_frame(&mut guest).await,
+            dial,
+            "the gate delivers the forwarder's dial toward the node's proxy port"
+        );
+        assert_eq!(
+            h.replies.record_count_of(node_addr),
+            Some(1),
+            "the forwarder's dial at the proxy port is the one flow the node \
+             holds a record for"
+        );
+
+        // The node proxy's answer — the exact reverse, and a frame whose
+        // destination is the gateway itself — reaches the switch: the
+        // record lifts it ahead of the control-surface rule that would
+        // otherwise refuse it.
+        let answer = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(node_addr),
+            7654,
+            forwarder,
+            51000,
+            sessions::core::egress::TCP_SYN | sessions::core::egress::TCP_ACK,
+        );
+        send_frame(&mut guest, &answer).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            answer,
+            "the node proxy's answer to the forwarder reaches the switch"
+        );
+
+        // Nothing else from the node toward the gateway passes: the node's
+        // own connect from the proxy port — the very frame an
+        // exfiltration would wear — and a frame from the answerer port are
+        // both refused, the record notwithstanding.
+        let own_connect = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(node_addr),
+            7654,
+            forwarder,
+            50000,
+            sessions::core::egress::TCP_SYN,
+        );
+        let from_answerer = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(node_addr),
+            7656,
+            forwarder,
+            51000,
+            sessions::core::egress::TCP_ACK,
+        );
+        for frame in [&own_connect, &from_answerer] {
+            send_frame(&mut guest, frame).await;
+        }
+        let marker = arp_frame(node_addr);
+        send_frame(&mut guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            marker,
+            "no frame the record does not reverse reached the switch; the \
+             marker did"
+        );
+        expect_silence(&mut switch).await;
+
+        // The flow's close is admitted and ends the record, so the frame
+        // behind it is refused.
+        let close = dns_pins::tests::tcp_frame(
+            Ipv4Addr::from(node_addr),
+            7654,
+            forwarder,
+            51000,
+            sessions::core::egress::TCP_FIN,
+        );
+        send_frame(&mut guest, &close).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            close,
+            "the node's FIN on the recorded flow passes, and ends the record"
+        );
+        assert_eq!(
+            h.replies.record_count_of(node_addr),
+            Some(0),
+            "the FIN ended the record it closed"
+        );
+        send_frame(&mut guest, &answer).await;
+        let marker = arp_frame(node_addr);
+        send_frame(&mut guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            marker,
+            "the frame behind the FIN never arrived; the marker did"
+        );
+        expect_silence(&mut switch).await;
+    }
+
     /// The §5.3 infrastructure deny set as a host frame rule
     /// ([`INFRASTRUCTURE_RULE`]), decided for every row before the row's own
     /// rules and before the deferral: a name-declaring row and a CIDR row
@@ -5953,6 +7416,436 @@ mod tests {
             !logged.contains("egress-undeclared-subnet"),
             "the name-declaring row's private destination is the infrastructure drop, not \
              a deferred one, got: {logged}"
+        );
+    }
+
+    /// NET-134: the Box Egress Proxy's listener is a credentialed lane's
+    /// infrastructure — the one host-side destination a box reaches by
+    /// declaring the upstream, never by allowing its address. A box whose
+    /// rules deny everything reaches the proxy's address at the proxy's own
+    /// port, admitted beside its rules, while the same rules hold the rest
+    /// of the host: no other host-side address answers the deny-all box,
+    /// and no outside destination does either. The lane adds reach at one
+    /// address and nowhere else.
+    #[tokio::test]
+    async fn credentialed_box_reaches_proxy_address_under_deny_all() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("laned", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_credentialed_upstream(sessions::CredentialedUpstream::default())
+                .with_egress_policy(EgressPolicy {
+                    // Deny-all: every IPv4 destination is denied, the
+                    // spelling the activating client's `--deny-subnets
+                    // 0.0.0.0/0` compiles to. The lane is admitted beside
+                    // these rules, so it must survive them.
+                    allow_protocols: None,
+                    allow_subnets: None,
+                    allow_dns_hosts: None,
+                    deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                }),
+        );
+        let mut h = gate_over(registry).await;
+
+        // The proxy's address, at the port its listener binds: admitted,
+        // whatever the deny-all rules say about it — the frame reaches the
+        // switch exactly as it was sent, because the credentials the proxy
+        // redeems are the lane's own and no egress rule of the box's says
+        // anything about them.
+        let proxy = SUBNET.box_egress_proxy_address().octets();
+        let to_proxy = ipv4_frame(LEASE, 6, proxy, 8118);
+        send_frame(&mut h.guest, &to_proxy).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            to_proxy,
+            "the laned box reaches the proxy's address under a deny-all row"
+        );
+
+        // No other host port and no other host address: the same box's
+        // frames to the host alias — at the proxy's port and at another —
+        // and to an outside destination are held by its own deny-all rules,
+        // exactly as they would be without the lane. The marker after them
+        // proves all were decided, and none passed: the proxy's address is
+        // the lane's whole reach.
+        let host_alias = SUBNET.host_alias().octets();
+        let refused = [
+            ipv4_frame(LEASE, 6, host_alias, 8118),
+            ipv4_frame(LEASE, 6, host_alias, 80),
+            ipv4_frame(LEASE, 6, [203, 0, 113, 7], 443),
+        ];
+        for frame in &refused {
+            send_frame(&mut h.guest, frame).await;
+        }
+        let marker = ipv4_frame(LEASE, 6, proxy, 8118);
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "only the proxy's address answers the laned box; the marker at it still does"
+        );
+        expect_silence(&mut h.switch).await;
+        assert!(
+            !h.log
+                .contents()
+                .contains("egress-uncredentialed-proxy-destination"),
+            "a laned box's frame to the proxy is not a proxy-lane drop, got: {}",
+            h.log.contents()
+        );
+    }
+
+    /// NET-134's refusal: a box without a credentialed lane has every frame
+    /// to the proxy's address dropped at the gate, whatever its rules would
+    /// say about the address — an allow-all box included, so the drop is the
+    /// lane's absence, never a rule's. The drop is not a reset (NET-062):
+    /// nothing answers, and the warn line says so — one rate-limited line
+    /// per source per rule per interval, naming the box, the proxy's
+    /// address, the port and the reason. A sibling box that declared the
+    /// lane reaches the same address at the same port under the same rules,
+    /// which is the proof the lane is the only thing that moved.
+    #[tokio::test]
+    async fn uncredentialed_box_dropped_at_proxy_address() {
+        let registry = BoxRegistry::new(SUBNET);
+        // The uncredentialed box: no policy at all, the allow-all default —
+        // the rules that would admit any address, so the proxy's address is
+        // refused by the lane's absence alone.
+        let bare = [100, 64, 0, 9];
+        // The sibling on a credentialed lane: the same allow-all rules, so
+        // the only difference between the two boxes is the declaration.
+        let laned = [100, 64, 0, 10];
+        registry.register(
+            BoxRegistration::new("bare", Ipv4Addr::from(bare), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080]),
+        );
+        registry.register(
+            BoxRegistration::new("laned", Ipv4Addr::from(laned), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_credentialed_upstream(sessions::CredentialedUpstream::default()),
+        );
+        let mut h = gate_over(registry).await;
+        let proxy = SUBNET.box_egress_proxy_address().octets();
+
+        // The uncredentialed box's frames to the proxy's address — the
+        // proxy's own port, and another port at the same address, over TCP
+        // and UDP — never reach the switch. The marker after them proves
+        // all were decided before it, and none passed.
+        let refused = [
+            ipv4_frame(bare, 6, proxy, 8118),
+            ipv4_frame(bare, 6, proxy, 8080),
+            ipv4_frame(bare, 17, proxy, 8118),
+        ];
+        for frame in &refused {
+            send_frame(&mut h.guest, frame).await;
+        }
+        let marker = ipv4_frame(LEASE, 6, [203, 0, 113, 7], 80);
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "no frame of the uncredentialed box reached the proxy's address; the marker did"
+        );
+        expect_silence(&mut h.switch).await;
+
+        // The drop says so, one line per source per rule: the box — by its
+        // row's name, the diagnostics line's own ask — its address, the
+        // proxy's address, the port and the reason — the line a diagnostic
+        // bundle's daemon log tail reads a refused frame to the proxy from.
+        wait_for_log(&h.log, "egress-uncredentialed-proxy-destination").await;
+        let logged = h.log.contents();
+        for needle in [
+            "source=100.64.0.9",
+            "destination=100.64.255.252",
+            "port=8118",
+            "box=\"bare\"",
+            "rule_matched=\"egress-uncredentialed-proxy-destination\"",
+        ] {
+            assert!(
+                logged.contains(needle),
+                "the proxy-lane drop line carries {needle}, got: {logged}"
+            );
+        }
+        assert_eq!(
+            logged
+                .matches("egress-uncredentialed-proxy-destination")
+                .count(),
+            1,
+            "one warn line per source address per rule per interval, got: {logged}"
+        );
+
+        // The sibling on a lane reaches the same address at the same port
+        // under the same rules: the declaration is the whole difference.
+        let reach = ipv4_frame(laned, 6, proxy, 8118);
+        send_frame(&mut h.guest, &reach).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            reach,
+            "the laned sibling reaches the proxy's address at the same port under the same rules"
+        );
+    }
+
+    /// NET-134's other refusal, the one a box that *has* the lane meets: the
+    /// declaration opens the proxy's listener, not the proxy's address, so a
+    /// frame to another port at the address — and a frame in another protocol
+    /// to the listener's own port — is not the listener the lane admitted.
+    /// The lane arm drops these frames before the row's own rules run,
+    /// whatever those rules are, under the same proxy rule the lane-less
+    /// box's frames take: the lane added one listener and no address, so
+    /// nothing else at the host-gateway side of the switch opened. The drop
+    /// is not a reset (NET-062), and the warn line names the box by its row's
+    /// name — the box is on a lane, and the lane is exactly what did not
+    /// admit the frame.
+    #[tokio::test]
+    async fn credentialed_box_dropped_at_proxy_address_other_port() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("laned", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_credentialed_upstream(sessions::CredentialedUpstream::default())
+                .with_egress_policy(EgressPolicy {
+                    // Deny-all, the spelling the activating client's
+                    // `--deny-subnets 0.0.0.0/0` compiles to: the listener is
+                    // admitted beside these rules, and nothing else at the
+                    // address is.
+                    allow_protocols: None,
+                    allow_subnets: None,
+                    allow_dns_hosts: None,
+                    deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                }),
+        );
+        let mut h = gate_over(registry).await;
+        let proxy = SUBNET.box_egress_proxy_address().octets();
+
+        // The lane's own half, as the control the drops below are read
+        // against: the listener is admitted beside the deny-all, so what the
+        // refused frames lose is the lane's narrowing, not its absence.
+        let to_listener = ipv4_frame(LEASE, 6, proxy, 8118);
+        send_frame(&mut h.guest, &to_listener).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            to_listener,
+            "the laned box reaches the proxy's listener under a deny-all row"
+        );
+
+        // TCP to another port at the proxy's address, and UDP to the
+        // listener's own port: none of these is the listener, so none
+        // reaches the switch. The marker after them, at the listener itself,
+        // proves every one was decided before it and none passed.
+        let refused = [
+            ipv4_frame(LEASE, 6, proxy, 443),
+            ipv4_frame(LEASE, 6, proxy, 8080),
+            ipv4_frame(LEASE, 17, proxy, 8118),
+        ];
+        for frame in &refused {
+            send_frame(&mut h.guest, frame).await;
+        }
+        let marker = ipv4_frame(LEASE, 6, proxy, 8118);
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "no frame to another port at the proxy's address reached the switch; the marker \
+             at the listener still did"
+        );
+        expect_silence(&mut h.switch).await;
+
+        // The drop says so under the proxy rule, naming the box by its row's
+        // name and the first refused frame's port — the line a host reads to
+        // learn that a laned box's frame was the lane's to refuse, not its
+        // rules'.
+        wait_for_log(&h.log, "egress-uncredentialed-proxy-destination").await;
+        let logged = h.log.contents();
+        for needle in [
+            "source=100.64.0.9",
+            "destination=100.64.255.252",
+            "port=443",
+            "box=\"laned\"",
+            "rule_matched=\"egress-uncredentialed-proxy-destination\"",
+        ] {
+            assert!(
+                logged.contains(needle),
+                "the proxy-lane drop line carries {needle}, got: {logged}"
+            );
+        }
+    }
+
+    /// NET-134's anti-spoof ordering, the second half of the two the lane
+    /// arm must keep: it runs after source attribution, because it reads the
+    /// row the frame's source resolved to, so a frame to the listener is
+    /// admitted only when its source is the address a lane-declaring row
+    /// holds. The same frame wearing any other source is dropped: a sibling
+    /// row that declared no lane is refused at the listener; an in-plan
+    /// address no namespace holds is the interim's, whose admission concedes
+    /// a row's absence and never the fabric, so the proxy rule holds it too;
+    /// and an address outside the plan's run never reaches the lane arm at
+    /// all — the unknown-source refusal took it first, the same place a
+    /// spoofed lease would die on the relay leg. Only the laned box's own
+    /// address rides its lane.
+    #[tokio::test]
+    async fn spoofed_source_to_proxy_listener_dropped() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("laned", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_credentialed_upstream(sessions::CredentialedUpstream::default()),
+        );
+        registry.register(
+            BoxRegistration::new(
+                "bare",
+                Ipv4Addr::from([100, 64, 0, 10]),
+                Ipv4Addr::LOCALHOST,
+            )
+            .with_admitted_ports([8080]),
+        );
+        let mut h = gate_over(registry).await;
+        let proxy = SUBNET.box_egress_proxy_address().octets();
+
+        // The lane's own half: the frame from the address the laned row
+        // holds reaches the listener — the control the drops below are read
+        // against.
+        let own = ipv4_frame(LEASE, 6, proxy, 8118);
+        send_frame(&mut h.guest, &own).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            own,
+            "the frame from the laned box's own address reaches the listener"
+        );
+
+        // The same frame wearing each other source: the sibling's address —
+        // a published row, but one that declared no lane — the interim's —
+        // an address the plan could lease that no namespace holds — and a
+        // stranger's from outside the plan's run. None is the laned row's
+        // address, so none rides its lane, whatever the row would have
+        // admitted had the frame come from it; and the stranger's never
+        // reaches the lane arm at all. The marker after them proves every
+        // one was decided before it, and none passed.
+        let sibling = [100, 64, 0, 10];
+        let interim = [100, 64, 0, 99];
+        let stranger = [203, 0, 113, 7];
+        let refused = [
+            ipv4_frame(sibling, 6, proxy, 8118),
+            ipv4_frame(interim, 6, proxy, 8118),
+            ipv4_frame(stranger, 6, proxy, 8118),
+        ];
+        for frame in &refused {
+            send_frame(&mut h.guest, frame).await;
+        }
+        let marker = ipv4_frame(LEASE, 6, proxy, 8118);
+        send_frame(&mut h.guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut h.switch).await,
+            marker,
+            "no frame wearing another source reached the listener; the laned box's own did"
+        );
+        expect_silence(&mut h.switch).await;
+
+        // The drops say so, each under the rule that decided it: the
+        // sibling's and the interim's under the proxy rule, the stranger's
+        // under the unknown-source rule, which runs before the lane arm can
+        // be reached at all.
+        wait_for_log(&h.log, "egress-unknown-source").await;
+        let logged = h.log.contents();
+        for needle in [
+            "source=100.64.0.10",
+            "box=\"bare\"",
+            "source=100.64.0.99",
+            "rule_matched=\"egress-uncredentialed-proxy-destination\"",
+            "source=203.0.113.7",
+            "rule_matched=\"egress-unknown-source\"",
+        ] {
+            assert!(
+                logged.contains(needle),
+                "the spoofed-source drops carry {needle}, got: {logged}"
+            );
+        }
+    }
+
+    /// NET-134's third refusal: the node plane's own reach. The proxy's
+    /// address is a credentialed lane's infrastructure, and the node plane
+    /// is on no lane — its baseline set is the enumeration of the categories
+    /// NET-130 admits, and no category names the proxy. So the set never
+    /// admits the address: with the baseline in force a node frame to the
+    /// proxy is dropped by the compiled set like any other undeclared
+    /// destination, and while the interim allow-all node row still decides
+    /// the node plane, that row declares no lane either, so the proxy rule
+    /// drops it there too — the shipped arm and the flip hold one posture.
+    #[test]
+    fn baseline_set_never_admits_the_proxy_address() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let table = registry.table();
+        let baseline = NodePlaneBaseline::built_in(SUBNET);
+        let pins = dns_pins::DnsPins::new(SUBNET);
+        let proxy = SUBNET.box_egress_proxy_address().octets();
+        let node = baseline.node_addr();
+
+        // The set's own membership: no category of the enumeration names the
+        // proxy's address, so a later category that points at it fails here
+        // rather than silently buying the node plane a lane.
+        for entry in baseline.entries() {
+            for endpoint in entry.endpoints() {
+                let address = endpoint
+                    .split_once('/')
+                    .expect("an endpoint is spelled `a.b.c.d/n`")
+                    .0;
+                assert_ne!(
+                    address,
+                    Ipv4Addr::from(proxy).to_string(),
+                    "the {} category must not name the box egress proxy's address; it is \
+                     not a destination the node plane buys by enumeration",
+                    entry.category().as_str(),
+                );
+            }
+        }
+
+        // In force: the node's frame to the proxy is decided by the compiled
+        // set — and refused, at the proxy's port and over UDP too, because
+        // the address is inside no category's endpoints.
+        let in_force = baseline.clone().in_force();
+        for (proto, port) in [(6, 8118), (17, 8118)] {
+            let frame = sessions::core::egress::summarize(&ipv4_frame(node, proto, proxy, port));
+            match gate_verdict(
+                &frame,
+                None,
+                &table,
+                &in_force,
+                &pins,
+                &ReplyTables::new(),
+                UNREGISTERED_SOURCE_PHASE,
+            ) {
+                Ok(GateAdmit::Baseline) => panic!(
+                    "the baseline set admitted the proxy's address at proto {proto} port {port}"
+                ),
+                Ok(admitted) => panic!(
+                    "the in-force gate admitted a node frame to the proxy by another way: \
+                     {admitted:?}"
+                ),
+                Err(drop) => assert!(
+                    drop.rule() != PROXY_LANE_RULE,
+                    "the in-force set refuses the proxy's address as an undeclared \
+                     destination, not by the lane rule, got {}",
+                    drop.rule(),
+                ),
+            }
+        }
+
+        // Announced, the shipped interim: the node row — allow-all, and the
+        // row that decides the node plane until the flip — declares no lane,
+        // so the proxy rule drops the same frame. Either posture, no reach.
+        let frame = sessions::core::egress::summarize(&ipv4_frame(node, 6, proxy, 8118));
+        assert!(
+            matches!(
+                gate_verdict(
+                    &frame,
+                    None,
+                    &table,
+                    &baseline,
+                    &pins,
+                    &ReplyTables::new(),
+                    UNREGISTERED_SOURCE_PHASE
+                ),
+                Err(GateDrop::ProxyLane { .. })
+            ),
+            "the interim node row carries no lane, so its frame to the proxy is the proxy \
+             rule's drop"
         );
     }
 
@@ -8111,6 +10004,9 @@ mod tests {
             /// The node-plane baseline set admitted the frame, decided
             /// beside the boxes' rows.
             AdmittedByBaseline,
+            /// The row's declared credentialed lane admitted the frame at
+            /// the proxy's address (NET-134): the admission no rules made.
+            AdmittedByProxyLane,
             /// The announced interim admitted the frame without consulting
             /// any rules: the shipped arm, until T66's flip (#1711).
             AdmittedByInterim,
@@ -8172,6 +10068,7 @@ mod tests {
                 Ok(GateAdmit::Baseline) => Verdict::AdmittedByBaseline,
                 Ok(GateAdmit::Row) if src == baseline.node_addr() => Verdict::AdmittedByNodeRow,
                 Ok(GateAdmit::Row) => Verdict::AdmittedByRow,
+                Ok(GateAdmit::ProxyLane) => Verdict::AdmittedByProxyLane,
                 Ok(GateAdmit::Unregistered { .. }) => Verdict::AdmittedByInterim,
                 Err(drop) => Verdict::Dropped(drop.rule()),
             };
@@ -8203,7 +10100,7 @@ mod tests {
         // The deny-all box: no declared subnets, so its row admits nothing
         // but the resolver carve-out — the box a spoof must not unseal.
         tcp_box(&registry, "locked", [100, 64, 0, 11], vec![]);
-        registry.register_node_namespace(7654, 7656);
+        registry.register_node_namespace(7654);
         let table = registry.table();
         let baseline = NodePlaneBaseline::built_in(SUBNET);
         // The pin table the attempts are decided against: empty — no row
@@ -8409,8 +10306,14 @@ mod tests {
                     attempt.port,
                 ),
                 // The shipped interim's admits are the gaps, each pinned to
-                // its in-force replacement by the verdict lookups below.
-                Verdict::AdmittedByNodeRow | Verdict::AdmittedByInterim | Verdict::Dropped(_) => {}
+                // its in-force replacement by the verdict lookups below. A
+                // proxy-lane admit is none of this test's attempts — no
+                // attempt names the proxy's address — and the arm keeps the
+                // match exhaustive for the ones that will.
+                Verdict::AdmittedByNodeRow
+                | Verdict::AdmittedByInterim
+                | Verdict::AdmittedByProxyLane
+                | Verdict::Dropped(_) => {}
             }
         }
 
@@ -8638,8 +10541,8 @@ mod tests {
         let registry = BoxRegistry::new(SUBNET);
         // The run path's own registration: the allow-all interim node row at
         // the daemon's address, registered at VM boot (cmd/run.rs) with the
-        // two ports the boot line hands the guest daemon.
-        registry.register_node_namespace(7654, 7656);
+        // proxy port the boot line hands the guest daemon.
+        registry.register_node_namespace(7654);
         let table = registry.table();
         // Built without [`NodePlaneBaseline::in_force`], so this is the
         // phase the build ships.
@@ -9350,8 +11253,8 @@ mod tests {
         );
 
         let ledger = super::PublishedForwards::new();
-        ledger.note_published(a, [100, 64, 0, 9], 18080);
-        ledger.note_published(b, [100, 64, 0, 10], 18081);
+        ledger.note_published(a, [100, 64, 0, 9], 18080, super::egress::IPPROTO_TCP);
+        ledger.note_published(b, [100, 64, 0, 10], 18081, super::egress::IPPROTO_UDP);
         assert_eq!(ledger.address_of(a), Some([100, 64, 0, 9]));
         assert_eq!(
             ledger.address_of(b),
@@ -9373,7 +11276,11 @@ mod tests {
             "the mapping's external port opens nothing: no publish dials it"
         );
 
-        ledger.note_retracted(b);
+        assert_eq!(
+            ledger.note_retracted(b),
+            Some(([100, 64, 0, 10], 18081, super::egress::IPPROTO_UDP)),
+            "a retraction hands back the protocol its publish was noted under"
+        );
         assert_eq!(
             ledger.address_of(b),
             None,
@@ -9387,6 +11294,41 @@ mod tests {
             ledger.address_of(a),
             Some([100, 64, 0, 9]),
             "retracting one box's listener leaves the other box's attribution"
+        );
+    }
+
+    #[test]
+    fn retraction_keeps_records_a_sibling_publish_still_dials() {
+        // Two listeners dial one inside port: retracting one leaves the
+        // other's publication standing, so the records it shares stay; the
+        // last retraction at that port, in that protocol, ends them.
+        let tcp = super::egress::IPPROTO_TCP;
+        let addr = [100, 64, 0, 9];
+        let ledger = super::PublishedForwards::new();
+        ledger.note_published(([127, 0, 0, 1], 8080), addr, 18080, tcp);
+        ledger.note_published(([127, 0, 0, 1], 8081), addr, 18080, tcp);
+        ledger.note_published(
+            ([127, 0, 0, 1], 8082),
+            addr,
+            18080,
+            super::egress::IPPROTO_UDP,
+        );
+
+        assert_eq!(
+            ledger.note_retracted(([127, 0, 0, 1], 8080)),
+            Some((addr, 18080, tcp))
+        );
+        assert!(
+            ledger.still_published(addr, 18080, tcp),
+            "the sibling listener's publication still dials the port"
+        );
+        assert_eq!(
+            ledger.note_retracted(([127, 0, 0, 1], 8081)),
+            Some((addr, 18080, tcp))
+        );
+        assert!(
+            !ledger.still_published(addr, 18080, tcp),
+            "a publication in another protocol does not keep the TCP records"
         );
     }
 
@@ -9630,7 +11572,7 @@ mod tests {
     async fn node_row_survives_the_relay_that_carried_its_frames() {
         let registry = BoxRegistry::new(SUBNET);
         tcp_lan_box(&registry, LEASE);
-        let node = registry.register_node_namespace(7654, 7656);
+        let node = registry.register_node_namespace(7654);
         registry.spawn_withdrawal_drainer();
         let mut h = gate_over(registry).await;
 
@@ -9696,7 +11638,7 @@ mod tests {
     async fn node_row_survives_relay_end() {
         let registry = BoxRegistry::new(SUBNET);
         tcp_lan_box(&registry, LEASE);
-        let node = registry.register_node_namespace(7654, 7656);
+        let node = registry.register_node_namespace(7654);
         // The reports, read directly: the drainer is not started, so the
         // report's content is the test's to assert on.
         let reports = registry

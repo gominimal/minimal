@@ -100,6 +100,15 @@ async fn register_box_with_vm_host(
         minimald_rpc::BoxControlReply::Error { error } => {
             anyhow::bail!("the VM host daemon refused the box registration: {error}")
         }
+        // The reply shapes are disjoint, so this arm is a daemon speaking
+        // another verb's answer to a register — not an address pair either
+        // way, so the registration did not happen.
+        minimald_rpc::BoxControlReply::Status(status) => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with its \
+                 answerer status {status:?}; the registration did not happen"
+            )
+        }
     }
 }
 
@@ -140,9 +149,87 @@ pub(crate) fn vm_host_control_sock(
         return None;
     }
     let ssh_sock = client::resolve_socket_path(minimal_dir, true).ok()?;
+    control_sock_beside(&ssh_sock)
+}
+
+/// The control socket beside an ssh socket a client already resolved (T66's
+/// rule, one definition for every caller): the VM host daemon serves both
+/// from the same provider dir, so the socket a listing or an activation
+/// reached a VM on is the one to find that VM's control socket beside.
+pub(crate) fn control_sock_beside(ssh_sock: &std::path::Path) -> Option<std::path::PathBuf> {
     ssh_sock
         .parent()
         .map(|dir| dir.join(minvmd::control::CONTROL_SOCK_FILE))
+}
+
+/// The machine's zone-answerer state, read from the VM host daemon's
+/// control socket (NET-138) — the read-only status verb, over the same
+/// socket the box rows ride, so the posture (a 0600 socket in the provider
+/// dir, the connection's own reach) is the one every other verb is served
+/// under.
+///
+/// Never read through the in-VM daemon: a guest relaying a host fact is
+/// forgeable from inside the escape boundary, so the CLI asks the host
+/// daemon that owns the fact. `None` — nothing to surface — when this
+/// invocation is not on a VM-backed host, the socket is not there, the
+/// deadline passes, or the daemon predates the verb and refuses the line:
+/// each is the same honest silence a daemon still bringing its answerer up
+/// gets, and the verbs print nothing they cannot prove. Whether the
+/// invocation is on a VM-backed host is [`daemon_provider_kind`]'s to say,
+/// the rule every VM-backed gate keys on — never `use_minvmd()` alone
+/// (NET-081's macOS half).
+pub(crate) async fn vm_host_answerer_status(
+    global: &GlobalArgs,
+) -> Option<minimald_rpc::ZoneAnswererStatus> {
+    vm_host_answerer_status_at(vm_host_control_sock(
+        daemon_provider_kind(global),
+        global.minimal_dir.as_deref(),
+    ))
+    .await
+}
+
+/// [`vm_host_answerer_status`]'s read over one control socket the caller
+/// resolved itself: the same bounded read, the same silence rules, over any
+/// VM host daemon's socket — `min ls` reads each listed VM's own state
+/// beside the ssh socket its listing reached that VM on (NET-057's
+/// enumeration), so the socket is the caller's to name.
+pub(crate) async fn vm_host_answerer_status_at(
+    sock_path: Option<std::path::PathBuf>,
+) -> Option<minimald_rpc::ZoneAnswererStatus> {
+    let sock_path = sock_path?;
+    let read = tokio::time::timeout(
+        BOX_CONTROL_TIMEOUT,
+        control_request_with_vm_host(&sock_path, minimald_rpc::BoxControlRequest::AnswererStatus),
+    )
+    .await;
+    match read {
+        Ok(Ok(minimald_rpc::BoxControlReply::Status(status))) => Some(status),
+        // Any other reply — a refusal from a daemon that predates the verb,
+        // a line that did not parse — is a daemon that cannot answer the
+        // question; say nothing rather than guessing the machine's state.
+        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+/// The interim's own start line (NET-138): who answers this VM's box zone,
+/// under the label the session's other facts print beside. Every session
+/// start on a VM-backed host prints it — TTY and non-TTY, before the
+/// advisory and the verdict — because the interim is a fact about the
+/// machine the session is about to rely on: which VM host daemon answers
+/// the zone decides where the names resolve from, and a start that said
+/// nothing left the holder discoverable only from `min ls`. The same line
+/// `min ls` prints for the state ([`crate::resolver::vm_host_answerer_line`]),
+/// so the two surfaces name one holder the same way. Pure, so the test
+/// asserts the wording without capturing stderr.
+///
+/// `None` for the pre-acquisition state — a daemon still bringing its
+/// answerer up has nothing to name yet, and the start prints nothing for
+/// it, exactly as `min ls` does.
+#[must_use]
+pub(crate) fn vm_host_answerer_start_line(
+    status: minimald_rpc::ZoneAnswererStatus,
+) -> Option<String> {
+    crate::resolver::vm_host_answerer_line(status).map(|line| format!("zone answerer: {line}"))
 }
 
 /// Withdraws the box's host row (T66) when the session that registered it
@@ -217,6 +304,17 @@ pub(crate) async fn withdraw_box_row(
                     %error,
                     "the VM host daemon refused the box row withdrawal; the row \
                      stays published"
+                );
+            }
+            // A status reply is another verb's answer on a wire whose
+            // reply shapes are disjoint: the row asked for was not
+            // withdrawn, so say so and leave it published.
+            minimald_rpc::BoxControlReply::Status(status) => {
+                tracing::warn!(
+                    box = %name,
+                    status = ?status,
+                    "the VM host daemon answered the box row withdrawal with its \
+                     answerer status; the row stays published"
                 );
             }
         },
@@ -295,6 +393,7 @@ async fn register_box_for_activation(
             })
             .unwrap_or_default(),
         egress: policy.egress.clone(),
+        credentialed_upstream: policy.credentialed_upstream.clone(),
     };
     let registration = tokio::time::timeout(
         BOX_CONTROL_TIMEOUT,
@@ -413,6 +512,13 @@ pub(crate) async fn activate_session(
             dynamic_allowed_range: None,
             dynamic_ingress: None,
         }),
+        // NET-134: the lane is the box's own declaration, never a default —
+        // a box that did not ask for a credentialed upstream keeps every
+        // frame it sends to the proxy's address refused at the host-side
+        // gate, whatever its egress rules say.
+        credentialed_upstream: args
+            .credentialed_upstream
+            .then(sessions::CredentialedUpstream::default),
     };
 
     // A session with no `--name` still deserves a typable handle, so mint
@@ -458,7 +564,9 @@ pub(crate) async fn activate_session(
     // Scaffold-offer a missing `minimal.toml` only after loadouts resolve:
     // a bad `--loadout` must error before anything prints, so the user is
     // never told the session is proceeding and then that it is not.
-    if offer_scaffold {
+    // `--sync none` never sends a `minimal.toml`, so offering to create
+    // one there would only write a file the session then ignores.
+    if offer_scaffold && !matches!(args.sync, Some(SyncMode::None)) {
         offer_mfile_scaffold(
             &utf8_path,
             global,
@@ -740,46 +848,108 @@ pub(crate) async fn activate_session(
             hostname_proxy_start_line(hostname_proxy_start_vm(global), port)
         );
     }
-    // NET-122/NET-123: the naming advisory, printed once per session start —
-    // after the create, and re-surfaced when the daemon reports this session
-    // at the 127.0.0.1 interim because its session-start bind probe found
-    // the reserved range absent. It only ever names the command that
-    // points the host's resolver at the answerer; running it (and any
-    // privilege prompt it carries) is the user's act, never the session
-    // start's. One read of this host's resolver state decides both this and
-    // the surface verdict below it, so the two lines cannot disagree about
-    // one host.
+    // NET-122/NET-123/NET-138: the naming lines, printed once per session
+    // start — after the create, and re-surfaced when the daemon reports this
+    // session at the 127.0.0.1 interim because its session-start bind
+    // probe found the reserved range absent. The advisory only ever names
+    // the command that points the host's resolver at the answerer; running
+    // it (and any privilege prompt it carries) is the user's act, never the
+    // session start's. One read of this host's resolver state decides the
+    // advisory and the surface verdict below it, so the two lines cannot
+    // disagree about one host.
     //
-    // Both lines are the answerer's port's to print: the advisory has no
-    // command to name without one, the verdict no answerer whose surface to
-    // decide, so a create that reports none — the answerer still coming up,
-    // or a daemon that predates the field — prints neither and reads
-    // nothing. That keeps the no-port activate the zero-cost start it was
-    // before either line read this host: the detection below is two
-    // `resolvectl` queries under a five-second bound, and a wedged
-    // systemd-resolved must not be waited out for lines that cannot print
-    // from it.
-    if let Some(answerer_port) = created.zone_answerer_port {
+    // On a VM-backed host the answerer is the VM host daemon's (NET-138):
+    // the in-VM daemon starts none, so the port and the bound proof come
+    // from the host — the state read over minvmd's control socket (never
+    // through the in-VM daemon, because a guest relaying a host fact is
+    // forgeable from inside the escape boundary) and this CLI's own A
+    // query for the host's row at the port that read named, the proof the
+    // answerer is live rather than merely reported held. A native host
+    // keeps the daemon's own report. `held_no_channel` is the machine fact
+    // that ends the question: a port held by a process no channel reaches
+    // means this VM's names are not answered on the host whatever this
+    // host's hook and range say, so neither is read and the warning says
+    // the fact instead of the advisory.
+    let (vm_answerer, answerer_port, answerer_bound, held_no_channel) =
+        match vm_host_answerer_status(global).await {
+            Some(status) => {
+                let read = crate::resolver::host_answerer_read(status).await;
+                (
+                    Some(status),
+                    read.port,
+                    read.answerer_bound,
+                    read.held_no_channel,
+                )
+            }
+            None => (
+                None,
+                created.zone_answerer_port,
+                created.answerer_bound,
+                false,
+            ),
+        };
+    // The interim itself, named at every session start on a VM-backed host
+    // — TTY and non-TTY, ahead of the warning, the advisory and the verdict
+    // below — because who answers the zone is the machine fact the names
+    // this session is about to rely on rest on, and a holder another VM's
+    // minvmd took is otherwise discoverable only from `min ls`. The
+    // pre-acquisition state prints nothing: nothing is held yet to name.
+    if let Some(status) = vm_answerer
+        && let Some(line) = vm_host_answerer_start_line(status)
+    {
+        eprintln!("{line}");
+    }
+    if held_no_channel && let Some(answerer_port) = answerer_port {
+        // NET-138's warning, at every session start — TTY and non-TTY: it
+        // rides stderr unconditionally, because the first lookup that
+        // fails is the one it explains, and a piped activate is as owed
+        // the fact as an interactive one.
+        eprintln!(
+            "{}",
+            crate::resolver::port_held_no_channel_warning(answerer_port)
+        );
+        // The verdict is the proxy's by the status's own word, without
+        // reading the hook or the range: both could only misreport native
+        // for a port no daemon answers, and the arm that cannot strand the
+        // user is the proxy's (NET-019 keeps it serving). Logged as the
+        // same session-start record the native arm logs, with the fact
+        // that decided it.
+        tracing::info!(
+            surface = ?crate::resolver::LiveSurface::Proxy,
+            held_no_channel = true,
+            answerer_bound = false,
+            answerer_port = answerer_port,
+            "session start decided the live name surface for this host"
+        );
+        eprintln!(
+            "{}",
+            crate::resolver::name_surface_line(
+                crate::resolver::LiveSurface::Proxy,
+                created.hostname_proxy_port,
+            )
+        );
+    } else if let Some(answerer_port) = answerer_port {
         let detection = crate::resolver::session_detection().await;
         // NET-018: name the live surface at the moment the user is about to
         // rely on the names — decided in the one function both verbs share
         // (`resolver`), from the same detection the advisory reads: this
         // host's hook (and the stub-bypass blocker that says whether its
-        // lookups consult what the hook configures), the daemon's
-        // answerer-bound report, and the reserved range on this host's own
-        // loopback. Decided before the advisory prints only so the range
-        // its read holds can be the advisory's too — one probe, one host —
-        // while the printed order stays the advisory's and then the
-        // surface's. `None` — the answerer not bound — prints nothing: no
-        // native surface to name, and the ports and the advisory have told
-        // the proxy's story. The proxy's half is said with the native arm
-        // either way (NET-019): the `HTTP(S)_PROXY` recipes this activation
-        // prints keep working beside native DNS, so nothing already
-        // captured goes stale.
+        // lookups consult what the hook configures), the answerer-bound
+        // proof this start holds — the daemon's report on a native host,
+        // this CLI's own query on a VM-backed one — and the reserved range
+        // on this host's own loopback. Decided before the advisory prints
+        // only so the range its read holds can be the advisory's too — one
+        // probe, one host — while the printed order stays the advisory's
+        // and then the surface's. `None` — the answerer not bound — prints
+        // nothing: no native surface to name, and the ports and the
+        // advisory have told the proxy's story. The proxy's half is said
+        // with the native arm either way (NET-019): the `HTTP(S)_PROXY`
+        // recipes this activation prints keep working beside native DNS,
+        // so nothing already captured goes stale.
         let surface_verdict = crate::resolver::live_name_surface_with_range_at(
             &detection,
             Some(answerer_port),
-            created.answerer_bound,
+            answerer_bound,
         )
         .await;
         // The advisory shares that verdict's range read: the daemon's
@@ -815,7 +985,7 @@ pub(crate) async fn activate_session(
                 surface = ?verdict.surface,
                 hook_routes = detection.0.routes(answerer_port),
                 blocker = ?detection.1,
-                answerer_bound = created.answerer_bound,
+                answerer_bound = answerer_bound,
                 range_present = ?verdict.range_present,
                 range_unit_state = ?detection.2.state,
                 range_unit_check = ?detection.2.failed_check,
@@ -829,6 +999,19 @@ pub(crate) async fn activate_session(
         }
     }
     let id = created.id;
+
+    // NET-079: the host's verdict on whether it can decide a host-address
+    // box's egress per box, spelled by the daemon — the side that read the
+    // host — and printed verbatim, so the terminal, the daemon's log line
+    // for this same create, and the start all say the same thing. The
+    // advisory names the cause, the state it leaves the box in, and, when
+    // the missing privileged step is the cause, the exact command that
+    // installs it; it is never a prompt, and never load-bearing for the
+    // start either (see [`print_classifier_advisory`]). Printed after the
+    // session exists and before the work on it, like the notice below it,
+    // so a host that cannot decide per box is named at the start that
+    // runs there and not only in a log the person was not reading.
+    print_classifier_advisory(&mut std::io::stderr(), &created);
 
     // The coming-change notice (NET-076), printed while the deny-all egress
     // default is announced but not yet in force. Scoped to the box it would
@@ -862,7 +1045,16 @@ pub(crate) async fn activate_session(
     // the daemon then composes against an empty workspace and the
     // caller is on their own for getting files there.
     match sync_mode {
-        SyncMode::None => {}
+        SyncMode::None => {
+            // `--sync none` skips the upload, so the daemon composes against
+            // an empty workspace and the project's `minimal.toml` — packages,
+            // vars, patches, hooks — is silently dropped. Say so when there
+            // is a config to lose, so the default-config session is not a
+            // surprise.
+            if let Some(notice) = sync_none_notice(&utf8_path) {
+                eprintln!("{notice}");
+            }
+        }
         SyncMode::Tarball if skip_empty_or_home => {
             // An empty directory has nothing to sync, and `$HOME` is far
             // too much to ship on a stray confirmation keypress — and if
@@ -1459,6 +1651,7 @@ pub(crate) async fn activate_new_for_attach(global: &GlobalArgs) -> Result<(), a
             allow_dns_hosts: Vec::new(),
             allow_protocols: Vec::new(),
             deny_subnets: Vec::new(),
+            credentialed_upstream: false,
             loadout: Vec::new(),
             no_loadouts: false,
             no_hooks: false,
@@ -1599,7 +1792,26 @@ pub async fn cmd_session_policy(
         .await
         .context("GetEffectiveSessionPolicy RPC failed")?;
 
-    // The ports the box published at runtime, listed beside the declaration
+    // NET-079's per-box enforcement answers beside the rules, over its own
+    // runtime-facts reply — never as a field on the policy, because the
+    // policy struct is `deny_unknown_fields`: an older `min` would reject the
+    // whole rules reply over a key it has no field for, so the fact rides a
+    // separate reply the way live ingress does. A client that cannot get it
+    // — an older daemon, a session mid-teardown — renders the rules with no
+    // enforcement row, silently: the row is an optional fact beside the
+    // declaration, and the same silence is what a session that is not
+    // host-address already prints.
+    let facts_lookup = match SessionLookup::parse(&args.session) {
+        SessionLookup::Id(id) => minimald_rpc::GetSessionRuntimeFactsRequest::Id(id),
+        SessionLookup::Name(n) => minimald_rpc::GetSessionRuntimeFactsRequest::Name(n),
+    };
+    let host_ip_enforcement = match client
+        .oneshot_rpc::<minimald_rpc::GetSessionRuntimeFacts>(facts_lookup)
+        .await
+    {
+        Ok(minimald_rpc::Errorable::Ok(facts)) => facts.host_ip_enforcement,
+        Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => None,
+    };
     // (NET-044) — the rows that make a `min net expose` visible rather than
     // only permitted. Built here rather than through a `SessionLookup`
     // conversion for the same reason the effective lookup above is: the
@@ -1646,7 +1858,13 @@ pub async fn cmd_session_policy(
             let fabric = (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
                 .then_some(switch::SwitchSubnet::default());
             let mut out = std::io::stdout();
-            format_policy(&mut out, &policy, record.network, fabric)?;
+            format_policy(
+                &mut out,
+                &policy,
+                record.network,
+                host_ip_enforcement,
+                fabric,
+            )?;
             write_live_ingress(&mut out, &live)?;
             out.flush().context("Failed to write policy")?;
             Ok(())
@@ -1680,12 +1898,70 @@ pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'
     }
 }
 
+/// The classifier advisory a create reply carries (NET-079), as the line
+/// the activation prints: this host's cause in words for why it cannot
+/// decide a host-address box's egress verdict per box, the state that
+/// leaves the box in, and — when the missing privileged step is the cause —
+/// the exact command that installs it. The daemon spelled it, because the
+/// daemon is the side that read the host; the start prints it verbatim, so
+/// the terminal, the daemon's own log line for the same create, and the
+/// start all say the same thing. A reply that carries no advisory — from a
+/// host that decides per box, or from a daemon that predates the field —
+/// writes nothing: no line to print then, the way the other create-reply
+/// facts read.
+///
+/// A writer over the reply rather than a string out of it, so the render
+/// the start drives and the render a test drives are the same code — the
+/// test pins the bytes the terminal gets, not an accessor's echo of the
+/// field it read. The advisory is never a prompt: it names what a person
+/// may run, and running it — and any privilege prompt it carries — is the
+/// person's act, never the session start's, so the activation prints it
+/// and goes on without waiting for an answer.
+pub fn write_classifier_advisory(
+    out: &mut impl std::io::Write,
+    created: &minimald_rpc::CreateSessionResponse,
+) -> std::io::Result<()> {
+    if let Some(advisory) = created.classifier_advisory.as_deref() {
+        writeln!(out, "{advisory}")?;
+    }
+    Ok(())
+}
+
+/// [`write_classifier_advisory`] as the start drives it: the render over
+/// the person's own stderr, best-effort. The advisory qualifies a session
+/// the daemon has already created — it never gates one — so a note that
+/// cannot print must not fail the activation that carried it: a stderr
+/// closed by the person running the start, or a reader gone before the
+/// note landed (the broken pipe `min version | head -1` taught this CLI
+/// to expect), is the person's pipe to manage, and the write's error is
+/// logged and left, never propagated — the activation goes on to the
+/// session's work the way it already does for a reply that carries no
+/// advisory at all. Logged at `debug`, because a person whose stderr
+/// cannot take the note cannot read a louder line about it either.
+pub fn print_classifier_advisory(
+    out: &mut impl std::io::Write,
+    created: &minimald_rpc::CreateSessionResponse,
+) {
+    if let Err(error) = write_classifier_advisory(out, created) {
+        tracing::debug!(%error, "the classifier advisory did not print");
+    }
+}
+
 /// Render a session's effective policy as its rules: the egress the gate
 /// enforces (NET-074/NET-075) — a declared section's dimensions each
 /// resolved to its list or its default (`allow all`; `deny subnets` reads
 /// `(none)` when nothing is denied), or, for a box that declared no egress
 /// at all, the default its daemon resolved to (`deny all` once the deny-all
-/// default is in force; `allow all` behind the opt-out or before it) — the
+/// default is in force; `allow all` behind the opt-out or before it), with
+/// NET-079's per-box enforcement beside the egress rows when the daemon
+/// reported one: a host-address box's verdict is decided on the host's
+/// cgroup tree, so the egress block that says what the box may reach also
+/// says whether this host can decide that per box — `none` beside a
+/// declaration that then describes the box's posture, not its fact: the
+/// state the box actually runs in. An own-address box, a none box, and a
+/// reply that carries no state say nothing there — the row a render prints
+/// from silence would be the decided-looking one a daemon that predates
+/// the fact never sent — the
 /// node-plane baseline set the helper enumerates beside it (NET-130: the
 /// categories the in-VM daemon's own registry and cache fetches are to
 /// reach, one row a category's subnets, headed by the posture the
@@ -1694,7 +1970,14 @@ pub fn deny_all_default_notice(phase: sessions::EgressDefaultPhase) -> Option<&'
 /// and the set binds nothing yet; in force, the set decides them whatever
 /// the box's own declaration resolves to, so it is what a deny-all box
 /// reads beside), and the ingress mappings spelled out.
-/// `network` is the session's network mode. `fabric` is the switch plan the
+/// `network` is the session's network mode. `host_ip_enforcement` is the
+/// per-box egress state the daemon's runtime-facts reply carried (NET-079):
+/// the box's own launch record lowered by the host's current fact, spelled
+/// in the machine's own words (`per_box`/`none`, the same spellings the
+/// record, the listing, and the daemon's log line carry), never an invented
+/// prose of its own. `None` — a session that is not host-address, or a
+/// daemon that predates the reply — prints no row at all. `fabric` is the
+/// switch plan the
 /// session's own-address surface leaves its frames on — the plan the
 /// host-side helper builds this enumeration from, named where the CLI knows
 /// it: the microVM backend's run path builds its registry and this set from
@@ -1716,6 +1999,7 @@ pub fn format_policy(
     out: &mut impl std::io::Write,
     effective: &sessions::EffectiveSessionPolicy,
     network: sessions::NetworkMode,
+    host_ip_enforcement: Option<sessions::HostIpEnforcement>,
     fabric: Option<switch::SwitchSubnet>,
 ) -> Result<(), anyhow::Error> {
     // A none box has no network, so it can carry no egress or ingress
@@ -1751,6 +2035,22 @@ pub fn format_policy(
             }
             write_rules(out, "deny subnets", egress.deny_subnets.as_ref(), "(none)")?;
         }
+    }
+    // NET-079's per-box enforcement, as the egress block's closing row: a
+    // host-address box's verdict is decided on the host's cgroup tree, so
+    // this is the row that says whether the rules above are decided per box
+    // at all — and a `deny all` printed beside an enforcement of `none` is
+    // the honest rendering, the posture the box declared beside the state it
+    // actually runs in, rather than a verdict that looks decided and is not.
+    // The value is the runtime-facts reply's, in the machine spelling: the
+    // row a person reads here names the same fact the record's
+    // `host_ip_enforcement` field and the daemon's log line carry, so the
+    // three surfaces agree by construction. Printed only when the daemon
+    // reported a state — `None`, for a session that is not host-address, or
+    // from a daemon too old to answer the facts reply, prints nothing
+    // rather than a row silence never carried.
+    if let Some(enforcement) = host_ip_enforcement {
+        writeln!(out, "  per-box enforcement  {}", enforcement.machine_str())?;
     }
     // The node-plane baseline set, beside the box's rules (NET-130): the
     // helper's built-in enumeration of the categories the in-VM daemon's own
@@ -1982,17 +2282,18 @@ pub async fn cmd_session_setup_zed(
 ///
 /// Rows are in setup order — project first, then loadouts in the order
 /// they were applied. Teardown runs the reverse.
-pub(crate) async fn cmd_session_hooks(
-    global: &GlobalArgs,
-    args: HooksArgs,
-) -> Result<(), anyhow::Error> {
+pub async fn cmd_session_hooks(global: &GlobalArgs, args: HooksArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
     let mut client = connect_daemon(global).await?;
 
+    // Resolve first, like every other session command, so a missing session
+    // is named in the error; then ask for the hooks of the record that
+    // resolved, so both calls target the same session.
+    let record = resolve_session(&mut client, &args.session).await?;
+
     use minimald_rpc::{GetSessionHooks, GetSessionHooksRequest};
-    let lookup: GetSessionHooksRequest = SessionLookup::parse(&args.session).into();
     let resp = client
-        .oneshot_rpc::<GetSessionHooks>(lookup)
+        .oneshot_rpc::<GetSessionHooks>(GetSessionHooksRequest::Id(record.id))
         .await
         .context("GetSessionHooks RPC failed")?;
 
@@ -2560,7 +2861,7 @@ mod tests {
             }),
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  dynamic ingress  allow"),
@@ -2587,7 +2888,7 @@ mod tests {
             }),
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  tcp  :8080 → :80"),
@@ -2610,7 +2911,7 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains("egress\n"), "{rendered}");
         assert!(rendered.contains("  allow all\n"), "{rendered}");
@@ -2628,7 +2929,7 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &deny_all, NetworkMode::OwnIp, None).unwrap();
+        format_policy(&mut out, &deny_all, NetworkMode::OwnIp, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("egress\n  deny all\n"),
@@ -2645,12 +2946,272 @@ mod tests {
             ingress: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &allow_all, NetworkMode::OwnIp, None).unwrap();
+        format_policy(&mut out, &allow_all, NetworkMode::OwnIp, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("egress\n  allow all\n"),
             "an opted-out bare box must show allow-all: {rendered}"
         );
+    }
+
+    /// NET-079's per-box enforcement row in the policy render: printed as
+    /// the egress block's closing row when the daemon reported a state over
+    /// the runtime-facts reply, in the machine spelling the record and the
+    /// daemon's log line carry — and printed from silence never, because a
+    /// row made of nothing would be the decided-looking one a daemon that
+    /// predates the reply never sent. The requirement's own case is the
+    /// first: a deny-all declaration beside an enforcement of `none` is the
+    /// state the box actually runs in, not a verdict that looks decided and
+    /// is not.
+    #[test]
+    fn policy_render_carries_the_enforcement_row_when_the_host_reported_it() {
+        let unenforced = EffectiveSessionPolicy {
+            egress: EffectiveEgress::DenyAll,
+            ingress: None,
+        };
+        let mut out = Vec::new();
+        format_policy(
+            &mut out,
+            &unenforced,
+            NetworkMode::HostNet,
+            Some(sessions::HostIpEnforcement::None),
+            None,
+        )
+        .unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("egress\n  deny all\n  per-box enforcement  none\n"),
+            "a deny-all declaration beside an enforcement of none is the \
+             state the box runs in, got: {rendered}"
+        );
+
+        // The decided host's own spelling rides the same row.
+        let enforced = EffectiveSessionPolicy {
+            egress: EffectiveEgress::AllowAll,
+            ingress: None,
+        };
+        let mut out = Vec::new();
+        format_policy(
+            &mut out,
+            &enforced,
+            NetworkMode::HostNet,
+            Some(sessions::HostIpEnforcement::PerBox),
+            None,
+        )
+        .unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("  per-box enforcement  per_box\n"),
+            "a host that decides per box says so in the machine spelling, \
+             got: {rendered}"
+        );
+
+        // No state reported, no row — the same silence an own-address box
+        // reads (its own render never carries the state at all), and the one
+        // a daemon too old to answer the facts reply leaves the caller with.
+        let silent = EffectiveSessionPolicy {
+            egress: EffectiveEgress::DenyAll,
+            ingress: None,
+        };
+        let mut out = Vec::new();
+        format_policy(&mut out, &silent, NetworkMode::HostNet, None, None).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            !rendered.contains("per-box enforcement"),
+            "no state reported means no row, got: {rendered}"
+        );
+    }
+
+    /// The create reply the activation reads, with only the fields this
+    /// test's lines depend on set: an id and a version to satisfy the skew
+    /// gate, the classifier advisory, and the enforcement the same create
+    /// recorded.
+    fn create_reply(
+        advisory: Option<&str>,
+        host_ip_enforcement: Option<&str>,
+    ) -> minimald_rpc::CreateSessionResponse {
+        minimald_rpc::CreateSessionResponse {
+            id: sessions::SessionId::nil(),
+            daemon_version: Some("0.7.0".to_string()),
+            hostname_routing_unavailable: None,
+            hostname_proxy_port: None,
+            zone_answerer_port: None,
+            answerer_bound: false,
+            interim_loopback: false,
+            deny_all_opt_out: None,
+            classifier_advisory: advisory.map(str::to_string),
+            host_ip_enforcement: host_ip_enforcement.map(str::to_string),
+        }
+    }
+
+    /// NET-079: the advisory a create reply carries is the line the
+    /// activation prints, verbatim — with the exact command that installs
+    /// the classifier's privileged step when the step is the cause, spelled
+    /// by the daemon so the command the terminal shows is the one that ends
+    /// it — and it is never a prompt: no question in the line, nothing for
+    /// the start to wait on. A cause no command ends still names the cause
+    /// and never an install. A host that decides per box, or a daemon that
+    /// predates the field, prints nothing at all.
+    ///
+    /// The render itself is driven here, with a buffer, the way
+    /// [`format_policy`]'s tests drive that render — the same writer the
+    /// start drives, so what this pins is the bytes the terminal gets, not
+    /// an accessor's echo of the field it read: the advisory the daemon
+    /// spelled, the newline that ends it, the command as the last line
+    /// with nothing after it.
+    #[test]
+    fn activate_prints_classifier_advisory() {
+        // The reply a step-missing host sends: the daemon's own spelling,
+        // with the command on the last line so the thing a person copies
+        // is the command, verbatim.
+        let step_missing = create_reply(
+            Some(
+                "note: this host cannot decide a host-address box's egress verdict \
+                 per box: the classifier's privileged step is not installed on this \
+                 host. While it cannot, its host-address boxes run unenforced — \
+                 whatever the boxes' declarations say. Install the classifier's \
+                 privileged step with:\n  run: curl -fsSLO \
+                 https://raw.githubusercontent.com/gominimal/minimal/main/scripts/\
+                 install-host-classifier.sh && sudo bash ./install-host-classifier.sh \
+                 --user runner --cohort-address 10.0.0.0/16 --node-plane-address \
+                 10.0.1.0/24",
+            ),
+            Some("none"),
+        );
+        let mut out = Vec::new();
+        write_classifier_advisory(&mut out, &step_missing).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.starts_with(
+                "note: this host cannot decide a host-address box's egress verdict \
+                 per box: the classifier's privileged step is not installed on this \
+                 host. While it cannot, its host-address boxes run unenforced — \
+                 whatever the boxes' declarations say."
+            ),
+            "the start prints the daemon's spelling verbatim, so the log, the \
+             reply, and the terminal cannot disagree, got: {rendered}"
+        );
+        assert!(
+            rendered.ends_with(
+                "  run: curl -fsSLO https://raw.githubusercontent.com/gominimal/\
+                 minimal/main/scripts/install-host-classifier.sh && sudo bash \
+                 ./install-host-classifier.sh --user runner --cohort-address \
+                 10.0.0.0/16 --node-plane-address 10.0.1.0/24\n"
+            ),
+            "the missing privileged step is the cause, so the render carries \
+             the exact command that installs it, on the last line with \
+             nothing after it: {rendered}"
+        );
+        assert!(
+            !rendered.contains('?'),
+            "the advisory names what a person may run; it never asks: {rendered}"
+        );
+
+        // A host that cannot confine: the cause is still named, and no
+        // install can end it, so the line names none.
+        let cannot_confine = create_reply(
+            Some(
+                "note: this host cannot decide a host-address box's egress verdict \
+                 per box: no cgroup2 mount with nsdelegate covers the classifier \
+                 tree, so a box could migrate out of its leaf. While it cannot, \
+                 its host-address boxes run unenforced — whatever the boxes' \
+                 declarations say.",
+            ),
+            Some("none"),
+        );
+        let mut out = Vec::new();
+        write_classifier_advisory(&mut out, &cannot_confine).unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(
+            rendered.contains("no cgroup2 mount with nsdelegate covers the classifier tree"),
+            "the advisory must name this cause in words too: {rendered}"
+        );
+        assert!(
+            rendered.ends_with("declarations say.\n"),
+            "no command ends this cause, so the advisory must end with the \
+             state it named: {rendered}"
+        );
+        assert!(
+            !rendered.contains("install-host-classifier"),
+            "no command ends this cause, so the advisory must name none: {rendered}"
+        );
+        assert!(
+            !rendered.contains('?'),
+            "the advisory names what a person may run; it never asks: {rendered}"
+        );
+
+        // A host that decides per box, or a daemon that predates the field:
+        // nothing to print, the way the other create-reply facts read — the
+        // render writes not one byte.
+        let decided = create_reply(None, Some("per_box"));
+        let mut out = Vec::new();
+        write_classifier_advisory(&mut out, &decided).unwrap();
+        assert!(
+            out.is_empty(),
+            "a decided host's create carries no advisory, so its start prints \
+             none, got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        let pre_field = create_reply(None, None);
+        let mut out = Vec::new();
+        write_classifier_advisory(&mut out, &pre_field).unwrap();
+        assert!(
+            out.is_empty(),
+            "a daemon that predates the field carries no advisory, so its \
+             start prints none, got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// A writer whose reader has gone away, as a piped stderr whose tool
+    /// exited — or a closed one (`2>&-`) — leaves the start's stderr: the
+    /// broken pipe `min version | head -1` taught this CLI to expect.
+    struct ClosedPipe;
+
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// NET-079: the advisory's print is best-effort, never load-bearing.
+    /// The note qualifies a session the daemon has already created — it
+    /// never gates one — so a start whose stderr cannot take it goes on
+    /// to the session's work instead of failing over a line it could not
+    /// say. The `?` this replaced made the note's own write failure the
+    /// activation's error, after the create it follows had already made
+    /// the session.
+    #[test]
+    fn classifier_advisory_print_is_best_effort() {
+        let step_missing = create_reply(
+            Some(
+                "note: this host cannot decide a host-address box's egress verdict \
+                 per box: the classifier's privileged step is not installed on this \
+                 host. While it cannot, its host-address boxes run unenforced.",
+            ),
+            Some("none"),
+        );
+
+        // A writer that takes the note gets the render's own bytes — the
+        // delegation is the whole print, so the start's line is the one the
+        // tests above pinned.
+        let mut printed = Vec::new();
+        print_classifier_advisory(&mut printed, &step_missing);
+        let mut rendered = Vec::new();
+        write_classifier_advisory(&mut rendered, &step_missing).unwrap();
+        assert_eq!(
+            printed, rendered,
+            "the print must carry exactly the bytes the render writes"
+        );
+
+        // A writer whose reader is gone is logged and left: the print
+        // returns — no panic, no error for the start to fail on — the same
+        // way a reply that carries no advisory prints nothing and goes on.
+        print_classifier_advisory(&mut ClosedPipe, &step_missing);
     }
 
     /// NET-044: the ports a box published at runtime are listed beside the
@@ -2677,7 +3238,7 @@ mod tests {
             }),
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
         write_live_ingress(&mut out, &live).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         let (declared, live_rows) = rendered
@@ -2796,6 +3357,7 @@ mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
             }),
+            credentialed_upstream: None,
         };
 
         // The successful shape, driven the way the activation drives it:
@@ -2896,6 +3458,7 @@ mod tests {
                 name: "db".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
+                credentialed_upstream: None,
             },
         )
         .await
@@ -2903,6 +3466,132 @@ mod tests {
         assert!(
             refused.to_string().contains("address plan is exhausted"),
             "the refusal surfaces with its reason: {refused}"
+        );
+    }
+
+    /// NET-138's status read: the machine's zone-answerer state is read
+    /// from the VM host daemon's control socket — the read-only verb, the
+    /// one request that names no row — and every way that read cannot be
+    /// made is the same silence: a native host has no VM host daemon to
+    /// ask, an absent socket no daemon to answer, and a daemon that
+    /// predates the verb refuses the line it cannot parse. The verbs print
+    /// nothing from a silence; this pins that they get one.
+    #[tokio::test]
+    async fn the_answerer_status_is_read_from_the_vm_host_alone() {
+        // The served shape: the state parses back as itself over the line
+        // protocol the registrations ride — built with the wire types so
+        // the reply cannot drift from what the daemon sends.
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider_dir = dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&provider_dir).unwrap();
+        let sock_path = provider_dir.join("control.sock");
+        let reply = serde_json_lenient::to_string(&minimald_rpc::BoxControlReply::Status(
+            minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 },
+        ))
+        .expect("the status reply serializes");
+        let requests = fake_vm_host(sock_path.clone(), reply).await;
+        let global = GlobalArgs {
+            provider: Some(Provider::LocalMinvmd),
+            minimal_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert_eq!(
+            vm_host_answerer_status(&global).await,
+            Some(minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 }),
+            "the state the daemon answered is the state the read returns"
+        );
+        {
+            let seen = requests.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one status read, one request");
+            let request: minimald_rpc::BoxControlRequest =
+                serde_json_lenient::from_str(&seen[0]).expect("the request is the wire type");
+            assert!(
+                matches!(request, minimald_rpc::BoxControlRequest::AnswererStatus),
+                "the read is the read-only verb, naming no row: {}",
+                seen[0]
+            );
+        }
+
+        // A native host asks nothing: there is no VM host daemon to read
+        // the machine's state from.
+        let native = GlobalArgs::default();
+        assert_eq!(
+            vm_host_answerer_status(&native).await,
+            None,
+            "a native host has no VM host daemon to ask"
+        );
+
+        // A VM-backed host with no socket is the same silence.
+        let absent_dir = tempfile::TempDir::new().unwrap();
+        let absent = GlobalArgs {
+            provider: Some(Provider::LocalMinvmd),
+            minimal_dir: Some(absent_dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert_eq!(
+            vm_host_answerer_status(&absent).await,
+            None,
+            "no socket answers, so no state is claimed"
+        );
+
+        // And a daemon that predates the verb refuses the line it cannot
+        // parse — the wire's version corner, answered with the same
+        // silence rather than a guessed state.
+        let old_dir = tempfile::TempDir::new().unwrap();
+        let old_provider = old_dir.path().join("providers").join("local-minvmd0");
+        std::fs::create_dir_all(&old_provider).unwrap();
+        let _old_requests = fake_vm_host(
+            old_provider.join("control.sock"),
+            r#"{"error":"unknown verb"}"#.to_string(),
+        )
+        .await;
+        let old = GlobalArgs {
+            provider: Some(Provider::LocalMinvmd),
+            minimal_dir: Some(old_dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        assert_eq!(
+            vm_host_answerer_status(&old).await,
+            None,
+            "a refusal from a daemon that predates the verb is silence, not a state"
+        );
+    }
+
+    /// NET-138's interim, surfaced at every session start: the line names
+    /// who answers the zone under the `zone answerer:` label — this VM's
+    /// minvmd when it holds the port, the machine's other holder when this
+    /// VM's table is registered with it — and the pre-acquisition state
+    /// prints nothing, exactly as its `min ls` line does.
+    #[test]
+    fn session_start_names_the_zone_answerer_at_every_start() {
+        let holder =
+            vm_host_answerer_start_line(minimald_rpc::ZoneAnswererStatus::Holder { port: 7_656 })
+                .expect("a holder is a state to name");
+        assert_eq!(
+            holder,
+            "zone answerer: answered by the VM host daemon \
+             (single-operator interim) · this VM's minvmd holds it on \
+             127.0.0.1:7656 (UDP) · point the host's resolver at it for \
+             *.min.internal",
+            "the start line names this VM's minvmd as the holder"
+        );
+        let registered =
+            vm_host_answerer_start_line(minimald_rpc::ZoneAnswererStatus::Registered {
+                port: 7_656,
+            })
+            .expect("a registered table is a state to name");
+        assert_eq!(
+            registered,
+            "zone answerer: answered by the VM host daemon \
+             (single-operator interim) · another VM host daemon holds it on \
+             127.0.0.1:7656 (UDP); this VM's table is registered with it · \
+             point the host's resolver at it for *.min.internal",
+            "the start line names the holder this VM's table answers through"
+        );
+        assert_eq!(
+            vm_host_answerer_start_line(minimald_rpc::ZoneAnswererStatus::Starting),
+            None,
+            "the pre-acquisition state prints nothing at session start"
         );
     }
 

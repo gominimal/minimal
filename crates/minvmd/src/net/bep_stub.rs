@@ -640,7 +640,7 @@ mod tests {
         // (cmd/run.rs resolves the same pair at VM boot). It is the guest's
         // own root netns, not a box, so it buys no share in the pool: the
         // partition the delivery runs under is by boxes alone.
-        registry.register_node_namespace(7654, 7656);
+        registry.register_node_namespace(7654);
         let dir = tempfile::tempdir().expect("tempdir");
         let proxy_sock = dir.path().join("bep-stub.sock");
         let token = [0x5au8; TOKEN_LEN];
@@ -677,6 +677,7 @@ mod tests {
                 name: "box-a".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
+                credentialed_upstream: None,
             })
             .expect("the plan has a switch address to hand out");
         let box_b = registry
@@ -684,6 +685,7 @@ mod tests {
                 name: "box-b".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
+                credentialed_upstream: None,
             })
             .expect("the plan has a second switch address to hand out");
         drive(&mut lane, 2).await;
@@ -795,7 +797,7 @@ mod tests {
 
         // The node's own row, as run.rs publishes it at boot: not a box, so
         // no share and no attachment — pinned by the pool's emptiness below.
-        registry.register_node_namespace(7654, 7656);
+        registry.register_node_namespace(7654);
         let dir = tempfile::tempdir().expect("tempdir");
         let proxy_sock = dir.path().join("bep-stub.sock");
         let token = [0x5au8; TOKEN_LEN];
@@ -826,6 +828,7 @@ mod tests {
                 name: "web".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
+                credentialed_upstream: None,
             })
             .expect("the plan has a switch address to hand out");
 
@@ -904,12 +907,13 @@ mod tests {
         // The guest node's row — the namespace the host publishes at boot —
         // and one client box, registered the way the activating client
         // registers one (T66).
-        registry.register_node_namespace(7654, 7656);
+        registry.register_node_namespace(7654);
         let box_row = registry
             .register_client_box(crate::box_registry::ClientBoxSpec {
                 name: "web".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
+                credentialed_upstream: None,
             })
             .expect("the plan has a switch address to hand out");
 

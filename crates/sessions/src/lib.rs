@@ -37,7 +37,7 @@ pub enum NetworkMode {
 
 /// An IP transport protocol, used in egress/ingress policy rules.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum IpProto {
     Tcp,
@@ -251,6 +251,31 @@ impl IngressPolicy {
     }
 }
 
+/// A box's declaration of a credentialed upstream (NET-134): the fact that
+/// the Box Egress Proxy — the node-local listener a box's credentialed
+/// traffic is steered through — is this box's infrastructure, reached at the
+/// proxy's own address on the switch whatever the box's egress rules say.
+///
+/// The declaration carries no fields of its own yet, and that is the point:
+/// the steering table and the credential grants that derive a box's
+/// credentialed upstream set are the Box Egress Proxy document's field
+/// schema, and this is the minimum of it the networking requirement binds
+/// here — the fact itself, which is all the host-side row needs to hold the
+/// box's lane open to the proxy's address. A policy that carries `Some`
+/// declaration puts its box on a credentialed lane; one that carries `None`
+/// declares nothing, and its box's frames to the proxy's address are refused
+/// under the box-to-host default-deny, never decided by its egress rules.
+/// When the proxy document lands it extends this declaration, and the row
+/// the fact fills is already waiting for it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+// An empty table today, so an unknown field would be one the proxy document
+// has not bound here yet — refused like every other field the policy schemas
+// do not know (the same `deny_unknown_fields` [`SessionPolicy`] carries),
+// rather than silently ignored into a shape no reader can tell from the
+// minimum.
+#[serde(deny_unknown_fields)]
+pub struct CredentialedUpstream {}
+
 /// The networking policy for a session: its egress and ingress configuration.
 ///
 /// `None` for a dimension means it was not configured (allow-all egress; the
@@ -269,13 +294,29 @@ pub struct SessionPolicy {
     pub egress: Option<EgressPolicy>,
     /// Ingress policy; `None` when no explicit ingress config is present.
     pub ingress: Option<IngressPolicy>,
+    /// The box's declaration of a credentialed upstream (NET-134): `Some`
+    /// marks the Box Egress Proxy's listener as this box's infrastructure —
+    /// the one destination its egress rules never decide — while `None`, the
+    /// absent declaration every policy without one carries, is no lane: the
+    /// proxy's address stays refused under the box-to-host default-deny.
+    /// Skipped when `None`, so a policy that declares nothing serializes
+    /// exactly as it did before this field existed — the shape every stored
+    /// record and every reading client already holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentialed_upstream: Option<CredentialedUpstream>,
 }
 
 impl SessionPolicy {
-    /// Builds a policy from its egress and ingress halves.
+    /// Builds a policy from its egress and ingress halves, carrying no
+    /// credentialed-upstream declaration (NET-134): the lane a box asks the
+    /// proxy for is its declaration's own, never a default.
     #[must_use]
     pub fn new(egress: Option<EgressPolicy>, ingress: Option<IngressPolicy>) -> Self {
-        Self { egress, ingress }
+        Self {
+            egress,
+            ingress,
+            credentialed_upstream: None,
+        }
     }
 }
 
@@ -342,9 +383,8 @@ pub enum EffectiveEgress {
     Declared(EgressPolicy),
 }
 
-/// A session's policy with its egress half resolved to what the gate
-/// enforces: the answer `GetEffectiveSessionPolicy` serves and
-/// `min session policy` renders (NET-075) — the shape that can carry
+/// The answer `GetEffectiveSessionPolicy` serves and `min session policy`
+/// renders (NET-075) — the shape that can carry
 /// [`EffectiveEgress::DenyAll`] without rewriting the strict
 /// [`SessionPolicy`] declaration. The ingress half is carried verbatim:
 /// ingress has no rollout default.
@@ -356,7 +396,12 @@ pub enum EffectiveEgress {
 // Same reason as the attribute on `SessionPolicy`: the response rides an
 // `#[serde(untagged)]` `Errorable`, and the daemon's `{"error": "..."}` reply
 // must fall through to the `Err` arm rather than decode as a valid policy —
-// a silent false negative on a security-introspection command.
+// a silent false negative on a security-introspection command. Its `egress`
+// is required, not an `Option`, so the error reply falls through on its own.
+// The strictness is also the wire contract with an older `min`: an old client
+// rejects a key it has no field for, so a fact that did not exist when it was
+// built must ride its own reply (`GetSessionRuntimeFacts`, the way live
+// ingress rides `GetLiveIngress`) rather than a new field here.
 #[serde(deny_unknown_fields)]
 pub struct EffectiveSessionPolicy {
     /// The effective egress: the declaration, or the default the rollout
@@ -463,6 +508,78 @@ pub enum PolicyError {
          bound >= 1024"
     )]
     PrivilegedDynamicRange { lo: u16 },
+    /// An ingress port mapping publishes the same host port on the same
+    /// transport more than once. gvproxy's static forwarder binds one forward
+    /// per transport and host port, so the duplicate is rejected at launch
+    /// rather than failing opaquely at attach. The same host port on TCP and
+    /// on UDP is two distinct binds and is allowed.
+    #[error(
+        "ingress port mapping publishes {proto:?} host port {external_port} \
+         more than once; each host port may appear in at most one ingress \
+         mapping per protocol"
+    )]
+    DuplicateIngressPort { external_port: u16, proto: IpProto },
+    /// An ingress port mapping targets box port 0. Port 0 is reserved and
+    /// cannot receive forwarded connections, so it is rejected at launch
+    /// rather than failing opaquely at attach.
+    #[error(
+        "ingress port mapping targets box port 0; port 0 is reserved — \
+         choose an internal_port >= 1"
+    )]
+    InvalidIngressPort { internal_port: u16 },
+}
+
+/// The static ingress mapping checks [`Record::validate_policy`] runs before
+/// its mode check, so a malformed mapping is named wherever it appears.
+fn validate_port_mappings(mappings: &[PortMapping]) -> Result<(), PolicyError> {
+    // gvproxy's static forwarder only exposes TCP and UDP, so an ingress
+    // mapping with any other transport is a configuration error wherever it
+    // appears — reject it before the mode check so it never reaches the
+    // forwarder as a silently-defaulted protocol.
+    if let Some(proto) = mappings
+        .iter()
+        .map(|mapping| mapping.proto)
+        .find(|proto| !matches!(proto, IpProto::Tcp | IpProto::Udp))
+    {
+        return Err(PolicyError::UnsupportedIngressProtocol { proto });
+    }
+    // minimald refuses to publish a privileged host port (< 1024): binding
+    // one needs elevated privilege the rootless switch lacks, so reject it
+    // at validation time with a remediation rather than letting the expose
+    // fail opaquely against gvproxy.
+    if let Some(external_port) = mappings
+        .iter()
+        .map(|mapping| mapping.external_port)
+        .find(|&port| port < 1024)
+    {
+        return Err(PolicyError::PrivilegedPort { external_port });
+    }
+    // A host port may be published at most once per transport: gvproxy's
+    // static forwarder keys each forward by protocol and host address, so a
+    // second mapping of the same host port on the same transport fails to
+    // bind. It is rejected at launch rather than failing opaquely at attach.
+    // TCP and UDP on one host port are distinct binds and both stand.
+    let mut seen = std::collections::HashSet::new();
+    if let Some(mapping) = mappings
+        .iter()
+        .find(|mapping| !seen.insert((mapping.external_port, mapping.proto)))
+    {
+        return Err(PolicyError::DuplicateIngressPort {
+            external_port: mapping.external_port,
+            proto: mapping.proto,
+        });
+    }
+    // Box port 0 is reserved and cannot receive forwarded connections, so
+    // a mapping targeting it is rejected at launch rather than failing
+    // opaquely at attach.
+    if let Some(internal_port) = mappings
+        .iter()
+        .map(|mapping| mapping.internal_port)
+        .find(|&port| port == 0)
+    {
+        return Err(PolicyError::InvalidIngressPort { internal_port });
+    }
+    Ok(())
 }
 
 /// Whether `s` is a syntactically valid CIDR prefix (`<addr>/<prefix-len>`) for
@@ -603,6 +720,47 @@ pub struct BoxAddresses {
     pub loopback_address: Ipv4Addr,
 }
 
+/// The per-box egress enforcement state a host-address session's verdict runs
+/// under (NET-079): `per_box` when the session's own launch placed its box in
+/// a classifier leaf of the host's cgroup tree — the state a host that can
+/// decide per box gives the host-address boxes it launches — and `none` when
+/// the launch did not, because the host cannot decide per box at all, or
+/// because the box got no leaf to be decided on, and the box runs with the
+/// host's address and no verdict of its own.
+///
+/// Defined here — beside the [`Record`] field that carries a box's own launch
+/// outcome — rather than in the RPC crate that first spelled it, because the
+/// record is a session-plane type that crate already depends on; the RPC
+/// crate re-exports it under the path its clients spell, so no wire form
+/// changes.
+///
+/// The default is `none` — a daemon that has not read its host, or one whose
+/// host cannot decide, both spell the state the boxes on it run in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostIpEnforcement {
+    /// The box's launch placed it in a classifier leaf: its egress verdict is
+    /// decided on that leaf of its own.
+    PerBox,
+    /// The box runs with the host's address and no verdict of its own.
+    #[default]
+    None,
+}
+
+impl HostIpEnforcement {
+    /// The machine spelling the stringly surfaces carry — the create
+    /// response, the session runtime-facts reply, the daemon's log lines —
+    /// so a script that greps one surface for the state finds the same word
+    /// on every other.
+    #[must_use]
+    pub fn machine_str(self) -> &'static str {
+        match self {
+            Self::PerBox => "per_box",
+            Self::None => "none",
+        }
+    }
+}
+
 /// The on-disk row/record pertaining to a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
@@ -667,6 +825,30 @@ pub struct Record {
     #[serde(default)]
     pub box_addresses: Option<BoxAddresses>,
 
+    /// The per-box egress enforcement this session's own launch placed its
+    /// host-address box under (NET-079): `per_box` when the launch placed the
+    /// box in a classifier leaf of the host's cgroup tree, `none` when it did
+    /// not — the box's own record of its launch, kept on the session record
+    /// rather than in `attrs` so no client can assert it, and daemon-owned
+    /// from its first write: the create strips the key for every mode and
+    /// only a launch ever sets this field.
+    ///
+    /// The reading surfaces show this record, not the host's current state:
+    /// a box launched unenforced stays `none` for its life even after a later
+    /// launch decides per box, because the outcome is a fact about the launch
+    /// that produced it and never about the host as it stands now. Only the
+    /// display halves lower it — a host whose table has since stopped
+    /// deciding reads as `none` for every box on it — never raise it.
+    ///
+    /// `None` for a session that is not host-address (its verdict is decided
+    /// on address leases, never on the host's cgroup tree) and for a
+    /// host-address box that has not launched yet, whose reads fall back to
+    /// the host's state. Defaults to `None` for records that predate the
+    /// field: pre-existing sessions had no launch to record, and their reads
+    /// answer over the host's state exactly as they did before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip_enforcement: Option<HostIpEnforcement>,
+
     /// Free-form attributes.
     pub attrs: BTreeMap<String, String>,
 }
@@ -689,9 +871,11 @@ impl Record {
     /// [`PolicyError::IngressRequiresOwnIp`] when a non-empty ingress policy is
     /// set on anything but an `OwnIp` `PTask`. Returns
     /// [`PolicyError::UnsupportedIngressProtocol`] for an ingress mapping whose
-    /// transport gvproxy's forwarder cannot expose, or
+    /// transport gvproxy's forwarder cannot expose,
     /// [`PolicyError::PrivilegedPort`] for one that publishes a host port below
-    /// 1024. For a `PTask` that accepts egress, returns
+    /// 1024, [`PolicyError::DuplicateIngressPort`] for a host port published
+    /// twice on one transport, or [`PolicyError::InvalidIngressPort`] for one
+    /// that targets box port 0. For a `PTask` that accepts egress, returns
     /// [`PolicyError::InvalidSubnet`] when an egress `allow_subnets` entry is
     /// not a valid CIDR prefix or [`PolicyError::InvalidDenySubnet`] when a
     /// `deny_subnets` entry is not, [`PolicyError::InvalidDynamicRange`] when
@@ -700,31 +884,8 @@ impl Record {
     /// privileged host port (< 1024). Does not validate `dynamic_ingress`, which
     /// is accepted on an `OwnIp` `PTask` and serialized verbatim.
     pub fn validate_policy(&self) -> Result<(), PolicyError> {
-        // gvproxy's static forwarder only exposes TCP and UDP, so an ingress
-        // mapping with any other transport is a configuration error wherever it
-        // appears — reject it before the mode check so it never reaches the
-        // forwarder as a silently-defaulted protocol.
-        if let Some(proto) = self.policy.ingress.as_ref().and_then(|ingress| {
-            ingress
-                .port_mappings
-                .iter()
-                .map(|mapping| mapping.proto)
-                .find(|proto| !matches!(proto, IpProto::Tcp | IpProto::Udp))
-        }) {
-            return Err(PolicyError::UnsupportedIngressProtocol { proto });
-        }
-        // minimald refuses to publish a privileged host port (< 1024): binding
-        // one needs elevated privilege the rootless switch lacks, so reject it
-        // at validation time with a remediation rather than letting the expose
-        // fail opaquely against gvproxy.
-        if let Some(external_port) = self.policy.ingress.as_ref().and_then(|ingress| {
-            ingress
-                .port_mappings
-                .iter()
-                .map(|mapping| mapping.external_port)
-                .find(|&port| port < 1024)
-        }) {
-            return Err(PolicyError::PrivilegedPort { external_port });
+        if let Some(ingress) = &self.policy.ingress {
+            validate_port_mappings(&ingress.port_mappings)?;
         }
         // A none box has no network: there is nothing to enforce an egress or
         // ingress declaration on, so both are configuration errors (NET-065).
@@ -820,6 +981,7 @@ mod tests {
             status: SessionStatus::default(),
             hooks_enabled: true,
             box_addresses: None,
+            host_ip_enforcement: None,
             attrs: BTreeMap::new(),
         }
     }
@@ -856,6 +1018,61 @@ mod tests {
         }"#;
         let r: Record = serde_json_lenient::from_str(json).expect("record must load");
         assert!(!r.hooks_enabled);
+    }
+
+    /// NET-134: the session policy gains a box's declaration of a
+    /// credentialed upstream — the minimum of the proxy document's field
+    /// schema — and that is all it needs to gain. The declaration parses from
+    /// the wire it rides to the host (`Some`), a policy written before the
+    /// field existed parses as no declaration (`None`), and a field the
+    /// minimum does not hold is refused rather than ignored: the proxy
+    /// document extends this declaration when it lands, and until then
+    /// nothing may smuggle a steering setting through it.
+    #[test]
+    fn credentialed_upstream_declaration_parses() {
+        let declared: SessionPolicy = serde_json_lenient::from_str(
+            r#"{"egress":null,"ingress":null,"credentialed_upstream":{}}"#,
+        )
+        .expect("a policy carrying the declaration must parse");
+        assert_eq!(
+            declared.credentialed_upstream,
+            Some(CredentialedUpstream {}),
+            "the declaration is carried on the policy, not swallowed"
+        );
+        // And it round-trips with the policy that carries it, so the host
+        // the registration reaches reads the same lane the client declared.
+        let json = serde_json_lenient::to_string(&declared).unwrap();
+        let round_tripped: SessionPolicy = serde_json_lenient::from_str(&json).unwrap();
+        assert_eq!(round_tripped, declared);
+
+        // A policy written before the field existed declares nothing: the
+        // absent declaration is the default, the JSON such a policy already
+        // serialized to still parses, and serializing it back changes
+        // nothing — the field rides additively, never as a migration.
+        let legacy: SessionPolicy =
+            serde_json_lenient::from_str(r#"{"egress":null,"ingress":null}"#)
+                .expect("a policy predating the field must still parse");
+        assert_eq!(
+            legacy.credentialed_upstream, None,
+            "no declaration in the JSON is no lane, not an error"
+        );
+        let json = serde_json_lenient::to_string(&legacy).unwrap();
+        assert!(
+            !json.contains("credentialed_upstream"),
+            "a policy with no declaration serializes exactly as it did before \
+             the field existed, got: {json}"
+        );
+
+        // The minimum holds no fields of its own: a steering setting the
+        // proxy document will bind is refused until that document lands,
+        // never silently dropped from a declaration that cannot carry it.
+        assert!(
+            serde_json_lenient::from_str::<SessionPolicy>(
+                r#"{"egress":null,"ingress":null,"credentialed_upstream":{"steering":"dns"}}"#
+            )
+            .is_err(),
+            "a field the minimum does not hold is refused, not ignored"
+        );
     }
 
     #[test]
@@ -1129,6 +1346,105 @@ mod tests {
         };
         let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
         assert!(record.validate_policy().is_ok());
+    }
+
+    #[test]
+    fn duplicate_host_port_is_rejected() {
+        // Publishing the same host port twice on one transport — even to
+        // different box ports — is rejected, since gvproxy's static forwarder
+        // cannot bind the same host port and protocol to two destinations.
+        let ingress = IngressPolicy {
+            port_mappings: vec![
+                PortMapping {
+                    external_port: 18080,
+                    internal_port: 80,
+                    proto: IpProto::Tcp,
+                },
+                PortMapping {
+                    external_port: 18080,
+                    internal_port: 443,
+                    proto: IpProto::Tcp,
+                },
+            ],
+            dynamic_allowed_range: None,
+            dynamic_ingress: None,
+        };
+        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+        assert_eq!(
+            record.validate_policy(),
+            Err(PolicyError::DuplicateIngressPort {
+                external_port: 18080,
+                proto: IpProto::Tcp,
+            })
+        );
+    }
+
+    #[test]
+    fn same_host_port_on_tcp_and_udp_is_allowed() {
+        // TCP and UDP on one host port are distinct binds: gvproxy keys each
+        // forward by protocol and host address, so both mappings stand.
+        let ingress = IngressPolicy {
+            port_mappings: vec![
+                PortMapping {
+                    external_port: 18080,
+                    internal_port: 80,
+                    proto: IpProto::Tcp,
+                },
+                PortMapping {
+                    external_port: 18080,
+                    internal_port: 80,
+                    proto: IpProto::Udp,
+                },
+            ],
+            dynamic_allowed_range: None,
+            dynamic_ingress: None,
+        };
+        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+        assert!(record.validate_policy().is_ok());
+    }
+
+    #[test]
+    fn box_port_zero_is_rejected() {
+        // Port 0 is reserved and cannot receive forwarded connections, so a
+        // mapping targeting it is rejected at launch.
+        let ingress = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 18080,
+                internal_port: 0,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+            dynamic_ingress: None,
+        };
+        let record = record_with(NetworkMode::OwnIp, SessionPolicy::new(None, Some(ingress)));
+        assert_eq!(
+            record.validate_policy(),
+            Err(PolicyError::InvalidIngressPort { internal_port: 0 })
+        );
+    }
+
+    #[test]
+    fn box_port_zero_check_precedes_mode_check() {
+        // The box-port-0 check runs before the mode check, so a mapping
+        // targeting port 0 on a non-OwnIp PTask surfaces as
+        // InvalidIngressPort rather than IngressRequiresOwnIp.
+        let ingress = IngressPolicy {
+            port_mappings: vec![PortMapping {
+                external_port: 18080,
+                internal_port: 0,
+                proto: IpProto::Tcp,
+            }],
+            dynamic_allowed_range: None,
+            dynamic_ingress: None,
+        };
+        assert_eq!(
+            record_with(
+                NetworkMode::HostNet,
+                SessionPolicy::new(None, Some(ingress))
+            )
+            .validate_policy(),
+            Err(PolicyError::InvalidIngressPort { internal_port: 0 })
+        );
     }
 
     #[test]

@@ -22,7 +22,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 pub(crate) mod composables;
 #[cfg(test)]
-use composables::{ProjectResolution, build_composables, run_composer};
+use composables::{
+    ProjectResolution, build_composables, resolve_project_ctx_and_graph, run_compose, run_composer,
+};
 
 /// A short summary of the metadata of a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +89,10 @@ fn build_record(
         box_addresses: config.box_addresses,
         status,
         hooks_enabled: config.hooks_enabled,
+        // Daemon-owned from its first line: a create holds no launch's
+        // outcome to record, and the key a client might assert in `attrs`
+        // is stripped above, so only a launch ever writes this field.
+        host_ip_enforcement: None,
         attrs: config.attrs,
     };
     record
@@ -2469,11 +2475,10 @@ pub(crate) mod tests {
     /// nowhere (yet), and the session persists `Active` on the
     /// empty-contribution fast path.
     ///
-    /// The graph-resolution outcome isn't observed by the test —
-    /// depending on how `Graph::new_from_chain` handles a bare
-    /// `minimal.toml` in a scratch dir, it may return an empty
-    /// graph or an error. Either branch must leave `CreateSession`
-    /// returning `Ready`; that's the invariant guarded here.
+    /// The bare `minimal.toml` fixture must resolve to a graph:
+    /// a graph-resolution error now fails `configure_loadout`, so
+    /// `CreateSession` returning `Ready` here also proves the
+    /// fixture's graph resolves.
     /// Guards against a regression where the mfile parse or graph
     /// pipeline breaks creation for real projects. Once composition
     /// consumes the parsed mfile + graph, this test evolves.
@@ -2722,16 +2727,14 @@ pub(crate) mod tests {
         assert!(packages.is_empty(), "NoMFile → no PackageComposables");
     }
 
-    /// [`build_composables`] with an [`ProjectResolution::MFileOnly`]
-    /// carrying a `[session]` block produces a [`ProjectComposable`];
-    /// package composables stay empty because the graph is absent.
-    /// The MFileOnly path exercises the "graph resolve failed but
-    /// project still declares packages" branch — project packages
-    /// don't get their own PackageComposables, they just wait for
-    /// the composer to see them via the ProjectComposable's
-    /// contribution.
+    /// [`build_composables`] on a resolved project stamps every
+    /// project-contributed package with `Source::Project` naming the
+    /// *declared* project path, not the per-session workspace the
+    /// mfile was read out of. The hooks policy matches projects by
+    /// this path and every error message quotes it, so a per-session
+    /// value would be unmatchable and unrecognizable.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn build_composables_mfile_only_yields_project_composable_and_no_packages() {
+    async fn build_composables_project_provenance_names_declared_path() {
         use std::io::Write;
 
         let project = TempDir::new().unwrap();
@@ -2740,8 +2743,6 @@ pub(crate) mod tests {
         writeln!(f, "[session]\npackages = [\"cargo\"]").unwrap();
         drop(f);
 
-        // Build a `Context` directly (no graph); the manager sets
-        // the same shape internally on the MFileOnly branch.
         let cache = TempDir::new().unwrap();
         let state = TempDir::new().unwrap();
         let mctx_config = mctx::ConfigBuilder::new()
@@ -2751,37 +2752,26 @@ pub(crate) mod tests {
             .build()
             .unwrap();
         let daemon = std::sync::Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
-        let mfile = mctx::MFileSearchStrategy::Override(project.path().to_path_buf())
-            .find_mfile()
-            .unwrap();
-        let ctx = mctx::Context::from_daemon(daemon, mfile);
 
         let path = DaemonAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
-        let (project_composable, packages) = build_composables(
+        let resolution = resolve_project_ctx_and_graph(&daemon, &path)
+            .expect("a stdlib-only mfile resolves offline");
+        assert!(
+            matches!(resolution, ProjectResolution::Full(..)),
+            "an mfile on disk with a resolvable graph → Full",
+        );
+        let (project_composable, _packages) = build_composables(
             &path,
             &declared_path(),
-            &ProjectResolution::MFileOnly(ctx),
+            &resolution,
             &WireContribution::default(),
             true,
         )
         .unwrap();
-        assert!(
-            project_composable.is_some(),
-            "MFileOnly with [session] block → ProjectComposable present",
-        );
-        assert!(
-            packages.is_empty(),
-            "MFileOnly → no PackageComposables (no graph to walk)",
-        );
 
-        // Provenance names the project as the *user* knows it, not the
-        // per-session workspace the mfile was read out of. The hooks
-        // policy matches projects by this path and every error message
-        // quotes it, so a per-session value would be unmatchable and
-        // unrecognizable — see `build_composables`.
         use sessions::core::compose::Composable as _;
         let contribution = project_composable
-            .unwrap()
+            .expect("[session] block → ProjectComposable present")
             .contribute(&|_| Err(std::env::VarError::NotPresent))
             .expect("the fixture's [session] block contributes cleanly");
         let sources: Vec<_> = contribution
@@ -2800,6 +2790,58 @@ pub(crate) mod tests {
                 "provenance should name the declared project path, not the workspace",
             );
         }
+    }
+
+    /// A project whose `minimal.toml` demands a newer standard
+    /// library than the daemon ships fails graph resolution, and
+    /// [`run_compose`] surfaces that as an `InvalidInput` error
+    /// rather than silently dropping every package contribution.
+    /// Regression guard for the `MFileOnly` fallback, which let
+    /// `min session activate` succeed (exit 0) while the session
+    /// came up missing all package material.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_compose_returns_invalid_input_when_graph_resolution_fails() {
+        use std::io::Write;
+
+        let project = TempDir::new().unwrap();
+        let mfile_path = project.path().join(mfile::MFILE_NAME);
+        let mut f = std::fs::File::create(&mfile_path).unwrap();
+        writeln!(
+            f,
+            "[stdlib]\nminimum_version = \"999.0.0\"\n\n[session]\npackages = [\"cargo\"]"
+        )
+        .unwrap();
+        drop(f);
+
+        let cache = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let mctx_config = mctx::ConfigBuilder::new()
+            .with_cache_dir(cache.path())
+            .with_state_dir(state.path())
+            .with_daemon_id("test".to_string())
+            .build()
+            .unwrap();
+        let daemon = std::sync::Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
+
+        let path = DaemonAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+        let err = run_compose(
+            &daemon,
+            &path,
+            &declared_path(),
+            WireContribution::default(),
+            true,
+        )
+        .expect_err("an outdated stdlib must fail the compose, not degrade");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::InvalidInput,
+            "graph-resolution failure should surface as InvalidInput, got {err:?}",
+        );
+        assert!(
+            err.to_string()
+                .contains("newer version of the standard library needed"),
+            "the error should carry the graph's own diagnostic, got {err}",
+        );
     }
 
     /// [`run_composer`] with an empty client contribution and no

@@ -582,6 +582,7 @@ mod tests {
             project_path: Some(HostAbsPath::try_new(path).unwrap()),
             status,
             git: None,
+            host_ip_enforcement: None,
             attrs: None,
         }
     }
@@ -595,6 +596,7 @@ mod tests {
             project_path: None,
             status,
             git: None,
+            host_ip_enforcement: None,
             attrs: None,
         }
     }

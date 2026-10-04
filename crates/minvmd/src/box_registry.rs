@@ -34,7 +34,7 @@
 //! attachment with it — the same host-side facts, the same trust boundary,
 //! the one writer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -42,6 +42,7 @@ use std::time::Instant;
 
 use sessions::EgressPolicy;
 use sessions::core::egress::EgressRules;
+use sessions::core::zone_answer;
 use switch::SwitchSubnet;
 
 /// The addresses of one relay's end, as the host reports them: the switch
@@ -54,6 +55,20 @@ type WithdrawalReport = Vec<[u8; 4]>;
 /// root-netns tap [`BoxRegistry::register_node_namespace`] publishes.
 const NODE_NAMESPACE: &str = "minimald";
 
+/// The node namespace's row's name under the zone, as
+/// [`BoxRegistry::zone_view`] holds it: `minimald.min.internal`, the same
+/// name every VM host daemon's table holds its own node's row under. The
+/// row never travels the answerer channel (`net::answerer::zone_rows`
+/// excludes it): one name for every VM means a second VM's registration of
+/// it is refused by the holder's first-writer rule by construction — a
+/// standing clash-warn for the normal multi-VM case — so the holder's own
+/// node row is the one the zone answers host-side, and inside the guest
+/// the node's DNS layer keeps answering the name for its own VM.
+#[must_use]
+pub fn node_zone_name() -> String {
+    zone_name(NODE_NAMESPACE)
+}
+
 /// The published rows, keyed by switch address in wire octets — the key the
 /// gate's per-frame lookup uses, straight off the frame summary. A `BTreeMap`
 /// because the row set's order escapes to diagnostics and to
@@ -64,10 +79,13 @@ type Rows = BTreeMap<[u8; 4], Arc<BoxRecord>>;
 /// One published namespace's row in the host-side table. Of what it holds,
 /// two dimensions decide a frame from this namespace's address: its switch
 /// address, the lease the shared verdict checks every frame's source against
-/// (NET-084), and its compiled egress rules — beside which the one dimension
-/// the frame rules cannot carry travels in the row too: the DNS hosts its
-/// declaration named ([`Self::allow_dns_hosts`]), for the gate's DNS admission
-/// table to pin the row's destinations from. The rest — its name
+/// (NET-084), and its compiled egress rules — beside which the dimensions
+/// the frame rules cannot carry travel in the row too: the DNS hosts its
+/// declaration named ([`Self::allow_dns_hosts`]), for the gate's DNS
+/// admission table to pin the row's destinations from, and whether its box
+/// declared a credentialed upstream
+/// ([`Self::declares_credentialed_upstream`], NET-134), for the gate to
+/// admit the proxy's address by. The rest — its name
 /// (diagnostics), its loopback address, the ports it admitted, the names it
 /// declared — is the declaration itself, carried for the host-side paths that
 /// attach and name the namespace, and for the publish half of the gate, which
@@ -84,6 +102,7 @@ pub struct BoxRecord {
     egress: EgressRules,
     resolves_names: bool,
     dns_hosts: Vec<String>,
+    credentialed_upstream: bool,
 }
 
 impl BoxRecord {
@@ -179,6 +198,24 @@ impl BoxRecord {
     pub fn allow_dns_hosts(&self) -> &[String] {
         &self.dns_hosts
     }
+
+    /// Whether this box's declaration named a credentialed upstream
+    /// (NET-134): `true` marks the Box Egress Proxy's listener as this
+    /// box's infrastructure — the one destination its compiled frame rules
+    /// never decide, because the credentials the proxy redeems are the
+    /// lane's own and no egress rule of the box's says anything about them.
+    /// `false`, the absent declaration, is no lane: the proxy's address
+    /// stays under the box-to-host default-deny like any other host-side
+    /// destination, whatever the box's rules would allow.
+    ///
+    /// The gate reads this beside the row's rules ([`crate::net::egress_gate`]),
+    /// never through them: the declaration is a fact about the box, reduced
+    /// from the session policy's own field at registration — nothing the
+    /// guest says can add a lane to a row behind the gate's back.
+    #[must_use]
+    pub fn declares_credentialed_upstream(&self) -> bool {
+        self.credentialed_upstream
+    }
 }
 
 /// A namespace's declaration as it arrives on the host, before any frame
@@ -193,6 +230,7 @@ pub struct BoxRegistration {
     admitted_ports: Vec<u16>,
     declared_names: Vec<String>,
     egress: Option<EgressPolicy>,
+    credentialed_upstream: Option<sessions::CredentialedUpstream>,
 }
 
 impl BoxRegistration {
@@ -209,6 +247,7 @@ impl BoxRegistration {
             admitted_ports: Vec::new(),
             declared_names: Vec::new(),
             egress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -240,6 +279,21 @@ impl BoxRegistration {
         self.egress = Some(policy);
         self
     }
+
+    /// The namespace's declaration of a credentialed upstream (NET-134):
+    /// `Some` marks the Box Egress Proxy's listener as this box's
+    /// infrastructure, so the gate admits its address beside — never
+    /// through — whatever egress rules the declaration also carries. The
+    /// declaration is reduced to a lane in the row; its own content is the
+    /// proxy document's to extend, so nothing of it is retained here.
+    #[must_use]
+    pub fn with_credentialed_upstream(
+        mut self,
+        declaration: sessions::CredentialedUpstream,
+    ) -> Self {
+        self.credentialed_upstream = Some(declaration);
+        self
+    }
 }
 
 /// A box declaration as the activating client carries it over the host's
@@ -259,6 +313,13 @@ pub struct ClientBoxSpec {
     /// the allow-all default, the same meaning the create request's absent
     /// policy carries.
     pub egress: Option<EgressPolicy>,
+    /// The box's declaration of a credentialed upstream (NET-134), carried
+    /// from the session's policy: `Some` makes the Box Egress Proxy's
+    /// listener this box's infrastructure — reachable whatever the egress
+    /// rules say — while `None` is no lane, and the proxy's address stays
+    /// refused under the box-to-host default-deny. The one field a client
+    /// that predates NET-134 sends absent, every time.
+    pub credentialed_upstream: Option<sessions::CredentialedUpstream>,
 }
 
 /// The run of `subnet`'s address plan the host hands registered boxes from:
@@ -364,6 +425,18 @@ pub enum WithdrawError {
 pub struct BoxRegistry {
     subnet: SwitchSubnet,
     rows: Arc<RwLock<Rows>>,
+    /// The switch addresses whose rows this daemon has marked stopped —
+    /// namespaces whose declarations stay published while they are not
+    /// running, keyed by the row's own key and shared by every clone.
+    stopped: Arc<RwLock<BTreeSet<[u8; 4]>>>,
+    /// The table's change pings: one `()` to every live subscriber whenever
+    /// a row lands, goes, or is marked stopped. The host answerer
+    /// ([`crate::net::answerer`]) subscribes — a daemon that does not hold
+    /// the answerer port re-registers its zone rows with the one that does
+    /// on every change — and the zone-table dump does
+    /// ([`crate::diag`]). Senders whose subscriber is gone are pruned on
+    /// the next ping, so a dead subscriber is never held past one change.
+    table_pings: Arc<Mutex<Vec<std::sync::mpsc::Sender<()>>>>,
     /// The sending end of the withdrawal reports, cloned into every
     /// [`BoxTable`] this registry hands out — one channel for the whole
     /// registry, whatever handle files a report into it.
@@ -404,6 +477,8 @@ impl Clone for BoxRegistry {
         BoxRegistry {
             subnet: self.subnet,
             rows: self.rows.clone(),
+            stopped: Arc::clone(&self.stopped),
+            table_pings: Arc::clone(&self.table_pings),
             withdrawal_reports: self.withdrawal_reports.clone(),
             withdrawal_reports_rx: Mutex::new(None),
             next_switch_addr: Arc::clone(&self.next_switch_addr),
@@ -426,6 +501,8 @@ impl BoxRegistry {
         Self {
             subnet,
             rows: Arc::new(RwLock::new(BTreeMap::new())),
+            stopped: Arc::new(RwLock::new(BTreeSet::new())),
+            table_pings: Arc::new(Mutex::new(Vec::new())),
             withdrawal_reports: reports,
             withdrawal_reports_rx: Mutex::new(Some(reports_rx)),
             next_switch_addr: Arc::new(AtomicU32::new(hand_out_run(subnet).0)),
@@ -512,6 +589,11 @@ impl BoxRegistry {
             ),
             resolves_names,
             dns_hosts,
+            // NET-134: the lane is the one egress dimension that compiles
+            // to nothing in the frame rules — a declaration, not a rule —
+            // so it travels in the row itself, reduced to the fact the
+            // gate reads beside those rules.
+            credentialed_upstream: registration.credentialed_upstream.is_some(),
             switch_addr: registration.switch_addr,
             loopback_addr: registration.loopback_addr,
             admitted_ports: registration.admitted_ports,
@@ -531,12 +613,25 @@ impl BoxRegistry {
         if let Some(attachments) = &self.attachments
             && record.switch_addr != self.subnet.daemon_ip()
         {
-            attachments.issue(record.name(), record.switch_addr, record.loopback_addr);
+            attachments.issue(
+                record.name(),
+                record.switch_addr,
+                record.loopback_addr,
+                record.declares_credentialed_upstream(),
+            );
         }
         self.rows
             .write()
             .expect("the row lock is never held across a panic, so it cannot be poisoned")
             .insert(record.switch_addr.octets(), Arc::clone(&record));
+        // The newest declaration is a namespace that is running: whatever
+        // stopped mark the address carried is stale now, and the change is
+        // a ping every subscriber re-derives from.
+        self.stopped
+            .write()
+            .expect("the stopped set's lock is never held across a panic, so it cannot be poisoned")
+            .remove(&record.switch_addr.octets());
+        self.ping();
         record
     }
 
@@ -559,10 +654,13 @@ impl BoxRegistry {
         // relay's report — so the withdrawal's own line measures itself
         // against this instant (NET-133's bound).
         self.retire_proxy_attachment(switch_addr, Instant::now());
-        self.rows
+        let removed = self
+            .rows
             .write()
             .expect("the row lock is never held across a panic, so it cannot be poisoned")
-            .remove(&switch_addr.octets())
+            .remove(&switch_addr.octets());
+        self.retired(&removed);
+        removed
     }
 
     /// Retires the proxy attachment issued for `switch_addr`, when this
@@ -636,6 +734,9 @@ impl BoxRegistry {
         if let Some(policy) = spec.egress {
             registration = registration.with_egress_policy(policy);
         }
+        if let Some(declaration) = spec.credentialed_upstream {
+            registration = registration.with_credentialed_upstream(declaration);
+        }
         Ok(self.register(registration))
     }
 
@@ -703,7 +804,136 @@ impl BoxRegistry {
         // every other path takes the two locks one at a time, never
         // together — so the order never inverts.
         self.retire_proxy_attachment(switch_addr, Instant::now());
-        Ok(rows.remove(&switch_addr.octets()))
+        let removed = rows.remove(&switch_addr.octets());
+        drop(rows);
+        self.retired(&removed);
+        Ok(removed)
+    }
+
+    /// Retires a removed row's side facts: its stopped mark is stale with
+    /// the row gone, and the change is a ping like any other.
+    fn retired(&self, removed: &Option<Arc<BoxRecord>>) {
+        if let Some(record) = removed {
+            self.stopped
+                .write()
+                .expect(
+                    "the stopped set's lock is never held across a panic, so it cannot be \
+                     poisoned",
+                )
+                .remove(&record.switch_addr.octets());
+            self.ping();
+        }
+    }
+
+    /// Marks the namespace published at `switch_addr` stopped: its row
+    /// stays — a stopped namespace is never mistaken for one that never
+    /// existed, so its zone name stays held and answers NODATA rather than
+    /// NXDOMAIN (NET-128) — but it answers no address while the mark
+    /// stands. A registration at the same address clears the mark, because
+    /// the newest declaration is a namespace that is running. Returns
+    /// whether a row was published at the address: marking an address no
+    /// row holds marks nothing.
+    ///
+    /// No production path marks a row stopped yet. A box's lifecycle lives
+    /// with the guest daemon that runs it, and the host learns a box
+    /// stopped when the task that carries box lifecycle over the host's
+    /// control path lands; this mutator is the seam that task writes
+    /// through, and the zone view and the state dump already carry the
+    /// mark.
+    pub fn mark_stopped(&self, switch_addr: Ipv4Addr) -> bool {
+        let held = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned")
+            .contains_key(&switch_addr.octets());
+        if held {
+            self.stopped
+                .write()
+                .expect(
+                    "the stopped set's lock is never held across a panic, so it cannot be \
+                     poisoned",
+                )
+                .insert(switch_addr.octets());
+            self.ping();
+        }
+        held
+    }
+
+    /// Subscribes to the table's change pings: one `()` per registration,
+    /// withdrawal, and stopped mark, for as long as the returned receiver
+    /// lives. The host answerer subscribes — a daemon that does not hold
+    /// the answerer port re-registers its zone rows with the one that does
+    /// on every change — and so does the zone-table dump
+    /// ([`crate::diag`]); a subscriber is pruned with its receiver, and a
+    /// ping to a dead one is dropped, never a registration held back. The
+    /// channel is unbounded and every sender drops a refused send, so a
+    /// slow registrar holds its own pings back, never the table's.
+    pub fn subscribe_table_pings(&self) -> std::sync::mpsc::Receiver<()> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.table_pings
+            .lock()
+            .expect("the ping channels' lock is held only across pushes and pings")
+            .push(sender);
+        receiver
+    }
+
+    /// Files one change ping to every live subscriber, pruning the dead
+    /// ones as it goes.
+    fn ping(&self) {
+        self.table_pings
+            .lock()
+            .expect("the ping channels' lock is held only across pushes and pings")
+            .retain(|sender| sender.send(()).is_ok());
+    }
+
+    /// The zone view the host answerer answers the box zone from (NET-138):
+    /// every published row's name under the zone apex —
+    /// `<name>.min.internal`, the form the shared decision matches — with
+    /// the host-answerable address a lookup may be told (NET-127) and the
+    /// row's liveness (NET-128). One row per namespace, held in name
+    /// order, so the view a lookup answers from and the table the state
+    /// dump writes are the same rows.
+    ///
+    /// The address is the row's published loopback address when it is one
+    /// the host may be told and `None` when it is not: a row's switch
+    /// lease is inside the guest's fabric, nothing on the host OS routes
+    /// to it, and a name held only there answers NODATA rather than
+    /// pointing a lookup somewhere it cannot go (the same gate the native
+    /// daemon's registry applies, [`is_host_answerable`]). The node's own
+    /// namespace is a row like any other — its services sit at the
+    /// machine's shared loopback address, which is answerable, so the row
+    /// answers with it.
+    ///
+    /// Liveness is the table's own fact: a row is live from its
+    /// registration, and [`Self::mark_stopped`] holds it NODATA while the
+    /// namespace it names is not running. The view is a snapshot, built
+    /// fresh by whoever asks — a lookup, a dump, a registration — so it
+    /// can never hold a row the table has already let go.
+    #[must_use]
+    pub fn zone_view(&self) -> zone_answer::ZoneView {
+        // The rows lock first, the stopped set inside it — the order every
+        // other path through both takes (`register`, `retired`,
+        // `mark_stopped`), so the two locks never wait on each other.
+        let rows = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        let stopped = self.stopped.read().expect(
+            "the stopped set's lock is never held across a panic, so it cannot be \
+                 poisoned",
+        );
+        let mut view = zone_answer::ZoneView::new();
+        for record in rows.values() {
+            view.hold(
+                zone_name(record.name()),
+                zone_answer::ZoneRow {
+                    address: is_host_answerable(record.loopback_addr())
+                        .then_some(record.loopback_addr()),
+                    live: !stopped.contains(&record.switch_addr.octets()),
+                },
+            );
+        }
+        view
     }
 
     /// Publishes the guest **node's** own namespace: the in-VM daemon's
@@ -712,13 +942,16 @@ impl BoxRegistry {
     /// with ([`SwitchSubnet::daemon_ip`]) — the guest is neither asked nor
     /// able to influence what this row holds.
     ///
-    /// The admitted ports are the two the daemon's own setup publishes at
-    /// its address: the hostname proxy's and the zone answerer's, both
-    /// assigned by the VM host before the VM boots
-    /// ([`crate::cmd::run`] hands them to the guest on the kernel command
+    /// The admitted port is the one the daemon's own setup publishes at its
+    /// address: the hostname proxy's, assigned by the VM host before the VM
+    /// boots ([`crate::cmd::run`] hands it to the guest on the kernel command
     /// line) and bound by the guest daemon as handed — so the publishes the
-    /// daemon makes to attach them are publishes of ports this row already
-    /// names, not requests for the host to open its own.
+    /// daemon makes to attach it are publishes of a port this row already
+    /// names, not requests for the host to open its own. The zone answerer is
+    /// not the node's to admit (NET-138): on a VM-backed host the in-VM daemon
+    /// starts no answerer — the host answerer serves the zone — so an
+    /// answerer port on this row would be an admitted port with nothing
+    /// behind it, a standing grant.
     ///
     /// The rules are the allow-all interim the absent-policy default ships:
     /// the node-plane baseline set is un-enrolled until NET-130's enumeration
@@ -726,10 +959,10 @@ impl BoxRegistry {
     /// gate existed — its own package fetches above all, which is the
     /// VM-side shape of NET-080. NET-130 tightens this row to the categories
     /// design §5.1 enumerates.
-    pub fn register_node_namespace(&self, proxy_port: u16, answerer_port: u16) -> Arc<BoxRecord> {
+    pub fn register_node_namespace(&self, proxy_port: u16) -> Arc<BoxRecord> {
         self.register(
             BoxRegistration::new(NODE_NAMESPACE, self.subnet.daemon_ip(), Ipv4Addr::LOCALHOST)
-                .with_admitted_ports([proxy_port, answerer_port]),
+                .with_admitted_ports([proxy_port]),
         )
     }
 
@@ -818,6 +1051,40 @@ impl BoxRegistry {
 fn take_next(cursor: &AtomicU32, first: u32, last: u32) -> Option<Ipv4Addr> {
     let next = cursor.fetch_add(1, Ordering::Relaxed);
     (first <= next && next <= last).then(|| Ipv4Addr::from(next))
+}
+
+/// A namespace's name under the zone apex, as the zone view holds it:
+/// `<name>.min.internal`. The view normalizes what it is given, so the
+/// row's name passes through exactly as the declaration spelled it.
+fn zone_name(name: &str) -> String {
+    format!("{name}.{}", zone_answer::ZONE_APEX)
+}
+
+/// Whether `addr` is one an A answer in the box zone may carry (NET-127):
+/// the host's shared loopback address, or an address from the reserved
+/// local range the address plan publishes boxes at. Anything else — a box's
+/// switch lease inside the guest's fabric, an address another host holds —
+/// is not one the host OS can reach, and a name held only there answers
+/// NODATA rather than pointing a lookup somewhere it cannot go. The same
+/// gate the native daemon's registry applies
+/// (`minimald::net::dns::is_host_answerable`), restated against the range's
+/// one definition in the switch crate so the two cannot drift.
+pub(crate) fn is_host_answerable(addr: Ipv4Addr) -> bool {
+    addr == Ipv4Addr::LOCALHOST || in_reserved_local_range(addr)
+}
+
+/// Whether `addr` falls in the reserved local range the address plan
+/// publishes boxes at.
+fn in_reserved_local_range(addr: Ipv4Addr) -> bool {
+    let (network, prefix) = switch::RESERVED_LOCAL_RANGE;
+    let host_bits = 32 - u32::from(prefix);
+    // A /0 range would mean "every address"; the shift below needs a
+    // network part to keep.
+    if host_bits >= 32 {
+        return true;
+    }
+    let mask = u32::MAX << host_bits;
+    u32::from(network) & mask == u32::from(addr) & mask
 }
 
 /// The read-only view of the published rows the egress gate decides by: the
@@ -1026,7 +1293,7 @@ mod tests {
             BoxRegistration::new("db", Ipv4Addr::new(100, 64, 0, 10), Ipv4Addr::LOCALHOST)
                 .with_admitted_ports([5432, 5433]),
         );
-        let node = registry.register_node_namespace(7654, 7656);
+        let node = registry.register_node_namespace(7654);
 
         // Every published namespace holds a row, resolved by the address the
         // gate's per-frame lookup uses.
@@ -1049,10 +1316,11 @@ mod tests {
         assert_eq!(node.switch_addr(), SUBNET.daemon_ip());
         assert_eq!(
             node.admitted_ports(),
-            [7654, 7656],
-            "the node's row names the proxy and answerer ports the VM host \
-             assigned and handed over, so the daemon's own publishes are \
-             publishes of ports the row already declares"
+            [7654],
+            "the node's row names the proxy port the VM host assigned and \
+             handed over — the answerer is not the node's to admit (NET-138) — \
+             so the daemon's own publishes are publishes of a port the row \
+             already declares"
         );
 
         // The table carries the plan its rows are addressed on, and the plan's
@@ -1202,6 +1470,7 @@ mod tests {
                 name: "web".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
+                credentialed_upstream: None,
             })
             .expect("the default plan has hand-out addresses");
         assert_eq!(
@@ -1228,6 +1497,7 @@ mod tests {
                 name: "web".to_string(),
                 ingress_ports: Vec::new(),
                 egress: None,
+                credentialed_upstream: None,
             })
             .expect("the carved subnet has hand-out addresses");
         assert_eq!(
@@ -1241,6 +1511,7 @@ mod tests {
                     name: format!("box{index}"),
                     ingress_ports: Vec::new(),
                     egress: None,
+                    credentialed_upstream: None,
                 })
                 .expect("the slice holds 32 published addresses");
         }
@@ -1251,6 +1522,7 @@ mod tests {
                         name: "late".to_string(),
                         ingress_ports: Vec::new(),
                         egress: None,
+                        credentialed_upstream: None,
                     }),
                     Err(AllocationError::LoopbackExhausted)
                 ),
@@ -1279,7 +1551,7 @@ mod tests {
                     deny_subnets: None,
                 }),
         );
-        registry.register_node_namespace(7654, 7656);
+        registry.register_node_namespace(7654);
         let mut harness = gate_over(registry).await;
 
         let before: Vec<_> = harness
@@ -1351,6 +1623,126 @@ mod tests {
         );
     }
 
+    /// The zone view the host answerer answers from (NET-138): every
+    /// published row's name under the zone apex, the host-answerable
+    /// address a lookup may be told (NET-127), and the row's liveness
+    /// (NET-128) — a row live from its registration, held NODATA once it
+    /// is marked stopped, and gone with its withdrawal, never NXDOMAIN for
+    /// a namespace that exists.
+    #[test]
+    fn the_zone_view_exposes_every_row_s_name_address_and_liveness() {
+        let registry = BoxRegistry::new(SUBNET);
+        assert!(
+            registry.zone_view().is_empty(),
+            "a fresh table's zone view holds nothing"
+        );
+
+        // One published box at its own address from the reserved local
+        // range, one whose declared loopback address is not one the host
+        // may be told — its switch lease, inside the guest's fabric — and
+        // the node's own namespace at the shared loopback.
+        let web = registry.register(BoxRegistration::new(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            Ipv4Addr::new(127, 0, 64, 9),
+        ));
+        registry.register(BoxRegistration::new(
+            "lease-only",
+            Ipv4Addr::new(100, 64, 0, 10),
+            Ipv4Addr::new(100, 64, 0, 10),
+        ));
+        registry.register_node_namespace(7654);
+
+        let view = registry.zone_view();
+        let rows: Vec<(String, Option<Ipv4Addr>, bool)> = view
+            .rows()
+            .map(|(name, row)| (name.to_string(), row.address, row.live))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("lease-only.min.internal".to_string(), None, true),
+                (
+                    "minimald.min.internal".to_string(),
+                    Some(Ipv4Addr::LOCALHOST),
+                    true
+                ),
+                (
+                    "web.min.internal".to_string(),
+                    Some(web.loopback_addr()),
+                    true
+                ),
+            ],
+            "every published row is held under its name, its host-answerable \
+             address, and its liveness, in name order"
+        );
+
+        // The decision over the view answers the same shapes the native
+        // daemon's registry does: an A lookup for the published address,
+        // NODATA for the name held at an address the host may not be told,
+        // NXDOMAIN for a name no row holds.
+        let a = sessions::core::zone_answer::Lookup {
+            name: "web.min.internal".to_string(),
+            record: sessions::core::zone_answer::RecordType::A,
+            origin: sessions::core::zone_answer::Origin::OnMachine,
+        };
+        assert_eq!(
+            sessions::core::zone_answer::decide(&a, &view),
+            sessions::core::zone_answer::Verdict::Address(web.loopback_addr()),
+            "a held live name answers A with its published address"
+        );
+        let lease_only = sessions::core::zone_answer::Lookup {
+            name: "lease-only.min.internal".to_string(),
+            record: sessions::core::zone_answer::RecordType::A,
+            origin: sessions::core::zone_answer::Origin::OnMachine,
+        };
+        assert_eq!(
+            sessions::core::zone_answer::decide(&lease_only, &view),
+            sessions::core::zone_answer::Verdict::Nodata,
+            "a name held only at an address the host may not be told is NODATA"
+        );
+
+        // A stopped namespace keeps its name held and answers NODATA, never
+        // NXDOMAIN (NET-128), and its re-registration clears the mark: the
+        // newest declaration is a namespace that is running.
+        assert!(registry.mark_stopped(web.switch_addr()));
+        let view = registry.zone_view();
+        assert_eq!(
+            view.rows()
+                .find(|(name, _)| *name == "web.min.internal")
+                .map(|(_, row)| *row),
+            Some(zone_answer::ZoneRow {
+                address: Some(web.loopback_addr()),
+                live: false,
+            }),
+            "a stopped namespace keeps its name held, live: false"
+        );
+        assert_eq!(
+            sessions::core::zone_answer::decide(&a, &view),
+            sessions::core::zone_answer::Verdict::Nodata,
+            "a stopped namespace answers NODATA, held"
+        );
+        registry.register(BoxRegistration::new(
+            "web",
+            web.switch_addr(),
+            web.loopback_addr(),
+        ));
+        assert_eq!(
+            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
+            sessions::core::zone_answer::Verdict::Address(web.loopback_addr()),
+            "a re-registration is a namespace that is running again"
+        );
+
+        // And a withdrawn namespace's name is gone with its row — held by
+        // no name, so NXDOMAIN, never a stopped name held forever.
+        assert!(registry.withdraw(web.switch_addr()).is_some());
+        assert_eq!(
+            sessions::core::zone_answer::decide(&a, &registry.zone_view()),
+            sessions::core::zone_answer::Verdict::Nxdomain,
+            "a withdrawn namespace's name is held by nothing"
+        );
+    }
+
     /// NET-133's trust boundary, on the proxy's attachments: the guest never
     /// sources one. The registry is the attachment table's one writer, and
     /// what that means behaviourally is that no amount of guest traffic
@@ -1375,7 +1767,7 @@ mod tests {
                     deny_subnets: None,
                 }),
         );
-        registry.register_node_namespace(7654, 7656);
+        registry.register_node_namespace(7654);
         let mut harness = gate_over(registry).await;
 
         // The host's own issuances, before any guest byte is written: the
