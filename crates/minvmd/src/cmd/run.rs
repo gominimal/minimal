@@ -1169,7 +1169,6 @@ const PORTS_DIR_MODE: u32 = 0o700;
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn node_ports_dir() -> Result<std::path::PathBuf> {
     use anyhow::Context as _;
-    use std::os::unix::fs::DirBuilderExt as _;
     #[cfg(target_os = "macos")]
     let base = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
@@ -1183,28 +1182,50 @@ fn node_ports_dir() -> Result<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
         .map(|runtime| runtime.join("minimal"))
         .unwrap_or_else(|| {
+            // The fallback lives under the shared, world-writable `/tmp`, so
+            // its base is created 0700 and held to the same owner/mode check
+            // as the ports dir: another user who pre-created it could
+            // otherwise swap the ports dir out from under this one.
             let uid = unsafe { libc::getuid() };
-            std::env::temp_dir().join(format!("minimal-{uid}"))
+            std::path::PathBuf::from(format!("/tmp/minimal-{uid}"))
         });
+    #[cfg(not(target_os = "macos"))]
+    let base_is_shared_tmp = std::env::var_os("XDG_RUNTIME_DIR").is_none_or(|v| v.is_empty());
+    #[cfg(target_os = "macos")]
+    let base_is_shared_tmp = false;
 
     // The base is this user's own runtime dir (the XDG_RUNTIME_DIR contract,
     // or macOS's Application Support): create it when absent, the default
     // mode — the ports dir itself is the one that carries the claim, so it
-    // is the one created 0700 and the one the owner/mode check refuses.
-    if !base.exists() {
+    // is the one created 0700 and the one the owner/mode check refuses. The
+    // `/tmp` fallback's base is the exception, created and checked like the
+    // ports dir.
+    if base_is_shared_tmp {
+        create_private_dir(&base)?;
+    } else if !base.exists() {
         std::fs::create_dir_all(&base).context("creating the node-port reservation base")?;
     }
     let ports = base.join("ports");
-    match std::fs::DirBuilder::new()
-        .mode(PORTS_DIR_MODE)
-        .create(&ports)
-    {
-        Ok(()) => Ok(ports),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            verify_ports_dir(&ports)?;
-            Ok(ports)
-        }
-        Err(error) => Err(error).context("creating the node-port reservation directory"),
+    create_private_dir(&ports)?;
+    Ok(ports)
+}
+
+/// Creates `dir` with [`PORTS_DIR_MODE`], or — when it already exists —
+/// refuses it unless this user owns it and its mode is no wider
+/// ([`verify_ports_dir`]).
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn create_private_dir(dir: &std::path::Path) -> Result<()> {
+    use anyhow::Context as _;
+    use std::os::unix::fs::DirBuilderExt as _;
+    match std::fs::DirBuilder::new().mode(PORTS_DIR_MODE).create(dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => verify_ports_dir(dir),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "creating the node-port reservation directory {}",
+                dir.display()
+            )
+        }),
     }
 }
 
@@ -1268,7 +1289,6 @@ fn verify_ports_dir(ports: &std::path::Path) -> Result<()> {
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 #[derive(Debug)]
 struct NodePortReservation {
-    port: u16,
     _lock: std::fs::File,
 }
 
@@ -1293,7 +1313,7 @@ impl NodePortReservation {
                 format!("opening the node-port reservation file {}", path.display())
             })?;
         match unsafe { libc::flock(_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } {
-            0 => Ok(Some(Self { port, _lock })),
+            0 => Ok(Some(Self { _lock })),
             _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock => {
                 Ok(None)
             }
@@ -1408,8 +1428,9 @@ struct NodePortAssignment {
     /// port taken fails the start instead of moving the surface.
     configured: bool,
     /// The host-wide reservation this supervisor holds on `port` for the
-    /// VM's life ([`NodePortReservation`]).
-    reservation: NodePortReservation,
+    /// VM's life ([`NodePortReservation`]). Never read: holding it is the
+    /// whole job, and dropping the assignment is what releases it.
+    _reservation: NodePortReservation,
 }
 
 /// Assigns the node's hostname-proxy TCP port. The operator's override
@@ -1451,7 +1472,7 @@ fn configured_node_port(port: u16) -> Result<NodePortAssignment> {
             preferred: port,
             skipped: None,
             configured: true,
-            reservation,
+            _reservation: reservation,
         }),
         CandidateCheck::Skip(reason) => Err(anyhow::anyhow!(
             "the operator-configured hostname-proxy port {port} is not available: {reason}. \
@@ -1570,7 +1591,7 @@ fn assign_node_port(preferred: u16, udp: bool) -> Result<NodePortAssignment> {
                 preferred,
                 skipped: None,
                 configured: false,
-                reservation,
+                _reservation: reservation,
             });
         }
         CandidateCheck::Skip(reason) => Some(reason),
@@ -1584,7 +1605,7 @@ fn assign_node_port(preferred: u16, udp: bool) -> Result<NodePortAssignment> {
         preferred,
         skipped,
         configured: false,
-        reservation,
+        _reservation: reservation,
     })
 }
 
@@ -2423,7 +2444,6 @@ mod tests {
         let held = super::NodePortReservation::take(port)
             .unwrap()
             .expect("a free port's reservation is taken");
-        assert_eq!(held.port, port, "the reservation names the port it holds");
         assert!(
             super::NodePortReservation::take(port).unwrap().is_none(),
             "a second supervisor's reservation of the held port is refused"
