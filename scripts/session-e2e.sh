@@ -119,6 +119,24 @@
 #                                    keeps serving; a run's box ends with
 #                                    its run's command, its client killed
 #                                    mid-command
+#   min_net_expose_publishes_lists_and_refuses
+#                                    NET-043/044: the dynamic_ingress
+#                                    stance a box is created with is what
+#                                    'min net expose' is decided against —
+#                                    an in-range ask of an allow box
+#                                    publishes, both 'min session policy'
+#                                    renderings list the runtime publish
+#                                    beside the declaration, and
+#                                    out-of-range and deny asks are
+#                                    refused with their own typed errors
+#   listen_published_port_reaches_peer_and_host
+#                                    NET-016/017: a listen inside the
+#                                    declared range publishes with no
+#                                    expose — a peer box and a host probe
+#                                    at the address the answerer returns
+#                                    reach it, the close withdraws it and
+#                                    both are refused fast, and an
+#                                    out-of-range listen reaches neither
 #   proxy_refuses_like_direct        the proxy refuses exactly as the switch
 #                                    does: paired direct/proxied attempts,
 #                                    h2 closed, h2c stripped (NET-069..071, 135)
@@ -13413,8 +13431,9 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
 
     # The listen no declaration names must stay unpublished. socat again, on
     # a port the box's rules permit no publication for — no declaration names
-    # it, and the CLI has no flag for a dynamic allow range, so NET-016's
-    # verdict for it is deny.
+    # it, and this box was created with no dynamic range either (a range this
+    # branch's create can now declare, and this proof's box deliberately
+    # does not), so NET-016's verdict for it is deny.
     mnl session exec "$po_sid" \
       "nohup /usr/bin/socat TCP-LISTEN:$PO_UNDECLARED,reuseaddr,fork SYSTEM:\"cat /home/po-http200\" >/dev/null 2>&1 &" \
       >/dev/null 2>>"$WORK/po-responder.err" \
@@ -13888,6 +13907,720 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
   po_run_half
 
   echo "port publishes on listen and the box outlives its client OK"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# A runtime expose, decided and listed end to end (NET-043, NET-044). The
+# dynamic_ingress stance a box is CREATED with — the CLI's
+# `--dynamic-ingress`/`--dynamic-range` flags, this tree's one host-side way
+# to set it — is the whole of what `min net expose` is decided against: the
+# box's own request carries a port and nothing else. This case declares an
+# `allow` over one range at the create, asks an in-range port of the box,
+# and holds the three surfaces the ask owns: the reply the box reads
+# (`published port N at ADDR:N`), the publication listed beside the
+# declaration on BOTH of `min session policy`'s renderings (NET-044), and the
+# typed refusals everything else gets — a port outside the declared range,
+# and a box whose stance is `deny`.
+#
+# The listener starts AFTER the expose on purpose. The listen watcher and
+# the expose path share the box's one publication set, and whoever reserves a
+# port first holds it — a listener standing first would hand the port to the
+# watcher, and the expose would then read back already-published instead of
+# publishing, proving nothing about the ask this case exists to drive.
+proof_min_net_expose_publishes_lists_and_refuses() {
+  echo "::group::min net expose publishes what the stance allows, lists the publication, and refuses the rest (NET-043, NET-044)"
+
+  # The names, ports and marker. The band 18110-18115 is this case's and the
+  # listen case's below it, fixed on purpose (the execs that start and probe
+  # the listener must agree) and clear of every band the proofs around them
+  # use (18080-18088, 18090-18098, 18101-18109, 19090/19091).
+  local mnx_sid="" mnx_deny_sid=""
+  local mnx_expose_out="" mnx_expose_rc="" mnx_expose_err=""
+  local mnx_ref_rc="" mnx_ref_err="" mnx_deny_rc="" mnx_deny_err=""
+  local mnx_policy="" mnx_json="" mnx_listening=""
+  local mnx_allow_name="e2e-dyn-expose" mnx_deny_name="e2e-dyn-deny"
+  local mnx_lo=18110 mnx_hi=18115      # the declared dynamic range
+  local mnx_port=18110                 # in-range: the port the allow box publishes
+  local mnx_deny_port=18111            # the port the deny box asks for
+  local mnx_out_port=18120             # outside the declared range
+  local mnx_marker="MNX_EXPOSE_OK"
+  local MNX_SEED_DIR="" MNX_DENY_SEED_DIR=""
+
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "min net expose SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so a box has no address to publish at)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ ! -c /dev/net/tun ]; then
+    echo "min net expose SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+    echo "::endgroup::"
+    return 0
+  fi
+  # The claim on the host's loopback under the 127.0.0.1 interim, the
+  # port-publish half's own check: a port the host already answers at would
+  # fake every leg below.
+  if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$mnx_port/" 2>/dev/null; then
+    echo "::error::127.0.0.1:$mnx_port already answers on this host; this case needs it free"
+    fail
+  fi
+
+  MNX_SEED_DIR="$(hook_mktemp /tmp/mnlxe.XXXXXX)"
+  hook_seed_preamble > "$MNX_SEED_DIR/minimal.toml"
+  mkdir "$MNX_SEED_DIR/.git"
+  mnx_sid="$(cd "$MNX_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$mnx_allow_name" --network own_ip \
+    --dynamic-ingress allow --dynamic-range "$mnx_lo-$mnx_hi" \
+    2>"$WORK/mnx-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --dynamic-ingress allow --dynamic-range $mnx_lo-$mnx_hi' failed"
+    echo "--- stderr ---"; cat "$WORK/mnx-activate.err" 2>/dev/null || true
+    fail
+  }
+  mnx_sid="$(printf '%s\n' "$mnx_sid" | tail -n1 | tr -d '\r')"
+  echo "allow box: $mnx_sid ($mnx_allow_name, dynamic ingress allow over $mnx_lo-$mnx_hi, no static mapping)"
+
+  # The capability gate the exec-driving proofs run, for the same reasons: a
+  # host that is itself a sandbox denies the nested namespaces a box needs,
+  # and no probe inside a box can run. A skip is honest only on a developer
+  # host; a lane that exists to run these assertions fails here instead.
+  mnx_can_skip() { [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; }
+  if ! mnl session exec "$mnx_sid" 'true' >"$WORK/mnx-execgate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$mnx_sid" 'true' >"$WORK/mnx-execgate.err" 2>&1; }; then
+    if mnx_can_skip; then
+      echo "::warning::min net expose case SKIPPED — this host cannot run a session sandbox"
+      echo "  (exec: $(head -n1 "$WORK/mnx-execgate.err" 2>/dev/null || true))"
+      echo "  on CI or a VM lane this gate fails instead"
+      mnl session destroy --force "$mnx_sid" >/dev/null 2>&1 || true
+      rm -rf "$MNX_SEED_DIR"
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::this lane cannot run a session sandbox, so no probe inside a box can run: nothing this case asserts can be asserted"
+    echo "  (exec: $(head -n1 "$WORK/mnx-execgate.err" 2>/dev/null || true))"
+    fail
+  fi
+  mnl session exec "$mnx_sid" 'test -x /usr/bin/min' >/dev/null 2>&1 \
+    || { echo "::error::the allow box has no min helper at /usr/bin/min (the daemon installs one in every box)"; fail; }
+  mnl session exec "$mnx_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 \
+    || { echo "::error::the allow box has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"; fail; }
+
+  # ---- the ask: an in-range port of an allow box --------------------------
+  # The reply is the box's own word that the publish stood: the address its
+  # forward bound, spelled host:port. A runtime-only port's reply carries the
+  # honesty caveat NET-047 pins — bound, but the relay gate has not admitted
+  # it — and this box declared no static mapping, so the caveat is expected;
+  # the case prints whichever reply it got and asserts only the publish line
+  # itself.
+  mnl session exec "$mnx_sid" "/usr/bin/min net expose $mnx_port" \
+    >"$WORK/mnx-expose.out" 2>"$WORK/mnx-expose.err"
+  mnx_expose_rc=$?
+  mnx_expose_out="$(cat "$WORK/mnx-expose.out" 2>/dev/null)"
+  mnx_expose_err="$(tr '\n' ' ' < "$WORK/mnx-expose.err" 2>/dev/null)"
+  echo "expose: min net expose $mnx_port in the allow box -> exit $mnx_expose_rc: ${mnx_expose_out:-<no reply>}${mnx_expose_err:+ [$mnx_expose_err]}"
+  if [ "$mnx_expose_rc" -ne 0 ]; then
+    echo "::error::the in-range expose did not succeed (exit $mnx_expose_rc) — the box was created allow over $mnx_lo-$mnx_hi and asked for $mnx_port"
+    cat "$WORK/mnx-expose.err" 2>/dev/null || true
+    fail
+  fi
+  case "$mnx_expose_out" in
+    "published port $mnx_port at "*":$mnx_port; not yet reachable") ;;
+    "published port $mnx_port at "*":$mnx_port") ;;
+    *)
+      echo "::error::the expose's reply is not a publish line naming the port and its address (got: '$mnx_expose_out')"
+      fail
+      ;;
+  esac
+  echo "the ask published: $mnx_expose_out (NET-043)"
+
+  # ---- the listener, after the publish -------------------------------------
+  # What the published forward delivers to, started second for the ownership
+  # reason this case's header names. Its own direct answer proves the
+  # listener exists without leaning on the publish — a leg failing against a
+  # listener that never started reads as a policy refusal, which is the one
+  # thing it must not be confused with.
+  mnl session exec "$mnx_sid" \
+    "body=$mnx_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/mnx-http200" \
+    >/dev/null 2>"$WORK/mnx-responder.err" \
+    || { echo "::error::could not write the in-box responder's response"; cat "$WORK/mnx-responder.err" 2>/dev/null || true; fail; }
+  mnl session exec "$mnx_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:$mnx_port,reuseaddr,fork SYSTEM:\"cat /home/mnx-http200\" >/dev/null 2>&1 &" \
+    >/dev/null 2>>"$WORK/mnx-responder.err" \
+    || { echo "::error::could not start the in-box responder on port $mnx_port"; cat "$WORK/mnx-responder.err" 2>/dev/null || true; fail; }
+  mnx_listening=""
+  for _ in $(seq 1 40); do
+    if [ "$(mnl session exec "$mnx_sid" \
+      "curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$mnx_port/" \
+      2>/dev/null || true)" = "200" ]; then
+      mnx_listening=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$mnx_listening" ]; then
+    echo "::error::the in-box responder on port $mnx_port never answered a direct curl — no client is in the picture yet, so this is the box's own loopback"
+    echo "--- socat exec stderr ---"; cat "$WORK/mnx-responder.err" 2>/dev/null || true
+    fail
+  fi
+  echo "listener: socat now serves port $mnx_port inside the allow box (its own loopback answers $mnx_marker)"
+
+  # ---- the publication listed beside the declaration ----------------------
+  # `min session policy` is where a person reads what a box actually
+  # published (NET-044): the text rendering carries the resolved stance and
+  # range the create declared, then the live section with one row a publish.
+  # The row is asserted by its port, not its address — the address is the
+  # switch's word, fixed only at the publish.
+  mnx_policy="$(mnl session policy "$mnx_sid" 2>"$WORK/mnx-policy.err")" \
+    || { echo "::error::'min session policy' failed for the allow box"; cat "$WORK/mnx-policy.err" 2>/dev/null || true; fail; }
+  echo "--- min session policy (text) ---"; printf '%s\n' "$mnx_policy" | sed 's/^/  /'
+  case "$mnx_policy" in
+    *"  dynamic ingress  allow"*) ;;
+    *) echo "::error::the text policy does not show the resolved dynamic ingress stance as allow"; fail ;;
+  esac
+  case "$mnx_policy" in
+    *"  dynamic ports  $mnx_lo–$mnx_hi"*) ;;
+    *) echo "::error::the text policy does not show the declared dynamic range $mnx_lo-$mnx_hi"; fail ;;
+  esac
+  case "$mnx_policy" in
+    *"live ingress (published at runtime)"*) ;;
+    *) echo "::error::the text policy shows no live-ingress section — the runtime publish is not listed beside the declaration (NET-044)"; fail ;;
+  esac
+  case "$mnx_policy" in
+    *":$mnx_port → :$mnx_port"*) ;;
+    *) echo "::error::the live-ingress section carries no row for the exposed port $mnx_port"; fail ;;
+  esac
+  echo "policy (text): stance allow over $mnx_lo–$mnx_hi, one live row for :$mnx_port (NET-043, NET-044)"
+
+  # The machine rendering, `-o json`: the same publication as one
+  # min/v1/session-policy document — the resolved stance and range inside
+  # the ingress object, the publish as one live_ingress row. python3 (an e2e
+  # prerequisite on every lane this script runs on) reads the document.
+  mnx_json="$(mnl session policy "$mnx_sid" -o json 2>"$WORK/mnx-json.err")" \
+    || { echo "::error::'min session policy -o json' failed for the allow box"; cat "$WORK/mnx-json.err" 2>/dev/null || true; fail; }
+  mnx_json_assert() { # $1 lo, $2 hi, $3 port; the document on stdin
+    python3 - "$1" "$2" "$3" <<'PY'
+import json
+import sys
+
+lo, hi, port = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+doc = json.load(sys.stdin)
+ingress = doc.get("ingress") or {}
+problems = []
+if ingress.get("kind") != "declared":
+    problems.append(f"ingress.kind is {ingress.get('kind')!r}, not 'declared'")
+if ingress.get("dynamic_ingress") != "allow":
+    problems.append(f"ingress.dynamic_ingress is {ingress.get('dynamic_ingress')!r}, not 'allow'")
+if ingress.get("dynamic_allowed_range") != [lo, hi]:
+    problems.append(
+        f"ingress.dynamic_allowed_range is {ingress.get('dynamic_allowed_range')!r}"
+        f", not [{lo}, {hi}]"
+    )
+live = doc.get("live_ingress")
+if not isinstance(live, list):
+    problems.append(f"live_ingress is {live!r}, not the rows the wire served")
+else:
+    rows = [row for row in live if row.get("internal_port") == port]
+    if len(rows) != 1:
+        problems.append(f"{len(rows)} live rows name port {port}, want exactly the one publish")
+    else:
+        print(
+            f"policy (json): live row {rows[0].get('local')}"
+            f" pending={rows[0].get('pending')}"
+        )
+if problems:
+    for line in problems:
+        print(line, file=sys.stderr)
+    sys.exit(1)
+PY
+  }
+  if ! printf '%s' "$mnx_json" | mnx_json_assert "$mnx_lo" "$mnx_hi" "$mnx_port" \
+      >"$WORK/mnx-json-check.out" 2>"$WORK/mnx-json-check.err"; then
+    echo "::error::the -o json document does not carry the resolved stance, the range, and the runtime publish"
+    cat "$WORK/mnx-json-check.out" "$WORK/mnx-json-check.err" 2>/dev/null || true
+    echo "--- document ---"; printf '%s\n' "$mnx_json"
+    fail
+  fi
+  sed 's/^/  /' "$WORK/mnx-json-check.out" 2>/dev/null || true
+
+  # ---- the range's own refusal --------------------------------------------
+  # A port outside the declared range is refused by the stance itself,
+  # decided before the switch is asked anything (NET-047): the typed error on
+  # the box's stderr, and the publish above untouched.
+  mnl session exec "$mnx_sid" "/usr/bin/min net expose $mnx_out_port" \
+    >"$WORK/mnx-out-range.out" 2>"$WORK/mnx-out-range.err"
+  mnx_ref_rc=$?
+  mnx_ref_err="$(tr '\n' ' ' < "$WORK/mnx-out-range.err" 2>/dev/null)"
+  echo "expose: min net expose $mnx_out_port in the allow box -> exit $mnx_ref_rc: ${mnx_ref_err:-<no error>}"
+  if [ "$mnx_ref_rc" -eq 0 ]; then
+    echo "::error::the out-of-range expose succeeded — the stance allows $mnx_lo-$mnx_hi and was asked for $mnx_out_port"
+    cat "$WORK/mnx-out-range.out" 2>/dev/null || true
+    fail
+  fi
+  case "$mnx_ref_err" in
+    *"port $mnx_out_port is outside this box's declared dynamic range $mnx_lo-$mnx_hi"*) ;;
+    *) echo "::error::the out-of-range refusal does not name the port and the declared range (got: '$mnx_ref_err')"; fail ;;
+  esac
+  echo "out of range: refused with its own typed error — the range the create declared is the whole gate (NET-043)"
+
+  # ---- the deny box's refusal ---------------------------------------------
+  # A box whose create said deny answers the same ask with the deny the
+  # stance spells — decided against the record before the switch is asked
+  # anything, so the deny box needs nothing but a running box to ask from.
+  MNX_DENY_SEED_DIR="$(hook_mktemp /tmp/mnlxn.XXXXXX)"
+  hook_seed_preamble > "$MNX_DENY_SEED_DIR/minimal.toml"
+  mkdir "$MNX_DENY_SEED_DIR/.git"
+  mnx_deny_sid="$(cd "$MNX_DENY_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$mnx_deny_name" --network own_ip \
+    --dynamic-ingress deny \
+    2>"$WORK/mnx-deny-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --dynamic-ingress deny' failed"
+    echo "--- stderr ---"; cat "$WORK/mnx-deny-activate.err" 2>/dev/null || true
+    fail
+  }
+  mnx_deny_sid="$(printf '%s\n' "$mnx_deny_sid" | tail -n1 | tr -d '\r')"
+  echo "deny box: $mnx_deny_sid ($mnx_deny_name, dynamic ingress deny)"
+  mnl session exec "$mnx_deny_sid" "/usr/bin/min net expose $mnx_deny_port" \
+    >"$WORK/mnx-deny.out" 2>"$WORK/mnx-deny.err"
+  mnx_deny_rc=$?
+  mnx_deny_err="$(tr '\n' ' ' < "$WORK/mnx-deny.err" 2>/dev/null)"
+  echo "expose: min net expose $mnx_deny_port in the deny box -> exit $mnx_deny_rc: ${mnx_deny_err:-<no error>}"
+  if [ "$mnx_deny_rc" -eq 0 ]; then
+    echo "::error::the deny box's expose succeeded — a box created --dynamic-ingress deny must refuse every ask"
+    cat "$WORK/mnx-deny.out" 2>/dev/null || true
+    fail
+  fi
+  case "$mnx_deny_err" in
+    *"dynamic ingress is denied for this box"*) ;;
+    *) echo "::error::the deny box's refusal does not say dynamic ingress is denied for the box (got: '$mnx_deny_err')"; fail ;;
+  esac
+  echo "deny box: refused with the deny the stance spells — the create's word is the whole decision (NET-043)"
+
+  mnl session destroy --force "$mnx_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$mnx_deny_sid" >/dev/null 2>&1 || true
+  rm -rf "$MNX_SEED_DIR" "$MNX_DENY_SEED_DIR"
+  echo "min net expose publishes, lists and refuses OK (in-range publish listed on both policy renderings; out-of-range and deny asks refused with their own typed errors)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# A listen inside the declared range, published with no expose at all
+# (NET-016, NET-017). The listen watcher decides a LISTEN against the same
+# dynamic_ingress stance the create carried — the end-to-end half of the
+# carry this branch's CLI flags own — so this case starts a server on an
+# in-range port with no expose anywhere and holds the two clients the
+# publication owes: a peer box, and a host-side probe connecting at the
+# address the host's own zone answerer returns for the box's name (the
+# published loopback address NET-016 publishes on). Closing the listener
+# withdraws the publication, and both clients' next connects must be
+# refused — fast, never a connect timeout (NET-014) — while a listener on a
+# port OUTSIDE the range publishes nothing, so neither client can reach it
+# while it stands.
+#
+# The peer rides the surface its lane has, because the lanes' fabrics
+# differ: a VM lane's boxes share the guest's fabric, so the peer is an
+# own-address box dialing the target's name, which resolves in-fabric to the
+# box's lease; a native host's daemon is off the switch and a lease is not
+# host-answerable (NET-127/128), so there the peer is a host-address box —
+# sharing the host's loopback — dialing the published address the host probe
+# resolves. Both are a peer box reaching the box's own listener; the
+# transcript names which ran.
+proof_listen_published_port_reaches_peer_and_host() {
+  echo "::group::a listen in the declared range publishes with no expose and withdraws when the listener closes (NET-016, NET-017)"
+
+  local lp_sid="" lp_peer_sid="" lp_peer_host="" lp_peer_why=""
+  local lp_ans_port="" lp_addr="" lp_listening="" lp_published="" lp_refused=""
+  local lp_rc="" lp_status="" lp_body="" lp_hrc="" lp_hstatus="" lp_hbody="" lp_hms=""
+  local lp_target_name="e2e-dyn-listen" lp_peer_name="e2e-dyn-peer"
+  local lp_lo=18110 lp_hi=18115      # the declared dynamic range (this case's band)
+  local lp_listen_port=18112         # in-range: the listen that publishes
+  local lp_out_port=18121            # outside the range: the listen that must not
+  local lp_marker="LP_LISTEN_OK"
+  local LP_SEED_DIR="" LP_PEER_SEED_DIR=""
+
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "listen-published port SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so a box has no address to publish at)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ ! -c /dev/net/tun ]; then
+    echo "listen-published port SKIPPED (no /dev/net/tun on this host: an own-IP box cannot open its in-namespace tap; runs for real on a host that has the device)"
+    echo "::endgroup::"
+    return 0
+  fi
+  # The claims on the host's loopback under the 127.0.0.1 interim: a port
+  # the host already answers at would fake both the reach legs and the
+  # refusal legs below.
+  for lp_claim_port in "$lp_listen_port" "$lp_out_port"; do
+    if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$lp_claim_port/" 2>/dev/null; then
+      echo "::error::127.0.0.1:$lp_claim_port already answers on this host; this case needs it free"
+      fail
+    fi
+  done
+
+  LP_SEED_DIR="$(hook_mktemp /tmp/mnllp.XXXXXX)"
+  hook_seed_preamble > "$LP_SEED_DIR/minimal.toml"
+  mkdir "$LP_SEED_DIR/.git"
+  lp_sid="$(cd "$LP_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$lp_target_name" --network own_ip \
+    --dynamic-ingress allow --dynamic-range "$lp_lo-$lp_hi" \
+    2>"$WORK/lp-activate.err")" || {
+    echo "::error::'min session activate --network own_ip --dynamic-ingress allow --dynamic-range $lp_lo-$lp_hi' failed for the listen target box"
+    echo "--- stderr ---"; cat "$WORK/lp-activate.err" 2>/dev/null || true
+    fail
+  }
+  lp_sid="$(printf '%s\n' "$lp_sid" | tail -n1 | tr -d '\r')"
+  echo "target box: $lp_sid ($lp_target_name, dynamic ingress allow over $lp_lo-$lp_hi — no static mapping, no expose anywhere in this case)"
+
+  # The capability gate, the port-publish half's own: a host that is itself
+  # a sandbox denies the nested namespaces a box needs, and no probe inside
+  # a box can run. A skip is honest only on a developer host.
+  lp_can_skip() { [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; }
+  if ! mnl session exec "$lp_sid" 'true' >"$WORK/lp-execgate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$lp_sid" 'true' >"$WORK/lp-execgate.err" 2>&1; }; then
+    if lp_can_skip; then
+      echo "::warning::listen-published port case SKIPPED — this host cannot run a session sandbox"
+      echo "  (exec: $(head -n1 "$WORK/lp-execgate.err" 2>/dev/null || true))"
+      echo "  on CI or a VM lane this gate fails instead"
+      mnl session destroy --force "$lp_sid" >/dev/null 2>&1 || true
+      rm -rf "$LP_SEED_DIR"
+      echo "::endgroup::"
+      return 0
+    fi
+    echo "::error::this lane cannot run a session sandbox, so no probe inside a box can run: nothing this case asserts can be asserted"
+    echo "  (exec: $(head -n1 "$WORK/lp-execgate.err" 2>/dev/null || true))"
+    fail
+  fi
+  mnl session exec "$lp_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 \
+    || { echo "::error::the target box has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"; fail; }
+
+  # The host answerer's own port, read the way the proofs around this one
+  # read it: the ZONE ANSWERER line of `min ls`.
+  lp_ans_port=""
+  for _ in $(seq 1 40); do
+    lp_ans_port="$(mnl ls 2>/dev/null \
+      | sed -n 's/^ZONE ANSWERER: *listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | head -n1)"
+    [ -n "$lp_ans_port" ] && break
+    sleep 0.25
+  done
+  if [ -z "$lp_ans_port" ]; then
+    echo "::error::the daemon's zone answerer never came up (no ZONE ANSWERER line in min ls) — the host probe below has no word for where the box is published"
+    fail
+  fi
+
+  # The server on the in-range port, the min.internal proof's socat form: a
+  # fixed 200 whose body is the marker, `nohup ... &` so it outlives the
+  # exec that starts it, and its pid on file so the close leg can stop it.
+  mnl session exec "$lp_sid" \
+    "body=$lp_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/lp-http200" \
+    >/dev/null 2>"$WORK/lp-responder.err" \
+    || { echo "::error::could not write the in-box responder's response"; cat "$WORK/lp-responder.err" 2>/dev/null || true; fail; }
+  mnl session exec "$lp_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:$lp_listen_port,reuseaddr,fork SYSTEM:\"cat /home/lp-http200\" >/dev/null 2>&1 & echo \$! > /home/lp.pid" \
+    >/dev/null 2>>"$WORK/lp-responder.err" \
+    || { echo "::error::could not start the in-box responder on port $lp_listen_port"; cat "$WORK/lp-responder.err" 2>/dev/null || true; fail; }
+  lp_listening=""
+  for _ in $(seq 1 40); do
+    if [ "$(mnl session exec "$lp_sid" \
+      "curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$lp_listen_port/" \
+      2>/dev/null || true)" = "200" ]; then
+      lp_listening=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$lp_listening" ]; then
+    echo "::error::the in-box responder on port $lp_listen_port never answered a direct curl — no publication is in the picture yet, so this is the box's own loopback"
+    echo "--- socat exec stderr ---"; cat "$WORK/lp-responder.err" 2>/dev/null || true
+    fail
+  fi
+  echo "listen: socat serves port $lp_listen_port inside the target box — inside the declared range, with no expose anywhere (NET-016's premise)"
+
+  # The address the host probe connects at: the host's own zone answerer's
+  # A record for the box's name — one datagram out, one reply back (the
+  # unpublished-port proof's own helper verbatim, python3 on every lane this
+  # script runs on; `dig` is no lane's declared dependency).
+  lp_answerer_a() {
+    python3 - "$1" "$2" <<'PY'
+import socket
+import struct
+import sys
+
+port, name = int(sys.argv[1]), sys.argv[2]
+if not 0 < port < 65536 or not name:
+    print("no answerer port or name to ask for", file=sys.stderr)
+    sys.exit(2)
+qname = b"".join(
+    bytes([len(label)]) + label.encode() for label in name.split(".") if label
+) + b"\x00"
+query = struct.pack(">HHHHHH", 0x5A5A, 0x0100, 1, 0, 0, 0)
+query += qname + struct.pack(">HH", 1, 1)
+try:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(2.0)
+        sock.sendto(query, ("127.0.0.1", port))
+        reply = sock.recv(4096)
+except OSError as error:
+    print(f"no reply from the zone answerer: {error}", file=sys.stderr)
+    sys.exit(1)
+if len(reply) < 12:
+    print("the answerer's reply is shorter than a DNS header", file=sys.stderr)
+    sys.exit(1)
+_, flags, questions, answers, _, _ = struct.unpack_from(">HHHHHH", reply, 0)
+rcode = flags & 0xF
+if rcode != 0:
+    print(f"the answerer replied rcode {rcode}", file=sys.stderr)
+    sys.exit(1)
+if answers == 0:
+    print("no answer records", file=sys.stderr)
+    sys.exit(1)
+
+
+def skip_name(buf, offset):
+    """The offset just past one name, compression pointers included."""
+    while offset < len(buf):
+        length = buf[offset]
+        if (length & 0xC0) == 0xC0:
+            return offset + 2
+        offset += 1
+        if length == 0:
+            return offset
+        offset += length
+    raise ValueError("a name runs past the reply")
+
+
+try:
+    offset = skip_name(reply, 12) + 4
+    for _ in range(answers):
+        offset = skip_name(reply, offset)
+        rtype, _, _, rdlen = struct.unpack_from(">HHIH", reply, offset)
+        if offset + 10 + rdlen > len(reply):
+            raise ValueError("an answer runs past the reply")
+        rdata = reply[offset + 10 : offset + 10 + rdlen]
+        offset += 10 + rdlen
+        if rtype == 1 and rdlen == 4:
+            print(".".join(str(byte) for byte in rdata))
+            sys.exit(0)
+except (ValueError, struct.error) as error:
+    print(f"the answerer's reply does not parse: {error}", file=sys.stderr)
+    sys.exit(1)
+print("no A record among the answer's records", file=sys.stderr)
+sys.exit(1)
+PY
+  }
+  lp_addr=""
+  for _ in $(seq 1 40); do
+    lp_addr="$(lp_answerer_a "$lp_ans_port" "$lp_target_name.min.internal" \
+      2>"$WORK/lp-ans.err" || true)"
+    [ -n "$lp_addr" ] && break
+    sleep 0.25
+  done
+  if [ -z "$lp_addr" ]; then
+    echo "::error::the zone answerer at 127.0.0.1:$lp_ans_port never answered an A record for $lp_target_name.min.internal — the host probe has no published address to connect at"
+    cat "$WORK/lp-ans.err" 2>/dev/null || true
+    fail
+  fi
+  echo "the answerer's address for $lp_target_name.min.internal (the published loopback address NET-016 publishes on): $lp_addr"
+
+  # The peer box, on the surface this lane's fabric has (this case's header
+  # names why): an own-address box dialing the name on a VM lane's guest
+  # fabric — the fabric plane as its one allow entry, the source's half of
+  # the connect-time conjunction (NET-072: a name's answer can never be the
+  # grant) — or a host-address box sharing the host's loopback on a native
+  # lane, dialing the published address the host probe resolved.
+  LP_PEER_SEED_DIR="$(hook_mktemp /tmp/mnllq.XXXXXX)"
+  hook_seed_preamble > "$LP_PEER_SEED_DIR/minimal.toml"
+  mkdir "$LP_PEER_SEED_DIR/.git"
+  if [ -n "$E2E_VM" ]; then
+    lp_peer_sid="$(cd "$LP_PEER_SEED_DIR" && mnl session activate . --no-prompt \
+      --name "$lp_peer_name" --network own_ip \
+      --allow-subnets 100.64.0.0/10 --allow-protocols tcp \
+      2>"$WORK/lp-peer-activate.err")" || {
+      echo "::error::'min session activate --network own_ip --allow-subnets ...' for the listen case's peer box failed"
+      echo "--- stderr ---"; cat "$WORK/lp-peer-activate.err" 2>/dev/null || true
+      fail
+    }
+    lp_peer_host="$lp_target_name.min.internal"
+    lp_peer_why="an own-address peer dialing the target's name, which resolves in-fabric to the box's lease (the VM lanes' between-box surface)"
+  else
+    lp_peer_sid="$(cd "$LP_PEER_SEED_DIR" && mnl session activate . --no-prompt \
+      --name "$lp_peer_name" 2>"$WORK/lp-peer-activate.err")" || {
+      echo "::error::'min session activate' for the listen case's host-address peer box failed"
+      echo "--- stderr ---"; cat "$WORK/lp-peer-activate.err" 2>/dev/null || true
+      fail
+    }
+    lp_peer_host="$lp_addr"
+    lp_peer_why="a host-address peer sharing the host's loopback, dialing the published address the host probe resolved (a native host's leases are not dialable, NET-127/128)"
+  fi
+  lp_peer_sid="$(printf '%s\n' "$lp_peer_sid" | tail -n1 | tr -d '\r')"
+  echo "peer box: $lp_peer_sid ($lp_peer_name) — $lp_peer_why"
+
+  # One peer GET, reported: the status line and the body, dialing
+  # http://$lp_peer_host:<port>/ from inside the peer box.
+  lp_peer_get() { # $1 = the port to dial; sets lp_rc, lp_status, lp_body
+    local out
+    out="$(mnl session exec "$lp_peer_sid" \
+      "curl -sS --max-time 8 -o /home/lp-peer.body -w '%{http_code}' 'http://$lp_peer_host:$1/'" \
+      2>"$WORK/lp-peer.err")"
+    lp_rc=$?
+    lp_status="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r\n')"
+    lp_body="$(mnl session exec "$lp_peer_sid" 'cat /home/lp-peer.body' 2>/dev/null || true)"
+  }
+  # One host-side GET, reported: every proxy variable stripped (NET-009's
+  # rule — no client anywhere needs configuring), the status, the body and
+  # the elapsed time — the refusal legs below read the time.
+  lp_host_get() { # $1 = the port to dial; sets lp_hrc, lp_hstatus, lp_hbody, lp_hms
+    local t0
+    t0=$(now_ms)
+    env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+      curl -sS --max-time 8 -o "$WORK/lp-host.body" -w '%{http_code}' \
+      "http://$lp_addr:$1/" >"$WORK/lp-host.out" 2>"$WORK/lp-host.err"
+    lp_hrc=$?
+    lp_hms=$(( $(now_ms) - t0 ))
+    lp_hstatus="$(cat "$WORK/lp-host.out" 2>/dev/null)"
+    lp_hbody="$(cat "$WORK/lp-host.body" 2>/dev/null || true)"
+  }
+
+  # ---- reach: the peer, polled — the watcher publishes within its own poll
+  # The watcher polls the box's listening sockets every 250 ms and publishes
+  # what the stance allows, so the peer's GET polls until the publication
+  # stands: a failure before that is a race with the watcher, not a verdict.
+  lp_published=""
+  for _ in $(seq 1 60); do
+    lp_peer_get "$lp_listen_port"
+    if [ "$lp_rc" -eq 0 ] && [ "$lp_status" = "200" ] \
+       && [[ "$lp_body" == *"$lp_marker"* ]]; then
+      lp_published=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$lp_published" ]; then
+    echo "::error::the peer never reached the in-range listen — the watcher did not publish what the stance allows (NET-016)"
+    echo "  last attempt: curl exit ${lp_rc:-<none>}, status ${lp_status:-<none>}, body '${lp_body:-<none>}'"
+    cat "$WORK/lp-peer.err" 2>/dev/null || true
+    fail
+  fi
+  echo "peer: GET http://$lp_peer_host:$lp_listen_port/ from the peer box -> HTTP 200 carrying $lp_marker — a listen the range allows is published with no expose (NET-016)"
+
+  # ---- reach: the host probe, at the address the answerer returned ---------
+  lp_host_get "$lp_listen_port"
+  echo "host: GET http://$lp_addr:$lp_listen_port/ at the answerer's address -> HTTP ${lp_hstatus:-<none>} ${lp_hbody:-<no body>}"
+  if [ "$lp_hrc" -ne 0 ] || [ "$lp_hstatus" != "200" ] \
+     || [[ "$lp_hbody" != *"$lp_marker"* ]]; then
+    echo "::error::the host-side probe did not reach the listen-published port at the box's published address"
+    cat "$WORK/lp-host.err" 2>/dev/null || true
+    fail
+  fi
+  echo "the published listen answers on the host loopback at the address its name resolves to (NET-016)"
+
+  # ---- the close: the publication withdraws with the listener -------------
+  # shellcheck disable=SC2016 # `$(cat /home/lp.pid)` must expand in the SESSION's shell, not here.
+  mnl session exec "$lp_sid" 'kill "$(cat /home/lp.pid)"' >/dev/null 2>&1 \
+    || { echo "::error::could not stop the in-box listener on port $lp_listen_port"; fail; }
+  # The withdrawal is the watcher's own next poll of the box, so the peer's
+  # GET polls until the refusal stands — bounded by the same cadence the
+  # publish leg just proved on this box.
+  lp_refused=""
+  for _ in $(seq 1 60); do
+    lp_peer_get "$lp_listen_port"
+    if [ "$lp_rc" -ne 0 ] || [ "$lp_status" != "200" ]; then
+      lp_refused=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$lp_refused" ]; then
+    echo "::error::the peer's connect still completed after the listener closed — the publication did not withdraw with it (NET-017)"
+    echo "  last attempt: curl exit ${lp_rc:-<none>}, status ${lp_status:-<none>}"
+    fail
+  fi
+  if [ "$lp_rc" -ne 7 ]; then
+    echo "::error::the peer's post-close connect ended in curl exit $lp_rc, not the 7 of a refused connection — a silent drop reads as the connect timeout 28, the shape NET-014 retires"
+    cat "$WORK/lp-peer.err" 2>/dev/null || true
+    fail
+  fi
+  echo "peer, after the close: the same GET -> connection refused (curl exit $lp_rc) — the listen's publication withdrew with its listener (NET-017)"
+  lp_host_get "$lp_listen_port"
+  echo "host, after the close: GET http://$lp_addr:$lp_listen_port/ -> curl exit $lp_hrc in ${lp_hms}ms"
+  if [ "$lp_hrc" -eq 0 ]; then
+    echo "::error::the host probe still reached the port after the listener closed — the publication did not withdraw with it (NET-017)"
+    cat "$WORK/lp-host.err" 2>/dev/null || true
+    fail
+  fi
+  if [ "$lp_hrc" -eq 28 ]; then
+    echo "::error::the host probe's post-close connect TIMED OUT (curl exit 28) — a withdrawn publication must refuse, not hang (NET-014)"
+    cat "$WORK/lp-host.err" 2>/dev/null || true
+    fail
+  fi
+  if [ "$lp_hms" -ge 4000 ]; then
+    echo "::error::the host probe's post-close connect took ${lp_hms}ms — a refusal must be fast, not a timeout (NET-014)"
+    cat "$WORK/lp-host.err" 2>/dev/null || true
+    fail
+  fi
+  echo "host probe, after the close: refused fast ($lp_hrc in ${lp_hms}ms, never the timeout)"
+
+  # ---- a listen outside the range publishes nothing ------------------------
+  mnl session exec "$lp_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:$lp_out_port,reuseaddr,fork SYSTEM:\"cat /home/lp-http200\" >/dev/null 2>&1 &" \
+    >/dev/null 2>>"$WORK/lp-responder.err" \
+    || { echo "::error::could not start the in-box responder on the out-of-range port"; cat "$WORK/lp-responder.err" 2>/dev/null || true; fail; }
+  lp_listening=""
+  for _ in $(seq 1 40); do
+    if [ "$(mnl session exec "$lp_sid" \
+      "curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$lp_out_port/" \
+      2>/dev/null || true)" = "200" ]; then
+      lp_listening=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ -z "$lp_listening" ]; then
+    echo "::error::the out-of-range responder never answered its own box — the refusals below must not run against a listener that never started"
+    echo "--- socat exec stderr ---"; cat "$WORK/lp-responder.err" 2>/dev/null || true
+    fail
+  fi
+  echo "listen: socat also serves the OUT-OF-RANGE port $lp_out_port inside the box — the stance does not allow it, so nothing may publish it"
+  # The watcher's own cadence bounds the wait: it polls every 250 ms, and
+  # the publish leg above was observed through it, so a listener standing
+  # through eight of its polls has been seen and answered — a refusal after
+  # this is the stance's verdict, not a race.
+  sleep 2
+  lp_peer_get "$lp_out_port"
+  echo "peer, out of range: GET http://$lp_peer_host:$lp_out_port/ -> curl exit ${lp_rc:-<none>}, status ${lp_status:-<none>}"
+  if [ "$lp_rc" -eq 0 ] || [ "$lp_status" = "200" ]; then
+    echo "::error::the peer reached the out-of-range listen — it was published without the stance allowing it (NET-016)"
+    cat "$WORK/lp-peer.err" 2>/dev/null || true
+    fail
+  fi
+  if [ "$lp_rc" -ne 7 ]; then
+    echo "::error::the peer's connect to the out-of-range port ended in curl exit $lp_rc, not the 7 of a refused connection — a silent drop reads as the connect timeout 28, the shape NET-014 retires"
+    cat "$WORK/lp-peer.err" 2>/dev/null || true
+    fail
+  fi
+  lp_host_get "$lp_out_port"
+  echo "host, out of range: GET http://$lp_addr:$lp_out_port/ -> curl exit $lp_hrc in ${lp_hms}ms"
+  if [ "$lp_hrc" -eq 0 ]; then
+    echo "::error::the host probe reached the out-of-range listen — it was published without the stance allowing it (NET-016)"
+    cat "$WORK/lp-host.err" 2>/dev/null || true
+    fail
+  fi
+  if [ "$lp_hrc" -eq 28 ]; then
+    echo "::error::the host probe's connect to the out-of-range port TIMED OUT (curl exit 28) — an unpublished port must refuse, not hang (NET-014)"
+    cat "$WORK/lp-host.err" 2>/dev/null || true
+    fail
+  fi
+  if [ "$lp_hms" -ge 4000 ]; then
+    echo "::error::the host probe's connect to the out-of-range port took ${lp_hms}ms — a refusal must be fast, not a timeout (NET-014)"
+    cat "$WORK/lp-host.err" 2>/dev/null || true
+    fail
+  fi
+  echo "out of range: neither the peer nor the host probe reached the listener the stance does not allow (NET-016, NET-014)"
+
+  mnl session destroy --force "$lp_peer_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$lp_sid" >/dev/null 2>&1 || true
+  rm -rf "$LP_PEER_SEED_DIR" "$LP_SEED_DIR"
+  echo "listen-published port OK (in-range listen published with no expose: the peer and the host probe reached it, the close withdrew it and both were refused, the out-of-range listen reached neither)"
   echo "::endgroup::"
 }
 
@@ -16252,6 +16985,8 @@ case "${1:-}" in
     proof_min_internal_names_through_proxy
     proof_own_ip_deny_all_box_answers_published_port
     proof_port_publishes_on_listen_and_box_outlives_client
+    proof_min_net_expose_publishes_lists_and_refuses
+    proof_listen_published_port_reaches_peer_and_host
     proof_proxy_refuses_like_direct
     proof_retired_surfaces_gone
     proof_switch_steers_proxy_mac_frames_to_the_host_stack
@@ -16286,6 +17021,8 @@ case "${1:-}" in
     | hostnames_recover_and_two_daemons_route \
     | min_internal_names_through_proxy | own_ip_deny_all_box_answers_published_port \
     | port_publishes_on_listen_and_box_outlives_client \
+    | min_net_expose_publishes_lists_and_refuses \
+    | listen_published_port_reaches_peer_and_host \
     | proxy_refuses_like_direct | retired_surfaces_gone \
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes | two_named_vms_on_one_machine \
@@ -16315,6 +17052,8 @@ case "${1:-}" in
     echo "         hostnames_recover_and_two_daemons_route"
     echo "         min_internal_names_through_proxy own_ip_deny_all_box_answers_published_port"
     echo "         port_publishes_on_listen_and_box_outlives_client"
+    echo "         min_net_expose_publishes_lists_and_refuses"
+    echo "         listen_published_port_reaches_peer_and_host"
     echo "         proxy_refuses_like_direct retired_surfaces_gone"
     echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
     echo "         two_named_vms_on_one_machine"
