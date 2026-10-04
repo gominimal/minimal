@@ -624,6 +624,38 @@ pub enum ZoneAnswererStatus {
         /// The machine's answerer port, held by a process with no channel.
         port: u16,
     },
+    /// The hostname proxy this VM host daemon reserved for its VM is not
+    /// serving, and this is the host-side cause (T93): the port the
+    /// supervisor drew or was pinned and what kept it from publishing. It
+    /// rides the answerer's read because that read is already the one
+    /// host-side fact the CLI asks this daemon for — the proxy's publish
+    /// outcome is a host fact the same way the answerer's state is, never
+    /// something the guest could vouch for, and it is the CLI's only way to
+    /// say *why* the proxy is down rather than that it merely is.
+    ProxyNotServing {
+        /// The port the supervisor reserved and the guest could not publish.
+        port: u16,
+        /// What kept the proxy from serving on that port.
+        cause: ProxyDownCause,
+    },
+}
+
+/// Why a VM host daemon says its VM's hostname proxy is not serving (T93):
+/// the terminal publish outcomes the supervisor itself reached — the port
+/// it reserved is held by another process on the host, or the draws to find
+/// a free one ran out. A host that merely has no switch to publish through
+/// says nothing here: that boot's proxy never attempted a publish, and its
+/// story stays the daemon log's, not a cause this status could name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyDownCause {
+    /// Another process on the host holds the published port — for a port
+    /// the operator pinned this fails the start outright; for a drawn one
+    /// it is what every redraw skipped.
+    PortHeld,
+    /// The drawn port's publish tries ran out: every port the reservation
+    /// drew was already taken when the guest tried to publish it.
+    RedrawsRanOut,
 }
 
 /// The addresses a successful registration hands back
