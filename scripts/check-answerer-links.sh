@@ -21,8 +21,8 @@
 #     that is statically linked has none and passes. Every ldd entry must
 #     resolve inside the loader's default dirs (/lib, /lib64, /usr/lib,
 #     /usr/lib64 — their multiarch subdirs included) or be the kernel's
-#     linux-vdso, and an entry that resolves from nowhere is an offender
-#     too (nothing is "system" until it is shown to resolve from a system
+#     vDSO (linux-vdso, or linux-gate on 32-bit x86), and an entry that
+#     resolves from nowhere is an offender too (nothing is "system" until it is shown to resolve from a system
 #     dir). The binary must also carry no RPATH and no RUNPATH entry at
 #     all: an embedded search path decides where root loads libraries
 #     from, and every system library is already on the loader's default
@@ -239,7 +239,7 @@ linux_check() {
                 # glibc ldd warns about a missing exec bit, then lists the
                 # dependencies as usual: the warning is not one of them.
                 /^ldd: warning: you do not have execution permission/ { next }
-                $1 ~ /^linux-vdso/ { emit("vdso", $1, ""); next }
+                $1 ~ /^linux-(vdso|gate)\.so/ { emit("vdso", $1, ""); next }
                 $2 == "=>" && $3 == "not" && $4 == "found" {
                     emit("missing", $1 " => not found", "")
                     next
