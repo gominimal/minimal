@@ -1686,6 +1686,7 @@ pub(crate) mod tests {
                 tcp_flags: 0,
                 seq: 0,
                 ack: 0,
+                payload_len: 0,
             },
             PINNED.octets(),
         );
@@ -1816,6 +1817,7 @@ pub(crate) mod tests {
                 tcp_flags: ACK,
                 seq: 0,
                 ack: 0,
+                payload_len: 0,
             },
             PINNED.octets(),
         );

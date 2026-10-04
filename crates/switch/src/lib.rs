@@ -1,6 +1,7 @@
 //! gvproxy-switch primitives: subnet arithmetic, MAC derivation, the vsock wire
-//! constants, gvproxy `-config` rendering, and the default address plan an
-//! un-enrolled host self-allocates from.
+//! constants, gvproxy `-config` rendering, the default address plan an
+//! un-enrolled host self-allocates from, and the one refusal shape every leg
+//! that refuses a connection answers with ([`refusal`]).
 //!
 //! Shared by `minimald` (the in-guest / native switch client + IP allocator) and
 //! `minvmd` (the host switch supervisor). A standalone crate — these are network
@@ -16,6 +17,7 @@ pub mod bep_host;
 #[cfg(feature = "stack-peer")]
 pub use bep_host::{BepDevice, BepDeviceEnds, BepHost, BepPeer};
 pub mod loopback;
+pub mod refusal;
 
 /// MTU advertised to the switch and the tap devices. gvproxy's own default.
 pub const DEFAULT_MTU: u16 = 1500;

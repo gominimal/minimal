@@ -116,6 +116,11 @@
 #   native_resolution_without_proxy_env
 #                                    NET-009/122/123: the advisory, the probe,
 #                                    and host-OS resolution with no proxies
+#   native_resolution_from_host_answerer_on_vm_host
+#                                    NET-124..128/138 on a VM-backed lane:
+#                                    the VM host daemon answers the zone on
+#                                    the host loopback and the in-VM daemon
+#                                    owns no answerer
 #   local_range_reserved_by_privileged_step
 #                                    NET-123's macOS half: the advisory's one
 #                                    command installs the boot-time range unit;
@@ -149,6 +154,17 @@
 #                                    a denied range, answers AAAA/HTTPS/SVCB
 #                                    empty, and lets boxes reach each other by
 #                                    name under both boxes' rules
+#   unpublished_port_refused_on_vm_host
+#                                    NET-014's VM-lane half: a peer box's
+#                                    connect to a box's unpublished port is
+#                                    refused within 5 s, never timed out;
+#                                    the host's own connect to the box's
+#                                    published address on an unpublished
+#                                    port is refused the same way, and
+#                                    where a published name reaches the
+#                                    box from the host the host's own
+#                                    connect through that name gets the
+#                                    same refusal
 #   proxy_sees_each_vm_box_by_its_switch_address
 #                                    NET-132: a box's connection to the
 #                                    proxy's address is delivered carrying
@@ -170,15 +186,16 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 E2E_VM="${E2E_VM:-}"
 
 # The three Linux fresh-install KVM proofs are documented as VM-backed cases
-# (NET-049/NET-051, plus the stock-install integration case) and are invoked
-# directly by their task test lines. When called that way, behave as if the
-# caller exported the KVM lane environment variables: E2E_VM=1 and
-# E2E_MINIMAL_ARGS="--provider local-minvmd". Without this the script's
-# min_daemon probe defaults to minimald on Linux and the standalone case fails
-# before it reaches the proof.
+# (NET-049/NET-051, plus the stock-install integration case), the
+# unpublished-port refusal proof is one by its own subject (NET-014 on the VM
+# host), and each is invoked directly by its task test line. When called that
+# way, behave as if the caller exported the KVM lane environment variables:
+# E2E_VM=1 and E2E_MINIMAL_ARGS="--provider local-minvmd". Without this the
+# script's min_daemon probe defaults to minimald on Linux and the standalone
+# case fails before it reaches the proof.
 case "${1:-}" in
   fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
-    | linux_stock_install_runs_vm_boxes)
+    | linux_stock_install_runs_vm_boxes | unpublished_port_refused_on_vm_host)
     E2E_VM="${E2E_VM:-1}"
     if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
       E2E_MINIMAL_ARGS="--provider local-minvmd"
@@ -242,6 +259,8 @@ DA_TARGET_SEED_DIR="" # its deny-all target box's seed; removed on teardown
 DA_SIBLING_SEED_DIR="" # its sibling box's seed; removed on teardown
 GOA_T_SEED_DIR="" # the github-only allowlist proof's toolchain-box seed; removed on teardown
 GOA_SEED_DIR="" # its shared shell-stack seed (the denied-range and peer boxes); removed on teardown
+UPR_T_SEED_DIR="" # the unpublished-port refusal proof's target box; removed on teardown
+UPR_P_SEED_DIR="" # its peer box's seed; removed on teardown
 BOXREG_SEED_DIR="" # the box-registration proof's seed; removed on teardown
 BOXREG_CTRLC_SEED_DIR="" # its Ctrl-C seed (carries bulk data); removed on teardown
 BOXREG_CTRLC_PID="" # its interrupted activate; INT then KILL on teardown
@@ -604,6 +623,11 @@ teardown() {
   [ -n "$DA_SIBLING_SEED_DIR" ] && rm -rf "$DA_SIBLING_SEED_DIR"
   [ -n "$GOA_T_SEED_DIR" ] && rm -rf "$GOA_T_SEED_DIR"
   [ -n "$GOA_SEED_DIR" ] && rm -rf "$GOA_SEED_DIR"
+  # The unpublished-port refusal proof's two boxes: its own success path
+  # removes them too, but every failure path in it goes straight to `fail`,
+  # so the trap is the one place that always sees them.
+  [ -n "$UPR_T_SEED_DIR" ] && rm -rf "$UPR_T_SEED_DIR"
+  [ -n "$UPR_P_SEED_DIR" ] && rm -rf "$UPR_P_SEED_DIR"
   [ -n "$NET080_SEED_DIR" ] && rm -rf "$NET080_SEED_DIR"
   [ -n "$BOXREG_SEED_DIR" ] && rm -rf "$BOXREG_SEED_DIR"
   [ -n "$BOXREG_CTRLC_SEED_DIR" ] && rm -rf "$BOXREG_CTRLC_SEED_DIR"
@@ -4921,13 +4945,14 @@ fi
 # they survive regardless.
 #
 # Lane gating, by observed fact as ever:
-#   * The advisory and its command assert on EVERY lane — the CLI detects the
-#     hook host-side, whatever side the daemon is on.
+#   * The advisory and its command assert on the NATIVE lane only — the
+#     in-VM daemon starts no zone answerer and publishes none through the
+#     forwarder (NET-138), so a VM session's create response carries no
+#     answerer port and the CLI prints no advisory for it; the VM lanes'
+#     answerer subject is native_resolution_from_host_answerer_on_vm_host.
 #   * The daemon's probe record and the host half (run the command, resolve)
-#     are native-only: a VM lane's daemon and answerer live in the guest, so
-#     its log is guest-side (`hook_log_readable`) and its answerer is not
-#     this host's loopback. The KVM/macOS lanes assert the advisory; the
-#     native lane proves the whole path.
+#     are native-only with it: a native daemon's log is host-side
+#     (`hook_log_readable`) and its answerer is this host's loopback.
 #   * The host half needs `resolvectl`, `getent` and passwordless `sudo`, and
 #     a skip is only honest on a developer host (the proxy case's gate
 #     doctrine); a CI native lane that cannot run the command is a red lane.
@@ -5354,6 +5379,16 @@ range_wait_unit() {
 }
 
 proof_native_resolution_without_proxy_env() {
+  # VM-backed lanes: the in-VM daemon starts no zone answerer (NET-138) and
+  # publishes none through the forwarder — the box zone on those hosts is the
+  # VM host daemon's answerer's, and the case named
+  # native_resolution_from_host_answerer_on_vm_host is that lane's own. This
+  # proof's subject is a NATIVE daemon's answerer and the host resolver it
+  # configures, which no VM lane has.
+  if [ -n "$E2E_VM" ]; then
+    echo "native resolution without proxy settings SKIPPED (VM-backed lane: the in-VM daemon starts no answerer; native_resolution_from_host_answerer_on_vm_host is this lane's case)"
+    return 0
+  fi
   echo "::group::native min.internal resolution with no proxy settings (NET-009, NET-122, NET-123)"
 
   # The daemon's file log, newest first (one file per calendar day).
@@ -5397,7 +5432,7 @@ proof_native_resolution_without_proxy_env() {
     sleep 0.25
   done
   if [ -z "$native_port" ]; then
-    if [ -z "${CI:-}" ] && [ -z "$E2E_VM" ]; then
+    if [ -z "${CI:-}" ]; then
       echo "::warning::native-resolution proof SKIPPED — this host's daemon never owned its zone answerer"
       echo "  (a dev host running another minimald holds the ports; with no answerer port there"
       echo "   is no command to name, and NET-122's advisory correctly stays quiet)"
@@ -5491,7 +5526,7 @@ proof_native_resolution_without_proxy_env() {
     native_bypassed=yes
     echo "advisory said this host's lookups bypass systemd-resolved's stub (NET-122 detection):"
     echo "  $(grep -F -- 'bypass systemd-resolved' "$native_err" 2>/dev/null | head -n1)"
-    if [ -n "${CI:-}" ] || [ -n "$E2E_VM" ]; then
+    if [ -n "${CI:-}" ]; then
       echo "::error::this lane's host bypasses systemd-resolved's stub, so NET-009 cannot be proved on it"
       echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
       echo "--- /etc/resolv.conf ---"; cat /etc/resolv.conf 2>&1 || true
@@ -5505,7 +5540,7 @@ proof_native_resolution_without_proxy_env() {
     # interim), so this is a dev host that configured the zone against this
     # daemon before. CI's fresh runners never see it, which is why it is an
     # error there.
-    if [ -n "${CI:-}" ] || [ -n "$E2E_VM" ]; then
+    if [ -n "${CI:-}" ]; then
       echo "::error::no advisory on the activate's stderr, and this lane's resolver is not configured for the zone (NET-122)"
       echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
       fail
@@ -5545,12 +5580,10 @@ proof_native_resolution_without_proxy_env() {
   fi
 
   # ---- the host half: run the command, then resolve with no proxy env -----
-  if [ -n "$E2E_VM" ]; then
-    echo "host half SKIPPED (VM-backed target: the answerer is guest-side; the native lane proves it)"
-  elif ! command -v resolvectl >/dev/null 2>&1 \
-       || ! command -v ip >/dev/null 2>&1 \
-       || ! command -v getent >/dev/null 2>&1 \
-       || ! sudo -n true >/dev/null 2>&1; then
+  if ! command -v resolvectl >/dev/null 2>&1 \
+     || ! command -v ip >/dev/null 2>&1 \
+     || ! command -v getent >/dev/null 2>&1 \
+     || ! sudo -n true >/dev/null 2>&1; then
     if [ -z "${CI:-}" ]; then
       echo "::warning::native-resolution host half SKIPPED — this host cannot run the advisory's command"
       echo "  (needs resolvectl, ip, getent and passwordless sudo; CI's native lane has all four)"
@@ -5679,6 +5712,308 @@ proof_native_resolution_without_proxy_env() {
 
   mnl session destroy --force "$native_sid" >/dev/null 2>&1 || true
   echo "native min.internal resolution with no proxy settings OK (${native_proved:-advisory race} — each printed)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# The box zone on a VM-backed host, answered by the VM host daemon on the HOST
+# loopback (NET-124..NET-128, NET-138). VM-lane only — a native lane's daemon
+# answers the zone itself, and the case above proves that. Both halves read
+# the way a person reads them:
+#
+#   * `min ls` names the VM host daemon as the zone's answerer (NET-138): on
+#     a VM-backed host the zone is the host's to answer, the guest daemon
+#     starts no answerer, and the CLI reads the host answerer's state from
+#     minvmd's control socket — never through the guest — and prints the
+#     ZONE ANSWERER line from it: answered by the VM host daemon, naming the
+#     holder.
+#   * The VM host daemon's answerer answers real zone names on the host, and
+#     dig reads the wire a host resolver would, at the port the answerer's
+#     own start record names — the listener it holds, or the machine's
+#     answerer port when another VM host daemon holds it and this table's
+#     rows answer through it:
+#       - `host.min.internal`, the row the answerer itself holds (NET-003's
+#         host half), answering the host loopback;
+#       - one live VM box's name, answering the host-loopback address the
+#         host authored for that box (NET-125), within the short TTL the
+#         zone's clients are promised (NET-126) — the box's own row, because
+#         the node's row no longer travels the answerer channel (a second
+#         VM's would be refused by construction);
+#       - an unknown name, answered NXDOMAIN with the zone's SOA (NET-126),
+#         not dropped.
+#
+# A VM lane that cannot produce the answers FAILS, not skips: this case is the
+# box zone's whole story on those lanes.
+# ---------------------------------------------------------------------------
+proof_native_resolution_from_host_answerer_on_vm_host() {
+  if [ -z "$E2E_VM" ]; then
+    echo "native resolution from the host answerer SKIPPED (VM-backed lane only; a native lane answers the zone from its own daemon)"
+    return 0
+  fi
+  echo "::group::native min.internal resolution from the VM host daemon's answerer (NET-124..NET-128, NET-138)"
+
+  # dig, the wire a host resolver reads. A lane without it cannot assert this
+  # case's subject at all, so a VM lane that lacks it fails: this proof never
+  # skips past the box zone's story on the lane the story is about.
+  if ! command -v dig >/dev/null 2>&1; then
+    echo "::error::a VM lane must have dig to read the host answerer's answers"
+    fail
+  fi
+
+  # Warm the lane: `min ls` is the call that autospawns the VM host daemon —
+  # the answerer serves beside it — and boots the guest behind it. The
+  # answerer's start record is INFO, and a daemon's filter comes from RUST_LOG
+  # at autospawn (it inherits the CLI's env), while this harness quiets the
+  # whole run to `warn` for output parsing — which drops the record before it
+  # reaches any sink, and a daemon an earlier case left up was spawned under
+  # that quiet filter and never wrote one: the Linux KVM lane passed this case
+  # only by reading the record its install proofs' `minvmd=info` spawns had
+  # left behind in the shared log dir, and the macOS lane runs no install
+  # proof, so nothing had. Take the VM down first — on a VM target that is the
+  # daemon itself (the restart proof pins sessions survive it) — and let the
+  # ONE command that autospawns carry `minvmd` at info: command-local, never
+  # an export, and `minvmd` is the daemon's crate, so the CLI's own stdout
+  # stays quiet.
+  mnl stop --force >/dev/null 2>&1 || true # a standalone run has no daemon yet
+  if ! RUST_LOG="warn,minvmd=info" mnl ls >/dev/null 2>&1; then
+    echo "::error::'min ls' could not bring this VM lane's daemon up (the host answerer serves beside it)"
+    fail
+  fi
+
+  # NET-138, the host half as the CLI surfaces it: `min ls` reads the
+  # answerer's state from the VM host daemon's control socket and names the
+  # zone's answerer — the in-VM daemon owns none. Capture-then-grep, never
+  # `mnl ls | grep`: grep's early exit SIGPIPEs the CLI.
+  host_answerer_ls="$(mnl ls 2>/dev/null || true)"
+  if ! printf '%s\n' "$host_answerer_ls" \
+      | grep -qF -- 'ZONE ANSWERER:   answered by the VM host daemon (single-operator interim)'; then
+    echo "::error::min ls does not name the VM host daemon as the zone's answerer — the line the CLI reads from minvmd's control socket is missing"
+    echo "--- min ls ---"; printf '%s\n' "$host_answerer_ls"
+    fail
+  fi
+  echo "min ls names the VM host daemon as the zone's answerer (NET-138):"
+  printf '%s\n' "$host_answerer_ls" | grep -- 'ZONE ANSWERER' | sed 's/^/  /'
+
+  # The VM host daemon's own log candidates, newest first: the answerer is a
+  # host process, so its start record sits beside the daemon's in minvmd's
+  # file log; the detached supervisor's run.log is the fallback (the fsr
+  # case's candidate list).
+  host_answerer_log_candidates() {
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log*' -type f 2>/dev/null | sort -r
+    printf '%s\n' "$XDG_STATE_HOME/minimal/providers/local-minvmd0/run.log"
+  }
+
+  # The answerer's start record, whichever of the three states it left: the
+  # listener it holds, the registration with a holder, or the warn that the
+  # port is held by something with no channel. Polled because a standalone
+  # run of this case can race the daemon's first boot.
+  host_answerer_records=""
+  for _ in $(seq 1 40); do
+    host_answerer_records=""
+    while IFS= read -r host_answerer_cand; do
+      [ -f "$host_answerer_cand" ] || continue
+      host_answerer_records="${host_answerer_records}
+$(grep -h -- 'zone-answerer' "$host_answerer_cand" 2>/dev/null || true)"
+    done < <(host_answerer_log_candidates)
+    printf '%s\n' "$host_answerer_records" | grep -qF \
+      -e 'holds the host loopback' \
+      -e "registered this table's zone rows with it" \
+      -e "this VM's box names are not answered on the host" \
+      && break
+    sleep 0.5
+  done
+
+  host_answerer_port=""
+  if printf '%s\n' "$host_answerer_records" | grep -qF -- 'holds the host loopback'; then
+    host_answerer_port="$(printf '%s\n' "$host_answerer_records" \
+      | grep -F -- 'holds the host loopback' | tail -n1 \
+      | sed -n 's/.*"listener":"127\.0\.0\.1:\([0-9][0-9]*\)".*/\1/p')"
+    if [ -z "$host_answerer_port" ]; then
+      echo "::error::the answerer's serving record names no listener port to read the zone from"
+      echo "--- record ---"; printf '%s\n' "$host_answerer_records" | grep -F -- 'holds the host loopback' | tail -n1
+      fail
+    fi
+    echo "the VM host daemon holds the machine's answerer port: 127.0.0.1:$host_answerer_port"
+  elif printf '%s\n' "$host_answerer_records" | grep -qF -- "registered this table's zone rows with it"; then
+    host_answerer_port=7656
+    echo "another VM host daemon on this machine holds the answerer port; this VM's rows answer through it at 127.0.0.1:$host_answerer_port"
+  elif printf '%s\n' "$host_answerer_records" | grep -qF -- "this VM's box names are not answered on the host"; then
+    # The port is held by a process no channel reaches (a native minimald, a
+    # foreign process): this VM's names genuinely do not answer on the host,
+    # so there is no answer to read — the defect this case exists to catch,
+    # on a CI lane and a dev host alike: a VM lane whose names do not answer
+    # is red, never quietly skipped past.
+    echo "::error::the VM host daemon's answerer could not take the machine's port (a process with no channel holds it), so this VM's box names are not answered on the host"
+    printf '%s\n' "$host_answerer_records" | grep -F -- 'zone-answerer' | tail -n5
+    fail
+  else
+    echo "::error::no zone-answerer start record in the VM host daemon's log after 20 s — the answerer neither holds the port nor says why it cannot"
+    echo "--- minvmd log (zone-answerer lines) ---"
+    printf '%s\n' "$host_answerer_records" | grep -F -- 'zone-answerer' | tail -n5
+    echo "--- minvmd log candidates ---"
+    while IFS= read -r host_answerer_cand; do
+      echo "--- $host_answerer_cand ---"; tail -10 "$host_answerer_cand" 2>/dev/null || echo "(no such file)"
+    done < <(host_answerer_log_candidates)
+    fail
+  fi
+
+  # One A query at the answerer's port, asserted field-wise (dig pads its
+  # columns, so no literal substring): one A record at the expected address,
+  # within the short TTL the zone promises (a withdrawn box stops resolving
+  # fast). The name and the address it must carry are the caller's — the
+  # host's own row, then a live box's.
+  host_answerer_expect_a() {
+    # $1: the name to ask for. $2: the A address the answer must carry.
+    local name="$1" address="$2" reply ttl
+    reply="$(dig +time=2 +tries=1 +noall +answer "@127.0.0.1" \
+      -p "$host_answerer_port" "$name" A 2>/dev/null || true)"
+    if [ -z "$reply" ]; then
+      echo "::error::$name did not answer at 127.0.0.1:$host_answerer_port on the host"
+      echo "--- dig (no answer) ---"
+      dig +time=2 +tries=1 "@127.0.0.1" -p "$host_answerer_port" "$name" A 2>&1 || true
+      echo "--- minvmd log (zone-answerer lines, tail) ---"
+      printf '%s\n' "$host_answerer_records" | grep -F -- 'zone-answerer' | tail -n5
+      fail
+    fi
+    echo "dig @127.0.0.1 -p $host_answerer_port $name A:"
+    printf '%s\n' "$reply" | sed 's/^/  /'
+    if ! printf '%s\n' "$reply" \
+        | awk -v want="$address" '$4 == "A" && $5 == want { found = 1 } END { exit !found }'; then
+      echo "::error::$name's answer is not the expected $address (got: '$reply')"
+      fail
+    fi
+    ttl="$(printf '%s\n' "$reply" | awk '$4 == "A" { print $2; exit }')"
+    case "$ttl" in
+      ''|*[!0-9]*)
+        echo "::error::could not read $name's answer TTL (got: '$ttl')"
+        fail
+        ;;
+    esac
+    if [ "$ttl" -gt 15 ]; then
+      echo "::error::$name's answer TTL is $ttl s — the zone's answers are promised short (≤ 15 s), so a withdrawn box stops resolving fast"
+      fail
+    fi
+    echo "$name answers $address at 127.0.0.1:$host_answerer_port (TTL ${ttl}s)"
+  }
+
+  # NET-003's host half, the row that proves the answerer on the wire is
+  # this zone's: a foreign process squatting the port would not answer the
+  # host's own name with 127.0.0.1.
+  host_answerer_expect_a host.min.internal 127.0.0.1
+
+  # One live VM box name (NET-125): a box's row is registered at its
+  # session's activation, and the row is the own-address registration's —
+  # a host-address box shares the node's own row and registers none, so
+  # `zone.json` would never hold `e2e-answerer.min.internal` — hence
+  # `--network own_ip`, ahead of whatever else the lane's activate args
+  # carry. The warm-up above took the daemon — and with it the table —
+  # down, so mint one. The address its name must answer with is read from
+  # the daemon's own zone-table dump (zone.json, the view the answerer
+  # answers from, the file a diagnostic bundle carries), because the host
+  # authored it: the CLI's activation hands it to the session, the
+  # daemon's allocation drew it, and the e2e has no other source of truth
+  # for it.
+  local answerer_session="e2e-answerer"
+  # shellcheck disable=SC2086
+  (cd "$PROJECT_DIR" && mnl session activate . --name "$answerer_session" --network own_ip ${E2E_ACTIVATE_ARGS:-}) \
+    >"$WORK/answerer-activate.out" 2>"$WORK/answerer-activate.err" \
+    || { echo "::error::could not activate a session to give the zone a live box row"
+         echo "--- activate stderr ---"; cat "$WORK/answerer-activate.err" 2>/dev/null || true
+         fail; }
+  answerer_box="${answerer_session}.min.internal"
+  zone_dump="$XDG_STATE_HOME/minimal/providers/local-minvmd0/zone.json"
+  answerer_expected=""
+  for _ in $(seq 1 40); do
+    answerer_expected="$(python3 -c '
+import json, sys
+for row in json.load(open(sys.argv[1])):
+    if row.get("name") == sys.argv[2] and row.get("live"):
+        print(row.get("address") or "")
+        break
+' "$zone_dump" "$answerer_box" 2>/dev/null || true)"
+    [ -n "$answerer_expected" ] && break
+    sleep 0.5
+  done
+  if [ -z "$answerer_expected" ]; then
+    echo "::error::the zone-table dump names no live row for $answerer_box — the box's host row never published"
+    echo "--- $zone_dump ---"; cat "$zone_dump" 2>/dev/null || echo "(absent)"
+    fail
+  fi
+  echo "the zone dump holds $answerer_box at $answerer_expected"
+  # The row reaches the port's holder on the registry's change ping — the
+  # same event that rewrote the dump — so on a machine whose answerer is
+  # another daemon the answer can trail the dump by a poll. Wait for the
+  # answer to be the row's, then let the assert above carry the TTL and the
+  # printed evidence.
+  for _ in $(seq 1 40); do
+    if dig +time=2 +tries=1 +noall +answer "@127.0.0.1" -p "$host_answerer_port" \
+        "$answerer_box" A 2>/dev/null \
+        | awk -v want="$answerer_expected" '$4 == "A" && $5 == want { found = 1 } END { exit !found }'; then
+      break
+    fi
+    sleep 0.5
+  done
+  host_answerer_expect_a "$answerer_box" "$answerer_expected"
+  # The row is this proof's to withdraw — destroying the session withdraws
+  # it (T66) — so the lane is left as it was found. The withdrawal is also
+  # the live table's other half, so this proof reads it too: the row must
+  # leave the host-authored zone view within the same 20 s bound the
+  # create-side poll allowed, and the name must stop answering — NXDOMAIN, a
+  # destroyed box's answer (NET-012), never the stale A record the live row
+  # answered with.
+  mnl session destroy --force "$answerer_session" >/dev/null 2>&1 || true
+  answerer_left=""
+  for _ in $(seq 1 40); do
+    answerer_left="$(python3 -c '
+import json, sys
+for row in json.load(open(sys.argv[1])):
+    if row.get("name") == sys.argv[2] and row.get("live"):
+        print(row.get("address") or "live")
+        break
+' "$zone_dump" "$answerer_box" 2>/dev/null || true)"
+    [ -z "$answerer_left" ] && break
+    sleep 0.5
+  done
+  if [ -n "$answerer_left" ]; then
+    echo "::error::$answerer_box still holds a live row ($answerer_left) in the zone table 20 s after its session was destroyed — the withdrawal never landed in the host-authored table"
+    echo "--- $zone_dump ---"; cat "$zone_dump" 2>/dev/null || echo "(absent)"
+    fail
+  fi
+  echo "$answerer_box's row left the zone table"
+  # The name follows the row off the answerer, and on a machine whose
+  # answerer is another daemon the negative can trail the dump by a poll —
+  # exactly the create side's trail — so wait for it, then assert it with the
+  # dig in hand: the row is gone from the table the answers come from, so
+  # anything but NXDOMAIN is a stale answer.
+  answerer_destroyed_nx=""
+  for _ in $(seq 1 40); do
+    answerer_destroyed_nx="$(dig +time=2 +tries=1 +noall +comments "@127.0.0.1" \
+      -p "$host_answerer_port" "$answerer_box" A 2>/dev/null || true)"
+    printf '%s\n' "$answerer_destroyed_nx" | grep -q 'status: NXDOMAIN' && break
+    sleep 0.5
+  done
+  if ! printf '%s\n' "$answerer_destroyed_nx" | grep -q 'status: NXDOMAIN'; then
+    echo "::error::$answerer_box did not answer NXDOMAIN at 127.0.0.1:$host_answerer_port after its session was destroyed"
+    echo "--- dig (comments) ---"; printf '%s\n' "$answerer_destroyed_nx"
+    echo "--- minvmd log (zone-answerer lines, tail) ---"
+    printf '%s\n' "$host_answerer_records" | grep -F -- 'zone-answerer' | tail -n5
+    fail
+  fi
+  echo "$answerer_box answers NXDOMAIN after destroy (the withdrawn row's name)"
+
+  # An unknown name (NET-126): the zone's negatives say NXDOMAIN and carry
+  # the SOA, not a silent drop, which a host resolver would read as a
+  # server failure rather than an absent box.
+  host_answerer_nx="$(dig +time=2 +tries=1 +noall +comments "@127.0.0.1" \
+    -p "$host_answerer_port" "no-such-box-e2e.min.internal" A 2>/dev/null || true)"
+  if ! printf '%s\n' "$host_answerer_nx" | grep -q 'status: NXDOMAIN'; then
+    echo "::error::an unknown box name did not answer NXDOMAIN at 127.0.0.1:$host_answerer_port"
+    echo "--- dig (comments) ---"; printf '%s\n' "$host_answerer_nx"
+    fail
+  fi
+  echo "an unknown box name answers NXDOMAIN (the SOA-carrying negative)"
+
+  echo "native min.internal resolution from the VM host daemon's answerer OK (min ls names the VM host daemon, the host row and a live box answer at 127.0.0.1:$host_answerer_port, the destroyed box's name withdraws to NXDOMAIN, unknown names NXDOMAIN)"
   echo "::endgroup::"
 }
 
@@ -8254,6 +8589,661 @@ $(cat "$WORK/goa-$label-1.err" "$WORK/goa-$label-2.err" 2>/dev/null || true)"
   rm -rf "$GOA_T_SEED_DIR"; GOA_T_SEED_DIR=""
   rm -rf "$GOA_SEED_DIR"; GOA_SEED_DIR=""
   echo "github-only allowlist OK (toolchain fetched, nothing else reached, one refused answer logged, AAAA/HTTPS/SVCB answered empty, boxes reached each other by name)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# NET-014 on the VM-backed host: a connection to a port a box has not
+# published is refused within 5 s, never timed out. The github-only case
+# above holds the connect-time conjunction's shape — its unpublished-port
+# zone leg included — on every lane that has a switch; THIS case is the VM
+# host's own half of the same requirement, driven where the fabric it
+# describes exists: boxes the VM host daemon registered, the in-guest relay
+# that answers their SYNs, and the host gate that fronts it. Three legs,
+# one transcript line each:
+#
+#   * the peer leg — a peer box connects to the target's UNPUBLISHED port by
+#     name and must be refused with the kernel's own connection-refused
+#     shape (curl exit 7, fast), never the connect timeout a silent drop
+#     reads as (exit 28). The control the same run completes first — the
+#     same peer reaching the target's PUBLISHED port by the same name — is
+#     what makes the refusal the port's and not weather: the fabric carried
+#     this peer to this box a moment before, so a fast refusal below can
+#     only be the unpublished port's own.
+#
+#   * the host address leg — the host connects to the box's PUBLISHED
+#     ADDRESS, the one its declaration publishes at, on a port nothing
+#     publishes. Host-side forwarders bind only admitted ports, so a host
+#     SYN to an unpublished port is refused by the host kernel and never
+#     reaches the VM: the leg proves the published address refuses fast —
+#     the same connection-refused shape (curl exit 7) within the 5 s
+#     NET-014 asks for, never the connect timeout a silent drop reads as
+#     (exit 28). The control is the condition, the peer leg's own doctrine:
+#     the host reaches the same address's PUBLISHED port and the marker
+#     answers, and the port the leg then refuses is probed first — a port
+#     something on this host answers at that address proves nothing about
+#     the address, and under the macOS 127.0.0.1 interim the published
+#     address IS the shared host loopback, where anything may be listening.
+#     The address itself is the host's own word for where the box is
+#     published: the zone answerer's A record for the box's name
+#     (NET-010/NET-127), the address the host-side forwarders bind, asked
+#     for straight at the answerer's own port — the one `min ls` reports as
+#     `ZONE ANSWERER`, which the guest daemon binds and the VM host's
+#     forwarders publish on the host loopback — with no OS resolver hook in
+#     the way. The box-registry record's `loopback_address` is a different
+#     allocation the forwarders do not bind at (#1908), so the leg does not
+#     connect by it; the case still reads and prints the record, as the
+#     registry's half of the pair beside the answerer's address, which is
+#     why it keeps the stop-and-respawn dance: the record is INFO and a
+#     daemon's log filter is fixed at spawn, so the case stops the daemon
+#     pair first and lets its own activation autospawn a host daemon pinned
+#     command-locally one step wider than the lane's
+#     `warn,minimald::exec=info`, which drops it. And the whole leg is
+#     WHERE-gated like the name leg: no answerer line, no address for the
+#     name, or a published port that does not answer at it, and the leg
+#     says what it could not assert and asserts nothing — the control alone
+#     never fails the case.
+#
+#   * the host name leg — WHERE a published name reaches the box from the
+#     host. The control IS the condition: the host connects through
+#     `<name>.min.internal` to the target's published port, every proxy
+#     variable stripped from curl's environment, and the marker answers.
+#     Where that holds, the host's own connect through the same name to the
+#     UNPUBLISHED port must get the same refusal — the leg that shows the
+#     host gate passing a host-originated SYN through to the relay that
+#     resets it. Where it does not (no lane points this host's own resolver
+#     at the answerer, so no box name resolves from the host's curl), the
+#     leg prints the observed fact and asserts nothing: the WHERE clause is
+#     the requirement's own, and a skip that says what it could not assert
+#     is the honest reading.
+#
+# Every refusal's audit line — the one shared format every leg's log tail
+# carries — rides the guest's serial console into the host-side boot log on
+# a VM lane, so each leg's window is printed beneath it: whichever leg
+# refused, the transcript shows the same `rule_matched=… address=… port=…
+# reason=… source=… refusals=N` line (printed, never asserted; the legs
+# assert the refused shape, and the window is the evidence of which leg
+# answered). The address leg's window is printed without the poll for one
+# reason of its own: a SYN its host kernel refuses never reaches the VM,
+# so the leg's expectation is the EMPTY window — and printing it is what
+# shows the refusal came from before the fabric, not through it.
+proof_unpublished_port_refused_on_vm_host() {
+  local upr_t_sid="" upr_p_sid="" upr_ready=""
+  local upr_ctl_rc="" upr_ctl_status="" upr_ctl_body=""
+  local upr_ref_rc="" upr_ref_ms="" upr_ref_status="" upr_ref_err="" upr_ref_answered=""
+  local upr_arec="" upr_addr="" upr_log0="" upr_log0_lines=0
+  local upr_actl_rc="" upr_actl_status="" upr_actl_body=""
+  local upr_probe_rc="" upr_closed_host="" upr_cand=""
+  local upr_aref_rc="" upr_aref_ms="" upr_aref_status="" upr_aref_err="" upr_aref_answered=""
+  local upr_w=""
+  local upr_hctl_rc="" upr_hctl_status="" upr_hctl_body=""
+  local upr_href_rc="" upr_href_ms="" upr_href_status="" upr_href_err="" upr_href_answered=""
+  local upr_peer_leg="" upr_addr_leg="" upr_name_leg=""
+  local upr_before="" upr_start=""
+  local upr_ans_port="" upr_ans_addr=""
+  local upr_t_name="e2e-unpub-target" upr_p_name="e2e-unpub-peer"
+  local upr_pub_port=18101 upr_closed_port=18102
+  local upr_marker="UNPUB_TARGET_OK"
+  echo "::group::an unpublished port is refused on a VM-backed host (NET-014)"
+
+  # This case is the VM lanes': the in-guest relay it drives and the host
+  # gate that fronts it exist only where the CLI is VM-backed. A native host's
+  # own relay refuses the same SYN — the github-only case's zone legs carry
+  # that half on a native lane — so a native run skips rather than prove the
+  # native path twice.
+  if [ -z "$E2E_VM" ]; then
+    echo "unpublished-port refusal on a VM host SKIPPED (native target: the in-guest relay this case drives and the host gate that fronts it exist only where the CLI is VM-backed; a native relay's own refusal is the github-only case's half on that lane)"
+    echo "::endgroup::"
+    return 0
+  fi
+  # The VM lanes' own prerequisite, scoped to the OS where it is the right
+  # criterion: a Linux VM boots on KVM (libkrun's Linux backend has no other
+  # tier), so the fresh-install KVM cases gate on /dev/kvm — while the macOS
+  # lane, which this case also runs on in the whole-lane order, hypervises
+  # through Hypervisor.framework and has no /dev/kvm at all. Probe the device
+  # only where it is the lane's tier, so a Linux box without KVM skips with
+  # the lane mismatch named instead of failing a boot it can never complete.
+  if [ "$(uname -s)" = Linux ] && { [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
+    echo "unpublished-port refusal on a VM host SKIPPED (no writable /dev/kvm: a Linux VM boots on KVM and this host has none — the case drives a VM-backed host, and a native host's own refusal is the github-only case's zone legs, not this case's subject)"
+    echo "::endgroup::"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+    echo "unpublished-port refusal on a VM host SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so no box has an address to be refused at)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The in-guest daemon's log on a VM lane: its stdout rides the guest's
+  # serial console into the host-side boot log — the same file `fail` dumps
+  # and the github-only case reads (goa_log's twin, and its note on the SGR
+  # codes the console layer paints applies here too: they are stripped at
+  # this one reader, so a record's fields read the same as the file shape).
+  upr_log() {
+    printf '%s\n' "${MINVMD_BOOT_LOG:-$XDG_STATE_HOME/minimal/providers/local-minvmd0/boot.log}"
+  }
+  upr_log_lines() {
+    local f
+    f="$(upr_log)"
+    if [ -n "$f" ] && [ -f "$f" ]; then wc -l < "$f"; else printf '0\n'; fi
+  }
+  upr_net_since() {
+    local f esc
+    f="$(upr_log)"
+    [ -n "$f" ] && [ -f "$f" ] || return 0
+    esc=$'\033'
+    tail -n "+$(($1 + 1))" "$f" | grep -F -- 'minimald::net::' \
+      | sed "s/${esc}[[0-9;]*m//g" || true
+  }
+  # The window's records, printed beneath the leg that owed them: poll ≤5 s
+  # for the wanted line (the serial console is asynchronous), then print
+  # whatever landed — the shared refusal audit line when the relay answered
+  # this leg's SYN, and the empty window that says it never saw one.
+  upr_print_net_since() {
+    local before="$1" want="$2" i w=""
+    for i in $(seq 1 20); do
+      w="$(upr_net_since "$before")"
+      case "$w" in *"$want"*) break ;; esac
+      sleep 0.25
+    done
+    if [ -n "$w" ]; then
+      printf '%s\n' "$w" | sed 's/^/daemon log: /'
+    else
+      echo "daemon log: (no minimald::net record in this window)"
+    fi
+  }
+
+  # The VM HOST daemon's file log (the proxy case's same sink, newest
+  # first: a dated rotation sorts after the unsuffixed name) — and the
+  # lines this case's own daemon gained, scoped by the snapshot below, so
+  # an earlier run's record for the same box name cannot stand in for this
+  # one's: the files accumulate across runs and days.
+  upr_host_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
+      | sort -r | head -n1
+  }
+  upr_case_log() {
+    local f
+    f="$(upr_host_log)"
+    [ -n "$f" ] || return 0
+    if [ "$f" = "$upr_log0" ] && [ "${upr_log0_lines:-0}" -gt 0 ]; then
+      tail -n +"$((upr_log0_lines + 1))" "$f" 2>/dev/null
+    else
+      # A rotation mid-case: the newest file postdates the snapshot, so
+      # every line in it is this case's own daemon's.
+      cat "$f" 2>/dev/null
+    fi
+  }
+
+  # The host address leg's address, from the host's own zone answerer: the
+  # address the box's declaration publishes at, which the host-side
+  # forwarders bind, is the A record the answerer returns for the box's
+  # name (NET-010/NET-127) — so the leg asks for it at the answerer's own
+  # port, straight, with no OS resolver hook involved (`dig @127.0.0.1 -p
+  # <port> <name> +short`'s question, asked with python3, which every lane
+  # this script runs on already owes the pty driver above; `dig` itself is
+  # no lane's declared dependency). One datagram out, one reply back, and
+  # the A record's four bytes on stdout; nothing on stdout and a nonzero
+  # exit when the answerer holds no address for the name, with the reason
+  # on stderr for the skip line that names it.
+  upr_answerer_a() {
+    python3 - "$1" "$2" <<'PY'
+import socket
+import struct
+import sys
+
+port, name = int(sys.argv[1]), sys.argv[2]
+if not 0 < port < 65536 or not name:
+    print("no answerer port or name to ask for", file=sys.stderr)
+    sys.exit(2)
+# One A query: a header with recursion desired and one question, the name
+# as length-prefixed labels, type A, class IN.
+qname = b"".join(
+    bytes([len(label)]) + label.encode() for label in name.split(".") if label
+) + b"\x00"
+query = struct.pack(">HHHHHH", 0x5A5A, 0x0100, 1, 0, 0, 0)
+query += qname + struct.pack(">HH", 1, 1)
+try:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(2.0)
+        sock.sendto(query, ("127.0.0.1", port))
+        reply = sock.recv(4096)
+except OSError as error:
+    print(f"no reply from the zone answerer: {error}", file=sys.stderr)
+    sys.exit(1)
+if len(reply) < 12:
+    print("the answerer's reply is shorter than a DNS header", file=sys.stderr)
+    sys.exit(1)
+_, flags, questions, answers, _, _ = struct.unpack_from(">HHHHHH", reply, 0)
+rcode = flags & 0xF
+if rcode != 0:
+    print(f"the answerer replied rcode {rcode}", file=sys.stderr)
+    sys.exit(1)
+if answers == 0:
+    print("no answer records", file=sys.stderr)
+    sys.exit(1)
+
+
+def skip_name(buf, offset):
+    """The offset just past one name, compression pointers included."""
+    while offset < len(buf):
+        length = buf[offset]
+        if (length & 0xC0) == 0xC0:
+            return offset + 2
+        offset += 1
+        if length == 0:
+            return offset
+        offset += length
+    raise ValueError("a name runs past the reply")
+
+
+try:
+    offset = skip_name(reply, 12) + 4  # the question's name, type, class
+    for _ in range(answers):
+        offset = skip_name(reply, offset)
+        rtype, _, _, rdlen = struct.unpack_from(">HHIH", reply, offset)
+        if offset + 10 + rdlen > len(reply):
+            raise ValueError("an answer runs past the reply")
+        rdata = reply[offset + 10 : offset + 10 + rdlen]
+        offset += 10 + rdlen
+        if rtype == 1 and rdlen == 4:
+            print(".".join(str(byte) for byte in rdata))
+            sys.exit(0)
+except (ValueError, struct.error) as error:
+    print(f"the answerer's reply does not parse: {error}", file=sys.stderr)
+    sys.exit(1)
+print("no A record among the answer's records", file=sys.stderr)
+sys.exit(1)
+PY
+  }
+
+  # The host address leg below connects by the box's PUBLISHED ADDRESS, and
+  # the only in-tree word for that address is the registration record the
+  # VM host daemon writes when it allocates the box's row (see the header).
+  # The record is INFO and a daemon's log filter is fixed at spawn from the
+  # RUST_LOG it inherits, and this lane runs the whole script at
+  # `warn,minimald::exec=info`, which drops it — so stop whatever daemon
+  # pair is up (the proxy case's idiom, both of the pair: the session
+  # daemon `min stop` reaches and, on a VM lane, the host daemon `minvmd
+  # stop` does, the one whose environment the pin must reach) and let this
+  # case's own activation below autospawn a fresh host daemon carrying it.
+  # The case stops the pair again on its way out, so the pin never leaks
+  # into the rest of the lane. The snapshot of the host log is taken now,
+  # before the daemon exists, so the record the case reads can only be this
+  # case's own.
+  mnl stop --force >/dev/null 2>&1 || true
+  if [ -n "$E2E_VM" ]; then
+    minvmd stop >/dev/null 2>&1 || true
+  fi
+  upr_log0="$(upr_host_log)"
+  upr_log0_lines=0
+  if [ -n "$upr_log0" ]; then
+    upr_log0_lines="$(wc -l <"$upr_log0" 2>/dev/null)" || upr_log0_lines=0
+  fi
+
+  # Two seeds, two dirs on purpose: a path that already holds a live session
+  # mints no second one (the browser-path proof's own note), and this case
+  # needs two boxes at once.
+  UPR_T_SEED_DIR="$(hook_mktemp /tmp/mnlut.XXXXXX)"
+  UPR_P_SEED_DIR="$(hook_mktemp /tmp/mnlup.XXXXXX)"
+  hook_seed_preamble > "$UPR_T_SEED_DIR/minimal.toml"
+  hook_seed_preamble > "$UPR_P_SEED_DIR/minimal.toml"
+  mkdir "$UPR_T_SEED_DIR/.git" "$UPR_P_SEED_DIR/.git"
+
+  # Both boxes declare the fabric plane as their one allow entry — the
+  # source's half of the connect-time conjunction (a box-zone answer pins
+  # nothing, so a name's answer can never be the grant, NET-072) — and the
+  # target declares its one published port: the control the refusal below
+  # is read against, never a substitute for it.
+  upr_t_sid="$(cd "$UPR_T_SEED_DIR" && RUST_LOG="warn,minimald::exec=info,minvmd=info" \
+    mnl session activate . --no-prompt \
+    --name "$upr_t_name" --network own_ip \
+    --allow-subnets 100.64.0.0/10 --allow-protocols tcp \
+    --ingress "$upr_pub_port:$upr_pub_port" \
+    2>"$WORK/upr-t-activate.err")" || {
+    echo "::error::'min session activate' for the unpublished-port target box failed"
+    echo "--- stderr ---"; cat "$WORK/upr-t-activate.err" 2>/dev/null || true
+    fail
+  }
+  upr_t_sid="$(printf '%s\n' "$upr_t_sid" | tail -n1 | tr -d '\r')"
+  # The registry's own allocation for the target box, straight from the
+  # registration record the activation just made the host daemon write —
+  # one INFO line naming the box and the address pair it allocated, this
+  # case's own daemon only (the snapshot above scopes the read), and the
+  # same record the box-register proof reads its pair from. The host address
+  # leg below does NOT connect by this address: the row's `loopback_address`
+  # is an allocation the forwarders do not bind at (#1908), so the leg asks
+  # the answerer where the box is published instead. The record stays in the
+  # transcript as the registry's half of that pair — a bundle read where the
+  # registry allocated and where the box actually is, in one place.
+  upr_addr=""
+  for _ in $(seq 1 40); do
+    upr_arec="$(upr_case_log | grep -F "\"box\":\"$upr_t_name\"" \
+      | grep -F 'registered box with the VM host daemon; addresses allocated' | tail -n1)"
+    upr_addr="$(printf '%s\n' "$upr_arec" \
+      | sed -n 's/.*"loopback_address":"\([0-9.]*\)".*/\1/p')"
+    [ -n "$upr_addr" ] && break
+    sleep 0.25
+  done
+  if [ -z "$upr_addr" ]; then
+    echo "::error::the VM host daemon's log carries no registration record naming box '$upr_t_name' and the address pair it allocated after activate — the host address leg below asks the answerer for the box's published address, and a box no row was ever registered for has none to ask about"
+    echo "--- minvmd log (tail) ---"
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minvmd.log*' -type f \
+      -exec tail -n 40 {} + 2>/dev/null || true
+    fail
+  fi
+  echo "VM host daemon record: $upr_arec"
+  echo "the registry's allocation for the target box: $upr_addr (the host address leg connects by the address the answerer returns for the box's name, not by this one)"
+  upr_p_sid="$(cd "$UPR_P_SEED_DIR" && mnl session activate . --no-prompt \
+    --name "$upr_p_name" --network own_ip \
+    --allow-subnets 100.64.0.0/10 --allow-protocols tcp \
+    2>"$WORK/upr-p-activate.err")" || {
+    echo "::error::'min session activate' for the unpublished-port peer box failed"
+    echo "--- stderr ---"; cat "$WORK/upr-p-activate.err" 2>/dev/null || true
+    fail
+  }
+  upr_p_sid="$(printf '%s\n' "$upr_p_sid" | tail -n1 | tr -d '\r')"
+  echo "boxes: the target $upr_t_sid ($upr_t_name, publishing $upr_pub_port) and the peer $upr_p_sid ($upr_p_name)"
+
+  # The target's responder on its published port (the github-only proof's
+  # socat form verbatim: socat is a launcher baseline package every box
+  # ships at /usr/bin), proven up before any leg runs — a leg failing
+  # against a listener that never started reads as a policy refusal, which
+  # is the one thing it must not be confused with.
+  mnl session exec "$upr_t_sid" 'test -x /usr/bin/socat' >/dev/null 2>&1 \
+    || { echo "::error::the target box has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"; fail; }
+  mnl session exec "$upr_t_sid" \
+    "body=$upr_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/upr200" \
+    >/dev/null 2>"$WORK/upr-responder.err" || {
+    echo "::error::could not write the target box's responder response"
+    cat "$WORK/upr-responder.err" 2>/dev/null || true
+    fail
+  }
+  mnl session exec "$upr_t_sid" \
+    "nohup /usr/bin/socat TCP-LISTEN:$upr_pub_port,reuseaddr,fork SYSTEM:\"cat /home/upr200\" >/dev/null 2>&1 &" \
+    >/dev/null 2>"$WORK/upr-responder.err" || {
+    echo "::error::could not start the target box's responder"
+    cat "$WORK/upr-responder.err" 2>/dev/null || true
+    fail
+  }
+  upr_ready=""
+  for _ in $(seq 1 40); do
+    if [ "$(mnl session exec "$upr_t_sid" \
+      "curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$upr_pub_port/" \
+      2>/dev/null || true)" = "200" ]; then
+      upr_ready=1; break
+    fi
+    sleep 0.25
+  done
+  [ -n "$upr_ready" ] || {
+    echo "::error::the target box's responder never answered its own box — the legs below must not run against a listener that never started"
+    fail
+  }
+
+  # ---- the control: the peer reaches the published port by name ----------
+  # The same peer, the same name, the published port: this leg's completing
+  # in THIS run is what separates the refusal below from a dead fabric —
+  # the doctrine every enforcement proof here carries.
+  mnl session exec "$upr_p_sid" \
+    "curl -sS --max-time 8 -o /home/upr.body -w 'HTTP:%{http_code}' 'http://$upr_t_name.min.internal:$upr_pub_port/'" \
+    >"$WORK/upr-ctl.out" 2>"$WORK/upr-ctl.err"
+  upr_ctl_rc=$?
+  upr_ctl_status="$(cat "$WORK/upr-ctl.out" 2>/dev/null)"
+  upr_ctl_body="$(mnl session exec "$upr_p_sid" 'cat /home/upr.body' 2>/dev/null || true)"
+  echo "control: the peer's GET http://$upr_t_name.min.internal:$upr_pub_port/ (the published port) -> ${upr_ctl_status:-<none>} ${upr_ctl_body:-<no body>}"
+  if [ "$upr_ctl_rc" -ne 0 ] || [ "${upr_ctl_status:-}" != "HTTP:200" ] \
+     || [[ "$upr_ctl_body" != *"$upr_marker"* ]]; then
+    echo "::error::the peer never reached the target's published port by name — the refusal below could not be told from a dead fabric"
+    cat "$WORK/upr-ctl.err" 2>/dev/null || true
+    fail
+  fi
+
+  # ---- the peer leg: the unpublished port is refused, never timed out -----
+  upr_before="$(upr_log_lines)"
+  upr_start="$(now_ms)"
+  mnl session exec "$upr_p_sid" \
+    "curl -sS --max-time 5 -o /dev/null -w 'HTTP:%{http_code}' 'http://$upr_t_name.min.internal:$upr_closed_port/'" \
+    >"$WORK/upr-ref.out" 2>"$WORK/upr-ref.err"
+  upr_ref_rc=$?
+  upr_ref_ms=$(( $(now_ms) - upr_start ))
+  upr_ref_status="$(cat "$WORK/upr-ref.out" 2>/dev/null)"
+  upr_ref_err="$(tr '\n' ' ' < "$WORK/upr-ref.err" 2>/dev/null)"
+  # curl ALWAYS writes its -w line and writes `HTTP:000` when nothing
+  # answered, so any real status back is an answer (the egress proof's rule).
+  # Each failure names the observed facts itself, so the leg's one transcript
+  # line below states the outcome only once the shape is verified.
+  upr_ref_answered=0
+  [ "$upr_ref_rc" -eq 0 ] && upr_ref_answered=1
+  [ -n "${upr_ref_status:-}" ] && [ "$upr_ref_status" != "HTTP:000" ] && upr_ref_answered=1
+  if [ "$upr_ref_answered" -ne 0 ]; then
+    echo "::error::the peer's connect to the target's unpublished port ANSWERED (curl exit $upr_ref_rc, ${upr_ref_status:-<none>}, ${upr_ref_ms} ms) — a port nothing published must be refused, and the control above reached this same box's published port in this same run"
+    cat "$WORK/upr-ref.err" 2>/dev/null || true
+    fail
+  fi
+  if [ "$upr_ref_rc" -ne 7 ]; then
+    echo "::error::the peer's connect to the unpublished port ended in curl exit $upr_ref_rc after ${upr_ref_ms} ms, not the 7 of a refused connection — a silent drop reads as the connect timeout 28, the shape NET-014 retires, and the control above completed in this same run so the fabric is alive"
+    cat "$WORK/upr-ref.err" 2>/dev/null || true
+    fail
+  fi
+  if [ "$upr_ref_ms" -ge 5000 ]; then
+    echo "::error::the peer's refusal took ${upr_ref_ms} ms (curl exit $upr_ref_rc) — NET-014 asks for the refusal within 5 s, and a refusal that slow is a drop that read as the timeout"
+    cat "$WORK/upr-ref.err" 2>/dev/null || true
+    fail
+  fi
+  upr_peer_leg="refused in ${upr_ref_ms} ms (curl exit $upr_ref_rc, never the timeout)"
+  echo "peer leg: the peer box's connect to $upr_t_name.min.internal:$upr_closed_port (published by nothing) -> $upr_peer_leg, while the control reached this same box's published port in this same run; curl: ${upr_ref_err:-<none>}"
+  upr_print_net_since "$upr_before" 'no ingress mapping'
+
+  # ---- the host address leg: the published address refuses fast -------------
+  # The address this leg connects at is the one the host's own zone
+  # answerer returns for the box's name — the address the box's declaration
+  # publishes at, which the host-side forwarders bind — asked for straight
+  # at the answerer's port (upr_answerer_a above), so no OS resolver hook is
+  # needed: a VM's daemon reports the port it bound, which is the one the VM
+  # host handed it and the host's forwarder publishes at 127.0.0.1. The
+  # registry's own record above names a different, unbound address (#1908),
+  # so this is the one word the tree has for where the box really is.
+  #
+  # The whole leg is WHERE-gated, like the name leg below it: without the
+  # answerer's address, or without the published port answering at it, there
+  # is no route to refuse on and the case says so and asserts nothing — the
+  # host control alone never fails it, and the OK line never claims a leg
+  # that did not run.
+  upr_ans_port=""
+  for _ in $(seq 1 40); do
+    upr_ans_port="$(mnl ls 2>/dev/null \
+      | sed -n 's/^ZONE ANSWERER:.*listening on 127\.0\.0\.1:\([0-9][0-9]*\) (UDP).*/\1/p' \
+      | head -n1)"
+    [ -n "$upr_ans_port" ] && break
+    sleep 0.25
+  done
+  upr_addr_leg=""
+  upr_ans_addr=""
+  if [ -z "$upr_ans_port" ]; then
+    upr_addr_leg="skipped (no zone answerer on record for this VM host: 'min ls' carries no ZONE ANSWERER line, so the host's own word for where the box is published cannot be asked for)"
+    echo "host address leg: SKIPPED ($upr_addr_leg)"
+  elif ! upr_ans_addr="$(upr_answerer_a "$upr_ans_port" \
+       "$upr_t_name.min.internal" 2>"$WORK/upr-ans.err")"; then
+    upr_addr_leg="skipped (the zone answerer at 127.0.0.1:$upr_ans_port has no published address for $upr_t_name.min.internal: $(tr '\n' ' ' < "$WORK/upr-ans.err" 2>/dev/null))"
+    echo "host address leg: SKIPPED ($upr_addr_leg)"
+  else
+    echo "the answerer's address for $upr_t_name.min.internal (the address the box publishes at): $upr_ans_addr, beside the registry's allocation $upr_addr"
+    # The control is the condition, the peer leg's own doctrine: the host
+    # reaches the target's PUBLISHED port at that address, every proxy
+    # variable stripped from curl's environment (NET-009's rule — no client
+    # anywhere needs configuring), and the marker answers.
+    env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+      curl -sS --max-time 8 -o "$WORK/upr-actl.body" -w 'HTTP:%{http_code}' \
+      "http://$upr_ans_addr:$upr_pub_port/" \
+      >"$WORK/upr-actl.out" 2>"$WORK/upr-actl.err"
+    upr_actl_rc=$?
+    upr_actl_status="$(cat "$WORK/upr-actl.out" 2>/dev/null)"
+    upr_actl_body="$(cat "$WORK/upr-actl.body" 2>/dev/null || true)"
+    echo "control: the host's GET http://$upr_ans_addr:$upr_pub_port/ (the published port, at the box's published address) -> ${upr_actl_status:-<none>} ${upr_actl_body:-<no body>}"
+    if [ "$upr_actl_rc" -ne 0 ] || [ "${upr_actl_status:-}" != "HTTP:200" ] \
+       || [[ "$upr_actl_body" != *"$upr_marker"* ]]; then
+      upr_addr_leg="skipped (the VM host does not serve the box's published ports at its published address ($upr_ans_addr))"
+      echo "host address leg: SKIPPED ($upr_addr_leg)"
+      cat "$WORK/upr-actl.err" 2>/dev/null || true
+    else
+      # The port the leg refuses must be one the box publishes nothing on AND
+      # one nothing on this host answers at that address: the box publishes
+      # $upr_pub_port and nothing else, and a connect that something answers
+      # proves nothing about the address — most of all under the macOS
+      # 127.0.0.1 interim, where the published address IS the shared host
+      # loopback and anything may be listening. Probe each candidate with a
+      # short connect first and take the first one nothing answers; curl exit
+      # 0 means something did.
+      upr_closed_host=""
+      for upr_cand in "$upr_closed_port" 18103 18104 18105 18106 18107 18108 18109; do
+        env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+          -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+          curl -sS --max-time 2 -o /dev/null \
+          "http://$upr_ans_addr:$upr_cand/" >/dev/null 2>&1
+        upr_probe_rc=$?
+        [ "$upr_probe_rc" -eq 0 ] && continue
+        upr_closed_host="$upr_cand"
+        break
+      done
+      if [ -z "$upr_closed_host" ]; then
+        upr_addr_leg="skipped (every candidate unpublished port answered at $upr_ans_addr, so the leg has no port the box publishes nothing on and nothing on this host answers)"
+        echo "host address leg: SKIPPED ($upr_addr_leg)"
+      else
+        # The leg: the host's own connect to that address on the unpublished
+        # port, the same proxy-stripped curl, and the address must refuse it
+        # fast — the shape NET-014 asks of the published address, never the
+        # timeout shape of a silent drop.
+        upr_before="$(upr_log_lines)"
+        upr_start="$(now_ms)"
+        env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+          -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+          curl -sS --max-time 5 -o /dev/null -w 'HTTP:%{http_code}' \
+          "http://$upr_ans_addr:$upr_closed_host/" \
+          >"$WORK/upr-aref.out" 2>"$WORK/upr-aref.err"
+        upr_aref_rc=$?
+        upr_aref_ms=$(( $(now_ms) - upr_start ))
+        upr_aref_status="$(cat "$WORK/upr-aref.out" 2>/dev/null)"
+        upr_aref_err="$(tr '\n' ' ' < "$WORK/upr-aref.err" 2>/dev/null)"
+        # The answered rule the peer leg above already carries: curl ALWAYS
+        # writes its -w line and `HTTP:000` when nothing answered, so any real
+        # status back — or a zero exit — is an answer, and a port nothing
+        # publishes must not produce one.
+        upr_aref_answered=0
+        [ "$upr_aref_rc" -eq 0 ] && upr_aref_answered=1
+        [ -n "${upr_aref_status:-}" ] && [ "$upr_aref_status" != "HTTP:000" ] && upr_aref_answered=1
+        if [ "$upr_aref_answered" -ne 0 ]; then
+          echo "::error::the host's connect to the unpublished port ANSWERED at the target's published address (curl exit $upr_aref_rc, ${upr_aref_status:-<none>}, ${upr_aref_ms} ms) — the control above reached this same address's published port in this same run, so the answer is an enforcement hole"
+          cat "$WORK/upr-aref.err" 2>/dev/null || true
+          fail
+        fi
+        if [ "$upr_aref_rc" -ne 7 ]; then
+          echo "::error::the host's connect to the unpublished port at the target's published address $upr_ans_addr ended in curl exit $upr_aref_rc after ${upr_aref_ms} ms, not the 7 of a refused connection — the control above reached this same address's published port, so a timeout shape here is the drop NET-014 retires"
+          cat "$WORK/upr-aref.err" 2>/dev/null || true
+          fail
+        fi
+        if [ "$upr_aref_ms" -ge 5000 ]; then
+          echo "::error::the refusal at the target's published address took ${upr_aref_ms} ms (curl exit $upr_aref_rc) — NET-014 asks for the refusal within 5 s, and one that slow is a drop that read as the timeout"
+          cat "$WORK/upr-aref.err" 2>/dev/null || true
+          fail
+        fi
+        upr_addr_leg="refused in ${upr_aref_ms} ms at $upr_ans_addr:$upr_closed_host (curl exit $upr_aref_rc, never the timeout)"
+        echo "host address leg: the host's connect to $upr_ans_addr:$upr_closed_host (the box's published address, a port nothing publishes) -> $upr_addr_leg; the host-side forwarders bind only admitted ports, so this SYN was refused before the fabric — the leg proves the published address refuses fast; curl: ${upr_aref_err:-<none>}"
+        # The window printed WITHOUT the poll: a SYN the host kernel refuses
+        # never reaches the VM, so the empty window is this leg's expected
+        # evidence — and a non-empty one is the interesting fact, not a
+        # failure of the leg, whose assertion is the shape above.
+        upr_w="$(upr_net_since "$upr_before")"
+        if [ -n "$upr_w" ]; then
+          printf '%s\n' "$upr_w" | sed 's/^/daemon log: /'
+        else
+          echo "daemon log: (no minimald::net record in this window — nothing forwarded this SYN into the VM)"
+        fi
+      fi
+    fi
+  fi
+
+  # ---- the host name leg: WHERE a published name reaches the box ---------
+  # The control is the condition: the host connects through the target's
+  # NAME to its published port, every proxy variable stripped from curl's
+  # environment (NET-009's rule — no client anywhere needs configuring), and
+  # the marker must answer. A name that does not resolve (curl exit 6) or
+  # one whose published port does not answer from the host is the WHERE
+  # clause reading false on this host; the leg says so and asserts nothing.
+  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+    -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+    curl -sS --max-time 10 -o "$WORK/upr-hctl.body" -w 'HTTP:%{http_code}' \
+    "http://$upr_t_name.min.internal:$upr_pub_port/" \
+    >"$WORK/upr-hctl.out" 2>"$WORK/upr-hctl.err"
+  upr_hctl_rc=$?
+  upr_hctl_status="$(cat "$WORK/upr-hctl.out" 2>/dev/null)"
+  upr_hctl_body="$(cat "$WORK/upr-hctl.body" 2>/dev/null || true)"
+  if [ "$upr_hctl_rc" -eq 6 ]; then
+    upr_name_leg="skipped (the name $upr_t_name.min.internal did not resolve from the host, curl exit 6)"
+    echo "name leg: SKIPPED (no published name reaches the box from this host — $upr_t_name.min.internal did not resolve from the host with no proxy settings, curl exit 6: this host's resolver is not pointed at the box zone's answerer. Where one is, the host's own connect through the name to the unpublished port must get the same refusal — the host gate passing that SYN through to the relay that resets it)"
+  elif [ "$upr_hctl_rc" -ne 0 ] || [ "${upr_hctl_status:-}" != "HTTP:200" ] \
+     || [[ "$upr_hctl_body" != *"$upr_marker"* ]]; then
+    upr_name_leg="skipped (the name resolved but the published port did not answer from the host — curl exit $upr_hctl_rc, ${upr_hctl_status:-<none>})"
+    echo "name leg: SKIPPED (the name resolved but the published port did not answer from the host — curl exit $upr_hctl_rc, ${upr_hctl_status:-<none>}; without that control a refusal below could not be told from a dead route)"
+    echo "  (host curl: $(tr '\n' ' ' < "$WORK/upr-hctl.err" 2>/dev/null))"
+  else
+    echo "control: the host's GET through the name to the published port -> ${upr_hctl_status:-<none>} $upr_marker (the name reaches the box from the host)"
+    # The leg: the host's own connect through the same name to the
+    # UNPUBLISHED port, the same proxy-stripped curl, the same refusal.
+    upr_before="$(upr_log_lines)"
+    upr_start="$(now_ms)"
+    env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+      curl -sS --max-time 5 -o /dev/null -w 'HTTP:%{http_code}' \
+      "http://$upr_t_name.min.internal:$upr_closed_port/" \
+      >"$WORK/upr-href.out" 2>"$WORK/upr-href.err"
+    upr_href_rc=$?
+    upr_href_ms=$(( $(now_ms) - upr_start ))
+    upr_href_status="$(cat "$WORK/upr-href.out" 2>/dev/null)"
+    upr_href_err="$(tr '\n' ' ' < "$WORK/upr-href.err" 2>/dev/null)"
+    upr_href_answered=0
+    [ "$upr_href_rc" -eq 0 ] && upr_href_answered=1
+    [ -n "${upr_href_status:-}" ] && [ "$upr_href_status" != "HTTP:000" ] && upr_href_answered=1
+    if [ "$upr_href_answered" -ne 0 ]; then
+      echo "::error::the host's connect through the name to the unpublished port ANSWERED (curl exit $upr_href_rc, ${upr_href_status:-<none>}, ${upr_href_ms} ms) — the control above reached this same box's published port through this same name in this same run, so the unpublished port's answer is an enforcement hole"
+      cat "$WORK/upr-href.err" 2>/dev/null || true
+      fail
+    fi
+    if [ "$upr_href_rc" -ne 7 ]; then
+      echo "::error::the host's connect through the name ended in curl exit $upr_href_rc after ${upr_href_ms} ms, not the 7 of a refused connection — the same box answered its published port through the same name above, so a timeout shape here is the drop NET-014 retires"
+      cat "$WORK/upr-href.err" 2>/dev/null || true
+      fail
+    fi
+    if [ "$upr_href_ms" -ge 5000 ]; then
+      echo "::error::the host's refusal took ${upr_href_ms} ms (curl exit $upr_href_rc) — the same refusal the peer leg got in ${upr_ref_ms} ms, and one that slow is a drop that read as the timeout"
+      cat "$WORK/upr-href.err" 2>/dev/null || true
+      fail
+    fi
+    upr_name_leg="refused in ${upr_href_ms} ms (curl exit $upr_href_rc, the host gate passing this SYN through to the relay that reset it)"
+    echo "name leg: the host's connect through $upr_t_name.min.internal:$upr_closed_port (the published name, the unpublished port) -> the same refusal, in ${upr_href_ms} ms (curl exit $upr_href_rc), the host gate passing this SYN through to the relay that reset it; curl: ${upr_href_err:-<none>}"
+    upr_print_net_since "$upr_before" 'no ingress mapping'
+  fi
+
+  mnl session destroy --force "$upr_t_sid" >/dev/null 2>&1 || true
+  mnl session destroy --force "$upr_p_sid" >/dev/null 2>&1 || true
+  # Leave the lane as the case found it, in the one way it changed it: the
+  # pair this case's activation autospawned carries the minvmd=info pin
+  # that made the registration record readable, and a later case reading
+  # the same log must not inherit records a filter it never chose let
+  # through. Stopping here is the restore, not a new departure — the next
+  # case's own activation autospawns a fresh pair from the lane's own
+  # RUST_LOG, so no record the pin let through survives it.
+  mnl stop --force >/dev/null 2>&1 || true
+  if [ -n "$E2E_VM" ]; then
+    minvmd stop >/dev/null 2>&1 || true
+  fi
+  rm -rf "$UPR_T_SEED_DIR"; UPR_T_SEED_DIR=""
+  rm -rf "$UPR_P_SEED_DIR"; UPR_P_SEED_DIR=""
+  # Each leg says its own outcome — refused with its address, or skipped
+  # with its reason — so the line never claims a leg that did not run: the
+  # address leg's string carries the answerer's address and the port it
+  # refused at when it ran, and its reason when it did not.
+  echo "unpublished port refused on a VM host OK (the peer box's connect to $upr_t_name.min.internal:$upr_closed_port, published by nothing, was $upr_peer_leg; the host's own connect at the box's published address was $upr_addr_leg; the host's connect through the published name to the same unpublished port was $upr_name_leg)"
   echo "::endgroup::"
 }
 
@@ -11228,6 +12218,7 @@ case "${1:-}" in
       echo "local range reserved by the privileged step SKIPPED (macOS lane only: Linux takes no range step)"
     fi
     proof_native_resolution_without_proxy_env
+    proof_native_resolution_from_host_answerer_on_vm_host
     proof_box_name_resolves_natively_without_proxy
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
@@ -11237,6 +12228,7 @@ case "${1:-}" in
     proof_switch_steers_proxy_mac_frames_to_the_host_stack
     proof_switch_answers_no_arp_for_the_proxy_address
     proof_github_only_allowlist
+    proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
     # Last on purpose: the daemon-fetch proof installs a host classifier
     # tree and table (its own, removed before it returns) and stops the
@@ -11248,6 +12240,7 @@ case "${1:-}" in
     | skip_scaffold | sandbox | restart | fresh_install_own_ip_ingress_publishes_loopback \
     | own_ip_box_registers_with_the_vm_host_without_a_provider_flag \
     | network_posture_from_stock_install | native_resolution_without_proxy_env \
+    | native_resolution_from_host_answerer_on_vm_host \
     | local_range_reserved_by_privileged_step \
     | box_name_resolves_natively_without_proxy \
     | hostnames_recover_and_two_daemons_route \
@@ -11256,7 +12249,8 @@ case "${1:-}" in
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
     | linux_stock_install_runs_vm_boxes \
     | switch_steers_proxy_mac_frames_to_the_host_stack | switch_answers_no_arp_for_the_proxy_address \
-    | github_only_allowlist | proxy_sees_each_vm_box_by_its_switch_address \
+    | github_only_allowlist | unpublished_port_refused_on_vm_host \
+    | proxy_sees_each_vm_box_by_its_switch_address \
     | daemon_fetch_under_deny_all_host_address_box)
     "proof_$1"
     ;;
@@ -11267,6 +12261,7 @@ case "${1:-}" in
     echo "         skip_scaffold sandbox restart fresh_install_own_ip_ingress_publishes_loopback"
     echo "         own_ip_box_registers_with_the_vm_host_without_a_provider_flag"
     echo "         network_posture_from_stock_install native_resolution_without_proxy_env"
+    echo "         native_resolution_from_host_answerer_on_vm_host"
     echo "         local_range_reserved_by_privileged_step"
     echo "         box_name_resolves_natively_without_proxy"
     echo "         fresh_linux_kvm_activate_local_minvmd fresh_arm64_kvm_activate_local_minvmd"
@@ -11275,7 +12270,8 @@ case "${1:-}" in
     echo "         min_internal_names_through_proxy own_ip_deny_all_box_answers_published_port"
     echo "         proxy_refuses_like_direct retired_surfaces_gone"
     echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
-    echo "         github_only_allowlist proxy_sees_each_vm_box_by_its_switch_address"
+    echo "         github_only_allowlist unpublished_port_refused_on_vm_host"
+    echo "         proxy_sees_each_vm_box_by_its_switch_address"
     echo "         daemon_fetch_under_deny_all_host_address_box"
     exit 2
     ;;
