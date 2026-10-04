@@ -130,8 +130,8 @@
 #                                    out-of-range and deny asks are
 #                                    refused with their own typed errors;
 #                                    a VM lane asserts the create's typed
-#                                    allow/ask refusal instead (T80,
-#                                    gominimal/minimal#1878)
+#                                    allow/ask refusal instead (T84,
+#                                    gominimal/minimal#1897)
 #   listen_published_port_reaches_peer_and_host
 #                                    NET-016/017: a listen inside the
 #                                    declared range publishes with no
@@ -143,7 +143,7 @@
 #                                    read against a declared control; a VM
 #                                    lane asserts the create's typed allow
 #                                    refusal, then the in-range listen
-#                                    unpublished under deny (T80)
+#                                    unpublished under deny (T84)
 #   proxy_refuses_like_direct        the proxy refuses exactly as the switch
 #                                    does: paired direct/proxied attempts,
 #                                    h2 closed, h2c stripped (NET-069..071, 135)
@@ -14090,10 +14090,10 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
 # registration already carries, and that registration carries the create's
 # declared `--ingress` mappings alone (`register_box_for_activation`,
 # crates/minimal/src/cmd/session.rs). Until the range reaches the host row
-# (T80, gominimal/minimal#1878) the CLI refuses an allow/ask stance on a
+# (T84, gominimal/minimal#1897) the CLI refuses an allow/ask stance on a
 # VM-backed host before any box exists, and the VM lanes assert exactly that
 # refusal — never a skip.
-VM_DYNAMIC_INGRESS_REFUSAL="dynamic ingress allow/ask is not yet supported on VM-backed hosts (gominimal/minimal#1878)"
+VM_DYNAMIC_INGRESS_REFUSAL="dynamic ingress allow/ask is not yet supported on VM-backed hosts (gominimal/minimal#1897)"
 assert_vm_refuses_dynamic_stance() { # $1 = stance (allow|ask), $2 = box name, $3 = label for files; rest = extra activate flags
   local stance="$1" name="$2" label="$3" seed="" out="" rc=0
   shift 3
@@ -14105,7 +14105,7 @@ assert_vm_refuses_dynamic_stance() { # $1 = stance (allow|ask), $2 = box name, $
     2>"$WORK/$label-vmrefusal.err")" || rc=$?
   rm -rf "$seed"
   if [ "$rc" -eq 0 ]; then
-    echo "::error::the VM-backed create accepted --dynamic-ingress $stance (printed '$out') — until T80 (gominimal/minimal#1878) it must refuse before any box exists"
+    echo "::error::the VM-backed create accepted --dynamic-ingress $stance (printed '$out') — until T84 (gominimal/minimal#1897) it must refuse before any box exists"
     mnl session destroy --force "$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')" >/dev/null 2>&1 || true
     fail
   fi
@@ -14142,8 +14142,8 @@ assert_vm_refuses_dynamic_stance() { # $1 = stance (allow|ask), $2 = box name, $
 #
 # The case splits by lane, never by a skip. A native lane runs the allow box
 # whole: the publish, its live row on both renderings, and the out-of-range
-# refusal. A VM lane cannot hold an allow/ask stance until T80
-# (gominimal/minimal#1878), so there the create's typed refusal of both is
+# refusal. A VM lane cannot hold an allow/ask stance until T84
+# (gominimal/minimal#1897), so there the create's typed refusal of both is
 # the assertion (`assert_vm_refuses_dynamic_stance` above), and the policy
 # renderings are read off the deny box instead — which declares the same
 # range on every lane, so its listing carries a declared stance and range
@@ -14252,7 +14252,7 @@ PY
   if [ -n "${E2E_VM:-}" ]; then
   # ---- a VM lane: the typed refusal is the assertion ----------------------
   # Both stances that could publish are refused at the create, before the
-  # box exists (T80, gominimal/minimal#1878); the deny box below carries the
+  # box exists (T84, gominimal/minimal#1897); the deny box below carries the
   # policy legs and the deny refusal this lane still owes.
   assert_vm_refuses_dynamic_stance allow "$mnx_allow_name" mnx-allow \
     --dynamic-range "$mnx_lo-$mnx_hi"
@@ -14476,7 +14476,7 @@ PY
   mnl session destroy --force "$mnx_deny_sid" >/dev/null 2>&1 || true
   rm -rf "$MNX_SEED_DIR" "$MNX_DENY_SEED_DIR"
   if [ -n "${E2E_VM:-}" ]; then
-    echo "min net expose OK on a VM lane (allow and ask refused at the create with the typed T80 reason; the deny box's stance and range listed on both policy renderings with no live publication; its ask refused with the deny the stance spells)"
+    echo "min net expose OK on a VM lane (allow and ask refused at the create with the typed T84 reason; the deny box's stance and range listed on both policy renderings with no live publication; its ask refused with the deny the stance spells)"
   else
     echo "min net expose publishes, lists and refuses OK (in-range publish listed on both policy renderings; out-of-range and deny asks refused with their own typed errors)"
   fi
@@ -14507,8 +14507,8 @@ PY
 # transcript names which ran.
 #
 # The case splits by lane the way the expose proof above it does, never by a
-# skip: a VM lane cannot hold an allow stance until T80
-# (gominimal/minimal#1878), so there the create's typed refusal is asserted
+# skip: a VM lane cannot hold an allow stance until T84
+# (gominimal/minimal#1897), so there the create's typed refusal is asserted
 # (`assert_vm_refuses_dynamic_stance`), the target runs under deny over the
 # same range, and the in-range listen is asserted UNpublished — no live row
 # in `min session policy` (the watcher records a publication only once the
@@ -14539,7 +14539,7 @@ proof_listen_published_port_reaches_peer_and_host() {
   local lp_live=""                   # set once the watcher's publish stood
   local lp_host_reach="skipped"      # "asserted" once the host control answered
   local lp_policy="" lp_ans_why="" lp_ans_ls=""
-  local lp_stance="allow"            # the target's stance; deny on a VM lane (T80)
+  local lp_stance="allow"            # the target's stance; deny on a VM lane (T84)
   local LP_SEED_DIR="" LP_PEER_SEED_DIR=""
 
   if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
@@ -14564,7 +14564,7 @@ proof_listen_published_port_reaches_peer_and_host() {
     fi
   done
 
-  # A VM lane cannot hold an allow stance until T80 (gominimal/minimal#1878):
+  # A VM lane cannot hold an allow stance until T84 (gominimal/minimal#1897):
   # the create's typed refusal is asserted first, and the target then runs
   # under deny over the same range — so every refusal leg below still runs,
   # and the in-range listen is asserted UNpublished instead of published.
@@ -14871,8 +14871,8 @@ proof_listen_published_port_reaches_peer_and_host() {
   # in `min session policy` is the observed word for whether the listen
   # published. On a native lane the stance is allow: the row must appear
   # within sixteen of the watcher's own polls, and the arm runs whole below,
-  # peer and host. On a VM lane the stance is deny (T80,
-  # gominimal/minimal#1878): the row must NOT appear in the same window, and
+  # peer and host. On a VM lane the stance is deny (T84,
+  # gominimal/minimal#1897): the row must NOT appear in the same window, and
   # the peer's connect to the in-range port must be refused.
   mnl session exec "$lp_sid" \
     "nohup /usr/bin/socat TCP-LISTEN:$lp_listen_port,reuseaddr,fork SYSTEM:\"cat /home/lp-http200\" >/dev/null 2>&1 & echo \$! > /home/lp.pid" \
@@ -15034,7 +15034,7 @@ proof_listen_published_port_reaches_peer_and_host() {
   mnl session destroy --force "$lp_sid" >/dev/null 2>&1 || true
   rm -rf "$LP_PEER_SEED_DIR" "$LP_SEED_DIR"
   if [ "$lp_stance" = "deny" ]; then
-    echo "listen-published port OK on a VM lane (allow refused at the create with the typed T80 reason; under deny the in-range listen was never listed and the peer was refused; the out-of-range listen reached no client while the declared control answered first; the host probe's legs are $lp_host_reach${lp_ans_why:+: $lp_ans_why})"
+    echo "listen-published port OK on a VM lane (allow refused at the create with the typed T84 reason; under deny the in-range listen was never listed and the peer was refused; the out-of-range listen reached no client while the declared control answered first; the host probe's legs are $lp_host_reach${lp_ans_why:+: $lp_ans_why})"
   elif [ -z "$lp_peer_host" ]; then
     echo "listen-published port OK as far as this host carries it (in-range listen listed as published with no expose; the peer and host legs are skipped: $lp_peer_why)"
   elif [ "$lp_host_reach" = "asserted" ]; then

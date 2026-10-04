@@ -527,7 +527,7 @@ pub fn box_registered_start_line(
 /// already carries, and that registration carries the create's static
 /// `--ingress` mappings alone, so an in-range publish would be decided allow
 /// and then refused at the host. Until the dynamic range reaches the host
-/// registration (gominimal/minimal#1878) the create says so up front instead
+/// registration (gominimal/minimal#1897) the create says so up front instead
 /// of handing the box a stance it cannot keep. `deny`, an absent stance, and
 /// every native host are unchanged.
 fn refuse_dynamic_ingress_on_vm(
@@ -542,7 +542,7 @@ fn refuse_dynamic_ingress_on_vm(
     {
         anyhow::bail!(
             "dynamic ingress allow/ask is not yet supported on VM-backed hosts \
-             (gominimal/minimal#1878)"
+             (gominimal/minimal#1897)"
         );
     }
     Ok(())
@@ -3525,7 +3525,7 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 "dynamic ingress allow/ask is not yet supported on VM-backed hosts \
-                 (gominimal/minimal#1878)"
+                 (gominimal/minimal#1897)"
             );
             refuse_dynamic_ingress_on_vm(Minimald, Some(mode))
                 .expect("a native host keeps every stance");
