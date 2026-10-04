@@ -4,15 +4,20 @@
 //! The hostname proxy ([`super::proxy`]) routes by `Host:` header; this is
 //! the other half of resolution — the DNS reply the host's own resolver gets
 //! when a process looks a box name up, no proxy variable involved.
-//! `server::start_host_proxies` binds it beside the proxy and, in a microVM,
-//! publishes it on the host loopback through the gvproxy forwarder's UDP
-//! path, so the host resolver's one address (`127.0.0.1:[`ANSWERER_PORT`]`,
-//! non-privileged, which is what the macOS resolver hook's `port` directive
-//! names) reaches it in every deployment.
+//! `server::start_host_proxies` binds it beside the proxy on a native host
+//! (DM2), and only there: a daemon running inside a microVM starts no
+//! answerer at all — the VM host daemon (`minvmd`) answers the zone from the
+//! host-authored table (NET-138) on the host loopback itself, and this
+//! answerer is the *native* deployment's half of the same semantics. The
+//! semantics are not per-deployment either way: they live in the shared
+//! decision ([`sessions::core::zone_answer`]), and what this module owns is
+//! the DNS wire — decoding a query, encoding the reply the decision's
+//! verdict names, and the SOA its negatives cite.
 //!
-//! Answer semantics, all gated on the lookup originating on this machine
-//! (NET-006 — the zone leaves the machine with *nothing*, not even a refusal,
-//! which would tell a scanner a DNS server is here):
+//! Answer semantics, all decided by the shared core, and all gated on the
+//! lookup originating on this machine (NET-006 — the zone leaves the machine
+//! with *nothing*, not even a refusal, which would tell a scanner a DNS
+//! server is here):
 //!
 //! | Lookup | Reply |
 //! |---|---|
@@ -42,8 +47,10 @@ use hickory_proto::rr::rdata::{A, SOA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use tokio::net::UdpSocket;
 
+use sessions::core::zone_answer;
+
 use super::SwitchSubnet;
-use super::dns::{ANSWER_TTL_SECS, HOSTNAME_SUFFIX, HostnameRegistry, ZoneEntry};
+use super::dns::{HOSTNAME_SUFFIX, HostnameRegistry, ZoneEntry};
 use super::proxy::BindFailure;
 
 /// Port the box-zone answerer listens on: the next one after the egress
@@ -102,12 +109,17 @@ pub enum AnswerScope {
     /// datagram, so a misbound socket can never serve the zone to the
     /// network.
     Native,
-    /// Inside a microVM (DM1/3/4): the listener binds in-guest (the host
-    /// reaches it only through the gvproxy forwarder publishing the port on
-    /// the host loopback), and the guest's only fabric is the host-local
-    /// switch, so loopback and the switch's own subnet are both on-machine.
-    /// Anything outside them — off the fabric the forwarder rides — is
-    /// off-host and gets nothing.
+    /// Inside a microVM (DM1/3/4): loopback and the host-local switch's own
+    /// subnet are both on-machine — the guest's only fabric is the switch —
+    /// and anything outside them is off-host and gets nothing.
+    ///
+    /// Since the VM host daemon took over the zone for a VM-backed host, no
+    /// production daemon serves under this scope: `start_host_proxies` starts
+    /// the answerer only on a native host, and the in-VM daemon answers
+    /// nothing (`minvmd`'s host answerer answers the zone from the host's
+    /// table instead). The variant stays the scope's complete answer — the
+    /// on-machine rule it states is the one the shared decision's origin
+    /// input carries, and the tests below still prove it.
     Microvm { subnet: SwitchSubnet },
 }
 
@@ -123,6 +135,17 @@ impl AnswerScope {
                     .contains(&u32::from(ip)),
             },
             IpAddr::V6(ip) => ip.is_loopback(),
+        }
+    }
+
+    /// The shared decision's origin for a datagram from `peer`: on this
+    /// machine, or off it (NET-006) — the one input the decision is gated on
+    /// that does not come off the query itself.
+    fn origin_for(&self, peer: SocketAddr) -> zone_answer::Origin {
+        if self.allows(peer) {
+            zone_answer::Origin::OnMachine
+        } else {
+            zone_answer::Origin::OffMachine
         }
     }
 }
@@ -198,133 +221,164 @@ impl<T: Zone> ZoneAnswerer<T> {
         let asked = qname.to_lowercase().to_string();
         let asked = asked.strip_suffix('.').unwrap_or(&asked);
 
-        // Off-host: no reply, one warn line (the only per-lookup warn there
-        // is; every answered lookup gets its own debug line below).
-        if !self.scope.allows(peer) {
-            tracing::warn!(
-                component = COMPONENT,
-                %peer,
-                name = asked,
-                query_type = ?qtype,
-                "refused an off-host box-zone lookup; the zone answers only this machine"
-            );
-            return None;
-        }
-
-        // Not a standard query: answered, with the code that says so.
-        if request.metadata.op_code != OpCode::Query {
-            let reply = Message::error_msg(
-                request.metadata.id,
-                request.metadata.op_code,
-                ResponseCode::NotImp,
-            );
-            tracing::debug!(
-                component = COMPONENT,
-                name = asked,
-                query_type = ?qtype,
-                answer = "notimp",
-                "answered a box-zone lookup"
-            );
-            return reply.to_vec().ok();
-        }
-
-        // Out of zone: this answerer is authoritative for `min.internal` and
-        // nothing else, so a name that strayed in (a too-broad resolver
-        // routing domain) is REFUSED — visibly, so the misconfiguration names
-        // itself — with no authority section: the zone's SOA certifies our own
-        // negatives, never someone else's namespace.
-        let Some(zone_name) = in_zone(&qname) else {
-            let mut reply = Message::response(request.metadata.id, request.metadata.op_code);
-            reply.metadata = Metadata::response_from_request(&request.metadata);
-            reply.metadata.response_code = ResponseCode::Refused;
-            reply.add_query(query);
-            tracing::debug!(
-                component = COMPONENT,
-                name = asked,
-                query_type = ?qtype,
-                answer = "refused",
-                "answered an out-of-zone lookup"
-            );
-            return reply.to_vec().ok();
+        // The lookup and the view, both resolved from this answerer's own
+        // halves, then the shared decision over them: where the datagram came
+        // from and what the registry holds for the name are this module's to
+        // say; which answer class that lookup gets is the core's.
+        let lookup = zone_answer::Lookup {
+            name: asked.to_string(),
+            record: if qtype == RecordType::A {
+                zone_answer::RecordType::A
+            } else {
+                zone_answer::RecordType::Other
+            },
+            origin: self.scope.origin_for(peer),
         };
-
-        // In-zone. The apex itself is held by the answerer: it carries the
-        // SOA every negative cites, so an apex query is NODATA, never
-        // NXDOMAIN — answering that the zone does not exist while citing its
-        // SOA in the same reply would contradict itself.
-        let entry = if zone_name == HOSTNAME_SUFFIX {
-            ZoneEntry::Held {
-                owner: HOSTNAME_SUFFIX.to_string(),
-                address: None,
+        let view = self.zone_view(asked);
+        match zone_answer::decide(&lookup, &view) {
+            // Off-host: no reply, one warn line (the only per-lookup warn
+            // there is; every answered lookup gets its own debug line below).
+            zone_answer::Verdict::Silent => {
+                tracing::warn!(
+                    component = COMPONENT,
+                    %peer,
+                    name = asked,
+                    query_type = ?qtype,
+                    "refused an off-host box-zone lookup; the zone answers only this machine"
+                );
+                None
             }
-        } else {
-            self.zone
-                // The node's own addresses travel empty today (see
-                // [`super::dns::is_host_answerable`]).
-                .zone_entry(&zone_name, &[])
-        };
-        let (rcode, answer, class) = match (&entry, qtype) {
-            (ZoneEntry::Absent, _) => (ResponseCode::NXDomain, None, "nxdomain"),
-            (ZoneEntry::Held { address: None, .. }, _) => (ResponseCode::NoError, None, "nodata"),
-            (
-                ZoneEntry::Held {
-                    address: Some(address),
-                    ..
-                },
-                RecordType::A,
-            ) => {
-                let record = Record::from_rdata(qname, ANSWER_TTL_SECS, RData::A(A(*address)));
-                (ResponseCode::NoError, Some(record), "a")
+            // Not a standard query: answered, with the code that says so — but
+            // only where the decision answers at all: an off-host datagram
+            // already got its silence above, whatever it carried.
+            _ if request.metadata.op_code != OpCode::Query => {
+                let reply = Message::error_msg(
+                    request.metadata.id,
+                    request.metadata.op_code,
+                    ResponseCode::NotImp,
+                );
+                tracing::debug!(
+                    component = COMPONENT,
+                    name = asked,
+                    query_type = ?qtype,
+                    answer = "notimp",
+                    "answered a box-zone lookup"
+                );
+                reply.to_vec().ok()
             }
-            (
-                ZoneEntry::Held {
-                    address: Some(_), ..
-                },
-                _,
-            ) => (ResponseCode::NoError, None, "nodata"),
-        };
+            // Out of zone: this answerer is authoritative for the box zone
+            // and nothing else, so a name that strayed in (a too-broad
+            // resolver routing domain) is REFUSED — visibly, so the
+            // misconfiguration names itself — with no authority section: the
+            // zone's SOA certifies our own negatives, never someone else's
+            // namespace.
+            zone_answer::Verdict::Refused => {
+                let reply = self.reply(&request, query, ResponseCode::Refused, None, false);
+                tracing::debug!(
+                    component = COMPONENT,
+                    name = asked,
+                    query_type = ?qtype,
+                    answer = "refused",
+                    "answered an out-of-zone lookup"
+                );
+                reply
+            }
+            zone_answer::Verdict::Nodata => {
+                let reply = self.reply(&request, query, ResponseCode::NoError, None, true);
+                tracing::debug!(
+                    component = COMPONENT,
+                    name = asked,
+                    query_type = ?qtype,
+                    answer = "nodata",
+                    "answered a box-zone lookup"
+                );
+                reply
+            }
+            zone_answer::Verdict::Nxdomain => {
+                let reply = self.reply(&request, query, ResponseCode::NXDomain, None, true);
+                tracing::debug!(
+                    component = COMPONENT,
+                    name = asked,
+                    query_type = ?qtype,
+                    answer = "nxdomain",
+                    "answered a box-zone lookup"
+                );
+                reply
+            }
+            zone_answer::Verdict::Address(address) => {
+                let record =
+                    Record::from_rdata(qname, zone_answer::ANSWER_TTL_SECS, RData::A(A(address)));
+                let reply = self.reply(&request, query, ResponseCode::NoError, Some(record), true);
+                tracing::debug!(
+                    component = COMPONENT,
+                    name = asked,
+                    query_type = ?qtype,
+                    answer = "a",
+                    "answered a box-zone lookup"
+                );
+                reply
+            }
+        }
+    }
 
+    /// The zone view the decision answers from: the registry's own resolution
+    /// of the asked name, as the one row it holds for it. The registry stays
+    /// the name authority — it maps the deprecated three-label form
+    /// (NET-002), and the address it gives is already the answer the zone
+    /// means to give, with the host-answerable gate (NET-127) and the
+    /// stopped-shared-address fold (NET-128) applied — so its row *is* this
+    /// lookup's view: held, with the address to tell or without one, and live,
+    /// because everything this registry knows about a stopped namespace it
+    /// has already folded into that address.
+    fn zone_view(&self, asked: &str) -> zone_answer::ZoneView {
+        let mut view = zone_answer::ZoneView::new();
+        if let ZoneEntry::Held { address, .. } = self
+            .zone
+            // The node's own addresses travel empty today (see
+            // [`super::dns::is_host_answerable`]).
+            .zone_entry(asked, &[])
+        {
+            view.hold(
+                asked.to_string(),
+                zone_answer::ZoneRow {
+                    address,
+                    live: true,
+                },
+            );
+        }
+        view
+    }
+
+    /// The reply bytes for one answered lookup: the envelope every verdict's
+    /// reply shares — the query echoed, the rcode named, and the answer
+    /// record in the answer section when there is one — authoritative for the
+    /// zone and for nothing else (the REFUSED reply is not, so it never cites
+    /// our SOA over someone else's namespace). The negatives the zone
+    /// certifies are its own — an authoritative reply with no answer records,
+    /// NODATA and NXDOMAIN — and every one of them carries the zone's SOA in
+    /// the authority section (NET-124): the record the host resolver needs to
+    /// cache the negative at all.
+    fn reply(
+        &self,
+        request: &Message,
+        query: hickory_proto::op::Query,
+        rcode: ResponseCode,
+        answer: Option<Record>,
+        authoritative: bool,
+    ) -> Option<Vec<u8>> {
         let mut reply = Message::response(request.metadata.id, request.metadata.op_code);
         reply.metadata = Metadata::response_from_request(&request.metadata);
-        // Authoritative for the zone, and for nothing else (REFUSED above
-        // never sets it).
-        reply.metadata.authoritative = true;
+        reply.metadata.authoritative = authoritative;
         reply.metadata.response_code = rcode;
         reply.add_query(query);
         if let Some(record) = answer {
             reply.add_answer(record);
         }
-        // Every negative carries the zone's SOA (NET-124): the record the
-        // host resolver needs to cache the negative at all.
-        if rcode != ResponseCode::NoError || reply.answers.is_empty() {
+        if authoritative && reply.answers.is_empty() {
             reply.add_authority(self.soa.clone());
         }
-        tracing::debug!(
-            component = COMPONENT,
-            name = asked,
-            query_type = ?qtype,
-            answer = class,
-            "answered a box-zone lookup"
-        );
         reply.to_vec().ok()
     }
-}
-
-/// The in-zone name a query carries, or `None` when it is outside the box
-/// zone: `web.min.internal` for `Web.Min.Internal.`, the apex `min.internal`
-/// for itself, `None` for `example.com.`. Returned in the registry's key form
-/// (lower-cased, no root dot), including the deprecated three-label form
-/// unchanged — [`HostnameRegistry::zone_entry`] maps that (NET-002).
-fn in_zone(qname: &Name) -> Option<String> {
-    // Wire names are FQDNs and render with the root dot: `Web.Min.Internal.`.
-    let rendered = qname.to_lowercase().to_string();
-    let without_root = rendered.strip_suffix('.')?;
-    if without_root == HOSTNAME_SUFFIX {
-        return Some(HOSTNAME_SUFFIX.to_string());
-    }
-    without_root
-        .strip_suffix(&format!(".{HOSTNAME_SUFFIX}"))
-        .map(|_| without_root.to_string())
 }
 
 /// One standard DNS query for `name` of `rtype`, encoded as the wire carries
@@ -345,8 +399,9 @@ pub(crate) fn encode_query(name: &str, rtype: RecordType) -> Vec<u8> {
 /// answer carries in its authority section (NET-124), so the host resolver can
 /// cache it — RFC 2308's negative TTL is this record's TTL capped by its
 /// `minimum`. The zone has no secondaries, so every field but `minimum` is
-/// inert; all of them carry the same 15 s so no number the answerer emits
-/// exceeds NET-126's ceiling.
+/// inert; all of them carry the shared decision's TTL ceiling
+/// ([`zone_answer::ANSWER_TTL_SECS`]) so no number the answerer emits exceeds
+/// NET-126's bound.
 fn zone_soa() -> Record {
     let apex = Name::from_utf8(format!("{HOSTNAME_SUFFIX}.")).expect("the zone apex parses");
     let mname = Name::from_utf8(format!("ns.{HOSTNAME_SUFFIX}.")).expect("the SOA mname parses");
@@ -357,12 +412,12 @@ fn zone_soa() -> Record {
         mname,
         rname,
         1,
-        ANSWER_TTL_SECS as i32,
-        ANSWER_TTL_SECS as i32,
-        ANSWER_TTL_SECS as i32,
-        ANSWER_TTL_SECS,
+        zone_answer::ANSWER_TTL_SECS as i32,
+        zone_answer::ANSWER_TTL_SECS as i32,
+        zone_answer::ANSWER_TTL_SECS as i32,
+        zone_answer::ANSWER_TTL_SECS,
     );
-    Record::from_rdata(apex, ANSWER_TTL_SECS, RData::SOA(soa))
+    Record::from_rdata(apex, zone_answer::ANSWER_TTL_SECS, RData::SOA(soa))
 }
 
 /// Binds the box-zone answerer's UDP socket at `addr`, returning it on
@@ -772,7 +827,8 @@ mod tests {
                 panic!("the authority record is the SOA")
             };
             assert_eq!(
-                soa.minimum, ANSWER_TTL_SECS,
+                soa.minimum,
+                zone_answer::ANSWER_TTL_SECS,
                 "the negative TTL must be cacheable: {name}"
             );
         }
@@ -878,7 +934,7 @@ mod tests {
                 .expect("an in-zone lookup is answered");
             for record in reply.answers.iter().chain(&reply.authorities) {
                 assert!(
-                    record.ttl <= ANSWER_TTL_SECS,
+                    record.ttl <= zone_answer::ANSWER_TTL_SECS,
                     "{} in the reply for {name} {rtype:?} carries a {}s TTL",
                     record.name,
                     record.ttl
@@ -893,7 +949,7 @@ mod tests {
             &encode_query("web.min.internal.", RecordType::A),
         )
         .expect("the held name answers");
-        assert_eq!(reply.answers[0].ttl, ANSWER_TTL_SECS);
+        assert_eq!(reply.answers[0].ttl, zone_answer::ANSWER_TTL_SECS);
     }
 
     /// NET-127: an A lookup answered for the host OS carries only an address in

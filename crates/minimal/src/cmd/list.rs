@@ -297,6 +297,11 @@ pub struct VmListing {
     pub vm: String,
     /// That VM's daemon reply.
     pub resp: minimald_rpc::ListSessionsResponse,
+    /// That VM's VM-host control socket, beside the ssh socket the listing
+    /// reached it on (NET-138): the socket `cmd_ls` reads this VM's own
+    /// zone-answerer state from. `None` on the native backend, which hosts
+    /// no VM host daemon — nothing to read, so nothing is read.
+    pub control_sock: Option<std::path::PathBuf>,
 }
 
 /// List sessions across every VM the CLI can see (NET-057): each running VM
@@ -337,14 +342,23 @@ pub(crate) async fn ls_listings(global: &GlobalArgs) -> Result<Vec<VmListing>, a
         if !vm.sock.exists() && !gate {
             continue;
         }
+        // The control socket this VM's own answerer state is read from
+        // (NET-138), beside the ssh socket this listing reached it on — the
+        // same dir the registration and the withdrawal find it in.
+        let control_sock = crate::cmd::session::control_sock_beside(&vm.sock);
         if gate {
             listings.push(VmListing {
                 vm: vm.vm,
                 resp: list_selected_vm(&vm.sock).await?,
+                control_sock,
             });
         } else {
             match list_other_vm(&vm.sock).await {
-                Ok(Some(resp)) => listings.push(VmListing { vm: vm.vm, resp }),
+                Ok(Some(resp)) => listings.push(VmListing {
+                    vm: vm.vm,
+                    resp,
+                    control_sock,
+                }),
                 Ok(None) => {}
                 Err(e) => eprintln!("warning: skipping VM {}: {e:#}", vm.vm),
             }
@@ -356,9 +370,33 @@ pub(crate) async fn ls_listings(global: &GlobalArgs) -> Result<Vec<VmListing>, a
         listings.push(VmListing {
             vm: selected.to_string(),
             resp: list_selected_vm(&sock).await?,
+            // The native backend reaches here with no VM host daemon to
+            // read a state from; a VM backend falls back to the selected
+            // VM's own dir, where its control socket sits.
+            control_sock: fallback_control_sock(global, &sock),
         });
     }
     Ok(listings)
+}
+
+/// The VM-host control socket the fallback listing pairs with its one entry
+/// (NET-138), keyed on the backend the daemon connection resolves through —
+/// the same rule [`hostname_proxy_start_vm`] states — and never on
+/// [`GlobalArgs::use_minvmd`]: the flag is how Linux asks for the VM host,
+/// while macOS reaches it with no flag at all, so a gate keyed on the flag
+/// would find no control socket for exactly the host whose every invocation
+/// is VM-backed, and the one entry `min ls` falls back to there would carry
+/// no answerer state to read. `sock` is the daemon socket the listing
+/// already resolved; the control socket sits beside it, in the same provider
+/// dir.
+#[must_use]
+pub fn fallback_control_sock(
+    global: &GlobalArgs,
+    sock: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    (super::session::daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
+        .then(|| super::session::control_sock_beside(sock))
+        .flatten()
 }
 
 /// The selected daemon's `ListSessions` reply, from its socket, gated as `min
@@ -493,7 +531,32 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
     // that cannot strand the user (NET-019 keeps the proxy serving). The
     // daemon's own view of this host's resolver is not a thing that
     // exists, so the host's half is the host's to read.
-    let surfaces = if args.json || args.raw {
+    // NET-138: on a VM-backed host the answerer whose surface this is is
+    // the VM host daemon's — every VM's in-VM daemon starts none, so each
+    // reply reports no answerer and the facts come from the host. Each
+    // listed VM's status is read over its own minvmd control socket, beside
+    // the ssh socket the listing reached it on, never through the in-VM
+    // daemon (a guest relaying a host fact is forgeable from inside the
+    // escape boundary), and the liveness proof is this CLI's own A query at
+    // the port that read named. The status decides that VM's own verdict
+    // and its own `ZONE ANSWERER` row — a VM whose minvmd holds the port
+    // is named there, and a sibling registered with another daemon says
+    // who holds it, so no row speaks with another VM's state. Read in the
+    // modes that can print them, like the detection below it: `--json` and
+    // `--raw` are machine-readable-only and pay no host read, socket or
+    // query either one.
+    let vm_answerers: Vec<Option<minimald_rpc::ZoneAnswererStatus>> = if args.json || args.raw {
+        Vec::new()
+    } else {
+        let mut read = Vec::with_capacity(listings.len());
+        for listing in &listings {
+            read.push(
+                crate::cmd::session::vm_host_answerer_status_at(listing.control_sock.clone()).await,
+            );
+        }
+        read
+    };
+    let mut surfaces = if args.json || args.raw {
         Vec::new()
     } else {
         crate::resolver::live_name_surfaces(
@@ -503,7 +566,24 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
         )
         .await
     };
-    format_ls_across_vms(&mut std::io::stdout(), &args, &listings, &surfaces)?;
+    // One verdict per VM from that VM's own status, over the verdict its
+    // daemon's report would have decided: the read that cannot be made —
+    // no control socket, the deadline, a daemon that predates the verb —
+    // keeps the silence a daemon-report verdict is, for that VM alone.
+    for (index, status) in vm_answerers.iter().enumerate() {
+        if let Some(status) = status
+            && let Some(slot) = surfaces.get_mut(index)
+        {
+            *slot = crate::resolver::vm_host_name_surface(*status).await;
+        }
+    }
+    format_ls_across_vms(
+        &mut std::io::stdout(),
+        &args,
+        &listings,
+        &surfaces,
+        &vm_answerers,
+    )?;
     Ok(())
 }
 
@@ -609,11 +689,20 @@ pub fn hostname_proxy_vm(kind: paths::ProviderKind) -> Option<&'static str> {
 /// through on this host, as [`cmd_ls`] computed it from the one function
 /// both verbs share — printed on the `NAME SURFACE` line when the daemon's
 /// answerer is bound at all.
+///
+/// `vm_answerer` is the machine's zone-answerer state on a VM-backed host
+/// (NET-138), as [`cmd_ls`] read it from the VM host daemon's control
+/// socket: when the daemon behind this list reports no answerer of its own
+/// — a VM-backed host's daemon starts none — the `ZONE ANSWERER` line
+/// prints from it instead, saying the zone is answered by the VM host
+/// daemon and naming the holder. `None`, the native shape, prints the
+/// daemon's own line exactly as before.
 pub fn format_ls(
     out: &mut impl std::io::Write,
     args: &LsArgs,
     resp: &minimald_rpc::ListSessionsResponse,
     surface: Option<crate::resolver::LiveSurface>,
+    vm_answerer: Option<minimald_rpc::ZoneAnswererStatus>,
 ) -> Result<(), anyhow::Error> {
     if args.json {
         let json = serde_json_lenient::to_string_pretty(resp)
@@ -660,11 +749,17 @@ pub fn format_ls(
                 "HOSTNAME PROXY:  listening on 127.0.0.1:{port} · <name>.min.internal routes through it"
             )?;
         }
+        // The VM host daemon's line is computed once here, because the
+        // blank line below rides on what printed, not on what was read:
+        // the pre-acquisition state prints no line and forces no blank one.
+        let vm_answerer_line = vm_answerer.and_then(crate::resolver::vm_host_answerer_line);
         if let Some(answerer) = resp.zone_answerer_port {
             writeln!(
                 out,
                 "ZONE ANSWERER:   listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal"
             )?;
+        } else if let Some(line) = &vm_answerer_line {
+            writeln!(out, "ZONE ANSWERER:   {line}")?;
         }
         // NET-018: say which of the two surfaces is live — the one verdict
         // both verbs share ([`resolver::live_name_surfaces`]). `None` — the
@@ -680,7 +775,10 @@ pub fn format_ls(
                 crate::resolver::name_surface_line(surface, resp.hostname_proxy_port)
             )?;
         }
-        if resp.hostname_proxy_port.is_some() || resp.zone_answerer_port.is_some() {
+        if resp.hostname_proxy_port.is_some()
+            || resp.zone_answerer_port.is_some()
+            || vm_answerer_line.is_some()
+        {
             writeln!(out)?;
         }
     }
@@ -777,18 +875,30 @@ const VM_COLUMN_WIDTH: usize = 8;
 /// VM: the host's resolver hook routes the zone to one VM's answerer, so
 /// each VM's line says which of the two surfaces its own names answer
 /// through.
+///
+/// `vm_answerers` is one zone-answerer state (NET-138) per listing, as
+/// [`cmd_ls`] read each listed VM's own from that VM's control socket: that
+/// VM's `ZONE ANSWERER` line prints from it when the VM's own daemon reports
+/// no answerer, as [`format_ls`] does for a single VM. A shorter slice than
+/// the listings — a machine mode reads nothing, and a caller that computed
+/// nothing — leaves the VMs it does not cover with no line.
 pub fn format_ls_across_vms(
     out: &mut impl std::io::Write,
     args: &LsArgs,
     listings: &[VmListing],
     surfaces: &[Option<crate::resolver::LiveSurface>],
+    vm_answerers: &[Option<minimald_rpc::ZoneAnswererStatus>],
 ) -> Result<(), anyhow::Error> {
     // The verdict of the listing at `index`, `None` when the caller passed
     // none for it — a machine mode never prints the line, and a direct
     // caller may have computed nothing.
     let surface_at = |index: usize| surfaces.get(index).copied().flatten();
+    // The host answerer's state for the listing at `index`, `None` when no
+    // read was made for that VM — a machine mode reads nothing, and a
+    // socket or daemon that did not answer keeps the same silence.
+    let answerer_at = |index: usize| vm_answerers.get(index).copied().flatten();
     if let [only] = listings {
-        return format_ls(out, args, &only.resp, surface_at(0));
+        return format_ls(out, args, &only.resp, surface_at(0), answerer_at(0));
     }
     if listings.is_empty() {
         // `cmd_ls` always lists the selected VM, so this is only reachable
@@ -805,6 +915,7 @@ pub fn format_ls_across_vms(
                 zone_answerer_port: None,
                 answerer_bound: false,
             },
+            None,
             None,
         );
     }
@@ -892,6 +1003,16 @@ pub fn format_ls_across_vms(
                 writeln!(
                     out,
                     "ZONE ANSWERER:   {vm:<width$} listening on 127.0.0.1:{answerer} (UDP) · point the host's resolver at it for *.min.internal",
+                    vm = listing.vm,
+                    width = VM_COLUMN_WIDTH,
+                )?;
+                facts += 1;
+            } else if let Some(line) =
+                answerer_at(index).and_then(crate::resolver::vm_host_answerer_line)
+            {
+                writeln!(
+                    out,
+                    "ZONE ANSWERER:   {vm:<width$} {line}",
                     vm = listing.vm,
                     width = VM_COLUMN_WIDTH,
                 )?;
