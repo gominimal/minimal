@@ -2301,9 +2301,10 @@ proof_host_ip_deny_all() {
     # ---- the cgroup half: the box cannot leave its leaf. Its own view
     # first — the cover the launch mounted over the tree the join went
     # through, named by the marker the box's own environment carries, and
-    # the cgroup namespace root its /proc reports (the sandbox unshares
-    # ipc, cgroup, network and uts — never pid, so the pid an exec prints
-    # below is the pid the host-side tree names).
+    # the cgroup namespace root its /proc reports (the sandbox unshares a
+    # PID namespace too — hakoniwa's Container::new does — so the pid an
+    # exec prints below is its box pid, matched to the host-side tree by
+    # NSpid).
     #
     # The marker is set in the launch's pre-exec closure, so it lives in the
     # environment of the box's launched process and what that process
@@ -2393,8 +2394,13 @@ proof_host_ip_deny_all() {
     # leaf its verdict is decided on. An exec prints its own pid and holds
     # itself alive for the read; the leaf is read as root, because cgroup
     # membership files are the tree's, not this account's, on every host.
+    # The hold is bash's own timed read on a pipe it keeps both ends of, so
+    # it needs no `sleep` binary in the box. The pid the exec prints is its
+    # pid in the box's PID namespace (hakoniwa's Container::new unshares it,
+    # and the shim joins it), while the leaf lists host pids — so the
+    # member is matched by the innermost NSpid its host /proc status names.
     : >"$WORK/hida-exec-pid.out"
-    mnl session exec "$hida_sid" 'echo $$; sleep 6' \
+    mnl session exec "$hida_sid" 'echo $$; read -rt 6 _ <> <(:) || :' \
       >"$WORK/hida-exec-pid.out" 2>/dev/null &
     hida_exec_client=$!
     hida_exec_pid=""
@@ -2415,14 +2421,26 @@ proof_host_ip_deny_all() {
       kill -9 "$hida_exec_client" 2>/dev/null || true
       fail
     }
-    if ! printf '%s\n' "$hida_leaf_procs" | grep -qx "$hida_exec_pid"; then
-      echo "::error::the box's own process (pid $hida_exec_pid) is not a member of its classifier leaf; the leaf holds: ${hida_leaf_procs:-<empty>}"
+    hida_exec_host_pid="" hida_leaf_nspids=""
+    for hida_pid_m in $hida_leaf_procs; do
+      hida_nspid="$(sudo -n cat "/proc/$hida_pid_m/status" 2>/dev/null \
+        | sed -n 's/^NSpid:[[:space:]]*//p' | tr -s '[:space:]' ' ')"
+      hida_leaf_nspids="${hida_leaf_nspids:+$hida_leaf_nspids, }$hida_pid_m=[${hida_nspid% }]"
+      # Two or more fields: a process in a nested PID namespace, the
+      # innermost of which is the pid the box's own exec printed.
+      case "$hida_nspid" in
+        *" $hida_exec_pid" | *" $hida_exec_pid ")
+          hida_exec_host_pid="$hida_pid_m"; break ;;
+      esac
+    done
+    if [ -z "$hida_exec_host_pid" ]; then
+      echo "::error::the box's own process (pid $hida_exec_pid in the box's PID namespace) is not a member of its classifier leaf; the leaf holds (host pid=[NSpid]): ${hida_leaf_nspids:-<empty>}"
       kill -9 "$hida_exec_client" 2>/dev/null || true
       fail
     fi
     kill -INT "$hida_exec_client" 2>/dev/null || true
     wait "$hida_exec_client" 2>/dev/null || true
-    echo "verdict: the box's own process (pid $hida_exec_pid) is a member of its classifier leaf boxes/deny/$hida_sid — placed there at the launch, and every path out of it is refused or absent inside the box"
+    echo "verdict: the box's own process (pid $hida_exec_pid in the box, host pid $hida_exec_host_pid) is a member of its classifier leaf boxes/deny/$hida_sid — placed there at the launch, and every path out of it is refused or absent inside the box"
 
     # ---- the fetch: the daemon's own package fetch still completes as
     # node-plane traffic — the NET-080 clause that rides with this one,
