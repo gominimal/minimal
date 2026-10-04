@@ -219,6 +219,78 @@ fn ls_table_shows_host_address_enforcement() {
     assert_eq!(cells_of("own-address")[3], "-", "got:\n{text}");
 }
 
+/// The multi-VM table carries the same EGRESS cell, one column right of the
+/// single-VM one because each row leads with its VM.
+#[test]
+fn ls_across_vms_table_shows_host_address_enforcement() {
+    let entry = |name: &str, n: u64, enforcement| minimald_rpc::ListSessionsEntry {
+        id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
+        name: Some(name.to_string()),
+        project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
+        status: sessions::SessionStatus::Active,
+        git: None,
+        host_ip_enforcement: enforcement,
+        attrs: None,
+    };
+    let listing = |vm: &str, sessions| VmListing {
+        vm: vm.to_string(),
+        resp: ListSessionsResponse {
+            daemon_version: None,
+            hostname_routing_unavailable: None,
+            hostname_proxy_port: None,
+            zone_answerer_port: None,
+            answerer_bound: false,
+            resource_pool: None,
+            sessions,
+        },
+        control_sock: None,
+    };
+    let listings = vec![
+        listing(
+            "default",
+            vec![
+                entry("decided", 1, Some(minimald_rpc::HostIpEnforcement::PerBox)),
+                entry("own-address", 3, None),
+            ],
+        ),
+        listing(
+            "alpha",
+            vec![entry(
+                "unenforced",
+                2,
+                Some(minimald_rpc::HostIpEnforcement::None),
+            )],
+        ),
+    ];
+    let mut out = Vec::new();
+
+    format_ls_across_vms(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &listings,
+        &[None, None],
+        &[None, None],
+    )
+    .unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+    let cells_of = |name: &str| -> Vec<String> {
+        text.lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("a row for {name} in:\n{text}"))
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    };
+    assert!(text.contains("EGRESS"), "header should list EGRESS: {text}");
+    assert_eq!(cells_of("decided")[4], "per_box", "got:\n{text}");
+    assert_eq!(cells_of("unenforced")[4], "none", "got:\n{text}");
+    assert_eq!(cells_of("own-address")[4], "-", "got:\n{text}");
+}
+
 #[tokio::test]
 async fn ls_empty() {
     let (_daemon, args) = setup().await;
