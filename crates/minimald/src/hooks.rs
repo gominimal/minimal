@@ -34,6 +34,7 @@
 //! reports what happened.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -219,6 +220,24 @@ pub(crate) enum HookStatus {
     /// Never ran: the command could not be built or spawned, or its
     /// script could not be read.
     NotRun { reason: String },
+}
+
+impl fmt::Display for HookStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ok => write!(f, "succeeded"),
+            Self::Failed { code: Some(code) } => write!(f, "exited with status {code}"),
+            Self::Failed { code: None } => write!(f, "was killed by a signal"),
+            Self::TimedOut { after, budgeted } => {
+                write!(f, "timed out after {}s", after.as_secs())?;
+                if *budgeted {
+                    write!(f, " (teardown budget)")?;
+                }
+                Ok(())
+            }
+            Self::NotRun { reason } => write!(f, "did not run: {reason}"),
+        }
+    }
 }
 
 /// How long output tails are kept in an outcome. Enough to see a
@@ -1050,6 +1069,43 @@ mod tests {
         assert_eq!(outcomes[0].status, HookStatus::Failed { code: Some(3) });
         assert!(outcomes[0].failed());
         assert!(outcomes[0].output.contains("oops"));
+    }
+
+    /// Each variant renders as a plain sentence, not Rust debug output.
+    #[test]
+    fn hook_status_displays_as_words() {
+        assert_eq!(HookStatus::Ok.to_string(), "succeeded");
+        assert_eq!(
+            HookStatus::Failed { code: Some(3) }.to_string(),
+            "exited with status 3"
+        );
+        assert_eq!(
+            HookStatus::Failed { code: None }.to_string(),
+            "was killed by a signal"
+        );
+        assert_eq!(
+            HookStatus::TimedOut {
+                after: Duration::from_secs(30),
+                budgeted: false,
+            }
+            .to_string(),
+            "timed out after 30s"
+        );
+        assert_eq!(
+            HookStatus::TimedOut {
+                after: Duration::from_secs(4),
+                budgeted: true,
+            }
+            .to_string(),
+            "timed out after 4s (teardown budget)"
+        );
+        assert_eq!(
+            HookStatus::NotRun {
+                reason: "no shell".to_string(),
+            }
+            .to_string(),
+            "did not run: no shell"
+        );
     }
 
     /// A hook that outlives its timeout is killed and reported as timed
