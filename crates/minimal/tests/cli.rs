@@ -3130,7 +3130,7 @@ async fn activate_and_ls_report_native_surface() {
         "activate must print the naming advisory beside the surface line, got: {activate_stderr}"
     );
     assert!(
-        activate_stderr.contains("Configure the host's resolver for the zone")
+        activate_stderr.contains("Configure the host's resolver")
             || activate_stderr.contains("bypass systemd-resolved"),
         "the advisory names what is missing — the command to run, or the host fact that \
          makes one dead: {activate_stderr}"

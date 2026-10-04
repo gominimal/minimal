@@ -415,7 +415,20 @@ fn serve_connection(
     // world-writable provider directory. The kernel captures the peer's
     // credentials at connect time, so a descriptor a same-uid connector
     // passes on still carries that connector's uid.
-    if let Err(error) = check_peer_credentials(&stream) {
+    //
+    // One exception, and only for the answerer handover's two verbs:
+    // root — the privileged step that installs the answerer service runs
+    // as root and asks this daemon to release the hook port. Every other
+    // verb stays the daemon's own uid's.
+    let uid = match peer_uid(&stream) {
+        Ok(uid) => uid,
+        Err(error) => {
+            tracing::debug!(%error, "control-socket peer check failed");
+            return Ok(());
+        }
+    };
+    let root_peer = is_root_peer(uid);
+    if !root_peer && let Err(error) = check_peer_uid(uid) {
         tracing::debug!(%error, "control-socket peer check failed");
         return Ok(());
     }
@@ -433,7 +446,31 @@ fn serve_connection(
             return write_reply(&mut stream, &BoxControlReply::Error { error });
         }
     };
+    if root_peer && !root_may_ask(&request) {
+        tracing::warn!(
+            peer_uid = uid,
+            "refused a control-socket request from root: root may only release the \
+             answerer or cancel a release"
+        );
+        return Ok(());
+    }
     serve_request(&mut stream, boxes, answerer, proxy_publish, request)
+}
+
+/// Whether `peer_uid` is root connecting to a daemon that is not root's:
+/// the one foreign uid the answerer handover's verbs admit.
+fn is_root_peer(peer_uid: u32) -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    peer_uid == 0 && unsafe { libc::geteuid() } != 0
+}
+
+/// The verbs root may ask: the answerer handover's release and its cancel,
+/// nothing that reads or writes the box table.
+fn root_may_ask(request: &BoxControlRequest) -> bool {
+    matches!(
+        request,
+        BoxControlRequest::ReleaseAnswerer | BoxControlRequest::ReleaseAnswererCancel
+    )
 }
 
 /// Dispatch one parsed request to its verb and write its one reply line.
@@ -455,8 +492,12 @@ fn serve_request(
     request: BoxControlRequest,
 ) -> std::io::Result<()> {
     match request {
-        BoxControlRequest::Register(request) => register_and_reply(stream, boxes, request),
-        BoxControlRequest::Withdraw(request) => withdraw_and_reply(stream, boxes, request),
+        BoxControlRequest::Register(request) => {
+            register_and_reply(stream, boxes, answerer, request)
+        }
+        BoxControlRequest::Withdraw(request) => {
+            withdraw_and_reply(stream, boxes, answerer, request)
+        }
         BoxControlRequest::AnswererStatus => {
             // The one read-only verb answers the host facts the CLI's
             // surfaces read (T93): why the hostname proxy is not serving
@@ -469,6 +510,36 @@ fn serve_request(
             };
             write_reply(stream, &reply)
         }
+        BoxControlRequest::ReleaseAnswerer => {
+            let reply = answerer.release();
+            tracing::info!(
+                acted = reply.acted,
+                "answer to a release request: {}",
+                reply.detail
+            );
+            write_reply(
+                stream,
+                &BoxControlReply::AnswererRelease {
+                    acted: reply.acted,
+                    detail: reply.detail,
+                },
+            )
+        }
+        BoxControlRequest::ReleaseAnswererCancel => {
+            let reply = answerer.release_cancel();
+            tracing::info!(
+                acted = reply.acted,
+                "answer to a release-cancel request: {}",
+                reply.detail
+            );
+            write_reply(
+                stream,
+                &BoxControlReply::AnswererRelease {
+                    acted: reply.acted,
+                    detail: reply.detail,
+                },
+            )
+        }
     }
 }
 
@@ -480,12 +551,13 @@ fn serve_request(
 ///
 /// The refusal is logged once per distinct foreign uid (per process
 /// lifetime) so a persistent misconfiguration does not flood the log.
+#[cfg(test)]
 fn check_peer_credentials(stream: &UnixStream) -> std::io::Result<()> {
     check_peer_uid(peer_uid(stream)?)
 }
 
 /// Admit `peer_uid` only when it is the daemon's own effective uid; the
-/// decision half of [`check_peer_credentials`], apart from the socket.
+/// decision half of the connection's peer check, apart from the socket.
 fn check_peer_uid(peer_uid: u32) -> std::io::Result<()> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     let my_uid = unsafe { libc::geteuid() };
@@ -607,9 +679,14 @@ fn parse_request(line: &str) -> Result<BoxControlRequest, serde_json_lenient::Er
 /// registration names the box, its id, both addresses and the declared
 /// egress the row carries: the diagnostic a bundle's VM host daemon log is
 /// read for.
+///
+/// The box's published address is the machine answerer's to hand out
+/// (design §7.1), asked for before the row is filled: a node never
+/// self-assigns one, so two state dirs' boxes never share an address.
 fn register_and_reply(
     stream: &mut UnixStream,
     boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
     request: RegisterBoxRequest,
 ) -> std::io::Result<()> {
     // The declaration as the row received it; `null` for a box with no
@@ -624,7 +701,23 @@ fn register_and_reply(
         egress: request.egress,
         credentialed_upstream: request.credentialed_upstream,
     };
-    let reply = match boxes.register_client_box(spec) {
+    let loopback_addr = match answerer.allocate(&request.name) {
+        Ok(address) => address,
+        Err(reason) => {
+            tracing::warn!(
+                box = %request.name,
+                %reason,
+                "box registration refused: the zone answerer handed out no address"
+            );
+            return write_reply(
+                stream,
+                &BoxControlReply::Error {
+                    error: format!("the zone answerer could not allocate a box address: {reason}"),
+                },
+            );
+        }
+    };
+    let reply = match boxes.register_client_box_at(spec, loopback_addr) {
         Ok(record) => {
             tracing::info!(
                 box = %record.name(),
@@ -641,6 +734,8 @@ fn register_and_reply(
             })
         }
         Err(error) => {
+            // The address goes back: no row holds it.
+            answerer.release_address(&request.name);
             tracing::debug!(
                 box = %request.name,
                 error = %error,
@@ -663,6 +758,7 @@ fn register_and_reply(
 fn withdraw_and_reply(
     stream: &mut UnixStream,
     boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
     request: WithdrawBoxRequest,
 ) -> std::io::Result<()> {
     let reply = match boxes.withdraw_client_box(
@@ -671,6 +767,9 @@ fn withdraw_and_reply(
         request.loopback_address,
     ) {
         Ok(withdrawn) => {
+            // The box is gone, so its published address returns to the
+            // machine's range — the answerer's release is idempotent.
+            answerer.release_address(&request.name);
             if withdrawn.is_some() {
                 tracing::info!(
                     box = %request.name,
@@ -779,7 +878,7 @@ mod tests {
     )> {
         let sock_path = dir.join(CONTROL_SOCK_FILE);
         let boxes = BoxRegistry::new(SUBNET);
-        let answerer = AnswererStatus::starting();
+        let answerer = AnswererStatus::allocating_for_tests("control-test-node");
         let proxy_publish = ProxyPublishStatus::new();
         let handle = spawn(
             sock_path.clone(),
@@ -844,6 +943,9 @@ mod tests {
                     "a registration is answered with the registered box, got the status {status:?}"
                 )
             }
+            BoxControlReply::AnswererRelease { detail, .. } => {
+                panic!("a box verb is never answered with a release reply, got {detail}")
+            }
         }
     }
 
@@ -890,11 +992,9 @@ mod tests {
         );
         assert_eq!(
             web.loopback_address,
-            switch::AddressPlan::default()
-                .loopback_slice_for_switch(SUBNET)
-                .expect("the default subnet is planned")
-                .first(),
-            "the first box takes the first address of the slice the host switch publishes at"
+            Ipv4Addr::new(127, 0, 64, 2),
+            "the first box takes the lowest box address the machine's answerer hands out \
+             (design §7.1): never the range's network address or .1"
         );
         assert_eq!(
             web.box_id,
@@ -962,15 +1062,8 @@ mod tests {
         );
         assert_eq!(
             db.loopback_address,
-            Ipv4Addr::from(
-                u32::from(
-                    switch::AddressPlan::default()
-                        .loopback_slice_for_switch(SUBNET)
-                        .expect("the default subnet is planned")
-                        .first()
-                ) + 1
-            ),
-            "the second box takes the next published loopback address"
+            Ipv4Addr::new(127, 0, 64, 3),
+            "the second box takes the answerer's next free box address"
         );
 
         // A malformed request is answered with the reason, not a hang.
@@ -1155,6 +1248,9 @@ mod tests {
             BoxControlReply::Status(status) => {
                 panic!("a withdrawal is answered with the pair, got the status {status:?}")
             }
+            BoxControlReply::AnswererRelease { detail, .. } => {
+                panic!("a box verb is never answered with a release reply, got {detail}")
+            }
         }
         assert!(
             registry
@@ -1230,6 +1326,9 @@ mod tests {
                 BoxControlReply::Status(status) => {
                     panic!("a withdrawal must be refused, got the status {status:?}")
                 }
+                BoxControlReply::AnswererRelease { detail, .. } => {
+                    panic!("a box verb is never answered with a release reply, got {detail}")
+                }
             }
         }
         assert!(
@@ -1267,6 +1366,9 @@ mod tests {
             }
             BoxControlReply::Status(status) => {
                 panic!("a repeat withdrawal echoes the pair, got the status {status:?}")
+            }
+            BoxControlReply::AnswererRelease { detail, .. } => {
+                panic!("a box verb is never answered with a release reply, got {detail}")
             }
         }
 
@@ -1355,6 +1457,7 @@ mod tests {
         for state in [
             ZoneAnswererStatus::Holder { port },
             ZoneAnswererStatus::Registered { port },
+            ZoneAnswererStatus::ManagerHeld { port },
             ZoneAnswererStatus::PortHeldNoChannel { port },
         ] {
             answerer.set(state.clone());
@@ -1682,6 +1785,20 @@ mod tests {
         // A repeat refusal (logged at debug, not warn) still refuses.
         let err = check_peer_uid(foreign).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    /// Root is admitted for the answerer handover's two verbs and nothing
+    /// else: the privileged step runs as root and asks a release, and no
+    /// other verb is root's to ask of the operator's daemon.
+    #[test]
+    fn root_may_only_release_the_answerer() {
+        assert!(root_may_ask(&BoxControlRequest::ReleaseAnswerer));
+        assert!(root_may_ask(&BoxControlRequest::ReleaseAnswererCancel));
+        assert!(!root_may_ask(&BoxControlRequest::AnswererStatus));
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        assert_eq!(is_root_peer(0), me != 0);
+        assert!(!is_root_peer(me.wrapping_add(1).max(1)));
     }
 
     /// The bind tightens a provider dir the daemon owns but `StateDir::new`
