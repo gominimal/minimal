@@ -3983,6 +3983,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "min-answerer"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "minvmd",
+ "tracing-subscriber",
+ "version",
+]
+
+[[package]]
 name = "minimal"
 version = "0.7.0"
 dependencies = [
