@@ -1019,7 +1019,6 @@ impl WatchState {
                                     return Appearance::Settled;
                                 }
                                 self.plan.gate.admit_published(port);
-                                self.plan.gate.admit_published(port);
                                 self.forwards.insert(port, mapping);
                                 tracing::info!(
                                     session = %self.plan.box_name,
