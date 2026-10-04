@@ -1532,8 +1532,13 @@ async fn relay_control(
             // and which held them for exactly this: a retraction
             // the ledger could not attribute was already refused, and a
             // row the retraction ends nothing of simply has no entry to
-            // end.
-            if let Some((addr, inside, proto)) = forwards.note_retracted(listener) {
+            // end. Two listeners can dial one inside port, and the records
+            // are keyed by protocol and inside port, not by listener: while
+            // another applied publish still dials the same port in the same
+            // protocol, the records are that publication's too, so they stay.
+            if let Some((addr, inside, proto)) = forwards.note_retracted(listener)
+                && !forwards.still_published(addr, inside, proto)
+            {
                 replies.end_port_at(addr, proto, inside);
             }
         }
@@ -1856,6 +1861,16 @@ impl PublishedForwards {
         self.lock()
             .iter()
             .any(|(_, at, inside, _)| *at == addr && *inside == port)
+    }
+
+    /// Whether an applied publish still dials `addr` at `inside` in
+    /// `proto`: a retraction's records stay while another listener's
+    /// publication stands at the same inside port, because they are its
+    /// records too ([`relay_control`]).
+    fn still_published(&self, addr: [u8; 4], inside: u16, proto: u8) -> bool {
+        self.lock()
+            .iter()
+            .any(|(_, at, port, p)| *at == addr && *port == inside && *p == proto)
     }
 
     fn lock(&self) -> MutexGuard<'_, Vec<AppliedPublish>> {
@@ -11197,6 +11212,41 @@ mod tests {
             ledger.address_of(a),
             Some([100, 64, 0, 9]),
             "retracting one box's listener leaves the other box's attribution"
+        );
+    }
+
+    #[test]
+    fn retraction_keeps_records_a_sibling_publish_still_dials() {
+        // Two listeners dial one inside port: retracting one leaves the
+        // other's publication standing, so the records it shares stay; the
+        // last retraction at that port, in that protocol, ends them.
+        let tcp = super::egress::IPPROTO_TCP;
+        let addr = [100, 64, 0, 9];
+        let ledger = super::PublishedForwards::new();
+        ledger.note_published(([127, 0, 0, 1], 8080), addr, 18080, tcp);
+        ledger.note_published(([127, 0, 0, 1], 8081), addr, 18080, tcp);
+        ledger.note_published(
+            ([127, 0, 0, 1], 8082),
+            addr,
+            18080,
+            super::egress::IPPROTO_UDP,
+        );
+
+        assert_eq!(
+            ledger.note_retracted(([127, 0, 0, 1], 8080)),
+            Some((addr, 18080, tcp))
+        );
+        assert!(
+            ledger.still_published(addr, 18080, tcp),
+            "the sibling listener's publication still dials the port"
+        );
+        assert_eq!(
+            ledger.note_retracted(([127, 0, 0, 1], 8081)),
+            Some((addr, 18080, tcp))
+        );
+        assert!(
+            !ledger.still_published(addr, 18080, tcp),
+            "a publication in another protocol does not keep the TCP records"
         );
     }
 
