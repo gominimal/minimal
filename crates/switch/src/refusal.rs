@@ -201,12 +201,13 @@ pub fn classify(frame: &[u8]) -> Option<Segment> {
 /// The ones' complement sum of `bytes` as 16-bit big-endian words (RFC 1071):
 /// the accumulator widened so the carries survive to be folded back in.
 pub fn ones_sum(bytes: &[u8]) -> u32 {
-    let sum: u32 = bytes
-        .chunks_exact(2)
-        .map(|word| u32::from(u16::from_be_bytes([word[0], word[1]])))
+    let (words, remainder) = bytes.as_chunks::<2>();
+    let sum: u32 = words
+        .iter()
+        .map(|word| u32::from(u16::from_be_bytes(*word)))
         .sum();
     // A trailing odd byte counts as the high half of a final word.
-    if let Some(tail) = bytes.chunks_exact(2).remainder().first() {
+    if let Some(tail) = remainder.first() {
         sum + (u32::from(*tail) << 8)
     } else {
         sum
