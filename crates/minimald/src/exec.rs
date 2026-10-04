@@ -1266,9 +1266,9 @@ where
         None => {
             tokio::select! {
                 status = process.wait() => status,
-                res = client_lost.wait_for(|lost| *lost) => {
-                    let lost = res.is_ok();
-                    drop(res);
+                // Reduced to a bool in the branch: the `watch::Ref` it
+                // yields is not `Send` and must not live across the wait.
+                lost = async { client_lost.wait_for(|lost| *lost).await.is_ok() } => {
                     if lost {
                         tracing::warn!(
                             %channel_id,
