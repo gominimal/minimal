@@ -601,7 +601,7 @@ impl Config {
                     let continues_variable = after_reference
                         .chars()
                         .next()
-                        .map_or(false, |ch| ch.is_ascii_alphanumeric() || ch == '_');
+                        .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
                     if continues_variable {
                         expanded_path.push_str("$PATH");
                     } else {
