@@ -202,11 +202,10 @@ pub(crate) enum ProjectResolution {
 }
 
 /// Parse the client's project `minimal.toml` and resolve its graph.
-/// A missing mfile yields [`ProjectResolution::NoMFile`]; a
-/// graph-resolve failure is returned as `InvalidInput` so the
-/// activation fails loudly rather than silently dropping every
-/// package contribution. Other mfile errors are returned as
-/// `InvalidInput`.
+/// A missing mfile yields [`ProjectResolution::NoMFile`]. Any other
+/// mfile error, and a graph that does not resolve, are returned as
+/// `InvalidInput`, so activation fails rather than dropping every
+/// package contribution.
 pub(crate) fn resolve_project_ctx_and_graph(
     daemon_ctx: &Arc<mctx::DaemonContext>,
     project_path: &DaemonAbsPath,

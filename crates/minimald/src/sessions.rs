@@ -22,7 +22,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 pub(crate) mod composables;
 #[cfg(test)]
-use composables::{ProjectResolution, build_composables, run_compose, run_composer};
+use composables::{
+    ProjectResolution, build_composables, resolve_project_ctx_and_graph, run_compose, run_composer,
+};
 
 /// A short summary of the metadata of a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2720,6 +2722,71 @@ pub(crate) mod tests {
         .unwrap();
         assert!(project.is_none(), "NoMFile → no ProjectComposable");
         assert!(packages.is_empty(), "NoMFile → no PackageComposables");
+    }
+
+    /// [`build_composables`] on a resolved project stamps every
+    /// project-contributed package with `Source::Project` naming the
+    /// *declared* project path, not the per-session workspace the
+    /// mfile was read out of. The hooks policy matches projects by
+    /// this path and every error message quotes it, so a per-session
+    /// value would be unmatchable and unrecognizable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_composables_project_provenance_names_declared_path() {
+        use std::io::Write;
+
+        let project = TempDir::new().unwrap();
+        let mfile_path = project.path().join(mfile::MFILE_NAME);
+        let mut f = std::fs::File::create(&mfile_path).unwrap();
+        writeln!(f, "[session]\npackages = [\"cargo\"]").unwrap();
+        drop(f);
+
+        let cache = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let mctx_config = mctx::ConfigBuilder::new()
+            .with_cache_dir(cache.path())
+            .with_state_dir(state.path())
+            .with_daemon_id("test".to_string())
+            .build()
+            .unwrap();
+        let daemon = std::sync::Arc::new(mctx::DaemonContext::init(mctx_config).unwrap());
+
+        let path = DaemonAbsPath::try_new(project.path().to_str().unwrap()).unwrap();
+        let resolution = resolve_project_ctx_and_graph(&daemon, &path)
+            .expect("a stdlib-only mfile resolves offline");
+        assert!(
+            matches!(resolution, ProjectResolution::Full(..)),
+            "an mfile on disk with a resolvable graph → Full",
+        );
+        let (project_composable, _packages) = build_composables(
+            &path,
+            &declared_path(),
+            &resolution,
+            &WireContribution::default(),
+            true,
+        )
+        .unwrap();
+
+        use sessions::core::compose::Composable as _;
+        let contribution = project_composable
+            .expect("[session] block → ProjectComposable present")
+            .contribute(&|_| Err(std::env::VarError::NotPresent))
+            .expect("the fixture's [session] block contributes cleanly");
+        let sources: Vec<_> = contribution
+            .packages()
+            .iter()
+            .map(sessions::core::source::Provenanced::source)
+            .collect();
+        assert!(!sources.is_empty(), "fixture should contribute a package");
+        for source in sources {
+            let sessions::core::source::Source::Project { path } = source else {
+                panic!("project material should carry Source::Project, got {source:?}");
+            };
+            assert_eq!(
+                path.as_utf8_path().as_str(),
+                declared_path().as_utf8_path().as_str(),
+                "provenance should name the declared project path, not the workspace",
+            );
+        }
     }
 
     /// A project whose `minimal.toml` demands a newer standard
