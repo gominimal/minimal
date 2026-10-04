@@ -1939,8 +1939,10 @@ pub(crate) async fn drive_proxy_until_serving(
                 // one report of the port the publication landed on ends it
                 // without waiting out the bound. This arm only runs on the
                 // in-VM publish path — a native daemon has no host daemon to
-                // tell.
-                report_proxy_serving(host_port).await;
+                // tell. Sent in the background: the report's vsock dial can
+                // take seconds per try, and the drive must record serving
+                // without waiting on it.
+                tokio::spawn(report_proxy_serving(host_port));
                 break;
             }
             Some(failure) => {
@@ -1995,8 +1997,11 @@ pub(crate) async fn drive_proxy_until_serving(
                         %failure.report,
                         "the host holds the hostname proxy's port; reporting the terminal publish failure to the VM host daemon"
                     );
-                    report_proxy_port_held(host_port).await;
+                    // Recorded first, reported in the background: the drive
+                    // ends here and never waits on the report's vsock dial,
+                    // which can take seconds per try.
                     proxy.record_unavailable(&state, failure.report).await;
+                    tokio::spawn(report_proxy_port_held(host_port));
                     return;
                 }
                 // No rung left to walk to, a pinned port, or a transient
@@ -3934,8 +3939,9 @@ mod tests {
 
         // The drive must end on its own — the report is the terminal
         // failure, not a preface to another backoff the test would have to
-        // abort. (The report's own dial retries are best-effort and bounded,
-        // so the task still resolves promptly on a host with no vsock.)
+        // abort. (The report is sent in the background, so the drive never
+        // waits on its vsock dial, which on a host with no VM host daemon
+        // can take seconds per try.)
         let drove = tokio::time::timeout(Duration::from_secs(8), drive).await;
         assert!(
             drove.is_ok(),
