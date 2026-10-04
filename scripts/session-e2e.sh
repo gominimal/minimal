@@ -129,9 +129,9 @@
 #                                    beside the declaration, and
 #                                    out-of-range and deny asks are
 #                                    refused with their own typed errors;
-#                                    the publish arm runs where the host
-#                                    side carries it and says so where it
-#                                    cannot (runtime_publish_gap_reason)
+#                                    a VM lane asserts the create's typed
+#                                    allow/ask refusal instead (T80,
+#                                    gominimal/minimal#1878)
 #   listen_published_port_reaches_peer_and_host
 #                                    NET-016/017: a listen inside the
 #                                    declared range publishes with no
@@ -140,10 +140,10 @@
 #                                    reach it, the close withdraws it and
 #                                    both are refused fast, and an
 #                                    out-of-range listen reaches neither,
-#                                    read against a declared control; the
-#                                    in-range arm runs where the host side
-#                                    carries the publish and says so where
-#                                    it cannot (runtime_publish_gap_reason)
+#                                    read against a declared control; a VM
+#                                    lane asserts the create's typed allow
+#                                    refusal, then the in-range listen
+#                                    unpublished under deny (T80)
 #   proxy_refuses_like_direct        the proxy refuses exactly as the switch
 #                                    does: paired direct/proxied attempts,
 #                                    h2 closed, h2c stripped (NET-069..071, 135)
@@ -14084,25 +14084,41 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
 }
 
 # ---------------------------------------------------------------------------
-# The one reason both dynamic-publish proofs share, as a helper so the two
-# SKIPPED lines say the same thing: a runtime publish the box's own stance
-# allows is still a request the HOST side must carry, and on a VM-backed
-# target the host side is the VM host's egress gate, which applies a publish
-# only at a port the box's host-side registration already carries. That
-# registration is built from the create's declared `--ingress` mappings
-# alone (`register_box_for_activation`, crates/minimal/src/cmd/session.rs),
-# so the dynamic range the create carried reaches the daemon's own decision
-# — the typed refusals these proofs assert are decided there, before the
-# switch is asked anything — but not the host row, and an in-range publish
-# is answered with nothing written on: the box reads a failed bind. Carrying
-# the range into the host-side registration (the minvmd/sessions half of
-# NET-043, deferred to T80, gominimal/minimal#1878) is what lets the publish
-# arms below run on a VM lane; until it lands they run where no gate sits in
-# the ask's way — a host-native daemon with a switch attached. The skip is
-# lane-gated: only a VM lane (E2E_VM) may take it, and only on the refusal
-# this gap produces; the same refusal on a native lane is a failure.
-runtime_publish_gap_reason() { # $1 = the port the box asked for, $2 = the declared range
-  echo "expected on a VM lane until T80 (gominimal/minimal#1878) lands: the publish for port $1 was decided allow by the box's stance ($2) but refused by the host side, which carries only the create's declared --ingress mappings and not the dynamic range — carrying the range into the host-side registration (the minvmd/sessions half of NET-043) is what lets this arm run on a VM lane"
+# The refusal a VM-backed create gives an allow/ask stance, held as one
+# helper so both dynamic-ingress proofs assert the same words: the VM host's
+# egress gate applies a runtime publish only at a port the box's host-side
+# registration already carries, and that registration carries the create's
+# declared `--ingress` mappings alone (`register_box_for_activation`,
+# crates/minimal/src/cmd/session.rs). Until the range reaches the host row
+# (T80, gominimal/minimal#1878) the CLI refuses an allow/ask stance on a
+# VM-backed host before any box exists, and the VM lanes assert exactly that
+# refusal — never a skip.
+VM_DYNAMIC_INGRESS_REFUSAL="dynamic ingress allow/ask is not yet supported on VM-backed hosts (gominimal/minimal#1878)"
+assert_vm_refuses_dynamic_stance() { # $1 = stance (allow|ask), $2 = box name, $3 = label for files; rest = extra activate flags
+  local stance="$1" name="$2" label="$3" seed="" out="" rc=0
+  shift 3
+  seed="$(hook_mktemp /tmp/mnlvr.XXXXXX)"
+  hook_seed_preamble > "$seed/minimal.toml"
+  mkdir "$seed/.git"
+  out="$(cd "$seed" && mnl session activate . --no-prompt \
+    --name "$name" --network own_ip "$@" --dynamic-ingress "$stance" \
+    2>"$WORK/$label-vmrefusal.err")" || rc=$?
+  rm -rf "$seed"
+  if [ "$rc" -eq 0 ]; then
+    echo "::error::the VM-backed create accepted --dynamic-ingress $stance (printed '$out') — until T80 (gominimal/minimal#1878) it must refuse before any box exists"
+    mnl session destroy --force "$(printf '%s\n' "$out" | tail -n1 | tr -d '\r')" >/dev/null 2>&1 || true
+    fail
+  fi
+  if ! grep -qF "$VM_DYNAMIC_INGRESS_REFUSAL" "$WORK/$label-vmrefusal.err"; then
+    echo "::error::the VM-backed create refused --dynamic-ingress $stance without the typed reason (want: '$VM_DYNAMIC_INGRESS_REFUSAL')"
+    echo "--- stderr ---"; cat "$WORK/$label-vmrefusal.err" 2>/dev/null || true
+    fail
+  fi
+  if mnl ls 2>/dev/null | grep -qF "$name"; then
+    echo "::error::the refused create for $name left a session behind — the refusal must come before any box exists"
+    fail
+  fi
+  echo "VM lane: --dynamic-ingress $stance refused before any box existed, with the typed reason: $VM_DYNAMIC_INGRESS_REFUSAL"
 }
 
 # ---------------------------------------------------------------------------
@@ -14124,14 +14140,14 @@ runtime_publish_gap_reason() { # $1 = the port the box asked for, $2 = the decla
 # watcher, and the expose would then read back already-published instead of
 # publishing, proving nothing about the ask this case exists to drive.
 #
-# The publish arm splits on what the target's host side can carry, the same
-# split the listen proof below makes (see `runtime_publish_gap_reason` above
-# this case): everything the box's own decision owns — the typed out-of-range
-# and deny refusals, and the policy renderings' verdict on what was actually
-# published — runs on every target, while the publish and its live row run
-# where the host side does not refuse them, and a target that refuses owes
-# the fail-closed half of the listing instead: a box that published nothing
-# lists nothing, on both renderings (NET-044).
+# The case splits by lane, never by a skip. A native lane runs the allow box
+# whole: the publish, its live row on both renderings, and the out-of-range
+# refusal. A VM lane cannot hold an allow/ask stance until T80
+# (gominimal/minimal#1878), so there the create's typed refusal of both is
+# the assertion (`assert_vm_refuses_dynamic_stance` above), and the policy
+# renderings are read off the deny box instead — which declares the same
+# range on every lane, so its listing carries a declared stance and range
+# with no live publication.
 proof_min_net_expose_publishes_lists_and_refuses() {
   echo "::group::min net expose publishes what the stance allows, lists the publication, and refuses the rest (NET-043, NET-044)"
 
@@ -14145,8 +14161,8 @@ proof_min_net_expose_publishes_lists_and_refuses() {
   local mnx_sid="" mnx_deny_sid=""
   local mnx_expose_out="" mnx_expose_rc="" mnx_expose_err=""
   local mnx_ref_rc="" mnx_ref_err="" mnx_deny_rc="" mnx_deny_err=""
-  local mnx_policy="" mnx_json="" mnx_listening=""
-  local mnx_live=""      # set once the in-range ask published on this target
+  local mnx_policy="" mnx_json="" mnx_listening="" mnx_json_mode=""
+  local mnx_policy_sid="" mnx_policy_stance=""  # the box the policy legs read
   local mnx_allow_name="e2e-dyn-expose" mnx_deny_name="e2e-dyn-deny"
   local mnx_lo=18110 mnx_hi=18115      # the declared dynamic range
   local mnx_port=18110                 # in-range: the port the allow box publishes
@@ -14173,6 +14189,76 @@ proof_min_net_expose_publishes_lists_and_refuses() {
     fail
   fi
 
+  # The machine rendering's check, `-o json`, defined once for whichever box
+  # the policy legs read: the resolved stance, its source and the range
+  # inside the ingress object, and live_ingress as one row for a publish or
+  # the empty list where nothing was published — the fail-closed claim the
+  # text rendering's missing section makes, spelled for a parser. python3
+  # (an e2e prerequisite on every lane this script runs on) reads the
+  # document. The document rides argv, never stdin: this python reads its
+  # program from a heredoc (`python3 -`), and a heredoc IS the interpreter's
+  # stdin — the document piped beside it would never arrive (the suite's
+  # other stdin readers use `python3 -c`, whose stdin stays the pipe's).
+  mnx_json_assert() { # $1 lo, $2 hi, $3 port, $4 live|nothing-published, $5 stance, $6 the document
+    python3 - "$1" "$2" "$3" "$4" "$5" "$6" <<'PY'
+import json
+import sys
+
+lo, hi, port, mode = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+stance = sys.argv[5]
+doc = json.loads(sys.argv[6])
+ingress = doc.get("ingress") or {}
+problems = []
+if ingress.get("kind") != "declared":
+    problems.append(f"ingress.kind is {ingress.get('kind')!r}, not 'declared'")
+if ingress.get("dynamic_ingress") != stance:
+    problems.append(f"ingress.dynamic_ingress is {ingress.get('dynamic_ingress')!r}, not {stance!r}")
+if ingress.get("dynamic_ingress_source") != "declared":
+    problems.append(
+        f"ingress.dynamic_ingress_source is {ingress.get('dynamic_ingress_source')!r}"
+        ", not 'declared'"
+    )
+if ingress.get("dynamic_allowed_range") != [lo, hi]:
+    problems.append(
+        f"ingress.dynamic_allowed_range is {ingress.get('dynamic_allowed_range')!r}"
+        f", not [{lo}, {hi}]"
+    )
+live = doc.get("live_ingress")
+if not isinstance(live, list):
+    problems.append(f"live_ingress is {live!r}, not the rows the wire served")
+elif mode == "live":
+    rows = [row for row in live if row.get("internal_port") == port]
+    if len(rows) != 1:
+        problems.append(f"{len(rows)} live rows name port {port}, want exactly the one publish")
+    else:
+        print(
+            f"policy (json): live row {rows[0].get('local')}"
+            f" pending={rows[0].get('pending')}"
+        )
+elif live:
+    problems.append(
+        f"live_ingress carries {len(live)} row(s) on a box that published"
+        " nothing — it must list nothing (NET-044)"
+    )
+else:
+    print("policy (json): live_ingress is the empty list — a box that published nothing lists nothing (NET-044, fail-closed)")
+if problems:
+    for line in problems:
+        print(line, file=sys.stderr)
+    sys.exit(1)
+PY
+  }
+
+  if [ -n "${E2E_VM:-}" ]; then
+  # ---- a VM lane: the typed refusal is the assertion ----------------------
+  # Both stances that could publish are refused at the create, before the
+  # box exists (T80, gominimal/minimal#1878); the deny box below carries the
+  # policy legs and the deny refusal this lane still owes.
+  assert_vm_refuses_dynamic_stance allow "$mnx_allow_name" mnx-allow \
+    --dynamic-range "$mnx_lo-$mnx_hi"
+  assert_vm_refuses_dynamic_stance ask "$mnx_allow_name" mnx-ask \
+    --dynamic-range "$mnx_lo-$mnx_hi"
+  else
   MNX_SEED_DIR="$(hook_mktemp /tmp/mnlxe.XXXXXX)"
   hook_seed_preamble > "$MNX_SEED_DIR/minimal.toml"
   mkdir "$MNX_SEED_DIR/.git"
@@ -14218,61 +14304,35 @@ proof_min_net_expose_publishes_lists_and_refuses() {
   # honesty caveat NET-047 pins — bound, but the relay gate has not admitted
   # it — and this box declared no static mapping, so the caveat is expected;
   # the case prints whichever reply it got and asserts only the publish line
-  # itself. The arm splits on the reply this target can give: a publish line
-  # runs the publish arm whole below, while a bind the host side refused —
-  # the gap `runtime_publish_gap_reason` above this case names, the one
-  # refusal an in-range ask of an attached allow box can meet that is not
-  # the stance's own — skips the publish arm on a VM lane only, and holds the
-  # case to what every target can still prove: the stance's own typed
-  # refusals, and a listing that carries no publication at all. The same
-  # refusal on a native lane has no gap to blame and fails.
+  # itself. A native host has no host gate in the ask's way, so any refusal
+  # here is a failure.
   mnl session exec "$mnx_sid" "/usr/bin/min net expose $mnx_port" \
     >"$WORK/mnx-expose.out" 2>"$WORK/mnx-expose.err"
   mnx_expose_rc=$?
   mnx_expose_out="$(cat "$WORK/mnx-expose.out" 2>/dev/null)"
   mnx_expose_err="$(tr '\n' ' ' < "$WORK/mnx-expose.err" 2>/dev/null)"
   echo "expose: min net expose $mnx_port in the allow box -> exit $mnx_expose_rc: ${mnx_expose_out:-<no reply>}${mnx_expose_err:+ [$mnx_expose_err]}"
-  mnx_live=""
-  if [ "$mnx_expose_rc" -eq 0 ]; then
-    case "$mnx_expose_out" in
-      "published port $mnx_port at "*":$mnx_port; not yet reachable") mnx_live=1 ;;
-      "published port $mnx_port at "*":$mnx_port") mnx_live=1 ;;
-      *)
-        echo "::error::the expose's reply is not a publish line naming the port and its address (got: '$mnx_expose_out')"
-        fail
-        ;;
-    esac
-  else
-    case "$mnx_expose_err" in
-      *"publishing port $mnx_port failed:"*)
-        if [ -z "${E2E_VM:-}" ]; then
-          echo "::error::the in-range expose was refused by the host side on a native lane (got: '$mnx_expose_err') — the VM-lane gap T80 (gominimal/minimal#1878) defers has no host gate here, so this refusal is a defect, not that gap"
-          cat "$WORK/mnx-expose.err" 2>/dev/null || true
-          fail
-        fi
-        echo "publish arm: SKIPPED — $(runtime_publish_gap_reason "$mnx_port" "$mnx_lo-$mnx_hi")"
-        echo "  (the box read: $mnx_expose_err)"
-        ;;
-      *)
-        echo "::error::the in-range expose failed with a refusal the stance does not spell for an allow box (got: '$mnx_expose_err') — the box was created allow over $mnx_lo-$mnx_hi and asked for $mnx_port"
-        cat "$WORK/mnx-expose.err" 2>/dev/null || true
-        fail
-        ;;
-    esac
+  if [ "$mnx_expose_rc" -ne 0 ]; then
+    echo "::error::the in-range expose failed (got: '$mnx_expose_err') — the box was created allow over $mnx_lo-$mnx_hi and asked for $mnx_port"
+    cat "$WORK/mnx-expose.err" 2>/dev/null || true
+    fail
   fi
-  if [ -n "$mnx_live" ]; then
-    echo "the ask published: $mnx_expose_out (NET-043)"
-  fi
+  case "$mnx_expose_out" in
+    "published port $mnx_port at "*":$mnx_port; not yet reachable") ;;
+    "published port $mnx_port at "*":$mnx_port") ;;
+    *)
+      echo "::error::the expose's reply is not a publish line naming the port and its address (got: '$mnx_expose_out')"
+      fail
+      ;;
+  esac
+  echo "the ask published: $mnx_expose_out (NET-043)"
 
   # ---- the listener, after the publish -------------------------------------
   # What the published forward delivers to, started second for the ownership
   # reason this case's header names. Its own direct answer proves the
   # listener exists without leaning on the publish — a leg failing against a
   # listener that never started reads as a policy refusal, which is the one
-  # thing it must not be confused with. Only a target that published runs
-  # this step: on a target whose host side refused the ask, there is no
-  # forward to deliver and no listener to prove.
-  if [ -n "$mnx_live" ]; then
+  # thing it must not be confused with.
   mnl session exec "$mnx_sid" \
     "body=$mnx_marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/mnx-http200" \
     >/dev/null 2>"$WORK/mnx-responder.err" \
@@ -14297,119 +14357,11 @@ proof_min_net_expose_publishes_lists_and_refuses() {
     fail
   fi
   echo "listener: socat now serves port $mnx_port inside the allow box (its own loopback answers $mnx_marker)"
-  fi
-
-  # ---- the publication listed beside the declaration ----------------------
-  # `min session policy` is where a person reads what a box actually
-  # published (NET-044): the text rendering carries the resolved stance and
-  # range the create declared, then the live section with one row a publish.
-  # The row is asserted by its port, not its address — the address is the
-  # switch's word, fixed only at the publish. A target that could not
-  # publish owes the fail-closed half instead: NO live section at all,
-  # because the box published nothing — an empty listing is a fact about the
-  # box, never a missing one (NET-044).
-  mnx_policy="$(mnl session policy "$mnx_sid" 2>"$WORK/mnx-policy.err")" \
-    || { echo "::error::'min session policy' failed for the allow box"; cat "$WORK/mnx-policy.err" 2>/dev/null || true; fail; }
-  echo "--- min session policy (text) ---"; printf '%s\n' "$mnx_policy" | sed 's/^/  /'
-  case "$mnx_policy" in
-    *"  dynamic ingress  allow"*) ;;
-    *) echo "::error::the text policy does not show the resolved dynamic ingress stance as allow"; fail ;;
-  esac
-  case "$mnx_policy" in
-    *"  dynamic ports  $mnx_lo–$mnx_hi"*) ;;
-    *) echo "::error::the text policy does not show the declared dynamic range $mnx_lo-$mnx_hi"; fail ;;
-  esac
-  if [ -n "$mnx_live" ]; then
-    case "$mnx_policy" in
-      *"live ingress (published at runtime)"*) ;;
-      *) echo "::error::the text policy shows no live-ingress section — the runtime publish is not listed beside the declaration (NET-044)"; fail ;;
-    esac
-    case "$mnx_policy" in
-      *":$mnx_port → :$mnx_port"*) ;;
-      *) echo "::error::the live-ingress section carries no row for the exposed port $mnx_port"; fail ;;
-    esac
-    echo "policy (text): stance allow over $mnx_lo–$mnx_hi, one live row for :$mnx_port (NET-043, NET-044)"
-  else
-    case "$mnx_policy" in
-      *"live ingress (published at runtime)"*)
-        echo "::error::the text policy shows a live-ingress section on a box whose publish was refused — a refused ask must list nothing (NET-044)"
-        fail
-        ;;
-    esac
-    echo "policy (text): stance allow over $mnx_lo–$mnx_hi, and no live-ingress section — the refused publish lists nothing (NET-044, fail-closed)"
-  fi
-
-  # The machine rendering, `-o json`: the same publication as one
-  # min/v1/session-policy document — the resolved stance and range inside
-  # the ingress object, the publish as one live_ingress row, and on a target
-  # that could not publish, live_ingress as the empty list: the fail-closed
-  # claim the text rendering's missing section makes, spelled for a parser.
-  # python3 (an e2e prerequisite on every lane this script runs on) reads the
-  # document.
-  mnx_json="$(mnl session policy "$mnx_sid" -o json 2>"$WORK/mnx-json.err")" \
-    || { echo "::error::'min session policy -o json' failed for the allow box"; cat "$WORK/mnx-json.err" 2>/dev/null || true; fail; }
-  # The document rides argv, never stdin: this python reads its program from
-  # a heredoc (`python3 -`), and a heredoc IS the interpreter's stdin — the
-  # document piped beside it would never arrive (the suite's other stdin
-  # readers use `python3 -c`, whose stdin stays the pipe's).
-  mnx_json_assert() { # $1 lo, $2 hi, $3 port, $4 live|nothing-published, $5 the document
-    python3 - "$1" "$2" "$3" "$4" "$5" <<'PY'
-import json
-import sys
-
-lo, hi, port, mode = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
-doc = json.loads(sys.argv[5])
-ingress = doc.get("ingress") or {}
-problems = []
-if ingress.get("kind") != "declared":
-    problems.append(f"ingress.kind is {ingress.get('kind')!r}, not 'declared'")
-if ingress.get("dynamic_ingress") != "allow":
-    problems.append(f"ingress.dynamic_ingress is {ingress.get('dynamic_ingress')!r}, not 'allow'")
-if ingress.get("dynamic_allowed_range") != [lo, hi]:
-    problems.append(
-        f"ingress.dynamic_allowed_range is {ingress.get('dynamic_allowed_range')!r}"
-        f", not [{lo}, {hi}]"
-    )
-live = doc.get("live_ingress")
-if not isinstance(live, list):
-    problems.append(f"live_ingress is {live!r}, not the rows the wire served")
-elif mode == "live":
-    rows = [row for row in live if row.get("internal_port") == port]
-    if len(rows) != 1:
-        problems.append(f"{len(rows)} live rows name port {port}, want exactly the one publish")
-    else:
-        print(
-            f"policy (json): live row {rows[0].get('local')}"
-            f" pending={rows[0].get('pending')}"
-        )
-elif live:
-    problems.append(
-        f"live_ingress carries {len(live)} row(s) on a box whose publish was"
-        " refused — a refused ask must list nothing (NET-044)"
-    )
-else:
-    print("policy (json): live_ingress is the empty list — the refused publish lists nothing (NET-044, fail-closed)")
-if problems:
-    for line in problems:
-        print(line, file=sys.stderr)
-    sys.exit(1)
-PY
-  }
-  mnx_json_mode="nothing-published"
-  [ -n "$mnx_live" ] && mnx_json_mode="live"
-  if ! mnx_json_assert "$mnx_lo" "$mnx_hi" "$mnx_port" "$mnx_json_mode" "$mnx_json" \
-      >"$WORK/mnx-json-check.out" 2>"$WORK/mnx-json-check.err"; then
-    echo "::error::the -o json document does not carry the resolved stance, the range, and the publication verdict this target owes"
-    cat "$WORK/mnx-json-check.out" "$WORK/mnx-json-check.err" 2>/dev/null || true
-    echo "--- document ---"; printf '%s\n' "$mnx_json"
-    fail
-  fi
-  sed 's/^/  /' "$WORK/mnx-json-check.out" 2>/dev/null || true
 
   # ---- the range's own refusal --------------------------------------------
   # A port outside the declared range is refused by the stance itself,
   # decided before the switch is asked anything (NET-047): the typed error on
-  # the box's stderr, and the publish above — where one stands — untouched.
+  # the box's stderr, and the publish above untouched.
   mnl session exec "$mnx_sid" "/usr/bin/min net expose $mnx_out_port" \
     >"$WORK/mnx-out-range.out" 2>"$WORK/mnx-out-range.err"
   mnx_ref_rc=$?
@@ -14425,24 +14377,28 @@ PY
     *) echo "::error::the out-of-range refusal does not name the port and the declared range (got: '$mnx_ref_err')"; fail ;;
   esac
   echo "out of range: refused with its own typed error — the range the create declared is the whole gate (NET-043)"
+  fi
 
   # ---- the deny box's refusal ---------------------------------------------
   # A box whose create said deny answers the same ask with the deny the
   # stance spells — decided against the record before the switch is asked
   # anything, so the deny box needs nothing but a running box to ask from.
+  # It declares the case's range beside the deny on every lane: a range
+  # never widens a deny, and on a VM lane this box is the one whose listing
+  # carries a declared stance and range for the policy legs below.
   MNX_DENY_SEED_DIR="$(hook_mktemp /tmp/mnlxn.XXXXXX)"
   hook_seed_preamble > "$MNX_DENY_SEED_DIR/minimal.toml"
   mkdir "$MNX_DENY_SEED_DIR/.git"
   mnx_deny_sid="$(cd "$MNX_DENY_SEED_DIR" && mnl session activate . --no-prompt \
     --name "$mnx_deny_name" --network own_ip \
-    --dynamic-ingress deny \
+    --dynamic-ingress deny --dynamic-range "$mnx_lo-$mnx_hi" \
     2>"$WORK/mnx-deny-activate.err")" || {
-    echo "::error::'min session activate --network own_ip --dynamic-ingress deny' failed"
+    echo "::error::'min session activate --network own_ip --dynamic-ingress deny --dynamic-range $mnx_lo-$mnx_hi' failed"
     echo "--- stderr ---"; cat "$WORK/mnx-deny-activate.err" 2>/dev/null || true
     fail
   }
   mnx_deny_sid="$(printf '%s\n' "$mnx_deny_sid" | tail -n1 | tr -d '\r')"
-  echo "deny box: $mnx_deny_sid ($mnx_deny_name, dynamic ingress deny)"
+  echo "deny box: $mnx_deny_sid ($mnx_deny_name, dynamic ingress deny, range $mnx_lo-$mnx_hi declared beside it)"
   mnl session exec "$mnx_deny_sid" "/usr/bin/min net expose $mnx_deny_port" \
     >"$WORK/mnx-deny.out" 2>"$WORK/mnx-deny.err"
   mnx_deny_rc=$?
@@ -14459,13 +14415,70 @@ PY
   esac
   echo "deny box: refused with the deny the stance spells — the create's word is the whole decision (NET-043)"
 
-  mnl session destroy --force "$mnx_sid" >/dev/null 2>&1 || true
+  # ---- the publication listed beside the declaration ----------------------
+  # `min session policy` is where a person reads what a box actually
+  # published (NET-044): the text rendering carries the resolved stance and
+  # range the create declared, then the live section with one row a publish.
+  # The row is asserted by its port, not its address — the address is the
+  # switch's word, fixed only at the publish. On a native lane the allow
+  # box's listing carries its publish; on a VM lane the deny box's listing
+  # carries its declared stance and range and NO live section at all,
+  # because the box published nothing — an empty listing is a fact about the
+  # box, never a missing one (NET-044).
+  if [ -n "${E2E_VM:-}" ]; then
+    mnx_policy_sid="$mnx_deny_sid" mnx_policy_stance="deny" mnx_json_mode="nothing-published"
+  else
+    mnx_policy_sid="$mnx_sid" mnx_policy_stance="allow" mnx_json_mode="live"
+  fi
+  mnx_policy="$(mnl session policy "$mnx_policy_sid" 2>"$WORK/mnx-policy.err")" \
+    || { echo "::error::'min session policy' failed for the $mnx_policy_stance box"; cat "$WORK/mnx-policy.err" 2>/dev/null || true; fail; }
+  echo "--- min session policy (text, the $mnx_policy_stance box) ---"; printf '%s\n' "$mnx_policy" | sed 's/^/  /'
+  if ! printf '%s\n' "$mnx_policy" | grep -qxF "  dynamic ingress  $mnx_policy_stance"; then
+    echo "::error::the text policy does not show the declared dynamic ingress stance as '$mnx_policy_stance' (with no (default) mark)"
+    fail
+  fi
+  case "$mnx_policy" in
+    *"  dynamic ports  $mnx_lo–$mnx_hi"*) ;;
+    *) echo "::error::the text policy does not show the declared dynamic range $mnx_lo-$mnx_hi"; fail ;;
+  esac
+  if [ "$mnx_json_mode" = "live" ]; then
+    case "$mnx_policy" in
+      *"live ingress (published at runtime)"*) ;;
+      *) echo "::error::the text policy shows no live-ingress section — the runtime publish is not listed beside the declaration (NET-044)"; fail ;;
+    esac
+    case "$mnx_policy" in
+      *":$mnx_port → :$mnx_port"*) ;;
+      *) echo "::error::the live-ingress section carries no row for the exposed port $mnx_port"; fail ;;
+    esac
+    echo "policy (text): stance allow over $mnx_lo–$mnx_hi, one live row for :$mnx_port (NET-043, NET-044)"
+  else
+    case "$mnx_policy" in
+      *"live ingress (published at runtime)"*)
+        echo "::error::the text policy shows a live-ingress section on a deny box — a box that published nothing must list nothing (NET-044)"
+        fail
+        ;;
+    esac
+    echo "policy (text): stance deny over $mnx_lo–$mnx_hi, and no live-ingress section — a box that published nothing lists nothing (NET-044, fail-closed)"
+  fi
+
+  mnx_json="$(mnl session policy "$mnx_policy_sid" -o json 2>"$WORK/mnx-json.err")" \
+    || { echo "::error::'min session policy -o json' failed for the $mnx_policy_stance box"; cat "$WORK/mnx-json.err" 2>/dev/null || true; fail; }
+  if ! mnx_json_assert "$mnx_lo" "$mnx_hi" "$mnx_port" "$mnx_json_mode" "$mnx_policy_stance" "$mnx_json" \
+      >"$WORK/mnx-json-check.out" 2>"$WORK/mnx-json-check.err"; then
+    echo "::error::the -o json document does not carry the declared stance, its source, the range, and the publication verdict this box owes"
+    cat "$WORK/mnx-json-check.out" "$WORK/mnx-json-check.err" 2>/dev/null || true
+    echo "--- document ---"; printf '%s\n' "$mnx_json"
+    fail
+  fi
+  sed 's/^/  /' "$WORK/mnx-json-check.out" 2>/dev/null || true
+
+  [ -n "$mnx_sid" ] && { mnl session destroy --force "$mnx_sid" >/dev/null 2>&1 || true; }
   mnl session destroy --force "$mnx_deny_sid" >/dev/null 2>&1 || true
   rm -rf "$MNX_SEED_DIR" "$MNX_DENY_SEED_DIR"
-  if [ -n "$mnx_live" ]; then
-    echo "min net expose publishes, lists and refuses OK (in-range publish listed on both policy renderings; out-of-range and deny asks refused with their own typed errors)"
+  if [ -n "${E2E_VM:-}" ]; then
+    echo "min net expose OK on a VM lane (allow and ask refused at the create with the typed T80 reason; the deny box's stance and range listed on both policy renderings with no live publication; its ask refused with the deny the stance spells)"
   else
-    echo "min net expose OK on a target whose host side refuses the runtime publish (publish arm SKIPPED, the reason above; both policy renderings list it fail-closed with no live publication; out-of-range and deny asks refused with their own typed errors)"
+    echo "min net expose publishes, lists and refuses OK (in-range publish listed on both policy renderings; out-of-range and deny asks refused with their own typed errors)"
   fi
   echo "::endgroup::"
 }
@@ -14493,15 +14506,15 @@ PY
 # resolves. Both are a peer box reaching the box's own listener; the
 # transcript names which ran.
 #
-# The case splits the way the expose proof above it does (see
-# `runtime_publish_gap_reason` there): the watcher's publish rides the same
-# host-side switch, so on a target whose host side refuses a runtime publish
-# the in-range arm — a listen that publishes, and the reach and withdrawal
-# legs it owes — says so with that reason, read off the box's own listing
-# (the watcher records a publication only once the switch said yes, so the
-# live row in `min session policy` is the observed word for whether this
-# target can carry the publish at all), never assumed either way. What runs
-# on every target is the case's refusal half, and that half carries its own
+# The case splits by lane the way the expose proof above it does, never by a
+# skip: a VM lane cannot hold an allow stance until T80
+# (gominimal/minimal#1878), so there the create's typed refusal is asserted
+# (`assert_vm_refuses_dynamic_stance`), the target runs under deny over the
+# same range, and the in-range listen is asserted UNpublished — no live row
+# in `min session policy` (the watcher records a publication only once the
+# switch said yes) and the peer refused. A native lane runs the allow arm
+# whole: the listen publishes, and the reach and withdrawal legs it owes
+# run. What runs on every target is the case's refusal half, and that half carries its own
 # control: the target box also DECLARES one static mapping, the port this
 # case's band leaves beside it — the control the refusals below are read
 # against, never a substitute for them (the unpublished-port proof's own
@@ -14526,6 +14539,7 @@ proof_listen_published_port_reaches_peer_and_host() {
   local lp_live=""                   # set once the watcher's publish stood
   local lp_host_reach="skipped"      # "asserted" once the host control answered
   local lp_policy="" lp_ans_why="" lp_ans_ls=""
+  local lp_stance="allow"            # the target's stance; deny on a VM lane (T80)
   local LP_SEED_DIR="" LP_PEER_SEED_DIR=""
 
   if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
@@ -14550,20 +14564,29 @@ proof_listen_published_port_reaches_peer_and_host() {
     fi
   done
 
+  # A VM lane cannot hold an allow stance until T80 (gominimal/minimal#1878):
+  # the create's typed refusal is asserted first, and the target then runs
+  # under deny over the same range — so every refusal leg below still runs,
+  # and the in-range listen is asserted UNpublished instead of published.
+  if [ -n "${E2E_VM:-}" ]; then
+    assert_vm_refuses_dynamic_stance allow "$lp_target_name" lp-allow \
+      --ingress "$lp_ctl_port:$lp_ctl_port" --dynamic-range "$lp_lo-$lp_hi"
+    lp_stance="deny"
+  fi
   LP_SEED_DIR="$(hook_mktemp /tmp/mnllp.XXXXXX)"
   hook_seed_preamble > "$LP_SEED_DIR/minimal.toml"
   mkdir "$LP_SEED_DIR/.git"
   lp_sid="$(cd "$LP_SEED_DIR" && mnl session activate . --no-prompt \
     --name "$lp_target_name" --network own_ip \
     --ingress "$lp_ctl_port:$lp_ctl_port" \
-    --dynamic-ingress allow --dynamic-range "$lp_lo-$lp_hi" \
+    --dynamic-ingress "$lp_stance" --dynamic-range "$lp_lo-$lp_hi" \
     2>"$WORK/lp-activate.err")" || {
-    echo "::error::'min session activate --network own_ip --ingress $lp_ctl_port:$lp_ctl_port --dynamic-ingress allow --dynamic-range $lp_lo-$lp_hi' failed for the listen target box"
+    echo "::error::'min session activate --network own_ip --ingress $lp_ctl_port:$lp_ctl_port --dynamic-ingress $lp_stance --dynamic-range $lp_lo-$lp_hi' failed for the listen target box"
     echo "--- stderr ---"; cat "$WORK/lp-activate.err" 2>/dev/null || true
     fail
   }
   lp_sid="$(printf '%s\n' "$lp_sid" | tail -n1 | tr -d '\r')"
-  echo "target box: $lp_sid ($lp_target_name, dynamic ingress allow over $lp_lo-$lp_hi, plus the one declared mapping $lp_ctl_port → :$lp_ctl_port the refusals below are read against — no expose anywhere in this case)"
+  echo "target box: $lp_sid ($lp_target_name, dynamic ingress $lp_stance over $lp_lo-$lp_hi, plus the one declared mapping $lp_ctl_port → :$lp_ctl_port the refusals below are read against — no expose anywhere in this case)"
 
   # The capability gate, the port-publish half's own: a host that is itself
   # a sandbox denies the nested namespaces a box needs, and no probe inside
@@ -14716,6 +14739,12 @@ proof_listen_published_port_reaches_peer_and_host() {
     }
     lp_peer_host="$lp_target_name.min.internal"
     lp_peer_why="an own-address peer dialing the target's name, which resolves in-fabric to the box's lease (the VM lanes' between-box surface)"
+  elif [ -z "$lp_addr" ]; then
+    # The native peer dials the published address the host probe resolves,
+    # so the host legs' own WHERE-gate is the peer's too: without the
+    # answerer's address there is nothing for either client to dial.
+    lp_peer_why="$lp_ans_why"
+    echo "peer legs: SKIPPED (a native lane's host-address peer dials the box's published address, and there is none to dial: $lp_peer_why)"
   else
     lp_peer_sid="$(cd "$LP_PEER_SEED_DIR" && mnl session activate . --no-prompt \
       --name "$lp_peer_name" 2>"$WORK/lp-peer-activate.err")" || {
@@ -14726,8 +14755,10 @@ proof_listen_published_port_reaches_peer_and_host() {
     lp_peer_host="$lp_addr"
     lp_peer_why="a host-address peer sharing the host's loopback, dialing the published address the host probe resolved (a native host's leases are not dialable, NET-127/128)"
   fi
-  lp_peer_sid="$(printf '%s\n' "$lp_peer_sid" | tail -n1 | tr -d '\r')"
-  echo "peer box: $lp_peer_sid ($lp_peer_name) — $lp_peer_why"
+  if [ -n "$lp_peer_host" ]; then
+    lp_peer_sid="$(printf '%s\n' "$lp_peer_sid" | tail -n1 | tr -d '\r')"
+    echo "peer box: $lp_peer_sid ($lp_peer_name) — $lp_peer_why"
+  fi
 
   # One peer GET, reported: the status line and the body, dialing
   # http://$lp_peer_host:<port>/ from inside the peer box.
@@ -14766,6 +14797,7 @@ proof_listen_published_port_reaches_peer_and_host() {
   # fabric (the unpublished-port proof's own doctrine, and the reason this
   # case's target box declares a mapping at all).
   sleep 2
+  if [ -n "$lp_peer_host" ]; then
   lp_peer_get "$lp_ctl_port"
   echo "control: GET http://$lp_peer_host:$lp_ctl_port/ from the peer box -> HTTP ${lp_status:-<none>} ${lp_body:-<no body>}"
   if [ "$lp_rc" -ne 0 ] || [ "$lp_status" != "200" ] \
@@ -14790,6 +14822,7 @@ proof_listen_published_port_reaches_peer_and_host() {
     fail
   fi
   echo "peer, out of range: refused (curl exit $lp_rc) while the declared control answers — the stance does not allow this port, so nothing published it (NET-016)"
+  fi
 
   # ---- a listen outside the range publishes nothing: the host --------------
   # WHERE-gated on both halves, the unpublished-port proof's own discipline:
@@ -14835,14 +14868,12 @@ proof_listen_published_port_reaches_peer_and_host() {
   # The listener is the premise this arm reads: the watcher polls the box's
   # listening sockets every 250 ms and publishes what the stance allows, and
   # it records a publication only once the switch said yes — so the live row
-  # in `min session policy` is the observed word for whether THIS target can
-  # carry a runtime publish at all. The row appears and the arm runs whole
-  # below, peer and host; the row is still absent after sixteen of the
-  # watcher's own polls and the publish was refused by the host side — the
-  # gap `runtime_publish_gap_reason` names — and on a VM lane the arm says so
-  # as a skip, never as a failure: the case's enforcement legs, the refusals
-  # above, have already run. A native lane has no such gap, so there the
-  # absent row fails.
+  # in `min session policy` is the observed word for whether the listen
+  # published. On a native lane the stance is allow: the row must appear
+  # within sixteen of the watcher's own polls, and the arm runs whole below,
+  # peer and host. On a VM lane the stance is deny (T80,
+  # gominimal/minimal#1878): the row must NOT appear in the same window, and
+  # the peer's connect to the in-range port must be refused.
   mnl session exec "$lp_sid" \
     "nohup /usr/bin/socat TCP-LISTEN:$lp_listen_port,reuseaddr,fork SYSTEM:\"cat /home/lp-http200\" >/dev/null 2>&1 & echo \$! > /home/lp.pid" \
     >/dev/null 2>>"$WORK/lp-responder.err" \
@@ -14871,30 +14902,46 @@ proof_listen_published_port_reaches_peer_and_host() {
     esac
     sleep 0.25
   done
-  if [ -z "$lp_live" ]; then
-    # The one skip this case may not take silently: a live-ingress section the
-    # row poll above did not match means the listen DID publish and this
-    # case's row pattern is what is wrong — a target that published is owed
-    # its arm, never a skip.
+  if [ "$lp_stance" = "deny" ]; then
     case "$lp_policy" in
-      *"live ingress (published at runtime)"*)
-        echo "::error::the target's policy carries a live-ingress section the row poll never matched — the listen published and this case's row pattern is wrong, not the publish refused"
-        printf '%s\n' "$lp_policy" | sed 's/^/  /'
-        fail
-        ;;
+      *"live ingress (published at runtime)"*) lp_live=1 ;;
     esac
-    if [ -z "${E2E_VM:-}" ]; then
-      echo "::error::the in-range listen on port $lp_listen_port was never listed as published on a native lane — the VM-lane gap T80 (gominimal/minimal#1878) defers has no host gate here, so an unpublished listen is a defect, not that gap"
+    if [ -n "$lp_live" ]; then
+      echo "::error::the deny box listed a runtime publication for its in-range listen — a deny stance publishes nothing (NET-016)"
       printf '%s\n' "$lp_policy" | sed 's/^/  /'
       fail
     fi
-    echo "in-range arm: SKIPPED — $(runtime_publish_gap_reason "$lp_listen_port" "$lp_lo-$lp_hi")"
-    echo "  (the listen stood through the watcher's own polls and was never listed as published on either of the box's policy renderings)"
-    echo "--- min session policy (text), the listing this skip was read off ---"
+    lp_peer_get "$lp_listen_port"
+    echo "peer, in range under deny: GET http://$lp_peer_host:$lp_listen_port/ -> curl exit ${lp_rc:-<none>}, status ${lp_status:-<none>}"
+    if [ "$lp_rc" -ne 7 ]; then
+      echo "::error::the peer's connect to the deny box's in-range listen ended in curl exit $lp_rc, not the 7 of a refused connection — a deny stance must leave the listen unpublished and refused fast (NET-016, NET-014)"
+      cat "$WORK/lp-peer.err" 2>/dev/null || true
+      fail
+    fi
+    if [ "$lp_host_reach" = "asserted" ]; then
+      lp_host_get "$lp_listen_port"
+      echo "host, in range under deny: GET http://$lp_addr:$lp_listen_port/ -> curl exit $lp_hrc in ${lp_hms}ms"
+      if [ "$lp_hrc" -eq 0 ] || [ "$lp_hrc" -eq 28 ] || [ "$lp_hms" -ge 4000 ]; then
+        echo "::error::the host probe's connect to the deny box's in-range listen was not refused fast (curl exit $lp_hrc in ${lp_hms}ms) — a deny stance publishes nothing, and an unpublished port must refuse, not hang (NET-016, NET-014)"
+        cat "$WORK/lp-host.err" 2>/dev/null || true
+        fail
+      fi
+    fi
+    echo "in range under deny: no live row through the watcher's own polls, and the peer refused (curl exit $lp_rc) — the deny stance published nothing (NET-016)"
+  elif [ -z "$lp_live" ]; then
+    case "$lp_policy" in
+      *"live ingress (published at runtime)"*)
+        echo "::error::the target's policy carries a live-ingress section the row poll never matched — the listen published and this case's row pattern is wrong"
+        ;;
+      *)
+        echo "::error::the in-range listen on port $lp_listen_port was never listed as published — the watcher did not publish what the allow stance allows (NET-016)"
+        ;;
+    esac
     printf '%s\n' "$lp_policy" | sed 's/^/  /'
+    fail
   fi
 
-  if [ -n "$lp_live" ]; then
+  if [ -n "$lp_live" ] && [ -n "$lp_peer_host" ]; then
   # ---- reach: the peer, polled — the watcher publishes within its own poll
   # The watcher polls the box's listening sockets every 250 ms and publishes
   # what the stance allows, so the peer's GET polls until the publication
@@ -14983,17 +15030,17 @@ proof_listen_published_port_reaches_peer_and_host() {
   fi
   fi
 
-  mnl session destroy --force "$lp_peer_sid" >/dev/null 2>&1 || true
+  [ -n "$lp_peer_sid" ] && { mnl session destroy --force "$lp_peer_sid" >/dev/null 2>&1 || true; }
   mnl session destroy --force "$lp_sid" >/dev/null 2>&1 || true
   rm -rf "$LP_PEER_SEED_DIR" "$LP_SEED_DIR"
-  if [ -n "$lp_live" ] && [ "$lp_host_reach" = "asserted" ]; then
-    echo "listen-published port OK (in-range listen published with no expose: the peer and the host probe reached it, the close withdrew it and both were refused; the out-of-range listen reached neither while the declared control answered first)"
-  elif [ -n "$lp_live" ]; then
-    echo "listen-published port OK (in-range listen published with no expose: the peer reached it and the close withdrew it; the out-of-range listen reached neither client, the declared control answered first, and the host probe's legs are $lp_host_reach: $lp_ans_why)"
+  if [ "$lp_stance" = "deny" ]; then
+    echo "listen-published port OK on a VM lane (allow refused at the create with the typed T80 reason; under deny the in-range listen was never listed and the peer was refused; the out-of-range listen reached no client while the declared control answered first; the host probe's legs are $lp_host_reach${lp_ans_why:+: $lp_ans_why})"
+  elif [ -z "$lp_peer_host" ]; then
+    echo "listen-published port OK as far as this host carries it (in-range listen listed as published with no expose; the peer and host legs are skipped: $lp_peer_why)"
   elif [ "$lp_host_reach" = "asserted" ]; then
-    echo "listen-published port OK on a target whose host side refuses the runtime publish (in-range arm SKIPPED, the reason above; the out-of-range listen reached neither the peer nor the host probe, with the declared control answering first)"
+    echo "listen-published port OK (in-range listen published with no expose: the peer and the host probe reached it, the close withdrew it and both were refused; the out-of-range listen reached neither while the declared control answered first)"
   else
-    echo "listen-published port OK on a target whose host side refuses the runtime publish (in-range arm SKIPPED, the reason above; the out-of-range listen reached neither client and the host probe's legs are $lp_host_reach: $lp_ans_why)"
+    echo "listen-published port OK (in-range listen published with no expose: the peer reached it and the close withdrew it; the out-of-range listen reached neither client, the declared control answered first, and the host probe's legs are $lp_host_reach: $lp_ans_why)"
   fi
   echo "::endgroup::"
 }
