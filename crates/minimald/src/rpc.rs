@@ -4370,10 +4370,10 @@ mod tests {
     /// could read. The two are the exception's one limit: natively the
     /// outcome names the refusal — a deny-all host-address box is refused at
     /// placement — so the advisory must not claim the boxes' declarations do
-    /// not matter over a refusal a person is about to hit. Neither names the
-    /// install command: the step is installed, so the step is not what is
-    /// missing. And in the guest every cause refuses, so the clause never
-    /// appears there either.
+    /// not matter over a refusal a person is about to hit. The table a
+    /// reload would fix still names the command; the probe no command can
+    /// make run names none. And in the guest every cause refuses, so the
+    /// clause never appears there either.
     #[test]
     fn advisory_over_a_probe_cause_names_the_refusal_not_a_blanket_unenforced() {
         let not_effective =
@@ -4390,10 +4390,10 @@ mod tests {
             "the clause holds only while no box is refused, got: {not_effective}"
         );
         assert!(
-            !not_effective.contains(&sandbox2::classifier::install_hint()),
-            "a table the marker vouches for but the probe does not is not a \
-             missing step, so the advisory names no install command, \
-             got: {not_effective}"
+            not_effective.contains(&sandbox2::classifier::install_hint()),
+            "a table the marker vouches for but the probe does not is the one \
+             the step's install reloads, so the advisory still carries the \
+             command, got: {not_effective}"
         );
         assert!(
             !not_effective.contains('?'),
