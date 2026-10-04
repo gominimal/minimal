@@ -92,6 +92,7 @@ fn ls_shows_shared_resource_pool() {
             project_path: Some(paths::HostAbsPath::try_new("/p").unwrap()),
             status: sessions::SessionStatus::Active,
             git: None,
+            host_ip_enforcement: None,
             attrs: None,
         }],
     };
@@ -130,6 +131,7 @@ fn ls_table_exposes_project_path_and_status() {
             project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
             status: sessions::SessionStatus::Active,
             git: None,
+            host_ip_enforcement: None,
             attrs: None,
         }],
     };
@@ -158,6 +160,135 @@ fn ls_table_exposes_project_path_and_status() {
         text.contains("/work/proj"),
         "row should show project path: {text}"
     );
+}
+
+/// NET-079's proof names the listing: a host-address box that runs
+/// unenforced shows egress enforcement `none` in the human `min ls`, not
+/// only in `--json`; one decided per box shows `per_box`; a box the daemon
+/// reports no enforcement for shows `-`.
+#[test]
+fn ls_table_shows_host_address_enforcement() {
+    let entry = |name: &str, n: u64, enforcement| minimald_rpc::ListSessionsEntry {
+        id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
+        name: Some(name.to_string()),
+        project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
+        status: sessions::SessionStatus::Active,
+        git: None,
+        host_ip_enforcement: enforcement,
+        attrs: None,
+    };
+    let resp = ListSessionsResponse {
+        daemon_version: None,
+        hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
+        answerer_bound: false,
+        resource_pool: None,
+        sessions: vec![
+            entry("decided", 1, Some(minimald_rpc::HostIpEnforcement::PerBox)),
+            entry("unenforced", 2, Some(minimald_rpc::HostIpEnforcement::None)),
+            entry("own-address", 3, None),
+        ],
+    };
+    let mut out = Vec::new();
+
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+    let cells_of = |name: &str| -> Vec<String> {
+        text.lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("a row for {name} in:\n{text}"))
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    };
+    assert!(text.contains("EGRESS"), "header should list EGRESS: {text}");
+    assert_eq!(cells_of("decided")[3], "per_box", "got:\n{text}");
+    assert_eq!(cells_of("unenforced")[3], "none", "got:\n{text}");
+    assert_eq!(cells_of("own-address")[3], "-", "got:\n{text}");
+}
+
+/// The multi-VM table carries the same EGRESS cell, one column right of the
+/// single-VM one because each row leads with its VM.
+#[test]
+fn ls_across_vms_table_shows_host_address_enforcement() {
+    let entry = |name: &str, n: u64, enforcement| minimald_rpc::ListSessionsEntry {
+        id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
+        name: Some(name.to_string()),
+        project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
+        status: sessions::SessionStatus::Active,
+        git: None,
+        host_ip_enforcement: enforcement,
+        attrs: None,
+    };
+    let listing = |vm: &str, sessions| VmListing {
+        vm: vm.to_string(),
+        resp: ListSessionsResponse {
+            daemon_version: None,
+            hostname_routing_unavailable: None,
+            hostname_proxy_port: None,
+            zone_answerer_port: None,
+            answerer_bound: false,
+            resource_pool: None,
+            sessions,
+        },
+        control_sock: None,
+    };
+    let listings = vec![
+        listing(
+            "default",
+            vec![
+                entry("decided", 1, Some(minimald_rpc::HostIpEnforcement::PerBox)),
+                entry("own-address", 3, None),
+            ],
+        ),
+        listing(
+            "alpha",
+            vec![entry(
+                "unenforced",
+                2,
+                Some(minimald_rpc::HostIpEnforcement::None),
+            )],
+        ),
+    ];
+    let mut out = Vec::new();
+
+    format_ls_across_vms(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &listings,
+        &[None, None],
+        &[None, None],
+    )
+    .unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+    let cells_of = |name: &str| -> Vec<String> {
+        text.lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("a row for {name} in:\n{text}"))
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    };
+    assert!(text.contains("EGRESS"), "header should list EGRESS: {text}");
+    assert_eq!(cells_of("decided")[4], "per_box", "got:\n{text}");
+    assert_eq!(cells_of("unenforced")[4], "none", "got:\n{text}");
+    assert_eq!(cells_of("own-address")[4], "-", "got:\n{text}");
 }
 
 #[tokio::test]
@@ -864,10 +995,275 @@ async fn session_policy_succeeds() {
         &args,
         PolicyArgs {
             session: session_id.to_string(),
+            output: None,
         },
     )
     .await
     .unwrap();
+}
+
+/// `min session policy -o json` writes one `min/v1/session-policy` document:
+/// the schema stamp a client checks before anything else, the policy's
+/// blocks as keys, and the live mappings as the wire's own rows with each
+/// one's `pending` state carried (NET-044) — a port published at runtime
+/// that the relay gate has not admitted must not read as reachable to
+/// something parsing the document, and the port the declaration named must
+/// read as the admitted forward it is. Driven through `write_policy_json`,
+/// the renderer the command goes through, with the effective policy fetched
+/// the way the command fetches it (the effective-policy RPC, NET-074) from
+/// a real session that really declares the port that reads `pending:
+/// false` — so the two rows are grounded in a declaration, not in a
+/// hand-built pair.
+#[tokio::test]
+async fn policy_json_carries_schema_and_pending() {
+    let (daemon, args) = setup().await;
+    let session_id = create_session_with_policy(
+        &daemon,
+        "policy-json",
+        sessions::NetworkMode::OwnIp,
+        sessions::SessionPolicy::new(
+            None,
+            Some(sessions::IngressPolicy {
+                port_mappings: vec![sessions::PortMapping {
+                    external_port: 3000,
+                    internal_port: 3000,
+                    proto: sessions::IpProto::Tcp,
+                }],
+                dynamic_allowed_range: None,
+                dynamic_ingress: None,
+            }),
+        ),
+    )
+    .await;
+
+    let mut client = connect_daemon(&args).await.unwrap();
+    use minimald_rpc::{GetEffectiveSessionPolicy, GetEffectiveSessionPolicyRequest};
+    let resp = client
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(session_id))
+        .await
+        .unwrap();
+    let policy = match resp {
+        minimald_rpc::Errorable::Ok(policy) => policy,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetEffectiveSessionPolicy failed: {error}")
+        }
+    };
+    assert!(
+        policy
+            .ingress
+            .as_ref()
+            .is_some_and(|ingress| ingress.port_mappings.len() == 1),
+        "the stored declaration must survive the record round trip"
+    );
+
+    // The live rows the way the daemon serves them: a runtime-only port the
+    // declaration never named, beside the declared one.
+    let live = vec![
+        minimald_rpc::LiveMapping {
+            local: "127.0.0.1:3200".to_string(),
+            internal_port: 3200,
+            proto: sessions::IpProto::Tcp,
+            pending: Some(true),
+        },
+        minimald_rpc::LiveMapping {
+            local: "127.0.0.1:3000".to_string(),
+            internal_port: 3000,
+            proto: sessions::IpProto::Tcp,
+            pending: Some(false),
+        },
+    ];
+
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        Ok(live),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        document["schema"], "min/v1/session-policy",
+        "the document must open with the schema stamp:\n{document}"
+    );
+    assert_eq!(
+        document["network"], "own_ip",
+        "the mode names which surface the policy describes:\n{document}"
+    );
+    assert_eq!(
+        document["ingress"]["kind"], "declared",
+        "the declared block is carried as the declaration:\n{document}"
+    );
+    let declared = document["ingress"]["port_mappings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the declared mappings ride as an array: {document}"));
+    assert_eq!(
+        declared[0]["internal_port"].as_u64(),
+        Some(3000),
+        "the declaration the pending rows are measured against:\n{document}"
+    );
+
+    let live_rows = document["live_ingress"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the live mappings ride as an array: {document}"));
+    assert_eq!(live_rows.len(), 2, "every mapping carried: {document}");
+    let pending_of = |port: u16| {
+        live_rows
+            .iter()
+            .find(|row| row["internal_port"].as_u64() == Some(u64::from(port)))
+            .unwrap_or_else(|| panic!("no live row for port {port}: {document}"))["pending"]
+            .clone()
+    };
+    assert_eq!(
+        pending_of(3200).as_bool(),
+        Some(true),
+        "a port the declaration never named is carried as pending:\n{document}"
+    );
+    assert_eq!(
+        pending_of(3000).as_bool(),
+        Some(false),
+        "the port the declaration named is carried as admitted:\n{document}"
+    );
+
+    // A row from a daemon that predates the field — one that carried no
+    // `pending` key — rides the document as `null`, the JSON surface's own
+    // way of saying the state is unknown rather than reachable (NET-044).
+    let pre_field = minimald_rpc::LiveMapping {
+        local: "127.0.0.1:3400".to_string(),
+        internal_port: 3400,
+        proto: sessions::IpProto::Tcp,
+        pending: None,
+    };
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        Ok(vec![pre_field]),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    let rows = document["live_ingress"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the live mappings ride as an array: {document}"));
+    assert_eq!(
+        rows[0]["pending"],
+        Value::Null,
+        "a pre-field row's unknown state rides the document as null, never as a bool:\n{document}"
+    );
+}
+
+/// The `live_ingress` key carries three states a client must be able to tell
+/// apart, because each says a different thing: the rows the daemon served —
+/// an empty list included, which is the claim that the box published
+/// nothing — `null` for the view the daemon could not serve, which is no
+/// claim at all (the box may have published anything, and the run cannot
+/// warn in prose: a `-o json` run's stderr is the error object's alone), and
+/// no key at all for a mode without the surface. A degraded fetch — an
+/// older daemon without the subsystem, a session mid-teardown — is the
+/// middle one, never collapsed into the first.
+#[test]
+fn policy_json_distinguishes_unavailable_live_rows_from_none_published() {
+    let policy = sessions::EffectiveSessionPolicy {
+        egress: sessions::EffectiveEgress::AllowAll,
+        ingress: None,
+    };
+
+    // A box that published nothing: the empty list is an authoritative
+    // claim about the box.
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        Ok(Vec::new()),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        document.get("live_ingress"),
+        Some(&Value::Array(Vec::new())),
+        "a served empty view is the box's own claim that it published nothing:\n{document}"
+    );
+
+    // A view the daemon could not serve: `null`, the document's unknown —
+    // present as a key, so it is not the mode's absence either.
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        Err("live port mappings are unavailable: no session found".to_string()),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        document.get("live_ingress"),
+        Some(&Value::Null),
+        "an unavailable live view rides the document as null, never as an empty list:\n{document}"
+    );
+
+    // A mode without the surface: no key at all, a third state again.
+    let mut out = Vec::new();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::NoNet,
+        None,
+        Ok(Vec::new()),
+    )
+    .unwrap();
+    let document: Value = serde_json_lenient::from_slice(&out).unwrap();
+    assert_eq!(
+        document.get("live_ingress"),
+        None,
+        "a mode without a live-ingress surface leaves the key out entirely:\n{document}"
+    );
+}
+
+/// A `-o json` run that fails answers with the mode's error contract, not a
+/// plain-text line: the failure crosses to `main` as the typed
+/// `MachineModeFailure` — the generic payload every `-o json` command fails
+/// into, which `main`'s machine-mode error emitter (keyed on the output
+/// mode, shared by every command that takes `-o json`) writes as the one
+/// `min/v1/error` object on stderr, its one-object shape pinned by `main`'s
+/// own unit test. A missing session carries the architecture's `not_found`
+/// code — never a policy-specific spelling — with the kind of thing that
+/// was missing, a session, in the message and the hint.
+#[tokio::test]
+async fn policy_json_failure_answers_with_the_error_contract() {
+    let (_daemon, args) = setup().await;
+    let err = cmd_session_policy(
+        &args,
+        PolicyArgs {
+            session: "no-such-session".to_string(),
+            output: Some(PolicyOutputFormat::Json),
+        },
+    )
+    .await
+    .unwrap_err();
+    let failure = err
+        .downcast_ref::<MachineModeFailure>()
+        .expect("the failure crosses as the payload the emitter writes, not a message");
+    assert_eq!(
+        failure.code(),
+        "not_found",
+        "a missing session is the architecture's not-found code: {err:#}"
+    );
+    assert!(
+        failure.message().contains("session"),
+        "the message names the kind of thing that was missing: {}",
+        failure.message()
+    );
+    assert!(
+        failure.hint().contains("session"),
+        "the hint names the kind of thing that was missing: {}",
+        failure.hint()
+    );
 }
 
 /// `min session policy` shows the effective egress rules (NET-061): the four
@@ -914,7 +1310,7 @@ async fn policy_shows_effective_egress() {
     );
 
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp, None).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp, None, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -956,7 +1352,14 @@ async fn policy_shows_effective_egress() {
         }
     };
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet, None).unwrap();
+    format_policy(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::HostNet,
+        None,
+        None,
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -965,6 +1368,46 @@ async fn policy_shows_effective_egress() {
     assert!(
         !text.contains("ingress"),
         "a host-address session has no per-session ingress policy to show:\n{text}"
+    );
+
+    // NET-079: the per-box enforcement state rides its own runtime-facts
+    // reply beside the rules — never a field on the policy, whose strict
+    // shape an older `min` would reject over a key it has no field for —
+    // and the row the render prints is the state that reply carried, in the
+    // machine spelling. Whatever this host actually decides is what shows:
+    // the assertion is on the agreement between the reply and the row, not
+    // on the state, which is the host's to answer.
+    use minimald_rpc::{GetSessionRuntimeFacts, GetSessionRuntimeFactsRequest};
+    let resp = client
+        .oneshot_rpc::<GetSessionRuntimeFacts>(GetSessionRuntimeFactsRequest::Id(host_id))
+        .await
+        .unwrap();
+    let facts = match resp {
+        minimald_rpc::Errorable::Ok(facts) => facts,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetSessionRuntimeFacts failed: {error}")
+        }
+    };
+    let host_ip_enforcement = facts
+        .host_ip_enforcement
+        .expect("a host-address session answers a state");
+    let mut out = Vec::new();
+    format_policy(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::HostNet,
+        Some(host_ip_enforcement),
+        None,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains(&format!(
+            "  per-box enforcement  {}\n",
+            host_ip_enforcement.machine_str()
+        )),
+        "the enforcement row must carry the runtime-facts reply's state, in \
+         its own machine spelling:\n{text}"
     );
 
     // A none box has no network, so it can carry no egress or ingress
@@ -989,7 +1432,7 @@ async fn policy_shows_effective_egress() {
         }
     };
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::NoNet, None).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::NoNet, None, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert_eq!(
         text, "No network policy (NoNet)\n",
@@ -1062,7 +1505,14 @@ async fn policy_shows_deny_all_default() {
         "the in-force default for a bare own-address box is deny-all"
     );
     let mut out = Vec::new();
-    format_policy(&mut out, &in_force, sessions::NetworkMode::OwnIp, None).unwrap();
+    format_policy(
+        &mut out,
+        &in_force,
+        sessions::NetworkMode::OwnIp,
+        None,
+        None,
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("egress\n  deny all\n"),
@@ -1112,7 +1562,14 @@ async fn policy_shows_deny_all_default() {
     };
     assert_eq!(policy.egress, sessions::EffectiveEgress::AllowAll);
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet, None).unwrap();
+    format_policy(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::HostNet,
+        None,
+        None,
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("egress\n  allow all\n"),
@@ -1156,6 +1613,7 @@ fn policy_shows_baseline_set() {
         &mut out,
         &deny_all,
         sessions::NetworkMode::OwnIp,
+        None,
         Some(fabric),
     )
     .unwrap();
@@ -1217,6 +1675,7 @@ fn policy_shows_baseline_set() {
         &mut out,
         &deny_all,
         sessions::NetworkMode::HostNet,
+        None,
         Some(fabric),
     )
     .unwrap();
@@ -1231,7 +1690,14 @@ fn policy_shows_baseline_set() {
     // and the set is left out rather than printed from the microVM plan the
     // session does not attach to.
     let mut out = Vec::new();
-    format_policy(&mut out, &deny_all, sessions::NetworkMode::OwnIp, None).unwrap();
+    format_policy(
+        &mut out,
+        &deny_all,
+        sessions::NetworkMode::OwnIp,
+        None,
+        None,
+    )
+    .unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         !text.contains("node-plane baseline set"),
