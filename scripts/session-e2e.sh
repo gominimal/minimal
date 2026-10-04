@@ -8097,10 +8097,16 @@ proof_hostnames_recover_and_two_daemons_route() {
   # Whether 127.0.0.1:$1 is free to bind — the probe that picks the pin,
   # then confirms the holder took it. Deliberately a bind probe, not a
   # connect one: a held-but-never-listening socket is exactly the situation
-  # beat A stages.
+  # beat A stages. It binds with SO_REUSEADDR, as the daemon's own bind does
+  # (crates/minimald/src/net/proxy.rs `bind_listener`), so "free" means what
+  # the daemon would find: the TIME_WAIT sockets a stopped daemon's accepted
+  # connections leave on 7654 do not read as busy here while the daemon
+  # binds over them, and only a live listener does. The holders set it too,
+  # so they can take a port such leftovers still sit on.
   recover_port_free() {
     python3 -c 'import socket,sys
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
     s.bind(("127.0.0.1", int(sys.argv[1])))
 except OSError:
@@ -8327,6 +8333,7 @@ s.close()' "$1"
 
   python3 -c 'import socket,sys,time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", int(sys.argv[1])))
 s.listen(1)
 while True:
@@ -8525,6 +8532,7 @@ while True:
   if [ "$RECOVER_PIN" != 7654 ] && recover_port_free 7654; then
     python3 -c 'import socket,sys,time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", 7654))
 s.listen(1)
 while True:
