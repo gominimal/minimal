@@ -238,6 +238,7 @@ RANGE_INSTALLED="" # set when that proof ran its command; gates the unit teardow
 RANGE_RESOLVER_BEFORE="" # the resolver file's prior bytes, when it had any; restored on teardown
 ANSWERER_SERVICE_CHANNEL="" # set when a proof ran an advisory that installs the answerer service: its channel path; gates the service teardown
 BN_SEED_DIR="" # seeded by the browser-path proof below; removed on teardown
+E2E_NOT_RUN="" # the cases this lane could not run, named by `not_run`; the lane summary counts them
 ASR_SEED_DIR="" # seeded by the answerer-service proof below; removed on teardown
 ASR_STATE2_DIR="" # that proof's second node's state base; stopped on teardown
 ASR_REVERT_LINK="" # the link that proof's advisory pointed the host resolver at; reverted on teardown
@@ -496,14 +497,15 @@ else
   # instead of the run dying at the CLI gate with a build instruction the
   # caller cannot read mid-verify.
   if [ -z "$min_cli_dir" ] && command -v cargo >/dev/null 2>&1; then
+    echo "no usable 'min' on PATH and no build under target/; building the pair this run drives (cargo build --locked -p minimal --bin min -p $min_daemon --bin $min_daemon)"
     # A VM-backed run also needs the answerer program the advisory's command
-    # copies into place (beside min or on PATH), which minvmd's crate builds.
-    min_extra_bin=""
-    [ "$min_daemon" = minvmd ] && min_extra_bin="--bin min-answerer"
-    echo "no usable 'min' on PATH and no build under target/; building the pair this run drives (cargo build --locked -p minimal --bin min -p $min_daemon --bin $min_daemon $min_extra_bin)"
-    # shellcheck disable=SC2086 # $min_extra_bin is one flag pair or empty
+    # copies into place (beside min). It builds in its own invocation, as
+    # `just answerer-build` does: beside `-p minvmd`, cargo would unify
+    # minvmd's `libkrun` feature into the root-run program.
     if (cd "$ROOT" && cargo build --locked -p minimal --bin min \
-        -p "$min_daemon" --bin "$min_daemon" $min_extra_bin) >"$WORK/cli-build.log" 2>&1; then
+        -p "$min_daemon" --bin "$min_daemon" \
+        && { [ "$min_daemon" != minvmd ] || cargo build --locked -p min-answerer; }) \
+        >"$WORK/cli-build.log" 2>&1; then
       for d in "$ROOT/target/debug" "${CARGO_TARGET_DIR:-/nonexistent}/debug"; do
         if [ -x "$d/min" ]; then
           min_cli_dir="$d"
@@ -551,6 +553,14 @@ fi
 mnl() {
   # shellcheck disable=SC2086
   min ${E2E_MINIMAL_ARGS:-} "$@"
+}
+
+# A case this lane cannot run: one named line, and the case counted in the
+# lane summary as NOT RUN, so a whole-lane pass never hides it.
+# $1: the case. $2: why.
+not_run() {
+  echo "$1: NOT RUN ($2)"
+  E2E_NOT_RUN="$E2E_NOT_RUN $1"
 }
 
 teardown() {
@@ -7321,6 +7331,27 @@ for row in json.load(open(sys.argv[1])):
   fi
   echo "  node A released the port and publishes to the manager-held service over $asr_channel"
   asr_expect_a e2e-asr-a.min.internal "$asr_a_ip"
+  # The hook probe's own answer, as `min ls` prints it: manager-held, with
+  # the channel node A publishes over. Capture-then-grep (grep's early exit
+  # would SIGPIPE the CLI).
+  local asr_ls=""
+  for _ in $(seq 1 20); do
+    asr_ls="$(mnl ls 2>/dev/null || true)"
+    case "$asr_ls" in
+      *"manager-held: answered by the answerer host service"*"$asr_channel"*) break ;;
+    esac
+    sleep 0.5
+  done
+  case "$asr_ls" in
+    *"manager-held: answered by the answerer host service"*"$asr_channel"*)
+      printf '%s\n' "$asr_ls" | grep -F -- 'ZONE ANSWERER' | sed 's/^/  /'
+      ;;
+    *)
+      echo "::error::min ls does not say the zone is manager-held after the handover"
+      echo "--- min ls ---"; printf '%s\n' "$asr_ls"
+      fail
+      ;;
+  esac
 
   # ---- 3. node B publishes over the one channel ------------------------------
   local asr_b_sid asr_b_err="$WORK/asr-b-activate.err" asr_b_ip
@@ -7341,6 +7372,21 @@ for row in json.load(open(sys.argv[1])):
     fail
   fi
   echo "3. node B (state dir $ASR_STATE2_DIR) publishes to the service"
+  # Box addresses are host-global (design §7.1): the answerer handed the
+  # two state dirs' boxes distinct addresses, both from .2 up.
+  if [ "$asr_a_ip" = "$asr_b_ip" ]; then
+    echo "::error::node A's and node B's boxes share the address $asr_a_ip — box addresses must be allocated host-wide"
+    fail
+  fi
+  for asr_ip in "$asr_a_ip" "$asr_b_ip"; do
+    case "${asr_ip##*.}" in
+      0 | 1 | 255 | '' | *[!0-9]*)
+        echo "::error::a box was handed $asr_ip, outside the box address range .2-.254"
+        fail
+        ;;
+    esac
+  done
+  echo "  distinct box addresses: e2e-asr-a $asr_a_ip, e2e-asr-b $asr_b_ip"
   asr_expect_a e2e-asr-b.min.internal "$asr_b_ip"
   asr_expect_a e2e-asr-a.min.internal "$asr_a_ip"
 
@@ -13347,7 +13393,7 @@ case "${1:-}" in
     if [ "$(uname -s)" != Darwin ] || [ "${MINIMAL_E2E_PRIVILEGED:-}" = 1 ]; then
       proof_answerer_survives_session_stop
     else
-      echo "answerer survives session stop SKIPPED in the whole-lane order (privileged: set MINIMAL_E2E_PRIVILEGED=1 on a macOS host with passwordless sudo)"
+      not_run answerer_survives_session_stop "no privileged LaunchDaemon install on this lane"
     fi
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
@@ -13414,4 +13460,9 @@ case "${1:-}" in
     ;;
 esac
 
+# The lane summary counts the cases a lane could not run as NOT RUN, never
+# as passed: the OK line below says what ran, this one what did not.
+if [ -n "$E2E_NOT_RUN" ]; then
+  echo "session e2e: $(printf '%s\n' "$E2E_NOT_RUN" | wc -w | tr -d ' ') case(s) NOT RUN:$E2E_NOT_RUN"
+fi
 echo "session e2e OK"
