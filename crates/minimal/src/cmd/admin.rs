@@ -25,16 +25,23 @@ pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyho
 /// Connect to the daemon UDS, retrying a bounded number of times when the
 /// connect is refused.
 ///
-/// A burst of concurrent `min session exec` invocations can overflow the
+/// A burst of concurrent connects to the daemon socket can overflow the
 /// daemon's accept backlog, so a single refused connect must not fail the
-/// proxy outright. Retry only on `ConnectionRefused`; a `NotFound` (no
-/// socket file) means the daemon is not running and fails immediately.
+/// proxy outright. A full backlog surfaces as `ConnectionRefused` on macOS
+/// and as `WouldBlock` (`EAGAIN` from the non-blocking connect) on Linux, so
+/// both are retried; a `NotFound` (no socket file) means the daemon is not
+/// running and fails immediately.
 async fn connect_with_retry(socket_path: &str) -> Result<tokio::net::UnixStream, anyhow::Error> {
     let mut last_err = None;
     for _ in 0..client::CONNECT_RETRIES {
         match tokio::net::UnixStream::connect(socket_path).await {
             Ok(stream) => return Ok(stream),
-            Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
                 last_err = Some(err);
                 tokio::time::sleep(client::CONNECT_RETRY_DELAY).await;
             }
