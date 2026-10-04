@@ -11118,13 +11118,13 @@ PY
 #     same way from the other side;
 #   * box A's address toward 198.51.100.7 — beyond the whole union — is
 #     refused by box A's own rules (egress-undeclared-subnet);
-#   * a made-up in-plan lease toward that same 198.51.100.7 — beyond the
-#     whole union — is dropped the same way: an in-plan source no row holds
-#     never leaves the VM, toward the union's far side like every other
-#     destination, whatever the egress default's phase (NET-085, the T89
-#     drop, gominimal/minimal#1951). The bound this case proves covers the
-#     address an escapee forges and a RESIDENT box's own alike: each
-#     reaches only the declared union plus the baseline set;
+#   * a made-up in-plan lease toward that same 198.51.100.7 is dropped the
+#     same way: an in-plan source no row holds never leaves the VM, toward
+#     the union's far side like every other destination, whatever the
+#     egress default's phase (NET-085, the T89 drop, gominimal/minimal#1951).
+#     The bound this case proves covers the address an escapee forges and a
+#     RESIDENT box's own alike: each reaches only the declared union plus
+#     the baseline set;
 #   * an address outside the plan's lease block is refused outright
 #     (egress-unknown-source), under either posture: outside the plan there
 #     is no lease to spoof.
