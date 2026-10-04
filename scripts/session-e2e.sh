@@ -10296,10 +10296,11 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
 # the lane's absence can refuse the proxy's address — gets silence at the
 # proxy's address and one rate-limited warn line in the daemon's log, the
 # refused frame's source (the box's own switch address) and the rule that
-# dropped it named. The control runs first: the same box's probe to the
-# node's own address on the switch is reset by the VM's own stack, which
-# proves the fabric and the gate's admit path are answering this box, so
-# the silence at the proxy's address is the lane's, not weather.
+# dropped it named. The control runs first: the same box's probe to a
+# sibling box's lease, at a port the sibling publishes but nothing listens
+# on, is reset by the sibling's own stack, which proves the fabric and the
+# gates' admit path are answering this box, so the silence at the proxy's
+# address is the lane's, not weather.
 proof_box_without_credentialed_lane_cannot_reach_proxy() {
   echo "::group::a box without a credentialed lane cannot reach the proxy's address (NET-134)"
   if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
@@ -10310,10 +10311,11 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
 
   cred_begin
 
-  local proxy_ip proxy_port node_ip nolane_sid nolane_ip start_ms elapsed_ms
+  local proxy_ip proxy_port nolane_sid nolane_ip start_ms elapsed_ms
+  local sibling_sid sibling_ip sibling_port
   proxy_ip="100.64.255.252"
   proxy_port="8118"
-  node_ip="100.64.255.253"
+  sibling_port="18090"
 
   CRED_NO_LANE_SEED_DIR="$(hook_mktemp /tmp/mnlcredn.XXXXXX)"
   hook_seed_preamble > "$CRED_NO_LANE_SEED_DIR/minimal.toml"
@@ -10344,21 +10346,36 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
     cred_fail
   }
 
-  # The control: the node's own address on the switch — the in-VM daemon's,
-  # which the switch forwards back into the VM's own stack. It sits inside
-  # the box's own block, so an allow-all row's frame crosses the box's
-  # relay, the gate and the switch and comes back; nothing in the VM
-  # listens on the proxy's port there (the guest's own egress proxy is a
-  # different port, and 8118's listener lives on the host-side peer at
-  # the proxy's address), so the VM's kernel resets the connect. A reset
-  # here proves resolution, the fabric and the gate's admit path are all
-  # live for this box; the proxy's address is one address away with a whole
-  # different answer.
+  # The control: a sibling own-address box's lease, at a port the sibling
+  # publishes (so its ingress gate admits the SYN) and nothing in it
+  # listens on. An allow-all row admits the lease, so the frame crosses the
+  # box's relay, the gate and the switch to the sibling, whose kernel
+  # resets the connect. A reset here proves the fabric and the gates' admit
+  # path are live for this box; the proxy's address is a whole different
+  # answer. The switch's own addresses cannot be the control: the node
+  # address and the host alias are the relay's own silent drops (NET-062's
+  # sub-clause, design §7.1), whatever the box's rules say.
+  sibling_sid="$(mkdir -p "$CRED_NO_LANE_SEED_DIR/sibling/.git" \
+    && hook_seed_preamble > "$CRED_NO_LANE_SEED_DIR/sibling/minimal.toml" \
+    && cd "$CRED_NO_LANE_SEED_DIR/sibling" && mnl session activate . --no-prompt \
+    --name e2e-cred-sibling --network own_ip \
+    --ingress "$sibling_port:$sibling_port" 2>"$WORK/cred-sibling.err")" || {
+    echo "::error::'min session activate --network own_ip --ingress ...' failed for the no-lane case's control sibling"
+    cat "$WORK/cred-sibling.err" 2>/dev/null || true
+    cred_fail
+  }
+  sibling_sid="$(printf '%s\n' "$sibling_sid" | tail -n1 | tr -d '\r')"
+  sibling_ip="$(cred_box_ip "$sibling_sid" "$WORK/cred-sibling-fib.out" "$WORK/cred-sibling-fib.err")"
+  if [ -z "$sibling_ip" ]; then
+    echo "::error::could not determine the control sibling's switch address from /proc/net/fib_trie"
+    echo "--- fib_trie ---"; cat "$WORK/cred-sibling-fib.out" 2>/dev/null || true
+    cred_fail
+  fi
   mnl session exec "$nolane_sid" \
-    "/usr/bin/socat /dev/null TCP:$node_ip:$proxy_port,connect-timeout=8" \
+    "/usr/bin/socat /dev/null TCP:$sibling_ip:$sibling_port,connect-timeout=8" \
     >/dev/null 2>"$WORK/cred-nolane-control.err"
   if ! grep -q 'Connection refused' "$WORK/cred-nolane-control.err" 2>/dev/null; then
-    echo "::error::the control probe to the node's own address was not reset — the fabric or the gate is not answering this box, so the silence at the proxy's address below would prove nothing. Control stderr:"
+    echo "::error::the control probe to the sibling's lease $sibling_ip:$sibling_port was not reset — the fabric or the gates are not answering this box, so the silence at the proxy's address below would prove nothing. Control stderr:"
     cat "$WORK/cred-nolane-control.err" 2>/dev/null || true
     cred_fail
   fi
@@ -10424,11 +10441,12 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
     cred_fail
   fi
 
+  mnl session destroy --force "$sibling_sid" >/dev/null 2>&1 || true
   mnl session destroy --force "$nolane_sid" >/dev/null 2>&1 || true
   rm -rf "$CRED_NO_LANE_SEED_DIR"
   CRED_NO_LANE_SEED_DIR=""
   cred_restore
-  echo "a box without a credentialed lane cannot reach the proxy's address OK (control reset at the node's own address, silence at $proxy_ip:$proxy_port for ${elapsed_ms}ms from $nolane_ip, refused at the box's relay so the host gate stayed silent)"
+  echo "a box without a credentialed lane cannot reach the proxy's address OK (control reset at the sibling's lease $sibling_ip:$sibling_port, silence at $proxy_ip:$proxy_port for ${elapsed_ms}ms from $nolane_ip, refused at the box's relay so the host gate stayed silent)"
   echo "::endgroup::"
 }
 
