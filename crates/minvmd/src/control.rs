@@ -341,21 +341,14 @@ fn register_and_reply(
     // The declaration as the row received it; `null` for a box with no
     // egress section. A plain struct of strings serialises infallibly.
     let declared_egress = serde_json_lenient::to_string(&request.egress).unwrap_or_default();
-    // The box's id: the one the client held — a re-registration
-    // presenting the identity its first registration created — or a
-    // fresh UUIDv7 minted here for this creation (BEP-070), minted
-    // before anything is allocated so the row, the reply and the
-    // attachment the row issues all hold the one identity.
-    let box_id = request.box_id.map_or_else(
-        crate::bep_attach::mint_box_id,
-        minimald_rpc::BoxId::to_bytes,
-    );
+    // The request carries no id: the registry mints the box's own UUIDv7
+    // for this creation (BEP-070), and the reply hands back the id the
+    // published row holds — the one the client records.
     let spec = ClientBoxSpec {
         name: request.name.clone(),
         ingress_ports: request.ingress_ports,
         egress: request.egress,
         credentialed_upstream: request.credentialed_upstream,
-        box_id: Some(box_id),
     };
     let reply = match boxes.register_client_box(spec) {
         Ok(record) => {
@@ -597,7 +590,6 @@ mod tests {
                         deny_subnets: None,
                     }),
                     credentialed_upstream: None,
-                    box_id: None,
                 },
             )
             .expect("first registration is answered"),
@@ -667,7 +659,6 @@ mod tests {
                     ingress_ports: vec![5432],
                     egress: None,
                     credentialed_upstream: None,
-                    box_id: None,
                 },
             )
             .expect("second registration is answered"),
@@ -716,7 +707,6 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
-                    box_id: None,
                 },
             )
             .expect("server still serves after a refused request"),
@@ -742,7 +732,6 @@ mod tests {
                     deny_subnets: None,
                 }),
                 credentialed_upstream: None,
-                box_id: None,
             })
             .expect("the default plan has addresses to allocate");
 
@@ -797,7 +786,6 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
-                box_id: None,
             })
             .expect_err("an unplanned subnet has no slice to allocate from");
         assert!(
@@ -843,7 +831,6 @@ mod tests {
                         deny_subnets: None,
                     }),
                     credentialed_upstream: None,
-                    box_id: None,
                 },
             )
             .expect("the registration is answered"),
@@ -924,7 +911,6 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
-                    box_id: None,
                 },
             )
             .expect("the marker box is registered"),
@@ -1134,7 +1120,6 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
-                    box_id: None,
                 },
             )
             .expect("a registration still answers around the read"),

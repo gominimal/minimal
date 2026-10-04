@@ -256,7 +256,7 @@ impl BoxRegistration {
     /// policy is absent (allow-all, the shipped default) until
     /// [`with_egress_policy`](Self::with_egress_policy) declares one, and
     /// the box's id is minted at registration
-    /// ([`Self::with_box_id`] presents one instead).
+    /// ([`crate::bep_attach::mint_box_id`]).
     #[must_use]
     pub fn new(name: impl Into<String>, switch_addr: Ipv4Addr, loopback_addr: Ipv4Addr) -> Self {
         Self {
@@ -269,20 +269,6 @@ impl BoxRegistration {
             egress: None,
             credentialed_upstream: None,
         }
-    }
-
-    /// The box's own id, when the registering side already holds one —
-    /// the id the box's first registration minted, which a
-    /// re-registration presents so the box stays the identity it was
-    /// created as (the CLI holds one across the autospawn retry's
-    /// re-registration, NET-133). Absent lets the registration mint one
-    /// ([`crate::bep_attach::mint_box_id`]), which the published row and
-    /// its attachment then hold: an explicit registration carries no id of
-    /// its own, and a client box's first registration never does either.
-    #[must_use]
-    pub fn with_box_id(mut self, id: BoxId) -> Self {
-        self.box_id = Some(id);
-        self
     }
 
     /// The ports this namespace admitted — the ingress **and** publish
@@ -354,14 +340,6 @@ pub struct ClientBoxSpec {
     /// refused under the box-to-host default-deny. The one field a client
     /// that predates NET-134 sends absent, every time.
     pub credentialed_upstream: Option<sessions::CredentialedUpstream>,
-    /// The box's id ([`BoxId`]), when the registering client already holds
-    /// one — the id its first registration minted, which a re-registration
-    /// presents so the box stays the identity it was created as. `None`,
-    /// the default, lets the host mint one for the box; the registration
-    /// reply hands the id the published row holds back, whatever minted
-    /// it. A registration whose id a live row or attachment already holds
-    /// is refused (BEP-070): one id names one box.
-    pub box_id: Option<BoxId>,
 }
 
 /// The run of `subnet`'s address plan the host hands registered boxes from:
@@ -408,10 +386,10 @@ pub enum AllocationError {
     /// addresses.
     #[error("the address plan does not serve subnet {0}; no box address can be allocated")]
     UnplannedSubnet(SwitchSubnet),
-    /// The id the registration presented is already held by a live row or
-    /// attachment: one id names one box (BEP-070), so a box claiming
-    /// another box's identity is refused — before any address is spent,
-    /// so the refusal leaves no new fact on the host.
+    /// The id minted for the registration is already held by a live row or
+    /// attachment: one id names one box (BEP-070), so the registration is
+    /// refused — never re-minted — before any address is spent, so the
+    /// refusal leaves no new fact on the host.
     #[error(
         "box id {} is already held by a live row or attachment",
         crate::bep_attach::BoxIdText(id)
@@ -630,11 +608,13 @@ impl BoxRegistry {
             .cloned()
             .unwrap_or_default();
         let resolves_names = !dns_hosts.is_empty();
-        // The box's own id (BEP-070): the one the registration presented,
-        // or a fresh UUIDv7 minted here for this creation — never a
-        // counter, never a digest of the declaration below. Minted once,
-        // before anything else, so the row and the attachment it issues
-        // hold the one identity this registration created the box with.
+        // The box's own id (BEP-070): the one a client-driven registration
+        // minted and checked ([`Self::register_client_box`]), or a fresh
+        // UUIDv7 minted here for this creation — never a counter, never a
+        // digest of the declaration below, never one a client presented.
+        // Minted once, before anything else, so the row and the attachment
+        // it issues hold the one identity this registration created the
+        // box with.
         let box_id = registration
             .box_id
             .unwrap_or_else(crate::bep_attach::mint_box_id);
@@ -778,25 +758,35 @@ impl BoxRegistry {
     /// lands with the last row source (T66's follow-up), not a change this
     /// registration makes.
     ///
-    /// A spec that presents an id of its own — the id a re-registration
-    /// holds — is refused when a live row or attachment already holds it
-    /// ([`AllocationError::CollidingBoxId`], BEP-070): one id names one
-    /// box. The refusal is decided before any address is spent, and said
-    /// as one warn line naming the id, so a tail reads which identity the
-    /// registration claimed. A spec with no id mints one
-    /// ([`crate::bep_attach::mint_box_id`]) and can never collide.
+    /// The box's id is always minted here, for this creation
+    /// ([`crate::bep_attach::mint_box_id`]): a spec carries none, so no
+    /// client can present an id, and a re-registration under the same
+    /// name and addresses is a new box with a new id. Ids are never reused.
+    /// A mint that collides with an id a live row or attachment already
+    /// holds is refused ([`AllocationError::CollidingBoxId`], BEP-070) —
+    /// never re-minted — before any address is spent, and said as one warn
+    /// line naming the id.
     pub fn register_client_box(
         &self,
         spec: ClientBoxSpec,
     ) -> Result<Arc<BoxRecord>, AllocationError> {
+        self.register_client_box_as(spec, crate::bep_attach::mint_box_id())
+    }
+
+    /// [`Self::register_client_box`] with the freshly minted `id` it
+    /// creates the box as: the one door the collision check guards, split
+    /// out so a test can drive a colliding mint.
+    fn register_client_box_as(
+        &self,
+        spec: ClientBoxSpec,
+        id: BoxId,
+    ) -> Result<Arc<BoxRecord>, AllocationError> {
         // One id names one box (BEP-070): the check runs before any
         // address is spent, so a refused registration leaves nothing
         // behind — no row, no share, no attachment, no spent address.
-        // A fresh mint never meets this refusal; what it guards is an
-        // id presented from outside.
-        if let Some(id) = spec.box_id
-            && self.holds_box_id(id)
-        {
+        // A colliding mint is refused, never re-minted: a collision means
+        // the mint is broken, and a second draw would hide it.
+        if self.holds_box_id(id) {
             tracing::warn!(
                 box_id = %crate::bep_attach::BoxIdText(&id),
                 "refused a box registration whose id a live row or attachment already holds"
@@ -823,19 +813,17 @@ impl BoxRegistry {
         if let Some(declaration) = spec.credentialed_upstream {
             registration = registration.with_credentialed_upstream(declaration);
         }
-        if let Some(id) = spec.box_id {
-            registration = registration.with_box_id(id);
-        }
+        registration.box_id = Some(id);
         Ok(self.register(registration))
     }
 
     /// Whether some live row or attachment already holds `id` (BEP-070):
-    /// the collision check a client-driven registration that arrives with
-    /// an id of its own runs. The mint's ids are unique per creation, so
-    /// what this catches is an id presented from outside — a box claiming
-    /// another box's identity. Rows whose attachments are gone still hold
-    /// their ids: an id never returns to use, so a withdrawn box's identity
-    /// is as spent as the box itself.
+    /// the collision check every client-driven registration runs on the id
+    /// it minted. Ids are never freed or reused; this set is every record
+    /// the host holds an id in today. No box or revocation record outlives
+    /// its box on this host yet, so a record type that does — a revocation
+    /// scoped to an id, a retained box record — joins this check when it
+    /// lands.
     fn holds_box_id(&self, id: BoxId) -> bool {
         let rows = self
             .rows
@@ -1650,7 +1638,6 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
-                box_id: None,
             })
             .expect("the default plan has hand-out addresses");
         assert_eq!(
@@ -1678,7 +1665,6 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
-                box_id: None,
             })
             .expect("the carved subnet has hand-out addresses");
         assert_eq!(
@@ -1693,7 +1679,6 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
-                    box_id: None,
                 })
                 .expect("the slice holds 32 published addresses");
         }
@@ -1705,7 +1690,6 @@ mod tests {
                         ingress_ports: Vec::new(),
                         egress: None,
                         credentialed_upstream: None,
-                        box_id: None,
                     }),
                     Err(AllocationError::LoopbackExhausted)
                 ),
@@ -1714,15 +1698,12 @@ mod tests {
         }
     }
 
-    /// BEP-070, one id names one box, so a registration that presents an id a
-    /// live row or attachment already holds is refused — before any address
-    /// is spent, so the refusal leaves no new fact on the host — and said
-    /// as one warn line naming the id, so a tail reads which identity the
-    /// registration claimed. What the refusal guards is a box claiming
-    /// another box's identity from outside: a fresh mint never meets it, and
-    /// a re-registration presenting its own ended box's id does not either,
-    /// because an ended box holds nothing in the live set — the shape the
-    /// CLI's autospawn retry's re-registration takes.
+    /// BEP-070, one id names one box, so a registration whose minted id a
+    /// live row or attachment already holds is refused — never re-minted,
+    /// and before any address is spent, so the refusal leaves no new fact
+    /// on the host — and said as one warn line naming the id. A real mint
+    /// does not collide, so the test drives the collision through the
+    /// registration's own door with the id it would have minted fixed.
     #[test]
     fn colliding_box_id_refused() {
         let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
@@ -1734,7 +1715,6 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
-                box_id: None,
             })
             .expect("the plan has an address for the first box");
         assert!(
@@ -1743,17 +1723,19 @@ mod tests {
              set a source's delivery resolves through"
         );
 
-        // A registration presenting the live row's id claims the web box's
-        // identity: refused, and the refusal names the id it claimed.
+        // A registration whose mint landed on the live row's id would name
+        // the web box: refused, and the refusal names the colliding id.
         let refused = registry
-            .register_client_box(ClientBoxSpec {
-                name: "impostor".to_string(),
-                ingress_ports: Vec::new(),
-                egress: None,
-                credentialed_upstream: None,
-                box_id: Some(web.box_id()),
-            })
-            .expect_err("an id a live box holds is not a second box's to claim");
+            .register_client_box_as(
+                ClientBoxSpec {
+                    name: "impostor".to_string(),
+                    ingress_ports: Vec::new(),
+                    egress: None,
+                    credentialed_upstream: None,
+                },
+                web.box_id(),
+            )
+            .expect_err("an id a live box holds is not a second box's");
         assert_eq!(
             refused,
             AllocationError::CollidingBoxId { id: web.box_id() },
@@ -1776,7 +1758,6 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
-                box_id: None,
             })
             .expect("the plan has a second hand-out address");
         assert_eq!(
@@ -1803,40 +1784,67 @@ mod tests {
                 "box_id={}",
                 crate::bep_attach::BoxIdText(&web.box_id())
             )),
-            "the warn line names the id the registration claimed, got: {logged}"
+            "the warn line names the colliding id, got: {logged}"
         );
+    }
 
-        // An ended box's id is free of the live set: the CLI's autospawn
-        // retry withdraws its box's row and re-registers presenting the id
-        // its first registration minted, and that re-registration is
-        // answered — with the same id, the recreated box staying the
-        // identity its first creation made it.
+    /// BEP-070: ids are never reused. A box registered, withdrawn, and
+    /// registered again under the same name is a new creation with a new
+    /// id — through the client-driven door, which spends fresh addresses,
+    /// and through the explicit one on the very addresses the first box
+    /// held — so a revocation scoped to the first id never names the
+    /// second box.
+    #[test]
+    fn re_registration_never_reuses_an_id() {
+        let attachments = crate::bep_attach::Attachments::new();
+        let registry = BoxRegistry::new(SUBNET).feeding_proxy_attachments(attachments.clone());
+        let spec = || ClientBoxSpec {
+            name: "web".to_string(),
+            ingress_ports: vec![8080],
+            egress: None,
+            credentialed_upstream: None,
+        };
+        let first = registry
+            .register_client_box(spec())
+            .expect("the plan has an address for the first box");
         assert!(
             registry
-                .withdraw_client_box("web", web.switch_addr(), web.loopback_addr())
+                .withdraw_client_box("web", first.switch_addr(), first.loopback_addr())
                 .expect("the withdrawing client is the row's creator")
                 .is_some(),
-            "the row was published"
+            "the first box's row was published"
         );
-        let recreated = registry
-            .register_client_box(ClientBoxSpec {
-                name: "web".to_string(),
-                ingress_ports: Vec::new(),
-                egress: None,
-                credentialed_upstream: None,
-                box_id: Some(web.box_id()),
-            })
-            .expect("an ended box's id is not a live row's to collide with");
-        assert_eq!(
-            recreated.box_id(),
-            web.box_id(),
-            "the re-registration held the box's identity: one id per box, across \
-             the end that did not end it"
-        );
+
+        // The client-driven re-registration under the same name: a new id.
+        let second = registry
+            .register_client_box(spec())
+            .expect("the plan has an address for the second box");
         assert_ne!(
-            recreated.switch_addr(),
-            web.switch_addr(),
-            "the recreation spent the run's next address, never a spent one again"
+            second.box_id(),
+            first.box_id(),
+            "a re-registration under the same name is a new box with a new id"
+        );
+
+        // The explicit door on the first box's own name and addresses: a
+        // new id again, neither of the two before it.
+        let third = registry.register(
+            BoxRegistration::new("web", first.switch_addr(), first.loopback_addr())
+                .with_admitted_ports([8080]),
+        );
+        assert_eq!(
+            (third.switch_addr(), third.loopback_addr()),
+            (first.switch_addr(), first.loopback_addr()),
+            "the third box sits on the first box's addresses"
+        );
+        assert!(
+            third.box_id() != first.box_id() && third.box_id() != second.box_id(),
+            "a box on the same name and addresses is a new box with a new id"
+        );
+        assert!(
+            !attachments.holds_id(first.box_id())
+                && attachments.holds_id(second.box_id())
+                && attachments.holds_id(third.box_id()),
+            "the live attachments carry the new ids; the withdrawn id is never handed out again"
         );
     }
 

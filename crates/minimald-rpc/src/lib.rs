@@ -441,15 +441,16 @@ fn default_hooks_enabled() -> bool {
 /// outside the VM, with its random fields from the host's OS CSPRNG
 /// (BEP-070): never a counter, never a digest of the box's facts, never
 /// anything a process inside the VM could predict or arrange. The
-/// registration that publishes the box's row mints one when the client
-/// holds none, the row and the proxy's attachment hold it, and the reply
-/// hands it back so a re-registration presents the identity the box was
-/// created as.
+/// registration that publishes the box's row mints it — a client never
+/// presents one — the row and the proxy's attachment hold it, and the
+/// reply hands it back so the client records the id its box was created
+/// as.
 ///
 /// Unique per creation by construction: a box recreated with the same
-/// name and the same addresses is a new box, and its id says so. The id
-/// never returns to use — nothing is ever allocated from it — so a
-/// revocation scoped to it stays scoped forever. The all-zero id is not
+/// name and the same addresses is a new box, and its id says so. Ids are
+/// never reused — no registration can present one, and the host refuses a
+/// mint that collides with a record it holds — so a revocation scoped to
+/// an id stays scoped forever. The all-zero id is not
 /// a mint's output and never names a box: the delivery header carried it
 /// for "no box named" before ids were the box's own, and the acceptor
 /// that reads a delivered header refuses it like any other id the
@@ -462,7 +463,7 @@ fn default_hooks_enabled() -> bool {
 pub struct BoxId([u8; 16]);
 
 impl BoxId {
-    /// Wraps `bytes` as a box id — the shape [`RegisterBoxRequest::box_id`]
+    /// Wraps `bytes` as a box id — the shape [`RegisteredBox::box_id`]
     /// carries and a delivery header fills from the box's attachment.
     #[must_use]
     pub fn from_bytes(bytes: [u8; 16]) -> Self {
@@ -513,16 +514,15 @@ impl<'de> Deserialize<'de> for BoxId {
 
 /// What a successful registration hands back: the allocated addresses —
 /// the pair [`BoxAddresses`] has always carried — and the box id the
-/// published row now holds ([`BoxId`]): the id the request presented when
-/// the client held one, or the one the host minted for the box when it
-/// did not ([`RegisterBoxRequest::box_id`]).
+/// published row now holds ([`BoxId`]): the one the host minted for this
+/// creation. A registration carries no id; this reply is where the client
+/// learns its box's.
 ///
 /// The id travels beside the addresses because both belong to the same
-/// fact — this is the box the host just published — and because a client
-/// that registers the box again presents the id back, so the box stays
-/// the identity its first registration created it as: the same id in the
-/// client's record, the sealed member's claims and the proxy's
-/// attachment.
+/// fact — this is the box the host just published — so the client records
+/// the id it is handed, and the client's record, the sealed member's
+/// claims and the proxy's attachment name the box by the same id. A
+/// re-registration is a new creation and is handed a new id.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegisteredBox {
     /// The box's address on the switch ([`BoxAddresses::switch_address`]).
@@ -553,9 +553,9 @@ pub struct RegisteredBox {
 /// protocol must not drift between them.
 ///
 /// A box's identity is its [`BoxId`]: minted once per box by the host-side
-/// creator outside the VM, carried on the registration the client sends and
-/// handed back on the reply, so the client, the published row and the
-/// proxy's attachment all name the box by one id.
+/// creator outside the VM — never carried on the registration the client
+/// sends — and handed back on the reply, so the client, the published row
+/// and the proxy's attachment all name the box by one id.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RegisterBoxRequest {
     /// The box's name — the session name the following create request
@@ -583,19 +583,6 @@ pub struct RegisterBoxRequest {
     /// nothing, exactly as one that never asked for a lane does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentialed_upstream: Option<CredentialedUpstream>,
-    /// The box's id ([`BoxId`]), when the registering client already holds
-    /// one — the id the box's first registration minted, which a
-    /// re-registration presents so the box stays the identity it was
-    /// created as. `None`, the default and all a client that predates the
-    /// field sends, lets the host mint one for the box; the reply hands
-    /// the id the published row holds back
-    /// ([`BoxControlReply::Registered`]), whatever minted it.
-    ///
-    /// The host refuses a registration whose id a live row or attachment
-    /// already holds: one id names one box, so a second box presenting it
-    /// is a box claiming another box's identity (BEP-070).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub box_id: Option<BoxId>,
 }
 
 /// The withdrawal a destroyed session's client sends for the row its
@@ -729,11 +716,10 @@ pub enum BoxControlReply {
     /// ignores a document's unknown fields, so a variant whose fields are
     /// a strict superset of another's must be tried before it: an
     /// id-carrying reply parsed as `Addresses` would silently drop the
-    /// id, and a client would hold a box with no identity it could
-    /// re-present. A reply that carries no `box_id` — from a daemon that
-    /// predates ids — fails this variant and parses as `Addresses`: the
-    /// registration succeeded, and the client simply holds no id to
-    /// present next time.
+    /// id, and the client would record no id for a box the host named. A
+    /// reply that carries no `box_id` — from a daemon that predates ids —
+    /// fails this variant and parses as `Addresses`: the registration
+    /// succeeded, and the client simply records no id for the box.
     Registered(RegisteredBox),
     /// The verb succeeded: a withdrawal's echo of the pair the row went by,
     /// and a registration's answer on a daemon that predates box ids.

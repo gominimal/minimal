@@ -1696,7 +1696,6 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
-                box_id: None,
             })
             .expect("the plan has a switch address to hand out");
 
