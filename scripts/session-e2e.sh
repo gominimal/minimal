@@ -9747,12 +9747,12 @@ proof_proxy_sees_each_vm_box_by_its_switch_address() {
 # to withdraw.
 #
 # The guest's IPv4 route table is printed as the case's diagnostic (the task
-# names it), and its IPv6 half asserted EMPTY: the guest boots with
-# ipv6.disable=1 (NET-082), so no netns inside it — a box's included — can
-# hold a v6 route. The case stops and respawns the daemon pair (the filter
-# its registration reads need, see below); the dispatch keeps it beside the
-# other VM-daemon cases and ahead of the daemon-fetch case, which respawns
-# the pair again for its own.
+# names it), and its IPv6 half asserted EMPTY between sentinels: the guest
+# boots with ipv6.disable=1 (NET-082), so no netns inside it — a box's
+# included — can hold a v6 route. The case stops and respawns the daemon
+# pair (the filter its registration reads need, see below); the dispatch
+# keeps it beside the other VM-daemon cases and ahead of the daemon-fetch
+# case, which respawns the pair again for its own.
 proof_escape_reaches_only_declared_union() {
   local esu_sid_a="" esu_sid_b="" esu_ip_a="" esu_ip_b=""
   local esu_rec_a="" esu_rec_b="" esu_out="" esu_rows="" esu_line=""
@@ -10117,15 +10117,27 @@ ESU_LISTENER_EOF
     fi
     echo "box $esu_box: the box netns's IPv4 route table:"
     printf '%s\n' "$esu_route" | sed 's/^/  /'
-    # The v6 read ignores the exit code on purpose: a guest with v6 disabled
-    # may not mount the tables at all, and the assertion is emptiness.
-    esu_v6="$(mnl session exec "${!sid_var}" \
-      'cat /proc/net/if_inet6 2>/dev/null; cat /proc/net/ipv6_route 2>/dev/null' \
-      2>/dev/null || true)"
-    esu_v6="$(printf '%s' "$esu_v6" | tr -d '\r')"
-    if [ -n "$esu_v6" ]; then
-      echo "::error::the box netns holds IPv6 state, but the guest booted with ipv6.disable=1 — no v6 route may appear anywhere in it (NET-082):"
-      printf '%s\n' "$esu_v6" | sed 's/^/  /'
+    # The v6 read is bracketed in sentinels on purpose: a failed exec and a
+    # genuinely empty v6-less guest both read as empty output, and only the
+    # markers tell the two apart. The assertion is emptiness between them —
+    # both markers must arrive, with nothing between.
+    if ! esu_v6="$(mnl session exec "${!sid_var}" \
+        'echo v6-begin; cat /proc/net/if_inet6 2>/dev/null; cat /proc/net/ipv6_route 2>/dev/null; echo v6-end' \
+        2>"$WORK/esu-v6-$esu_box.err")"; then
+      echo "::error::reading box $esu_box's IPv6 tables over exec failed"
+      cat "$WORK/esu-v6-$esu_box.err" 2>/dev/null || true
+      esu_fail
+    fi
+    esu_v6="$(printf '%s\n' "$esu_v6" | tr -d '\r')"
+    echo "box $esu_box: the box netns's IPv6 state, between the sentinels (empty is the v6-less posture):"
+    printf '%s\n' "$esu_v6" | sed 's/^/  /'
+    esu_between="$(printf '%s\n' "$esu_v6" \
+      | sed -e '/^v6-begin$/d' -e '/^v6-end$/d' -e '/^[[:space:]]*$/d')"
+    if ! printf '%s\n' "$esu_v6" | grep -qx 'v6-begin' \
+        || ! printf '%s\n' "$esu_v6" | grep -qx 'v6-end' \
+        || [ -n "$esu_between" ]; then
+      echo "::error::the box netns's IPv6 read is not empty between its sentinels (or never completed), but the guest booted with ipv6.disable=1 — no v6 route may appear anywhere in it (NET-082):"
+      printf '%s\n' "$esu_between" | sed 's/^/  /'
       esu_fail
     fi
     echo "NET-082 OK: box $esu_box's netns holds no IPv6 interface or route (the guest booted with ipv6.disable=1)"
