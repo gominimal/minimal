@@ -1,5 +1,6 @@
-//! The `answerer` subcommand: the program the privileged step installs as
-//! the host's box-zone answerer service.
+//! The `min-answerer` program: the one the privileged step copies to a
+//! root-owned path and installs as the host's box-zone answerer service,
+//! and the handover's client verbs the same step runs as root.
 //!
 //! The service manager runs it as the operator's uid, never root — the uid
 //! its unit names — and hands it both of the answerer's sockets, held by the
@@ -45,7 +46,7 @@ pub const CHANNEL_SOCKET_NAME: &str = "Channel";
 #[cfg(any(test, not(target_os = "macos")))]
 const HANDED_SOCKET_LIMIT: usize = 1024;
 
-/// The `answerer` subcommand.
+/// The answerer service, as the unit runs it.
 ///
 /// `--protocol-version` never serves: it prints the channel protocol version
 /// this copy speaks — the one fact the CLI's hook probe compares with the
@@ -80,6 +81,117 @@ pub fn run(protocol_version: bool) -> Result<()> {
         Arc::new(AtomicBool::new(false)),
     );
     Ok(())
+}
+
+/// How long the release verb waits for the hook port to be free once every
+/// daemon it asked has answered: a released daemon frees the port before
+/// it answers, so the wait only has to outlast a slow close — a port still
+/// held past it is another process's, a collision.
+const PORT_FREE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long the release verbs wait for one daemon's answer.
+const CONTROL_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// The handover's release verb (NET-122's privileged step, as root): asks
+/// each VM host daemon whose control socket is in `controls` to release its
+/// interim answerer, then waits up to [`PORT_FREE_WAIT`] for the hook port
+/// to be free. A control socket that is absent or that nothing listens
+/// behind is a daemon that is not running — skipped. A port still held
+/// after the wait is a collision: another process holds the hook port (a
+/// VM host daemon of another state dir included), and the error names it.
+///
+/// # Errors
+///
+/// When a daemon refuses the request, or the port is still held.
+pub fn release(controls: &[std::path::PathBuf], port: u16) -> Result<()> {
+    for control in controls {
+        if let Some(reply) = ask(control, &minimald_rpc::BoxControlRequest::ReleaseAnswerer)? {
+            eprintln!("min-answerer: {}: {reply}", control.display());
+        }
+    }
+    let deadline = std::time::Instant::now() + PORT_FREE_WAIT;
+    loop {
+        if UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "the hook port 127.0.0.1:{port} is still held {} s after the release: \
+                 another process holds it (a collision — a VM host daemon of another \
+                 state dir, a native minimald, or a foreign process), so the answerer \
+                 service cannot take it",
+                PORT_FREE_WAIT.as_secs()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// The handover's release-cancel verb: asks each daemon in `controls` to
+/// re-bind its interim answerer at once. Best-effort per daemon — a cancel
+/// is the failure path's own step, and one daemon that cannot answer must
+/// not keep the others from re-binding.
+pub fn release_cancel(controls: &[std::path::PathBuf]) {
+    for control in controls {
+        match ask(
+            control,
+            &minimald_rpc::BoxControlRequest::ReleaseAnswererCancel,
+        ) {
+            Ok(Some(reply)) => eprintln!("min-answerer: {}: {reply}", control.display()),
+            Ok(None) => {}
+            Err(error) => eprintln!("min-answerer: {}: {error:#}", control.display()),
+        }
+    }
+}
+
+/// One request over one daemon's control socket: `None` when no daemon is
+/// there (the socket is absent, or nothing listens behind it), else the
+/// daemon's answer as a sentence.
+fn ask(
+    control: &std::path::Path,
+    request: &minimald_rpc::BoxControlRequest,
+) -> Result<Option<String>> {
+    use std::io::{BufRead as _, Write as _};
+    let mut stream = match std::os::unix::net::UnixStream::connect(control) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("connecting to {}", control.display()));
+        }
+    };
+    stream.set_read_timeout(Some(CONTROL_REPLY_TIMEOUT))?;
+    let mut line = serde_json_lenient::to_string(request).context("encoding the request")?;
+    line.push('\n');
+    stream.write_all(line.as_bytes())?;
+    let mut reply = String::new();
+    std::io::BufReader::new(&stream)
+        .read_line(&mut reply)
+        .with_context(|| format!("reading {}'s answer", control.display()))?;
+    match serde_json_lenient::from_str::<minimald_rpc::BoxControlReply>(reply.trim()) {
+        Ok(minimald_rpc::BoxControlReply::AnswererRelease { acted, detail }) => {
+            Ok(Some(if acted {
+                detail
+            } else {
+                format!("nothing to do: {detail}")
+            }))
+        }
+        Ok(minimald_rpc::BoxControlReply::Error { error }) => {
+            bail!("{} refused the request: {error}", control.display())
+        }
+        Ok(other) => bail!("{} answered {other:?}", control.display()),
+        Err(error) => bail!(
+            "{} answered nothing this verb understands ({error}); the daemon may predate \
+             the handover",
+            control.display()
+        ),
+    }
 }
 
 /// The answerer's two sockets, received from the service manager and

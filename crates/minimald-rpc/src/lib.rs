@@ -538,6 +538,17 @@ pub enum BoxControlRequest {
     /// — the read-only verb: no row is touched, no state changes, the reply
     /// is the status the answerer's acquisition last left.
     AnswererStatus,
+    /// Release the interim answerer (NET-122's handover to the host
+    /// service): the daemon stops the answerer it hosts and frees the hook
+    /// port, then waits a bounded window for the service's channel and
+    /// publishes its rows there, re-binding the interim if the channel
+    /// never comes. Answered with [`BoxControlReply::AnswererRelease`] once
+    /// the port is free; a daemon that hosts no interim answers a no-op.
+    /// Accepted from the operator's uid and from root only.
+    ReleaseAnswerer,
+    /// Cancel a release: the daemon re-binds its interim answerer at once.
+    /// A daemon with no release pending answers a no-op.
+    ReleaseAnswererCancel,
 }
 
 /// The VM host daemon's answerer status: the state of the machine's
@@ -610,6 +621,15 @@ pub enum BoxControlReply {
     /// The answerer-status read succeeded: the state of the machine's
     /// zone answerer as the daemon holds it ([`ZoneAnswererStatus`]).
     Status(ZoneAnswererStatus),
+    /// A release or release-cancel was answered: `acted` says whether the
+    /// daemon did anything (false: it hosted no interim, or had no release
+    /// pending), and `detail` is the sentence it logged.
+    AnswererRelease {
+        /// Whether the request changed anything.
+        acted: bool,
+        /// What the daemon did, as its log line said it.
+        detail: String,
+    },
 }
 
 /// The request for a [`CreateSession`] RPC.

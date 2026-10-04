@@ -109,6 +109,12 @@ async fn register_box_with_vm_host(
                  answerer status {status:?}; the registration did not happen"
             )
         }
+        minimald_rpc::BoxControlReply::AnswererRelease { .. } => {
+            anyhow::bail!(
+                "the VM host daemon answered the box registration with an \
+                 answerer release reply; the registration did not happen"
+            )
+        }
     }
 }
 
@@ -315,6 +321,13 @@ pub(crate) async fn withdraw_box_row(
                     status = ?status,
                     "the VM host daemon answered the box row withdrawal with its \
                      answerer status; the row stays published"
+                );
+            }
+            minimald_rpc::BoxControlReply::AnswererRelease { .. } => {
+                tracing::warn!(
+                    box = %name,
+                    "the VM host daemon answered the box row withdrawal with an \
+                     answerer release reply; the row stays published"
                 );
             }
         },
@@ -930,13 +943,33 @@ pub(crate) async fn activate_session(
         );
     } else if let Some(answerer_port) = answerer_port {
         // The answerer service's step (NET-122's host service) is read
-        // beside the detection: whether the zone is manager-held or held
-        // only while a session holds it, and whether the installed copy
-        // speaks this daemon's channel protocol.
-        let (detection, answerer_step) = tokio::join!(
-            crate::resolver::session_detection(),
-            crate::resolver::read_answerer_step()
-        );
+        // beside the detection on a VM-backed host: whether the zone is
+        // manager-held or held only while a session holds it, and whether
+        // the installed copy speaks this daemon's channel protocol. A
+        // native host is not offered the step — its in-daemon answerer
+        // stays the interim — so its advisory falls quiet once the
+        // resolver step is done.
+        let vm_backed = daemon_provider_kind(global) == paths::ProviderKind::Minvmd;
+        let (detection, answerer_step) =
+            tokio::join!(crate::resolver::session_detection(), async {
+                if vm_backed {
+                    crate::resolver::read_answerer_step().await
+                } else {
+                    crate::resolver::AnswererStep::NotOffered
+                }
+            });
+        if vm_backed {
+            // The daemons the step asks to release the hook port: this
+            // CLI's own state dir's VM host daemons, default VM and named
+            // VMs alike — never another state dir's.
+            let controls = client::enumerate_vm_sockets(global.minimal_dir.as_deref(), true)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|vm| control_sock_beside(&vm.sock))
+                .map(|sock| sock.display().to_string())
+                .collect();
+            crate::resolver::set_handover_controls(controls);
+        }
         // NET-018: name the live surface at the moment the user is about to
         // rely on the names — decided in the one function both verbs share
         // (`resolver`), from the same detection the advisory reads: this

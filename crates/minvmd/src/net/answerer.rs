@@ -16,20 +16,25 @@
 //! That rule is **who holds the answerer**. The answerer port is the
 //! machine's, so exactly one process on the host may serve it — and the one
 //! that should is the **installed host service** the privileged step
-//! installs (NET-122's sub-requirement): a `minvmd answerer` the service
-//! manager runs as the operator, its listener and channel sockets the
-//! manager's own, so the zone survives every session on the host. This
-//! daemon is one of that service's *nodes*: at start it connects to the
-//! answerer channel first and publishes its table's rows there — a connect
-//! is what starts a socket-activated service, so a channel socket present
-//! but refusing or timing out is an error surfaced at session start, never
-//! a reason to hold the port — and only when the channel socket path is
-//! *absent* does the daemon host the answerer itself, as the recorded
-//! interim (NET-138): it binds the port and the channel both, serves the
-//! zone from its own table merged with every other node's published rows,
-//! and the next daemon to start publishes into it instead. Never both: a
-//! node hosts only when there is no channel to publish to, and a port held
-//! with no channel behind it is a surfaced collision, not a fallback.
+//! installs (NET-122's sub-requirement): `min-answerer`, which the service
+//! manager runs as the operator, its listener and its machine-global
+//! channel socket the manager's own, so the zone survives every session on
+//! the host. This daemon is one of that service's *nodes*. Whether the
+//! service is installed is its install marker's to say (the unit file),
+//! never the channel socket's existence: installed, the node connects to
+//! the machine-global channel and publishes its table's rows there — a
+//! connect is what starts a socket-activated service, so a channel that
+//! refuses or times out is an error surfaced at session start, never a
+//! reason to hold the port. Not installed, the node tries the interim's
+//! per-state-dir channel, and only when that is absent does it host the
+//! answerer itself, as the recorded interim (NET-138): it binds the port
+//! and the interim channel both, serves the zone from its own table merged
+//! with the rows of its state dir's other VMs, and they publish into it.
+//! Never both: a port held with no channel behind it is a surfaced
+//! collision, not a fallback. The privileged step hands the port over from
+//! a hosting daemon by asking it to release (over the control socket):
+//! the daemon frees the port, waits a bounded window for the service's
+//! channel, and re-binds the interim if the channel never comes.
 //!
 //! The channel — the service's and the interim holder's, one wire for
 //! both, so a node's publish path is the same either way — carries a
@@ -113,7 +118,7 @@ const COMPONENT: &str = "zone-answerer";
 /// answerer port — which the guest now binds nothing on — still is).
 pub const DEFAULT_ANSWERER_PORT: u16 = 7656;
 
-/// The answerer channel socket's file name inside the machine's shared
+/// The interim answerer channel socket's file name inside a state dir's
 /// provider-instance dir. Deliberately beside [`crate::control`]'s
 /// `control.sock` rather than in the `paths` crate: this name only means
 /// something where two VM host daemons share a machine.
@@ -128,7 +133,7 @@ const MAX_DATAGRAM: usize = 4096;
 /// changes, because a daemon and an installed answerer copy can be from
 /// different releases of this codebase — the service checks the number a
 /// node's hello carries against its own before it holds any of that node's
-/// rows, and the CLI's step probe runs `<installed copy> answerer
+/// rows, and the CLI's step probe runs `<installed copy>
 /// --protocol-version` and compares the printed number with the daemon's
 /// own (this constant, the same install), re-surfacing the privileged step
 /// on a mismatch so an upgrade re-runs it and the installed copy is never
@@ -160,6 +165,22 @@ const CHANNEL_RETRY: Duration = Duration::from_millis(250);
 /// timeout and not a non-blocking flip).
 const CONNECTION_POLL: Duration = Duration::from_millis(250);
 
+/// How long a released interim waits for the installed service's channel
+/// before it re-binds on its own: longer than the privileged step's whole
+/// handover (2 s for the port, 5 s for the unit), so a daemon never re-binds
+/// while the unit is still starting, and short enough that the hook port is
+/// never left unanswered past it.
+const RELEASE_WINDOW: Duration = Duration::from_secs(15);
+
+/// How often a released interim retries the service's channel inside the
+/// release window, and polls for a cancel.
+const RELEASE_POLL: Duration = Duration::from_millis(250);
+
+/// How long the control socket waits for the acquisition to answer a
+/// release or a cancel: the release itself is a stop and a join, well
+/// inside this.
+const RELEASE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The largest line either side of the channel will read: a publish
 /// carries one row per published namespace; anything past this bound is not
 /// one.
@@ -171,21 +192,127 @@ const MAX_REQUEST_LINE: usize = 64 * 1024;
 /// came up while the node idled is found within half a minute.
 const PORT_RECHECK: Duration = Duration::from_secs(30);
 
-/// Resolve the answerer channel socket's path — machine-global: the
-/// provider-instance dir every VM this host supervises shares
-/// (`<state>/providers/local-minvmd0/`, not the per-VM dir a named VM's
-/// files live under), so the daemon holding the answerer port and every
-/// daemon that does not resolve one path by the same rule.
+/// The machine-global channel socket the installed answerer service's unit
+/// holds (NET-122's host service): one per host, whatever any node's state
+/// dir — on Linux under the socket unit's own `RuntimeDirectory`, on macOS
+/// under the root-owned `Application Support` dir the privileged step
+/// makes (it survives a reboot, which `/var/run` does not).
+#[cfg(target_os = "macos")]
+pub const GLOBAL_CHANNEL_SOCK: &str = "/Library/Application Support/minimal/run/answerer.sock";
+/// See the macOS arm.
+#[cfg(not(target_os = "macos"))]
+pub const GLOBAL_CHANNEL_SOCK: &str = "/run/minimal/answerer.sock";
+
+/// The installed service's marker: the unit file whose presence — and only
+/// whose presence — says the answerer service is installed on this host
+/// (the LaunchDaemon plist on macOS, the systemd socket unit on Linux).
+/// The channel socket's path existing never says so: a stale socket file
+/// with no marker beside it is a leftover, not a service.
+#[cfg(target_os = "macos")]
+pub const INSTALL_MARKER: &str = "/Library/LaunchDaemons/dev.minimal.zone-answerer.plist";
+/// See the macOS arm.
+#[cfg(not(target_os = "macos"))]
+pub const INSTALL_MARKER: &str = "/etc/systemd/system/dev.minimal.zone-answerer.socket";
+
+/// The variable that overrides [`GLOBAL_CHANNEL_SOCK`] — read only by test
+/// and debug builds (the e2e harness's), never by a release build, so no
+/// production configuration can point a node at another channel.
+pub const CHANNEL_SOCK_ENV: &str = "MINIMAL_ANSWERER_CHANNEL_SOCK";
+
+/// The variable that overrides [`INSTALL_MARKER`], under the same rule as
+/// [`CHANNEL_SOCK_ENV`].
+pub const INSTALL_MARKER_ENV: &str = "MINIMAL_ANSWERER_INSTALL_MARKER";
+
+/// A path override from `var`, honoured only in test and debug builds.
+fn debug_path_override(var: &str) -> Option<PathBuf> {
+    #[cfg(any(test, debug_assertions))]
+    {
+        std::env::var_os(var)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        let _ = var;
+        None
+    }
+}
+
+/// The machine-global answerer channel's path from an override, when one
+/// is given — the pure half of [`resolve_channel_sock`]: no state dir, no
+/// VM name, nothing per node enters it.
+fn channel_sock_from(override_path: Option<PathBuf>) -> PathBuf {
+    override_path.unwrap_or_else(|| PathBuf::from(GLOBAL_CHANNEL_SOCK))
+}
+
+/// Resolve the answerer channel socket's path: the one machine-global
+/// channel the installed service holds ([`GLOBAL_CHANNEL_SOCK`]), the same
+/// for every node on the host whatever its state dir. The one definition
+/// every reader shares — the node daemons that connect to it, and the CLI
+/// that renders the unit holding it.
 #[must_use]
 pub fn resolve_channel_sock() -> PathBuf {
-    paths::provider_instance_dir(
-        &crate::state::state_base_dir(),
-        paths::ProviderKind::Minvmd,
-        0,
+    channel_sock_from(debug_path_override(CHANNEL_SOCK_ENV))
+}
+
+/// Resolve the installed service's marker ([`INSTALL_MARKER`]).
+#[must_use]
+pub fn resolve_install_marker() -> PathBuf {
+    debug_path_override(INSTALL_MARKER_ENV).unwrap_or_else(|| PathBuf::from(INSTALL_MARKER))
+}
+
+/// The interim holder's channel for a state base: the provider-instance dir
+/// every VM under that state dir shares (`<state>/providers/local-minvmd0/`),
+/// so co-resident VMs of one state dir publish into the interim one of them
+/// hosts. Per state dir by design: two state dirs on a host without the
+/// service do not share it, and their second node's collision is surfaced.
+fn interim_channel_sock_for(base: &paths::DaemonAbsPath) -> PathBuf {
+    paths::provider_instance_dir(base, paths::ProviderKind::Minvmd, 0)
+        .as_utf8_path()
+        .as_std_path()
+        .join(CHANNEL_SOCK_FILE)
+}
+
+/// This daemon's interim channel ([`interim_channel_sock_for`] over its
+/// own state base).
+#[must_use]
+pub fn interim_channel_sock() -> PathBuf {
+    interim_channel_sock_for(&crate::state::state_base_dir())
+}
+
+/// A node's id for a state base and VM name: the canonical state dir — so
+/// the id is the same across restarts and across symlinked spellings of one
+/// dir — and the VM's name. Name ownership on the channel is per node, so
+/// two nodes under different state dirs never share one even when both run
+/// the default VM.
+fn node_id_for(base: &Path, vm: &str) -> String {
+    let canonical = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    format!("{}#{vm}", canonical.display())
+}
+
+/// This daemon's node id ([`node_id_for`] over its own state base and VM).
+#[must_use]
+pub fn node_id() -> String {
+    node_id_for(
+        crate::state::state_base_dir().as_utf8_path().as_std_path(),
+        crate::state::vm_name(),
     )
-    .as_utf8_path()
-    .as_std_path()
-    .join(CHANNEL_SOCK_FILE)
+}
+
+/// The paths one acquisition decides over: the machine-global channel, the
+/// interim's per-state-dir channel, the install marker that says whether
+/// the service is installed, and the release window a handover waits.
+#[derive(Debug, Clone)]
+struct ChannelPaths {
+    /// The installed service's machine-global channel.
+    global: PathBuf,
+    /// The interim holder's per-state-dir channel.
+    interim: PathBuf,
+    /// The installed service's marker file.
+    marker: PathBuf,
+    /// How long a released interim waits for the service's channel before
+    /// it re-binds ([`RELEASE_WINDOW`] in production).
+    release_window: Duration,
 }
 
 // ── the channel's wire ───────────────────────────────────────────────────────
@@ -208,14 +335,14 @@ struct RegisteredRow {
 }
 
 /// The first line a node sends on the channel: who is connecting, and which
-/// protocol its copy speaks. The node id is the VM's name
-/// ([`crate::state::vm_name`]), the one handle a service log can name a
-/// connected machine by; the version is [`CHANNEL_PROTOCOL_VERSION`] as the
+/// protocol its copy speaks. The node id is the node's canonical state dir
+/// and its VM's name ([`node_id`]), the handle name ownership is kept by
+/// and a service log names a connected machine by; the version is [`CHANNEL_PROTOCOL_VERSION`] as the
 /// connecting copy holds it, and a mismatch is the one reason a healthy
 /// channel refuses a node outright.
 #[derive(Debug, Serialize, Deserialize)]
 struct Hello {
-    /// The connecting node's id: its VM's name.
+    /// The connecting node's id: its canonical state dir and VM name.
     node: String,
     /// The channel protocol version the connecting copy speaks.
     version: u32,
@@ -1107,19 +1234,29 @@ fn hold_channel(
     registered: Arc<RegisteredTables>,
     own: Option<Arc<BoxRegistry>>,
     expected_uid: u32,
-) -> io::Result<()> {
+) -> io::Result<Arc<AtomicBool>> {
     crate::sock::check_uds_path_len(sock)?;
     crate::sock::prepare_socket_dir(sock)?;
     crate::sock::remove_stale_socket(sock)?;
     let listener = UnixListener::bind(sock)?;
     crate::sock::enforce_socket_permissions(sock)?;
-    // The interim holder's channel never stops: the daemon serves until it
-    // exits, and the process's exit is the whole stop.
+    // The interim holder's channel serves until a release stops it (the
+    // returned flag) or the daemon exits.
     let stop = Arc::new(AtomicBool::new(false));
+    let serving = Arc::clone(&stop);
     std::thread::Builder::new()
         .name("minvmd-zone-channel".to_string())
-        .spawn(move || serve_channel(listener, registered, expected_uid, own, DAEMON_HOLDER, stop))
-        .map(|_| ())
+        .spawn(move || {
+            serve_channel(
+                listener,
+                registered,
+                expected_uid,
+                own,
+                DAEMON_HOLDER,
+                serving,
+            );
+        })
+        .map(|_| stop)
 }
 
 /// Serves the answerer channel on `listener`: one thread per connection,
@@ -1640,13 +1777,63 @@ fn zone_rows(registry: &BoxRegistry) -> Vec<RegisteredRow> {
 /// it is, and a read that lands there prints nothing, the arm that cannot
 /// misreport.
 #[derive(Debug, Clone)]
-pub struct AnswererStatus(Arc<Mutex<ZoneAnswererStatus>>);
+pub struct AnswererStatus(Arc<AnswererShared>);
+
+/// What the acquisition and the control socket share: the status cell, and
+/// the handover's door — whether this daemon hosts the interim (the only
+/// state a release or a cancel can act on), and the sender the acquisition
+/// listens on for both.
+#[derive(Debug)]
+struct AnswererShared {
+    status: Mutex<ZoneAnswererStatus>,
+    hosting: AtomicBool,
+    commands: Mutex<Option<std::sync::mpsc::Sender<HandoverCommand>>>,
+}
+
+/// One handover request, carrying where its answer goes.
+#[derive(Debug)]
+enum HandoverCommand {
+    /// Stop the interim and free the port; wait for the service's channel.
+    Release(std::sync::mpsc::Sender<ReleaseReply>),
+    /// Re-bind the interim at once.
+    Cancel(std::sync::mpsc::Sender<ReleaseReply>),
+}
+
+/// The answer to a release or a cancel: whether it changed anything, and
+/// the sentence the daemon logged for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseReply {
+    /// Whether the request changed anything.
+    pub acted: bool,
+    /// What the daemon did.
+    pub detail: String,
+}
+
+impl ReleaseReply {
+    fn acted(detail: impl Into<String>) -> Self {
+        Self {
+            acted: true,
+            detail: detail.into(),
+        }
+    }
+
+    fn no_op(detail: impl Into<String>) -> Self {
+        Self {
+            acted: false,
+            detail: detail.into(),
+        }
+    }
+}
 
 impl AnswererStatus {
     /// A status whose acquisition loop has not run yet.
     #[must_use]
     pub fn starting() -> Self {
-        Self(Arc::new(Mutex::new(ZoneAnswererStatus::Starting)))
+        Self(Arc::new(AnswererShared {
+            status: Mutex::new(ZoneAnswererStatus::Starting),
+            hosting: AtomicBool::new(false),
+            commands: Mutex::new(None),
+        }))
     }
 
     /// The state the acquisition loop last wrote.
@@ -1654,6 +1841,7 @@ impl AnswererStatus {
     pub fn get(&self) -> ZoneAnswererStatus {
         *self
             .0
+            .status
             .lock()
             .expect("the answerer status lock is never held across a panic")
     }
@@ -1663,8 +1851,76 @@ impl AnswererStatus {
     pub(crate) fn set(&self, status: ZoneAnswererStatus) {
         *self
             .0
+            .status
             .lock()
             .expect("the answerer status lock is never held across a panic") = status;
+    }
+
+    /// Marks whether this daemon hosts the interim (or is inside a release
+    /// window it may re-bind from).
+    fn set_hosting(&self, hosting: bool) {
+        self.0.hosting.store(hosting, Ordering::SeqCst);
+    }
+
+    /// The acquisition's end of the handover door: every release and cancel
+    /// from now on reaches the returned receiver.
+    fn attach_commands(&self) -> std::sync::mpsc::Receiver<HandoverCommand> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *self
+            .0
+            .commands
+            .lock()
+            .expect("the answerer command lock is never held across a panic") = Some(sender);
+        receiver
+    }
+
+    /// Asks the acquisition to release its interim answerer (NET-122's
+    /// handover): answered once the port is free, or as a no-op by a
+    /// daemon that hosts no interim.
+    #[must_use]
+    pub fn release(&self) -> ReleaseReply {
+        self.ask(HandoverCommand::Release, "nothing to release")
+    }
+
+    /// Asks the acquisition to cancel a release and re-bind its interim at
+    /// once; a no-op where no release is pending.
+    #[must_use]
+    pub fn release_cancel(&self) -> ReleaseReply {
+        self.ask(HandoverCommand::Cancel, "nothing to re-bind")
+    }
+
+    fn ask(
+        &self,
+        command: fn(std::sync::mpsc::Sender<ReleaseReply>) -> HandoverCommand,
+        nothing: &str,
+    ) -> ReleaseReply {
+        if !self.0.hosting.load(Ordering::SeqCst) {
+            return ReleaseReply::no_op(format!(
+                "this VM host daemon hosts no interim answerer; {nothing}"
+            ));
+        }
+        let sender = self
+            .0
+            .commands
+            .lock()
+            .expect("the answerer command lock is never held across a panic")
+            .clone();
+        let Some(sender) = sender else {
+            return ReleaseReply::no_op(format!(
+                "this VM host daemon's answerer is not running; {nothing}"
+            ));
+        };
+        let (reply_to, reply) = std::sync::mpsc::channel();
+        if sender.send(command(reply_to)).is_err() {
+            return ReleaseReply::no_op(format!(
+                "this VM host daemon's answerer is not running; {nothing}"
+            ));
+        }
+        reply
+            .recv_timeout(RELEASE_REPLY_TIMEOUT)
+            .unwrap_or_else(|_| {
+                ReleaseReply::no_op("the zone answerer did not answer the request in time")
+            })
     }
 }
 
@@ -1697,7 +1953,28 @@ pub fn spawn(
 /// Acquires the machine's answerer — by publishing to it or by hosting it —
 /// for this daemon's lifetime.
 fn acquire_loop(registry: BoxRegistry, port: u16, status: AnswererStatus) {
-    acquire_loop_at(registry, port, resolve_channel_sock(), status);
+    let paths = ChannelPaths {
+        global: resolve_channel_sock(),
+        interim: interim_channel_sock(),
+        marker: resolve_install_marker(),
+        release_window: RELEASE_WINDOW,
+    };
+    acquire(registry, port, &paths, &node_id(), &status);
+}
+
+/// The acquisition over one channel, for the tests that drive it on a
+/// temporary channel: `channel` is the interim's, and no service is
+/// installed (the marker and the global channel are paths nothing holds),
+/// so the decision is the interim's publish-or-host alone.
+#[cfg(test)]
+fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: AnswererStatus) {
+    let paths = ChannelPaths {
+        global: channel.with_file_name("no-global-channel.sock"),
+        marker: channel.with_file_name("no-install-marker"),
+        interim: channel,
+        release_window: RELEASE_WINDOW,
+    };
+    acquire(registry, port, &paths, crate::state::vm_name(), &status);
 }
 
 /// What woke the acquisition's wait ([`wait_for_wake`]): a table change (a
@@ -1810,24 +2087,23 @@ fn warn_refused(node: &str, refused: Vec<RefusedRow>) {
     }
 }
 
-/// The acquisition over a named channel socket, so the whole publish-or-host
-/// machinery is drivable where the channel is not the machine's own (the
-/// tests below run daemons and the installed service's serving loops on one
-/// temporary channel).
+/// The acquisition over named channel paths, so the whole publish-or-host
+/// machinery is drivable where the channels are not the machine's own (the
+/// tests below run daemons and the installed service's serving loops on
+/// temporary channels).
 ///
-/// The choice is made on the channel socket's path, and the channel comes
-/// first: a path present is an answerer's — the installed host service's,
-/// or the interim holder daemon's, and a connect is what starts a
-/// socket-activated service, so the daemon's first act is to connect and
-/// publish there. A path present that refuses or times out is an error
-/// surfaced at session start, never a reason to host. Only a path absent
-/// leaves the answerer nobody's, and then the port decides: free, this
+/// Whether the service is installed is the install marker's to say, never
+/// the channel socket's existence. With the marker present the node
+/// publishes to the machine-global channel and nowhere else: a connect is
+/// what starts a socket-activated service, so a channel that refuses or
+/// times out is an error surfaced at session start, never a reason to host.
+/// With the marker absent, a socket at the global path is a leftover and
+/// is logged as one; the node then tries the interim's per-state-dir
+/// channel — present and answering, it publishes there — and only when that
+/// is absent (or a dead holder's corpse) does the port decide: free, this
 /// daemon hosts the answerer itself as the recorded interim and holds the
-/// channel beside it for any sibling daemon; held, the collision is
-/// surfaced — the holder is a process with no channel (a native minimald,
-/// a foreign squatter), and this VM's names answer nothing on the host
-/// until it goes. Never both: a published-to answerer is never hosted
-/// over, and a hosted one binds the channel, so the next daemon publishes.
+/// interim channel beside it for any co-resident VM; held, the collision is
+/// surfaced. Never both.
 ///
 /// A publish that lands lives for the session: the loop re-publishes the
 /// whole table on every change ping — idempotent, so a row that went is
@@ -1835,13 +2111,17 @@ fn warn_refused(node: &str, refused: Vec<RefusedRow>) {
 /// moment the answerer's end of the connection closes it reconnects with
 /// backoff and re-publishes, so a service restart is a short absence
 /// window and never a session restart.
-fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: AnswererStatus) {
+fn acquire(
+    registry: BoxRegistry,
+    port: u16,
+    paths: &ChannelPaths,
+    node: &str,
+    status: &AnswererStatus,
+) {
     // Subscribed before the first connect, so no change lands unpinged in
-    // the window before the answerer is decided. The host drops it: its own
-    // table answers live, so it has nothing to re-publish, and the next
-    // ping prunes the dead sender.
+    // the window before the answerer is decided.
     let mut pings = registry.subscribe_table_pings();
-    let node = crate::state::vm_name().to_string();
+    let commands = status.attach_commands();
     let mut held: Option<Registration> = None;
     // The once-only start info line: the first publish that lands says
     // which answerer the rows went to, whatever the passes before it
@@ -1849,9 +2129,10 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: A
     let mut published_once = false;
     // Whether the loop is inside an error episode ([`surface_error`]).
     let mut erroring = false;
-    // Whether the corpse leftover has been said already: a channel socket
-    // file with no listener logs once, not per pass of a collision episode.
+    // Whether a leftover socket file has been said already: a corpse logs
+    // once, not per pass of a collision episode.
     let mut stale_once = false;
+    let mut stale_global_once = false;
     // The backoff between attempts on a channel that is present but not
     // answering, doubling to the re-check cadence.
     let mut retry = CHANNEL_RETRY;
@@ -1865,12 +2146,12 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: A
                 Ok(refused) => {
                     erroring = false;
                     status.set(ZoneAnswererStatus::Registered { port });
-                    warn_refused(&node, refused);
-                    held = wait_out_wake(&mut pings, registration, &status, port, &mut erroring);
+                    warn_refused(node, refused);
+                    held = wait_out_wake(&mut pings, registration, status, port, &mut erroring);
                 }
                 Err(error) => {
                     surface_error(
-                        &status,
+                        status,
                         port,
                         &mut erroring,
                         &format!("the answerer channel connection failed: {error}"),
@@ -1879,53 +2160,69 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: A
             }
             continue;
         }
-        // ── the publish arm, fresh: the channel comes first, always. The
-        // connect is what starts a socket-activated answerer.
-        match connect_and_publish(&channel, &node, zone_rows(&registry)) {
+        // ── the publish arm, fresh. The installed service first, decided by
+        // its marker: its channel or nothing.
+        let installed = paths.marker.exists();
+        let channel = if installed {
+            &paths.global
+        } else {
+            if !stale_global_once && std::fs::symlink_metadata(&paths.global).is_ok() {
+                stale_global_once = true;
+                tracing::info!(
+                    component = COMPONENT,
+                    channel = %paths.global.display(),
+                    marker = %paths.marker.display(),
+                    "a socket sits at the machine-global answerer channel path but no \
+                     answerer service is installed (no install marker); treating the \
+                     path as absent"
+                );
+            }
+            &paths.interim
+        };
+        match connect_and_publish(channel, node, zone_rows(&registry)) {
             Ok(published) => {
-                let registration = published.registration;
                 retry = CHANNEL_RETRY;
                 erroring = false;
                 status.set(ZoneAnswererStatus::Registered { port });
-                warn_refused(&node, published.refused);
+                warn_refused(node, published.refused);
                 if !published_once {
                     published_once = true;
-                    // The one info line at daemon start, the diagnostics
-                    // contract's: publish-or-host, the hook port, the
-                    // channel path — and which answerer holds the port, as
-                    // its hello ack named it.
-                    let whose = match published.holder.as_str() {
-                        SERVICE_HOLDER => "the manager-held answerer service".to_string(),
-                        _ => "another VM host daemon holding the port (the single-operator \
-                              interim)"
-                            .to_string(),
-                    };
-                    tracing::info!(
-                        component = COMPONENT,
-                        holder = %published.holder,
-                        port,
-                        channel = %channel.display(),
-                        "the zone answerer is held by {whose}; published this table's zone \
-                         rows to it over the channel and hosts nothing here"
-                    );
+                    announce_publish(&published.holder, port, channel, node);
                 }
-                held = wait_out_wake(&mut pings, registration, &status, port, &mut erroring);
-                // The connection is the publish arm's to serve from now,
-                // whether the wake kept it or ended it: the host arm is for
-                // a channel socket path that is not there at all.
+                held = wait_out_wake(
+                    &mut pings,
+                    published.registration,
+                    status,
+                    port,
+                    &mut erroring,
+                );
                 continue;
             }
-            // The channel socket path is absent: the answerer is nobody's,
-            // and the host arm below decides this daemon's.
+            // The service is installed and its channel did not answer: an
+            // error, never a reason to host.
+            Err(error) if installed => {
+                surface_error(
+                    status,
+                    port,
+                    &mut erroring,
+                    &format!(
+                        "the answerer service is installed ({}) but its channel {} did not \
+                         answer: {error}",
+                        paths.marker.display(),
+                        paths.global.display()
+                    ),
+                );
+                let _ = pings.recv_timeout(retry);
+                retry = (retry * 2).min(PORT_RECHECK);
+                continue;
+            }
+            // The interim channel's path is absent: the answerer is
+            // nobody's, and the host arm below decides this daemon's.
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            // A refused connect names a corpse: the socket file is present
-            // with no listener behind it, the leftover of an interim holder
-            // that died. A service manager's socket never refuses a connect
-            // (the manager accepts it and starts the answerer) and a live
-            // holder never refuses one either, so the file is nobody's —
-            // the answerer is nobody's too, and the host arm below takes
-            // this machine's, removing the leftover when it binds the
-            // channel for the siblings it answers.
+            // A refused connect names a corpse: a socket file with no
+            // listener behind it, the leftover of an interim holder that
+            // died. The host arm takes the machine's answerer and replaces
+            // the leftover when it binds the channel.
             Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
                 if !stale_once {
                     stale_once = true;
@@ -1938,15 +2235,11 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: A
                     );
                 }
             }
-            // A channel present that refuses or times out is an error,
-            // never a reason to host: a connect starts a socket-activated
-            // service, so an answerer that is installed and healthy always
-            // answers one — this one is broken, and surfacing that is the
-            // only honest move. Retried with backoff, so a restarted one
-            // is found inside a second or two.
+            // A live interim channel that refuses or times out is an error,
+            // never a reason to host. Retried with backoff.
             Err(error) => {
                 surface_error(
-                    &status,
+                    status,
                     port,
                     &mut erroring,
                     &format!("the answerer channel is present but did not answer: {error}"),
@@ -1956,61 +2249,39 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: A
                 continue;
             }
         }
-        // ── the host arm: the channel socket path is absent, so this
-        // daemon hosts the answerer itself as the recorded interim — when
-        // the port is free. A port held with no channel behind it is a
-        // surfaced collision, not a fallback.
+        // ── the host arm: no service, no interim channel — this daemon
+        // hosts the answerer itself, when the port is free.
         match UdpSocket::bind((Ipv4Addr::LOCALHOST, port)) {
             Ok(socket) => {
-                let addr = socket
-                    .local_addr()
-                    .map_or_else(|_| format!("127.0.0.1:{port}"), |addr| addr.to_string());
-                status.set(ZoneAnswererStatus::Holder { port });
-                tracing::info!(
-                    component = COMPONENT,
-                    listener = %addr,
-                    port,
-                    channel = %channel.display(),
-                    status = "serving",
-                    "no answerer channel exists on this machine; this VM's host daemon \
-                     holds the zone answerer itself as the single-operator interim: \
-                     the box zone answers here, from this host-authored table"
-                );
-                // One table of published rows, shared by the answers and
-                // the channel that fills them: a row another daemon
-                // publishes must be the row a lookup is answered by, which
-                // two tables could never promise.
-                let registered = Arc::new(RegisteredTables::new());
-                let answerer = HostAnswerer::new(registry.clone(), Arc::clone(&registered));
-                // The channel is how sibling daemons' tables reach these
-                // answers, and how the next daemon to start knows not to
-                // host; a bind failure is warned and served around — the
-                // zone still answers, from this table alone.
-                if let Err(error) = hold_channel(
-                    &channel,
-                    Arc::clone(&registered),
-                    Some(Arc::new(registry.clone())),
-                    // SAFETY: geteuid only reads the process's own uid.
-                    unsafe { libc::geteuid() },
-                ) {
-                    tracing::warn!(
-                        component = COMPONENT,
-                        %error,
-                        "could not bind the answerer channel socket; other VM host \
-                         daemons cannot publish their names to this answerer"
+                if let Some(published) =
+                    host_interim(&registry, port, paths, node, status, &commands, socket)
+                {
+                    // A release handed the port to the service and the
+                    // publish landed there: from now on this daemon is a
+                    // channel client. Pings filed while it hosted are moot —
+                    // the publish just carried the whole table.
+                    while pings.try_recv().is_ok() {}
+                    erroring = false;
+                    retry = CHANNEL_RETRY;
+                    status.set(ZoneAnswererStatus::Registered { port });
+                    warn_refused(node, published.refused);
+                    held = wait_out_wake(
+                        &mut pings,
+                        published.registration,
+                        status,
+                        port,
+                        &mut erroring,
                     );
                 }
-                drop(pings);
-                serve(socket, answerer);
-                return;
             }
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
                 surface_error(
-                    &status,
+                    status,
                     port,
                     &mut erroring,
                     "the zone answerer's port is held by a process with no answerer \
-                     channel (a native minimald or a foreign process)",
+                     channel (a native minimald, another state dir's VM host daemon, or \
+                     a foreign process)",
                 );
                 let _ = pings.recv_timeout(PORT_RECHECK);
             }
@@ -2027,15 +2298,211 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: A
     }
 }
 
-/// Serves the box zone on a bound socket, for the holder's lifetime (the
-/// interim is this daemon's; the service's is until the service manager
-/// stops it): one datagram per turn, each either answered
-/// ([`HostAnswerer::respond`]) or silently dropped — an off-host source, or
-/// something that is not a standard query. A reply that cannot be sent is
-/// logged and skipped: a peer that vanished mid-exchange must not take the
-/// answerer down.
-fn serve(socket: UdpSocket, answerer: HostAnswerer) {
-    serve_with_stop(socket, answerer, None);
+/// The one info line at a node's first publish, the diagnostics contract's:
+/// publish-or-host, the hook port, the channel path — and which answerer
+/// holds the port, as its hello ack named it.
+fn announce_publish(holder: &str, port: u16, channel: &Path, node: &str) {
+    let whose = match holder {
+        SERVICE_HOLDER => "the manager-held answerer service",
+        _ => "another VM host daemon holding the port (the single-operator interim)",
+    };
+    tracing::info!(
+        component = COMPONENT,
+        holder = %holder,
+        port,
+        node = %node,
+        channel = %channel.display(),
+        "the zone answerer is held by {whose}; registered this table's zone rows with it \
+         over the channel and hosts nothing here"
+    );
+}
+
+/// How a release window ended.
+enum WindowEnd {
+    /// The service's channel took this node's publish.
+    Switched(Published),
+    /// A cancel arrived: re-bind now, answering it once bound.
+    Cancelled(std::sync::mpsc::Sender<ReleaseReply>),
+    /// The window ran out with no channel and no cancel.
+    TimedOut,
+}
+
+/// Hosts the interim answerer on `socket` (NET-138's recorded interim) until
+/// a release hands the port to the installed service and this node's
+/// publish lands on the service's channel — returned, for the caller to
+/// hold as a channel client. Never returns otherwise: a cancelled or timed
+/// out release re-binds the interim and keeps hosting, and a re-bind that
+/// finds the port taken returns `None` for the caller's next pass to
+/// surface.
+///
+/// The interim holds its per-state-dir channel beside the port, so the
+/// co-resident VMs of its state dir publish into it; a release stops both,
+/// removes the channel's socket file, and answers the release once the
+/// port is free.
+fn host_interim(
+    registry: &BoxRegistry,
+    port: u16,
+    paths: &ChannelPaths,
+    node: &str,
+    status: &AnswererStatus,
+    commands: &std::sync::mpsc::Receiver<HandoverCommand>,
+    socket: UdpSocket,
+) -> Option<Published> {
+    let mut socket = socket;
+    let mut rebound: Option<std::sync::mpsc::Sender<ReleaseReply>> = None;
+    loop {
+        let addr = socket
+            .local_addr()
+            .map_or_else(|_| format!("127.0.0.1:{port}"), |addr| addr.to_string());
+        status.set(ZoneAnswererStatus::Holder { port });
+        status.set_hosting(true);
+        tracing::info!(
+            component = COMPONENT,
+            listener = %addr,
+            port,
+            channel = %paths.interim.display(),
+            status = "serving",
+            "no answerer service is installed and no interim channel answers; this \
+             VM's host daemon holds the host loopback answerer port itself as the \
+             single-operator interim: the box zone answers here, from this \
+             host-authored table"
+        );
+        // One table of published rows, shared by the answers and the
+        // channel that fills them.
+        let registered = Arc::new(RegisteredTables::new());
+        let answerer = HostAnswerer::new(registry.clone(), Arc::clone(&registered));
+        let channel_stop = match hold_channel(
+            &paths.interim,
+            Arc::clone(&registered),
+            Some(Arc::new(registry.clone())),
+            // SAFETY: geteuid only reads the process's own uid.
+            unsafe { libc::geteuid() },
+        ) {
+            Ok(stop) => Some(stop),
+            Err(error) => {
+                tracing::warn!(
+                    component = COMPONENT,
+                    %error,
+                    "could not bind the interim answerer channel socket; other VM host \
+                     daemons cannot publish their names to this answerer"
+                );
+                None
+            }
+        };
+        let serve_stop = Arc::new(AtomicBool::new(false));
+        let serving = Arc::clone(&serve_stop);
+        let server = std::thread::Builder::new()
+            .name("minvmd-zone-answers".to_string())
+            .spawn(move || serve_with_stop(socket, answerer, Some(serving)));
+        let server = match server {
+            Ok(server) => server,
+            Err(error) => {
+                tracing::warn!(
+                    component = COMPONENT,
+                    %error,
+                    "could not start the interim answerer's serving thread"
+                );
+                status.set_hosting(false);
+                return None;
+            }
+        };
+        if let Some(reply_to) = rebound.take() {
+            let _ = reply_to.send(ReleaseReply::acted(format!(
+                "re-bound the interim answerer at 127.0.0.1:{port}"
+            )));
+        }
+        // ── hosting: wait for a release.
+        let release = loop {
+            match commands.recv() {
+                Ok(HandoverCommand::Release(reply_to)) => break reply_to,
+                Ok(HandoverCommand::Cancel(reply_to)) => {
+                    let _ = reply_to.send(ReleaseReply::no_op(
+                        "no release is pending; the interim answerer is serving",
+                    ));
+                }
+                // The door closed (the status went with its daemon): serve
+                // for the process's life, as the interim always did.
+                Err(_) => {
+                    let _ = server.join();
+                    return None;
+                }
+            }
+        };
+        // ── the release: stop answering, free the port, retire the channel.
+        serve_stop.store(true, Ordering::SeqCst);
+        let _ = server.join();
+        if let Some(stop) = channel_stop {
+            stop.store(true, Ordering::SeqCst);
+        }
+        let _ = std::fs::remove_file(&paths.interim);
+        status.set(ZoneAnswererStatus::Starting);
+        let detail = format!(
+            "released the interim answerer: 127.0.0.1:{port} is free; waiting up to {} s \
+             for the answerer service's channel at {}",
+            paths.release_window.as_secs(),
+            paths.global.display()
+        );
+        tracing::info!(component = COMPONENT, port, "{detail}");
+        let _ = release.send(ReleaseReply::acted(detail));
+        // ── the window: the service's channel, a cancel, or the bound.
+        let deadline = Instant::now() + paths.release_window;
+        let end = loop {
+            match commands.recv_timeout(RELEASE_POLL) {
+                Ok(HandoverCommand::Cancel(reply_to)) => break WindowEnd::Cancelled(reply_to),
+                Ok(HandoverCommand::Release(reply_to)) => {
+                    let _ = reply_to.send(ReleaseReply::no_op(
+                        "the interim answerer is already released",
+                    ));
+                }
+                Err(_) => {}
+            }
+            if paths.marker.exists()
+                && let Ok(published) = connect_and_publish(&paths.global, node, zone_rows(registry))
+            {
+                break WindowEnd::Switched(published);
+            }
+            if Instant::now() >= deadline {
+                break WindowEnd::TimedOut;
+            }
+        };
+        match end {
+            WindowEnd::Switched(published) => {
+                status.set_hosting(false);
+                announce_publish(&published.holder, port, &paths.global, node);
+                return Some(published);
+            }
+            WindowEnd::Cancelled(reply_to) => {
+                tracing::info!(
+                    component = COMPONENT,
+                    port,
+                    "the release was cancelled; re-binding the interim answerer"
+                );
+                rebound = Some(reply_to);
+            }
+            WindowEnd::TimedOut => {
+                tracing::info!(
+                    component = COMPONENT,
+                    port,
+                    "no answerer service channel came within {} s of the release; \
+                     re-binding the interim answerer",
+                    paths.release_window.as_secs()
+                );
+            }
+        }
+        match UdpSocket::bind((Ipv4Addr::LOCALHOST, port)) {
+            Ok(bound) => socket = bound,
+            Err(error) => {
+                let detail =
+                    format!("could not re-bind the interim answerer at 127.0.0.1:{port}: {error}");
+                tracing::warn!(component = COMPONENT, port, "{detail}");
+                if let Some(reply_to) = rebound.take() {
+                    let _ = reply_to.send(ReleaseReply::no_op(detail));
+                }
+                status.set_hosting(false);
+                return None;
+            }
+        }
+    }
 }
 
 /// The serving loop both holders share. Without a stop flag it serves
@@ -3107,7 +3574,7 @@ mod tests {
         let log = buf.contents();
         assert!(
             log.lines().any(|line| {
-                line.contains("published this table's zone rows")
+                line.contains("registered this table's zone rows")
                     && line.contains(channel.to_string_lossy().as_ref())
             }),
             "the first publish after a warn must still name its holder \
@@ -3265,7 +3732,7 @@ mod tests {
         await_log(
             &buf,
             |line| {
-                line.contains("published this table's zone rows")
+                line.contains("registered this table's zone rows")
                     && line.contains("the manager-held answerer service")
                     && line.contains(&channel_text)
             },
@@ -3747,6 +4214,30 @@ mod tests {
             b_web,
             "the second daemon's name answers again, at its own address"
         );
+        // The negative the restarted service serves is no longer-lived than
+        // the positive: the SOA minimum a host resolver caches a negative by
+        // (RFC 2308) is at most the A answer's TTL, so a lookup that landed
+        // in the restart's absence window cannot outlive the window in the
+        // host resolver's negative cache.
+        let positive = reply
+            .answers
+            .first()
+            .expect("the re-published name answers a record")
+            .ttl;
+        let negative = query(port, "nobody-here.min.internal.", RecordType::A)
+            .expect("an unknown name is answered after the restart");
+        assert_eq!(negative.metadata.response_code, ResponseCode::NXDomain);
+        let soa = soa_of(&negative);
+        let RData::SOA(rdata) = &soa.data else {
+            panic!("the negative carries the zone's SOA");
+        };
+        assert!(
+            rdata.minimum <= positive && soa.ttl <= positive,
+            "the negative TTL (SOA minimum {} s, record {} s) must not outlive the \
+             positive TTL ({positive} s)",
+            rdata.minimum,
+            soa.ttl
+        );
         // And both daemons' statuses are back to the published state — the
         // episode the restart opened is over.
         await_status_is(
@@ -3918,6 +4409,373 @@ mod tests {
         assert!(
             UnixStream::connect(&channel).is_ok(),
             "the holder re-bound the channel over the dead file"
+        );
+    }
+
+    /// The channel paths a test acquisition decides over, all in `dir`: the
+    /// service's global channel, the interim's, and the install marker —
+    /// none of them created here.
+    fn test_paths(dir: &tempfile::TempDir, window: Duration) -> ChannelPaths {
+        ChannelPaths {
+            global: dir.path().join("global.sock"),
+            interim: dir.path().join(CHANNEL_SOCK_FILE),
+            marker: dir.path().join("installed.marker"),
+            release_window: window,
+        }
+    }
+
+    /// A free loopback port, reserved only to learn its number.
+    fn free_port() -> u16 {
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the probe binds loopback");
+        probe.local_addr().expect("the probe names its port").port()
+    }
+
+    /// Starts one daemon's acquisition over `paths` on its own thread.
+    fn start_daemon(
+        registry: BoxRegistry,
+        port: u16,
+        paths: ChannelPaths,
+        node: &str,
+    ) -> AnswererStatus {
+        let status = AnswererStatus::starting();
+        let probe = status.clone();
+        let node = node.to_string();
+        std::thread::Builder::new()
+            .name("test-zone-daemon".to_string())
+            .spawn(move || acquire(registry, port, &paths, &node, &status))
+            .expect("the daemon's thread spawns");
+        probe
+    }
+
+    /// The machine-global channel is one path per host: nothing of a node's
+    /// state dir or VM name enters it, while the interim's channel and the
+    /// node id are per state dir — so two nodes under separate state dirs
+    /// meet on the one global channel and never share an interim or an id.
+    #[test]
+    fn channel_path_is_machine_global_across_state_dirs() {
+        assert_eq!(
+            channel_sock_from(None),
+            PathBuf::from(GLOBAL_CHANNEL_SOCK),
+            "with no test override the channel is the machine-global path"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(GLOBAL_CHANNEL_SOCK, "/run/minimal/answerer.sock");
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            GLOBAL_CHANNEL_SOCK,
+            "/Library/Application Support/minimal/run/answerer.sock"
+        );
+        let a = tempfile::TempDir::new().expect("a first state dir");
+        let b = tempfile::TempDir::new().expect("a second state dir");
+        let base = |dir: &tempfile::TempDir| {
+            paths::DaemonAbsPath::try_new(dir.path().to_str().expect("a utf-8 dir"))
+                .expect("an absolute dir")
+        };
+        let (a_interim, b_interim) = (
+            interim_channel_sock_for(&base(&a)),
+            interim_channel_sock_for(&base(&b)),
+        );
+        assert_ne!(
+            a_interim, b_interim,
+            "each state dir has its own interim channel"
+        );
+        assert!(a_interim.starts_with(a.path()) && b_interim.starts_with(b.path()));
+        for interim in [&a_interim, &b_interim] {
+            assert_ne!(
+                *interim,
+                PathBuf::from(GLOBAL_CHANNEL_SOCK),
+                "no state dir's interim is the global channel"
+            );
+        }
+        assert_ne!(
+            node_id_for(a.path(), "default"),
+            node_id_for(b.path(), "default"),
+            "two state dirs' default VMs are two nodes"
+        );
+    }
+
+    /// Name ownership is per node, not per uid: two nodes of one operator
+    /// (one uid) are two owners, so the second node's publish of the first's
+    /// name is refused and names the owner; the owner itself, reconnecting
+    /// after a service restart from a symlinked spelling of its state dir,
+    /// is the same node and keeps its name.
+    #[test]
+    fn name_ownership_is_per_node_not_per_uid() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the service");
+        let (port, channel, listener, channel_listener) = service_sockets(&dir);
+        let (stop, handle) = start_service(
+            listener
+                .try_clone()
+                .expect("the manager re-hands its listener"),
+            channel_listener
+                .try_clone()
+                .expect("the manager re-hands its channel"),
+        );
+        let state_a = dir.path().join("state-a");
+        let state_b = dir.path().join("state-b");
+        std::fs::create_dir_all(&state_a).expect("node a's state dir");
+        std::fs::create_dir_all(&state_b).expect("node b's state dir");
+        let link_a = dir.path().join("state-a-link");
+        std::os::unix::fs::symlink(&state_a, &link_a).expect("a symlinked spelling of a's dir");
+        let node_a = node_id_for(&state_a, "default");
+        let node_b = node_id_for(&state_b, "default");
+        let address = Ipv4Addr::new(127, 0, 64, 21);
+
+        let first = connect_and_publish(&channel, &node_a, vec![published_row("owned", address)])
+            .expect("node a publishes");
+        assert!(first.refused.is_empty(), "node a's name is held");
+        let second = connect_and_publish(&channel, &node_b, vec![published_row("owned", address)])
+            .expect("node b's connection is served");
+        let [refused] = &second.refused[..] else {
+            panic!(
+                "node b's claim on a's name is refused: {:?}",
+                second.refused
+            );
+        };
+        assert!(
+            refused.reason.contains(&node_a),
+            "the refusal names the owning node: {}",
+            refused.reason
+        );
+        drop(second);
+        drop(first);
+
+        // ── the service restarts; node a re-publishes first, from the
+        // symlinked spelling of its state dir.
+        stop.store(true, Ordering::SeqCst);
+        handle.join().expect("the service's first run ends");
+        std::thread::sleep(CONNECTION_POLL * 3);
+        let (stop, handle) = start_service(
+            listener
+                .try_clone()
+                .expect("the manager re-hands its listener"),
+            channel_listener
+                .try_clone()
+                .expect("the manager re-hands its channel"),
+        );
+        let relinked = node_id_for(&link_a, "default");
+        assert_eq!(relinked, node_a, "a symlinked state dir is the same node");
+        let again = connect_and_publish(&channel, &relinked, vec![published_row("owned", address)])
+            .expect("node a re-publishes after the restart");
+        assert!(again.refused.is_empty(), "node a keeps its name");
+        // A second connection of the same node is the same owner too.
+        let same = connect_and_publish(&channel, &node_a, vec![published_row("owned", address)])
+            .expect("node a's second connection is served");
+        assert!(
+            same.refused.is_empty(),
+            "the same node is never refused its own name"
+        );
+        let other = connect_and_publish(&channel, &node_b, vec![published_row("owned", address)])
+            .expect("node b's connection is served");
+        assert_eq!(other.refused.len(), 1, "node b is still refused the name");
+        let reply = await_a_record(
+            || query(port, "owned.min.internal.", RecordType::A),
+            "the owned name never answered after the restart",
+        );
+        assert_eq!(a_answer(&reply), address);
+        drop((again, same, other));
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle;
+    }
+
+    /// A release frees the hook port and switches the node to the service:
+    /// the hosting daemon answers the release once the port is free, the
+    /// service binds it, and the daemon's rows answer through the service's
+    /// channel — the handover the privileged step drives. A daemon that
+    /// hosts nothing answers a release as a no-op.
+    #[test]
+    fn release_frees_the_port_and_switches_to_the_channel() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channels");
+        let paths = test_paths(&dir, Duration::from_secs(15));
+        let port = free_port();
+        let (registry, web) = web_registry();
+        let status = start_daemon(registry, port, paths.clone(), "node-a");
+        await_status_is(
+            &status,
+            ZoneAnswererStatus::Holder { port },
+            "the daemon never hosted the interim",
+        );
+        assert!(paths.interim.exists(), "the interim holds its channel");
+
+        // The step installs the units (the marker), then asks the release.
+        std::fs::write(&paths.marker, b"").expect("the marker is written");
+        let reply = status.release();
+        assert!(reply.acted, "the hosting daemon releases: {reply:?}");
+        let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, port))
+            .expect("the port is free once the release is answered");
+        assert!(!paths.interim.exists(), "the interim's channel is retired");
+        let channel_listener =
+            UnixListener::bind(&paths.global).expect("the service's channel binds");
+        let (stop, handle) = start_service(listener, channel_listener);
+
+        await_status_is(
+            &status,
+            ZoneAnswererStatus::Registered { port },
+            "the released daemon never published to the service",
+        );
+        let reply = await_a_record(
+            || query(port, "web.min.internal.", RecordType::A),
+            "the released daemon's name never answered through the service",
+        );
+        assert_eq!(a_answer(&reply), web);
+        let noop = status.release();
+        assert!(
+            !noop.acted,
+            "a channel client has nothing to release: {noop:?}"
+        );
+        let noop = status.release_cancel();
+        assert!(
+            !noop.acted,
+            "a channel client has nothing to re-bind: {noop:?}"
+        );
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle;
+    }
+
+    /// A release whose service never comes re-binds the interim on its own
+    /// when the window runs out: the hook port is never left unanswered
+    /// past the bound.
+    #[test]
+    fn release_rebinds_the_interim_when_the_channel_never_comes() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channels");
+        let window = Duration::from_secs(2);
+        let paths = test_paths(&dir, window);
+        let port = free_port();
+        let (registry, web) = web_registry();
+        let status = start_daemon(registry, port, paths.clone(), "node-a");
+        await_status_is(
+            &status,
+            ZoneAnswererStatus::Holder { port },
+            "the daemon never hosted the interim",
+        );
+        std::fs::write(&paths.marker, b"").expect("the marker is written");
+        let released_at = Instant::now();
+        assert!(status.release().acted, "the hosting daemon releases");
+        assert!(
+            query(port, "web.min.internal.", RecordType::A).is_none(),
+            "nothing answers the released port"
+        );
+        let reply = await_a_record(
+            || query(port, "web.min.internal.", RecordType::A),
+            "the interim never re-bound after the window",
+        );
+        assert!(
+            released_at.elapsed() >= window,
+            "the interim re-bound only once the window ran out"
+        );
+        assert_eq!(a_answer(&reply), web);
+        await_status_is(
+            &status,
+            ZoneAnswererStatus::Holder { port },
+            "the daemon never said it hosts again",
+        );
+    }
+
+    /// A cancel re-binds the interim at once, well inside the window, and
+    /// says so; a cancel with no release pending is a no-op.
+    #[test]
+    fn release_cancel_rebinds_immediately() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channels");
+        let window = Duration::from_secs(60);
+        let paths = test_paths(&dir, window);
+        let port = free_port();
+        let (registry, web) = web_registry();
+        let status = start_daemon(registry, port, paths.clone(), "node-a");
+        await_status_is(
+            &status,
+            ZoneAnswererStatus::Holder { port },
+            "the daemon never hosted the interim",
+        );
+        let idle = status.release_cancel();
+        assert!(!idle.acted, "no release is pending: {idle:?}");
+        assert!(status.release().acted, "the hosting daemon releases");
+        let cancelled_at = Instant::now();
+        let reply = status.release_cancel();
+        assert!(reply.acted, "the cancel re-binds: {reply:?}");
+        assert!(
+            reply.detail.contains("re-bound"),
+            "and says so: {}",
+            reply.detail
+        );
+        let answer = await_a_record(
+            || query(port, "web.min.internal.", RecordType::A),
+            "the cancelled release never re-bound",
+        );
+        assert!(
+            cancelled_at.elapsed() < window / 4,
+            "the cancel re-bound at once, not at the window"
+        );
+        assert_eq!(a_answer(&answer), web);
+        assert!(
+            paths.interim.exists(),
+            "the re-bound interim holds its channel again"
+        );
+    }
+
+    /// A socket at the global channel path without the install marker is a
+    /// leftover, not a service: the daemon logs the stale path, ignores it,
+    /// and hosts the interim — while the marker's presence with a channel
+    /// that refuses is an error, never a host.
+    #[test]
+    fn stale_channel_without_install_marker_hosts_the_interim() {
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channels");
+        let paths = test_paths(&dir, Duration::from_secs(15));
+        // The leftover: a socket file a dead service left, nothing behind it.
+        drop(UnixListener::bind(&paths.global).expect("the leftover binds"));
+        assert!(paths.global.exists(), "the leftover socket file stays");
+        let port = free_port();
+        let (registry, web) = web_registry();
+        let status = AnswererStatus::starting();
+        let probe = status.clone();
+        let global = paths.global.display().to_string();
+        let daemon_paths = paths.clone();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        std::thread::Builder::new()
+            .name("test-zone-daemon".to_string())
+            .spawn(move || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    acquire(registry, port, &daemon_paths, "node-a", &status);
+                });
+            })
+            .expect("the daemon's thread spawns");
+        await_status_is(
+            &probe,
+            ZoneAnswererStatus::Holder { port },
+            "a stale global channel without a marker kept the daemon from hosting",
+        );
+        let reply = await_a_record(
+            || query(port, "web.min.internal.", RecordType::A),
+            "the interim never answered",
+        );
+        assert_eq!(a_answer(&reply), web);
+        await_log(
+            &buf,
+            |line| line.contains("no answerer service is installed") && line.contains(&global),
+            "the stale global channel path was never logged",
+        );
+
+        // The marker present over a channel that refuses: an error, no host.
+        let other = tempfile::TempDir::new().expect("a second temp dir");
+        let installed = test_paths(&other, Duration::from_secs(15));
+        drop(UnixListener::bind(&installed.global).expect("the refusing socket binds"));
+        std::fs::write(&installed.marker, b"").expect("the marker is written");
+        let port = free_port();
+        let (registry, _) = web_registry();
+        let status = start_daemon(registry, port, installed, "node-b");
+        await_status_is(
+            &status,
+            ZoneAnswererStatus::PortHeldNoChannel { port },
+            "an installed service's refusing channel was hosted around",
+        );
+        assert!(
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok(),
+            "the daemon never bound the port over an installed service"
         );
     }
 }

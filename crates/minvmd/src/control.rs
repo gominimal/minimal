@@ -149,7 +149,20 @@ fn serve_connection(
     // world-writable provider directory. The kernel captures the peer's
     // credentials at connect time, so a descriptor a same-uid connector
     // passes on still carries that connector's uid.
-    if let Err(error) = check_peer_credentials(&stream) {
+    //
+    // One exception, and only for the answerer handover's two verbs:
+    // root — the privileged step that installs the answerer service runs
+    // as root and asks this daemon to release the hook port. Every other
+    // verb stays the daemon's own uid's.
+    let uid = match peer_uid(&stream) {
+        Ok(uid) => uid,
+        Err(error) => {
+            tracing::debug!(%error, "control-socket peer check failed");
+            return Ok(());
+        }
+    };
+    let root_peer = is_root_peer(uid);
+    if !root_peer && let Err(error) = check_peer_uid(uid) {
         tracing::debug!(%error, "control-socket peer check failed");
         return Ok(());
     }
@@ -167,7 +180,31 @@ fn serve_connection(
             return write_reply(&mut stream, &BoxControlReply::Error { error });
         }
     };
+    if root_peer && !root_may_ask(&request) {
+        tracing::warn!(
+            peer_uid = uid,
+            "refused a control-socket request from root: root may only release the \
+             answerer or cancel a release"
+        );
+        return Ok(());
+    }
     serve_request(&mut stream, boxes, answerer, request)
+}
+
+/// Whether `peer_uid` is root connecting to a daemon that is not root's:
+/// the one foreign uid the answerer handover's verbs admit.
+fn is_root_peer(peer_uid: u32) -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    peer_uid == 0 && unsafe { libc::geteuid() } != 0
+}
+
+/// The verbs root may ask: the answerer handover's release and its cancel,
+/// nothing that reads or writes the box table.
+fn root_may_ask(request: &BoxControlRequest) -> bool {
+    matches!(
+        request,
+        BoxControlRequest::ReleaseAnswerer | BoxControlRequest::ReleaseAnswererCancel
+    )
 }
 
 /// Dispatch one parsed request to its verb and write its one reply line.
@@ -194,6 +231,36 @@ fn serve_request(
             let reply = BoxControlReply::Status(answerer.get());
             write_reply(stream, &reply)
         }
+        BoxControlRequest::ReleaseAnswerer => {
+            let reply = answerer.release();
+            tracing::info!(
+                acted = reply.acted,
+                "answer to a release request: {}",
+                reply.detail
+            );
+            write_reply(
+                stream,
+                &BoxControlReply::AnswererRelease {
+                    acted: reply.acted,
+                    detail: reply.detail,
+                },
+            )
+        }
+        BoxControlRequest::ReleaseAnswererCancel => {
+            let reply = answerer.release_cancel();
+            tracing::info!(
+                acted = reply.acted,
+                "answer to a release-cancel request: {}",
+                reply.detail
+            );
+            write_reply(
+                stream,
+                &BoxControlReply::AnswererRelease {
+                    acted: reply.acted,
+                    detail: reply.detail,
+                },
+            )
+        }
     }
 }
 
@@ -205,12 +272,13 @@ fn serve_request(
 ///
 /// The refusal is logged once per distinct foreign uid (per process
 /// lifetime) so a persistent misconfiguration does not flood the log.
+#[cfg(test)]
 fn check_peer_credentials(stream: &UnixStream) -> std::io::Result<()> {
     check_peer_uid(peer_uid(stream)?)
 }
 
 /// Admit `peer_uid` only when it is the daemon's own effective uid; the
-/// decision half of [`check_peer_credentials`], apart from the socket.
+/// decision half of the connection's peer check, apart from the socket.
 fn check_peer_uid(peer_uid: u32) -> std::io::Result<()> {
     // SAFETY: geteuid has no preconditions and cannot fail.
     let my_uid = unsafe { libc::geteuid() };
@@ -541,6 +609,9 @@ mod tests {
             BoxControlReply::Status(status) => {
                 panic!("a registration is answered with addresses, got the status {status:?}")
             }
+            BoxControlReply::AnswererRelease { detail, .. } => {
+                panic!("a box verb is never answered with a release reply, got {detail}")
+            }
         }
     }
 
@@ -822,6 +893,9 @@ mod tests {
             BoxControlReply::Status(status) => {
                 panic!("a withdrawal is answered with the pair, got the status {status:?}")
             }
+            BoxControlReply::AnswererRelease { detail, .. } => {
+                panic!("a box verb is never answered with a release reply, got {detail}")
+            }
         }
         assert!(
             registry
@@ -894,6 +968,9 @@ mod tests {
                 BoxControlReply::Status(status) => {
                     panic!("a withdrawal must be refused, got the status {status:?}")
                 }
+                BoxControlReply::AnswererRelease { detail, .. } => {
+                    panic!("a box verb is never answered with a release reply, got {detail}")
+                }
             }
         }
         assert!(
@@ -924,6 +1001,9 @@ mod tests {
             }
             BoxControlReply::Status(status) => {
                 panic!("a repeat withdrawal echoes the pair, got the status {status:?}")
+            }
+            BoxControlReply::AnswererRelease { detail, .. } => {
+                panic!("a box verb is never answered with a release reply, got {detail}")
             }
         }
 
@@ -1102,6 +1182,20 @@ mod tests {
         // A repeat refusal (logged at debug, not warn) still refuses.
         let err = check_peer_uid(foreign).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    /// Root is admitted for the answerer handover's two verbs and nothing
+    /// else: the privileged step runs as root and asks a release, and no
+    /// other verb is root's to ask of the operator's daemon.
+    #[test]
+    fn root_may_only_release_the_answerer() {
+        assert!(root_may_ask(&BoxControlRequest::ReleaseAnswerer));
+        assert!(root_may_ask(&BoxControlRequest::ReleaseAnswererCancel));
+        assert!(!root_may_ask(&BoxControlRequest::AnswererStatus));
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        assert_eq!(is_root_peer(0), me != 0);
+        assert!(!is_root_peer(me.wrapping_add(1).max(1)));
     }
 
     /// The bind tightens a provider dir the daemon owns but `StateDir::new`
