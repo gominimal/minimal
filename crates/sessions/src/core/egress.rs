@@ -187,14 +187,12 @@ impl ProxyListener {
 ///   rule set compiled without a listener at all, where no lane exists to
 ///   open it and the address is the set's drop like any other.
 /// * **Configured host exposures over the host alias**, reached as local
-///   reach under the box's rules: reach over the alias is local reach
-///   evaluated under the box's own egress rules (NET-003, design §7.1),
-///   so with no exposure configured the alias is decided by those rules
-///   and by nothing here — the shape the VM host's gate holds and the
-///   session e2e proves — and a host exposure list, when the host
-///   configures one, port-scopes the same opening: the exposure ports
-///   fall through to the box's rules and every other port at the alias
-///   joins the set's drop.
+///   reach under the box's rules (design §7.1): box→host reach over the
+///   alias is default-deny except the exposures the host configured. The
+///   exposure ports fall through to the box's own rules, which decide
+///   reach within an exposure but never open the alias by themselves;
+///   every other port at the alias is the set's drop. With no exposure
+///   configured the alias has no opening at all, at any port.
 ///
 /// The node address has no opening: nothing a box runs names a service it
 /// is owed there, and the daemon's own plane is not a destination a box's
@@ -210,9 +208,9 @@ pub struct SwitchOwnAddresses {
     /// handed again because the caller, not the rules, is what knows the
     /// switch's own layout.
     gateway: [u8; 4],
-    /// The host alias: the deprecated host-reach literal (NET-004), whose
-    /// reach is local reach under the box's rules at the exposures the host
-    /// configures.
+    /// The host alias: the deprecated host-reach literal (NET-004),
+    /// default-deny: reached only at the exposures the host configures,
+    /// as local reach under the box's rules there.
     host_alias: [u8; 4],
     /// The node address — the daemon's own address on the switch, with no
     /// opening: the machine's plane, never a box's destination.
@@ -221,17 +219,16 @@ pub struct SwitchOwnAddresses {
     /// listener arms decide when the rules carry a listener, and the set's
     /// own drop when they do not.
     bep_peer: [u8; 4],
-    /// The ports the host configured as its exposures over the host alias.
-    /// Empty — the shape every compile builds today — leaves the alias
-    /// whole as local reach under the box's rules; a list port-scopes the
-    /// opening to exactly these ports.
+    /// The ports the host configured as its exposures over the host alias:
+    /// the alias's only openings. Empty — the shape every compile builds
+    /// today — leaves the alias with no opening, dropped at every port.
     host_exposure_ports: Vec<u16>,
 }
 
 impl SwitchOwnAddresses {
     /// The four addresses of the switch this box attaches to, with no host
-    /// exposure configured: the host alias's reach stays local reach under
-    /// the box's own rules, which is the shape the VM host's gate holds.
+    /// exposure configured: the host alias has no opening, and every frame
+    /// to it is the set's drop.
     #[must_use]
     pub fn new(gateway: [u8; 4], host_alias: [u8; 4], node: [u8; 4], bep_peer: [u8; 4]) -> Self {
         Self {
@@ -245,11 +242,9 @@ impl SwitchOwnAddresses {
 
     /// The configured host exposures over the host alias (NET-062's third
     /// opening): the ports the host itself exposes, at which the alias is
-    /// reached as local reach under the box's rules — and the ceiling that
-    /// closes the alias at every other port. An empty list — nothing
-    /// configured — keeps the alias's reach decided by the box's own rules
-    /// alone, so the shipped default's reach over `host.min.internal`
-    /// (NET-003) is unchanged by the set.
+    /// reached as local reach under the box's rules. The alias is
+    /// default-deny (design §7.1): every port outside this list is the
+    /// set's drop, and an empty list leaves the alias with no opening.
     #[must_use]
     pub fn with_host_exposure_ports(mut self, ports: impl Into<Vec<u16>>) -> Self {
         self.host_exposure_ports = ports.into();
@@ -292,10 +287,7 @@ impl SwitchOwnAddresses {
             // the set holds the address for a compile that carries none,
             // where no lane exists to open it.
             Some(reason)
-        } else if dst == self.host_alias
-            && !self.host_exposure_ports.is_empty()
-            && !self.host_exposure_ports.contains(&dst_port)
-        {
+        } else if dst == self.host_alias && !self.host_exposure_ports.contains(&dst_port) {
             Some(reason)
         } else {
             None
@@ -711,9 +703,10 @@ pub struct EgressRules {
     lease: [u8; 4],
     /// The switch's own addresses, NET-062's sub-clause subtracts from
     /// whatever the CIDR dimensions admit ([`SwitchOwnAddresses`]): the
-    /// gateway, the host alias, the node address, and the Box Egress
-    /// Proxy's peer — handed by the caller, the one place that knows the
-    /// switch's subnet. `None`, the shape [`EgressRules::new`] and
+    /// gateway, the host alias (default-deny outside the host's configured
+    /// exposures), the node address, and the Box Egress Proxy's peer —
+    /// handed by the caller, the one place that knows the switch's subnet.
+    /// `None`, the shape [`EgressRules::new`] and
     /// [`EgressRules::from_policy`] build, is a compile that subtracts
     /// nothing: the VM host's gate rows are compiled this way and decide
     /// by their own copies, and the Kani oracle holds that shape.
@@ -843,7 +836,8 @@ impl EgressRules {
     /// [`SwitchOwnAddresses`]): the resolver's port on the gateway, the
     /// proxy's listener for a box on a credentialed lane, and the host's
     /// configured exposures over the alias, reached as local reach under
-    /// the box's own rules.
+    /// the box's own rules. The alias is default-deny: with no exposure
+    /// configured it has no opening.
     ///
     /// The relay leg of a frame's path out of a VM is the leg a native
     /// host runs alone, so the set is the relay's own here: no box
@@ -1162,9 +1156,10 @@ fn verdict_ipv4(summary: &FrameSummary, rules: &EgressRules) -> FrameVerdict {
     // the proxy's listener for a box on a credentialed lane (the arms
     // above, which every rule set carrying a listener has already decided
     // the peer address by), and the host alias at the exposures the host
-    // configured, reached as local reach under the box's rules. A drop
-    // here is a drop, never a reset: the verdict answers the relay, which
-    // writes nothing back toward the box.
+    // configured, reached as local reach under the box's rules — the alias
+    // is default-deny, so with none configured it drops at every port. A
+    // drop here is a drop, never a reset: the verdict answers the relay,
+    // which writes nothing back toward the box.
     if let Some(own) = &rules.switch_own
         && let Some(reason) = own.drop_reason(summary.dst_port, dst, proto, rules.proxy)
     {
@@ -2719,10 +2714,9 @@ mod tests {
     /// and a TCP query keeps the verdict its rules give it anywhere else;
     /// the proxy's listener opens for a box on a credentialed lane and
     /// nothing else at that address opens at all; and the host alias is
-    /// local reach evaluated under the box's egress rules (NET-003), at
-    /// the exposures the host configured — the whole alias while none are,
-    /// which is the shape the VM host's gate holds and the session e2e
-    /// proves, and exactly those ports once one is.
+    /// default-deny (design §7.1): reached as local reach under the box's
+    /// egress rules at exactly the exposures the host configured, and at
+    /// no port while none are.
     #[test]
     fn switch_address_openings_admit_only_their_ports() {
         let deny_all_set = deny_all().with_switch_own_addresses(own_addresses());
@@ -2786,54 +2780,66 @@ mod tests {
             "another port at the peer is the proxy arm's drop, not the set's: \
              the lane is the address's whole opening"
         );
-        // Opening three: the host alias, reached as local reach under the
-        // box's rules (NET-003). Nothing configured — the shape every
-        // compile builds today — leaves the alias whole: the rules decide
-        // it, admitting for a box that allows the subnet and refusing for
-        // one that does not, the way the host-side gate's own copy holds
-        // the alias and the session e2e proves the reach over
-        // `host.min.internal`.
-        assert!(
-            admits(&ipv4_frame(IPPROTO_TCP, HOST_ALIAS, 80), &covering),
-            "the alias is local reach: rules that admit the subnet reach it, \
-             as the gate's own copy and the e2e hold"
+        // The same for a box whose rules admit everything: the listener arms
+        // run ahead of the own-address check in the verdict, so a
+        // non-listener port at the peer drops there, whatever the rules say.
+        let laned_allow_all = EgressRules::from_policy(None, RESOLVER, LEASE)
+            .with_credentialed_upstream(BEP_PEER)
+            .with_switch_own_addresses(own_addresses());
+        assert_eq!(
+            verdict(&summarize(&other_port), &laned_allow_all),
+            FrameVerdict::Drop(DropReason::UncredentialedProxyDestination {
+                dst: BEP_PEER,
+                proto: IPPROTO_TCP,
+            }),
+            "an allow-all box on a credentialed lane cannot reach the peer off the listener"
         );
-        assert!(
-            !admits(&ipv4_frame(IPPROTO_TCP, HOST_ALIAS, 80), &deny_all_set),
-            "and a deny-all box reaches nothing over the alias — its rules' \
-             own refusal, not the set's"
+        // Opening three: the host alias, default-deny except the host's
+        // configured exposures (design §7.1). Nothing configured — the
+        // shape every compile builds today — leaves the alias with no
+        // opening: even an allow-all box's frame to it is the set's drop.
+        assert_eq!(
+            verdict(
+                &summarize(&ipv4_frame(IPPROTO_TCP, HOST_ALIAS, 80)),
+                &allow_all
+            ),
+            FrameVerdict::Drop(DropReason::InfrastructureDestination {
+                dst: HOST_ALIAS,
+                proto: IPPROTO_TCP,
+            }),
+            "with no exposure configured the alias has no opening, even for an allow-all box"
         );
-        // A host exposure configured port-scopes the same opening: the
-        // exposure ports fall through to the box's rules, and every other
-        // port at the alias joins the set's drop, whatever the rules admit.
+        // A configured exposure is the alias's only opening: the exposure
+        // ports fall through to the box's rules, which decide reach within
+        // the exposure, and every other port at the alias is the set's drop.
         let exposed = own_addresses().with_host_exposure_ports([18081u16]);
-        let covering_exposed = covering_with(exposed.clone());
-        let deny_all_exposed = deny_all().with_switch_own_addresses(exposed);
+        let allow_all_exposed = EgressRules::from_policy(None, RESOLVER, LEASE)
+            .with_switch_own_addresses(exposed.clone());
         assert!(
             admits(
                 &ipv4_frame(IPPROTO_TCP, HOST_ALIAS, 18081),
-                &covering_exposed
+                &allow_all_exposed
             ),
-            "a configured exposure is reached as local reach under the box's rules"
+            "an allow-all box reaches the configured exposure under its own rules"
         );
+        assert_eq!(
+            verdict(
+                &summarize(&ipv4_frame(IPPROTO_TCP, HOST_ALIAS, 80)),
+                &allow_all_exposed
+            ),
+            FrameVerdict::Drop(DropReason::InfrastructureDestination {
+                dst: HOST_ALIAS,
+                proto: IPPROTO_TCP,
+            }),
+            "and every other alias port is still the set's drop"
+        );
+        let deny_all_exposed = deny_all().with_switch_own_addresses(exposed);
         assert!(
             !admits(
                 &ipv4_frame(IPPROTO_TCP, HOST_ALIAS, 18081),
                 &deny_all_exposed
             ),
             "but adds no floor: the deny-all box's rules still refuse the exposure"
-        );
-        assert_eq!(
-            verdict(
-                &summarize(&ipv4_frame(IPPROTO_TCP, HOST_ALIAS, 80)),
-                &covering_exposed
-            ),
-            FrameVerdict::Drop(DropReason::InfrastructureDestination {
-                dst: HOST_ALIAS,
-                proto: IPPROTO_TCP,
-            }),
-            "every other port at the alias is the set's drop once an exposure \
-             is configured"
         );
     }
 

@@ -2102,9 +2102,10 @@ pub fn declared_request_ports(policy: Option<&sessions::SessionPolicy>) -> BTree
 /// native host runs — subtracts them from whatever the box's
 /// `egress.allow_subnets` admits, outside the three port-scoped openings
 /// the sub-clause lists (the resolver's port on the gateway, the proxy's
-/// listener on a credentialed lane, and the host alias as local reach under
-/// the box's rules — no host exposure is configured anywhere today, so the
-/// set is handed with none). The same compilation is the hostname proxy's
+/// listener on a credentialed lane, and the host's configured exposures over
+/// the host alias). The alias is default-deny (design §7.1): no host exposure
+/// is configured anywhere today, so the set is handed with none and the
+/// alias has no opening. The same compilation is the hostname proxy's
 /// caller check, so no reach the relay would refuse can be asked of the
 /// proxy instead (NET-071).
 #[must_use]
@@ -3524,13 +3525,10 @@ pub(crate) mod tests {
     /// the node address at every port never reach the switch, dropped
     /// silently (never reset) and named by the rate-limited warn line under
     /// the infrastructure deny set's own rule; the peer's listener is the
-    /// lane's opening, already pinned lane-less above. The openings still
-    /// forward: the resolver's port on the gateway, and the host alias,
-    /// reached as local reach under the box's own rules — no host exposure
-    /// is configured anywhere today, so the alias is the rules' own to
-    /// decide, and these rules admit it, the shape the VM host's gate
-    /// holds and the session e2e proves over `host.min.internal`
-    /// (NET-003).
+    /// lane's opening, already pinned lane-less above. The host alias is
+    /// default-deny except configured host exposures (design §7.1), and none
+    /// is configured, so it drops with them under the same rule. The
+    /// resolver's port on the gateway still forwards.
     #[tokio::test]
     async fn native_relay_drops_flows_to_switch_addresses() {
         let capture = crate::test_harness::captured_log();
@@ -3560,13 +3558,11 @@ pub(crate) mod tests {
         };
         let mut harness = spawn_test_relay(&covering);
 
-        // The openings forward, verbatim: the resolver's port on the
-        // gateway over UDP and TCP alike, and the host alias as local reach
-        // under the rules (NET-003's shape).
+        // The opening forwards, verbatim: the resolver's port on the
+        // gateway over UDP and TCP alike.
         let openings = [
             udp_frame(LEASE, 40000, gateway, 53),
             egress_tcp_frame(LEASE, gateway, 53),
-            egress_tcp_frame(LEASE, alias, 18081),
         ];
         for frame in &openings {
             harness.box_end.write_all(frame).unwrap();
@@ -3582,13 +3578,16 @@ pub(crate) mod tests {
         }
 
         // The box reaches for the switch's own control surface — the
-        // gateway on another port, and the node address at the daemon's own
-        // port — then ARP as the sentinel: nothing before it arrives.
+        // gateway on another port, the node address at the daemon's own
+        // port, and the host alias with no exposure configured — then ARP
+        // as the sentinel: nothing before it arrives.
         let api = egress_tcp_frame(LEASE, gateway, 443);
         let node_ssh = egress_tcp_frame(LEASE, node, 7654);
+        let to_alias = egress_tcp_frame(LEASE, alias, 18081);
         let sentinel = arp_frame(LEASE);
         harness.box_end.write_all(&api).unwrap();
         harness.box_end.write_all(&node_ssh).unwrap();
+        harness.box_end.write_all(&to_alias).unwrap();
         harness.box_end.write_all(&sentinel).unwrap();
         let seen = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
             .await
@@ -3596,10 +3595,10 @@ pub(crate) mod tests {
             .expect("the switch side stays open");
         assert_eq!(
             seen, sentinel,
-            "neither the gateway nor the node address reached the switch"
+            "neither the gateway, the node address nor the alias reached the switch"
         );
 
-        // The drop says so, once per box per rule per interval — the two
+        // The drop says so, once per box per rule per interval — the three
         // drops share the set's one rule, so the first is the line a
         // bundle reads: the gateway's own (address, port), the protocol,
         // the box, the direction, and the rule naming the infrastructure
