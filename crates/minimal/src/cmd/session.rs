@@ -4132,7 +4132,7 @@ mod tests {
         let _server = minvmd::control::spawn(
             sock_path.clone(),
             registry.clone(),
-            minvmd::net::answerer::AnswererStatus::starting(),
+            minvmd::net::answerer::AnswererStatus::allocating_for_tests("session-test-node"),
         )
         .expect("the control server binds its socket");
         let global = GlobalArgs {

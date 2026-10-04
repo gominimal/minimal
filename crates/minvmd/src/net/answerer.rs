@@ -2577,8 +2577,9 @@ impl AnswererStatus {
     /// A status whose allocations a test thread answers from its own book,
     /// as node `node` — the stand-in for the acquisition loop in tests that
     /// register boxes without one.
-    #[cfg(test)]
-    pub(crate) fn allocating_for_tests(node: &str) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn allocating_for_tests(node: &str) -> Self {
         let status = Self::starting();
         let commands = status.attach_commands();
         let node = node.to_string();
