@@ -73,7 +73,7 @@ pub trait PackageSelection {
                 .unwrap()
                 .map(|n| match g.by_name(n) {
                     Some(bsr) => Ok(*bsr),
-                    None => Err(Error::Other(anyhow!("{}", package_not_found_message(g, n)))),
+                    None => Err(Error::Other(anyhow!(package_not_found_message(g, n)))),
                 })
                 .collect::<Result<_, _>>()
         }
@@ -104,16 +104,16 @@ fn package_suggestions(g: &Graph, input: &str) -> Vec<String> {
     use common::fuzzy_search::fuzzy_match;
 
     let input = input.trim().to_lowercase();
+    let mut exact: Vec<&str> = Vec::new();
     let mut prefix_of_input: Vec<&str> = Vec::new();
     let mut input_prefix_of: Vec<&str> = Vec::new();
     let mut fuzzy: Vec<(&str, common::fuzzy_search::SearchMatch)> = Vec::new();
 
     for name in g.names() {
         let lower = name.to_lowercase();
-        if name == input {
-            continue;
-        }
-        if input.starts_with(&lower) {
+        if lower == input {
+            exact.push(name);
+        } else if input.starts_with(&lower) {
             prefix_of_input.push(name);
         } else if lower.starts_with(&input) {
             input_prefix_of.push(name);
@@ -122,11 +122,13 @@ fn package_suggestions(g: &Graph, input: &str) -> Vec<String> {
         }
     }
 
+    exact.sort_unstable();
     prefix_of_input.sort_by_key(|n| (n.len(), *n));
     input_prefix_of.sort_by_key(|n| (n.len(), *n));
     fuzzy.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
 
     let mut candidates: Vec<String> = Vec::with_capacity(3);
+    candidates.extend(exact.into_iter().map(str::to_string));
     candidates.extend(prefix_of_input.into_iter().map(str::to_string));
     candidates.extend(input_prefix_of.into_iter().map(str::to_string));
     candidates.extend(fuzzy.into_iter().map(|(n, _)| n.to_string()));
@@ -1942,34 +1944,20 @@ mod tests {
         });
     }
 
-    /// Builds a small graph containing `node` and `python` for the
+    /// Builds a small graph containing the named packages for the
     /// package-not-found suggestion tests.
-    fn suggestion_graph() -> Graph {
+    fn suggestion_graph(names: &[&str]) -> Graph {
         let mut opts = decode::LoadOptions::for_test();
         opts.minimal_lib_path = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("../stdlib/minimal-ncl");
 
+        let specs = names
+            .iter()
+            .map(|n| format!("({{ name = \"{n}\", build_deps = [], cmd = \"\" }} | BuildSpec)"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let layer = decode::Layer::new_for_test_with(
-            indoc! {
-                "
-                let {BuildSpec, ..} = import \"minimal.ncl\" in
-
-                let
-                    node = {
-                        name = \"node\",
-                        build_deps = [],
-                        cmd = \"\",
-                    } | BuildSpec,
-                    python = {
-                        name = \"python\",
-                        build_deps = [],
-                        cmd = \"\",
-                    } | BuildSpec,
-                in
-                [node, python]
-                "
-            }
-            .to_string(),
+            format!("let {{BuildSpec, ..}} = import \"minimal.ncl\" in [{specs}]"),
             &opts,
         )
         .unwrap_or_else(|e| {
@@ -1982,7 +1970,7 @@ mod tests {
 
     #[test]
     fn package_not_found_suggests_prefix_of_input() {
-        let graph = suggestion_graph();
+        let graph = suggestion_graph(&["node", "python"]);
         let err = vec!["nodejs".to_string()].as_bsrs(&graph).unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -1992,7 +1980,7 @@ mod tests {
 
     #[test]
     fn package_not_found_suggests_fuzzy_match() {
-        let graph = suggestion_graph();
+        let graph = suggestion_graph(&["node", "python"]);
         let err = vec!["pyhton".to_string()].as_bsrs(&graph).unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -2002,7 +1990,7 @@ mod tests {
 
     #[test]
     fn package_not_found_without_candidates_suggests_search() {
-        let graph = suggestion_graph();
+        let graph = suggestion_graph(&["node", "python"]);
         let err = vec!["zzzz".to_string()].as_bsrs(&graph).unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -2012,38 +2000,23 @@ mod tests {
 
     #[test]
     fn package_not_found_suggests_case_insensitive_match() {
-        let mut opts = decode::LoadOptions::for_test();
-        opts.minimal_lib_path = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
-            .join("../stdlib/minimal-ncl");
-
-        let layer = decode::Layer::new_for_test_with(
-            indoc! {
-                "
-                let {BuildSpec, ..} = import \"minimal.ncl\" in
-
-                let
-                    Python = {
-                        name = \"Python\",
-                        build_deps = [],
-                        cmd = \"\",
-                    } | BuildSpec,
-                in
-                [Python]
-                "
-            }
-            .to_string(),
-            &opts,
-        )
-        .unwrap_or_else(|e| {
-            e.report_to_stderr();
-            panic!("spec parsing failed");
-        });
-
-        let graph = Graph::new().ingest(layer).unwrap();
+        let graph = suggestion_graph(&["Python"]);
         let err = vec!["python".to_string()].as_bsrs(&graph).unwrap_err();
         assert_eq!(
             err.to_string(),
             "No such package: python (did you mean: Python?)"
         );
+    }
+
+    #[test]
+    fn package_not_found_suggests_exact_name_for_other_case() {
+        let graph = suggestion_graph(&["node", "nodejs", "python"]);
+        for input in ["NODE", "Node", "node "] {
+            let err = vec![input.to_string()].as_bsrs(&graph).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("No such package: {input} (did you mean: node, nodejs?)")
+            );
+        }
     }
 }
