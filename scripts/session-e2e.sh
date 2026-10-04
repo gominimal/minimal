@@ -16300,6 +16300,49 @@ exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
   echo "VM host daemon start record (default): $tw_rec_a"
   echo "VM host daemon start record ($tw_name): $tw_rec_b"
 
+  # ---- T93: each boot's publish report carried that boot's generation -----
+  # The supervisor draws a publish generation per boot and hands it to the
+  # guest on the kernel command line; the guest echoes it in every publish
+  # report. A report with no generation is still kept after READY (an older
+  # guest's), so a break anywhere in that chain would leave every beat above
+  # green. Each VM's last draw and its last kept-report line — read from the
+  # tail after the snapshot, so they are this run's boots — must name the
+  # same generation, and the report's must be present.
+  for tw_vm in default "$tw_name"; do
+    tw_draw=""
+    tw_kept=""
+    for _ in $(seq 1 40); do
+      tw_since="$(two_vm_log_since "$tw_log" "$tw_log_lines" | grep -F -- "\"vm\":\"$tw_vm\"" || true)"
+      tw_draw="$(printf '%s\n' "$tw_since" \
+        | grep -F -- "drew the boot's publish generation" | tail -n1 || true)"
+      tw_kept="$(printf '%s\n' "$tw_since" | grep -F -- '"report_generation"' \
+        | grep -E -- "re-probed the port|the guest's late report" | tail -n1 || true)"
+      [ -n "$tw_draw" ] && [ -n "$tw_kept" ] && break
+      sleep 0.5
+    done
+    if [ -z "$tw_draw" ] || [ -z "$tw_kept" ]; then
+      echo "::error::VM $tw_vm: the supervisor log is missing its publish-generation draw or its kept publish report for this boot (draw: '${tw_draw:-<none>}' · report: '${tw_kept:-<none>}') (T93)"
+      echo "--- log (tail) ---"; tail -40 "$(two_vm_minvmd_log)" 2>/dev/null || true
+      fail
+    fi
+    tw_gen_drawn="$(printf '%s\n' "$tw_draw" | sed -n 's/.*"generation":\([0-9][0-9]*\).*/\1/p')"
+    tw_gen_report="$(printf '%s\n' "$tw_kept" | sed -n 's/.*"report_generation":"\([^"]*\)".*/\1/p')"
+    tw_gen_boot="$(printf '%s\n' "$tw_kept" | sed -n 's/.*"boot_generation":\([0-9][0-9]*\).*/\1/p')"
+    if [ -z "$tw_gen_drawn" ] || [ -z "$tw_gen_report" ] || [ "$tw_gen_report" = absent ]; then
+      echo "::error::VM $tw_vm: the publish report this boot kept carried no generation (drawn '${tw_gen_drawn:-<none>}', reported '${tw_gen_report:-<none>}') — the command line → guest → report chain is broken, and the token-less report was kept as an older guest's (T93)"
+      echo "--- draw ---"; printf '%s\n' "$tw_draw"
+      echo "--- report ---"; printf '%s\n' "$tw_kept"
+      fail
+    fi
+    if [ "$tw_gen_report" != "$tw_gen_drawn" ] || [ "$tw_gen_boot" != "$tw_gen_drawn" ]; then
+      echo "::error::VM $tw_vm: the kept publish report's generation is not the one this boot drew (drawn $tw_gen_drawn, reported $tw_gen_report, decided against ${tw_gen_boot:-<none>}) (T93)"
+      echo "--- draw ---"; printf '%s\n' "$tw_draw"
+      echo "--- report ---"; printf '%s\n' "$tw_kept"
+      fail
+    fi
+    echo "publish generation (VM $tw_vm): drawn $tw_gen_drawn · reported $tw_gen_report — the guest echoed this boot's generation"
+  done
+
   mnl session destroy --force "$tw_a_sid" >/dev/null 2>&1 \
     || { echo "::error::could not destroy the default VM's box"; fail; }
   echo "destroy: box A on VM default — min session destroy --force"

@@ -817,6 +817,10 @@ fn run_foreground() -> Result<()> {
         // report, so a report is told apart from a killed boot's even when
         // both boots were handed the same port.
         let publish_generation = draw_publish_generation();
+        tracing::info!(
+            generation = publish_generation,
+            "drew the boot's publish generation"
+        );
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("__krun-vmm");
         // Forward the state-dir override and VM name so the VMM child resolves the
@@ -1011,21 +1015,26 @@ fn run_foreground() -> Result<()> {
     // from a guest too old to echo one — none.
     if let Some((port, generation)) = unconfirmed_port {
         let proxy_publish = proxy_publish.clone();
+        // The watcher keeps the supervisor's span, so its lines carry `vm`.
+        let vm_scope = tracing::Span::current();
         std::thread::spawn(move || {
+            let _vm_scope = vm_scope.entered();
             for event in marker_events {
                 if event.is_straggler_for(generation, true) {
                     continue;
                 }
                 match event {
-                    MarkerEvent::ProxyServing(published, _) if published == port => {
+                    MarkerEvent::ProxyServing(published, reported) if published == port => {
                         tracing::info!(
                             port,
+                            report_generation = %report_generation_field(reported),
+                            boot_generation = generation,
                             "the guest's late report confirms the hostname proxy's publish"
                         );
                         proxy_publish.confirm(port);
                         return;
                     }
-                    MarkerEvent::ProxyPortHeld(held, _) if held == port => {
+                    MarkerEvent::ProxyPortHeld(held, reported) if held == port => {
                         // The VM stays up: the cause says so, and names the
                         // holder the host can see now, so the surfaces never
                         // recycle the start failure's words for a VM that
@@ -1034,6 +1043,8 @@ fn run_foreground() -> Result<()> {
                         tracing::warn!(
                             port,
                             holder = holder.as_deref().unwrap_or("unnamed"),
+                            report_generation = %report_generation_field(reported),
+                            boot_generation = generation,
                             "the guest's late report says the hostname proxy's port is held"
                         );
                         proxy_publish.set_down(port, ProxyDownCause::PortHeldAfterStart { holder });
@@ -2250,7 +2261,7 @@ fn await_boot_beacon(
             }
             event => {
                 if early_report.is_none() {
-                    early_report = publish_report_of(event);
+                    early_report = publish_report_of(event, boot_generation);
                 }
             }
         }
@@ -2267,7 +2278,7 @@ fn log_straggler(event: &MarkerEvent, boot_generation: u64, when: &str) {
     {
         tracing::warn!(
             port,
-            report_generation = ?reported,
+            report_generation = %report_generation_field(*reported),
             boot_generation,
             when,
             "skipped a publish report another boot sent"
@@ -2275,25 +2286,42 @@ fn log_straggler(event: &MarkerEvent, boot_generation: u64, when: &str) {
     }
 }
 
+/// How a publish report's generation reads in the log (T93): the
+/// generation the guest echoed, or `absent` for a report that carried none —
+/// a word, never a number, so a token-less report cannot pass for one.
+#[cfg(any(minvmd_libkrun, test))]
+fn report_generation_field(reported: Option<u64>) -> String {
+    reported.map_or_else(|| "absent".to_owned(), |generation| generation.to_string())
+}
+
 /// A kept publish report as the decision reads it, re-probed host-side and
 /// logged (T93), so the daemon's log names the outcome the supervisor
-/// *checked* for the port, not only the one the guest claimed. `None` for a
+/// *checked* for the port, not only the one the guest claimed — and the
+/// generation the report carried beside this boot's, so a report that lost
+/// its generation on the way is visible, not silently kept. `None` for a
 /// beacon.
 #[cfg(any(minvmd_libkrun, test))]
-fn publish_report_of(event: MarkerEvent) -> Option<crate::control::GuestPublish> {
+fn publish_report_of(
+    event: MarkerEvent,
+    boot_generation: u64,
+) -> Option<crate::control::GuestPublish> {
     match event {
-        MarkerEvent::ProxyServing(published, _) => {
+        MarkerEvent::ProxyServing(published, reported) => {
             tracing::info!(
                 port = published,
                 port_answers = loopback_answers(published),
+                report_generation = %report_generation_field(reported),
+                boot_generation,
                 "the guest published the hostname proxy; re-probed the port"
             );
             Some(crate::control::GuestPublish::Serving { port: published })
         }
-        MarkerEvent::ProxyPortHeld(held, _) => {
+        MarkerEvent::ProxyPortHeld(held, reported) => {
             tracing::info!(
                 port = held,
                 port_answers = loopback_answers(held),
+                report_generation = %report_generation_field(reported),
+                boot_generation,
                 "the guest's publish was refused for address-in-use; re-probed the port"
             );
             Some(crate::control::GuestPublish::PortHeld { port: held })
@@ -2418,7 +2446,7 @@ fn await_publish_report(
             Ok(event) if event.is_straggler_for(boot_generation, true) => {
                 log_straggler(&event, boot_generation, "while watching the publish");
             }
-            Ok(event) => return publish_report_of(event),
+            Ok(event) => return publish_report_of(event, boot_generation),
             Err(_) => return None,
         }
     }
@@ -2588,6 +2616,16 @@ mod tests {
             None
         );
         assert_eq!(super::parse_publish_report("PROXY_ELSE", "7654", ""), None);
+    }
+
+    #[test]
+    fn a_report_generation_logs_as_its_number_or_absent() {
+        assert_eq!(super::report_generation_field(Some(41)), "41");
+        assert_eq!(
+            super::report_generation_field(Some(u64::MAX)),
+            u64::MAX.to_string()
+        );
+        assert_eq!(super::report_generation_field(None), "absent");
     }
 
     #[test]
