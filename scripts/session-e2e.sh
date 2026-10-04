@@ -7580,6 +7580,27 @@ for row in json.load(open(sys.argv[1])):
       fail
     fi
   fi
+  # The service answers on the host loopback only (§7.1: box names are
+  # answered locally): its unit must bind 127.0.0.1, never a wildcard that
+  # would put a *.min.internal responder on every interface.
+  local asr_binds
+  if [ "$asr_os" = Linux ]; then
+    asr_binds="$(sudo -n ss -Hlun 2>/dev/null | awk '{print $4}' | grep -E ":$asr_port\$" || true)"
+  else
+    asr_binds="$(sudo -n lsof -nP -iUDP:"$asr_port" 2>/dev/null | awk 'NR > 1 {print $NF}' || true)"
+  fi
+  case "$asr_binds" in
+    *"127.0.0.1:$asr_port"*) ;;
+    *)
+      echo "::error::nothing holds 127.0.0.1:$asr_port after the handover: ${asr_binds:-<none listed>}"
+      fail
+      ;;
+  esac
+  if printf '%s\n' "$asr_binds" | grep -Eq "^(\*|0\.0\.0\.0|\[::\]|\[\*\]):$asr_port\$"; then
+    echo "::error::the hook port is bound on every interface after the handover, not the loopback only: $asr_binds"
+    fail
+  fi
+  echo "  the hook port is bound on the loopback only: $(printf '%s' "$asr_binds" | sort -u | tr '\n' ' ')"
   if ! sudo -n test -S "$asr_channel"; then
     echo "::error::the machine-global channel socket $asr_channel is absent after the command"
     fail
