@@ -165,6 +165,10 @@ included, with every refusal logged (NET-001 to NET-004).
   property: for every host with the reserved local range present and every sequence of publish and withdraw operations from every allocator on it, up to 8 live boxes, no two live own-address or `none` boxes hold the same loopback address
   harness:  kani_loopback_alloc_injective, exhaustive to 8 live boxes across allocators; requires the allocator to be a pure function over one host-wide owned set of leased addresses, separate from the publish call and from any allocator's own state
   <!-- S1b-2a; prose 6; event-driven; the no-collision clause is the universal for spec-tiers; "host-global" per design §7.1: allocation is host-global through the answerer's authenticated channel for every allocator, the helper for each VM (NET-138) and each native daemon, and no in-VM daemon self-assigns; host-address boxes mirror their node's address (NET-129); a host without the range publishes at `127.0.0.1` under NET-123's interim, outside this requirement -->
+  - WHEN the allocator frees a box's host loopback address THE SYSTEM SHALL hold it back from allocation for the positive answer TTL.
+    tier:   T0
+    verify: cargo nextest run -p minvmd released_address_is_not_reused_within_the_answer_ttl
+    <!-- design §7.1; event-driven; allocation runs through the answerer's authenticated channel from `.2` upward within the reserved range, and co-resident nodes never self-assign; a client that resolved the released name can still connect for the answer's 15 s positive TTL, so an early reuse would hand that connection to a different box -->
 
 - **NET-011** WHEN a session is finalised THE SYSTEM SHALL register `<name>.min.internal` for the box's loopback address.
   tier:     T0
