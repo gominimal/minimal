@@ -66,6 +66,15 @@ enum Command {
     },
     /// Stop the running daemon gracefully.
     Stop,
+    /// Serve the box-zone answerer as the installed host service — run by the
+    /// service manager over the sockets it holds, not for direct use.
+    Answerer {
+        /// Print the answerer channel protocol version this copy speaks and
+        /// exit — the probe the CLI's privileged step compares with the
+        /// daemon's own.
+        #[arg(long)]
+        protocol_version: bool,
+    },
     /// Hidden VMM child subcommand — spawned by `boot`, not for direct use.
     #[command(name = "__krun-vmm", hide = true)]
     KrunVmm,
@@ -142,6 +151,7 @@ fn main() -> Result<()> {
             // stop that never happened.
             minvmd::cmd::stop::run()
         }
+        Command::Answerer { protocol_version } => minvmd::cmd::answerer::run(protocol_version),
         Command::KrunVmm => minvmd::cmd::vmm_child::run(),
     }
 }

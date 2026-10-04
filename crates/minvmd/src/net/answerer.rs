@@ -13,22 +13,42 @@
 //! verdict names, the SOA its negatives cite), the host loopback listener,
 //! and one machine-shaped rule below.
 //!
-//! That rule is the **holder**. The answerer port is the machine's, so on a
-//! host running more than one VM host daemon — one per named VM — exactly
-//! one of them can bind it. The one that does is the holder: it serves the
-//! zone from its own table *merged with every other daemon's registered
-//! rows*, which arrive over the answerer channel, a unix socket beside the
-//! daemon's state — a name two sources both hold is kept by the first
-//! writer and refused of the later, one warn per clash. A daemon that
-//! finds the port held connects, sends its
-//! table's zone rows as one line, keeps the connection open, and answers
-//! nothing itself — its rows answer through the holder. The connection is
-//! the registration's lifetime: when it drops, the holder retires its rows,
-//! so a daemon that exits never leaves names answering behind it, and a
-//! table that changes re-registers (the registry pings every change
-//! ([`BoxRegistry::subscribe_table_pings`])). A holder that exits frees
-//! the port, and the next daemon's re-check takes it, so the zone is never
-//! orphaned on a host whose first daemon went away.
+//! That rule is **who holds the answerer**. The answerer port is the
+//! machine's, so exactly one process on the host may serve it — and the one
+//! that should is the **installed host service** the privileged step
+//! installs (NET-122's sub-requirement): a `minvmd answerer` the service
+//! manager runs as the operator, its listener and channel sockets the
+//! manager's own, so the zone survives every session on the host. This
+//! daemon is one of that service's *nodes*: at start it connects to the
+//! answerer channel first and publishes its table's rows there — a connect
+//! is what starts a socket-activated service, so a channel socket present
+//! but refusing or timing out is an error surfaced at session start, never
+//! a reason to hold the port — and only when the channel socket path is
+//! *absent* does the daemon host the answerer itself, as the recorded
+//! interim (NET-138): it binds the port and the channel both, serves the
+//! zone from its own table merged with every other node's published rows,
+//! and the next daemon to start publishes into it instead. Never both: a
+//! node hosts only when there is no channel to publish to, and a port held
+//! with no channel behind it is a surfaced collision, not a fallback.
+//!
+//! The channel — the service's and the interim holder's, one wire for
+//! both, so a node's publish path is the same either way — carries a
+//! hello naming the node and the channel's protocol version
+//! ([`CHANNEL_PROTOCOL_VERSION`], the number the CLI's probe compares
+//! between an installed copy and the daemon, so an upgrade re-surfaces the
+//! privileged step), then one publish per line: a whole table's zone
+//! rows, with the connection's reply naming the rows it refused. A name
+//! belongs to the connection that first published it — a second node's
+//! publish of a held name is refused and reported — and a published A
+//! address outside the host-answerable range (NET-127) is refused with
+//! its reason. A publish is held while its connection lives and retired
+//! the moment it ends, so a restarted service holds nothing until its
+//! nodes connect again — and a node keeps its connection for the session,
+//! re-publishes idempotently on every table change, and reconnects with
+//! backoff the moment the service's end closes, so a service restart is a
+//! short absence window and never a session restart. The connection's
+//! peer uid is the service's own or the connection is refused: the
+//! channel is the operator's, not the machine's.
 //!
 //! Answer semantics, decided by the shared core and gated on the lookup
 //! originating on this machine (NET-006 — the zone leaves the machine with
@@ -50,16 +70,20 @@
 //!
 //! The observability contract, as the phase's diagnostics state it: one
 //! debug line per answered lookup naming the name, the type, and the answer
-//! class; one info line at start naming the listener this daemon holds or
-//! the holder it registered with.
+//! class; one info line at daemon start naming publish-or-host, the hook
+//! port and the channel path; at the answerer service, one info line per
+//! node connection and disconnection, and one warn line per refused channel
+//! peer naming its uid.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, UdpSocket};
+use std::os::unix::io::AsRawFd as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, MessageType, Metadata, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{A, SOA};
@@ -100,20 +124,51 @@ pub const CHANNEL_SOCK_FILE: &str = "answerer.sock";
 /// buffered unbounded.
 const MAX_DATAGRAM: usize = 4096;
 
-/// How long the holder waits for a registering daemon's first line before
-/// dropping the connection: a connection that never speaks is a stray
-/// connect, not a registrant, and must not pin the per-connection slot.
-const REGISTER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// The channel's protocol version: bumped whenever the channel's wire
+/// changes, because a daemon and an installed answerer copy can be from
+/// different releases of this codebase — the service checks the number a
+/// node's hello carries against its own before it holds any of that node's
+/// rows, and the CLI's step probe runs `<installed copy> answerer
+/// --protocol-version` and compares the printed number with the daemon's
+/// own (this constant, the same install), re-surfacing the privileged step
+/// on a mismatch so an upgrade re-runs it and the installed copy is never
+/// left speaking a wire the daemon no longer understands.
+pub const CHANNEL_PROTOCOL_VERSION: u32 = 2;
 
-/// The largest line either side of the channel will read: a registration
+/// How long the serving side waits for a connecting node's hello before
+/// dropping the connection: a connection that never speaks is a stray
+/// connect, not a node, and must not pin the per-connection slot.
+const HELLO_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a node waits for the serving side's reply to its hello or a
+/// publish: a socket-activated service starts at the connect, so the bound
+/// only has to cover the manager's start latency, and a reply that misses
+/// it means the answerer is not serving — surfaced, retried with backoff,
+/// never hosted around.
+const CHANNEL_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The first backoff a node waits between attempts on a channel that is
+/// present but not answering, doubling each attempt up to [`PORT_RECHECK`]:
+/// a restarting service is back inside a second or two, and a broken one is
+/// retried at the re-check cadence rather than hammered.
+const CHANNEL_RETRY: Duration = Duration::from_millis(250);
+
+/// How often a served connection or listener is polled for a stop of the
+/// serving loops: the stop handle is the restart proof's, always unset in
+/// production, and the poll slice bounds how long after the flag a loop
+/// keeps serving (see [`read_line_resumable`] for why the slice is a read
+/// timeout and not a non-blocking flip).
+const CONNECTION_POLL: Duration = Duration::from_millis(250);
+
+/// The largest line either side of the channel will read: a publish
 /// carries one row per published namespace; anything past this bound is not
 /// one.
 const MAX_REQUEST_LINE: usize = 64 * 1024;
 
-/// How long a daemon that does not hold the answerer port waits before
-/// trying it again: long enough that a live holder sees no chatter, short
-/// enough that a holder that exited is replaced within half a minute — the
-/// zone is never orphaned on a host whose first daemon went away.
+/// How long a node waits before re-deciding the answerer when nothing woke
+/// it — a table change ping, or the held connection's end: long enough
+/// that a live answerer sees no chatter, short enough that a channel that
+/// came up while the node idled is found within half a minute.
 const PORT_RECHECK: Duration = Duration::from_secs(30);
 
 /// Resolve the answerer channel socket's path — machine-global: the
@@ -152,34 +207,83 @@ struct RegisteredRow {
     live: bool,
 }
 
-/// One registration over the channel: a whole table's zone rows, one line.
-/// The *message*, not the registration itself — that is the registrant's
-/// held connection ([`Registration`]), which outlives the line it arrived
-/// by for exactly as long as its rows are held.
+/// The first line a node sends on the channel: who is connecting, and which
+/// protocol its copy speaks. The node id is the VM's name
+/// ([`crate::state::vm_name`]), the one handle a service log can name a
+/// connected machine by; the version is [`CHANNEL_PROTOCOL_VERSION`] as the
+/// connecting copy holds it, and a mismatch is the one reason a healthy
+/// channel refuses a node outright.
 #[derive(Debug, Serialize, Deserialize)]
-struct RegistrationRequest {
+struct Hello {
+    /// The connecting node's id: its VM's name.
+    node: String,
+    /// The channel protocol version the connecting copy speaks.
+    version: u32,
+}
+
+/// One publish over the channel: a whole table's zone rows, one line. The
+/// *message*, not the publish itself — that is the node's held connection
+/// ([`Registration`]), which outlives the line it arrived by for exactly as
+/// long as its rows are held.
+#[derive(Debug, Serialize, Deserialize)]
+struct PublishRequest {
     /// The sender's zone rows, in the sender's name order.
     rows: Vec<RegisteredRow>,
 }
 
-/// The holder's one-line reply to a registration: the ack a registrant waits
-/// for, so it knows its rows are answering before it stops trying, or the
-/// reason it is not.
+/// One row the serving side refused to hold, with the reason it named: the
+/// reply a publish carries names every row it did not take, so the node
+/// that sent it can warn about the name it lost — and about the address the
+/// host may not be told — at the moment it happens, not at the first lookup
+/// that finds the row absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RefusedRow {
+    /// The refused row's zone name.
+    name: String,
+    /// Why the serving side refused it.
+    reason: String,
+}
+
+/// The serving side's one-line reply to a hello or a publish: the ack a node
+/// waits for, so it knows its rows are answering before it stops trying —
+/// or the reason it is not — and, on a hello, which kind of answerer is
+/// holding the port (the installed service, or the interim holder
+/// daemon), the fact the node's own start line names.
 #[derive(Debug, Serialize, Deserialize)]
 struct RegistrationReply {
-    /// Whether the registration is held.
+    /// Whether the line was held.
     ok: bool,
-    /// The reason a registration was refused, when it was.
+    /// The reason a line was refused, when it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// The rows a publish carried that were not held, with their reasons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    refused: Vec<RefusedRow>,
+    /// Who answered a hello: `service` (the installed host service) or
+    /// `daemon` (the interim holder). Absent on a publish's reply, and on
+    /// old wires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    holder: Option<String>,
 }
 
 impl RegistrationReply {
-    /// The ack.
-    fn ok() -> Self {
+    /// The ack a hello gets, naming the kind of answerer that gave it.
+    fn hello(holder: impl Into<String>) -> Self {
         Self {
             ok: true,
             error: None,
+            refused: Vec::new(),
+            holder: Some(holder.into()),
+        }
+    }
+
+    /// The ack a publish gets, carrying the rows it refused.
+    fn published(refused: Vec<RefusedRow>) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            refused,
+            holder: None,
         }
     }
 
@@ -188,21 +292,54 @@ impl RegistrationReply {
         Self {
             ok: false,
             error: Some(reason.into()),
+            refused: Vec::new(),
+            holder: None,
         }
     }
 }
 
+/// Who holds the answerer's port, as the interim holder daemon names itself
+/// in a hello's reply — the other kind is the installed service's own
+/// ([`SERVICE_HOLDER`]); the node's start info line repeats the fact so a
+/// bundle says whether it published into the service or the interim.
+const DAEMON_HOLDER: &str = "daemon";
+
+/// Who holds the answerer's port, as the installed service names itself in
+/// a hello's reply (see [`DAEMON_HOLDER`]).
+pub(crate) const SERVICE_HOLDER: &str = "service";
+
 // ── the holder's registered tables ───────────────────────────────────────────
 
-/// The rows other VM host daemons registered over the channel, keyed by the
-/// connection that filed them: a registration is held while its connection
+/// One node's held publish: the id its hello named, and the rows its
+/// connection holds. The id rides in the map so a later publish's refusal
+/// can name the node that keeps the name, and the connect and disconnect
+/// lines can name the machine they are about.
+#[derive(Debug)]
+struct NodeRows {
+    /// The node id the connection's hello carried.
+    node: String,
+    /// The rows the connection's last publish held.
+    rows: Vec<RegisteredRow>,
+}
+
+/// The rows other VM host daemons published over the channel, keyed by the
+/// connection that filed them: a publish is held while its connection
 /// lives, replaced by the connection's next line, and retired with the
 /// connection's end. Shared between the channel's serving threads (which
 /// install and retire) and the answerer (which answers), so a lookup and
 /// the channel never see different tables.
 #[derive(Debug, Default)]
 struct RegisteredTables {
-    rows: Mutex<BTreeMap<u64, Vec<RegisteredRow>>>,
+    rows: Mutex<BTreeMap<u64, NodeRows>>,
+}
+
+/// What one publish left in the tables: the rows the connection now holds,
+/// and the rows the answerer refused it with the reasons why — the ack the
+/// node waits for is built from the second half, and the first is the
+/// answerer's own log of what it now answers.
+struct PublishOutcome {
+    held: Vec<RegisteredRow>,
+    refused: Vec<RefusedRow>,
 }
 
 impl RegisteredTables {
@@ -211,32 +348,108 @@ impl RegisteredTables {
         Self::default()
     }
 
-    /// Holds `rows` as the registration `connection` filed, replacing
-    /// whatever it held before — a re-registration is the whole table
-    /// again, so a row that went is gone in the same line.
-    fn install(&self, connection: u64, rows: Vec<RegisteredRow>) {
+    /// Holds `rows` as the publish `connection` of the node `node` filed,
+    /// replacing whatever it held before — a re-publish is the whole table
+    /// again, so a row that went is gone in the same line — refusing the
+    /// rows this publish may not take and naming why, all under the one
+    /// lock so two publishes racing over a name are decided by the one
+    /// that entered first, which is the first writer the clash rule keeps.
+    ///
+    /// The refusals are the channel's publish-time half of the rules the
+    /// fold re-applies as it answers, applied once as the rows arrive
+    /// rather than once per lookup: a name another node holds is the first
+    /// publisher's, a name in `reserved` — the answerer's own held names,
+    /// and the interim holder's own table's — is not a publish's to take,
+    /// and an A address outside the host-answerable range (NET-127) never
+    /// reaches the zone at all. Every refusal is *per row*: the publish's
+    /// other rows still hold.
+    fn install_validated(
+        &self,
+        connection: u64,
+        node: &str,
+        rows: Vec<RegisteredRow>,
+        reserved: &[String],
+    ) -> PublishOutcome {
+        let mut held = self.rows.lock().expect(
+            "the registered tables' lock is never held across a panic, so it cannot \
+                 be poisoned",
+        );
+        let mut accepted = Vec::with_capacity(rows.len());
+        let mut refused = Vec::new();
+        for row in rows {
+            let name = canonical(&row.name);
+            if reserved.contains(&name) {
+                refused.push(RefusedRow {
+                    name: row.name,
+                    reason: "the answerer holds this name itself".to_string(),
+                });
+                continue;
+            }
+            // The node that first holds the name, if any: an earlier
+            // connection's row, or this one's own — a re-publish of a name
+            // the same node already holds is a replace, not a clash, so a
+            // reconnecting node never loses its own names to its own
+            // retired connection.
+            let holder = held.values().find_map(|held| {
+                held.rows
+                    .iter()
+                    .any(|held_row| canonical(&held_row.name) == name)
+                    .then_some(held.node.as_str())
+            });
+            if let Some(holder) = holder
+                && holder != node
+            {
+                refused.push(RefusedRow {
+                    name: row.name,
+                    reason: format!(
+                        "another node ({holder}) holds this name; the first publisher \
+                         keeps it"
+                    ),
+                });
+                continue;
+            }
+            if let Some(address) = row.address
+                && !is_host_answerable(address)
+            {
+                refused.push(RefusedRow {
+                    name: row.name,
+                    reason: format!(
+                        "the address {address} is outside the host-answerable range \
+                         (the reserved local range or the host loopback)"
+                    ),
+                });
+                continue;
+            }
+            accepted.push(row);
+        }
+        let outcome = PublishOutcome {
+            held: accepted,
+            refused,
+        };
+        held.insert(
+            connection,
+            NodeRows {
+                node: node.to_string(),
+                rows: outcome.held.clone(),
+            },
+        );
+        outcome
+    }
+
+    /// Retires the publish `connection` filed: the connection is over, so
+    /// its names answer nothing here anymore. The retired rows come back,
+    /// so the retirement's own log line can name them.
+    fn remove(&self, connection: u64) -> Option<NodeRows> {
         self.rows
             .lock()
             .expect(
                 "the registered tables' lock is never held across a panic, so it cannot \
                  be poisoned",
             )
-            .insert(connection, rows);
+            .remove(&connection)
     }
 
-    /// Retires the registration `connection` filed: the connection is over,
-    /// so its names answer nothing here anymore.
-    fn remove(&self, connection: u64) {
-        self.rows
-            .lock()
-            .expect(
-                "the registered tables' lock is never held across a panic, so it cannot \
-                 be poisoned",
-            )
-            .remove(&connection);
-    }
-
-    /// Every registered row with the connection that filed it, flattened
+    /// Every published row with the connection that filed it, flattened
     /// across them in connection order — the earlier connection is the
     /// earlier writer, which is the order the answerer's clash rule keeps
     /// names in. The connection rides along so a refused row can be logged
@@ -249,24 +462,68 @@ impl RegisteredTables {
                  be poisoned",
             )
             .iter()
-            .flat_map(|(connection, rows)| rows.iter().map(|row| (*connection, row.clone())))
+            .flat_map(|(connection, held)| held.rows.iter().map(|row| (*connection, row.clone())))
             .collect()
+    }
+
+    /// Whether any publish is held — the installed service's own node row's
+    /// liveness: the node's shared name answers while some node is
+    /// connected, and nothing holds it when none is.
+    fn is_empty(&self) -> bool {
+        self.rows
+            .lock()
+            .expect(
+                "the registered tables' lock is never held across a panic, so it cannot \
+                 be poisoned",
+            )
+            .is_empty()
+    }
+
+    /// Holds `rows` for `connection` unvalidated — the shape a publish
+    /// leaves in the tables once the serving side has accepted it. The
+    /// answerer's answer-time gates (the fold's clash refusal and address
+    /// re-gate) are still exercised on rows installed this way, which is
+    /// why this is here: the fold must hold even against a publish-time
+    /// gate that somehow let a row through.
+    #[cfg(test)]
+    fn install(&self, connection: u64, rows: Vec<RegisteredRow>) {
+        self.rows
+            .lock()
+            .expect(
+                "the registered tables' lock is never held across a panic, so it cannot \
+                 be poisoned",
+            )
+            .insert(
+                connection,
+                NodeRows {
+                    node: "a test node".to_string(),
+                    rows,
+                },
+            );
     }
 }
 
 // ── the answerer ──────────────────────────────────────────────────────────────
 
 /// The host answerer: this daemon's own host-authored table, merged with the
-/// rows other VM host daemons registered over the channel, behind the
+/// rows other VM host daemons published over the channel, behind the
 /// shared answer decision. Built once when the port is held and served for
-/// the daemon's lifetime ([`serve`]).
+/// the holder's lifetime ([`serve`]).
 struct HostAnswerer {
-    /// This daemon's own table (NET-138): the registry `run` fills.
+    /// This daemon's own table (NET-138): the registry `run` fills. The
+    /// installed service's holds nothing — its own row is [`HOST_NAME`],
+    /// and the node's shared one — and answers only what nodes publish.
     own: BoxRegistry,
-    /// The rows other VM host daemons registered with this one.
+    /// The rows other VM host daemons published to this answerer.
     registered: Arc<RegisteredTables>,
     /// The zone's SOA, carried by every negative (NET-124), built once.
     soa: Record,
+    /// Whether this answerer holds the node's shared name itself: the
+    /// installed service does (no table of its own carries it, and every
+    /// node excludes it from its publishes — every VM's node row is the
+    /// same name); the interim holder does not, because its own table
+    /// holds its own node row.
+    holds_node_row: bool,
     /// The refused name clashes a warn has already named: one warn per clash,
     /// not one per lookup, and a clash that clears is warnable again if it
     /// comes back (see [`Self::zone_view`]).
@@ -280,6 +537,21 @@ impl HostAnswerer {
             own,
             registered,
             soa: zone_soa(),
+            holds_node_row: false,
+            warned: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    /// The answerer of the installed host service: an empty table of its
+    /// own — a service holds no boxes; the nodes publish their rows to it —
+    /// with the host's own name and the node's shared name held by the
+    /// answerer itself.
+    fn for_service(registered: Arc<RegisteredTables>) -> Self {
+        Self {
+            own: BoxRegistry::new(switch::DEFAULT_SUBNET),
+            registered,
+            soa: zone_soa(),
+            holds_node_row: true,
             warned: Mutex::new(BTreeSet::new()),
         }
     }
@@ -457,6 +729,24 @@ impl HostAnswerer {
                 live: true,
             },
         );
+        // The node's own shared name, when this answerer is the installed
+        // service: no table of its own publishes it — every node excludes
+        // it from its publishes, because every VM's node row is the same
+        // name — so the service holds it itself, at the shared loopback
+        // address the node's namespace serves from, live while any node
+        // is connected and held by nothing once none is. The interim
+        // holder holds no such row: its own table carries its own.
+        if self.holds_node_row {
+            let node_name = crate::box_registry::node_zone_name();
+            held.insert(node_name.clone(), THE_SERVICE_NODE_ROW.to_string());
+            view.hold(
+                node_name,
+                ZoneRow {
+                    address: Some(Ipv4Addr::LOCALHOST),
+                    live: !self.registered.is_empty(),
+                },
+            );
+        }
         let mut refused: BTreeSet<String> = BTreeSet::new();
         for (connection, row) in self.registered.rows() {
             let name = canonical(&row.name);
@@ -562,6 +852,10 @@ pub const HOST_NAME: &str = "host.min.internal";
 /// the fold: the keeper a refused registration's warn names.
 const HOST_ROW: &str = "the host's own row";
 
+/// The source the installed service's node row keeps the node's shared
+/// name under in the fold (see [`HostAnswerer::for_service`]).
+const THE_SERVICE_NODE_ROW: &str = "the service's own node row";
+
 /// The source a name the registration `connection` filed is named by in
 /// the clash warn: which co-resident daemon's connection it rode, the only
 /// handle the holder has on a registrant that is not its own process.
@@ -623,36 +917,51 @@ fn zone_soa() -> Record {
 
 // ── the channel's line codec ──────────────────────────────────────────────────
 
-/// Read one line (terminated by `\n`) from one side of the channel. A
-/// connection that closes before sending a line reads as no request; a
-/// line past [`MAX_REQUEST_LINE`] is refused. Bounded by the caller's read
-/// timeout, whatever it is: the holder bounds the first line only, and a
-/// registrant bounds the reply it waits for.
+/// Read one line (terminated by `\n`) from one side of the channel,
+/// resuming across read timeouts: the bytes read so far stay in `partial`
+/// when the read times out, so a caller that polls its connection between
+/// timeout slices (the serving loops' stop check) retries without losing
+/// a line the timeout split mid-write. A connection that closes before
+/// sending a line reads as no request; a line past [`MAX_REQUEST_LINE`]
+/// is refused. Bounded by the caller's read timeout, whatever it is: the
+/// serving side bounds the hello only, and everything after it polls.
 #[expect(
     clippy::indexing_slicing,
     reason = "cut at `read`, the byte count `read()` reported, or at `newline`, an index `position` found inside `buf[..read]`"
 )]
-fn read_line(stream: &mut UnixStream) -> io::Result<Option<String>> {
-    let mut line = Vec::new();
+fn read_line_resumable(
+    stream: &mut UnixStream,
+    partial: &mut Vec<u8>,
+) -> io::Result<Option<String>> {
+    // A line that finished inside the last poll slice is still waiting in
+    // `partial`; answer it before reading more.
+    if let Some(newline) = partial.iter().position(|byte| *byte == b'\n') {
+        let line: Vec<u8> = partial.drain(..newline).collect();
+        // The newline itself goes with it: drain stopped before it, so the
+        // first byte left is it.
+        partial.remove(0);
+        return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+    }
     let mut buf = [0u8; 1024];
     loop {
         let read = stream.read(&mut buf)?;
         if read == 0 {
-            return if line.is_empty() {
+            return if partial.is_empty() {
                 Ok(None)
             } else {
                 // A partial line at EOF — a peer that died mid-write.
                 // Still answerable with a refusal, so hand what arrived
                 // back rather than hanging the slot on a timeout.
-                Ok(Some(String::from_utf8_lossy(&line).into_owned()))
+                Ok(Some(String::from_utf8_lossy(partial).into_owned()))
             };
         }
         if let Some(newline) = buf[..read].iter().position(|byte| *byte == b'\n') {
-            line.extend_from_slice(&buf[..newline]);
+            partial.extend_from_slice(&buf[..newline]);
+            let line = std::mem::take(partial);
             return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
         }
-        line.extend_from_slice(&buf[..read]);
-        if line.len() > MAX_REQUEST_LINE {
+        partial.extend_from_slice(&buf[..read]);
+        if partial.len() > MAX_REQUEST_LINE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("channel line exceeded {MAX_REQUEST_LINE} bytes without a newline"),
@@ -661,18 +970,35 @@ fn read_line(stream: &mut UnixStream) -> io::Result<Option<String>> {
     }
 }
 
-/// Parses one registration line. A line that does not parse is refused, not
-/// fatal: the holder answers with the reason and drops the connection.
-fn parse_registration(line: &str) -> Result<RegistrationRequest, String> {
+/// One bounded read of a reply line: the whole line inside the read
+/// timeout the caller set, or the error that says it did not come. A
+/// reply is a single write on the other side, so a fresh buffer per read
+/// is all a reply ever needs.
+fn read_reply_line(stream: &mut UnixStream) -> io::Result<Option<String>> {
+    let mut partial = Vec::new();
+    read_line_resumable(stream, &mut partial)
+}
+
+/// Parses one hello line. A line that does not parse is refused, not
+/// fatal: the serving side answers with the reason and drops the
+/// connection.
+fn parse_hello(line: &str) -> Result<Hello, String> {
     serde_json_lenient::from_str(line).map_err(|error| error.to_string())
 }
 
-/// Writes one reply line.
-fn write_reply(stream: &mut UnixStream, reply: &RegistrationReply) -> io::Result<()> {
-    let mut line = serde_json_lenient::to_string(reply).map_err(|error| {
+/// Parses one publish line, the same way ([`parse_hello`]).
+fn parse_publish(line: &str) -> Result<PublishRequest, String> {
+    serde_json_lenient::from_str(line).map_err(|error| error.to_string())
+}
+
+/// Writes one line of the channel's wire: `message` serialized, one
+/// `\n`. Every message on the channel is a single line, so the read on
+/// the other side answers a whole message per call.
+fn write_line<T: ?Sized + Serialize>(stream: &mut UnixStream, message: &T) -> io::Result<()> {
+    let mut line = serde_json_lenient::to_string(message).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("channel reply did not serialize: {error}"),
+            format!("channel line did not serialize: {error}"),
         )
     })?;
     line.push('\n');
@@ -680,228 +1006,582 @@ fn write_reply(stream: &mut UnixStream, reply: &RegistrationReply) -> io::Result
     stream.flush()
 }
 
-// ── the holder: the channel listener ──────────────────────────────────────────
+/// Writes one reply line ([`write_line`], the reply's spelling).
+fn write_reply(stream: &mut UnixStream, reply: &RegistrationReply) -> io::Result<()> {
+    write_line(stream, reply)
+}
 
-/// Binds the answerer channel's listener beside the answerer's socket and
-/// serves registrations on a dedicated thread: one connection per
+// ── the channel's serving side ───────────────────────────────────────────────
+
+/// The peer's uid, the kernel's own answer for who holds the other end of
+/// `stream` — the channel's trust gate: a publish is the operator's, so a
+/// connection whose peer is not the uid this answerer serves is refused
+/// before a byte of it is read. The credential is decided at connect
+/// time, so nothing the peer writes can influence what this reads.
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `size_of::<ucred>()` bytes into
+    // `cred`, whose length is passed alongside it; the fd is the stream's
+    // own and stays valid for the borrow's life.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::addr_of_mut!(cred).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(cred.uid)
+}
+
+/// Off Linux the kernel offers one credential fact for a connected unix
+/// socket: the peer's uid, read with `getpeereid` — the same gate with the
+/// same answer ([`peer_uid`]'s Linux arm).
+#[cfg(not(target_os = "linux"))]
+fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    let mut uid = libc::uid_t::default();
+    let mut gid = libc::gid_t::default();
+    // SAFETY: getpeereid writes the peer's uid and gid into the two
+    // locals; the fd is the stream's own and stays valid for the
+    // borrow's life.
+    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(uid)
+}
+
+/// The names no publish may take, the answerer's own: the host's own name
+/// and the node's shared one ([`HostAnswerer::for_service`] holds both
+/// itself; the interim holder's own table holds its own node row, which
+/// reserving it too changes nothing but keeps the set one rule), and — for
+/// the interim holder, which has a table of its own — every name that
+/// table holds, so no node's publish can take a name this host authored.
+/// Computed per publish line, so a table that changed between two
+/// publishes is honoured without a second copy of the fold's bookkeeping.
+fn reserved_names(own: Option<&Arc<BoxRegistry>>) -> Vec<String> {
+    let mut reserved = vec![HOST_NAME.to_string(), crate::box_registry::node_zone_name()];
+    if let Some(own) = own {
+        reserved.extend(own.zone_view().rows().map(|(name, _)| name.to_string()));
+    }
+    reserved
+}
+
+/// Binds the answerer channel's listener beside the interim holder's socket
+/// and serves publishes on a dedicated thread: one connection per
 /// co-resident VM host daemon, each connection's rows held while the
 /// connection lives. The bind happens on the calling thread so its failure
-/// surfaces where the answerer is started ([`acquire_loop`] warns and
+/// surfaces where the answerer is started ([`acquire_loop_at`] warns and
 /// serves on); the socket gets the bridge socket's posture — path-length
 /// check, a 0700 parent dir, a stale socket removed, 0600 on the socket —
-/// so only the same user may register rows, the same trust the control
-/// socket rests on.
-fn hold_channel(sock: &Path, registered: Arc<RegisteredTables>) -> io::Result<()> {
+/// so only the same user may connect, the same trust the control socket
+/// rests on, with the uid gate ([`peer_uid`]) as the wire's own check of
+/// it.
+fn hold_channel(
+    sock: &Path,
+    registered: Arc<RegisteredTables>,
+    own: Option<Arc<BoxRegistry>>,
+    expected_uid: u32,
+) -> io::Result<()> {
     crate::sock::check_uds_path_len(sock)?;
     crate::sock::prepare_socket_dir(sock)?;
     crate::sock::remove_stale_socket(sock)?;
     let listener = UnixListener::bind(sock)?;
     crate::sock::enforce_socket_permissions(sock)?;
+    // The interim holder's channel never stops: the daemon serves until it
+    // exits, and the process's exit is the whole stop.
+    let stop = Arc::new(AtomicBool::new(false));
     std::thread::Builder::new()
         .name("minvmd-zone-channel".to_string())
-        .spawn(move || accept_registrations(listener, registered))
+        .spawn(move || serve_channel(listener, registered, expected_uid, own, DAEMON_HOLDER, stop))
         .map(|_| ())
 }
 
-/// Accepts registrations until the daemon exits. One thread per connection:
-/// a registration's rows must retire the moment its connection ends, which
-/// is a read per connection, so one hung connection holds its own rows and
-/// nothing else.
-fn accept_registrations(listener: UnixListener, registered: Arc<RegisteredTables>) {
+/// Serves the answerer channel on `listener`: one thread per connection,
+/// each gated on the peer's uid before a byte of it is read, hello'd with
+/// its node id and protocol version, then publishing rows until the
+/// connection ends. `expected_uid` is the uid this answerer serves — the
+/// operator's, whoever the unit runs the service as; `holder` is how a
+/// hello's ack names this answerer, the installed service or the interim
+/// holder daemon, the fact the node's start line repeats; `stop` retires
+/// the loop — the interim's is never set, and the restart proof's is the
+/// one handle that cleanly stops a serving answerer's threads.
+fn serve_channel(
+    listener: UnixListener,
+    registered: Arc<RegisteredTables>,
+    expected_uid: u32,
+    own: Option<Arc<BoxRegistry>>,
+    holder: &'static str,
+    stop: Arc<AtomicBool>,
+) {
+    // The accept loop is a poll, not a blocking accept, so a stop is
+    // honoured within one slice however idle the channel is.
+    if let Err(error) = listener.set_nonblocking(true) {
+        tracing::warn!(
+            component = COMPONENT,
+            %error,
+            "could not put the answerer channel into poll mode; no node's rows can \
+             be held here"
+        );
+        return;
+    }
     let mut next: u64 = 0;
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let connection = next;
-                next += 1;
-                let registered = Arc::clone(&registered);
-                let spawned = std::thread::Builder::new()
-                    .name("minvmd-zone-registration".to_string())
-                    .spawn(move || serve_registration(connection, stream, registered));
-                if let Err(error) = spawned {
-                    tracing::warn!(
-                        component = COMPONENT,
-                        %error,
-                        "could not serve a zone registration; that daemon's names will \
-                         not answer here"
-                    );
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                // The uid gate, before any byte of the peer is read: a
+                // foreign process is refused on what it is, not on what
+                // it says, and the refusal is a warn naming its uid —
+                // the one a misconfigured unit's service user answers at
+                // a glance.
+                match peer_uid(&stream) {
+                    Ok(uid) if uid == expected_uid => {
+                        let connection = next;
+                        next += 1;
+                        let registered = Arc::clone(&registered);
+                        let own = own.clone();
+                        let stop = Arc::clone(&stop);
+                        let spawned = std::thread::Builder::new()
+                            .name("minvmd-zone-publish".to_string())
+                            .spawn(move || {
+                                serve_registration(
+                                    connection, stream, registered, own, holder, stop,
+                                )
+                            });
+                        if let Err(error) = spawned {
+                            tracing::warn!(
+                                component = COMPONENT,
+                                %error,
+                                "could not serve a node's publishes; that node's names \
+                                 will not answer here"
+                            );
+                        }
+                    }
+                    Ok(uid) => {
+                        tracing::warn!(
+                            component = COMPONENT,
+                            peer_uid = uid,
+                            service_uid = expected_uid,
+                            "refused an answerer channel connection from a foreign uid; \
+                             only the uid this answerer serves may publish rows"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            component = COMPONENT,
+                            %error,
+                            "could not read a channel peer's uid"
+                        );
+                    }
                 }
             }
             Err(error) => {
-                tracing::debug!(
-                    component = COMPONENT,
-                    %error,
-                    "answerer channel accept failed"
-                );
+                // A poll slice with no connection in it is the idle loop's
+                // own shape, not a failure worth a line at any level.
+                if error.kind() != io::ErrorKind::WouldBlock {
+                    tracing::debug!(
+                        component = COMPONENT,
+                        %error,
+                        "answerer channel accept failed"
+                    );
+                }
+                std::thread::sleep(CONNECTION_POLL);
             }
         }
     }
 }
 
-/// Serves one registration connection. The first line — the registration
-/// itself — is bounded, because a connection that never speaks is a stray
-/// connect, not a registrant; once it has registered, the connection holds
-/// its rows for as long as it lives, and re-registrations arrive only when
-/// the peer's table changes, so the wait between them is unbounded and the
-/// peer's exit — the one event that retires its rows — is the read's own
-/// EOF.
-fn serve_registration(connection: u64, mut stream: UnixStream, registered: Arc<RegisteredTables>) {
-    if let Err(error) = stream.set_read_timeout(Some(REGISTER_READ_TIMEOUT)) {
+/// Serves one node's connection: the hello first — bounded, because a
+/// connection that never speaks is a stray connect, not a node — then the
+/// publishes, each replacing the connection's rows, until the connection
+/// ends. The reads between publishes are polls ([`CONNECTION_POLL`], the
+/// stop handle's slice), resuming across them, so a harness can retire
+/// the loop without stranding a thread per connection; a node's exit —
+/// the one event that retires its rows — is the read's own EOF.
+fn serve_registration(
+    connection: u64,
+    mut stream: UnixStream,
+    registered: Arc<RegisteredTables>,
+    own: Option<Arc<BoxRegistry>>,
+    holder: &'static str,
+    stop: Arc<AtomicBool>,
+) {
+    if let Err(error) = stream.set_read_timeout(Some(HELLO_READ_TIMEOUT)) {
         tracing::debug!(
             component = COMPONENT,
             %error,
-            "zone registration connection could not set its read timeout"
+            "a channel connection could not set its read bound"
         );
         return;
     }
-    let first = match read_line(&mut stream) {
+    let hello = match read_reply_line(&mut stream) {
         Ok(Some(line)) => line,
         Ok(None) => return,
         Err(error) => {
             tracing::debug!(
                 component = COMPONENT,
                 %error,
-                "zone registration connection went before it registered"
+                "a channel connection went before it said hello"
             );
             return;
         }
     };
-    if !accept_line(&mut stream, connection, &first, &registered) {
+    // The hello is the gate the whole connection rests on. The protocol
+    // version must match — a node running a different release of the wire
+    // than this answerer is refused outright, so the error surfaces at the
+    // node and the CLI's step probe re-runs the privileged install.
+    let node = match parse_hello(&hello) {
+        Ok(hello) if hello.version == CHANNEL_PROTOCOL_VERSION => hello.node,
+        Ok(hello) => {
+            let reply = RegistrationReply::refused(format!(
+                "this answerer speaks channel protocol {CHANNEL_PROTOCOL_VERSION}; the \
+                 node said {}",
+                hello.version
+            ));
+            if let Err(error) = write_reply(&mut stream, &reply) {
+                tracing::debug!(component = COMPONENT, %error, "channel hello reply failed");
+            }
+            tracing::warn!(
+                component = COMPONENT,
+                node = %hello.node,
+                said = hello.version,
+                speaks = CHANNEL_PROTOCOL_VERSION,
+                "refused a node speaking a different answerer channel protocol; \
+                 re-running the privileged step re-installs the answerer it speaks"
+            );
+            return;
+        }
+        Err(error) => {
+            let reply = RegistrationReply::refused(error);
+            if let Err(error) = write_reply(&mut stream, &reply) {
+                tracing::debug!(component = COMPONENT, %error, "channel hello reply failed");
+            }
+            return;
+        }
+    };
+    if let Err(error) = write_reply(&mut stream, &RegistrationReply::hello(holder)) {
+        tracing::debug!(component = COMPONENT, %error, "channel hello reply failed");
         return;
     }
-    // Registered: the connection's rows live with it now, and every later
-    // line replaces them — the ping shape the peer re-registers by.
-    let _ = stream.set_read_timeout(None);
+    // One info line per node connection — the observability contract's —
+    // naming the machine that connected.
+    tracing::info!(
+        component = COMPONENT,
+        node = %node,
+        "a node connected to the zone answerer channel"
+    );
+    let mut partial = Vec::new();
+    if let Err(error) = stream.set_read_timeout(Some(CONNECTION_POLL)) {
+        tracing::debug!(
+            component = COMPONENT,
+            %error,
+            "a channel connection could not arm its poll"
+        );
+        return;
+    }
     loop {
-        match read_line(&mut stream) {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match read_line_resumable(&mut stream, &mut partial) {
             Ok(Some(line)) => {
-                if !accept_line(&mut stream, connection, &line, &registered) {
-                    return;
+                if !accept_publish(
+                    &mut stream,
+                    connection,
+                    &node,
+                    &line,
+                    &registered,
+                    own.as_ref(),
+                ) {
+                    break;
                 }
             }
-            Ok(None) | Err(_) => {
-                registered.remove(connection);
+            // The node's end: the whole withdrawal. A stopped loop retires
+            // the rows the same way — a restarted answerer holds nothing
+            // until its nodes connect again.
+            Ok(None) => break,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(error) => {
                 tracing::debug!(
                     component = COMPONENT,
-                    "a zone registration ended; its names answer here no more"
+                    %error,
+                    "a channel connection's read failed"
                 );
-                return;
+                break;
             }
         }
     }
+    let withdrawn = registered.remove(connection);
+    // One info line per node disconnection, naming the machine that left
+    // and the rows that went with it — a node that exits never leaves
+    // names answering behind it.
+    tracing::info!(
+        component = COMPONENT,
+        node = %node,
+        rows = withdrawn
+            .map(|held| held
+                .rows
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "))
+            .unwrap_or_default(),
+        "a node disconnected from the zone answerer channel; its rows answer \
+         here no more"
+    );
 }
 
-/// Holds or refuses one registration line, answering it. Returns whether
-/// the connection may carry on: a refused line ends it, and its rows go.
-fn accept_line(
+/// Holds or refuses one publish line, answering it. Returns whether the
+/// connection may carry on: a line that does not parse ends it, and its
+/// rows go; a publish whose rows were partly refused keeps the rest, and
+/// the reply names the refused ones with their reasons.
+fn accept_publish(
     stream: &mut UnixStream,
     connection: u64,
+    node: &str,
     line: &str,
     registered: &RegisteredTables,
+    own: Option<&Arc<BoxRegistry>>,
 ) -> bool {
-    let outcome = match parse_registration(line) {
-        Ok(registration) => {
-            let rows = registration.rows.len();
-            registered.install(connection, registration.rows);
-            tracing::debug!(
-                component = COMPONENT,
-                rows = rows,
-                "holds a zone registration"
-            );
-            write_reply(stream, &RegistrationReply::ok())
+    let outcome = match parse_publish(line) {
+        Ok(publish) => {
+            let outcome =
+                registered.install_validated(connection, node, publish.rows, &reserved_names(own));
+            // The publish's own line names each row it published and each
+            // it refused — the answerer's log says what the zone holds.
+            let held: Vec<&str> = outcome.held.iter().map(|row| row.name.as_str()).collect();
+            if held.is_empty() {
+                tracing::debug!(
+                    component = COMPONENT,
+                    node = %node,
+                    "a node published no rows"
+                );
+            } else {
+                tracing::info!(
+                    component = COMPONENT,
+                    node = %node,
+                    rows = held.join(", "),
+                    "a node published its zone rows to the answerer"
+                );
+            }
+            for refused in &outcome.refused {
+                tracing::warn!(
+                    component = COMPONENT,
+                    node = %node,
+                    name = %refused.name,
+                    reason = %refused.reason,
+                    "refused a published zone row"
+                );
+            }
+            outcome
         }
-        Err(error) => write_reply(stream, &RegistrationReply::refused(error)),
+        Err(error) => {
+            let outcome = write_reply(stream, &RegistrationReply::refused(error));
+            if let Err(error) = outcome {
+                tracing::debug!(component = COMPONENT, %error, "channel publish reply failed");
+            }
+            registered.remove(connection);
+            return false;
+        }
     };
-    match outcome {
+    match write_reply(stream, &RegistrationReply::published(outcome.refused)) {
         Ok(()) => true,
         Err(error) => {
-            tracing::debug!(component = COMPONENT, %error, "zone registration reply failed");
+            tracing::debug!(component = COMPONENT, %error, "channel publish reply failed");
             registered.remove(connection);
             false
         }
     }
 }
 
-// ── the registrant ───────────────────────────────────────────────────────────
+// ── the node: the publish's held connection ───────────────────────────────────
 
-/// One daemon's registration with the zone answerer's holder: the
-/// connection its rows are held by. Dropping it retires them — the
-/// connection's end is the whole withdrawal, so a daemon that exits never
-/// leaves names answering behind it — and [`send`](Self::send) re-registers
-/// over the same connection, which is the ping shape [`acquire_loop`]
-/// re-registers by.
+/// One node's publish, held by the connection it arrived on: dropping this
+/// retires the rows — the connection's end is the whole withdrawal, so a
+/// daemon that exits never leaves names answering behind it — and
+/// [`send`](Self::send) re-publishes over the same connection, idempotent:
+/// the same table again replaces the same rows and changes nothing.
 struct Registration {
-    /// The held connection: this registration's lifetime.
+    /// The held connection: this publish's lifetime.
     stream: UnixStream,
 }
 
+/// What a node's first publish learned: the held connection, which kind of
+/// answerer holds the port (as its hello ack named it — the installed
+/// service, or the interim holder daemon; the fact the node's own start
+/// line repeats), and the rows the answerer refused.
+struct Published {
+    /// The held connection: this publish's lifetime.
+    registration: Registration,
+    /// Which kind of answerer the rows went to.
+    holder: String,
+    /// The rows the answerer refused, with its reasons.
+    refused: Vec<RefusedRow>,
+}
+
 impl Registration {
-    /// Re-registers `rows` over the held connection, waiting for the
-    /// holder's ack: a registration that did not land is not held, and the
-    /// error tells the caller to connect again.
-    fn send(&mut self, rows: Vec<RegisteredRow>) -> io::Result<()> {
-        let mut line =
-            serde_json_lenient::to_string(&RegistrationRequest { rows }).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("zone registration did not serialize: {error}"),
-                )
-            })?;
-        line.push('\n');
-        self.stream.write_all(line.as_bytes())?;
-        self.stream.flush()?;
-        let _ = self.stream.set_read_timeout(Some(REGISTER_READ_TIMEOUT));
-        let reply_line = read_line(&mut self.stream)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "the holder closed"))?;
+    /// Re-publishes `rows` over the held connection, waiting for the
+    /// answerer's ack: a publish that did not land is not held, and the
+    /// error tells the caller to connect again. The refused rows come
+    /// back with the ack, so the caller can warn about a name it lost —
+    /// and about an address the host may not be told — when it happens,
+    /// not at the first lookup that finds the row absent.
+    fn send(&mut self, rows: Vec<RegisteredRow>) -> io::Result<Vec<RefusedRow>> {
+        let _ = self.stream.set_read_timeout(Some(CHANNEL_REPLY_TIMEOUT));
+        write_line(&mut self.stream, &PublishRequest { rows })?;
+        let reply_line = read_reply_line(&mut self.stream)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the answerer closed the channel",
+            )
+        })?;
         let reply: RegistrationReply =
             serde_json_lenient::from_str(reply_line.trim()).map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("the holder's reply did not parse: {error}"),
+                    format!("the answerer's reply did not parse: {error}"),
                 )
             })?;
-        if reply.ok {
-            Ok(())
-        } else {
-            Err(io::Error::new(
+        if !reply.ok {
+            return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 reply
                     .error
-                    .unwrap_or_else(|| "the holder refused the registration".to_string()),
-            ))
+                    .unwrap_or_else(|| "the answerer refused the publish".to_string()),
+            ));
         }
+        Ok(reply.refused)
+    }
+
+    /// Whether the answerer's end of the connection is still there: a peek
+    /// of one byte, never consuming — nothing the peek sees is lost, and a
+    /// reply the next publish waits for is still its next read's. The peek
+    /// carries `MSG_DONTWAIT`, so it returns at once however idle the
+    /// stream is; the caller's own wait bounds the slices between peeks.
+    fn answerer_alive(&self) -> io::Result<bool> {
+        let mut probe = 0u8;
+        // SAFETY: recv writes at most one byte into `probe`, whose length is
+        // passed alongside it; the fd is the stream's own and stays valid
+        // for the borrow's life. MSG_PEEK never consumes, MSG_DONTWAIT never
+        // blocks.
+        let seen = unsafe {
+            libc::recv(
+                self.stream.as_raw_fd(),
+                std::ptr::addr_of_mut!(probe).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if seen < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock || error.kind() == io::ErrorKind::TimedOut
+            {
+                // Nothing waiting: the answerer's end has said nothing —
+                // which a live one that has nothing to say is exactly how.
+                return Ok(true);
+            }
+            return Err(error);
+        }
+        // The answerer's end closed (zero bytes): a service that restarted,
+        // or an interim holder that went. The rows this connection held are
+        // gone with it; the next pass reconnects and re-publishes. Any
+        // buffered byte at all means the end is still there.
+        Ok(seen != 0)
     }
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        // Closing the connection is the whole withdrawal: the holder
-        // retires this registration's rows when its read ends.
+        // Closing the connection is the whole withdrawal: the answerer
+        // retires this publish's rows when its read ends.
         let _ = self.stream.shutdown(Shutdown::Both);
     }
 }
 
-/// Registers `rows` with the daemon holding the answerer port: one
-/// connection, one registration line, one ack. The returned
-/// [`Registration`] holds the connection open, which is the registration's
-/// lifetime.
-fn register_rows(sock: &Path, rows: Vec<RegisteredRow>) -> io::Result<Registration> {
+/// One node's first publish: connect to the answerer channel, say the
+/// hello — the node's id, the protocol version this copy speaks — wait
+/// for the answerer's ack, then publish `rows` and wait for the ack that
+/// says they are held. A connect is what starts a socket-activated
+/// answerer, so this is the first thing a daemon does on the channel, and
+/// every way it can fail — a socket path absent, a connect refused, a
+/// hello that never gets its ack or gets it refused — is a distinct error
+/// the acquisition loop surfaces; none of them is a reason to host.
+fn connect_and_publish(sock: &Path, node: &str, rows: Vec<RegisteredRow>) -> io::Result<Published> {
     let mut registration = Registration {
         stream: UnixStream::connect(sock)?,
     };
-    registration.send(rows)?;
-    Ok(registration)
+    // The hello and its reply are bounded like a publish's: a service
+    // manager starts a socket-activated answerer at the connect, so the
+    // bound only has to cover the start, and an answerer that never
+    // answers inside it is broken, not busy.
+    let _ = registration
+        .stream
+        .set_read_timeout(Some(CHANNEL_REPLY_TIMEOUT));
+    write_line(
+        &mut registration.stream,
+        &Hello {
+            node: node.to_string(),
+            version: CHANNEL_PROTOCOL_VERSION,
+        },
+    )?;
+    let reply_line = read_reply_line(&mut registration.stream)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the answerer closed the channel before it answered the hello",
+        )
+    })?;
+    let reply: RegistrationReply =
+        serde_json_lenient::from_str(reply_line.trim()).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the answerer's hello reply did not parse: {error}"),
+            )
+        })?;
+    if !reply.ok {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            reply
+                .error
+                .unwrap_or_else(|| "the answerer refused the hello".to_string()),
+        ));
+    }
+    let holder = reply.holder.unwrap_or_else(|| DAEMON_HOLDER.to_string());
+    let refused = registration.send(rows)?;
+    Ok(Published {
+        registration,
+        holder,
+        refused,
+    })
 }
 
-/// The zone rows of `registry`'s table, as the registration wire carries
-/// them: the same view the holder's own answers come from, encoded — one
-/// row per published namespace, its name under the zone, its
-/// host-answerable address, and its liveness — minus the node namespace's
-/// row, which never travels the channel: every VM host daemon's table holds
-/// the same name (`minimald.min.internal`), so the holder answers its own
-/// node row and a second VM's registration of it would only be refused as a
-/// clash — the by-construction clash-warn this exclusion takes out. The
-/// host's own name is in no table's view (the answerer holds it itself), so
+/// The zone rows of `registry`'s table, as the publish wire carries them:
+/// the same view the holder's own answers come from, encoded — one row per
+/// published namespace, its name under the zone, its host-answerable
+/// address, and its liveness — minus the node namespace's row, which never
+/// travels the channel: every VM host daemon's table holds the same name
+/// (`minimald.min.internal`), so the answerer answers it itself — the
+/// interim holder from its own table, the installed service from its own
+/// held row — and a second VM's publish of it would only be refused as a
+/// clash, the by-construction refusal this exclusion takes out. The host's
+/// own name is in no table's view (the answerer holds it itself), so
 /// nothing else needs excluding here.
 fn zone_rows(registry: &BoxRegistry) -> Vec<RegisteredRow> {
     let node = crate::box_registry::node_zone_name();
@@ -963,16 +1643,18 @@ impl AnswererStatus {
     }
 }
 
-/// Starts the host answerer: binds the machine's answerer port on the host
-/// loopback and serves the zone from `registry`'s table, or — when the port
-/// is held by another VM host daemon on this machine — registers
-/// `registry`'s zone rows with that holder over the answerer channel and
-/// answers nothing itself. Every pass the acquisition takes writes the
-/// state it left the machine in to `status`, the one place the control
-/// socket's status read serves it from. One background thread, for the
-/// daemon's lifetime, the way the control socket serves; a thread the host
-/// could not spare is the only failure returned, because a held port is
-/// the normal multi-VM case, not an error to fail a boot over.
+/// Starts the host answerer: this daemon's publish-or-host acquisition, for
+/// the daemon's lifetime. The acquisition connects to the answerer channel
+/// first and publishes this table's zone rows to whichever answerer holds
+/// the port — the installed host service, or the interim holder daemon —
+/// and only hosts the answerer itself when no channel socket exists and
+/// the port is free. Every pass the acquisition takes writes the state it
+/// left the machine in to `status`, the one place the control socket's
+/// status read serves it from. One background thread, for the daemon's
+/// lifetime, the way the control socket serves; a thread the host could
+/// not spare is the only failure returned, because an answerer somebody
+/// else holds is the normal multi-VM case, not an error to fail a boot
+/// over.
 ///
 /// # Errors
 ///
@@ -987,49 +1669,251 @@ pub fn spawn(
         .spawn(move || acquire_loop(registry, port, status))
 }
 
-/// Acquires the machine's answerer port and serves it, or registers with
-/// the daemon that holds it, for this daemon's lifetime.
-///
-/// The holder is whichever daemon bound the port first, and a lone daemon
-/// is one at start: the bind is attempted before any wait, so the port is
-/// held the moment the daemon starts rather than after the first box
-/// registration or the [`PORT_RECHECK`] cadence. A daemon that finds the
-/// port held registers its rows and then re-checks it on the registry's
-/// change pings — a changed table re-registers with the holder, so a box
-/// published after this daemon started answers through the holder too —
-/// and on the [`PORT_RECHECK`] cadence, so a holder that exited is replaced
-/// within it and the zone is never orphaned. A port held by something that
-/// is not a holder — a native daemon, or a foreign process with no channel
-/// socket — is warned once and retried at the same cadence: the zone
-/// answers from that holder alone, and this daemon answers nothing.
+/// Acquires the machine's answerer — by publishing to it or by hosting it —
+/// for this daemon's lifetime.
 fn acquire_loop(registry: BoxRegistry, port: u16, status: AnswererStatus) {
     acquire_loop_at(registry, port, resolve_channel_sock(), status);
 }
 
-/// The acquisition over a named channel socket, so the whole holder and
-/// registrant machinery is drivable where the channel is not the machine's
-/// own (the test below runs two daemons on one temporary channel).
-fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: AnswererStatus) {
-    // Subscribed before the first bind attempt, so no change lands unpinged
-    // in the window before the port is decided. The holder drops it: its
-    // own table answers live, so it has nothing to re-register, and the
-    // next ping prunes the dead sender.
-    let pings = registry.subscribe_table_pings();
-    let mut held: Option<Registration> = None;
-    // Two once-only lines, each on a flag of its own: the warn that the port
-    // is held by something the channel cannot reach, and the info line that
-    // names the holder this table's rows first registered with. A pass that
-    // warned must not take the info line with it — a daemon that boots
-    // against a native minimald's hold and registers with the VM host daemon
-    // that takes the port after it would otherwise name its holder neither
-    // at a listener nor at a registration, and the diagnostics contract and
-    // the e2e's log greps read the info line.
-    let mut warned = false;
-    let mut registered_once = false;
+/// What woke the acquisition's wait ([`wait_for_wake`]): a table change (a
+/// row that must be re-published), the held connection's end (the
+/// answerer's side went), or the cadence bound.
+enum Wake {
+    /// The registry pinged: the table changed.
+    Table,
+    /// The held connection's end closed.
+    Loss,
+    /// The cadence bound ran out.
+    Cadence,
+}
+
+/// Waits for the next wake after a publish lands: the registry's table
+/// change ping, the held connection's end, or the [`PORT_RECHECK`] bound.
+/// The connection's end is peeked — never consuming, so a reply the next
+/// publish waits for stays its next read's — once per slice, because two
+/// blocking reads cannot be selected on std and the table ping holds the
+/// wait; the peek is the whole point, though: an answerer that goes is
+/// known at the slice, not at the next cadence, which is what keeps a
+/// service restart a short absence window.
+fn wait_for_wake(
+    pings: &mut std::sync::mpsc::Receiver<()>,
+    held: Option<&Registration>,
+    bound: Duration,
+) -> Wake {
+    let deadline = Instant::now() + bound;
     loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Wake::Cadence;
+        }
+        match pings.recv_timeout(remaining.min(CONNECTION_POLL)) {
+            Ok(()) => return Wake::Table,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Wake::Cadence,
+        }
+        if let Some(held) = held
+            && matches!(held.answerer_alive(), Ok(false) | Err(_))
+        {
+            return Wake::Loss;
+        }
+    }
+}
+
+/// Waits for the next wake after a publish landed, keeping the connection
+/// when it survived it: a table change or the cadence keeps it; its end
+/// drops it — entering an error episode, since this table's rows answer
+/// nothing from the moment the answerer's side closes until the next pass
+/// reconnects — and the caller reconnects next pass.
+fn wait_out_wake(
+    pings: &mut std::sync::mpsc::Receiver<()>,
+    registration: Registration,
+    status: &AnswererStatus,
+    port: u16,
+    erroring: &mut bool,
+) -> Option<Registration> {
+    match wait_for_wake(pings, Some(&registration), PORT_RECHECK) {
+        Wake::Table | Wake::Cadence => Some(registration),
+        Wake::Loss => {
+            surface_error(
+                status,
+                port,
+                erroring,
+                "the answerer's end of the channel closed (a service restart, or the \
+                 interim holder's exit)",
+            );
+            None
+        }
+    }
+}
+
+/// Enters an error episode: the status names the port as held with nothing
+/// answering this table's names, the first entry into an episode warns with
+/// `why`, and the passes inside it stay at debug — until a publish lands
+/// again, which re-arms the warn (the caller resets `erroring`), so an
+/// unrelated later failure warns on its own.
+fn surface_error(status: &AnswererStatus, port: u16, erroring: &mut bool, why: &str) {
+    status.set(ZoneAnswererStatus::PortHeldNoChannel { port });
+    if *erroring {
+        tracing::debug!(
+            component = COMPONENT,
+            "the zone answerer still answers nothing for this VM: {why}"
+        );
+    } else {
+        *erroring = true;
+        tracing::warn!(
+            component = COMPONENT,
+            port,
+            "this VM's box names are not answered on the host: {why}"
+        );
+    }
+}
+
+/// Warns the rows an answerer refused this table's publish, each with its
+/// reason: a name this table lost to the node that first published it, or
+/// an address the host may not be told — the operator's problem to see at
+/// the moment it happens, not at the first lookup that finds the row
+/// absent.
+fn warn_refused(node: &str, refused: Vec<RefusedRow>) {
+    for row in refused {
+        tracing::warn!(
+            component = COMPONENT,
+            node = %node,
+            name = %row.name,
+            reason = %row.reason,
+            "the answerer refused a published zone row"
+        );
+    }
+}
+
+/// The acquisition over a named channel socket, so the whole publish-or-host
+/// machinery is drivable where the channel is not the machine's own (the
+/// tests below run daemons and the installed service's serving loops on one
+/// temporary channel).
+///
+/// The choice is made on the channel socket's path, and the channel comes
+/// first: a path present is an answerer's — the installed host service's,
+/// or the interim holder daemon's, and a connect is what starts a
+/// socket-activated service, so the daemon's first act is to connect and
+/// publish there. A path present that refuses or times out is an error
+/// surfaced at session start, never a reason to host. Only a path absent
+/// leaves the answerer nobody's, and then the port decides: free, this
+/// daemon hosts the answerer itself as the recorded interim and holds the
+/// channel beside it for any sibling daemon; held, the collision is
+/// surfaced — the holder is a process with no channel (a native minimald,
+/// a foreign squatter), and this VM's names answer nothing on the host
+/// until it goes. Never both: a published-to answerer is never hosted
+/// over, and a hosted one binds the channel, so the next daemon publishes.
+///
+/// A publish that lands lives for the session: the loop re-publishes the
+/// whole table on every change ping — idempotent, so a row that went is
+/// gone in the same line — and on the [`PORT_RECHECK`] cadence, and the
+/// moment the answerer's end of the connection closes it reconnects with
+/// backoff and re-publishes, so a service restart is a short absence
+/// window and never a session restart.
+fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: AnswererStatus) {
+    // Subscribed before the first connect, so no change lands unpinged in
+    // the window before the answerer is decided. The host drops it: its own
+    // table answers live, so it has nothing to re-publish, and the next
+    // ping prunes the dead sender.
+    let mut pings = registry.subscribe_table_pings();
+    let node = crate::state::vm_name().to_string();
+    let mut held: Option<Registration> = None;
+    // The once-only start info line: the first publish that lands says
+    // which answerer the rows went to, whatever the passes before it
+    // warned.
+    let mut published_once = false;
+    // Whether the loop is inside an error episode ([`surface_error`]).
+    let mut erroring = false;
+    // The backoff between attempts on a channel that is present but not
+    // answering, doubling to the re-check cadence.
+    let mut retry = CHANNEL_RETRY;
+    loop {
+        // ── the publish arm, a held connection: re-publish the whole
+        // table, idempotent. A send that fails is the connection's end —
+        // the next pass reconnects, immediately, because a restarted
+        // answerer is most likely back.
+        if let Some(mut registration) = held.take() {
+            match registration.send(zone_rows(&registry)) {
+                Ok(refused) => {
+                    erroring = false;
+                    status.set(ZoneAnswererStatus::Registered { port });
+                    warn_refused(&node, refused);
+                    held = wait_out_wake(&mut pings, registration, &status, port, &mut erroring);
+                }
+                Err(error) => {
+                    surface_error(
+                        &status,
+                        port,
+                        &mut erroring,
+                        &format!("the answerer channel connection failed: {error}"),
+                    );
+                }
+            }
+            continue;
+        }
+        // ── the publish arm, fresh: the channel comes first, always. The
+        // connect is what starts a socket-activated answerer.
+        match connect_and_publish(&channel, &node, zone_rows(&registry)) {
+            Ok(published) => {
+                let registration = published.registration;
+                retry = CHANNEL_RETRY;
+                erroring = false;
+                status.set(ZoneAnswererStatus::Registered { port });
+                warn_refused(&node, published.refused);
+                if !published_once {
+                    published_once = true;
+                    // The one info line at daemon start, the diagnostics
+                    // contract's: publish-or-host, the hook port, the
+                    // channel path — and which answerer holds the port, as
+                    // its hello ack named it.
+                    let whose = match published.holder.as_str() {
+                        SERVICE_HOLDER => "the manager-held answerer service".to_string(),
+                        _ => "another VM host daemon holding the port (the single-operator \
+                              interim)"
+                            .to_string(),
+                    };
+                    tracing::info!(
+                        component = COMPONENT,
+                        holder = %published.holder,
+                        port,
+                        channel = %channel.display(),
+                        "the zone answerer is held by {whose}; published this table's zone \
+                         rows to it over the channel and hosts nothing here"
+                    );
+                }
+                held = wait_out_wake(&mut pings, registration, &status, port, &mut erroring);
+                // The connection is the publish arm's to serve from now,
+                // whether the wake kept it or ended it: the host arm is for
+                // a channel socket path that is not there at all.
+                continue;
+            }
+            // The channel socket path is absent: the answerer is nobody's,
+            // and the host arm below decides this daemon's.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            // A channel present that refuses or times out is an error,
+            // never a reason to host: a connect starts a socket-activated
+            // service, so an answerer that is installed and healthy always
+            // answers one — this one is broken, and surfacing that is the
+            // only honest move. Retried with backoff, so a restarted one
+            // is found inside a second or two.
+            Err(error) => {
+                surface_error(
+                    &status,
+                    port,
+                    &mut erroring,
+                    &format!("the answerer channel is present but did not answer: {error}"),
+                );
+                let _ = pings.recv_timeout(retry);
+                retry = (retry * 2).min(PORT_RECHECK);
+                continue;
+            }
+        }
+        // ── the host arm: the channel socket path is absent, so this
+        // daemon hosts the answerer itself as the recorded interim — when
+        // the port is free. A port held with no channel behind it is a
+        // surfaced collision, not a fallback.
         match UdpSocket::bind((Ipv4Addr::LOCALHOST, port)) {
             Ok(socket) => {
-                drop(held);
                 let addr = socket
                     .local_addr()
                     .map_or_else(|_| format!("127.0.0.1:{port}"), |addr| addr.to_string());
@@ -1037,25 +1921,35 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: A
                 tracing::info!(
                     component = COMPONENT,
                     listener = %addr,
+                    port,
+                    channel = %channel.display(),
                     status = "serving",
-                    "the zone answerer holds the host loopback: the box zone answers here, \
-                     from this host-authored table"
+                    "no answerer channel exists on this machine; this VM's host daemon \
+                     holds the zone answerer itself as the single-operator interim: \
+                     the box zone answers here, from this host-authored table"
                 );
-                // One table of registered rows, shared by the answers and
+                // One table of published rows, shared by the answers and
                 // the channel that fills them: a row another daemon
-                // registers must be the row a lookup is answered by, which
+                // publishes must be the row a lookup is answered by, which
                 // two tables could never promise.
                 let registered = Arc::new(RegisteredTables::new());
                 let answerer = HostAnswerer::new(registry.clone(), Arc::clone(&registered));
-                // The channel is how other VM host daemons' tables reach
-                // these answers; a bind failure is warned and served
-                // around — the zone still answers, from this table alone.
-                if let Err(error) = hold_channel(&channel, registered) {
+                // The channel is how sibling daemons' tables reach these
+                // answers, and how the next daemon to start knows not to
+                // host; a bind failure is warned and served around — the
+                // zone still answers, from this table alone.
+                if let Err(error) = hold_channel(
+                    &channel,
+                    Arc::clone(&registered),
+                    Some(Arc::new(registry.clone())),
+                    // SAFETY: geteuid only reads the process's own uid.
+                    unsafe { libc::geteuid() },
+                ) {
                     tracing::warn!(
                         component = COMPONENT,
                         %error,
-                        "could not bind the answerer channel socket; other VM host daemons \
-                         cannot register their names with this answerer"
+                        "could not bind the answerer channel socket; other VM host \
+                         daemons cannot publish their names to this answerer"
                     );
                 }
                 drop(pings);
@@ -1063,71 +1957,13 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: A
                 return;
             }
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-                // The port is held: this daemon's rows answer through the
-                // holder. A held connection re-registers; a lost one is
-                // dropped here and the next pass connects again.
-                let rows = zone_rows(&registry);
-                let outcome = match held.take() {
-                    Some(mut registration) => {
-                        let sent = registration.send(rows.clone());
-                        if sent.is_ok() {
-                            held = Some(registration);
-                        }
-                        sent
-                    }
-                    None => register_rows(&channel, rows.clone()).map(|registration| {
-                        held = Some(registration);
-                    }),
-                };
-                let first = held.is_some() && !registered_once;
-                match outcome {
-                    Ok(()) => {
-                        status.set(ZoneAnswererStatus::Registered { port });
-                        if first {
-                            registered_once = true;
-                            tracing::info!(
-                                component = COMPONENT,
-                                holder = %channel.display(),
-                                rows = rows.len(),
-                                "the zone answerer's port is held by another VM host daemon; \
-                                 registered this table's zone rows with it and answer nothing here"
-                            );
-                        } else {
-                            tracing::debug!(
-                                component = COMPONENT,
-                                holder = %channel.display(),
-                                rows = rows.len(),
-                                "re-registered this table's zone rows with the holder"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        status.set(ZoneAnswererStatus::PortHeldNoChannel { port });
-                        if !warned {
-                            warned = true;
-                            tracing::warn!(
-                                component = COMPONENT,
-                                port,
-                                %error,
-                                channel = %channel.display(),
-                                "the zone answerer's port is held and the holder's channel did \
-                                 not answer (a native minimald or a foreign process holds it); \
-                                 this VM's box names are not answered on the host"
-                            );
-                        } else {
-                            tracing::debug!(
-                                component = COMPONENT,
-                                %error,
-                                "the holder's channel still did not answer"
-                            );
-                        }
-                    }
-                }
-                // The wait belongs at the end of a pass that did not take
-                // the port: a change ping re-registers through the next
-                // pass, a cadence wake just re-checks the port — and the
-                // holder does not live forever, so a daemon that outlives
-                // one takes the port.
+                surface_error(
+                    &status,
+                    port,
+                    &mut erroring,
+                    "the zone answerer's port is held by a process with no answerer \
+                     channel (a native minimald or a foreign process)",
+                );
                 let _ = pings.recv_timeout(PORT_RECHECK);
             }
             Err(error) => {
@@ -1143,14 +1979,33 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: A
     }
 }
 
-/// Serves the box zone on a bound socket, for the daemon's lifetime: one
-/// datagram per turn, each either answered ([`HostAnswerer::respond`]) or
-/// silently dropped — an off-host source, or something that is not a
-/// standard query. A reply that cannot be sent is logged and skipped: a
-/// peer that vanished mid-exchange must not take the answerer down.
+/// Serves the box zone on a bound socket, for the holder's lifetime (the
+/// interim is this daemon's; the service's is until the service manager
+/// stops it): one datagram per turn, each either answered
+/// ([`HostAnswerer::respond`]) or silently dropped — an off-host source, or
+/// something that is not a standard query. A reply that cannot be sent is
+/// logged and skipped: a peer that vanished mid-exchange must not take the
+/// answerer down.
 fn serve(socket: UdpSocket, answerer: HostAnswerer) {
+    serve_with_stop(socket, answerer, None);
+}
+
+/// The serving loop both holders share. Without a stop flag it serves
+/// forever (the interim's daemon-held lifetime); with one it polls
+/// [`CONNECTION_POLL`] between receives, so a service asked to stop stops
+/// inside a poll slice instead of blocking in `recv_from` until the next
+/// datagram.
+fn serve_with_stop(socket: UdpSocket, answerer: HostAnswerer, stop: Option<Arc<AtomicBool>>) {
+    if stop.is_some() {
+        let _ = socket.set_read_timeout(Some(CONNECTION_POLL));
+    }
     let mut buf = vec![0u8; MAX_DATAGRAM];
     loop {
+        if let Some(stop) = &stop
+            && stop.load(Ordering::SeqCst)
+        {
+            return;
+        }
         match socket.recv_from(&mut buf) {
             Ok((len, peer)) => {
                 if let Some(reply) = answerer.respond(peer, &buf[..len])
@@ -1164,6 +2019,15 @@ fn serve(socket: UdpSocket, answerer: HostAnswerer) {
                     );
                 }
             }
+            // A poll wake with the stop still unset is the next turn.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) && stop.is_some() =>
+            {
+                continue;
+            }
             Err(error) => {
                 tracing::debug!(
                     component = COMPONENT,
@@ -1173,6 +2037,46 @@ fn serve(socket: UdpSocket, answerer: HostAnswerer) {
             }
         }
     }
+}
+
+/// Serves the answerer as the installed host service: the listener the
+/// service manager holds (the hook port on the host loopback) and the
+/// channel socket it holds beside it, both inherited, answering with the
+/// shared zone decision from the rows node daemons publish over the
+/// channel. Rows live only while their node's connection is up — a service
+/// restart holds nothing until the nodes reconnect and re-publish, which
+/// they do unprompted, in backoff time.
+///
+/// The uid gate is the channel's whole security posture: a peer whose uid
+/// is not this service's own is refused before a byte of its payload is
+/// read ([`serve_channel`]), so only the operator's own daemons — and the
+/// tests — can publish.
+pub(crate) fn serve_service(
+    listener: UdpSocket,
+    channel: UnixListener,
+    expected_uid: u32,
+    stop: Arc<AtomicBool>,
+) {
+    let registered = Arc::new(RegisteredTables::new());
+    let answerer = HostAnswerer::for_service(Arc::clone(&registered));
+    // The answers are served on their own thread, so a slow DNS exchange
+    // never delays a publish — and the channel is served here, on the
+    // calling thread: a service has nothing else to do, and its per-node
+    // connect and disconnect lines then come from the one thread a service
+    // manager's journal reads them from.
+    let answer_stop = Arc::clone(&stop);
+    std::thread::Builder::new()
+        .name("minvmd-zone-answers".to_string())
+        .spawn(move || serve_with_stop(listener, answerer, Some(answer_stop)))
+        .expect("the answerer's answers thread should spawn");
+    serve_channel(
+        channel,
+        registered,
+        expected_uid,
+        None,
+        SERVICE_HOLDER,
+        stop,
+    );
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -1319,6 +2223,27 @@ mod tests {
         }
     }
 
+    /// Waits until `probe` returns a reply that carries an answer record —
+    /// not merely any reply — failing the test on `what` past the deadline.
+    /// The wait a freshly restarted answerer makes: it answers its nodes'
+    /// names with negatives until the nodes reconnect and re-publish, and
+    /// the window between is the restart's whole absence.
+    fn await_a_record(probe: impl Fn() -> Option<Message>, what: &str) -> Message {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(reply) = probe()
+                && !reply.answers.is_empty()
+            {
+                return reply;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: the name never answered a record within 10 s"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Waits until `probe` — one status read per try — reports a state the
     /// acquisition has decided, failing the test on `what` when the deadline
     /// passes. The acquisition's first pass is asynchronous from the thread
@@ -1369,6 +2294,109 @@ mod tests {
             "the SOA is the zone's own"
         );
         record
+    }
+
+    /// One published row, the shape a publish line carries: a zone name, the
+    /// address its A lookup gets, and a live namespace behind it.
+    fn published_row(name: &str, address: Ipv4Addr) -> RegisteredRow {
+        RegisteredRow {
+            name: format!("{name}.{}", zone_answer::ZONE_APEX),
+            address: Some(address),
+            live: true,
+        }
+    }
+
+    /// A registry holding one published box named `name` at the reserved-range
+    /// address whose tail is `tail` — [`web_registry`]'s shape, at a name and
+    /// address the caller picks, so two daemons in one test hold rows that
+    /// cannot meet.
+    fn named_box_registry(name: &str, tail: u8) -> (BoxRegistry, Ipv4Addr) {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register_node_namespace(7654);
+        let web = Ipv4Addr::new(127, 0, 64, tail);
+        registry.register(BoxRegistration::new(
+            name,
+            Ipv4Addr::new(100, 64, 0, tail),
+            web,
+        ));
+        (registry, web)
+    }
+
+    /// The installed service's two sockets, bound by the test the way the
+    /// service manager binds them for socket activation: the listener at a
+    /// free hook port and the channel beside it, both handed to the service
+    /// rather than bound by it. Returns the port, the channel's path, and
+    /// the two sockets.
+    fn service_sockets(dir: &tempfile::TempDir) -> (u16, PathBuf, UdpSocket, UnixListener) {
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the probe binds loopback");
+        let port = probe.local_addr().expect("the probe names its port").port();
+        drop(probe);
+        let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, port))
+            .expect("the service's listener binds the hook port");
+        let channel_listener = UnixListener::bind(&channel).expect("the service's channel binds");
+        (port, channel, listener, channel_listener)
+    }
+
+    /// Starts the installed service's serving loops ([`serve_service`]) over
+    /// sockets the test holds, as the service manager's activation hands them
+    /// over, on its own thread. Returns the stop flag that retires it and
+    /// the thread's handle — the pair a restart proof needs to end one run
+    /// before starting the next.
+    fn start_service(
+        listener: UdpSocket,
+        channel: UnixListener,
+    ) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let service_stop = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("test-zone-service".to_string())
+            .spawn(move || {
+                // SAFETY: geteuid only reads the process's own uid.
+                let expected_uid = unsafe { libc::geteuid() };
+                serve_service(listener, channel, expected_uid, service_stop);
+            })
+            .expect("the service's thread spawns");
+        (stop, handle)
+    }
+
+    /// Waits until `probe` reads exactly `wanted`, failing the test on `what`
+    /// when the deadline passes — the wait for a state an acquisition has
+    /// been through before, which its once-only lines make the re-deciding
+    /// one every time.
+    fn await_status_is(probe: &AnswererStatus, wanted: ZoneAnswererStatus, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if probe.get() == wanted {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: the status never read {wanted:?} within 10 s"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Waits until some captured log line satisfies `matches`, failing the
+    /// test on `what` when the deadline passes. A thread's logging races the
+    /// fact that made its caller return: the connect line is written before
+    /// the ack the caller waits for, but the disconnect line is written
+    /// after the withdrawal a negative lookup observes — so the assert
+    /// waits, not the reader.
+    fn await_log(buf: &CaptureWriter, says: impl Fn(&str) -> bool, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if buf.contents().lines().any(&says) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: the log never said it within 10 s, got: {}",
+                buf.contents()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// The holder answers the zone from the host-authored table (NET-138):
@@ -1780,10 +2808,20 @@ mod tests {
              node row: every VM's node row is the same name, so the channel \
              would only refuse it"
         );
-        let registration =
-            register_rows(&channel, rows.clone()).expect("the holder accepts the table");
+        let published = connect_and_publish(&channel, "a test node", rows.clone())
+            .expect("the holder accepts the table");
+        assert!(
+            published.refused.is_empty(),
+            "the holder refuses no row of the second table: {:?}",
+            published.refused
+        );
+        assert_eq!(
+            published.holder, DAEMON_HOLDER,
+            "the interim holder names itself in the hello ack"
+        );
+        let registration = published.registration;
 
-        // Both VMs' box names are registered and no row is refused: every
+        // Both VMs' box names are published and no row is refused: every
         // row the second daemon sent answers through the holder at the
         // address it sent — a refused row would answer with its keeper's
         // address or nothing, and the sent set is the whole second table.
@@ -1980,9 +3018,15 @@ mod tests {
         );
 
         // The holder comes up beside the hold: the channel alone, the half a
-        // registration needs, while the foreign socket keeps the port.
-        hold_channel(&channel, Arc::new(RegisteredTables::new()))
-            .expect("the holder's channel binds beside the foreign hold");
+        // publish needs, while the foreign socket keeps the port.
+        hold_channel(
+            &channel,
+            Arc::new(RegisteredTables::new()),
+            None,
+            // SAFETY: geteuid only reads the process's own uid.
+            unsafe { libc::geteuid() },
+        )
+        .expect("the holder's channel binds beside the foreign hold");
         // A table change wakes the loop now, at its ping, rather than at the
         // port-recheck cadence — the way a live daemon's box registration
         // reaches the answerer — so the registration this test is about
@@ -2007,19 +3051,733 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        // The registration that got through is the first, so it is the info
+        // The publish that got through is the first, so it is the info
         // line naming the holder — on a line that names this test's channel,
-        // so a co-resident test's own registration cannot speak for it — and
-        // not the re-registration's debug line a warn-suppressed first
-        // registration would have been left with.
+        // so a co-resident test's own publish cannot speak for it — and
+        // not the re-publish's debug line a warn-suppressed first publish
+        // would have been left with.
         let log = buf.contents();
         assert!(
             log.lines().any(|line| {
-                line.contains("registered this table's zone rows with it")
+                line.contains("published this table's zone rows")
                     && line.contains(channel.to_string_lossy().as_ref())
             }),
-            "the first registration after a warn must still name its holder \
+            "the first publish after a warn must still name its holder \
              at info, got: {log}"
+        );
+    }
+
+    // ── the installed service ───────────────────────────────────────────────
+
+    /// The service the privileged step installs answers both nodes' names
+    /// from the one answerer the service manager holds: two nodes, each over
+    /// its own channel connection, publish one name each, and both answer
+    /// through the one listener — beside the answerer's own held rows, the
+    /// host's name and the node's shared one, which no node publishes and
+    /// the service holds itself.
+    #[test]
+    fn answerer_service_answers_rows_from_two_nodes() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let (port, channel, listener, channel_listener) = service_sockets(&dir);
+        let (stop, _handle) = start_service(listener, channel_listener);
+
+        // Two nodes on one machine: each connects, says its hello, and
+        // publishes its rows over its own connection, the way two VM host
+        // daemons publish to the installed service.
+        let a = connect_and_publish(
+            &channel,
+            "vm-a",
+            vec![published_row("web-a", Ipv4Addr::new(127, 0, 64, 9))],
+        )
+        .expect("the service accepts the first node");
+        assert_eq!(
+            a.holder, SERVICE_HOLDER,
+            "the installed service names itself in the hello ack"
+        );
+        let b = connect_and_publish(
+            &channel,
+            "vm-b",
+            vec![published_row("web-b", Ipv4Addr::new(127, 0, 64, 10))],
+        )
+        .expect("the service accepts the second node");
+        assert_eq!(
+            b.holder, SERVICE_HOLDER,
+            "the installed service names itself in the hello ack"
+        );
+        assert!(
+            a.refused.is_empty() && b.refused.is_empty(),
+            "no row of either node is refused: {:?} / {:?}",
+            a.refused,
+            b.refused
+        );
+
+        // Both nodes' names answer through the one listener, each at the
+        // address its node published.
+        let reply = await_answer(
+            || query(port, "web-a.min.internal.", RecordType::A),
+            "the service never answered the first node's name",
+        );
+        assert_eq!(
+            a_answer(&reply),
+            Ipv4Addr::new(127, 0, 64, 9),
+            "the first node's name answers at the address it published"
+        );
+        let reply = await_answer(
+            || query(port, "web-b.min.internal.", RecordType::A),
+            "the service never answered the second node's name",
+        );
+        assert_eq!(
+            a_answer(&reply),
+            Ipv4Addr::new(127, 0, 64, 10),
+            "the second node's name answers at the address it published"
+        );
+
+        // The answerer's own held rows answer beside the nodes': the host's
+        // own name, and the node's shared one, live while any node is
+        // connected.
+        let reply = await_answer(
+            || query(port, "host.min.internal.", RecordType::A),
+            "the service never answered the host's own name",
+        );
+        assert_eq!(
+            a_answer(&reply),
+            Ipv4Addr::LOCALHOST,
+            "the host's own name is the service's row, at the host loopback"
+        );
+        let reply = query(port, "minimald.min.internal.", RecordType::A)
+            .expect("the node's shared name answers while a node is connected");
+        assert_eq!(
+            a_answer(&reply),
+            Ipv4Addr::LOCALHOST,
+            "the node's shared name is the service's row, live while nodes are"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    /// A helper daemon that finds the hook port held by the installed service
+    /// publishes its rows over the channel instead of binding and says so at
+    /// start: its status reports its rows answering through the holder, its
+    /// box name answers at its own address through the service's listener,
+    /// and its start line names the manager-held service and the channel it
+    /// published over — the one info line the diagnostics contract asks for.
+    #[test]
+    fn helper_publishes_when_service_holds_the_port() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let (port, channel, listener, channel_listener) = service_sockets(&dir);
+        let (stop, _handle) = start_service(listener, channel_listener);
+
+        // The helper daemon: its acquisition loop exactly as `run` starts
+        // it, on a thread whose logging this test captures — the thread-local
+        // capture the crate's other tests use, because the acquisition logs
+        // from its own thread.
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let (registry, web) = web_registry();
+        let status = AnswererStatus::starting();
+        let probe = status.clone();
+        let daemon_channel = channel.clone();
+        std::thread::Builder::new()
+            .name("test-zone-helper".to_string())
+            .spawn(move || {
+                let _guard = tracing::subscriber::set_default(subscriber);
+                acquire_loop_at(registry, port, daemon_channel, status);
+            })
+            .expect("the helper's thread spawns");
+
+        // The helper found the channel and published there: its status says
+        // its rows answer through the holder, never that it holds the port.
+        assert_eq!(
+            await_status(
+                || probe.get(),
+                "the helper never said what the machine's answerer is"
+            ),
+            ZoneAnswererStatus::Registered { port },
+            "a daemon whose channel the service holds publishes, and reports that"
+        );
+
+        // Its box name answers through the service's listener, at its own
+        // published address.
+        let reply = await_answer(
+            || query(port, "web.min.internal.", RecordType::A),
+            "the helper's name never answered through the service",
+        );
+        assert_eq!(
+            a_answer(&reply),
+            web,
+            "the helper's name answers at its own address, through the service"
+        );
+
+        // And its start line says so: publish-or-host, naming the
+        // manager-held service and the channel path.
+        let channel_text = channel.to_string_lossy().into_owned();
+        await_log(
+            &buf,
+            |line| {
+                line.contains("published this table's zone rows")
+                    && line.contains("the manager-held answerer service")
+                    && line.contains(&channel_text)
+            },
+            "the helper's start line never announced its publish",
+        );
+
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    /// A channel peer whose uid is not the service's own is refused before a
+    /// byte of its payload is read: the connection closes without an ack,
+    /// its rows are never held, and the refusal is the one warn line that
+    /// names the peer's uid — the line a misconfigured unit's service user
+    /// answers at a glance.
+    #[test]
+    fn answerer_channel_refuses_foreign_uid() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        let listener = UnixListener::bind(&channel).expect("the channel binds");
+        let registered = Arc::new(RegisteredTables::new());
+        let tables = Arc::clone(&registered);
+        // The uid this answerer serves: not this test process's own, so this
+        // test's connect is a foreign peer's. The xor flips the low bit, so
+        // it can never equal the real one.
+        //
+        // SAFETY: geteuid only reads the process's own uid.
+        let expected_uid = unsafe { libc::geteuid() } ^ 1;
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let stop = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("test-zone-gate".to_string())
+            .spawn(move || {
+                let _guard = tracing::subscriber::set_default(subscriber);
+                serve_channel(
+                    listener,
+                    registered,
+                    expected_uid,
+                    None,
+                    SERVICE_HOLDER,
+                    gate,
+                );
+            })
+            .expect("the gate's thread spawns");
+
+        // The foreign peer's publish is refused: the connection gets no ack —
+        // it closes — so the client's hello fails one way or another.
+        let refused = connect_and_publish(
+            &channel,
+            "vm-a",
+            vec![published_row("web-a", Ipv4Addr::new(127, 0, 64, 9))],
+        );
+        assert!(
+            refused.is_err(),
+            "a channel peer with a foreign uid is refused"
+        );
+
+        // And nothing it sent was held: the gate refused the peer before a
+        // byte of its payload was read.
+        assert!(tables.is_empty(), "the refused peer's rows were never held");
+
+        // The refusal is the warn line naming the peer's uid — the gate's
+        // own record of who it turned away.
+        //
+        // SAFETY: geteuid only reads the process's own uid.
+        let own_uid = unsafe { libc::geteuid() };
+        await_log(
+            &buf,
+            |line| {
+                line.contains("refused an answerer channel connection from a foreign uid")
+                    && line.contains(&format!("peer_uid={own_uid}"))
+                    && line.contains(&format!("service_uid={expected_uid}"))
+            },
+            "the gate never warned about the foreign peer",
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        handle
+            .join()
+            .expect("the gate's thread ends when its stop is set");
+    }
+
+    /// The installed service holds a node's rows only while the node's
+    /// connection is up (NET-124's context, the answerer's half): the
+    /// connection's end is the whole withdrawal — the name answers nothing,
+    /// and a restart of the service holds nothing until the nodes reconnect
+    /// — and the service's own log names the node's connection, its
+    /// publish, and the rows that went with its disconnection.
+    #[test]
+    fn answerer_service_forgets_rows_of_a_gone_node() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let (port, channel, listener, channel_listener) = service_sockets(&dir);
+
+        // The service's own log captured, so the connect, publish, and
+        // disconnect lines the observability contract asks for are the
+        // asserts this test reads. The global default, not a thread-local
+        // guard: the per-node lines are logged from the channel's
+        // per-connection threads, which no thread-local capture reaches.
+        // One per test process — nextest runs each test as its own process,
+        // the assumption the crate's other global capture makes.
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("the capturing subscriber installs once per test process");
+        let (stop, handle) = start_service(listener, channel_listener);
+
+        let published = connect_and_publish(
+            &channel,
+            "vm-a",
+            vec![published_row("gone", Ipv4Addr::new(127, 0, 64, 9))],
+        )
+        .expect("the service accepts the node");
+        assert!(
+            published.refused.is_empty(),
+            "the node's row is held: {:?}",
+            published.refused
+        );
+        let reply = await_answer(
+            || query(port, "gone.min.internal.", RecordType::A),
+            "the service never answered the node's name",
+        );
+        assert_eq!(
+            a_answer(&reply),
+            Ipv4Addr::new(127, 0, 64, 9),
+            "the node's name answers while its connection is up"
+        );
+
+        // The service's log named the node's connection and its publish —
+        // the one info line per connection and per publish.
+        await_log(
+            &buf,
+            |line| {
+                line.contains("a node connected to the zone answerer channel")
+                    && line.contains("vm-a")
+            },
+            "the service never logged the node's connection",
+        );
+        await_log(
+            &buf,
+            |line| {
+                line.contains("a node published its zone rows to the answerer")
+                    && line.contains("gone.min.internal")
+            },
+            "the service never logged the node's publish",
+        );
+
+        // The connection's end is the whole withdrawal: the name answers
+        // NXDOMAIN, the negative the zone certifies with its SOA.
+        drop(published);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let answered = query(port, "gone.min.internal.", RecordType::A)
+                .expect("an in-zone lookup is still answered");
+            if answered.metadata.response_code == ResponseCode::NXDomain {
+                soa_of(&answered);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the gone node's name still answers: {:?}",
+                answered.metadata.response_code
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // And the service's log named the disconnection and the rows that
+        // went with it.
+        await_log(
+            &buf,
+            |line| {
+                line.contains("a node disconnected from the zone answerer channel")
+                    && line.contains("gone.min.internal")
+            },
+            "the service never logged the node's withdrawal",
+        );
+
+        // The node's shared name — live while any node is connected, held by
+        // the service itself — answers nothing once none is.
+        let reply = query(port, "minimald.min.internal.", RecordType::A)
+            .expect("the service still answers the node's name with a negative");
+        assert!(
+            reply.answers.is_empty(),
+            "the node's shared name answers nothing once no node is connected"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle;
+    }
+
+    /// A name belongs to the node that first published it: a second node's
+    /// publish of a held name is refused and reported — the ack names the
+    /// row and the reason names the node that keeps it — while the rest of
+    /// the second node's publish still holds, exactly the per-row refusal
+    /// the channel's rules promise.
+    #[test]
+    fn second_node_publishing_a_held_name_is_refused() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let (port, channel, listener, channel_listener) = service_sockets(&dir);
+        let (stop, _handle) = start_service(listener, channel_listener);
+
+        let shared = Ipv4Addr::new(127, 0, 64, 9);
+        let a = connect_and_publish(
+            &channel,
+            "vm-a",
+            vec![
+                published_row("shared", shared),
+                published_row("only-a", Ipv4Addr::new(127, 0, 64, 10)),
+            ],
+        )
+        .expect("the service accepts the first node");
+        assert!(
+            a.refused.is_empty(),
+            "the first publish holds every row: {:?}",
+            a.refused
+        );
+
+        // The second node publishes the held name beside one of its own: the
+        // connection is kept — a refusal is a row's, not a node's — and the
+        // ack names the refused row and the node that keeps it.
+        let b = connect_and_publish(
+            &channel,
+            "vm-b",
+            vec![
+                published_row("shared", Ipv4Addr::new(127, 0, 64, 11)),
+                published_row("only-b", Ipv4Addr::new(127, 0, 64, 12)),
+            ],
+        )
+        .expect("the service keeps the second node's connection open");
+        let [refused] = &b.refused[..] else {
+            panic!("the held name is refused, exactly once: {:?}", b.refused);
+        };
+        assert_eq!(
+            refused.name, "shared.min.internal",
+            "the refused row is the held name"
+        );
+        assert!(
+            refused.reason.contains("another node (vm-a)")
+                && refused.reason.contains("first publisher"),
+            "the refusal names the node that keeps the name: {}",
+            refused.reason
+        );
+
+        // The first publisher keeps the name, at its own address…
+        let reply = await_answer(
+            || query(port, "shared.min.internal.", RecordType::A),
+            "the held name never answered",
+        );
+        assert_eq!(
+            a_answer(&reply),
+            shared,
+            "the first publisher keeps the name at its own address"
+        );
+        // …the refused node's other row still answers — the refusal is per
+        // row, so the second node's table holds its own names…
+        let reply = await_answer(
+            || query(port, "only-b.min.internal.", RecordType::A),
+            "the second node's other name never answered",
+        );
+        assert_eq!(
+            a_answer(&reply),
+            Ipv4Addr::new(127, 0, 64, 12),
+            "the second node's other row holds, refused row or no"
+        );
+        // …and the first node's own rows are untouched.
+        let reply = query(port, "only-a.min.internal.", RecordType::A)
+            .expect("the first node's other name answers");
+        assert_eq!(
+            a_answer(&reply),
+            Ipv4Addr::new(127, 0, 64, 10),
+            "the first node's other row is untouched by the refused publish"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Every published A address must fall inside the answer rule — the
+    /// reserved local range or the host loopback — and is refused otherwise
+    /// (NET-127, the publish-time half): a row at a box's switch lease, an
+    /// address inside the guest's fabric the host cannot reach, never
+    /// reaches the zone, while the same publish's rows at host-answerable
+    /// addresses hold.
+    #[test]
+    fn answerer_refuses_an_address_outside_the_answer_rule() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let (port, channel, listener, channel_listener) = service_sockets(&dir);
+        let (stop, _handle) = start_service(listener, channel_listener);
+
+        let published = connect_and_publish(
+            &channel,
+            "vm-a",
+            vec![
+                published_row("far", Ipv4Addr::new(100, 64, 0, 9)),
+                published_row("near", Ipv4Addr::new(127, 0, 64, 9)),
+                published_row("loop", Ipv4Addr::LOCALHOST),
+            ],
+        )
+        .expect("the service keeps the node's connection: the refusal is a row's");
+        let [refused] = &published.refused[..] else {
+            panic!(
+                "the out-of-range row is refused, exactly once: {:?}",
+                published.refused
+            );
+        };
+        assert_eq!(
+            refused.name, "far.min.internal",
+            "the refused row is the out-of-range one"
+        );
+        assert!(
+            refused.reason.contains("outside the host-answerable range"),
+            "the refusal names the range rule: {}",
+            refused.reason
+        );
+
+        // The rows the rule admits answer: one at the reserved local range
+        // the address plan publishes boxes at, one at the host loopback.
+        let reply = await_answer(
+            || query(port, "near.min.internal.", RecordType::A),
+            "the reserved-range name never answered",
+        );
+        assert_eq!(
+            a_answer(&reply),
+            Ipv4Addr::new(127, 0, 64, 9),
+            "the reserved-range row holds"
+        );
+        let reply = query(port, "loop.min.internal.", RecordType::A)
+            .expect("the host-loopback name answers");
+        assert_eq!(
+            a_answer(&reply),
+            Ipv4Addr::LOCALHOST,
+            "the host-loopback row holds"
+        );
+
+        // The refused row never reached the zone: its name answers the
+        // negative, NXDOMAIN with the zone's SOA (NET-124).
+        let reply = await_answer(
+            || query(port, "far.min.internal.", RecordType::A),
+            "the refused name never answered its negative",
+        );
+        assert_eq!(
+            reply.metadata.response_code,
+            ResponseCode::NXDomain,
+            "a name whose only row was refused answers NXDOMAIN"
+        );
+        soa_of(&reply);
+
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    /// A service restart is a short absence window and never a session
+    /// restart: two daemons hold their published rows through one, because
+    /// the channel connection each holds is reconnected and re-published on
+    /// loss, unprompted — and the service manager's restart hands the same
+    /// listening sockets to the new run, the way systemd re-activates a
+    /// socket-activated service. A restart holds nothing until the nodes
+    /// reconnect and re-publish; both names answer again with no session
+    /// action.
+    #[test]
+    fn nodes_republish_after_a_service_restart() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the probe binds loopback");
+        let port = probe.local_addr().expect("the probe names its port").port();
+        drop(probe);
+        // The manager's sockets: bound here, handed to each run of the
+        // service, and never closed by a restart — the socket-activation
+        // shape, which is what makes the restart a window and not a rebind.
+        let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, port))
+            .expect("the service's listener binds the hook port");
+        let channel_listener = UnixListener::bind(&channel).expect("the service's channel binds");
+
+        // The first run of the service, over the manager's sockets, before
+        // the daemons that publish to it.
+        let (stop, handle) = start_service(
+            listener
+                .try_clone()
+                .expect("the manager re-hands its listener"),
+            channel_listener
+                .try_clone()
+                .expect("the manager re-hands its channel"),
+        );
+
+        // Two daemons with rows that cannot meet, their acquisition loops
+        // exactly as `run` starts them.
+        let (a_registry, a_web) = named_box_registry("web-a", 9);
+        let (b_registry, b_web) = named_box_registry("web-b", 10);
+        let a_status = AnswererStatus::starting();
+        let a_probe = a_status.clone();
+        let a_channel = channel.clone();
+        std::thread::Builder::new()
+            .name("test-zone-daemon-a".to_string())
+            .spawn(move || acquire_loop_at(a_registry, port, a_channel, a_status))
+            .expect("the first daemon's thread spawns");
+        let b_status = AnswererStatus::starting();
+        let b_probe = b_status.clone();
+        let b_channel = channel.clone();
+        std::thread::Builder::new()
+            .name("test-zone-daemon-b".to_string())
+            .spawn(move || acquire_loop_at(b_registry, port, b_channel, b_status))
+            .expect("the second daemon's thread spawns");
+
+        // Both daemons published: their statuses say so, and both names
+        // answer through the service.
+        assert_eq!(
+            await_status(
+                || a_probe.get(),
+                "the first daemon never said what the machine's answerer is"
+            ),
+            ZoneAnswererStatus::Registered { port },
+            "the first daemon published to the service"
+        );
+        assert_eq!(
+            await_status(
+                || b_probe.get(),
+                "the second daemon never said what the machine's answerer is"
+            ),
+            ZoneAnswererStatus::Registered { port },
+            "the second daemon published to the service"
+        );
+        let reply = await_answer(
+            || query(port, "web-a.min.internal.", RecordType::A),
+            "the first daemon's name never answered",
+        );
+        assert_eq!(
+            a_answer(&reply),
+            a_web,
+            "the first daemon's name answers at its own address"
+        );
+        let reply = query(port, "web-b.min.internal.", RecordType::A)
+            .expect("the second daemon's name answers");
+        assert_eq!(
+            a_answer(&reply),
+            b_web,
+            "the second daemon's name answers at its own address"
+        );
+
+        // ── the restart: the manager stops the service, then starts it
+        // again over the same listening sockets. The new run accepts on the
+        // same sockets, so the old run's channel thread must be gone before
+        // it does: a stop is honoured within one poll slice, and three of
+        // them is far past the whole loop.
+        stop.store(true, Ordering::SeqCst);
+        handle.join().expect("the service's first run ends");
+        std::thread::sleep(CONNECTION_POLL * 3);
+        let (stop, handle) = start_service(
+            listener
+                .try_clone()
+                .expect("the manager re-hands its listener"),
+            channel_listener
+                .try_clone()
+                .expect("the manager re-hands its channel"),
+        );
+
+        // Both names answer again — with no session action, no daemon
+        // restart, nothing but the daemons' own reconnect-and-republish on
+        // the connection loss the restart is.
+        let reply = await_a_record(
+            || query(port, "web-a.min.internal.", RecordType::A),
+            "the first daemon never re-published after the restart",
+        );
+        assert_eq!(
+            a_answer(&reply),
+            a_web,
+            "the first daemon's name answers again, at its own address"
+        );
+        let reply = await_a_record(
+            || query(port, "web-b.min.internal.", RecordType::A),
+            "the second daemon never re-published after the restart",
+        );
+        assert_eq!(
+            a_answer(&reply),
+            b_web,
+            "the second daemon's name answers again, at its own address"
+        );
+        // And both daemons' statuses are back to the published state — the
+        // episode the restart opened is over.
+        await_status_is(
+            &a_probe,
+            ZoneAnswererStatus::Registered { port },
+            "the first daemon never re-published its status",
+        );
+        await_status_is(
+            &b_probe,
+            ZoneAnswererStatus::Registered { port },
+            "the second daemon never re-published its status",
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle;
+    }
+
+    /// A channel socket path that is present but refuses is an error
+    /// surfaced at session start, never a reason to host: the daemon that
+    /// finds one does not take the hook port even with it free — a connect
+    /// starts a socket-activated service, so an answerer that is installed
+    /// and healthy always answers a connect, and one that does not is
+    /// broken, not absent. The status names the port held with nothing
+    /// answering this table's names, the warn says why, and nothing binds.
+    #[test]
+    fn present_channel_that_refuses_is_an_error_not_a_host() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        // A channel socket file present with nothing listening behind it:
+        // the crash shape, a service that died and left its socket file.
+        let listener = UnixListener::bind(&channel).expect("the dead channel binds");
+        drop(listener);
+
+        // The hook port is free — hosting it would be possible, and must not
+        // happen.
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the probe binds loopback");
+        let port = probe.local_addr().expect("the probe names its port").port();
+        drop(probe);
+
+        let buf = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let (registry, _) = web_registry();
+        let status = AnswererStatus::starting();
+        let status_probe = status.clone();
+        std::thread::Builder::new()
+            .name("test-zone-refused-channel".to_string())
+            .spawn(move || {
+                let _guard = tracing::subscriber::set_default(subscriber);
+                acquire_loop_at(registry, port, channel, status);
+            })
+            .expect("the daemon's thread spawns");
+
+        // The status surfaces the error: the port is named as held with
+        // nothing this table's names answer through — the state the CLI
+        // shows as "this VM's names are not answered on the host".
+        assert_eq!(
+            await_status(
+                || status_probe.get(),
+                "the daemon never said why this VM's names answer nothing"
+            ),
+            ZoneAnswererStatus::PortHeldNoChannel { port },
+            "a present channel that refuses is surfaced as an error"
+        );
+
+        // The daemon never took the free port: nothing answers there.
+        assert!(
+            query(port, "host.min.internal.", RecordType::A).is_none(),
+            "the daemon must not host the answerer over a present channel, \
+             even with the hook port free"
+        );
+
+        // And the warn says why, at the first pass of the error episode.
+        await_log(
+            &buf,
+            |line| line.contains("did not answer"),
+            "the daemon never warned why it published nothing",
         );
     }
 }

@@ -548,15 +548,20 @@ fn run_foreground() -> Result<()> {
     // loopback, answering from this host-authored table — the same
     // semantics the native daemon's answerer gives, over the same shared
     // decision — so the in-VM daemon starts no answerer of its own and the
-    // host's resolver has one answerer to be pointed at. The port is the
-    // machine's, not this VM's: when another VM host daemon on this host
-    // already holds it, this daemon registers its rows with that holder over
-    // the answerer channel and answers nothing itself, so a second VM's
-    // boxes answer too. Started beside the switch, before the guest boots,
-    // so the node row the registration above published answers from the
-    // moment the VM does — best-effort at startup, like the control socket:
-    // a thread that could not spawn is warned and the VM still boots, its
-    // names then answering from whatever daemon holds the port.
+    // host's resolver has one answerer to be pointed at. The answerer is the
+    // machine's, not this VM's, and the channel decides who holds it: this
+    // daemon connects to the answerer channel first and publishes its rows
+    // there — to the installed host service when the privileged step put one
+    // in, or to another VM host daemon holding the port as the recorded
+    // single-operator interim — and hosts the answerer itself only when no
+    // channel socket exists and the hook port is free, never both, so a
+    // second VM's boxes answer too and the installed service, when there is
+    // one, is the one answerer the machine runs. Started beside the switch,
+    // before the guest boots, so the node row the registration above
+    // published answers from the moment the VM does — best-effort at
+    // startup, like the control socket: a thread that could not spawn is
+    // warned and the VM still boots, its names then answering from whatever
+    // answerer holds the port.
     if let Err(error) =
         crate::net::answerer::spawn(boxes.clone(), DEFAULT_ANSWERER_PORT, answerer_status)
     {
