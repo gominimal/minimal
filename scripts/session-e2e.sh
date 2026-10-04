@@ -10599,15 +10599,16 @@ proof_proxy_sees_boxes_by_address() {
   # cred_restore puts the lane's own filter back on every exit.
   export RUST_LOG="warn,minimald::exec=info,minvmd=info,switch::bep_host=debug"
 
-  local proxy_ip proxy_port node_ip sock sock_wait
+  local proxy_ip proxy_port sock sock_wait
   local psba_sid_a psba_sid_b psba_sid_c
+  local psba_sibling_sid psba_sibling_ip psba_sibling_port
   local psba_ip_a psba_ip_b psba_ip_c
   local psba_reason psba_wait psba_seen psba_line
   local psba_pos_issue psba_pos_delivered
   local psba_box psba_want_lane psba_ip_var psba_sid_var
   proxy_ip="100.64.255.252"
   proxy_port="8118"
-  node_ip="100.64.255.253"
+  psba_sibling_port="18090"
   # The refusal reason a same-uid host process earns at the acceptor, per
   # OS: on Linux the kernel names the unix peer's process and this script's
   # is not the host daemon's; off Linux no pid comes with the credentials,
@@ -10874,18 +10875,39 @@ proof_proxy_sees_boxes_by_address() {
   done
 
   # The laneless box, against the fabric the two answers just proved live:
-  # its control probe to the node's own address on the switch is reset by
-  # the VM's own stack — resolution, the fabric and the gate's admit path
-  # all answer this box — and its probe to the proxy's address runs out its
+  # its control probe to a sibling own-address box's lease, at a port the
+  # sibling publishes (so its ingress gate admits the SYN) and nothing in it
+  # listens on, is reset by the sibling's own stack — resolution, the fabric
+  # and the gates' admit path all answer this box. The switch's own
+  # addresses cannot be the control: the node address and the host alias
+  # are the relay's own silent drops (NET-062's sub-clause, design §7.1),
+  # whatever the box's rules say. Its probe to the proxy's address runs out its
   # window with no reset: the box's own relay dropped the SYN inside the
   # guest, before the switch, exactly the no-lane refusal. The acceptor
   # never saw it, so the pool never recorded a delivery for its address,
   # and the host gate's log says nothing about the frame.
+  psba_sibling_sid="$(mkdir -p "$PSBA_SEED_DIR_C/sibling/.git" \
+    && hook_seed_preamble > "$PSBA_SEED_DIR_C/sibling/minimal.toml" \
+    && cd "$PSBA_SEED_DIR_C/sibling" && mnl session activate . --no-prompt \
+    --name e2e-psba-sibling --network own_ip \
+    --ingress "$psba_sibling_port:$psba_sibling_port" 2>"$WORK/psba-sibling.err")" || {
+    echo "::error::'min session activate --network own_ip --ingress ...' failed for the laneless box's control sibling"
+    cat "$WORK/psba-sibling.err" 2>/dev/null || true
+    cred_fail
+  }
+  psba_sibling_sid="$(printf '%s\n' "$psba_sibling_sid" | tail -n1 | tr -d '\r')"
+  cred_wait_registered "the laneless box's control sibling" "e2e-psba-sibling"
+  psba_sibling_ip="$(cred_box_ip "$psba_sibling_sid" "$WORK/psba-sibling-fib.out" "$WORK/psba-sibling-fib.err")"
+  if [ -z "$psba_sibling_ip" ]; then
+    echo "::error::could not determine the control sibling's switch address from /proc/net/fib_trie"
+    echo "--- fib_trie ---"; cat "$WORK/psba-sibling-fib.out" 2>/dev/null || true
+    cred_fail
+  fi
   mnl session exec "$psba_sid_c" \
-    "/usr/bin/socat /dev/null TCP:$node_ip:$proxy_port,connect-timeout=8" \
+    "/usr/bin/socat /dev/null TCP:$psba_sibling_ip:$psba_sibling_port,connect-timeout=8" \
     >/dev/null 2>"$WORK/psba-nolane-control.err"
   if ! grep -q 'Connection refused' "$WORK/psba-nolane-control.err" 2>/dev/null; then
-    echo "::error::the laneless box's control probe to the node's own address was not reset — the fabric or the gate is not answering this box, so its silence at the proxy's address below would prove nothing. Control stderr:"
+    echo "::error::the laneless box's control probe to the sibling's lease $psba_sibling_ip:$psba_sibling_port was not reset — the fabric or the gates are not answering this box, so its silence at the proxy's address below would prove nothing. Control stderr:"
     cat "$WORK/psba-nolane-control.err" 2>/dev/null || true
     cred_fail
   fi
@@ -11031,6 +11053,7 @@ PY
 
   mnl session destroy --force "$psba_sid_b" >/dev/null 2>&1 || true
   mnl session destroy --force "$psba_sid_c" >/dev/null 2>&1 || true
+  mnl session destroy --force "$psba_sibling_sid" >/dev/null 2>&1 || true
   rm -rf "$PSBA_SEED_DIR_A" "$PSBA_SEED_DIR_B" "$PSBA_SEED_DIR_C"
   PSBA_SEED_DIR_A=""
   PSBA_SEED_DIR_B=""
