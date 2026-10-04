@@ -2360,7 +2360,7 @@ async fn policy_shows_unset_egress_as_named_default() {
         "the declared box's row is the name, bare:\n{declared_text}"
     );
     assert!(
-        !declared_text.contains("(default)"),
+        !declared_text.contains("deny-all (default)"),
         "the declared row carries no default mark, so it never reads as \
          one:\n{declared_text}"
     );

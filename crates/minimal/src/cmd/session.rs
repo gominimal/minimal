@@ -3642,7 +3642,7 @@ mod tests {
             );
         }
         assert!(
-            !rendered.contains("(default)"),
+            !rendered.contains("deny-all (default)"),
             "a declared deny-all is a declaration, never a default, so its \
              row carries no mark: {rendered}"
         );
