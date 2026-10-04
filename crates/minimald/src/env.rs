@@ -1376,6 +1376,10 @@ impl SessionChannel {
                     // read-only rootfs (#1204); the session has a real,
                     // writable home and this channel already holds it.
                     mctx::PatchHome::Session(self.home.clone()),
+                    mctx::WdLayout::Session {
+                        home: self.home.as_utf8_path().to_path_buf().into(),
+                        working: self.working.as_utf8_path().to_path_buf().into(),
+                    },
                 )
                 .await?;
 
