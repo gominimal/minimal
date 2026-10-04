@@ -1596,6 +1596,7 @@ mod tests {
             LEASE,
             policy,
             SwitchSubnet::default(),
+            None,
         ));
         let plan = ListenPlan::new(
             "listen-box".into(),
