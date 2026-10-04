@@ -84,6 +84,8 @@ pub trait PackageSelection {
 /// names when any exist.
 fn package_not_found_message(g: &Graph, input: &str) -> String {
     let suggestions = package_suggestions(g, input);
+    // Show the name the suggestions were computed from, not stray padding.
+    let input = input.trim();
     if suggestions.is_empty() {
         format!(
             "No such package: {} (try 'min package search {}')",
@@ -2026,7 +2028,10 @@ mod tests {
             let err = vec![input.to_string()].as_bsrs(&graph).unwrap_err();
             assert_eq!(
                 err.to_string(),
-                format!("No such package: {input} (did you mean: node, nodejs?)")
+                format!(
+                    "No such package: {} (did you mean: node, nodejs?)",
+                    input.trim()
+                )
             );
         }
     }
