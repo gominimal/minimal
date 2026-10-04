@@ -388,7 +388,7 @@ mod tests {
         // exactly the limit still fails with E2BIG once ssh execs it. Refuse
         // the boundary too, not just lengths above it.
         let at_limit = "x".repeat(MAX_EXEC_COMMAND_BYTES - prefix_len);
-        let boundary_wire = remote_command(&[at_limit.clone()]).unwrap();
+        let boundary_wire = remote_command(std::slice::from_ref(&at_limit)).unwrap();
         assert_eq!(boundary_wire.len(), MAX_EXEC_COMMAND_BYTES);
         assert!(checked_remote_command(&[at_limit]).is_err());
 
