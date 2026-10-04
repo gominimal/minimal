@@ -3155,7 +3155,7 @@ mod tests {
         let mut client = server.connect().await;
 
         let created = client
-            .call::<CreateSession>(&req("my session", "/uwu"))
+            .call::<CreateSession>(&req("my-session", "/uwu"))
             .await
             .unwrap();
         let id = created.id;
@@ -3167,7 +3167,7 @@ mod tests {
         assert_eq!(get_session.record.as_ref().unwrap().id, id);
         assert_eq!(
             get_session.record.as_ref().unwrap().name,
-            Some("my session".to_string())
+            Some("my-session".to_string())
         );
         assert_eq!(
             get_session.record.as_ref().unwrap().project_path,
@@ -3206,7 +3206,7 @@ mod tests {
             list_sessions.sessions,
             vec![ListSessionsEntry {
                 id,
-                name: Some("my session".to_string()),
+                name: Some("my-session".to_string()),
                 project_path: Some(HostAbsPath::try_new("/uwu").unwrap()),
                 // A freshly-created session that hasn't been configured yet
                 // sits in `Pending` until `ConfigureLoadout` promotes it.
@@ -4962,7 +4962,7 @@ mod tests {
         let mut client = server.connect().await;
 
         let id = client
-            .call::<CreateSession>(&req("my session", "/uwu"))
+            .call::<CreateSession>(&req("my-session", "/uwu"))
             .await
             .unwrap()
             .id;
@@ -5632,7 +5632,7 @@ mod tests {
         let mut client = server.connect().await;
 
         let id = client
-            .call::<CreateSession>(&req("my session", "/uwu"))
+            .call::<CreateSession>(&req("my-session", "/uwu"))
             .await
             .unwrap()
             .id;
@@ -5640,7 +5640,7 @@ mod tests {
 
         assert_eq!(
             client
-                .call::<CreateSession>(&req("my session", "/uwu"))
+                .call::<CreateSession>(&req("my-session", "/uwu"))
                 .await,
             Errorable::Err {
                 error: "A session with that name already exists".to_string()

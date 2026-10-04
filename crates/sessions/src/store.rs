@@ -783,7 +783,10 @@ const RESERVED_SESSION_NAMES: [&str; 3] = ["host", "local", "localhost"];
 /// tab or newline in particular — splits one row into several, and an empty
 /// or whitespace-padded name is useless as an addressable handle. Enforced
 /// here beside the name-collision check so both name writers (`create` for
-/// `activate --name`, `save` for `rename`) share one gate.
+/// `activate --name`, `save` for `rename`) share one gate. The name must
+/// also be a single DNS label (ASCII letters, digits and `-`, 1 to 63
+/// octets, no `-` at either end) because the daemon renders it into
+/// `<name>.min.internal`.
 fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
     let invalid = |msg: &str| {
         std::io::Error::new(
@@ -805,6 +808,17 @@ fn validate_session_name(name: &str) -> Result<(), std::io::Error> {
         .find(|reserved| name.eq_ignore_ascii_case(reserved))
     {
         return Err(invalid(&format!("`{reserved}` is reserved")));
+    }
+    // Session names are rendered into `<name>.min.internal` box names, so a
+    // name must be a single DNS label: ASCII letters, digits and `-`, 1 to 63
+    // octets, not starting or ending with `-`.
+    let is_ldh = |c: char| c.is_ascii_alphanumeric() || c == '-';
+    if name.len() > 63 || !name.chars().all(is_ldh) || name.starts_with('-') || name.ends_with('-')
+    {
+        return Err(invalid(
+            "must be a DNS label: ASCII letters, digits and `-`, \
+             1 to 63 characters, not starting or ending with `-`",
+        ));
     }
     Ok(())
 }
@@ -1256,7 +1270,26 @@ mod tests {
     #[test]
     fn validate_session_name_accepts_ordinary_names() {
         assert!(validate_session_name("debug-qa").is_ok());
-        assert!(validate_session_name("my session").is_ok());
+        assert!(validate_session_name("my-session").is_ok());
+        assert!(validate_session_name("a".repeat(63).as_str()).is_ok());
+    }
+
+    #[test]
+    fn validate_session_name_rejects_non_ldh_labels() {
+        for bad in [
+            "bad name/y",
+            "dot.ted.name",
+            "Ünï-cødé",
+            "-leading",
+            "trailing-",
+            "a".repeat(64).as_str(),
+        ] {
+            assert_eq!(
+                validate_session_name(bad).err().map(|e| e.kind()),
+                Some(ErrorKind::InvalidInput),
+                "expected `{bad:?}` to be rejected",
+            );
+        }
     }
 
     #[test]
@@ -1368,6 +1401,23 @@ mod tests {
     }
 
     #[test]
+    fn create_rejects_a_non_ldh_name_and_creates_no_session_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        for bad in ["bad name/y", "dot.ted.name", "Ünï-cødé", "-lead", "trail-"] {
+            let mut record = sample_record();
+            record.name = Some(bad.to_string());
+            assert_eq!(
+                loader.create(record).err().map(|e| e.kind()),
+                Some(ErrorKind::InvalidInput),
+                "expected `{bad:?}` to be rejected",
+            );
+        }
+        assert!(loader.keys().next().is_none());
+    }
+
+    #[test]
     fn rename_rejects_a_control_character_name_and_keeps_the_old_one() {
         let tmp = TempDir::new().unwrap();
         let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
@@ -1386,6 +1436,92 @@ mod tests {
             loader.get(&key).unwrap().record().name.as_deref(),
             Some("my-session"),
             "a rejected rename must leave the original name intact"
+        );
+    }
+
+    #[test]
+    fn rename_rejects_a_non_ldh_name_and_keeps_the_old_one() {
+        let tmp = TempDir::new().unwrap();
+        let mut loader = DiskLoader::new(loader_dir(&tmp)).unwrap();
+
+        let key = loader.create(sample_record()).unwrap();
+        assert_eq!(
+            loader
+                .rename(&key, "dot.ted.name".to_string())
+                .err()
+                .map(|e| e.kind()),
+            Some(ErrorKind::InvalidInput)
+        );
+        assert_eq!(
+            loader.get(&key).unwrap().record().name.as_deref(),
+            Some("my-session"),
+            "a rejected rename must leave the original name intact"
+        );
+    }
+
+    #[test]
+    fn rename_of_a_legacy_invalid_named_session_to_a_valid_name_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        // Plant a record with a pre-existing invalid name directly on disk
+        // (create refuses it now), then reopen so self-heal indexes it.
+        let orphan_short = "zzzzz";
+        let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
+        std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
+        let mut orphan_record = sample_record();
+        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.name = Some("bad name/y".to_string());
+        std::fs::write(
+            orphan_dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(&orphan_record).unwrap(),
+        )
+        .unwrap();
+
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader
+            .find_by_name("bad name/y")
+            .unwrap()
+            .expect("re-indexed");
+
+        loader.rename(&key, "good-name".to_string()).unwrap();
+        assert_eq!(
+            loader.get(&key).unwrap().record().name.as_deref(),
+            Some("good-name"),
+        );
+    }
+
+    #[test]
+    fn loading_a_store_with_a_legacy_invalid_name_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let root = loader_dir(&tmp);
+
+        let orphan_short = "zzzzz";
+        let orphan_dir = root.as_utf8_path().join("sessions").join(orphan_short);
+        std::fs::create_dir_all(orphan_dir.as_std_path()).unwrap();
+        let mut orphan_record = sample_record();
+        orphan_record.id = SessionId(uuid::Uuid::from_u128(0xDEAD_BEEF));
+        orphan_record.name = Some("dot.ted.name".to_string());
+        std::fs::write(
+            orphan_dir.join("record.json").as_std_path(),
+            serde_json_lenient::to_vec(&orphan_record).unwrap(),
+        )
+        .unwrap();
+
+        let mut loader = DiskLoader::new(root).unwrap();
+        let key = loader
+            .find_by_name("dot.ted.name")
+            .unwrap()
+            .expect("re-indexed");
+
+        // Re-saving the record with its legacy name unchanged (e.g. a status
+        // promotion) must not re-validate the name.
+        let mut promoted = loader.get(&key).unwrap().record().clone();
+        promoted.status = SessionStatus::Active;
+        loader.save(&key, &promoted).unwrap();
+        assert_eq!(
+            loader.get(&key).unwrap().record().status,
+            SessionStatus::Active,
         );
     }
 
