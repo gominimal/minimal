@@ -1508,9 +1508,18 @@ const FOREIGN_PEER_HELLO_WAIT: Duration = Duration::from_secs(1);
 /// hello is drained unread, on a thread of its own, so a foreign peer that
 /// never writes cannot stall the gate's accept loop.
 fn refuse_foreign_peer(mut stream: UnixStream, peer_uid: u32, service_uid: u32) {
+    // The channel is world-connectable (its mode grants the connect; this
+    // gate decides), so the refusals in flight are capped: past the cap a
+    // foreign peer is closed bare, and no peer can grow this service's
+    // threads or fds by connecting.
+    if FOREIGN_REFUSALS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= FOREIGN_REFUSALS_MAX {
+        FOREIGN_REFUSALS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
     let spawned = std::thread::Builder::new()
         .name("minvmd-zone-refuse".to_string())
         .spawn(move || {
+            let _in_flight = RefusalSlot;
             let _ = stream.set_read_timeout(Some(FOREIGN_PEER_HELLO_WAIT));
             let _ = read_reply_line(&mut stream);
             let reply = RegistrationReply::refused(format!(
@@ -1522,7 +1531,26 @@ fn refuse_foreign_peer(mut stream: UnixStream, peer_uid: u32, service_uid: u32) 
             }
         });
     if let Err(error) = spawned {
+        // The closure never ran, so its slot is released here.
+        FOREIGN_REFUSALS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
         tracing::debug!(component = COMPONENT, %error, "could not answer a foreign peer");
+    }
+}
+
+/// The most foreign-peer refusals answered at once ([`refuse_foreign_peer`]).
+const FOREIGN_REFUSALS_MAX: usize = 4;
+
+/// The foreign-peer refusals answering now.
+static FOREIGN_REFUSALS_IN_FLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// One refusal's hold on [`FOREIGN_REFUSALS_IN_FLIGHT`], released when the
+/// refusal's thread ends however it ends.
+struct RefusalSlot;
+
+impl Drop for RefusalSlot {
+    fn drop(&mut self) {
+        FOREIGN_REFUSALS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -4717,6 +4745,24 @@ mod tests {
             .expect("the gate's thread ends when its stop is set");
     }
 
+    #[test]
+    fn foreign_refusals_past_the_cap_close_bare() {
+        // Every refusal slot taken: the next foreign peer is closed without
+        // a thread or a reply, and the count is left as it was.
+        FOREIGN_REFUSALS_IN_FLIGHT.store(FOREIGN_REFUSALS_MAX, Ordering::SeqCst);
+        let (served, mut peer) = UnixStream::pair().expect("a socket pair");
+        refuse_foreign_peer(served, 1001, 1000);
+        assert_eq!(
+            FOREIGN_REFUSALS_IN_FLIGHT.load(Ordering::SeqCst),
+            FOREIGN_REFUSALS_MAX,
+            "a refusal past the cap takes no slot"
+        );
+        let _ = peer.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut buf = String::new();
+        let read = std::io::Read::read_to_string(&mut peer, &mut buf).expect("the close is read");
+        assert_eq!(read, 0, "past the cap the peer is closed bare: {buf:?}");
+        FOREIGN_REFUSALS_IN_FLIGHT.store(0, Ordering::SeqCst);
+    }
     /// The installed service holds a node's rows only while the node's
     /// connection is up (NET-124's context, the answerer's half): the
     /// connection's end is the whole withdrawal — the name answers nothing,
