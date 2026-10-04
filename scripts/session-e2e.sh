@@ -9941,19 +9941,56 @@ ESU_LISTENER_EOF
   fi
   echo "host listener: $esu_line (behind the fabric's NAT, which maps $esu_alias to 127.0.0.1)"
 
+  esu_gate_lines() {
+    # The gate's own lines for one source under one rule, this case's lines
+    # only; $3, when given, pins the destination inside the grep: the gate's
+    # infrastructure lines carry the destination they refused, so a line
+    # another flow's frame wrote under the same source and rule cannot stand
+    # in for the arm's. (The undeclared-subnet and unknown-source lines carry
+    # no destination — DropLimiter::emit in crates/minvmd/src/net/egress_gate.rs
+    # writes source and rule only — so the arms that read those use
+    # esu_wait_new_gate_line's window discipline below instead.) Prints them
+    # oldest first, none when this case's daemon wrote none.
+    local lines
+    lines="$(esu_case_log | grep -F "\"source\":\"$1\"" \
+      | grep -F "\"rule_matched\":\"$2\"")"
+    if [ -n "${3:-}" ]; then
+      lines="$(printf '%s\n' "$lines" | grep -F "\"destination\":\"$3\"")"
+    fi
+    printf '%s\n' "$lines" | sed '/^$/d'
+  }
   esu_gate_line() {
-    # The gate's own line for one source under one rule, this case's lines
-    # only; prints it, nonzero when this case's daemon wrote none.
+    # The newest of esu_gate_lines' lines; nonzero when there is none.
     local line
-    line="$(esu_case_log | grep -F "\"source\":\"$1\"" \
-      | grep -F "\"rule_matched\":\"$2\"" | tail -n1)"
+    line="$(esu_gate_lines "$@" | tail -n1)"
     [ -n "$line" ] || return 1
     printf '%s\n' "$line"
   }
   esu_wait_gate_line() {
     for _ in $(seq 1 20); do
-      if esu_line="$(esu_gate_line "$1" "$2")"; then
+      if esu_line="$(esu_gate_line "$@")"; then
         printf '%s\n' "$esu_line"
+        return 0
+      fi
+      sleep 0.25
+    done
+    return 1
+  }
+  esu_wait_new_gate_line() {
+    # Waits for the gate to write MORE lines for this source, rule and
+    # destination than the $4 it already had when the arm started, then prints
+    # the newest. That window discipline is what attributes a line to the arm
+    # when the line's own shape cannot: a stale line from an earlier flow was
+    # counted before the arm ran and cannot satisfy the growth, and a
+    # rate-limit window an earlier frame consumed fails the arm by name —
+    # the arm's own line was silenced — rather than letting the earlier
+    # frame's line pass for it.
+    # SRC RULE DST BASE_COUNT
+    local count
+    for _ in $(seq 1 20); do
+      count="$(esu_gate_lines "$1" "$2" "$3" | wc -l)"
+      if [ "$count" -gt "$4" ]; then
+        esu_gate_line "$1" "$2" "$3"
         return 0
       fi
       sleep 0.25
@@ -10533,7 +10570,12 @@ source=100.64.0.99 destination=$esu_alias:$ESU_LISTEN_PORT verdict=refused at th
 
   # Box A's address toward box B's private half — inside the union, outside
   # the row that holds the worn address: the gate's infrastructure rule
-  # refuses it, and its line names both the source and the destination.
+  # refuses it, and its line names both the source and the destination, so
+  # both are pinned inside the wait: a line box A's own traffic wrote under
+  # the same rule names a different destination and cannot pass for this
+  # arm's, and a line that predates the arm cannot either (the window
+  # discipline below).
+  esu_prior="$(esu_gate_lines "$esu_ip_a" egress-infrastructure-destination 192.168.77.7 | wc -l)"
   esu_run_spoofer cross-a "$esu_ip_a" 192.168.77.7 esu-spoof-cross-a 3 no
   case "$esu_out" in
     outcome=refused*) : ;;
@@ -10546,19 +10588,24 @@ source=100.64.0.99 destination=$esu_alias:$ESU_LISTEN_PORT verdict=refused at th
     echo "::error::a refused spoof from box A's address still left a marker at the host listener"
     esu_fail
   fi
-  esu_line="$(esu_wait_gate_line "$esu_ip_a" egress-infrastructure-destination)" || {
-    echo "::error::the gate refused box A's address toward 192.168.77.7 without its infrastructure line naming the source"
+  esu_line="$(esu_wait_new_gate_line "$esu_ip_a" egress-infrastructure-destination \
+    192.168.77.7 "$esu_prior")" || {
+    echo "::error::the gate refused box A's address toward 192.168.77.7 without its infrastructure line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
     esu_fail
   }
-  if ! printf '%s' "$esu_line" | grep -q '"destination":"192.168.77.7"'; then
-    echo "::error::the gate's infrastructure line for box A's address does not name the destination it refused: $esu_line"
-    esu_fail
-  fi
   esu_rows="$esu_rows
 source=$esu_ip_a destination=192.168.77.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-infrastructure-destination — box B's declared half, which box A's row does not cover)"
 
   # Box A's address toward a destination no resident box declared — beyond
-  # the whole union: the row's own rules refuse it.
+  # the whole union: the row's own rules refuse it. The undeclared-subnet
+  # line names only the source and the rule (DropLimiter::emit writes no
+  # destination on it), so this arm cannot pin the destination inside the
+  # grep the way the cross arms do; it pins the line to the arm's own window
+  # instead: the count before the arm must grow, so a line box A's own
+  # traffic wrote earlier cannot pass for the spoof's — and if the gate's
+  # rate-limit window for this pair was already spent, the arm fails by name
+  # rather than reading the earlier frame's line as its proof.
+  esu_prior="$(esu_gate_lines "$esu_ip_a" egress-undeclared-subnet | wc -l)"
   esu_run_spoofer beyond-a "$esu_ip_a" 198.51.100.7 esu-spoof-beyond-a 3 no
   case "$esu_out" in
     outcome=refused*) : ;;
@@ -10571,8 +10618,8 @@ source=$esu_ip_a destination=192.168.77.7:$ESU_LISTEN_PORT verdict=refused at th
     echo "::error::a refused spoof from box A's address still left a marker at the host listener"
     esu_fail
   fi
-  esu_wait_gate_line "$esu_ip_a" egress-undeclared-subnet >/dev/null || {
-    echo "::error::the gate refused box A's address toward 198.51.100.7 without its undeclared-subnet line naming the source"
+  esu_wait_new_gate_line "$esu_ip_a" egress-undeclared-subnet "" "$esu_prior" >/dev/null || {
+    echo "::error::the gate refused box A's address toward 198.51.100.7 without its undeclared-subnet line naming the source ($esu_prior such line(s) existed before the arm)"
     esu_fail
   }
   esu_rows="$esu_rows
@@ -10580,7 +10627,8 @@ source=$esu_ip_a destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at th
 
   # Box B's address toward box A's private half: the same refusal, worn from
   # the other side — whichever box's address the spoofer wears, its own row is
-  # the one that decides.
+  # the one that decides, and the destination stays pinned inside the wait.
+  esu_prior="$(esu_gate_lines "$esu_ip_b" egress-infrastructure-destination 10.0.0.7 | wc -l)"
   esu_run_spoofer cross-b "$esu_ip_b" 10.0.0.7 esu-spoof-cross-b 3 no
   case "$esu_out" in
     outcome=refused*) : ;;
@@ -10593,19 +10641,19 @@ source=$esu_ip_a destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at th
     echo "::error::a refused spoof from box B's address still left a marker at the host listener"
     esu_fail
   fi
-  esu_line="$(esu_wait_gate_line "$esu_ip_b" egress-infrastructure-destination)" || {
-    echo "::error::the gate refused box B's address toward 10.0.0.7 without its infrastructure line naming the source"
+  esu_line="$(esu_wait_new_gate_line "$esu_ip_b" egress-infrastructure-destination \
+    10.0.0.7 "$esu_prior")" || {
+    echo "::error::the gate refused box B's address toward 10.0.0.7 without its infrastructure line naming the source and the destination ($esu_prior such line(s) existed before the arm)"
     esu_fail
   }
-  if ! printf '%s' "$esu_line" | grep -q '"destination":"10.0.0.7"'; then
-    echo "::error::the gate's infrastructure line for box B's address does not name the destination it refused: $esu_line"
-    esu_fail
-  fi
   esu_rows="$esu_rows
 source=$esu_ip_b destination=10.0.0.7:$ESU_LISTEN_PORT verdict=refused at the gate (egress-infrastructure-destination — box A's declared half, which box B's row does not cover)"
 
   # An address outside the plan's lease block: refused outright, under either
-  # posture — outside the plan there is no lease to spoof.
+  # posture — outside the plan there is no lease to spoof. The source is
+  # unique to this arm, but the window discipline applies anyway: the count
+  # must grow past the arm's own baseline.
+  esu_prior="$(esu_gate_lines 203.0.113.7 egress-unknown-source | wc -l)"
   esu_run_spoofer outside 203.0.113.7 "$esu_alias" esu-spoof-outside 3 no
   case "$esu_out" in
     outcome=refused*) : ;;
@@ -10618,8 +10666,8 @@ source=$esu_ip_b destination=10.0.0.7:$ESU_LISTEN_PORT verdict=refused at the ga
     echo "::error::a source outside the plan's lease block left a marker at the host listener"
     esu_fail
   fi
-  esu_wait_gate_line 203.0.113.7 egress-unknown-source >/dev/null || {
-    echo "::error::the gate dropped the out-of-plan source without its unknown-source line naming it"
+  esu_wait_new_gate_line 203.0.113.7 egress-unknown-source "" "$esu_prior" >/dev/null || {
+    echo "::error::the gate dropped the out-of-plan source without its unknown-source line naming it ($esu_prior such line(s) existed before the arm)"
     esu_fail
   }
   esu_rows="$esu_rows
