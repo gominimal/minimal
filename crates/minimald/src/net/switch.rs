@@ -34,15 +34,17 @@
 //! The refusal carries both bounds a source-fed channel needs: the resets ride
 //! a **bounded** channel ([`RESET_CHANNEL_CAPACITY`]) that this module's legs
 //! feed and the switch-side writer drains, so no box's flood grows the
-//! daemon's memory — the excess is dropped, never queued — and each source
-//! draws from a per-window refusal budget ([`ResetBudget`]), so the flooder
-//! degrades to the timeout the reset replaced while nobody else does, with one
-//! audited line per source per window. The resets themselves are built only
-//! from state the gate holds ([`SessionGate::refuse_tcp_segment`]): a bare SYN
-//! is answered the way a kernel refuses a connection, and a connection the
-//! gate ended is reset from the sequence pair it tracked — never from the
-//! numbers an arriving segment claims, and always addressed to that segment's
-//! source.
+//! daemon's memory — the excess is dropped, never queued — and every refusal
+//! goes through the **shared** bounded, rate-limited audit
+//! ([`switch::refusal::RefusalEmitter`], one line per source per window, said
+//! at the window's first refusal and carrying the refusals that window saw),
+//! so the flooder degrades to the timeout the reset replaced while nobody
+//! else does. The resets themselves are built by the shared crate
+//! ([`switch::refusal`]) from state the gate holds
+//! ([`SessionGate::refuse_tcp_segment`]): a bare SYN is answered the way a
+//! kernel refuses a connection, and a connection the gate ended is reset from
+//! the sequence pair it tracked — never from the numbers an arriving segment
+//! claims, and always addressed to that segment's source.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Read, Write};
@@ -66,6 +68,7 @@ use super::{DEFAULT_MTU, PtaskLease, SwitchSubnet};
 use sessions::core::egress::{
     self, DropReason, FrameSummary, FrameVerdict, IngressRules, ListenVerdict,
 };
+use switch::refusal;
 
 /// `ioctl` request number for `TUNSETIFF` (set the tap/tun interface a fd backs).
 ///
@@ -790,6 +793,7 @@ fn drop_transport(reason: &DropReason) -> Proto {
         DropReason::UndeclaredFamily(_) | DropReason::Truncated => Proto::None,
         DropReason::UndeclaredProtocol { proto }
         | DropReason::DeniedSubnet { proto, .. }
+        | DropReason::UncredentialedProxyDestination { proto, .. }
         | DropReason::UndeclaredSubnet { proto, .. } => Proto::from_ipv4_number(*proto),
     }
 }
@@ -1057,20 +1061,23 @@ pub struct SessionGate {
     /// segment carries, which a spoofing peer chooses (see
     /// [`SessionGate::refuse_tcp_segment`]). Swept like [`UdpConntrack`].
     terminated_flows: Mutex<HashMap<InboundFlowKey, (Instant, InboundFlowTail)>>,
-    /// The per-source budget the refusals are drawn against: a reset is
-    /// synthesized for a source only while it has window budget left, so a
-    /// box flooding SYNs at this box's ports cannot spend the daemon's memory
-    /// or the reset channel on its own refusals ([`ResetBudget`]).
-    reset_budget: ResetBudget,
+    /// The shared, bounded, rate-limited refusal audit every refusal this gate
+    /// answers goes through ([`refusal::RefusalEmitter`]): a reply is written
+    /// for a source only while it has window quota left, so a box flooding
+    /// SYNs at this box's ports cannot spend the daemon's memory or the reset
+    /// channel on its own refusals, and the line it says — its window's one,
+    /// at the window's first refusal, carrying the refusals that window saw —
+    /// is the one format every leg's log tail carries.
+    refusals: refusal::RefusalEmitter,
     /// The resets this gate's legs synthesize — a refused SYN's (NET-014), a
     /// revoked port's, a revocation's terminations — handed to the egress leg
     /// and written to the switch, the only leg that holds the switch's write
     /// half. **Bounded** ([`RESET_CHANNEL_CAPACITY`]): the channel is fed by
     /// frames other boxes originate, so an unbounded one would let a single
-    /// box grow the daemon's memory at will; the per-source budget
-    /// ([`ResetBudget`]) is what keeps a well-behaved source's refusals inside
-    /// it, and a send past the bound is dropped — the flooder degrades to a
-    /// timeout, nobody else does.
+    /// box grow the daemon's memory at will; the per-source quota of the
+    /// shared refusal audit is what keeps a well-behaved source's refusals
+    /// inside it, and a send past the bound is dropped — the flooder degrades
+    /// to a timeout, nobody else does.
     resets: mpsc::Sender<Vec<u8>>,
     /// The receiving half of [`Self::resets`], taken by the relay's spawn —
     /// once, and never again: a clone that spawns a second relay on this gate
@@ -1165,8 +1172,8 @@ impl SessionGate {
         // it, and a gate that never spawns a relay — a policy-level caller —
         // just accumulates nothing, because nothing sends into a channel whose
         // gate was never attached. Bounded, and a send past the bound is
-        // dropped (see the field doc): the per-source budget is what keeps a
-        // legitimate source inside it.
+        // dropped (see the field doc): the shared audit's per-source quota is
+        // what keeps a legitimate source inside it.
         let (resets, resets_rx) = mpsc::channel(RESET_CHANNEL_CAPACITY);
         let (box_resets, box_resets_rx) = mpsc::channel(RESET_CHANNEL_CAPACITY);
         Self {
@@ -1180,7 +1187,7 @@ impl SessionGate {
             revoked: Mutex::new(HashSet::new()),
             inbound_flows: Mutex::new(HashMap::new()),
             terminated_flows: Mutex::new(HashMap::new()),
-            reset_budget: ResetBudget::default(),
+            refusals: refusal::RefusalEmitter::default(),
             resets,
             resets_rx: Mutex::new(Some(resets_rx)),
             box_resets,
@@ -1360,32 +1367,42 @@ impl SessionGate {
     /// whose ingress was revoked (NET-121) — with a reset on the switch side,
     /// subject to the two bounds a source-fed channel needs:
     ///
-    /// - the **per-source budget** ([`ResetBudget`]): a source that has spent
-    ///   its window's refusals gets no more until the window rolls, so one
+    /// - the **per-source quota** ([`refusal::RefusalEmitter`], the shared
+    ///   audit every refusal on every leg goes through): a source that has
+    ///   spent its window's quota gets no more until the window rolls, so one
     ///   box's flood cannot spend the gate's resets on itself. The flooder
-    ///   degrades to a timeout; nobody else does.
+    ///   degrades to a timeout; nobody else does. The audit says its window's
+    ///   one line — at the window's first refusal, carrying the refusals that
+    ///   window saw — so the daemon's log tail reads a refusal exactly like
+    ///   the stack peer's does.
     /// - the **channel's bound** ([`RESET_CHANNEL_CAPACITY`]): a send past it is
     ///   dropped rather than queued, so no burst of refusals grows the
     ///   daemon's memory.
     ///
-    /// The reset's shape follows RFC 793, and is built from state the gate
+    /// The reset's shape follows RFC 793, and is built by the shared crate
+    /// ([`refusal::refused_tcp_reset`], [`rst_from_flow`]) from state the gate
     /// holds, never from numbers the arriving segment carries:
     ///
     /// - a bare SYN is answered with RST|ACK from sequence zero, acknowledging
-    ///   the SYN — `SYN.seq + 1` — the kernel's own connection-refused shape,
-    ///   which a connecting peer's half-open socket reads as the refusal it is.
+    ///   the SYN — `SYN.seq + its data + 1` (RFC 793 §3.4 counts both) — the
+    ///   kernel's own connection-refused shape, which a connecting peer's
+    ///   half-open socket reads as the refusal it is.
     /// - a segment of an established connection is answered only when the gate
     ///   holds that connection's tail — the revocation's terminated table — and
     ///   then from the sequence pair it tracked, which is in the peer's window
     ///   by construction. A segment of a flow the gate holds **nothing** for is
-    ///   answered with no reset at all: the arriving segment's own sequence
-    ///   numbers are its sender's claim, and a spoofed one would let any box
-    ///   make this box emit a reset carrying an attacker-chosen sequence to a
-    ///   spoofed victim. The reset is always addressed to the frame's source
-    ///   (`rst_frame` swaps the observed packet's own addresses), so a refusal
-    ///   can never be steered at a third party.
-    /// - a segment that is itself a reset is answered with nothing, before any
-    ///   budget is spent: answering a reset with a reset is the one exchange
+    ///   answered with no reset at all — and spends no reply quota: the
+    ///   arriving segment's own sequence numbers are its sender's claim, and a
+    ///   spoofed one would let any box make this box emit a reset carrying an
+    ///   attacker-chosen sequence to a spoofed victim. Its refusal is still
+    ///   the audit's — the line is said through the shared emitter whether or
+    ///   not a reset frame is written, so a revoked port's refusal never goes
+    ///   quiet — but it writes nothing back and burns none of the source's
+    ///   quota. The reset is always addressed to the frame's source (the
+    ///   builder swaps the observed packet's own addresses), so a refusal can
+    ///   never be steered at a third party.
+    /// - a segment that is itself a reset is answered with nothing, before the
+    ///   audit is reached: answering a reset with a reset is the one exchange
     ///   RFC 793 forbids outright, and the ended connection's stragglers are
     ///   exactly that — resets, ACKs and FINs a peer's already-closed socket
     ///   sends into a flow the gate has ended. Charging them against the
@@ -1393,19 +1410,18 @@ impl SessionGate {
     ///   refusals on replies that cannot exist.
     ///
     /// Returns whether a reset was queued.
-    fn refuse_tcp_segment(&self, frame: &[u8], pkt: &L4Packet) -> bool {
+    fn refuse_tcp_segment(&self, frame: &[u8], pkt: &L4Packet, class: refusal::Class) -> bool {
         // Never answer a reset with a reset — and never let one spend the
-        // source's refusal budget either.
-        if pkt.tcp_flags & 0x04 != 0 {
+        // source's refusal quota either.
+        if pkt.carries_reset() {
             return false;
         }
-        if !self.reset_budget.admit(*pkt.src.ip(), &self.label) {
-            return false;
-        }
-        let syn = pkt.tcp_flags & 0x02 != 0;
-        let ack = pkt.tcp_flags & 0x10 != 0;
-        let reset = if syn && !ack {
-            rst_reply_frame(frame, pkt)
+        // Build before charging: a segment the gate can build nothing for — a
+        // flow the gate holds no tail for, whose numbers are its sender's
+        // claim — is answered with nothing on the wire, but its refusal is
+        // still the audit's below, so the line is said for it too.
+        let reset = if pkt.is_bare_syn() {
+            refusal::refused_tcp_reset(frame, pkt)
         } else {
             // The flow the segment belongs to: the gate's own record of a
             // connection it admitted and then ended. `None` — a flow nothing
@@ -1418,12 +1434,51 @@ impl SessionGate {
                 .filter(|(seen, _)| Instant::now().duration_since(*seen) < TERMINATED_FLOW_TTL)
                 .map(|(_, tail)| rst_from_flow(tail))
         };
-        match reset {
-            Some(reset) => {
-                self.send_reset(reset);
-                true
-            }
-            None => false,
+        // The sweep first, ahead of the charge: a window that ended between
+        // refusals — this source's or any other's — says the count it was
+        // still holding here, so a rolled window's own count is said at the
+        // window it belongs to and never folded into the next one's opening
+        // line. It runs on every refusal, whether or not that refusal builds
+        // a reset to write: a source that sends only spoofed segments to a
+        // revoked port refuses as much as one whose SYN is answered, and its
+        // closed windows must not wait for a reset the gate will never build.
+        // The stack peer's leg drives the same sweep on its own turn
+        // ([`switch::refusal::RefusalEmitter::flush_expired`]).
+        for line in self.refusals.flush_expired(Instant::now()) {
+            tracing::warn!("{line}");
+        }
+        // The shared audit: bounded per source, its window's one line — said
+        // whether or not there is a reply to write, while the reply itself is
+        // written only when one was built and the source's quota owes it.
+        let outcome = self.refusals.refuse(
+            &refusal::Refusal {
+                class,
+                source: *pkt.src.ip(),
+                address: *pkt.dst.ip(),
+                about: refusal::About::Port(pkt.dst.port()),
+            },
+            reset.is_some(),
+            Instant::now(),
+        );
+        if let refusal::Outcome::Emit(line) = &outcome {
+            tracing::warn!("{line}");
+        }
+        // No early return past this point: the sweep above has already run,
+        // and a refusal that writes no reset returns through here like any
+        // other.
+        match outcome {
+            // Past the quota: the source's refusals to lose are its own.
+            refusal::Outcome::Suppressed => false,
+            // A refusal the gate built no reset for — a spoofed segment, or
+            // one of a flow it holds no tail for — is counted and said above,
+            // and writes nothing here.
+            refusal::Outcome::Quiet | refusal::Outcome::Emit(_) => match reset {
+                Some(reset) => {
+                    self.send_reset(reset);
+                    true
+                }
+                None => false,
+            },
         }
     }
 
@@ -1935,14 +1990,30 @@ impl ReplyFlowGate {
     }
 }
 
-/// The rule name an ingress refusal carries on both surfaces that decide
-/// ingress (NET-069, NET-071): the relay logs this name when it drops a
-/// direct connection to a port the target did not declare, and the hostname
-/// proxy logs the *same* name when it refuses a proxied request to that port
-/// before dialing — so the daemon log's tail (the diagnostics bundle's)
-/// shows one rule for one violation, whichever route it took. R2.7's
-/// `rule_matched` field.
-pub const NO_INGRESS_MAPPING_RULE: &str = "no ingress mapping";
+impl Drop for SessionGate {
+    /// The gate's teardown flush: every count its audit still holds unsaid is
+    /// said now, in the one audit format, because nothing after the gate
+    /// exists to carry one — a count the session's last window was still
+    /// holding would otherwise be the audit's one silent loss, dropped with
+    /// the gate that counted it. The last handle going away is the session's
+    /// own end: both relay legs are done with the gate, and the live-gate
+    /// table holds it only weakly.
+    fn drop(&mut self) {
+        for line in self.refusals.flush_pending() {
+            tracing::warn!("{line}");
+        }
+    }
+}
+
+/// The rule name an ingress refusal carries on every surface that decides
+/// one (NET-069, NET-071): the hostname proxy logs this name when it refuses
+/// a proxied request to a port the target did not declare before dialing,
+/// and the shared refusal audit (`switch::refusal`) carries the *same* name
+/// in the line it says when the relay answers such a connection with a
+/// reset — so the daemon log's tail (the diagnostics bundle's) shows one
+/// rule for one violation, whichever route it took, and the relay leg and
+/// the VM host's gate agree by construction. R2.7's `rule_matched` field.
+pub use switch::refusal::NO_INGRESS_MAPPING_RULE;
 
 /// The rule name an inbound-flow cap refusal carries (NET-040's answer
 /// half): the relay logs this name when it refuses a new inbound flow at the
@@ -1954,10 +2025,9 @@ pub const NO_INGRESS_MAPPING_RULE: &str = "no ingress mapping";
 pub const INBOUND_FLOW_CAP_RULE: &str = "inbound flow cap";
 
 /// The rule name a refusal of a *revoked* ingress port carries (NET-121):
-/// the relay logs it — rate-limited, with the port — for every segment the
-/// gate answers with a reset once the port's forwarder has been unbound.
-/// R2.7's `rule_matched` field.
-pub const REVOKED_INGRESS_PORT_RULE: &str = "revoked ingress port";
+/// the shared refusal audit says it, with the port, when the gate answers a
+/// segment of one with a reset. R2.7's `rule_matched` field.
+pub use switch::refusal::REVOKED_INGRESS_PORT_RULE;
 
 /// The internal ports a target's ingress declaration admits on `proto` — the
 /// one derivation both ingress surfaces read: the relay's inbound gate
@@ -2010,18 +2080,36 @@ pub fn declared_request_ports(policy: Option<&sessions::SessionPolicy>) -> BTree
 /// session's egress declaration cannot mean one thing on the switch and
 /// another through the proxy (NET-071). `lease` is the box's address on that
 /// switch, compiled into the rules as the one source its frames may carry
-/// (NET-084).
+/// (NET-084). The Box Egress Proxy's address on `subnet` is compiled in for
+/// every session, lane or no lane (NET-134): a session that declared a
+/// credentialed upstream carries its lane with it, so the relay — the first
+/// leg a box's frame must clear, before it ever reaches the shared switch —
+/// admits the proxy's listener beside the rules exactly as the host-side gate
+/// on the far side does, and a deny-all box that declared the lane reaches
+/// the proxy's acceptor while the same rules hold everything else, the
+/// listener's port and protocol included; a session that declared none
+/// carries the address alone, so the relay drops every frame to it ahead of
+/// the rules, the listener's own triple included — the address is
+/// infrastructure no egress rule opens, the lane alone admits the listener,
+/// and the refusal a lane-less box is owed there belongs to the box's own
+/// path, which on a native host — no minvmd gate beside the relay — this
+/// leg is.
 #[must_use]
 pub fn compiled_egress(
     policy: Option<&sessions::SessionPolicy>,
     subnet: SwitchSubnet,
     lease: Ipv4Addr,
 ) -> egress::EgressRules {
-    egress::EgressRules::from_policy(
+    let rules = egress::EgressRules::from_policy(
         policy.and_then(|policy| policy.egress.as_ref()),
         subnet.dns_server().octets(),
         lease.octets(),
-    )
+    );
+    let proxy = subnet.box_egress_proxy_address().octets();
+    match policy.is_some_and(|policy| policy.credentialed_upstream.is_some()) {
+        true => rules.with_credentialed_upstream(proxy),
+        false => rules.with_box_egress_proxy(proxy),
+    }
 }
 
 /// The egress verdict a direct TCP connection from a box whose own frames are
@@ -2036,8 +2124,11 @@ pub fn compiled_egress(
 /// NET-062..064 tier requires, and reusing it verbatim is what keeps exactly
 /// one admit-or-drop function in the tree. The rules are address- and
 /// protocol-shaped — never port-shaped, the resolver carve-out aside, which a
-/// TCP frame cannot match — so the port names the connection without
-/// changing the verdict.
+/// TCP frame cannot match, and the credentialed lane's one listener aside
+/// (NET-134: a lane's proxy is admitted as the (address, port, protocol)
+/// triple, so a TCP frame to the proxy's address carries the port the
+/// verdict reads) — so the port names the connection without changing the
+/// verdict anywhere else.
 ///
 /// The synthesized frame carries the rules' own lease as its source (NET-084):
 /// it stands for a frame the box itself put on the wire, so the verdict's
@@ -2169,83 +2260,21 @@ pub fn proxied_request_verdict(
 }
 
 /// The L4 addressing of a TCP/UDP-over-IPv4 frame, as extracted by
-/// [`parse_ipv4_l4`]. `tcp_flags` is meaningful only when `proto == IPPROTO_TCP`.
-/// `pub(crate)`: the DNS gate's tests read the addressing of the replies the
-/// relay synthesizes.
-pub(crate) struct L4Packet {
-    /// Source `ip:port`.
-    pub(crate) src: SocketAddrV4,
-    /// Destination `ip:port`.
-    pub(crate) dst: SocketAddrV4,
-    /// IPv4 protocol number (`IPPROTO_TCP` or `IPPROTO_UDP`).
-    pub(crate) proto: u8,
-    /// TCP flags byte; `0` for UDP.
-    pub(crate) tcp_flags: u8,
-    /// TCP sequence number; `0` for UDP. Read for the resets the gate
-    /// synthesizes (NET-014, NET-121), which ride the observed packet's own
-    /// sequence/acknowledgement pair.
-    pub(crate) seq: u32,
-    /// TCP acknowledgement number; `0` for UDP and for a packet with no ACK
-    /// set (where the field is unspecified by the sender).
-    pub(crate) ack: u32,
-}
+/// [`parse_ipv4_l4`]. The shared crate's classifier owns the shape — this is
+/// its [`switch::refusal::Segment`], under the name this module's readers have
+/// always used — so the relay, the DNS gate and the shared refusal builders
+/// all mean the same thing by one packet. `tcp_flags` is meaningful only when
+/// `proto == IPPROTO_TCP`. `pub(crate)`: the DNS gate's tests read the
+/// addressing of the replies the relay synthesizes.
+pub(crate) use switch::refusal::Segment as L4Packet;
 
 /// Parses an Ethernet II + IPv4 + TCP/UDP frame into its L4 addressing, or `None`
 /// for non-IPv4 (ARP/IPv6/VLAN), non-TCP/UDP, IP fragments, and short/malformed
-/// frames. Length-checked at every step and allocation-free, so a truncated or
-/// hostile frame yields `None` rather than an out-of-bounds read.
+/// frames — the shared crate's one classifier, called under the name this
+/// module's readers use, so a leg that parses a frame here and a leg that
+/// classifies with the shared crate cannot disagree on what it carried.
 fn parse_ipv4_l4(frame: &[u8]) -> Option<L4Packet> {
-    // Ethernet header + minimum (20-byte) IPv4 header.
-    if frame.len() < ETH_HDR + 20 {
-        return None;
-    }
-    if u16::from_be_bytes([frame[12], frame[13]]) != ETHERTYPE_IPV4 {
-        return None;
-    }
-    let ip = &frame[ETH_HDR..];
-    // IHL (low nibble of byte 0) is the header length in 32-bit words.
-    let ihl = ((ip[0] & 0x0f) as usize) * 4;
-    if ihl < 20 || ip.len() < ihl {
-        return None;
-    }
-    let proto = ip[9];
-    if proto != IPPROTO_TCP && proto != IPPROTO_UDP {
-        return None;
-    }
-    // A non-zero fragment offset (low 13 bits of bytes 6–7) is a later fragment
-    // with no L4 header at `ihl`; pass rather than misparse.
-    if u16::from_be_bytes([ip[6], ip[7]]) & 0x1fff != 0 {
-        return None;
-    }
-    let l4 = &ip[ihl..];
-    // TCP needs through the flags byte (offset 13); UDP only its 8-byte header.
-    // Both carry src/dst ports in the first four bytes.
-    let need = if proto == IPPROTO_TCP { 14 } else { 8 };
-    if l4.len() < need {
-        return None;
-    }
-    let (seq, ack) = if proto == IPPROTO_TCP {
-        (
-            u32::from_be_bytes([l4[4], l4[5], l4[6], l4[7]]),
-            u32::from_be_bytes([l4[8], l4[9], l4[10], l4[11]]),
-        )
-    } else {
-        (0, 0)
-    };
-    Some(L4Packet {
-        src: SocketAddrV4::new(
-            Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]),
-            u16::from_be_bytes([l4[0], l4[1]]),
-        ),
-        dst: SocketAddrV4::new(
-            Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]),
-            u16::from_be_bytes([l4[2], l4[3]]),
-        ),
-        proto,
-        tcp_flags: if proto == IPPROTO_TCP { l4[13] } else { 0 },
-        seq,
-        ack,
-    })
+    refusal::classify(frame)
 }
 
 /// Returns `Some((dst_port, src))` iff `frame` is a bare TCP SYN (SYN set, ACK
@@ -2310,91 +2339,6 @@ const TERMINATED_FLOW_SWEEP_AT: usize = 4096;
 /// queued — the flooder degrades to a timeout, nobody else does, and a
 /// well-behaved revocation is one reset per held flow, far under the cap.
 const RESET_CHANNEL_CAPACITY: usize = 256;
-
-/// How long one window of the per-source reset budget ([`ResetBudget`]) lasts.
-/// A source that has spent its window's refusals waits for the next window,
-/// so the budget is a rate, not a lifetime quota.
-const RESET_WINDOW: Duration = Duration::from_secs(1);
-
-/// How many refusals one source may spend per [`RESET_WINDOW`] before the gate
-/// stops answering it until the window rolls: far above what a peer with a
-/// real reason to reconnect needs, far below what a flood spends.
-const RESET_PER_WINDOW: u32 = 16;
-
-/// The per-source budget the gate's refusals are drawn against (NET-014,
-/// NET-121): a map of source address to the window it is spending in. A source
-/// that has spent [`RESET_PER_WINDOW`] refusals in the current window gets no
-/// more until the window rolls — one box's flood cannot spend the gate's
-/// resets on itself — and the first refusal a window refuses is logged once,
-/// as the audit line that names the flooder. Swept like [`UdpConntrack`]:
-/// only once the table crosses [`RESET_BUDGET_SWEEP_AT`], so the steady state
-/// costs one map lookup per refusal.
-#[derive(Debug)]
-struct ResetBudget {
-    /// How long one window lasts: [`RESET_WINDOW`] in production, shrunk by
-    /// the proofs that cannot wait a second to watch a window roll.
-    window: Duration,
-    spent: Mutex<HashMap<Ipv4Addr, (Instant, u32, bool)>>,
-}
-
-/// Sweep exhausted per-source windows once the budget table crosses this many
-/// entries, bounding memory under a burst of spoofed sources.
-const RESET_BUDGET_SWEEP_AT: usize = 4096;
-
-impl Default for ResetBudget {
-    fn default() -> Self {
-        Self {
-            window: RESET_WINDOW,
-            spent: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-impl ResetBudget {
-    /// Narrows the window — the test hook for the proofs that need a window
-    /// to roll inside a test, the DNS gate's admission-window hook's twin.
-    #[cfg(test)]
-    fn shrink_window(&mut self, window: Duration) {
-        self.window = window;
-    }
-
-    /// Whether the gate may spend one more refusal on `source` this window.
-    /// `label` names the session the gate belongs to, so the audit line names
-    /// the flooder's target too.
-    fn admit(&self, source: Ipv4Addr, label: &str) -> bool {
-        let now = Instant::now();
-        let window = self.window;
-        let mut spent = self.spent.lock().expect("ResetBudget mutex poisoned");
-        if spent.len() > RESET_BUDGET_SWEEP_AT {
-            spent.retain(|_, (seen, _, _)| now.duration_since(*seen) < window);
-        }
-        let (_, count, warned) = {
-            let entry = spent.entry(source).or_insert((now, 0, false));
-            // A fresh window for a source the table already holds: its old
-            // spend lapses, and with it the suppression line's
-            // once-per-window.
-            if now.duration_since(entry.0) >= window {
-                *entry = (now, 0, false);
-            }
-            entry
-        };
-        if *count >= RESET_PER_WINDOW {
-            if !*warned {
-                *warned = true;
-                tracing::warn!(
-                    source = %source,
-                    session = label,
-                    limit = RESET_PER_WINDOW,
-                    window_ms = window.as_millis() as u64,
-                    "stopping TCP resets for a source that spent its window's refusals"
-                );
-            }
-            return false;
-        }
-        *count += 1;
-        true
-    }
-}
 
 /// The identity of a tracked inbound TCP flow: source address and port, and
 /// the destination port it was admitted to. The destination address is the
@@ -2553,173 +2497,61 @@ fn is_ipv4_udp(frame: &[u8]) -> bool {
             .is_some_and(|proto| *proto == IPPROTO_UDP)
 }
 
-/// The ones' complement sum of `bytes`, read as big-endian 16-bit words with an
-/// odd trailing byte padded into the high half.
-fn ones_sum(bytes: &[u8]) -> u32 {
-    let mut sum: u32 = bytes
-        .chunks_exact(2)
-        .map(|word| {
-            u32::from(u16::from_be_bytes(
-                // `chunks_exact(2)` yields two-byte words by definition, so
-                // this conversion cannot fail.
-                word.try_into().expect("chunks_exact(2) yields two bytes"),
-            ))
-        })
-        .sum();
-    if let Some(tail) = bytes.chunks_exact(2).remainder().first() {
-        sum += u32::from(*tail) << 8;
-    }
-    sum
-}
-
-/// Folds a ones' complement `sum` into the 16-bit checksum that carries it:
-/// the carries added back in, then the complement.
-fn ones_complement(sum: u32) -> u16 {
-    let mut sum = sum;
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
-/// The IPv4 header checksum of `header` (a whole header, the checksum field
-/// zeroed): the ones' complement of the ones' complement sum of its 16-bit
-/// words. The box's kernel verifies it on every received frame, so the
-/// replies the relay synthesizes must carry an honest one.
-fn ipv4_checksum(header: &[u8]) -> u16 {
-    ones_complement(ones_sum(header))
-}
-
-/// The TCP checksum of `segment` carried from `src` to `dst`: the IPv4
-/// pseudo-header (source, destination, protocol, TCP length) folded into the
-/// segment's own ones' complement sum. Unlike UDP, TCP has no zero-checksum
-/// option, and both ends of the resets the gate synthesizes verify it — the
-/// box's kernel on the way in, the switch's stack on the way out — so the
-/// frames must carry an honest one.
-fn tcp_checksum(segment: &[u8], src: Ipv4Addr, dst: Ipv4Addr) -> u16 {
-    let mut sum = ones_sum(src.octets().as_slice());
-    sum += ones_sum(dst.octets().as_slice());
-    // The pseudo-header's remaining words: the `[zero][protocol]` word and
-    // the TCP length. The word is big-endian `[0x00][0x06]` (RFC 793 §3.1),
-    // so the protocol contributes *itself*, unshifted — parking it in the
-    // zero byte's place yields a checksum no TCP stack verifies, and every
-    // reset this module builds would be dropped where it is meant to end a
-    // connection.
-    sum += u32::from(IPPROTO_TCP);
-    sum += u32::from(u16::try_from(segment.len()).unwrap_or(u16::MAX));
-    sum += ones_sum(segment);
-    ones_complement(sum)
-}
-
-/// Builds the Ethernet + IPv4 + TCP reset the gate answers a refused packet
-/// with (NET-014, NET-121): from `src` — the refused packet's destination, the
-/// box whose gate speaks for it here — back to `dst`, the packet's source, with
-/// the observed packet's Ethernet addresses swapped (`eth_dst` is the reset's
-/// destination, the packet's source). `seq`/`ack` follow the kernel's own reset
-/// rule: a packet with ACK set is answered with a reset riding its own
-/// ack/seq pair — the receiver of the reset has already told the sender what it
-/// expects next, so the reset rides an in-window sequence for an established
-/// connection — while a bare SYN is answered with a reset acknowledging it
-/// (its sequence + the SYN flag), which a connecting peer's half-open socket
-/// reads as the refusal it is.
-fn rst_frame(
-    eth_dst: [u8; 6],
-    eth_src: [u8; 6],
-    src: SocketAddrV4,
-    dst: SocketAddrV4,
-    seq: u32,
-    ack: u32,
-) -> Vec<u8> {
-    const TCP_HDR: usize = 20;
-    const RST_ACK: u8 = 0x14;
-    let mut frame = Vec::with_capacity(ETH_HDR + 2 * TCP_HDR);
-    frame.extend_from_slice(&eth_dst);
-    frame.extend_from_slice(&eth_src);
-    frame.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
-    // IPv4, IHL 5: the box's address as the source, the refused packet's
-    // source as the destination; the checksum covers the header the box's
-    // kernel verifies.
-    let mut header = [0u8; 20];
-    header[0] = 0x45;
-    header[2..4].copy_from_slice(&((TCP_HDR + TCP_HDR) as u16).to_be_bytes());
-    header[8] = 64;
-    header[9] = IPPROTO_TCP;
-    header[12..16].copy_from_slice(&src.ip().octets());
-    header[16..20].copy_from_slice(&dst.ip().octets());
-    let checksum = ipv4_checksum(&header);
-    header[10..12].copy_from_slice(&checksum.to_be_bytes());
-    frame.extend_from_slice(&header);
-    // TCP: no payload, so the checksum is taken over the header alone, from
-    // the reset's source to its destination through the pseudo-header.
-    let mut tcp = [0u8; TCP_HDR];
-    tcp[0..2].copy_from_slice(&src.port().to_be_bytes());
-    tcp[2..4].copy_from_slice(&dst.port().to_be_bytes());
-    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
-    tcp[8..12].copy_from_slice(&ack.to_be_bytes());
-    tcp[12] = 0x50; // data offset 5, reserved
-    tcp[13] = RST_ACK;
-    let checksum = tcp_checksum(&tcp, *src.ip(), *dst.ip());
-    tcp[16..18].copy_from_slice(&checksum.to_be_bytes());
-    frame.extend_from_slice(&tcp);
-    frame
-}
-
-/// The acknowledgement a reset to a packet of `payload_len` bytes at `seq`
-/// with `flags` gives: everything the packet carried, plus the SYN and FIN
-/// flags' sequence weight.
-fn rst_ack(seq: u32, payload_len: u16, flags: u8) -> u32 {
-    seq.wrapping_add(u32::from(payload_len))
-        .wrapping_add(u32::from(flags & 0x02 != 0))
-        .wrapping_add(u32::from(flags & 0x01 != 0))
-}
-
-/// The reset [`rst_frame`] builds for one observed TCP packet `pkt` carried in
-/// `frame`: `None` for a frame too short to carry both Ethernet addresses —
-/// a shape [`parse_ipv4_l4`] never admits a packet from, so callers that
-/// parsed `pkt` cannot hit it.
-fn rst_reply_frame(frame: &[u8], pkt: &L4Packet) -> Option<Vec<u8>> {
-    let (eth_dst, rest) = frame.split_first_chunk::<6>()?;
-    let (eth_src, _) = rest.split_first_chunk::<6>()?;
-    // The segment's payload, bounded by what the frame actually carries: the
-    // reset's acknowledgement says the sender's data was seen, and a lie in
-    // either direction costs only a retransmission it was going to make.
-    let carried = tcp_payload_len(frame);
-    let (seq, ack) = if pkt.tcp_flags & 0x10 != 0 {
-        (pkt.ack, rst_ack(pkt.seq, carried, pkt.tcp_flags))
-    } else {
-        (0, rst_ack(pkt.seq, 0, pkt.tcp_flags))
-    };
-    // The reset's destination is the packet's *source* — the peer the
-    // refusal is for — so the Ethernet addresses hand over swapped.
-    Some(rst_frame(*eth_src, *eth_dst, pkt.dst, pkt.src, seq, ack))
-}
-
-/// The reset [`rst_frame`] builds for a flow the gate recorded — the one a
-/// revoked port's connections are terminated with (NET-121), built from the
-/// last packet the gate saw of the flow so it rides that packet's own
-/// ack/seq pair. The Ethernet addresses are the observed packet's, swapped;
-/// the box's address is the flow's destination.
+/// The reset the shared builder assembles for a flow the gate recorded — the
+/// one a revoked port's connections are terminated with (NET-121), built from
+/// the last packet the gate saw of the flow so it rides that packet's own
+/// ack/seq pair. The bytes are the shared crate's ([`refusal::tcp_reset_frame`],
+/// the one assembler, so a revocation's reset and a refused SYN's read the
+/// same on the wire); this keeps only the arithmetic the gate's own record
+/// carries. The Ethernet addresses are the observed packet's, swapped; the
+/// box's address is the flow's destination.
 fn rst_from_flow(tail: &InboundFlowTail) -> Vec<u8> {
-    let (seq, ack) = if tail.flags & 0x10 != 0 {
-        (tail.ack, rst_ack(tail.seq, tail.payload_len, tail.flags))
+    let (seq, ack) = if tail.flags & refusal::TCP_ACK != 0 {
+        (
+            tail.ack,
+            refusal::seq_acknowledging(tail.seq, tail.payload_len, tail.flags),
+        )
     } else {
-        (0, rst_ack(tail.seq, 0, tail.flags))
+        (
+            0,
+            refusal::seq_acknowledging(tail.seq, tail.payload_len, tail.flags),
+        )
     };
-    rst_frame(tail.src_mac, tail.dst_mac, tail.dst, tail.src, seq, ack)
+    refusal::tcp_reset_frame(
+        tail.src_mac,
+        tail.dst_mac,
+        tail.dst,
+        tail.src,
+        seq,
+        ack,
+        true,
+    )
 }
 
-/// The reset [`rst_frame`] builds for a flow the gate recorded, written the
-/// other way — into the tap, toward the box (NET-121): a revoked port's
-/// connections end at both ends, and the box's half ends with a reset that
-/// arrives from the peer's address at the peer's **next** sequence — the
+/// The reset the shared builder assembles for a flow the gate recorded,
+/// written the other way — into the tap, toward the box (NET-121): a revoked
+/// port's connections end at both ends, and the box's half ends with a reset
+/// that arrives from the peer's address at the peer's **next** sequence — the
 /// sequence the box's socket is windowed to receive, so the connection it
 /// holds into a forwarder that no longer exists ends at once. The Ethernet
 /// addresses stay as observed — the box's MAC is still the destination —
 /// and the acknowledgement is the peer's own latest one.
 fn rst_toward_box_from_flow(tail: &InboundFlowTail) -> Vec<u8> {
-    let seq = rst_ack(tail.seq, tail.payload_len, tail.flags);
-    let ack = if tail.flags & 0x10 != 0 { tail.ack } else { 0 };
-    rst_frame(tail.dst_mac, tail.src_mac, tail.src, tail.dst, seq, ack)
+    let seq = refusal::seq_acknowledging(tail.seq, tail.payload_len, tail.flags);
+    let ack = if tail.flags & refusal::TCP_ACK != 0 {
+        tail.ack
+    } else {
+        0
+    };
+    refusal::tcp_reset_frame(
+        tail.dst_mac,
+        tail.src_mac,
+        tail.src,
+        tail.dst,
+        seq,
+        ack,
+        true,
+    )
 }
 
 /// Builds the Ethernet + IPv4 + UDP frame the relay writes back toward the
@@ -2729,8 +2561,10 @@ fn rst_toward_box_from_flow(tail: &InboundFlowTail) -> Vec<u8> {
 ///
 /// For the NODATA answers of NET-136: the box's resolver stack sees its
 /// question answered by the resolver it asked. The IPv4 header checksum is
-/// computed; the UDP checksum is left zero, a legal "no checksum" for IPv4,
-/// so the reply needs no pseudo-header arithmetic of its own.
+/// computed — by the shared crate's one header-checksum helper
+/// ([`refusal::ipv4_checksum`]) — and the UDP checksum is left zero, a legal
+/// "no checksum" for IPv4, so the reply needs no pseudo-header arithmetic of
+/// its own.
 fn udp_reply_frame(request: &[u8], pkt: &L4Packet, payload: &[u8]) -> Vec<u8> {
     let total = 20 + 8 + payload.len();
     let mut frame = Vec::with_capacity(ETH_HDR + total);
@@ -2755,7 +2589,7 @@ fn udp_reply_frame(request: &[u8], pkt: &L4Packet, payload: &[u8]) -> Vec<u8> {
     header[9] = IPPROTO_UDP;
     header[12..16].copy_from_slice(&pkt.dst.ip().octets());
     header[16..20].copy_from_slice(&pkt.src.ip().octets());
-    let checksum = ipv4_checksum(&header);
+    let checksum = refusal::ipv4_checksum(&header);
     header[10..12].copy_from_slice(&checksum.to_be_bytes());
     frame.extend_from_slice(&header);
     // UDP: the resolver's :53 back to the query's source port, no checksum.
@@ -2828,15 +2662,12 @@ where
             && let Some(pkt) = &tcp
             && gate.port_revoked(pkt.dst.port())
         {
-            gate.refuse_tcp_segment(&frame[..n], pkt);
-            gate.limiter.warn(
-                &gate.label,
-                Direction::Ingress,
-                Some(SocketAddr::V4(pkt.src)),
-                Proto::from_ipv4_number(pkt.proto),
-                Some(pkt.dst.port()),
-                REVOKED_INGRESS_PORT_RULE,
-            );
+            // The shared refusal audit says its line inside the refusal —
+            // the one format every leg's log tail carries, the window's one
+            // line at its first refusal — whether the gate built a reset for
+            // the segment or not, so a revoked port's refusals never go
+            // quiet. This arm says nothing of its own.
+            gate.refuse_tcp_segment(&frame[..n], pkt, refusal::REVOKED_PORT);
             continue;
         }
         // Inbound ingress gate (finding #2): drop a new TCP connection or an
@@ -2848,7 +2679,9 @@ where
         // NET-014 turns the TCP half of that drop into a refusal: a SYN to a
         // port nothing is listening on is answered with a reset — the peer's
         // connect fails at once with connection refused instead of hanging to
-        // its timeout. A UDP datagram is not a connection and stays a drop.
+        // its timeout, and the shared refusal audit says the line, in the one
+        // format every leg carries. A UDP datagram is not a connection and
+        // stays a drop, whose audit line is the drop's own vocabulary.
         //
         // NET-073 goes first, on the connection event itself: a bare SYN from
         // another box is judged by the source box's own egress rules beside
@@ -2866,16 +2699,20 @@ where
             if proto == sessions::IpProto::Tcp
                 && let Some(pkt) = &tcp
             {
-                gate.refuse_tcp_segment(&frame[..n], pkt);
+                gate.refuse_tcp_segment(&frame[..n], pkt, refusal::UNPUBLISHED_PORT);
+            } else {
+                // The UDP half: a datagram wrote nothing back, so there is no
+                // count for the refusal audit's line to carry — its audit is
+                // the drop limiter's, with the drop's own vocabulary.
+                gate.limiter.warn(
+                    &gate.label,
+                    Direction::Ingress,
+                    Some(SocketAddr::V4(src)),
+                    Proto::from_ipproto(proto),
+                    Some(dst_port),
+                    NO_INGRESS_MAPPING_RULE,
+                );
             }
-            gate.limiter.warn(
-                &gate.label,
-                Direction::Ingress,
-                Some(SocketAddr::V4(src)),
-                Proto::from_ipproto(proto),
-                Some(dst_port),
-                NO_INGRESS_MAPPING_RULE,
-            );
             continue;
         }
         // NET-066/NET-067: a DNS reply from this switch's own resolver is
@@ -3111,6 +2948,7 @@ pub(crate) mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         };
         let gate = SessionGate::for_session(
             "100.64.0.9".into(),
@@ -3220,6 +3058,7 @@ pub(crate) mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         };
         let gate = SessionGate::for_session(
             "100.64.0.9".into(),
@@ -3385,6 +3224,7 @@ pub(crate) mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         };
         let gate =
             SessionGate::for_session(LEASE.to_string(), LEASE, &policy, SwitchSubnet::default());
@@ -3607,6 +3447,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -3654,6 +3495,261 @@ pub(crate) mod tests {
             .expect("the relay survives a dropped frame")
             .expect("the switch side stays open");
         assert_eq!(next, sentinel);
+    }
+
+    /// NET-134 on the relay leg, the first of the two a box's frame must
+    /// clear to reach the Box Egress Proxy's listener: a deny-all box that
+    /// declared a credentialed upstream has its frame to the proxy's
+    /// listener forwarded to the switch — where the host-side gate's lane
+    /// arm decides it on the far side — while the same rules hold every
+    /// other destination, the other ports and protocols at the proxy's own
+    /// address included, and the host alias on the same switch, dropped
+    /// and unanswered. Without the declaration the same rules hold the
+    /// listener too: the lane is granted by the declaration alone, and the
+    /// refusal a lane-less box meets at the listener is this leg's own
+    /// drop, made wherever the box's path runs — on a native host, where
+    /// no minvmd gate stands beside the relay, as much as on a VM-backed
+    /// one.
+    #[tokio::test]
+    async fn compiled_egress_carries_the_credentialed_lane() {
+        // The address the lane admits is the switch's own Box Egress Proxy
+        // address (`broadcast - 3` of the default /16), the one the e2e
+        // cases probe — read from the subnet, not restated as its own
+        // constant beside the assert that pins it.
+        let proxy = SwitchSubnet::default().box_egress_proxy_address();
+        assert_eq!(proxy, Ipv4Addr::new(100, 64, 255, 252));
+        // Deny-all, spelled the way the activating client's
+        // `--deny-subnets 0.0.0.0/0` compiles: one declared dimension that
+        // denies every IPv4 destination.
+        let deny_all = sessions::SessionPolicy {
+            egress: Some(sessions::EgressPolicy {
+                allow_protocols: None,
+                allow_subnets: None,
+                allow_dns_hosts: None,
+                deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+            }),
+            ingress: None,
+            credentialed_upstream: Some(sessions::CredentialedUpstream {}),
+        };
+        let mut harness = spawn_test_relay(&deny_all);
+
+        // The lane's half: the frame to the proxy's listener is forwarded
+        // verbatim, whatever the deny-all says about the address — the
+        // relay's own pin of the listener's port, the number the host-side
+        // listener actually listens on (the e2e case connects through the
+        // real one and is where the two spellings of the number are proved
+        // to agree).
+        let listener = egress::PROXY_LISTENER_PORT;
+        let to_proxy = egress_tcp_frame(LEASE, proxy, listener);
+        harness.box_end.write_all(&to_proxy).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the lane's frame is forwarded")
+            .expect("the switch side stays open");
+        assert_eq!(
+            first, to_proxy,
+            "a frame to the proxy's listener is forwarded beside the deny-all"
+        );
+
+        // The lane admits the listener, not the address: TCP to another
+        // port at the proxy's address and UDP to the listener's own port
+        // are the address's own drop, ahead of the rules — which deny them
+        // here anyway — so only the ARP sentinel behind them comes through.
+        let other_port = egress_tcp_frame(LEASE, proxy, 443);
+        let other_proto = udp_frame(LEASE, 40000, proxy, listener);
+        let sentinel = arp_frame(LEASE);
+        harness.box_end.write_all(&other_port).unwrap();
+        harness.box_end.write_all(&other_proto).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, sentinel,
+            "the lane holds everything at the proxy's address but the listener"
+        );
+
+        // And nowhere else: the same box's frame to the host alias drops
+        // without an answer — the ARP sentinel behind it is the one thing
+        // that comes through, and nothing is written back toward the box.
+        let refused = egress_tcp_frame(LEASE, SwitchSubnet::default().host_alias(), listener);
+        harness.box_end.write_all(&refused).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, sentinel,
+            "the deny-all holds everywhere but the proxy's listener"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        set_nonblocking(harness.box_end.as_raw_fd()).unwrap();
+        let mut probe = [0u8; 1];
+        let read = harness.box_end.read(&mut probe);
+        assert!(
+            matches!(read, Err(ref e) if e.kind() == io::ErrorKind::WouldBlock),
+            "a frame the rules refuse is dropped, not reset: got {read:?}"
+        );
+
+        // The declaration is the only thing that opens the listener: the
+        // same deny-all without a lane drops the listener's frame the same
+        // way — the lane rule holds the address ahead of the rules, so the
+        // frame never reaches the host gate at all.
+        let unlaned = sessions::SessionPolicy {
+            credentialed_upstream: None,
+            ..deny_all.clone()
+        };
+        let mut harness = spawn_test_relay(&unlaned);
+        harness.box_end.write_all(&to_proxy).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            first, sentinel,
+            "without the declaration the proxy's listener is any other destination"
+        );
+
+        // And the address is carried for a lane-less box too, so the relay
+        // drops at it ahead of the rules, whatever they would say about it:
+        // an allow-all box — the absent egress section's default, the
+        // posture that would otherwise reach anything — has its frame to
+        // another port at the proxy's address dropped, and its listener
+        // triple no less. The lane is the one thing that opens the
+        // listener, so the refusal a lane-less box is owed there is this
+        // leg's own, made wherever the box's path runs — on a native host,
+        // where no minvmd gate stands beside the relay, as much as on a
+        // VM-backed one. The counted warning line and the laned pass are
+        // the two dedicated tests that follow.
+        let allow_all = sessions::SessionPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let mut harness = spawn_test_relay(&allow_all);
+        harness.box_end.write_all(&other_port).unwrap();
+        harness.box_end.write_all(&to_proxy).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            next, sentinel,
+            "an allow-all box without a lane reaches nothing at the proxy's address, its listener included"
+        );
+    }
+
+    /// NET-134's refusal half, counted: the leg a native host runs alone,
+    /// with no minvmd gate beside it. An allow-all box that declared no
+    /// lane — the absent egress section's default, the posture that would
+    /// otherwise reach anything — sends TCP to the proxy's listener port,
+    /// and the frame never reaches the switch: it is the relay's own drop
+    /// under the lane's rule, named the way the host-side gate names it
+    /// (`egress-uncredentialed-proxy-destination`), and counted — one
+    /// rate-limited warn line per box per rule per interval (NET-062,
+    /// R2.7), so a probe's retransmits say one line, naming the box, the
+    /// direction, the destination the frame named and its protocol.
+    #[tokio::test]
+    async fn a_laneless_box_frame_to_the_proxy_listener_is_dropped_and_counted() {
+        let capture = crate::test_harness::captured_log();
+        let proxy = SwitchSubnet::default().box_egress_proxy_address();
+        let listener_port = egress::PROXY_LISTENER_PORT;
+        let allow_all = sessions::SessionPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let mut harness = spawn_test_relay(&allow_all);
+
+        // The frame a lane-less box would send to reach the proxy's
+        // acceptor: TCP to the listener's own port. The ARP sentinel behind
+        // it is the one thing that comes through.
+        let to_listener = egress_tcp_frame(LEASE, proxy, listener_port);
+        let sentinel = arp_frame(LEASE);
+        harness.box_end.write_all(&to_listener).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            first, sentinel,
+            "a lane-less box's frame to the proxy's listener never reaches the switch"
+        );
+
+        // The refusal is counted — one line, under the lane's own rule,
+        // naming the box, the direction, the listener's own (address, port)
+        // the frame named, and its protocol. On a VM host this is the same
+        // line the guest-side relay writes, so the host gate beyond the
+        // switch has nothing of the box's to log: the frame is refused once,
+        // at the first gate it meets.
+        let logged = capture.contents();
+        assert_eq!(
+            logged
+                .matches("rule_matched=\"egress-uncredentialed-proxy-destination\"")
+                .count(),
+            1,
+            "the lane-less listener drop says one line: {logged}"
+        );
+        for expected in [
+            "network policy violation",
+            "session_id=\"100.64.0.9\"",
+            "direction=egress",
+            &format!("remote_addr={proxy}:{listener_port}"),
+            "proto=tcp",
+        ] {
+            assert!(
+                logged.contains(expected),
+                "missing {expected:?} in: {logged}"
+            );
+        }
+
+        // And the drop is silent, not a reset (NET-062): nothing is
+        // written back toward the box.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        set_nonblocking(harness.box_end.as_raw_fd()).unwrap();
+        let mut probe = [0u8; 1];
+        let read = harness.box_end.read(&mut probe);
+        assert!(
+            matches!(read, Err(ref e) if e.kind() == io::ErrorKind::WouldBlock),
+            "a refused frame is dropped, not reset: got {read:?}"
+        );
+    }
+
+    /// The same frame from a box that declared the upstream is admitted:
+    /// the declaration is the one thing that opens the listener, and it
+    /// opens on this leg — the relay forwards the frame verbatim toward
+    /// the switch, where a VM host's gate decides it in turn, and nothing
+    /// is logged against it.
+    #[tokio::test]
+    async fn a_laned_box_frame_to_the_proxy_listener_passes() {
+        let capture = crate::test_harness::captured_log();
+        let proxy = SwitchSubnet::default().box_egress_proxy_address();
+        let laned = sessions::SessionPolicy {
+            egress: None,
+            ingress: None,
+            credentialed_upstream: Some(sessions::CredentialedUpstream {}),
+        };
+        let mut harness = spawn_test_relay(&laned);
+
+        let to_listener = egress_tcp_frame(LEASE, proxy, egress::PROXY_LISTENER_PORT);
+        harness.box_end.write_all(&to_listener).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the lane's frame is forwarded")
+            .expect("the switch side stays open");
+        assert_eq!(
+            first, to_listener,
+            "a laned box's frame to the proxy's listener is forwarded verbatim"
+        );
+        assert!(
+            !capture.contents().contains("network policy violation"),
+            "the lane's own frame is not a violation"
+        );
     }
 
     /// NET-062's warning: every drop is logged once per box per rule per
@@ -3743,6 +3839,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         };
         let mut harness = spawn_test_relay(&policy);
 
@@ -3773,6 +3870,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         };
         let mut harness = spawn_test_relay(&policy);
         let peer = Ipv4Addr::new(10, 1, 2, 3);
@@ -3840,6 +3938,7 @@ pub(crate) mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         };
         let mut harness = spawn_test_relay(&policy);
 
@@ -3886,22 +3985,269 @@ pub(crate) mod tests {
             "a declared port is forwarded, refusal or no refusal"
         );
 
-        // The refusal says its line, under the ingress leg's own rule, naming
-        // the peer and the port it came to (the diagnostics bundle's tail).
+        // The refusal says its line — the one shared format every leg's log
+        // tail carries (the diagnostics bundle's): the rule, the address
+        // that refused, the port, the reason, the peer, and the refusals
+        // that source's window has seen.
         let logged = capture.contents();
-        for expected in [
-            "network policy violation",
-            "session_id=\"100.64.0.9\"",
-            "direction=ingress",
-            "remote_addr=100.64.0.5:40000",
-            "dst_port=9999",
-            "rule_matched=\"no ingress mapping\"",
-        ] {
-            assert!(
-                logged.contains(expected),
-                "missing {expected:?} in: {logged}"
-            );
+        assert!(
+            logged.contains(
+                "rule_matched=\"no ingress mapping\" address=100.64.0.9 port=9999 \
+                 reason=\"no listener is published for the port\" source=100.64.0.5 refusals=1"
+            ),
+            "the refusal's audit line, in the one shared format: {logged}"
+        );
+        assert!(
+            !logged.contains("network policy violation"),
+            "a refused connection's audit is the shared line, not the drop limiter's: {logged}"
+        );
+    }
+
+    /// NET-121: a revoked ingress port's refusal is logged through the shared
+    /// emitter on **both** of its halves. One half a reset answers — a peer's
+    /// SYN to the port the revocation closed, refused on the spot, forwarder
+    /// or no forwarder — and one half nothing answers: a segment of a flow
+    /// the gate holds no tail for, a spoofed one, which writes no reset by
+    /// design and must not go quiet either. The line is the shared audit's
+    /// whether or not a reset frame is written, so the log tail names every
+    /// refusal, and the wire stays silent exactly where no reply exists to
+    /// write.
+    #[tokio::test]
+    async fn revoked_port_refusal_is_logged() {
+        let capture = crate::test_harness::captured_log();
+        let policy = declared_ingress_80();
+        let mut harness = spawn_test_relay_with(&policy, |gate| {
+            gate.revoke_port(80);
+        });
+
+        // The peer's SYN to the revoked port: answered with a reset on the
+        // switch side, the kernel's own connection-refused shape for that
+        // port.
+        let syn = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 80);
+        let mut framed = Vec::with_capacity(2 + syn.len());
+        framed.extend_from_slice(&(syn.len() as u16).to_le_bytes());
+        framed.extend_from_slice(&syn);
+        harness.switch.write_all(&framed).await.unwrap();
+
+        let reset = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("a revoked port is refused at once")
+            .expect("the switch side stays open");
+        let answered = parse_ipv4_l4(&reset).expect("the reset parses");
+        assert_eq!(*answered.src.ip(), LEASE, "the reset speaks for the box");
+        assert_eq!(
+            answered.src.port(),
+            80,
+            "for the port whose published ingress was revoked"
+        );
+        assert_eq!(*answered.dst.ip(), PEER, "addressed to the connecting peer");
+        assert_eq!(answered.dst.port(), 40000, "at the port the SYN came from");
+        assert_eq!(
+            answered.tcp_flags,
+            refusal::TCP_RST | refusal::TCP_ACK,
+            "RST|ACK: a refusal, not an acceptance"
+        );
+        assert_eq!(answered.seq, 0, "a refusal to a bare SYN resets from zero");
+        assert_eq!(answered.ack, 1, "acknowledging the SYN and its weight");
+        assert_tcp_checksum_verifies_on_the_wire(&reset);
+
+        // The answered refusal says its line, in the one shared format.
+        let logged = capture.contents();
+        assert!(
+            logged.contains(
+                "rule_matched=\"revoked ingress port\" address=100.64.0.9 port=80 \
+                 reason=\"the port's published ingress was revoked\" source=100.64.0.5 refusals=1"
+            ),
+            "the answered refusal's audit line, in the one shared format: {logged}"
+        );
+
+        // The refusal no reset can answer: a segment of a flow the gate holds
+        // nothing for — a spoofed one, whose numbers are its sender's claim —
+        // writes no reset by design, forwards nothing either, and still says
+        // its line through the shared emitter.
+        let spoofed = tcp_segment_with_numbers(ACK, OTHER_PEER, 80, 0xdead_beef, 0xfeed_face);
+        let mut framed = Vec::with_capacity(2 + spoofed.len());
+        framed.extend_from_slice(&(spoofed.len() as u16).to_le_bytes());
+        framed.extend_from_slice(&spoofed);
+        harness.switch.write_all(&framed).await.unwrap();
+        // Give the relay its moment, then both ends must be silent: no reset
+        // was built for the spoofed flow, and the revoked port forwards
+        // nothing toward the box either.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        set_nonblocking(harness.box_end.as_raw_fd()).unwrap();
+        let mut probe = [0u8; 1];
+        let read = harness.box_end.read(&mut probe);
+        assert!(
+            matches!(read, Err(ref e) if e.kind() == io::ErrorKind::WouldBlock),
+            "nothing is forwarded to the box: got {read:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), read_framed(&mut harness.switch))
+                .await
+                .is_err(),
+            "no reset is built for a flow the gate holds nothing for"
+        );
+        let logged = capture.contents();
+        assert!(
+            logged.contains(
+                "rule_matched=\"revoked ingress port\" address=100.64.0.9 port=80 \
+                 reason=\"the port's published ingress was revoked\" source=100.64.0.6 refusals=1"
+            ),
+            "a refusal that writes no reset is still the shared audit's — its \
+             line is said: {logged}"
+        );
+
+        // The sweep a no-reset refusal drives: four more spoofed segments
+        // count silently through the same window — five refusals it saw, one
+        // line said — and then the window ends in the silence of a source
+        // that stopped. The next refusal is a spoofed one too, so it writes
+        // no reset either: the sweep ahead of its charge is what says the
+        // closed window's count, and the path that never builds a reset must
+        // reach it as much as the one that does.
+        let spoofed = tcp_segment_with_numbers(ACK, OTHER_PEER, 80, 0xdead_beef, 0xfeed_face);
+        for _ in 0..4 {
+            let mut framed = Vec::with_capacity(2 + spoofed.len());
+            framed.extend_from_slice(&(spoofed.len() as u16).to_le_bytes());
+            framed.extend_from_slice(&spoofed);
+            harness.switch.write_all(&framed).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        assert_eq!(
+            capture
+                .contents()
+                .matches("source=100.64.0.6 refusals=")
+                .count(),
+            1,
+            "the window's refusals after its opening line say nothing yet: {}",
+            capture.contents()
+        );
+        tokio::time::sleep(refusal::REFUSAL_WINDOW + Duration::from_millis(100)).await;
+        let mut framed = Vec::with_capacity(2 + spoofed.len());
+        framed.extend_from_slice(&(spoofed.len() as u16).to_le_bytes());
+        framed.extend_from_slice(&spoofed);
+        harness.switch.write_all(&framed).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let logged = capture.contents();
+        assert!(
+            logged.contains(
+                "rule_matched=\"revoked ingress port\" address=100.64.0.9 port=80 \
+                 reason=\"the port's published ingress was revoked\" source=100.64.0.6 refusals=5"
+            ),
+            "the window that ended in a spoofed-only silence says its true \
+             count, at a refusal that writes no reset: {logged}"
+        );
+        assert_eq!(
+            logged.matches("source=100.64.0.6 refusals=").count(),
+            3,
+            "the closed window's count, the window's opening line, and the \
+             next window's own opening line — one per window, never per \
+             refusal: {logged}"
+        );
+        // And still no reset: the sweep and the line cost the wire nothing.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), read_framed(&mut harness.switch))
+                .await
+                .is_err(),
+            "no reset is built for a flow the gate holds nothing for"
+        );
+    }
+
+    /// The native relay leg answers through the shared builder: a refused SYN
+    /// rides the native attachment — the host-side UDS one, the harness's
+    /// duplex standing in for its upgraded control socket — through the whole
+    /// relay ([`spawn_relay`]: framing, parse, the refusal arms, the gate, the
+    /// writer), and the reset this test captures is the bytes the leg put on
+    /// the wire, read back rather than taken from the builder's return value.
+    /// Those bytes are asserted byte-for-byte against the frame
+    /// `switch::refusal` assembles for the same SYN — and against the wire's
+    /// own oracle ([`assert_reset_refuses`]: the refusal's addressing, flags,
+    /// acknowledgement arithmetic and checksum, spelled out here rather than
+    /// inherited from the builder) — so the leg is proved on the bytes it
+    /// writes, not on its own delegate's. Both attachment paths funnel into
+    /// the one [`spawn_relay`], so the loop this drives is the in-VM one too;
+    /// the leg that is native-only is the wire under it, and the box end
+    /// staying silent is the other half of a refusal: the gate answers for
+    /// the box, and the box's kernel never sees the connection.
+    #[tokio::test]
+    async fn native_relay_refusal_matches_the_shared_builder() {
+        let policy = declared_ingress_80();
+        let mut harness = spawn_test_relay(&policy);
+
+        let syn = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 9999);
+        let mut framed = Vec::with_capacity(2 + syn.len());
+        framed.extend_from_slice(&(syn.len() as u16).to_le_bytes());
+        framed.extend_from_slice(&syn);
+        harness.switch.write_all(&framed).await.unwrap();
+
+        let reset = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("an unpublished port is refused at once")
+            .expect("the switch side stays open");
+        let segment = parse_ipv4_l4(&syn).expect("the SYN parses");
+        let shared = refusal::refused_tcp_reset(&syn, &segment)
+            .expect("the shared builder refuses a bare SYN");
+        assert_eq!(
+            reset, shared,
+            "the relay's reset is the shared builder's, byte for byte"
+        );
+        assert_reset_refuses(&reset, &syn);
+        // The refusal forwards nothing: the reset is the leg's whole answer,
+        // and the box's kernel never sees the connection to refuse itself.
+        set_nonblocking(harness.box_end.as_raw_fd()).unwrap();
+        let mut probe = [0u8; 1];
+        let read = harness.box_end.read(&mut probe);
+        assert!(
+            matches!(read, Err(ref e) if e.kind() == io::ErrorKind::WouldBlock),
+            "nothing is forwarded to the box: got {read:?}"
+        );
+    }
+
+    /// The in-VM gate leg answers through the shared builder: the unit the
+    /// in-guest relay consults — [`SessionGate::refuse_tcp_segment`], whose
+    /// reset channel the VM's pid-1 relay drains onto its vsock wire — is
+    /// driven here for a refused SYN, and the bytes this test captures are the
+    /// ones that leg writes, read off the channel rather than taken from the
+    /// builder's return value. They are asserted byte-for-byte against the
+    /// frame `switch::refusal` assembles for the same SYN — and, because a
+    /// bare SYN's reset is the builder's own answer delegated, against the
+    /// wire's oracle too ([`assert_reset_refuses`]), so the equality is
+    /// carried by assertions the delegation cannot satisfy on its own: the
+    /// leg's written bytes must be a refusal for *that* SYN — the tuples
+    /// swapped, RST|ACK, the acknowledgement counting the SYN's weight, a
+    /// checksum the peer's kernel verifies — and must be the one frame the
+    /// leg writes for it.
+    #[test]
+    fn in_vm_gate_refusal_matches_the_shared_builder() {
+        let gate = SessionGate::for_session(
+            LEASE.to_string(),
+            LEASE,
+            &declared_ingress_80(),
+            SwitchSubnet::default(),
+        );
+        let mut resets = gate
+            .take_resets()
+            .expect("a gate's reset channel is taken exactly once");
+
+        let syn = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 9999);
+        let segment = parse_ipv4_l4(&syn).expect("the SYN parses");
+        assert!(
+            gate.refuse_tcp_segment(&syn, &segment, refusal::UNPUBLISHED_PORT),
+            "the gate leg refuses the SYN to the unpublished port"
+        );
+        let reset = resets
+            .try_recv()
+            .expect("the gate answers the refused SYN at once");
+        assert!(
+            resets.try_recv().is_err(),
+            "the leg writes exactly one frame for one refused SYN"
+        );
+        let shared = refusal::refused_tcp_reset(&syn, &segment)
+            .expect("the shared builder refuses a bare SYN");
+        assert_eq!(
+            reset, shared,
+            "the gate's reset is the shared builder's, byte for byte"
+        );
+        assert_reset_refuses(&reset, &syn);
     }
 
     /// Verifies `frame`'s TCP checksum the way the receiving kernel does —
@@ -3911,7 +4257,7 @@ pub(crate) mod tests {
     /// with the segment's own bytes, checksum field left in place, must fold
     /// to `0xffff` (RFC 1071).
     ///
-    /// Deliberately independent of [`tcp_checksum`]: a check that recomputes
+    /// Deliberately independent of [`refusal::tcp_checksum`]: a check that recomputes
     /// with the builder's own function inherits whatever byte-order mistake
     /// the builder made, so a wrong pseudo-header passes. Here the byte
     /// order is an explicit construction the reader can hold against the
@@ -3939,8 +4285,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// [`tcp_checksum`] matches the wire definition on a fixed vector: the
-    /// reset the NET-014 proof's refusal carries — `100.64.0.9:9999 →
+    /// [`refusal::tcp_checksum`] — the shared crate's, which every reset every
+    /// leg writes now carries — matches the wire definition on a fixed vector:
+    /// the reset the NET-014 proof's refusal carries — `100.64.0.9:9999 →
     /// 100.64.0.5:40000`, sequence zero, acknowledging a bare SYN (its
     /// sequence plus the SYN flag's weight), data offset `0x50`, RST|ACK —
     /// has checksum `0x23f2` under the RFC's own pseudo-header. The value
@@ -3958,7 +4305,7 @@ pub(crate) mod tests {
         segment[12] = 0x50; // data offset 5
         segment[13] = 0x14; // RST|ACK
         assert_eq!(
-            tcp_checksum(&segment, LEASE, PEER),
+            refusal::tcp_checksum(&segment, LEASE, PEER),
             0x23f2,
             "the wire's checksum for this reset, per RFC 793's pseudo-header"
         );
@@ -4045,6 +4392,7 @@ pub(crate) mod tests {
                 dynamic_ingress: None,
             }),
             egress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -4167,7 +4515,7 @@ pub(crate) mod tests {
         // source.
         let syn = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 9999);
         let syn_pkt = parse_ipv4_l4(&syn).expect("the SYN parses");
-        assert!(gate.refuse_tcp_segment(&syn, &syn_pkt));
+        assert!(gate.refuse_tcp_segment(&syn, &syn_pkt, refusal::UNPUBLISHED_PORT));
         let refused = resets
             .try_recv()
             .expect("the refused SYN is answered at once");
@@ -4200,7 +4548,7 @@ pub(crate) mod tests {
         // self-healing reset stays in the window the gate watched.
         let straggler = tcp_segment_with_numbers(ACK, PEER, 80, 2001, 6001);
         let straggler_pkt = parse_ipv4_l4(&straggler).expect("the straggler parses");
-        assert!(gate.refuse_tcp_segment(&straggler, &straggler_pkt));
+        assert!(gate.refuse_tcp_segment(&straggler, &straggler_pkt, refusal::REVOKED_PORT));
         let healed = resets
             .try_recv()
             .expect("the ended connection's straggler is answered");
@@ -4219,7 +4567,7 @@ pub(crate) mod tests {
         // be made to emit a reset carrying a spoofed sequence to a victim.
         let spoofed = tcp_segment_with_numbers(ACK, OTHER_PEER, 80, 0xdead_beef, 0xfeed_face);
         let spoofed_pkt = parse_ipv4_l4(&spoofed).expect("the segment parses");
-        assert!(!gate.refuse_tcp_segment(&spoofed, &spoofed_pkt));
+        assert!(!gate.refuse_tcp_segment(&spoofed, &spoofed_pkt, refusal::REVOKED_PORT));
         assert!(
             resets.try_recv().is_err(),
             "no reset is built for a flow the gate holds nothing for"
@@ -4265,7 +4613,7 @@ pub(crate) mod tests {
         let straggler = tcp_segment_with_numbers(RST | ACK, PEER, 80, 1001, 5001);
         let straggler_pkt = parse_ipv4_l4(&straggler).expect("the reset parses");
         assert!(
-            !gate.refuse_tcp_segment(&straggler, &straggler_pkt),
+            !gate.refuse_tcp_segment(&straggler, &straggler_pkt, refusal::REVOKED_PORT),
             "a reset is never answered with a reset"
         );
         assert!(
@@ -4274,14 +4622,14 @@ pub(crate) mod tests {
         );
         assert!(box_resets.try_recv().is_err(), "and none toward the box");
 
-        // And it charges no budget: the same source's resets arrive in
+        // And it never reaches the audit: the same source's resets arrive in
         // numbers no window would answer, and the source is still owed every
-        // refusal it had — the next SYN is answered, and no budget line was
-        // ever spent on the resets that came first.
-        for seq in 0..RESET_PER_WINDOW + 8 {
+        // refusal it had — the next SYN is answered, and none of the resets
+        // that came first was ever counted against it.
+        for seq in 0..refusal::REFUSALS_PER_WINDOW + 8 {
             let flood = tcp_segment_with_numbers(RST | ACK, PEER, 80, 1001 + seq, 5001);
             let flood_pkt = parse_ipv4_l4(&flood).expect("the reset parses");
-            assert!(!gate.refuse_tcp_segment(&flood, &flood_pkt));
+            assert!(!gate.refuse_tcp_segment(&flood, &flood_pkt, refusal::REVOKED_PORT));
         }
         assert!(
             resets.try_recv().is_err(),
@@ -4290,16 +4638,18 @@ pub(crate) mod tests {
         let syn = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 9999);
         let syn_pkt = parse_ipv4_l4(&syn).expect("the SYN parses");
         assert!(
-            gate.refuse_tcp_segment(&syn, &syn_pkt),
-            "the resets charged no budget: the source is still answered"
+            gate.refuse_tcp_segment(&syn, &syn_pkt, refusal::UNPUBLISHED_PORT),
+            "the resets charged no quota: the source is still answered"
         );
         assert!(
             resets.try_recv().is_ok(),
             "the SYN's refusal is the reset it was owed"
         );
         assert!(
-            !capture.contents().contains("stopping TCP resets"),
-            "no budget was ever spent on the resets: {}",
+            !capture
+                .contents()
+                .contains(&format!("refusals={}", refusal::REFUSALS_PER_WINDOW)),
+            "no refusals of the resets were ever counted against the source: {}",
             capture.contents()
         );
     }
@@ -4334,71 +4684,154 @@ pub(crate) mod tests {
         );
     }
 
-    /// The per-source refusal budget: one source spends its window's refusals
-    /// and then waits for the window to roll — degrading alone, while a
-    /// second source in the same window is still answered — and the first
-    /// refused-over attempt says one audited line per window, not one per
-    /// refusal.
+    /// The shared refusal audit, wired into the gate: one source spends its
+    /// window's quota and then waits for the window to roll — degrading
+    /// alone, while a second source in the same window is still answered —
+    /// and the window says its one line, at its first refusal, carrying the
+    /// refusals it saw: the opening refusal's `1`, and the closed window's
+    /// real count when the next one opens. Never one line per refusal.
     #[test]
-    fn the_reset_budget_spends_per_source_and_says_one_line_per_window() {
+    fn the_shared_quota_spends_per_source_and_says_the_windows_count() {
         let capture = crate::test_harness::captured_log();
-        let mut budget = ResetBudget::default();
-        // A window short enough to watch it roll inside a test.
-        budget.shrink_window(Duration::from_millis(50));
-        let flooder = Ipv4Addr::new(100, 64, 0, 77);
-        let quiet = Ipv4Addr::new(100, 64, 0, 78);
+        let mut gate = SessionGate::for_session(
+            LEASE.to_string(),
+            LEASE,
+            &declared_ingress_80(),
+            SwitchSubnet::default(),
+        );
+        // The shared emitter, with a small quota and a window short enough to
+        // watch roll inside a test: the same audit, tightened for the proof.
+        gate.refusals =
+            refusal::RefusalEmitter::new(refusal::REFUSAL_ROWS, 4, Duration::from_millis(50));
+        let mut resets = gate
+            .take_resets()
+            .expect("a gate's reset channel is taken exactly once");
 
-        for _ in 0..RESET_PER_WINDOW {
-            assert!(budget.admit(flooder, "box"), "the window opens with budget");
+        let refused_syn = |gate: &SessionGate, src: Ipv4Addr| {
+            let frame = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, src, 9999);
+            let pkt = parse_ipv4_l4(&frame).expect("the SYN parses");
+            gate.refuse_tcp_segment(&frame, &pkt, refusal::UNPUBLISHED_PORT)
+        };
+
+        let mut answered = 0;
+        for _ in 0..4 {
+            if refused_syn(&gate, PEER) {
+                answered += 1;
+                assert!(resets.try_recv().is_ok(), "an answered refusal is queued");
+            }
         }
-        // Past the cap the flooder is refused its resets until the window
-        // rolls — and the refusal says one line per window, not one per
-        // refused attempt.
+        assert_eq!(answered, 4, "the window opens with its whole quota");
+        // Past the quota the flooder waits for the window to roll — nothing
+        // is answered, nothing is queued, and the window stays at its one
+        // line: the refusals still count, silently, for the count the next
+        // window's line carries.
         for _ in 0..4 {
             assert!(
-                !budget.admit(flooder, "box"),
-                "the flooder has spent its window's refusals"
+                !refused_syn(&gate, PEER),
+                "the flooder has spent its window's quota"
+            );
+            assert!(
+                resets.try_recv().is_err(),
+                "a suppressed refusal writes nothing"
             );
         }
         assert_eq!(
-            capture.contents().matches("stopping TCP resets").count(),
+            capture
+                .contents()
+                .matches("source=100.64.0.5 refusals=")
+                .count(),
             1,
-            "one audited line per source per window: {}",
+            "the window's one line so far, at its first refusal: {}",
+            capture.contents()
+        );
+        assert_eq!(
+            capture
+                .contents()
+                .matches("source=100.64.0.5 refusals=1")
+                .count(),
+            1,
+            "the opening refusal's line: {}",
             capture.contents()
         );
 
         // Nobody else pays for the flood: a second source in the same window
         // is still answered.
-        assert!(budget.admit(quiet, "box"), "the flooder degrades alone");
+        assert!(refused_syn(&gate, OTHER_PEER), "the flooder degrades alone");
+        assert!(resets.try_recv().is_ok(), "the sibling's refusal is queued");
+        assert_eq!(
+            capture
+                .contents()
+                .matches("source=100.64.0.6 refusals=1")
+                .count(),
+            1,
+            "the sibling's own line, in the same window: {}",
+            capture.contents()
+        );
 
-        // The window rolls and the flooder's budget returns with it.
+        // The window rolls and the flooder's quota returns with it — and the
+        // sweep ahead of the new window's charge says the spent one's own
+        // count first: eight refusals, four answered and four suppressed,
+        // said at the window they belong to rather than folded into the next
+        // window's opening line.
         std::thread::sleep(Duration::from_millis(60));
         assert!(
-            budget.admit(flooder, "box"),
-            "a new window opens the flooder's budget again"
+            refused_syn(&gate, PEER),
+            "a new window opens the flooder's quota again"
+        );
+        assert!(resets.try_recv().is_ok());
+        assert_eq!(
+            capture
+                .contents()
+                .matches("source=100.64.0.5 refusals=8")
+                .count(),
+            1,
+            "the rolled window's line carries the refusals it saw: {}",
+            capture.contents()
+        );
+        assert_eq!(
+            capture
+                .contents()
+                .matches("source=100.64.0.5 refusals=1")
+                .count(),
+            2,
+            "each of the two windows opens with its own count, never the \
+             closed one's: {}",
+            capture.contents()
+        );
+        // Three lines for the source across two windows — the one each
+        // window says, plus the count the first one still held at its end —
+        // and not one per refusal anywhere.
+        assert_eq!(
+            capture
+                .contents()
+                .matches("source=100.64.0.5 refusals=")
+                .count(),
+            3,
+            "the flooder's lines are the window's, not the refusals': {}",
+            capture.contents()
         );
     }
 
-    /// NET-014's refusal, bounded end to end: a peer that floods the box's
-    /// unpublished ports is answered until its window's refusals are spent
-    /// and then degrades to the timeout the reset replaced — while another
-    /// peer's connection in the same window is still refused at once, so the
-    /// flood costs its source alone. The flood's own line says it once.
+    /// NET-014's refusal, bounded end to end through the shared audit: a peer
+    /// that floods the box's unpublished ports is answered until its window's
+    /// quota is spent and then degrades to the timeout the reset replaced —
+    /// while another peer's connection in the same window is still refused at
+    /// once, so the flood costs its source alone. The flood's window says its
+    /// one line, at the first refusal that opened it.
     #[tokio::test]
     async fn refused_resets_are_budgeted_per_source() {
         let capture = crate::test_harness::captured_log();
-        let mut harness = spawn_test_relay_with(&declared_ingress_80(), |gate| {
-            gate.reset_budget.shrink_window(Duration::from_millis(120));
-        });
+        let mut harness = spawn_test_relay(&declared_ingress_80());
 
         // The flood: one more refused SYN than the window pays for, then a
-        // second peer's connection behind it — answered only if the budget
-        // is the source's, not the box's. Every frame rides the relay's own
+        // second peer's connection behind it — answered only if the quota is
+        // the source's, not the box's. Every frame rides the relay's own
         // framing, one length prefix per frame.
         let flood = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, PEER, 9999);
         let other = tcp_frame(ETHERTYPE_IPV4, IPPROTO_TCP, SYN, OTHER_PEER, 9999);
-        let mut framed = Vec::with_capacity((2 + flood.len()) * (RESET_PER_WINDOW as usize + 4));
-        for _ in 0..RESET_PER_WINDOW + 3 {
+        let mut framed =
+            Vec::with_capacity((2 + flood.len()) * (refusal::REFUSALS_PER_WINDOW as usize + 4));
+        for _ in 0..refusal::REFUSALS_PER_WINDOW + 3 {
             framed.extend_from_slice(&(flood.len() as u16).to_le_bytes());
             framed.extend_from_slice(&flood);
         }
@@ -4411,7 +4844,7 @@ pub(crate) mod tests {
         // is everything the flood was ever owed.
         let mut flood_resets = 0usize;
         let mut other_reset = None;
-        for _ in 0..RESET_PER_WINDOW + 8 {
+        for _ in 0..refusal::REFUSALS_PER_WINDOW + 8 {
             let frame =
                 tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
                     .await
@@ -4430,13 +4863,27 @@ pub(crate) mod tests {
             "another peer's refused connection is still answered behind the flood"
         );
         assert_eq!(
-            flood_resets, RESET_PER_WINDOW as usize,
-            "the flooder spent exactly its window's refusals, then degraded to a timeout"
+            flood_resets,
+            refusal::REFUSALS_PER_WINDOW as usize,
+            "the flooder spent exactly its window's quota, then degraded to a timeout"
         );
         assert_eq!(
-            capture.contents().matches("stopping TCP resets").count(),
+            capture
+                .contents()
+                .matches("source=100.64.0.5 refusals=1\n")
+                .count(),
             1,
-            "the flood is audited once: {}",
+            "the flood's window says its one line, at the first refusal: {}",
+            capture.contents()
+        );
+        assert_eq!(
+            capture
+                .contents()
+                .matches("source=100.64.0.5 refusals=")
+                .count(),
+            1,
+            "and no second one while the window stands — the flood's \
+             refusals count, they do not speak: {}",
             capture.contents()
         );
     }
@@ -4456,6 +4903,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -4473,6 +4921,7 @@ pub(crate) mod tests {
                 deny_subnets: None,
             }),
             ingress: None,
+            credentialed_upstream: None,
         }
     }
 
@@ -4492,6 +4941,7 @@ pub(crate) mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
             }),
+            credentialed_upstream: None,
         }
     }
 
@@ -4744,14 +5194,13 @@ pub(crate) mod tests {
             "source_pass=true",
             "target_pass=false",
             "port=9999",
-            // The refusal is the target's own, under the target's own label,
-            // naming the source box that came (`remote_addr` is the peer on
-            // an ingress line) and the port it came to.
-            "session_id=\"100.64.0.11\"",
-            "direction=ingress",
-            "remote_addr=100.64.0.12:40000",
-            "dst_port=9999",
-            "rule_matched=\"no ingress mapping\"",
+            // The refusal is the target's own, through the shared refusal
+            // audit: the line names the address that refused, the port, the
+            // reason, the source box that came, and the refusals that
+            // source's window has seen.
+            "rule_matched=\"no ingress mapping\" address=100.64.0.11 port=9999",
+            "reason=\"no listener is published for the port\"",
+            "source=100.64.0.12 refusals=1",
         ] {
             assert!(
                 logged.contains(expected),
@@ -4781,11 +5230,16 @@ pub(crate) mod tests {
         // connect-time one under the source's label — the source's own leg
         // refused the same frame above and said no second line for it, one
         // refusal being one line through the limiter the two share — and the
-        // target's ingress one.
+        // target's ingress one, through the shared refusal audit.
         assert_eq!(
             logged.matches("network policy violation").count(),
-            2,
-            "each refusal says its own line, and nothing else does: {logged}"
+            1,
+            "the connect-time refusal alone says the limiter's line: {logged}"
+        );
+        assert_eq!(
+            logged.matches("address=100.64.0.11 port=9999").count(),
+            1,
+            "the target's ingress refusal says the shared audit's line: {logged}"
         );
     }
 
@@ -5139,6 +5593,7 @@ pub(crate) mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: None,
             }),
+            credentialed_upstream: None,
         }
     }
 

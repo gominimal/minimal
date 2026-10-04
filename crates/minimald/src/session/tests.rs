@@ -1446,6 +1446,53 @@ async fn ensure_host_launches_an_unattached_host_and_then_reuses_it() {
     );
 }
 
+/// NET-079's "recorded as such" is not best-effort: a host-address box
+/// whose launch cannot write its outcome onto the session record does not
+/// run as though it had one. The launch kills the box it minted and fails
+/// with `LaunchRecordUnwritable`, the session holds no host, and the record
+/// keeps no outcome — so no read surface ever answers for a box that ran
+/// without one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_launch_whose_record_cannot_be_written_kills_its_box() {
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let session_id = create_configured_session(&mut client, "unrecorded-launch", "/tmp").await;
+    let torn_down = crate::session::launch_record_seam::fail_writes_for(session_id);
+
+    let manager = server.state.sessions_manager().await;
+    let handle = manager
+        .get_session(crate::sessions::SessionKeyPredicate::Id(session_id))
+        .await
+        .unwrap()
+        .expect("session should resolve");
+
+    match handle.ensure_host("tester".to_string()).await {
+        Err(crate::session::AttachError::LaunchRecordUnwritable(_)) => {}
+        Err(other) => panic!("the launch failed for another reason: {other}"),
+        Ok(_) => panic!("a launch whose outcome could not be recorded handed its box back"),
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !torn_down.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the launch kills the box it could not record, tearing its network down");
+    assert!(
+        handle.get_attrs().await.is_none(),
+        "the session holds no host after a launch it could not record"
+    );
+    let record = client
+        .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(session_id))
+        .await
+        .record
+        .expect("the session's record is readable");
+    assert_eq!(
+        record.host_ip_enforcement, None,
+        "a launch that could not record its outcome left none on the record"
+    );
+}
+
 // ---- lifecycle hooks -------------------------------------------------
 //
 // Hooks run inside the session, which under test means the host-side
@@ -2741,6 +2788,7 @@ fn own_ip_session_req(name: &str) -> minimald_rpc::CreateSessionRequest {
                     }],
                     ..Default::default()
                 }),
+                credentialed_upstream: None,
             },
             box_addresses: None,
             hooks_enabled: true,
@@ -4902,7 +4950,7 @@ async fn register_hostname_promotes_an_interim_to_its_vouched_hand() {
 /// tests below pin the decision and the publish it leads to, not the
 /// plumbing around them. `mode: None` is the deny-all default a box that
 /// declared nothing runs under.
-fn dynamic_ingress_session_req(
+pub(crate) fn dynamic_ingress_session_req(
     name: &str,
     switch: std::net::Ipv4Addr,
     loopback: std::net::Ipv4Addr,
@@ -4928,7 +4976,7 @@ fn dynamic_ingress_session_req(
 
 /// Drives Create → ConfigureLoadout → FinalizeSession for a
 /// [`dynamic_ingress_session_req`] box and returns its id.
-async fn finalize_dynamic_ingress_session(
+pub(crate) async fn finalize_dynamic_ingress_session(
     client: &mut TestClient,
     name: &str,
     switch: std::net::Ipv4Addr,
@@ -5007,7 +5055,7 @@ async fn read_control_request(stream: &mut tokio::net::UnixStream) -> Option<Str
 /// harness never spawns a real forwarder, so binding here is what puts a
 /// control channel behind the publish verbs — a 500 answers the way the real
 /// forwarder answers a bind it cannot make.
-async fn fake_forwarder(
+pub(crate) async fn fake_forwarder(
     sock: std::path::PathBuf,
     status: u16,
 ) -> (

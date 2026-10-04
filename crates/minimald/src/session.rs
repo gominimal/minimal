@@ -50,6 +50,13 @@ pub enum AttachError {
     /// Configuring the loadout of an as-yet-unconfigured session, on the way
     /// into the attach, failed.
     LoadoutFailed(std::io::Error),
+    /// Recording the launch's egress-enforcement outcome on the session
+    /// record (NET-079) failed: the box the launch minted was killed and
+    /// the attach failed, because a host-address box whose record says
+    /// nothing about it must not run as though it had an outcome — the
+    /// reads would answer the host's state for a box that did launch,
+    /// which is exactly what a record exists to outrank.
+    LaunchRecordUnwritable(std::io::Error),
     /// The session isn't attachable yet. Either its composition is
     /// still awaiting the client's contribution verdict
     /// (`SubmitVerdict` hasn't landed), or its composition
@@ -67,6 +74,7 @@ impl std::error::Error for AttachError {
         match self {
             AttachError::InvalidPolicy(e) => Some(e),
             AttachError::LoadoutFailed(e) => Some(e),
+            AttachError::LaunchRecordUnwritable(e) => Some(e),
             _ => None,
         }
     }
@@ -82,6 +90,11 @@ impl fmt::Display for AttachError {
             AttachError::SpawnFailed(e) => write!(f, "session spawn: {e}"),
             AttachError::InvalidPolicy(e) => write!(f, "invalid session policy: {e}"),
             AttachError::LoadoutFailed(e) => write!(f, "configuring session loadout: {e}"),
+            AttachError::LaunchRecordUnwritable(e) => write!(
+                f,
+                "recording the launch's egress enforcement on the session \
+                 record: {e}"
+            ),
             AttachError::SessionPending => write!(
                 f,
                 "session isn't attachable yet (still awaiting either \
@@ -196,6 +209,12 @@ pub(crate) fn effective_session_policy(
     sessions::SessionPolicy {
         egress: effective_egress_section(policy, network, phase, opt_out),
         ingress: policy.ingress.clone(),
+        // The credentialed-upstream declaration (NET-134) resolves nothing —
+        // the lane it opens is decided host-side, by the row the client's
+        // registration fills — so it is carried verbatim, like the ingress:
+        // the effective policy a box's gate reads keeps the lane the box
+        // declared beside it.
+        credentialed_upstream: policy.credentialed_upstream.clone(),
     }
 }
 
@@ -495,11 +514,68 @@ enum SessionMessage {
     /// (NET-044) — what the `GetLiveIngress` RPC serves. Empty for a box that
     /// published none.
     LiveIngress(oneshot::Sender<Vec<minimald_rpc::LiveMapping>>),
+    /// The attached human's answer to a runtime port-publish ask routed to
+    /// them (NET-045), sent by the task [`Session::route_ask`] spawned —
+    /// never by the actor itself, which must not park on a human. `None`
+    /// means nobody was attached to answer, which is the ask's own
+    /// fail-closed case rather than an error to report.
+    ///
+    /// Carries the ask's [`AskId`], not just its port: two asks can share a
+    /// port, and an answer that arrived keyed only by that would pop whichever
+    /// ask on it parked first — a late fail-closed answer would refuse the
+    /// wrong asker while its dialog was still on screen.
+    AskAnswered {
+        id: AskId,
+        port: u16,
+        answer: Option<session_host::AskAnswer>,
+    },
     /// Test-only inspection: an `Arc` clone of the held [`Composition`]
     /// (`None` in `Draft`, or `Active` without one post-restart). Lets tests
     /// assert composition contents without disturbing the lifecycle.
     #[cfg(test)]
     PeekComposition(oneshot::Sender<Option<Arc<Composition>>>),
+    /// Test-only inspection: the ids of the runtime port-publish asks still
+    /// parked on a human (NET-045), in route order, paired with their ports.
+    /// Lets tests name the asks they answer out of band — the interleaving a
+    /// racy hand-off failure can produce in production, reconstructed
+    /// deterministically here — without disturbing the lifecycle.
+    #[cfg(test)]
+    PeekPendingAsks(oneshot::Sender<Vec<(AskId, u16)>>),
+}
+
+/// The key an ask parks under (NET-045): minted per request the session
+/// routes, never derived from the port — two concurrent requests can share a
+/// port. The ask's continuation ([`SessionMessage::AskAnswered`]) carries it
+/// back, so an answer reaches the ask it answers even when another ask on the
+/// same port is parked ahead of it, and a late fail-closed answer for an ask
+/// that already ended does not pop its neighbour instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AskId(u64);
+
+/// One runtime port-publish request this box decided `ask`, parked until the
+/// attached human answers the dialog it was routed to (NET-045).
+///
+/// The caller's reply travels with it because the actor never answers the
+/// request itself: it answers from [`Session::resume_ask`] once the human
+/// has, or fail-closed from [`Session::stop_running`] when the session is
+/// going away and nobody can. Keyed by [`AskId`] — the id the continuation
+/// message carries back — so two asks for the same port each reach their own
+/// asker however their answers arrive.
+#[derive(Debug)]
+struct PendingAsk {
+    /// The ask's key: the id its continuation carries back.
+    id: AskId,
+    /// The port the box asked to publish.
+    port: u16,
+    /// The box's record as it stood when the ask was routed: the publish an
+    /// allow ends up running needs the address pair the box's registration
+    /// handed it, and it is the same record the decision was made against.
+    record: Record,
+    /// The box's name, resolved once at route time so the log line and the
+    /// audit record (NET-046) name the same box the human's dialog named.
+    box_name: String,
+    /// The caller's reply, answered by whichever way the ask ended.
+    reply: oneshot::Sender<Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>>,
 }
 
 /// Manages one session, from the moment its record is allocated: the create
@@ -552,6 +628,17 @@ pub struct Session {
     /// [`crate::net::provider::OwnAddressReporter`]). A box that published
     /// none — and one that is not running — holds an empty list.
     live_ingress: crate::net::provider::RuntimeIngress,
+
+    /// The runtime port-publish requests this box decided `ask`, parked until
+    /// the attached human answers them (NET-045). Empty for a box with
+    /// nothing waiting on a human; drained fail-closed by
+    /// [`Session::stop_running`].
+    pending_asks: Vec<PendingAsk>,
+
+    /// The counter behind [`AskId`]: the actor mints one id per ask it parks,
+    /// so ids are unique within the session and monotonic in route order —
+    /// and carry no meaning beyond that.
+    next_ask_id: u64,
 
     /// The root of this session's operation tree - tracks long-running
     /// operations for display.
@@ -678,6 +765,11 @@ impl Session {
             // The same for the ports the box publishes at runtime: nothing is
             // live until a `min net expose` inside it lands (NET-044).
             live_ingress: Default::default(),
+            // And for the asks routed to a human: nothing waits until a
+            // request decided `ask` lands (NET-045), and the first of those
+            // takes the first id.
+            pending_asks: Vec::new(),
+            next_ask_id: 0,
             #[cfg(target_os = "linux")]
             hostnames,
             #[cfg(target_os = "linux")]
@@ -1576,11 +1668,10 @@ impl Session {
                 let _ = r.send(self.composition());
             }
             SessionMessage::ExposeDynamic { port, reply } => {
-                #[expect(
-                    clippy::let_underscore_must_use,
-                    reason = "the asker may already be gone; there is nothing to answer then"
-                )]
-                let _ = reply.send(self.expose_dynamic(port).await);
+                // Answers the reply itself, or parks it with the ask it
+                // routed to the attached human (NET-045) — either way this
+                // handler is done with it.
+                self.expose_dynamic(port, reply).await;
             }
             SessionMessage::LiveIngress(r) => {
                 #[expect(
@@ -1588,6 +1679,9 @@ impl Session {
                     reason = "the asker may already be gone; there is nothing to answer then"
                 )]
                 let _ = r.send(self.live_ingress_snapshot());
+            }
+            SessionMessage::AskAnswered { id, port, answer } => {
+                self.resume_ask(id, port, answer).await;
             }
             SessionMessage::GetRecord(r) => {
                 let _ = r.send(self.record.record().await.unwrap());
@@ -1608,6 +1702,19 @@ impl Session {
                     SessionInner::Active { composition, .. } => composition.clone(),
                     SessionInner::Draft { .. } => None,
                 });
+            }
+            #[cfg(test)]
+            SessionMessage::PeekPendingAsks(r) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
+                let _ = r.send(
+                    self.pending_asks
+                        .iter()
+                        .map(|ask| (ask.id, ask.port))
+                        .collect(),
+                );
             }
         }
         ControlFlow::Continue(())
@@ -2145,17 +2252,37 @@ impl Session {
     /// bound on the switch and recorded as a live mapping (NET-044), which is
     /// what `min session policy` lists beside the declaration.
     ///
-    /// One info line per request, naming the box, the port, the decision its
-    /// `dynamic_ingress` setting made, and the outcome, so a diagnostics
-    /// bundle's daemon log tail carries every expose request with what became
-    /// of it.
+    /// Takes the caller's reply by value because it does not always answer it:
+    /// a request the box decided `ask` is routed to the attached human
+    /// (NET-045) and parked — with the reply — until they have answered, and
+    /// the actor must not park with it, or every probe, read, and shutdown
+    /// behind this one would wait on a human. The parked request comes back
+    /// through [`SessionMessage::AskAnswered`]. Everything else is finished
+    /// here, through [`Self::answer_expose`], which writes the one info line
+    /// every request logs and the decision's own audit record (NET-046)
+    /// beside it.
     async fn expose_dynamic(
         &mut self,
         port: u16,
-    ) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
+        reply: oneshot::Sender<
+            Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
+        >,
+    ) {
+        use crate::net::policy::ExposeFailure;
+
         let record = match self.record.record().await {
             Ok(record) => record,
-            Err(e) => return Err(crate::net::policy::ExposeFailure::Publish { port, source: e }),
+            // The request could not be read back to be decided, so no
+            // decision was made and there is nothing to log or audit
+            // (NET-046): the typed failure is the whole answer.
+            Err(e) => {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
+                let _ = reply.send(Err(ExposeFailure::Publish { port, source: e }));
+                return;
+            }
         };
         let box_name = record.name.clone().unwrap_or_else(|| record.id.to_string());
         // The setting the request is evaluated against (NET-043), spelled the
@@ -2167,58 +2294,271 @@ impl Session {
             .as_ref()
             .and_then(|ingress| ingress.dynamic_ingress)
             .unwrap_or(sessions::DynamicIngress::Deny);
-        let outcome = self.publish_exposed_port(&record, port).await;
-        match &outcome {
-            Ok(mapping) => tracing::info!(
-                name = %box_name,
-                port,
-                decision = %decision,
-                outcome = "published",
-                local = %mapping.local,
-                "dynamic ingress expose"
-            ),
-            Err(crate::net::policy::ExposeFailure::Refused(refusal)) => tracing::info!(
-                name = %box_name,
-                port,
-                decision = %decision,
-                outcome = "refused",
-                reason = %refusal,
-                "dynamic ingress expose"
-            ),
-            Err(crate::net::policy::ExposeFailure::Publish { source, .. }) => tracing::info!(
-                name = %box_name,
-                port,
-                decision = %decision,
-                outcome = "publish failed",
-                reason = %source,
-                "dynamic ingress expose"
-            ),
+        // The box's own setting decides first (NET-043), whatever asked: the
+        // deny-all default when nothing was declared, the range gate under an
+        // `allow`, and an `ask` handed to whoever is attached (NET-045).
+        match crate::net::policy::dynamic_ingress_decision(record.policy.ingress.as_ref(), port) {
+            Err(crate::net::policy::ExposeRefusal::AskNeedsAnswer) => {
+                self.route_ask(record, box_name, port, reply).await;
+            }
+            decided => {
+                // The only decision that passes the gate is the box's own
+                // `allow`, so an `Ok` here is one; every other refusal was
+                // made with the switch asked nothing (NET-047).
+                let outcome = match decided {
+                    Ok(_) => self.publish_exposed_port(&record, port).await,
+                    Err(refusal) => Err(ExposeFailure::Refused(refusal)),
+                };
+                self.answer_expose(
+                    &box_name,
+                    port,
+                    decision,
+                    crate::audit::DecidedBy::BoxPolicy,
+                    outcome,
+                    reply,
+                )
+                .await;
+            }
         }
-        outcome
     }
 
-    /// The publish half of [`Session::expose_dynamic`], run once the request's
-    /// decision is known for the log. Everything the box can refuse without
-    /// asking the switch runs first — the policy decision (NET-043), the
-    /// live-duplicate check, and the address pair the publish needs — so a
-    /// refused request is refused with nothing bound and nothing asked
-    /// (NET-047). Only then is the switch asked to bind, and the forwarder is
-    /// recorded only once it accepted.
+    /// Routes a runtime port-publish request the box decided `ask` to whoever
+    /// is attached (NET-045): the host's binding renders the exit prompt's own
+    /// dialog, and the human's answer decides the request.
+    ///
+    /// The ask itself runs off the actor, on a spawned task: the human's
+    /// answer is the only bound it has, and parking the actor on it would
+    /// hang `min session policy` reads, manager probes, and a daemon shutdown
+    /// behind a dialog nobody may be looking at. It comes back as
+    /// [`SessionMessage::AskAnswered`], which answers the parked reply.
+    ///
+    /// Nobody attached is not an error to route — it is the ask's own
+    /// fail-closed answer, decided by the daemon, and it goes through the
+    /// same continuation ([`Self::resume_ask`]) so every ask ends on the one
+    /// path that writes the log line and the audit record (NET-046).
+    async fn route_ask(
+        &mut self,
+        record: Record,
+        box_name: String,
+        port: u16,
+        reply: oneshot::Sender<
+            Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
+        >,
+    ) {
+        // The dialog needs a host with somebody attached to render it. No
+        // host running means the same thing as nobody attached — there is no
+        // human to ask — so it is answered fail-closed right here rather than
+        // routed to a continuation that would only come back with the same
+        // answer.
+        let host = match &self.inner {
+            SessionInner::Active {
+                host: Some((host, _)),
+                ..
+            } => host.clone(),
+            _ => {
+                self.answer_expose(
+                    &box_name,
+                    port,
+                    sessions::DynamicIngress::Ask,
+                    crate::audit::DecidedBy::Daemon,
+                    Err(crate::net::policy::ExposeFailure::Refused(
+                        crate::net::policy::ExposeRefusal::AskNeedsAnswer,
+                    )),
+                    reply,
+                )
+                .await;
+                return;
+            }
+        };
+        // Minted before the park, not derived from the port: two asks can
+        // share a port, and the continuation below keys on this so each
+        // answer reaches the ask it answers however their answers arrive.
+        let id = AskId(self.next_ask_id);
+        self.next_ask_id += 1;
+        self.pending_asks.push(PendingAsk {
+            id,
+            port,
+            record,
+            box_name,
+            reply,
+        });
+        let weak = self.weak_self.clone();
+        tokio::spawn(async move {
+            let answer = host.ask_expose(port).await;
+            // A session that already went away has already answered its
+            // pending asks fail-closed (`stop_running`), so a handle that
+            // will not promote is the normal end of a late answer.
+            if let Some(handle) = weak.upgrade() {
+                handle.ask_answered(id, port, answer).await;
+            }
+        });
+    }
+
+    /// Continues a parked runtime port-publish ask (NET-045) with the attached
+    /// human's answer — or its absence, which is the ask's own fail-closed
+    /// refusal. The ask is found by its [`AskId`], not its port: two asks can
+    /// share a port, and the answer is whatever the task the *ask* routed
+    /// came back with. The pending request's reply is answered here and its
+    /// decision audited (NET-046), whichever way it went: an allow runs the
+    /// publish half against the record the ask was routed with, a deny is the
+    /// box's own deny answer in the human's hand, and nobody attached is the
+    /// typed nobody-is-attached refusal the request ends with.
+    async fn resume_ask(&mut self, id: AskId, port: u16, answer: Option<session_host::AskAnswer>) {
+        let Some(position) = self.pending_asks.iter().position(|ask| ask.id == id) else {
+            // The ask already ended another way — the session answered it
+            // fail-closed on its way down — or the asker went away. Nothing
+            // is waiting on this answer, and no decision changes: said at
+            // info like the answer it failed to be, because an answer the
+            // audit cannot account for is the line that explains the port
+            // that did not publish.
+            tracing::info!(
+                id = id.0,
+                port,
+                "a runtime port-publish answer arrived with no ask waiting for it"
+            );
+            return;
+        };
+        let ask = self.pending_asks.remove(position);
+        let outcome = match answer {
+            // The human said allow: run the publish half. Everything that can
+            // still refuse it runs there — a duplicate publish, a missing
+            // address pair, a switch that would not bind — so even an
+            // allowed ask can end refused, with the switch asked only now
+            // (NET-047).
+            Some(session_host::AskAnswer::Allowed) => {
+                self.publish_exposed_port(&ask.record, ask.port).await
+            }
+            // The human said deny — or keyed a cancel (Ctrl-C, `q`, Escape),
+            // which means the same thing: the box's own deny answer, now in
+            // the human's hand. An input EOF is not this — a client that
+            // went away did not answer — so it lands on the `None` below.
+            Some(session_host::AskAnswer::Refused) => {
+                Err(crate::net::policy::ExposeFailure::Refused(
+                    crate::net::policy::ExposeRefusal::DeniedByPolicy,
+                ))
+            }
+            // Nobody was attached to answer (NET-045's unwanted branch) — no
+            // binding to render the dialog, or one that ended mid-dialog
+            // without the human choosing, its reply sender dropped unsent: a
+            // shed, a teardown, the host going away, an input EOF (the
+            // client's channel going away with the dialog standing). The
+            // typed refusal, decided by the daemon, because there was no
+            // human deciding.
+            None => Err(crate::net::policy::ExposeFailure::Refused(
+                crate::net::policy::ExposeRefusal::AskNeedsAnswer,
+            )),
+        };
+        let decided_by = match answer {
+            Some(_) => crate::audit::DecidedBy::AttachedHuman,
+            None => crate::audit::DecidedBy::Daemon,
+        };
+        self.answer_expose(
+            &ask.box_name,
+            ask.port,
+            sessions::DynamicIngress::Ask,
+            decided_by,
+            outcome,
+            ask.reply,
+        )
+        .await;
+    }
+
+    /// Finishes one runtime port-publish request (or one parked ask now
+    /// answered): one info line naming the box, the port, the decision the
+    /// box's `dynamic_ingress` setting made, who actually decided it, and the
+    /// outcome — the line a diagnostics bundle's daemon log tail carries every
+    /// request with — and the decision's own audit record (NET-046) written
+    /// beside it, then the caller's answer.
+    async fn answer_expose(
+        &mut self,
+        box_name: &str,
+        port: u16,
+        decision: sessions::DynamicIngress,
+        decided_by: crate::audit::DecidedBy,
+        outcome: Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
+        reply: oneshot::Sender<
+            Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure>,
+        >,
+    ) {
+        let (audited, reason) = match &outcome {
+            Ok(mapping) => {
+                tracing::info!(
+                    name = %box_name,
+                    port,
+                    decision = %decision,
+                    decided_by = %decided_by,
+                    outcome = "published",
+                    local = %mapping.local,
+                    "dynamic ingress expose"
+                );
+                (crate::audit::DecisionOutcome::Published, None)
+            }
+            Err(crate::net::policy::ExposeFailure::Refused(refusal)) => {
+                tracing::info!(
+                    name = %box_name,
+                    port,
+                    decision = %decision,
+                    decided_by = %decided_by,
+                    outcome = "refused",
+                    reason = %refusal,
+                    "dynamic ingress expose"
+                );
+                (
+                    crate::audit::DecisionOutcome::Refused,
+                    Some(refusal.to_string()),
+                )
+            }
+            Err(crate::net::policy::ExposeFailure::Publish { source, .. }) => {
+                tracing::info!(
+                    name = %box_name,
+                    port,
+                    decision = %decision,
+                    decided_by = %decided_by,
+                    outcome = "publish failed",
+                    reason = %source,
+                    "dynamic ingress expose"
+                );
+                (
+                    crate::audit::DecisionOutcome::PublishFailed,
+                    Some(source.to_string()),
+                )
+            }
+        };
+        crate::audit::append(
+            self.minimal_state_dir.as_utf8_path().as_std_path(),
+            &crate::audit::DecisionRecord {
+                ts: chrono::Utc::now().to_rfc3339(),
+                box_name: box_name.to_string(),
+                port,
+                decision,
+                decided_by,
+                outcome: audited,
+                reason,
+            },
+        )
+        .await;
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the asker may already be gone; there is nothing to answer then"
+        )]
+        let _ = reply.send(outcome);
+    }
+
+    /// The publish half of a runtime port-publish request (NET-043): the
+    /// duplicate check, the address pair the publish needs, and the switch
+    /// bind, run once the request is decided — by the box's own `allow` in
+    /// [`Session::expose_dynamic`], or by the attached human's answer to an
+    /// `ask` in [`Session::resume_ask`]. Everything the box can refuse
+    /// without asking the switch runs first, so a refused request is refused
+    /// with nothing bound and nothing asked (NET-047). Only then is the
+    /// switch asked to bind, and the forwarder is recorded only once it
+    /// accepted.
     async fn publish_exposed_port(
         &mut self,
         record: &Record,
         port: u16,
     ) -> Result<minimald_rpc::LiveMapping, crate::net::policy::ExposeFailure> {
-        use crate::net::policy::{
-            ExposeFailure, ExposeRefusal, dynamic_ingress_decision, expose_dynamic,
-        };
-
-        // The box's own setting decides first (NET-043), whatever asked: the
-        // deny-all default when nothing was declared, and `ask` failing
-        // closed with nobody attached to answer (NET-045's prompt is the
-        // sibling path).
-        dynamic_ingress_decision(record.policy.ingress.as_ref(), port)
-            .map_err(ExposeFailure::Refused)?;
+        use crate::net::policy::{ExposeFailure, ExposeRefusal, expose_dynamic};
 
         // The port is published already, live, by this box: a second request
         // for it would double-bind the same address, so it is refused as the
@@ -2351,6 +2691,26 @@ impl Session {
         if !forwarders.is_empty() {
             let control = self.switch_control().await;
             crate::net::policy::remove_ingress(&control, &forwarders).await;
+        }
+
+        // Runtime port-publish asks still waiting on a human (NET-045) fail
+        // closed with the typed nobody-is-attached refusal: a session that is
+        // going away has no attached human to answer them, and no caller can
+        // be left parked on a reply that will never come. The decision is
+        // audited like every other (NET-046) — and a late answer from the
+        // task the ask routed through finds no ask left to answer.
+        for ask in std::mem::take(&mut self.pending_asks) {
+            self.answer_expose(
+                &ask.box_name,
+                ask.port,
+                sessions::DynamicIngress::Ask,
+                crate::audit::DecidedBy::Daemon,
+                Err(crate::net::policy::ExposeFailure::Refused(
+                    crate::net::policy::ExposeRefusal::AskNeedsAnswer,
+                )),
+                ask.reply,
+            )
+            .await;
         }
 
         let inner = match &mut self.inner {
@@ -2769,7 +3129,70 @@ impl Session {
             }
             None => (None, spawn.await),
         };
-        Ok((channel, spawned.map_err(AttachError::SpawnFailed)?))
+        let (host, task, host_ip_enforcement) = spawned.map_err(AttachError::SpawnFailed)?;
+        // NET-079: the launch that just ran records its own outcome for
+        // this session's box on the box's record here — the one path every
+        // launch takes, so an attach, an exec, an activation and a hook run
+        // all record the placement they each made. A launch that cannot
+        // record its outcome does not hand its box back: the reads would
+        // answer the host's state for a box that did launch, which is what
+        // a record exists to outrank, so the box is killed here and the
+        // attach fails — and a record with no outcome keeps meaning "never
+        // launched", the state a created session's reads answer.
+        if let Err(e) = self.record_launch_outcome(host_ip_enforcement).await {
+            let _ = host.kill(false).await;
+            return Err(AttachError::LaunchRecordUnwritable(e));
+        }
+        Ok((channel, (host, task)))
+    }
+
+    /// Records the launch's own placement outcome on this session's record
+    /// (NET-079): `per_box` when the launch placed this session's
+    /// host-address box in a classifier leaf of the host's tree, `none` when
+    /// it did not. The box's record of its own launch, in the daemon-owned
+    /// field the read surfaces show, rather than the host's state as it
+    /// stands now — so a box launched unenforced stays `none` for its life,
+    /// whatever a later launch of another box decided.
+    ///
+    /// The write is not best-effort: the box is running by the time this
+    /// runs, but a box whose outcome cannot be recorded must not run as
+    /// though it had one, so the caller kills the box this launch minted
+    /// and fails the launch on `Err`. That is what keeps a record with no
+    /// outcome meaning "never launched", which is the state the reads'
+    /// fall-back answers for a created session
+    /// (`displayed_host_ip_enforcement`).
+    async fn record_launch_outcome(
+        &self,
+        host_ip_enforcement: Option<minimald_rpc::HostIpEnforcement>,
+    ) -> Result<(), std::io::Error> {
+        let Some(enforcement) = host_ip_enforcement else {
+            // Not a host-address box: its verdict is decided on address
+            // leases, never on the host's cgroup tree, so there is no
+            // per-box outcome to record and nothing to lower it by.
+            return Ok(());
+        };
+        let mut record = self.record.record().await?;
+        record.host_ip_enforcement = Some(enforcement);
+        #[cfg(test)]
+        if launch_record_seam::write_fails(self.record.id()) {
+            return Err(std::io::Error::other(
+                "the test seam failed this session's launch-record write",
+            ));
+        }
+        self.record.write(record).await?;
+        // NET-079's observability: one info line per host-address box launch,
+        // carrying what this launch recorded in the machine spelling every
+        // surface and log line share — so the bundle's tail says each box's
+        // own outcome beside the launch lines that decided it. Said after
+        // the write it describes, so the line's presence says the record
+        // carries the outcome it names.
+        tracing::info!(
+            session_id = %self.record.id(),
+            host_ip_enforcement = %enforcement.machine_str(),
+            "the launch recorded its host-address box's egress \
+             enforcement on the session record",
+        );
+        Ok(())
     }
 
     /// Produces this session's arm result for [`WorkspaceBaseline`]: the
@@ -3227,7 +3650,39 @@ impl Session {
         record
             .validate_policy()
             .map_err(AttachError::InvalidPolicy)?;
-        Ok(session_host::MockLauncher::default())
+        // Mirror the production classifier half too, as the placement's
+        // outcome alone: a mock launch records what its own placement would
+        // — `per_box` when the fact's cause says this host has the step's
+        // tree to place a leaf in (the same inference the reads make over a
+        // launch that cannot tell them, `fact_places_a_leaf`), `none` when
+        // it does not — over the fact a test's injected reading sets, so
+        // the launches a test drives record each box's own outcome over the
+        // same fact the real launcher's per-launch read produces. The mock
+        // has no sandbox, so it models the placement's outcome, not the
+        // placement: which box a leaf goes to, and the mapping from a
+        // placement to the state it leaves the box in, are the production
+        // launcher's, pinned in session_host's launch proofs. A session
+        // that is not host-address keeps the plain mock — its verdict is
+        // decided on address leases, never on the host's cgroup tree, so
+        // there is no per-box outcome for its launches to record.
+        if record.network == sessions::NetworkMode::HostNet {
+            let fact = crate::session_host::host_ip_enforcement_fact();
+            let placement = if crate::session_host::fact_places_a_leaf(fact.cause) {
+                minimald_rpc::HostIpEnforcement::PerBox
+            } else {
+                minimald_rpc::HostIpEnforcement::None
+            };
+            let launcher = session_host::MockLauncher::with_host_ip_enforcement(placement);
+            // A session whose launch-record write a test fails also carries
+            // the guard that test watches, so the box's teardown is
+            // observable after the launch kills it.
+            Ok(match launch_record_seam::teardown_guard(record.id) {
+                Some(guard) => launcher.and_net_guard(guard),
+                None => launcher,
+            })
+        } else {
+            Ok(session_host::MockLauncher::default())
+        }
     }
 
     /// Return this session's workspace-rooted [`mctx::Context`].
@@ -3635,6 +4090,48 @@ impl SessionHandle {
         }
     }
 
+    /// Continues a parked runtime port-publish ask (NET-045) with the attached
+    /// human's answer, or its absence — sent by the task
+    /// [`Session::route_ask`] spawned, never by the actor itself. Keyed by the
+    /// ask's [`AskId`] so the answer reaches the ask it answers. Best-effort
+    /// by shape: a session that has already stopped has answered its asks
+    /// fail-closed, so a message that does not land is the normal end of a
+    /// late answer, not a loss.
+    pub(crate) async fn ask_answered(
+        &self,
+        id: AskId,
+        port: u16,
+        answer: Option<session_host::AskAnswer>,
+    ) {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the session may already be gone; its asks were answered fail-closed then"
+        )]
+        let _ = self
+            .0
+            .send(SessionMessage::AskAnswered { id, port, answer })
+            .await;
+    }
+
+    /// Test-only: the ids of the runtime port-publish asks still parked on a
+    /// human (NET-045), in route order, paired with their ports. Lets a test
+    /// answer a specific ask through [`Self::ask_answered`] — the same path
+    /// the routed task's answer takes — without guessing which park it
+    /// reached.
+    #[cfg(test)]
+    pub(crate) async fn pending_ask_ids(&self) -> Vec<(AskId, u16)> {
+        let (send, recv) = oneshot::channel();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "the actor may already be gone; an empty peek is the honest answer then"
+        )]
+        let _ = self.0.send(SessionMessage::PeekPendingAsks(send)).await;
+        // A dead actor has no asks parked, and `Vec`'s default says exactly
+        // that — which is also the truth about a session that stopped, since
+        // `stop_running` answered them all fail-closed first.
+        recv.await.unwrap_or_default()
+    }
+
     /// The live dynamic-ingress mappings this box published at runtime
     /// (NET-044) — the rows `min session policy` lists. Empty for a box that
     /// published none. A dead actor maps to `NotConnected`.
@@ -3942,5 +4439,64 @@ fn promote_interim_to_hand(
     }
 }
 
+/// The test seam for a launch whose outcome cannot be recorded (NET-079):
+/// a test names a session whose launch-record write fails, and gets back
+/// the flag the session's box's network teardown sets — the observable
+/// that the launch killed the box it could not record. Keyed by session
+/// id, so tests running beside each other in one process never fail each
+/// other's writes.
 #[cfg(test)]
-mod tests;
+pub(crate) mod launch_record_seam {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use sessions::SessionId;
+
+    static FAILING: Mutex<Option<HashMap<SessionId, Arc<AtomicBool>>>> = Mutex::new(None);
+
+    /// Makes every launch-record write for `id` fail, and returns the flag
+    /// its box's network teardown sets.
+    pub(crate) fn fail_writes_for(id: SessionId) -> Arc<AtomicBool> {
+        let torn_down = Arc::new(AtomicBool::new(false));
+        FAILING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, Arc::clone(&torn_down));
+        torn_down
+    }
+
+    pub(super) fn write_fails(id: &SessionId) -> bool {
+        FAILING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|failing| failing.contains_key(id))
+    }
+
+    pub(super) fn teardown_guard(id: SessionId) -> Option<Box<dyn sandbox2::NetGuard>> {
+        let failing = FAILING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let torn_down = Arc::clone(failing.as_ref()?.get(&id)?);
+        Some(Box::new(TeardownFlag(torn_down)))
+    }
+
+    struct TeardownFlag(Arc<AtomicBool>);
+
+    impl sandbox2::NetGuard for TeardownFlag {
+        fn teardown(
+            self: Box<Self>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            self.0.store(true, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+    }
+}
+
+/// `pub(crate)` so the session-host tests — which host the runtime
+/// port-publish ask tests (NET-045) and drive them through the session
+/// actor's own flow — can reuse this module's fixtures.
+#[cfg(test)]
+pub(crate) mod tests;

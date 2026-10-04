@@ -30,6 +30,13 @@ use tokio_vsock::{VMADDR_CID_HOST, VsockAddr, VsockStream};
 /// booted. The host listens here for the one-shot `READY` marker.
 const BOOT_MARKER_PORT: u32 = 7350;
 
+/// The VM-wide PTY pool the guest init raises `kernel.pty.max` to. Each box's
+/// devpts is capped at [`sandbox2::config::BOX_PTY_MAX`] by its own remount,
+/// but every instance still draws from the one kernel-wide counter, so the
+/// pool must be large enough for several boxes at their cap plus the session
+/// host's own shells. 65536 is a working value.
+const GUEST_PTY_MAX: u32 = 65536;
+
 // ── The node port the boot line hands the daemon ────────────────────────
 
 /// Boot token the VM host puts on the kernel command line to hand the guest
@@ -346,6 +353,20 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
         if let Err(e) = std::os::unix::fs::symlink("pts/ptmx", &ptmx) {
             tracing::warn!(error = %e, "linking /dev/ptmx -> pts/ptmx; interactive PTY sessions may fail");
         }
+    }
+
+    // Raise the VM-wide PTY pool so several boxes at their per-instance cap
+    // still fit. Each box's devpts is remounted with `max=<BOX_PTY_MAX>` in
+    // its pre-exec step, but the guest's own devpts (mounted above) and every
+    // box draw from the one kernel-wide counter bounded by `kernel.pty.max`
+    // minus `kernel.pty.reserve`; the kernel default (4096) leaves room for
+    // only a few boxes at their cap. Best-effort: a guest that cannot raise
+    // it still boots, just with the smaller shared pool.
+    if let Err(e) = std::fs::write(
+        format!("{NEWROOT}/proc/sys/kernel/pty/max"),
+        format!("{GUEST_PTY_MAX}\n"),
+    ) {
+        tracing::warn!(error = %e, "raising kernel.pty.max; several boxes at their PTY cap may exhaust the shared pool");
     }
 
     // NET-079: cgroup2, mounted with `nsdelegate` so the cgroup namespace a
@@ -873,10 +894,12 @@ const FITRIM: u32 =
 /// journal commits, so trimming straight after a sweep otherwise reports far
 /// less than the sweep released.
 ///
-/// Safe to run on a live filesystem — `FITRIM` is the online-discard ioctl —
-/// but it takes ext4's block-group locks as it walks, so callers schedule it
-/// against idle time rather than contending with a build. The daemon's caller
-/// is the `maintenance` actor, which runs it behind the cache clean.
+/// Safe to run on a live filesystem — `FITRIM` is the online-discard ioctl.
+/// It takes ext4's block-group locks as it walks, but ext4 skips every group
+/// it has already trimmed and freed nothing in since, so a trim with nothing
+/// new to discard is cheap even alongside a build. The daemon's caller is the
+/// `maintenance` actor, which runs it behind every cache clean and also alone
+/// every `TRIM_INTERVAL`, whatever the guest is doing.
 ///
 /// Blocking, and unbounded: the walk is proportional to the filesystem, not to
 /// what the clean freed. Callers on an async runtime owe it a blocking thread.
