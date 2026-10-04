@@ -1244,7 +1244,8 @@ fn upsert_toml_packages_list<T: TableLike>(
         // For multi-line arrays, copy the last element's prefix decor so pushed
         // elements land on their own line with matching indentation.
         let last_prefix = arr
-            .get(arr.len().saturating_sub(1))
+            .iter()
+            .last()
             .and_then(|v| v.decor().prefix())
             .and_then(|p| p.as_str())
             .and_then(|s| s.rfind('\n').map(|i| s[i..].to_owned()));
@@ -1254,7 +1255,12 @@ fn upsert_toml_packages_list<T: TableLike>(
             if !existing.iter().any(|e| e == p) {
                 let mut value = Value::from(p.as_str());
                 if let Some(prefix) = &last_prefix {
-                    value.decor_mut().set_prefix(prefix.as_str());
+                    let carried = if did_edit {
+                        String::new()
+                    } else {
+                        detach_array_close(arr)
+                    };
+                    value.decor_mut().set_prefix(carried + prefix);
                 }
                 arr.push(value);
                 existing.push(p.clone());
@@ -1266,6 +1272,40 @@ fn upsert_toml_packages_list<T: TableLike>(
         t.insert(key, Item::Value(Value::Array(Array::from_iter(upsert))));
         Ok(true)
     }
+}
+
+/// Prepares a multi-line array for appending after its last element.
+///
+/// Whatever follows the last element up to its final line break, such as a
+/// same-line comment, is cut out and returned so the caller can put it ahead of
+/// the appended element and keep it on the old last element's line. The final
+/// line break and anything after it become the array's trailing text, so the
+/// appended element closes the array the same way the old last element did.
+/// Without a trailing comma that text sits in the last element's suffix,
+/// otherwise in the array's trailing.
+fn detach_array_close(arr: &mut Array) -> String {
+    let trailing = arr.trailing().as_str().unwrap_or_default().to_owned();
+    let suffix = arr
+        .iter()
+        .last()
+        .and_then(|v| v.decor().suffix())
+        .and_then(|s| s.as_str())
+        .filter(|s| s.contains('\n'))
+        .map(str::to_owned);
+    let (tail, rest) = match suffix {
+        Some(suffix) => {
+            if let Some(last) = arr.iter_mut().last() {
+                last.decor_mut().set_suffix("");
+            }
+            (suffix, trailing)
+        }
+        None => (trailing, String::new()),
+    };
+    let Some(i) = tail.rfind('\n') else {
+        return String::new();
+    };
+    arr.set_trailing(format!("{}{rest}", &tail[i..]));
+    tail[..i].trim_end().to_owned()
 }
 
 #[cfg(test)]
@@ -1667,6 +1707,78 @@ mod tests {
                   "vim",
                   "git",
                   "python",
+                ]
+            "#}
+        );
+    }
+
+    #[test]
+    fn upsert_packages_keeps_last_element_comment_in_place() {
+        let mut doc = indoc! {r#"
+            packages = [
+              "base",
+              "git", # pinned
+            ]
+        "#}
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        assert!(
+            upsert_toml_packages_list(
+                doc.as_table_mut(),
+                "packages",
+                &["python".to_string(), "vim".to_string()]
+            )
+            .unwrap()
+        );
+
+        assert_eq!(
+            doc.to_string(),
+            indoc! {r#"
+                packages = [
+                  "base",
+                  "git", # pinned
+                  "python",
+                  "vim",
+                ]
+            "#}
+        );
+    }
+
+    #[test]
+    fn upsert_packages_without_trailing_comma() {
+        let mut doc = indoc! {r#"
+            packages = [
+              "base",
+              "git"
+            ]
+            tools = [
+              "base",
+              "git" # pinned
+            ]
+        "#}
+        .parse::<DocumentMut>()
+        .unwrap();
+
+        for key in ["packages", "tools"] {
+            assert!(
+                upsert_toml_packages_list(doc.as_table_mut(), key, &["python".to_string()])
+                    .unwrap()
+            );
+        }
+
+        assert_eq!(
+            doc.to_string(),
+            indoc! {r#"
+                packages = [
+                  "base",
+                  "git",
+                  "python"
+                ]
+                tools = [
+                  "base",
+                  "git", # pinned
+                  "python"
                 ]
             "#}
         );
