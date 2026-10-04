@@ -366,12 +366,62 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(
-            err.to_string().contains("connect to"),
+            err.to_string().contains(&sock_path),
             "the error must name the socket path: {err}"
         );
         assert!(
             elapsed < std::time::Duration::from_secs(1),
             "a missing socket must not be retried ({elapsed:?})"
         );
+    }
+
+    /// A would-block connect is retried: on Linux a full accept backlog makes
+    /// the non-blocking connect fail with `EAGAIN` (`WouldBlock`), and a
+    /// listener that drains its backlog after the first attempt is still
+    /// reached.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn connect_with_retry_retries_a_would_block_on_a_full_backlog() {
+        let dir = tempfile::tempdir().expect("a temp dir for the socket");
+        let sock = dir.path().join("daemon.sock");
+        let sock_path = sock.to_str().unwrap().to_string();
+
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        // Shrink the accept backlog so a couple of connects fill it.
+        nix::sys::socket::listen(
+            &listener,
+            nix::sys::socket::Backlog::new(0).expect("a zero backlog"),
+        )
+        .expect("shrink the backlog");
+
+        // Fill the backlog until a connect would block.
+        let mut held = Vec::new();
+        loop {
+            match tokio::net::UnixStream::connect(&sock).await {
+                Ok(stream) => {
+                    held.push(stream);
+                    assert!(held.len() < 64, "the backlog never filled");
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("unexpected connect error filling the backlog: {err}"),
+            }
+        }
+
+        // Drain the backlog after the first retried attempt, then accept the
+        // retried connect too.
+        let pending = held.len() + 1;
+        let acceptor = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            (0..pending)
+                .map(|_| listener.accept().expect("accept").0)
+                .collect::<Vec<_>>()
+        });
+
+        let stream = connect_with_retry(&sock_path)
+            .await
+            .expect("a would-block connect must be reached by retry");
+        drop(stream);
+        drop(held);
+        acceptor.join().expect("the acceptor thread");
     }
 }
