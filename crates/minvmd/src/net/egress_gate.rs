@@ -7053,6 +7053,15 @@ mod tests {
         // The handle the withdrawal below is spoken through: a clone of the
         // same registry the gate decides by.
         let handle = registry.clone();
+        // The node's own row, filed once at boot the way the run path files
+        // it: the one published namespace that survives the web box's
+        // withdrawal below, and the source the final arm's marker wears — an
+        // ARP announcing the withdrawn lease would wear an in-plan address no
+        // row holds, and that frame is the unregistered rule's drop now
+        // (NET-085), so it could no more prove the relay decided the answer
+        // than the answer itself.
+        let node = registry.register_node_namespace(7654);
+        let node_addr = node.switch_addr().octets();
         registry.register(
             BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
                 .with_admitted_ports([8080, 8081])
@@ -7200,7 +7209,12 @@ mod tests {
         // (NET-016/017's listen-publishing). The count above is the
         // purge's own evidence, the one thing this retraction changed.
         send_frame(&mut guest, &first_answer).await;
-        let marker = arp_frame(LEASE);
+        // The marker wears the node's address — the one row the withdrawal
+        // left standing — because the withdrawn lease's own announcement is
+        // an in-plan source no row holds, which the unregistered rule drops
+        // unconditionally now (NET-085), not a frame that can prove the
+        // relay is alive.
+        let marker = arp_frame(node_addr);
         send_frame(&mut guest, &marker).await;
         assert_eq!(
             expect_frame(&mut switch).await,
@@ -8680,7 +8694,11 @@ mod tests {
         // The exchange was decided, and admitted under the interim — which
         // says so, once, marked as the interim's own line and naming the
         // address the publish went out at. Nothing was dropped: a control
-        // exchange is not a frame, and no frame verdict ran on it.
+        // exchange is not a frame, and no frame verdict ran on it — no
+        // frame-drop line exists, which is what the needle below reads:
+        // the start-up line names the gate's postures (`unregistered_sources
+        // = "dropped"`), so the bare word is the gate's own vocabulary and
+        // the drop lines' opening words are the verdict's trace.
         wait_for_log(&h.log, "egress-unregistered-publish").await;
         let logged = h.log.contents();
         assert!(
@@ -8692,7 +8710,7 @@ mod tests {
             "the interim's line names the address the publish went out at, got: {logged}"
         );
         assert!(
-            !logged.contains("dropped"),
+            !logged.contains("dropped a frame"),
             "no frame was decided on this connection, got: {logged}"
         );
     }
@@ -8854,14 +8872,17 @@ mod tests {
 
         // Nothing was refused and nothing was scanned: the body was parsed as
         // the request its shape said it was, and the parse never met a
-        // request line.
+        // request line. A frame verdict never ran on this connection, so
+        // no frame-drop line exists — the needle reads the drop lines'
+        // own words, not the bare word "dropped", which the start-up line
+        // now uses to name the gate's unregistered-source posture.
         let logged = h.log.contents();
         assert!(
             !logged.contains("egress-control-upgrade"),
             "a body carrying the connect path was refused as an upgrade, got: {logged}"
         );
         assert!(
-            !logged.contains("dropped"),
+            !logged.contains("dropped a frame"),
             "a control exchange is not a frame, got: {logged}"
         );
     }
