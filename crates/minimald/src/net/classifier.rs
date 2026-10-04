@@ -223,11 +223,12 @@ pub(crate) fn refuses_unenforceable_declaration(
 /// unenforced rule by the field that names it, why this host has no rule
 /// for any of them, and — at the end, where a person still reading is
 /// looking — what to do about it: remove the rules, or declare the one
-/// shape this host's classifier enforces, or take the mode that enforces
-/// them. A refusal that names what it refused without saying how to get
-/// the box running leaves a person with nothing to type, and the words
-/// are the typed error a client sees, so the create and the launch say
-/// the same thing about the same declaration.
+/// shape this host's classifier enforces — by the flag that writes it,
+/// `--deny-all-egress`, or by the box's `egress` section — or take the
+/// mode that enforces them. A refusal that names what it refused without
+/// saying how to get the box running leaves a person with nothing to
+/// type, and the words are the typed error a client sees, so the create
+/// and the launch say the same thing about the same declaration.
 pub(crate) fn unenforceable_declaration_words(rules: &[UnenforceableRule]) -> String {
     let named = rules
         .iter()
@@ -242,9 +243,10 @@ pub(crate) fn unenforceable_declaration_words(rules: &[UnenforceableRule]) -> St
          per-box verdict the loaded table decides is deny-all alone \
          (every allow_* list present and empty) or nothing, so the box \
          was refused rather than run with these rules unenforced; remove \
-         these rules, or declare deny-all egress instead — the box's \
-         `egress` section, all three allow lists present and empty, and \
-         no deny entries — or run the box with `--network own_ip` \
+         these rules, or declare deny-all egress instead — `min session \
+         activate --deny-all-egress`, or the box's `egress` section, all \
+         three allow lists present and empty, and no deny entries — or \
+         run the box with `--network own_ip` \
          (own-address boxes enforce them)"
     )
 }
@@ -2039,11 +2041,11 @@ mod tests {
         // The words end with what to do: a refusal that names the rules it
         // refused and stops leaves a person with nothing to type, so the
         // tail is the remedy — remove these rules, declare the one shape
-        // this host's classifier enforces (spelled by the egress section,
-        // not a flag: the CLI has none that writes an empty list), or take
-        // the mode that enforces them — and the why ahead of it is the
-        // classifier's own limit, the thing a person cannot fix from the
-        // declaration.
+        // this host's classifier enforces, by the flag that writes it
+        // (T88's `--deny-all-egress`, pinned by its own test below) or by
+        // the `egress` section, or take the mode that enforces them — and
+        // the why ahead of it is the classifier's own limit, the thing a
+        // person cannot fix from the declaration.
         assert!(
             words.contains("remove these rules")
                 && words.contains("declare deny-all egress")
@@ -2132,6 +2134,42 @@ mod tests {
             refusal.to_string(),
             unenforceable_declaration_words(&rules),
             "the typed error carries the one words string both paths say"
+        );
+    }
+
+    /// The refusal names the flag that declares the deny-all shape (T88,
+    /// the remedy half of the words): `--deny-all-egress` is the one-
+    /// keystroke form of the section the words have always spelled, so a
+    /// person refused over a rule the classifier cannot enforce is told
+    /// both spellings — the flag to type at the next activate, and the
+    /// section it writes — rather than a remedy the CLI could not reach.
+    /// The flag and the section write the same record, so the words name
+    /// them as the one declaration they are, and the flag sits in the
+    /// remedy — the tail a person still reading is looking at — beside
+    /// the section form, never in place of it.
+    #[test]
+    fn unenforceable_refusal_names_the_deny_all_flag() {
+        let declaration = sessions::EgressPolicy {
+            deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+            ..Default::default()
+        };
+        let rules = unenforceable_rules(Some(&declaration));
+        let words = unenforceable_declaration_words(&rules);
+        let (_, remedy) = words
+            .split_once("remove these rules")
+            .expect("the refusal ends with its remedy");
+        assert!(
+            remedy.contains("--deny-all-egress"),
+            "the remedy names the flag that declares deny-all: {words}"
+        );
+        assert!(
+            remedy.contains("`egress` section"),
+            "the flag names the section form beside it, never in place of \
+             it: {words}"
+        );
+        assert!(
+            remedy.contains("--network own_ip"),
+            "the mode remedy stays beside the declaration's: {words}"
         );
     }
 

@@ -71,6 +71,7 @@ pub(crate) fn bare_activate_args() -> ActivateArgs {
         allow_dns_hosts: Vec::new(),
         allow_protocols: Vec::new(),
         deny_subnets: Vec::new(),
+        deny_all_egress: false,
         credentialed_upstream: false,
         loadout: Vec::new(),
         no_loadouts: false,

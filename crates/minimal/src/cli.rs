@@ -565,6 +565,22 @@ impl GlobalArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    // The egress rule flags as one named set, so a declaration that admits
+    // no exceptions can conflict with them as a family: `--deny-all-egress`
+    // names this group in `conflicts_with`, which is how it comes to
+    // conflict with every `--allow-*`/`--deny-*` rule flag at parse without
+    // the four rules becoming mutually exclusive with each other — they
+    // still combine freely (`multiple`), the way the section they build
+    // combines its dimensions. The one place the egress flags appear is
+    // `ActivateArgs`, so this is the one shared definition.
+    group(
+        ArgGroup::new("egress-rules")
+            .args(["allow_subnets", "allow_dns_hosts", "allow_protocols", "deny_subnets"])
+            .required(false)
+            .multiple(true)
+    )
+)]
 pub struct ActivateArgs {
     /// Optional session name
     #[arg(long, short)]
@@ -643,6 +659,16 @@ pub struct ActivateArgs {
     /// denied.
     #[arg(long = "deny-subnets", value_name = "CIDR")]
     pub deny_subnets: Vec<String>,
+    /// Declare deny-all egress: the box reaches no external address. The
+    /// section this writes is the deny-all shape — every allow list present
+    /// and empty, nothing denied on top (`sessions::EgressPolicy::deny_all()`)
+    /// — a declaration, not the default: on a host-address box the host's
+    /// classifier decides it per box (NET-079), while a box that declares no
+    /// egress at all keeps the default the rollout phase resolves
+    /// (NET-074). Valid wherever the egress rule flags are; conflicts with
+    /// every one of them, because deny-all admits no exceptions.
+    #[arg(long = "deny-all-egress", conflicts_with = "egress-rules")]
+    pub deny_all_egress: bool,
     /// Declare a credentialed upstream for this box (NET-134): the Box
     /// Egress Proxy's listener becomes the box's infrastructure, reachable
     /// whatever its `--allow-*`/`--deny-*` rules say. Without the flag every

@@ -237,6 +237,41 @@ fn detail_pane_with_policy() {
 }
 
 #[test]
+fn detail_pane_names_a_declared_deny_all() {
+    // Every allow list present and empty: the box declared deny-all, and the
+    // pane names it as `min session policy` does instead of printing the
+    // empty dimension rows as blankness.
+    let mut model = fixed_model(vec![provider(
+        "host",
+        vec![entry(1, Some("api-staging"), "/src/api")],
+    )]);
+    let key = SessionKey {
+        provider: "host".to_string(),
+        id: id(1),
+    };
+    model.details.insert(
+        key,
+        Detail {
+            record: Some(record(Some("api-staging"), NetworkMode::OwnIp)),
+            policy: Some(sessions::SessionPolicy::new(
+                Some(sessions::EgressPolicy {
+                    allow_subnets: Some(vec![]),
+                    allow_dns_hosts: Some(vec![]),
+                    allow_protocols: Some(vec![]),
+                    deny_subnets: None,
+                }),
+                None,
+            )),
+        },
+    );
+    model.cursor = 1;
+    let rendered = render(&mut model);
+    assert!(rendered.contains("  deny-all "), "{rendered}");
+    assert!(!rendered.contains("  subnets "), "{rendered}");
+    assert!(!rendered.contains("dns hosts"), "{rendered}");
+}
+
+#[test]
 fn detail_pane_shows_dynamic_ingress() {
     let mut model = fixed_model(vec![provider(
         "host",
