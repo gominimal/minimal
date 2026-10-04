@@ -425,6 +425,34 @@ export XDG_RUNTIME_DIR="$WORK/runtime"
 mkdir -p "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME"
 chmod 700 "$XDG_RUNTIME_DIR"
 
+# The native Linux lane drives the daemon directly (minimald), and its
+# own-IP proofs gate on MINVMD_GVPROXY_BIN — the switch the daemon spawns
+# for an own-address box's tap. A bare checkout ships none, and the native
+# lane's CI invocation (ci-linux-native.yml) fetches none, so every own-IP
+# proof would SKIP at its first gate. Provision it here, once per run, the
+# same way the fresh-install and browser-path proofs do: the host's own
+# prefix wins, then a staged .scratch/gvproxy, then the pinned fetch
+# (verified against vendor/gvproxy/gvproxy.lock). The binary is staged as
+# gvproxy-min — the name switch::installed_gvproxy_bin probes for under
+# $MINIMAL_BIN — and both signals are exported so the daemon finds it and
+# the proofs un-gate. VM-backed lanes (KVM/macOS) set MINVMD_GVPROXY_BIN
+# themselves and their switch lives guest-side, so this is native-only.
+if [ -z "$E2E_VM" ] && [ "$(uname -s)" = Linux ] && [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
+  gvproxy_dir="$WORK/gvproxy-bin"
+  mkdir -p "$gvproxy_dir"
+  if [ -x "$ROOT/.scratch/gvproxy" ]; then
+    cp "$ROOT/.scratch/gvproxy" "$gvproxy_dir/gvproxy-min"
+  elif ! "$ROOT/scripts/fetch-gvproxy.sh" "$gvproxy_dir/gvproxy-min" \
+      >"$WORK/gvproxy-fetch.out" 2>&1; then
+    echo "::warning::could not fetch the pinned gvproxy switch; own-IP proofs will skip (set MINVMD_GVPROXY_BIN or stage $ROOT/.scratch/gvproxy)"
+    cat "$WORK/gvproxy-fetch.out" 2>/dev/null || true
+  fi
+  if [ -x "$gvproxy_dir/gvproxy-min" ]; then
+    export MINIMAL_BIN="$gvproxy_dir"
+    export MINVMD_GVPROXY_BIN="$gvproxy_dir/gvproxy-min"
+  fi
+fi
+
 # Hermetic user config: the CLI resolves loadouts and config.toml under
 # XDG_CONFIG_HOME, and the sandbox proof below asserts the zero-config
 # orientation banner (built-in `default` loadout). An operator's own
