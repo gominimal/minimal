@@ -1589,6 +1589,9 @@ impl SessionLauncher for SealingMockLauncher {
             // This mock has no sandbox, so no classifier placed it anywhere.
             leaf: None,
             host_ip_enforcement: None,
+            // No launch this mock stands for gathered a listen plan, so
+            // the host it builds starts no listener watcher.
+            listen_plan: None,
         })
     }
 }
@@ -2130,12 +2133,16 @@ fn a_leftover_leaf_is_reclaimed_but_a_held_one_refuses_the_launch() {
 /// box with a leaf is recorded `per_box` whatever the table is doing — the
 /// reads lower it to the state the host can currently honour
 /// (`displayed_host_ip_enforcement`), and when the table comes back the box
-/// is in the leaf its launch placed it in. A host-address box without a
-/// leaf ran with the host's address and no verdict of its own, recorded
-/// `none` for its life; a none box or an own-IP box has no host address to
-/// decide on at all. Pure over its inputs, so each mapping is pinned where
-/// it is written — beside the refusal predicate, the two halves of what a
-/// launch says about the box it is about to run.
+/// is in the leaf its launch placed it in — *while the declaration is one
+/// the classifier can enforce*: a placed box whose rules no per-box
+/// verdict enforces is recorded `none`, the state it ran in, so the record
+/// never promises `per_box` for rules that are not enforced (NET-079). A
+/// host-address box without a leaf ran with the host's address and no
+/// verdict of its own, recorded `none` for its life; a none box or an
+/// own-IP box has no host address to decide on at all. Pure over its
+/// inputs, so each mapping is pinned where it is written — beside the
+/// refusal predicate, the two halves of what a launch says about the box it
+/// is about to run.
 #[test]
 fn host_ip_enforcement_says_what_the_launch_decided() {
     use sessions::NetworkMode;
@@ -2155,19 +2162,29 @@ fn host_ip_enforcement_says_what_the_launch_decided() {
         )
         .expect("the leaf the launch places its box in"),
     );
-    let placed = |mode, leaf: Option<sandbox2::config::ClassifierLeaf>| {
-        super::host_ip_enforcement(mode, leaf.as_ref())
+    let deny_all = sessions::EgressPolicy::deny_all();
+    let placed = |mode,
+                  leaf: Option<sandbox2::config::ClassifierLeaf>,
+                  declaration: Option<&sessions::EgressPolicy>| {
+        super::host_ip_enforcement(mode, leaf.as_ref(), declaration)
     };
 
     assert_eq!(
-        placed(NetworkMode::HostNet, Some(leaf.clone())),
+        placed(NetworkMode::HostNet, Some(leaf.clone()), Some(&deny_all)),
         Some(super::HostIpEnforcement::PerBox),
         "a host-address box its launch placed is recorded `per_box` — the \
          leaf is the outcome, and the reads lower it to the state the host \
          can currently honour, never raise a placement the tree did not make"
     );
     assert_eq!(
-        placed(NetworkMode::HostNet, None),
+        placed(NetworkMode::HostNet, Some(leaf.clone()), None),
+        Some(super::HostIpEnforcement::PerBox),
+        "a placed box with no egress section is recorded `per_box` too — no \
+         section is the allow-all it is, and every verdict the classifier \
+         could decide for it is one the leaf enforces"
+    );
+    assert_eq!(
+        placed(NetworkMode::HostNet, None, Some(&deny_all)),
         Some(super::HostIpEnforcement::None),
         "a host-address box its launch left unplaced is recorded `none` — it \
          ran with the host's address and no verdict of its own, and no \
@@ -2182,11 +2199,84 @@ fn host_ip_enforcement_says_what_the_launch_decided() {
     ] {
         for leaf in [Some(leaf.clone()), None] {
             assert_eq!(
-                placed(mode, leaf),
+                placed(mode, leaf, Some(&deny_all)),
                 None,
                 "{why}: there is no host address to decide on, leaf or no leaf"
             );
         }
+    }
+}
+
+/// The launch record can never say `per_box` for a declaration the
+/// classifier cannot enforce (NET-079): the record is derived from the
+/// placement *plus* the declaration's rules — never the placement or the
+/// node fact alone — so a placed box whose declaration names a rule no
+/// per-box verdict enforces is recorded `none`, the state it ran in,
+/// whatever the host's own fact said when it ran. The host that decides
+/// per box refuses such a box at launch, so the only box that reaches this
+/// derivation placed is one on a host that cannot decide — and there the
+/// record is the one thing that must not promise a verdict the box's rules
+/// never had.
+#[test]
+fn launch_record_never_per_box_for_unenforceable_declaration() {
+    use sessions::NetworkMode;
+
+    let tree = tempfile::tempdir().expect("a temp dir standing in for the tree");
+    std::fs::create_dir_all(
+        tree.path()
+            .join(sandbox2::classifier::BOXES_DIR)
+            .join(sandbox2::config::ALLOW_DIR),
+    )
+    .expect("the cohort directory and its subtree");
+    let leaf = sandbox2::config::ClassifierLeaf::new(
+        sandbox2::classifier::create_box_leaf(
+            tree.path(),
+            "a placed box whose rules are unenforced",
+            sandbox2::config::Verdict::Allow,
+        )
+        .expect("the leaf the launch places its box in"),
+    );
+    let deny_all = sessions::EgressPolicy::deny_all();
+    // The narrowing shapes the classifier cannot enforce, in the CLI's own
+    // spellings: a denied range over an allow-all, and an allow list that
+    // narrows one.
+    let deny_a_range = sessions::EgressPolicy {
+        deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+        ..Default::default()
+    };
+    let allow_a_subnet = sessions::EgressPolicy {
+        allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+        ..deny_all.clone()
+    };
+    for (declaration, why) in [
+        (Some(&deny_a_range), "a denied range over an allow-all"),
+        (Some(&allow_a_subnet), "a narrowing allow list"),
+    ] {
+        assert_eq!(
+            super::host_ip_enforcement(NetworkMode::HostNet, Some(&leaf), declaration),
+            Some(super::HostIpEnforcement::None),
+            "a placed box is recorded `none` while it is {why}: no per-box \
+             verdict enforces these rules, so the placement is not an \
+             enforcement of anything the box declared"
+        );
+        assert_eq!(
+            super::host_ip_enforcement(NetworkMode::HostNet, None, declaration),
+            Some(super::HostIpEnforcement::None),
+            "{why}: an unplaced box was never decided, whatever it declared"
+        );
+    }
+    // The enforceable shapes stay `per_box` placed — the ones the deny
+    // subtree refuses and the allow subtree refuses nothing for: the
+    // record is not narrower than the classifier's own vocabulary.
+    for (declaration, why) in [
+        (None, "no egress section at all"),
+        (Some(&deny_all), "the deny-all shape"),
+    ] {
+        assert_eq!(
+            super::host_ip_enforcement(NetworkMode::HostNet, Some(&leaf), declaration),
+            Some(super::HostIpEnforcement::PerBox),
+            "{why} is enforced by the leaf, so the placement is the record"
+        );
     }
 }
 
@@ -2457,6 +2547,10 @@ fn launcher_with(
         // same reason — the host's own mount table covers no stand-in tree,
         // so over it every stand-in reads as unconfined.
         classifier_mountinfo: None,
+        // The empty set a launch's publications start from: these launches
+        // run no runtime expose surface and carry no listen plan, so no
+        // publication ever enters it.
+        publications: Default::default(),
     }
 }
 
@@ -2754,7 +2848,7 @@ async fn unenforcing_native_host_runs_host_ip_box_unenforced() {
         );
     }
     assert_eq!(
-        super::host_ip_enforcement(NetworkMode::HostNet, None),
+        super::host_ip_enforcement(NetworkMode::HostNet, None, None),
         Some(super::HostIpEnforcement::None),
         "a host-address box with no leaf is recorded unenforced, whatever it \
          declared"
@@ -3030,6 +3124,234 @@ async fn a_native_launch_over_either_probe_cause_runs_records_none_and_advises()
         );
     }
     let _ = std::fs::remove_file(&squatted);
+}
+
+/// NET-079's race, closed at the launch: the create answers over the
+/// daemon's one node fact, so a box created while that fact said the host
+/// cannot decide — or a record persisted before this gate existed — still
+/// reaches a launch on a host that has since loaded a refusing table. The
+/// launch re-reads the host for itself, so the same declaration is refused
+/// there: one predicate, two call sites, and the launch's is what keeps
+/// the box from running placed and looking decided while its rules go
+/// unenforced. Refused *before* the leaf is allocated, so the box never
+/// lands in `boxes/allow`; the refusal's words are the ones the create
+/// would have said — each rule by the field that names it, the remedy at
+/// the end, and the mode that enforces them — and its error is the
+/// create's own typed one, so the refusal maps to the same machine-mode
+/// code wherever the declaration meets it.
+///
+/// Driven over a stand-in tree the test builds, so the proof runs
+/// everywhere: the launcher reads the stand-in's root *and* its mount
+/// table, and the reading — the one fact a stand-in tree cannot vouch
+/// for — is injected the way a test injects every other classifier fact.
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the guard spans the launches because each host-address one \
+              re-reads the process-global classifier fact"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launch_refuses_unenforceable_host_ip_declaration_after_host_gains_per_box() {
+    use sandbox2::config::Verdict;
+    use sessions::NetworkMode;
+
+    // The window the launches write the daemon's process-global classifier
+    // fact in — every host-address launch re-reads it — taken for the whole
+    // proof, so under libtest no concurrent read answers over the state
+    // they write.
+    let _fact_window = super::PROBE_TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+
+    // The step's half, installed: both subtrees with the kernel's own files,
+    // and the marker that says the table loaded — everything the re-read's
+    // gate requires, so the reading is the only thing the decision still
+    // needs, and it is injected where the proof needs the table's effect.
+    let scratch = tempfile::tempdir().expect("a scratch dir for the stand-in mount");
+    let mountpoint = scratch.path().join("cgroup");
+    let root = mountpoint.join(
+        std::path::Path::new(sandbox2::classifier::TREE_ROOT)
+            .file_name()
+            .expect("the tree root is a slice below the cgroup2 mount root"),
+    );
+    for verdict in [Verdict::Deny, Verdict::Allow] {
+        let subtree = root
+            .join(sandbox2::classifier::BOXES_DIR)
+            .join(verdict.dir_name());
+        std::fs::create_dir_all(&subtree).expect("the step makes the subtree");
+        model_cgroup_files(&subtree);
+    }
+    std::fs::create_dir_all(root.join(sandbox2::classifier::TABLE_MARKER))
+        .expect("the step writes the marker");
+    std::fs::create_dir_all(root.join("ct-mark-mask-0x30000000"))
+        .expect("the step records the ct-mark mask beside the marker");
+    let mountinfo = format!(
+        "35 30 0:26 / {} rw,relatime shared:2 - cgroup2 cgroup2 rw,nsdelegate\n",
+        mountpoint.display(),
+    );
+
+    let capture = crate::test_harness::captured_log();
+    const REFUSAL: &str = "cannot enforce the rules this box's declaration names";
+    // The box's declaration: the narrowing a per-box host has no verdict for,
+    // in the CLI's own spelling of `--deny-subnets`.
+    let narrowing = sessions::SessionPolicy::new(
+        Some(sessions::EgressPolicy {
+            deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+            ..Default::default()
+        }),
+        None,
+    );
+    let state = tempfile::tempdir().expect("a state dir for the daemon's context");
+    let session_id = sessions::SessionId::parse_str("e2ea79c1-0000-4000-8000-000000000001")
+        .expect("a session id the proof names its box by");
+
+    // The fact as this box's create read it: a host that cannot decide per
+    // box — the state a create falls through on, over the same declaration
+    // the launch below is refused for.
+    super::set_host_ip_enforcement_fact(&crate::net::classifier::Decision::undecidable(
+        crate::net::classifier::Cause::StepNotInstalled,
+    ));
+
+    // The same box over the same tree, while the table does not refuse: the
+    // launch reads its own undecided answer and runs — the exception is the
+    // undeciding host's to keep, whatever the box declared.
+    let mut launcher = launcher_with(NetworkMode::HostNet, state.path(), narrowing.clone());
+    launcher.classifier_root = root.clone();
+    launcher.classifier_mountinfo = Some(mountinfo.clone());
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        launcher.launch(
+            false,
+            session_id,
+            "race-proof-before".to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+        ),
+    )
+    .await
+    .expect("the launch decides within its timeout");
+    if let Err(e) = &outcome {
+        assert!(
+            !e.to_string().contains(REFUSAL),
+            "a host that cannot decide per box runs the box, whatever it \
+             declared: {e}"
+        );
+    }
+    drop(outcome);
+
+    // The table refuses now: the reading a loaded table's probe reads. The
+    // next launch re-reads it for itself, and the same declaration is
+    // refused with the words the create would have said.
+    super::install_classifier_reading_standin(crate::net::classifier::Reading::Refused(Vec::new()));
+    let mut launcher = launcher_with(NetworkMode::HostNet, state.path(), narrowing);
+    launcher.classifier_root = root.clone();
+    launcher.classifier_mountinfo = Some(mountinfo.clone());
+    let refused = tokio::time::timeout(
+        Duration::from_secs(30),
+        launcher.launch(
+            false,
+            session_id,
+            "race-proof-after".to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+        ),
+    )
+    .await
+    .expect("the launch decides within its timeout");
+    let (refusal, refusal_kind) = match refused {
+        Err(e) => (e.to_string(), e.kind()),
+        Ok(launched) => {
+            drop(launched);
+            panic!(
+                "a host that gained per-box enforcement refuses the same \
+                    box it ran, got a launch"
+            );
+        }
+    };
+    assert!(
+        refusal.contains("deny_subnets 0.0.0.0/0"),
+        "the launch's refusal names the rule it refused over: {refusal}"
+    );
+    assert!(
+        refusal.contains("own-address boxes enforce them"),
+        "the launch's refusal says own-address boxes enforce these rules, \
+         the same words the create's would have said: {refusal}"
+    );
+    assert!(
+        refusal.contains("remove these rules"),
+        "the launch's refusal ends with what to do, the same remedy the \
+         create's would have named: {refusal}"
+    );
+    // The refusal the launch returned is the create's own typed error, not
+    // an unspecified failure: the same declaration is the same
+    // machine-mode code wherever a client meets it — the create's RPC
+    // answer keys on this kind, so a box refused at a create and refused
+    // again at a launch reads as one failure, not two.
+    assert_eq!(
+        refusal_kind,
+        std::io::ErrorKind::InvalidInput,
+        "the launch's refusal is typed the way the create's is, so both \
+         map to the same machine-mode code: {refusal}"
+    );
+
+    // The box never landed in `boxes/allow`: the refusal is before the leaf
+    // is allocated, so the subtree holds no leaf of this box's.
+    assert!(
+        !sandbox2::classifier::box_leaf(&root, &session_id.to_string(), Verdict::Allow).exists(),
+        "the refused launch allocated no leaf for the box: {}",
+        root.display()
+    );
+
+    // One info line for the refused launch: the box, the host's per-box
+    // value in the machine spelling, and each unenforced rule.
+    let logged = capture.contents();
+    assert!(
+        logged.lines().any(|line| {
+            line.contains("refusing a host-address box whose declaration names rules")
+                && line.contains("session=race-proof-after")
+                && line.contains("host_ip_enforcement=per_box")
+                && line.contains("deny_subnets 0.0.0.0/0")
+        }),
+        "the refused launch logged the box, the per-box value, and the rule \
+         it refused over, got: {logged}"
+    );
+
+    // The same host, the same refusing reading, a box whose rules the
+    // classifier can enforce — no egress section at all, the allow-all it
+    // is: the gate refuses it over nothing, and the launch goes on to
+    // whatever it finds next.
+    let mut launcher = launcher_with(
+        NetworkMode::HostNet,
+        state.path(),
+        sessions::SessionPolicy::default(),
+    );
+    launcher.classifier_root = root.clone();
+    launcher.classifier_mountinfo = Some(mountinfo.clone());
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        launcher.launch(
+            false,
+            sessions::SessionId::nil(),
+            "race-proof-plain".to_string(),
+            "user".to_string(),
+            test_paths(),
+            DEFAULT_SIZE,
+        ),
+    )
+    .await
+    .expect("the launch decides within its timeout");
+    if let Err(e) = &outcome {
+        assert!(
+            !e.to_string().contains(REFUSAL),
+            "a box with no egress section is enforceable, so no per-box \
+             host refuses it: {e}"
+        );
+    }
+    drop(outcome);
+
+    super::clear_classifier_reading_standin();
+    super::clear_host_ip_enforcement_fact();
 }
 
 /// The unenforced-placement record is not a once-per-daemon latch: the
@@ -3339,7 +3661,7 @@ fn the_guests_unenforced_host_address_box_advises_with_the_interim() {
     // guest's fact re-read beside it — and an unplaced box records the
     // state it ran in, which no later host state raises.
     assert_eq!(
-        super::host_ip_enforcement(NetworkMode::HostNet, None),
+        super::host_ip_enforcement(NetworkMode::HostNet, None, None),
         Some(super::HostIpEnforcement::None),
         "a box the launch left unplaced is recorded unenforced — the state \
          the guest's unplaced boxes share with the native host's"
@@ -3540,12 +3862,17 @@ fn a_guests_placed_unenforced_host_address_box_advises_at_its_start() {
 
     // The state a guest without its table puts its placed boxes in: the
     // launch records the placement — `per_box`, the leaf is the outcome,
-    // whatever the table is doing — and the reads lower it to the
-    // unenforced state the table leaves the box in while it cannot decide,
-    // never raise the placement to a verdict nothing is enforcing, so the
-    // banner spells `none` and the advisory fires at every session start
-    // of the box.
-    let recorded = super::host_ip_enforcement(NetworkMode::HostNet, Some(&leaf));
+    // whatever the table is doing, while the declaration is one the leaf
+    // can enforce (the deny-all section, here) — and the reads lower it to
+    // the unenforced state the table leaves the box in while it cannot
+    // decide, never raise the placement to a verdict nothing is enforcing,
+    // so the banner spells `none` and the advisory fires at every session
+    // start of the box.
+    let recorded = super::host_ip_enforcement(
+        NetworkMode::HostNet,
+        Some(&leaf),
+        Some(&sessions::EgressPolicy::deny_all()),
+    );
     assert_eq!(
         recorded,
         Some(super::HostIpEnforcement::PerBox),
@@ -3666,9 +3993,12 @@ async fn dynamic_ingress_box(
     mode: Option<sessions::DynamicIngress>,
     range: Option<(u16, u16)>,
 ) -> (sessions::SessionId, crate::session::SessionHandle) {
+    // The loopback verdict vouches for the handed address, so the registry
+    // publishes the box at it — the address a runtime publish binds at.
+    let manager = server.state.sessions_manager().await;
+    manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
     let id =
         finalize_dynamic_ingress_session(client, name, ASK_SWITCH, ASK_LOOPBACK, mode, range).await;
-    let manager = server.state.sessions_manager().await;
     let handle = manager
         .get_session(crate::sessions::SessionKeyPredicate::Id(id))
         .await
@@ -3977,6 +4307,7 @@ async fn expose_ask_answered_after_the_stall_bound_publishes() {
             local: format!("{}:3000", ASK_LOOPBACK),
             internal_port: 3000,
             proto: sessions::IpProto::Tcp,
+            pending: Some(false),
         },
         "the publish the human allowed is the one an allow box's takes"
     );
@@ -4825,6 +5156,7 @@ async fn expose_ask_answers_reach_their_own_ask_on_a_shared_port() {
             local: format!("{}:3000", ASK_LOOPBACK),
             internal_port: 3000,
             proto: sessions::IpProto::Tcp,
+            pending: Some(false),
         },
         "the publish is the one an allow box's request takes"
     );
@@ -4979,6 +5311,7 @@ async fn expose_ask_prompts_attached_human() {
             local: format!("{}:3000", ASK_LOOPBACK),
             internal_port: 3000,
             proto: sessions::IpProto::Tcp,
+            pending: Some(false),
         },
         "the publish the human allowed is the one an allow box's takes"
     );
@@ -5121,6 +5454,12 @@ async fn expose_unenrolled_decision_audited() {
         None,
     )
     .await;
+    // A publish needs a box running behind it (NET-047's stopped-box
+    // refusal), so the allowing box launches its host first.
+    web_handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the allowing box launches its host");
     let sock = web_handle
         .net_switch()
         .await

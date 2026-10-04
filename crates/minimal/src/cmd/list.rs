@@ -69,6 +69,7 @@ pub(crate) fn bare_activate_args() -> ActivateArgs {
         allow_dns_hosts: Vec::new(),
         allow_protocols: Vec::new(),
         deny_subnets: Vec::new(),
+        deny_all_egress: false,
         credentialed_upstream: false,
         loadout: Vec::new(),
         no_loadouts: false,
@@ -575,7 +576,7 @@ pub async fn cmd_ls(global: &GlobalArgs, args: LsArgs) -> Result<(), anyhow::Err
         if let Some(status) = status
             && let Some(slot) = surfaces.get_mut(index)
         {
-            *slot = crate::resolver::vm_host_name_surface(*status).await;
+            *slot = crate::resolver::vm_host_name_surface(status.clone()).await;
         }
     }
     format_ls_across_vms(
@@ -901,11 +902,11 @@ pub fn format_ls_across_vms(
     // The verdict of the listing at `index`, `None` when the caller passed
     // none for it — a machine mode never prints the line, and a direct
     // caller may have computed nothing.
-    let surface_at = |index: usize| surfaces.get(index).copied().flatten();
+    let surface_at = |index: usize| surfaces.get(index).cloned().flatten();
     // The host answerer's state for the listing at `index`, `None` when no
     // read was made for that VM — a machine mode reads nothing, and a
     // socket or daemon that did not answer keeps the same silence.
-    let answerer_at = |index: usize| vm_answerers.get(index).copied().flatten();
+    let answerer_at = |index: usize| vm_answerers.get(index).cloned().flatten();
     if let [only] = listings {
         return format_ls(out, args, &only.resp, surface_at(0), answerer_at(0));
     }

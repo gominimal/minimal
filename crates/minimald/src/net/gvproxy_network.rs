@@ -212,13 +212,26 @@ pub(crate) async fn complete_own_ip_attach(
     // their addresses from the subnet of the switch this box attaches to, so
     // a custom-subnet switch is keyed to its own resolver and watched at its
     // own host alias.
-    let subnet = switch.lock().await.subnet();
+    // The hostname proxy's port rides with it: the node address's interim
+    // opening in the box's own-address set (design §7.1).
+    let (subnet, hostname_proxy_port) = {
+        let switch = switch.lock().await;
+        (switch.subnet(), switch.hostname_proxy_port())
+    };
     // The gate is held in an `Arc` so the relay's legs and the ingress
     // forwarders this attach goes on to build (NET-121) share one gate: a
     // revoked port's refusal on the legs is the same gate state the
     // forwarder's revocation sets.
     let gate = policy
-        .map(|policy| SessionGate::for_session(lease_ip.to_string(), lease_ip, policy, subnet))
+        .map(|policy| {
+            SessionGate::for_session(
+                lease_ip.to_string(),
+                lease_ip,
+                policy,
+                subnet,
+                hostname_proxy_port,
+            )
+        })
         .map(Arc::new);
     let relay = match (&control, &gate) {
         (ControlChannel::Unix(sock), Some(gate)) => {
@@ -1953,6 +1966,11 @@ mod tests {
                     local: forwarder.local().to_string(),
                     internal_port: forwarder.internal_port(),
                     proto: sessions::IpProto::Tcp,
+                    // The gate-less runtime publish this test drives reads
+                    // as reachable — there is no relay gate to have
+                    // admitted the port — so the field says so outright
+                    // rather than defaulting to the unknown.
+                    pending: Some(false),
                 },
                 forwarder,
             })
