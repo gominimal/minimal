@@ -2780,15 +2780,26 @@ async fn net_forward_announces_the_bound_local_port() {
         .spawn()
         .expect("the min binary should be invocable");
 
+    // Tracing also writes to stderr (warnings, or anything `RUST_LOG`
+    // enables), so skip ahead to the announcement rather than assuming it is
+    // the first line.
     let mut stderr = tokio::io::BufReader::new(child.stderr.take().expect("stderr is piped"));
-    let mut line = String::new();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        stderr.read_line(&mut line),
-    )
+    let line = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = stderr
+                .read_line(&mut line)
+                .await
+                .expect("reading the forward's stderr");
+            assert!(n > 0, "the forward closed stderr before announcing");
+            if line.contains("Forwarding localhost:") {
+                return line;
+            }
+        }
+    })
     .await
-    .expect("the forward must announce its listener")
-    .expect("reading the forward's announcement");
+    .expect("the forward must announce its listener");
 
     let announced = line
         .split_once("localhost:")
