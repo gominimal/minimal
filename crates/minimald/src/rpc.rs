@@ -443,10 +443,11 @@ async fn serve_create_session(
 
 /// The record-attr key a create strips unconditionally (NET-079): the key
 /// the state was once recorded under, so the one a client might assert to
-/// hand the reads a state of its own choosing. The daemon writes nothing
-/// about enforcement into a record — the state is the host's verdict,
-/// derived at read time from the daemon's own classifier fact — so the key
-/// is removed whatever the session's network mode, and whatever value it
+/// hand the reads a state of its own choosing. The per-box enforcement is a
+/// daemon-owned launch record — written only by the box's own launch, on
+/// the record's `host_ip_enforcement` field, never an attr — and displayed
+/// as that record lowered by the host's current fact, so the key is
+/// removed whatever the session's network mode, and whatever value it
 /// carries.
 const HOST_IP_ENFORCEMENT_ATTR: &str = "host_ip_enforcement";
 
@@ -964,12 +965,11 @@ async fn serve_get_session_policy(
 
 /// The `GetEffectiveSessionPolicy` reply for one record's policy and network
 /// mode: the egress half resolved to what the gate enforces, the ingress half
-/// verbatim, and NET-079's enforcement state for a host-address box — the
-/// box's own launch record lowered by the daemon's one classifier fact,
-/// never raised above it, the same derivation the listing answers over and
-/// the create reply gates on, so every surface that reads a session names
-/// the state the box's launch placed it under rather than the host's later
-/// state.
+/// verbatim. NET-079's enforcement state answers beside this reply, over
+/// `GetSessionRuntimeFacts` — never as a field here, because the policy
+/// struct is `deny_unknown_fields`: an older `min` rejects a key it has no
+/// field for, so a fact that did not exist when that client was built must
+/// ride its own reply or the rules stop reading at all.
 /// `phase` is the rollout
 /// phase to resolve under — the handler serves
 /// [`sessions::EGRESS_DEFAULT_PHASE`], the phase this build ships, while the
@@ -981,12 +981,10 @@ pub(crate) fn effective_policy_reply(
     network: sessions::NetworkMode,
     phase: sessions::EgressDefaultPhase,
     opt_out: bool,
-    host_ip_enforcement: Option<String>,
 ) -> minimald_rpc::EffectiveSessionPolicy {
     minimald_rpc::EffectiveSessionPolicy {
         egress: sessions::effective_egress(policy.egress.as_ref(), network, phase, opt_out),
         ingress: policy.ingress.clone(),
-        host_ip_enforcement,
     }
 }
 
@@ -1023,29 +1021,18 @@ async fn serve_get_effective_session_policy(
                     error: "no session found".to_string(),
                 }),
                 Some(record) => {
-                    // NET-079's enforcement state: the box's own launch
-                    // record, lowered by the daemon's one classifier fact
-                    // over the record's own declaration and network mode —
-                    // the same read the listing answers over, so
-                    // `min session policy` and a listing cannot disagree,
-                    // and never re-probed here. The record is the box's own
-                    // launch outcome, so a box launched unenforced says
-                    // `none` for its life beside the rules it runs under,
-                    // never the host's later state.
-                    let host_ip_enforcement = crate::session_host::displayed_host_ip_enforcement(
-                        s.in_microvm().await,
-                        record.network,
-                        classifier::verdict_of(record.policy.egress.as_ref()),
-                        &crate::session_host::host_ip_enforcement_fact(),
-                        record.host_ip_enforcement,
-                    )
-                    .map(|enforcement| enforcement.machine_str().to_string());
+                    // NET-079's enforcement state no longer rides this
+                    // reply: the policy struct is `deny_unknown_fields`, so
+                    // an older `min` would reject the whole reply over the
+                    // key it has no field for. It answers over
+                    // `GetSessionRuntimeFacts` (see
+                    // [`serve_get_session_runtime_facts`]), beside the
+                    // rules rather than inside them.
                     Ok(Errorable::Ok(effective_policy_reply(
                         &record.policy,
                         record.network,
                         sessions::EGRESS_DEFAULT_PHASE,
                         opt_out,
-                        host_ip_enforcement,
                     )))
                 }
             }
@@ -1088,6 +1075,58 @@ async fn serve_get_live_ingress(
                         error: e.to_string(),
                     }),
                 },
+            }
+        })
+        .await
+}
+
+/// `GetSessionRuntimeFacts`: NET-079's per-box enforcement state for one
+/// session — the box's own launch record, lowered by the daemon's one
+/// classifier fact over the record's own declaration and network mode — the
+/// same read the listing answers over, so `min session policy` and a listing
+/// cannot disagree, and never re-probed here. The record is the box's own
+/// launch outcome, so a box launched unenforced says `none` for its life
+/// beside the rules it runs under, never the host's later state.
+///
+/// Served over this reply rather than a field on the effective policy
+/// because the policy struct is `deny_unknown_fields`: an older `min` has no
+/// field for the key and would refuse the whole reply, rules included. A
+/// client that cannot ask for the facts — an older `min`, against this
+/// daemon, or a newer one against an older daemon — simply gets no row,
+/// which is the same silence the field's own absence reads as.
+async fn serve_get_session_runtime_facts(
+    s: ServerStateHandle,
+    c: RuChannel<Msg>,
+) -> Result<(), ConnectionError> {
+    use minimald_rpc::GetSessionRuntimeFactsRequest;
+    minimald_rpc::GetSessionRuntimeFacts
+        .handle_channel(c, async |req| {
+            let mngr = s.sessions_manager().await;
+            let predicate = match req {
+                GetSessionRuntimeFactsRequest::Id(id) => SessionKeyPredicate::Id(id),
+                GetSessionRuntimeFactsRequest::Name(name) => SessionKeyPredicate::Name(name),
+            };
+            let record = mngr
+                .get_record(predicate)
+                .await
+                .map_err(|e| ConnectionError::Internal(e.to_string()))?;
+            match record {
+                None => Ok(Errorable::Err {
+                    error: "no session found".to_string(),
+                }),
+                Some(record) => {
+                    let host_ip_enforcement =
+                        crate::session_host::displayed_host_ip_enforcement(
+                            s.in_microvm().await,
+                            record.network,
+                            classifier::verdict_of(record.policy.egress.as_ref()),
+                            &crate::session_host::host_ip_enforcement_fact(),
+                            record.host_ip_enforcement,
+                        );
+                    Ok(Errorable::Ok(minimald_rpc::SessionRuntimeFacts {
+                        host_ip_enforcement,
+                    }))
+                }
             }
         })
         .await
@@ -2046,6 +2085,7 @@ pub async fn handle_ssh_rpc(
         | GetSessionPolicy::NAME
         | GetEffectiveSessionPolicy::NAME
         | minimald_rpc::GetLiveIngress::NAME
+        | minimald_rpc::GetSessionRuntimeFacts::NAME
         | minimald_rpc::GetSessionHooks::NAME
         | SessionDelta::NAME
         | GetSessionScreen::NAME
@@ -2134,6 +2174,9 @@ pub async fn handle_ssh_rpc(
         }
         minimald_rpc::GetLiveIngress::NAME => {
             serve!(serve_get_live_ingress(s, channel))
+        }
+        minimald_rpc::GetSessionRuntimeFacts::NAME => {
+            serve!(serve_get_session_runtime_facts(s, channel))
         }
         minimald_rpc::GetSessionHooks::NAME => serve!(serve_get_session_hooks(s, channel)),
         SessionDelta::NAME => serve!(serve_session_delta(s, channel)),
@@ -3053,8 +3096,10 @@ mod tests {
                 .unwrap()
                 .attrs
                 .contains_key(super::HOST_IP_ENFORCEMENT_ATTR),
-            "the daemon writes nothing about enforcement into a record: the \
-             state is the host's verdict, derived at read time, got: {:?}",
+            "the per-box enforcement is a daemon-owned launch record, never \
+             an attr: the record's own field carries it, written only by a \
+             launch, and displayed as that record lowered by the host's \
+             current fact, got: {:?}",
             get_session.record.as_ref().unwrap().attrs
         );
 
@@ -3279,21 +3324,22 @@ mod tests {
     /// create reply and every surface that reads the session after the
     /// create all say its egress is not enforced per box — the reply so a
     /// client can say it at once, the listing a picker reads without a
-    /// round trip per session, and the effective-policy reply
-    /// `min session policy` renders, where the state rides beside the rules
-    /// it qualifies: a deny-all declaration with an enforcement of `none` is
-    /// the state the box actually runs in, not a verdict that looks decided
-    /// and is not. A deny-all box running unenforced is the requirement's
-    /// own case. All of it is derived at read time from the one node fact —
-    /// nothing is recorded, so the record the create leaves carries no
-    /// enforcement key at all — and a box whose verdict is decided on
-    /// address leases instead of the host's cgroup tree carries nothing:
-    /// `None`, not `none`, on every surface — the same nothing a daemon
-    /// that predates the field says. A box the classifier refuses — the
-    /// deny-all box over a probe cause — shows nothing on the create
-    /// reply or the read surfaces, exactly as its launch refuses it,
-    /// while the host-address boxes that are not refused keep showing
-    /// the fact.
+    /// round trip per session, and the runtime-facts reply
+    /// `min session policy` renders beside the rules it qualifies: a
+    /// deny-all declaration with an enforcement of `none` is the state the
+    /// box actually runs in, not a verdict that looks decided and is not.
+    /// A deny-all box running unenforced is the requirement's own case. The
+    /// enforcement is a daemon-owned launch record — never an attr a
+    /// client can assert, and nothing the create writes — displayed as
+    /// that record lowered by the host's current fact; none of these
+    /// sessions launches, so the reads answer over the fact alone. A box
+    /// whose verdict is decided on address leases instead of the host's
+    /// cgroup tree carries nothing: `None`, not `none`, on every surface —
+    /// the same nothing a daemon that predates the field says. A box the
+    /// classifier refuses — the deny-all box over a probe cause — shows
+    /// nothing on the create reply or the read surfaces, exactly as its
+    /// launch refuses it, while the host-address boxes that are not
+    /// refused keep showing the fact.
     // The guard is taken before the server is even built and held across
     // the awaited creates on purpose: the fact is process-global, so under
     // libtest another test's read in the window would answer over it too.
@@ -3333,9 +3379,11 @@ mod tests {
             created.classifier_advisory
         );
 
-        // Nothing is recorded: the state is the host's, derived at read
-        // time, so the record the create leaves carries no enforcement key —
-        // an old state cannot outlive the read that replaced it.
+        // Nothing is recorded by the create: the state the reply named is
+        // the daemon's one classifier fact, and the launch record the reads
+        // answer over — the record's own `host_ip_enforcement` field, which
+        // only a launch writes — is still empty, so the record's attrs
+        // carry no enforcement key at all.
         let record = client
             .call::<GetSessionRecord>(&GetSessionRecordRequest::Id(created.id))
             .await;
@@ -3345,13 +3393,14 @@ mod tests {
             .attrs;
         assert!(
             !attrs.contains_key(super::HOST_IP_ENFORCEMENT_ATTR),
-            "the daemon writes nothing about enforcement into a record, so \
-             the state cannot go stale on one, got: {attrs:?}"
+            "the per-box enforcement is a daemon-owned launch record, never \
+             an attr: no create records it, and the reads show the record a \
+             launch wrote, lowered by the host's current fact, got: {attrs:?}"
         );
 
         // The surfaces that read a session after the create derive their
         // answer from the same fact the reply stated: the listing a picker
-        // reads without a round trip per session, and the effective-policy
+        // reads without a round trip per session, and the runtime-facts
         // reply `min session policy` renders. All of them agree by
         // construction here — they read one fact, the daemon's own.
         let listed = client.call::<ListSessions>(&()).await;
@@ -3377,12 +3426,11 @@ mod tests {
             "the policy reply keeps the declaration the box launched with"
         );
         assert_eq!(
-            policy.host_ip_enforcement.as_deref(),
-            Some("none"),
-            "the policy reply must carry the state beside the rules it \
+            facts_enforcement(&mut client, created.id).await,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the runtime-facts reply carries the state beside the rules it \
              qualifies: a deny-all declaration that is not decided per box \
-             is the state the box runs in, got: {:?}",
-            policy.host_ip_enforcement
+             is the state the box runs in"
         );
 
         // A box whose verdict is decided on address leases carries nothing:
@@ -3418,16 +3466,11 @@ mod tests {
              verdict was decided on address leases, got: {:?}",
             own_entry.host_ip_enforcement
         );
-        let own_policy = client
-            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(own_address))
-            .await
-            .unwrap();
         assert!(
-            own_policy.host_ip_enforcement.is_none(),
-            "an own-address box shows nothing on the policy reply either — \
-             there is no per-box state to qualify rules that are decided on \
-             leases, got: {:?}",
-            own_policy.host_ip_enforcement
+            facts_enforcement(&mut client, own_address).await.is_none(),
+            "an own-address box shows nothing on the runtime-facts reply \
+             either — there is no per-box state to qualify rules that are \
+             decided on leases"
         );
 
         // A box the classifier refuses shows nothing on any surface: the
@@ -3435,7 +3478,7 @@ mod tests {
         // box natively, and the same launch gate the derivation shares —
         // the deny-all box's launch is refused on this ground, so the
         // create that mints it says no enforcement value, and its listing
-        // entry and its policy reply say nothing rather than `none`. The
+        // entry and its runtime-facts reply say nothing rather than `none`. The
         // host-address boxes that are not refused keep showing the fact:
         // the one carrying an egress section still runs unenforced and
         // still says so, at its create and after.
@@ -3492,15 +3535,9 @@ mod tests {
              listing — the refusal is what its launch said, got: {:?}",
             refused.host_ip_enforcement
         );
-        let refused_policy = client
-            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(created.id))
-            .await
-            .unwrap();
         assert!(
-            refused_policy.host_ip_enforcement.is_none(),
-            "a refused box shows nothing on the policy reply either, got: \
-             {:?}",
-            refused_policy.host_ip_enforcement
+            facts_enforcement(&mut client, created.id).await.is_none(),
+            "a refused box shows nothing on the runtime-facts reply either"
         );
         let unrefused = listed
             .sessions
@@ -3669,6 +3706,23 @@ mod tests {
             .into_iter()
             .find(|e| e.id == id)
             .expect("the created session is in the listing")
+            .host_ip_enforcement
+    }
+
+    /// The enforcement the runtime-facts reply carries for one session
+    /// (NET-079): the read surface `min session policy` renders beside the
+    /// rules, so the proofs assert on what that command actually prints —
+    /// the same derivation the listing answers over, over the reply the
+    /// CLI reads.
+    async fn facts_enforcement(
+        client: &mut TestClient,
+        id: SessionId,
+    ) -> Option<minimald_rpc::HostIpEnforcement> {
+        use minimald_rpc::{GetSessionRuntimeFacts, GetSessionRuntimeFactsRequest};
+        client
+            .call::<GetSessionRuntimeFacts>(&GetSessionRuntimeFactsRequest::Id(id))
+            .await
+            .unwrap()
             .host_ip_enforcement
     }
 
@@ -3954,8 +4008,8 @@ mod tests {
 
         // The reads show the boxes' own records while the host can decide:
         // A stays `none` beside B's `per_box` — on the listing and the
-        // policy reply both, and whatever the host now decides for boxes it
-        // has yet to launch.
+        // runtime-facts reply both, and whatever the host now decides for
+        // boxes it has yet to launch.
         assert_eq!(
             listed_enforcement(&mut client, created_a.id).await,
             Some(minimald_rpc::HostIpEnforcement::None),
@@ -3968,27 +4022,17 @@ mod tests {
             "the listing shows box B's own launch record while its host can \
              still decide per box"
         );
-        let policy_a = client
-            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(created_a.id))
-            .await
-            .unwrap();
         assert_eq!(
-            policy_a.host_ip_enforcement.as_deref(),
-            Some("none"),
-            "the policy reply shows box A's own launch record beside the \
-             rules it runs under, got: {:?}",
-            policy_a.host_ip_enforcement
+            facts_enforcement(&mut client, created_a.id).await,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the runtime-facts reply shows box A's own launch record beside \
+             the rules it runs under"
         );
-        let policy_b = client
-            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(created_b.id))
-            .await
-            .unwrap();
         assert_eq!(
-            policy_b.host_ip_enforcement.as_deref(),
-            Some("per_box"),
-            "the policy reply shows box B's own launch record while its host \
-             can still decide per box, got: {:?}",
-            policy_b.host_ip_enforcement
+            facts_enforcement(&mut client, created_b.id).await,
+            Some(minimald_rpc::HostIpEnforcement::PerBox),
+            "the runtime-facts reply shows box B's own launch record while \
+             its host can still decide per box"
         );
 
         // The observability half: one info line per host-address box launch,
@@ -4051,16 +4095,11 @@ mod tests {
             Some(minimald_rpc::HostIpEnforcement::None),
             "box A stays `none` — the state its own launch left it in"
         );
-        let policy_b = client
-            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(created_b.id))
-            .await
-            .unwrap();
         assert_eq!(
-            policy_b.host_ip_enforcement.as_deref(),
-            Some("none"),
-            "the policy reply lowers box B's own record too, beside the \
-             rules it qualifies, got: {:?}",
-            policy_b.host_ip_enforcement
+            facts_enforcement(&mut client, created_b.id).await,
+            Some(minimald_rpc::HostIpEnforcement::None),
+            "the runtime-facts reply lowers box B's own record too, beside \
+             the rules it qualifies"
         );
 
         drop(channel_a);
@@ -4127,17 +4166,10 @@ mod tests {
             "an own-address box shows no enforcement on the listing, \
              assertion or not: its verdict is decided on address leases"
         );
-        let own_policy = client
-            .call::<GetEffectiveSessionPolicy>(&GetEffectiveSessionPolicyRequest::Id(
-                own_address.id,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            own_policy.host_ip_enforcement, None,
-            "an own-address box shows no enforcement on the policy reply \
-             either, assertion or not, got: {:?}",
-            own_policy.host_ip_enforcement
+        assert!(
+            facts_enforcement(&mut client, own_address.id).await.is_none(),
+            "an own-address box shows no enforcement on the runtime-facts \
+             reply either, assertion or not"
         );
 
         // The strip is for every network mode: a host-address box carrying
@@ -4826,12 +4858,10 @@ mod tests {
                 NetworkMode::OwnIp,
                 sessions::EgressDefaultPhase::InForce,
                 false,
-                None,
             ),
             EffectiveSessionPolicy {
                 egress: EffectiveEgress::DenyAll,
                 ingress: None,
-                host_ip_enforcement: None,
             },
             "an own-address box with no egress section must answer deny-all in force",
         );
@@ -4843,7 +4873,6 @@ mod tests {
         let deny_all = EffectiveSessionPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
-            host_ip_enforcement: None,
         };
         let wire = serde_json_lenient::to_string(&minimald_rpc::Errorable::Ok(deny_all.clone()))
             .expect("the deny-all reply must serialize");
@@ -4871,7 +4900,6 @@ mod tests {
                 NetworkMode::OwnIp,
                 sessions::EGRESS_DEFAULT_PHASE,
                 false,
-                None,
             ),
             "the wire must answer the shipped phase's resolution for a bare box",
         );
@@ -4930,7 +4958,6 @@ mod tests {
             EffectiveSessionPolicy {
                 egress: EffectiveEgress::AllowAll,
                 ingress: None,
-                host_ip_enforcement: None,
             },
             "behind the opt-out, an absent egress section keeps the shipped allow-all",
         );

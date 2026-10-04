@@ -342,9 +342,8 @@ pub enum EffectiveEgress {
     Declared(EgressPolicy),
 }
 
-/// A session's policy with its egress half resolved to what the gate
-/// enforces: the answer `GetEffectiveSessionPolicy` serves and
-/// `min session policy` renders (NET-075) — the shape that can carry
+/// The answer `GetEffectiveSessionPolicy` serves and `min session policy`
+/// renders (NET-075) — the shape that can carry
 /// [`EffectiveEgress::DenyAll`] without rewriting the strict
 /// [`SessionPolicy`] declaration. The ingress half is carried verbatim:
 /// ingress has no rollout default.
@@ -358,6 +357,10 @@ pub enum EffectiveEgress {
 // must fall through to the `Err` arm rather than decode as a valid policy —
 // a silent false negative on a security-introspection command. Its `egress`
 // is required, not an `Option`, so the error reply falls through on its own.
+// The strictness is also the wire contract with an older `min`: an old client
+// rejects a key it has no field for, so a fact that did not exist when it was
+// built must ride its own reply (`GetSessionRuntimeFacts`, the way live
+// ingress rides `GetLiveIngress`) rather than a new field here.
 #[serde(deny_unknown_fields)]
 pub struct EffectiveSessionPolicy {
     /// The effective egress: the declaration, or the default the rollout
@@ -365,26 +368,6 @@ pub struct EffectiveSessionPolicy {
     pub egress: EffectiveEgress,
     /// Ingress policy; `None` when no explicit ingress config is present.
     pub ingress: Option<IngressPolicy>,
-    /// The per-box egress enforcement the session's box actually runs under
-    /// (NET-079): `per_box` when the box's own launch placed it in a
-    /// classifier leaf of its own, `none` when it did not and the box runs
-    /// with the host's address and no verdict of its own. `None` for a
-    /// session that is not host-address — an own-address or none box's
-    /// verdict is decided on address leases, never on the host's cgroup
-    /// tree — and from a daemon that predates the field, whose silence
-    /// never reads as a decided `per_box`. Carried beside the rules because
-    /// the enforcement is what makes them true or not: on a host that cannot
-    /// decide per box a deny-all declaration prints `deny all` beside an
-    /// enforcement of `none`, the state the box actually runs in, rather
-    /// than a verdict that looks decided and is not.
-    ///
-    /// The state it names is the box's own launch record — the same one
-    /// [`Record::host_ip_enforcement`] holds and the listing answers over —
-    /// lowered to `none` when the host can no longer decide per box, never
-    /// raised above it, and the host's current state only until the box's
-    /// first launch has a record of its own to show.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_ip_enforcement: Option<String>,
 }
 
 /// Resolves the effective egress of a box (NET-074/NET-077): a declared
@@ -653,9 +636,9 @@ pub enum HostIpEnforcement {
 
 impl HostIpEnforcement {
     /// The machine spelling the stringly surfaces carry — the create
-    /// response, the effective-policy reply, the daemon's log lines — so a
-    /// script that greps one surface for the state finds the same word on
-    /// every other.
+    /// response, the session runtime-facts reply, the daemon's log lines —
+    /// so a script that greps one surface for the state finds the same word
+    /// on every other.
     #[must_use]
     pub fn machine_str(self) -> &'static str {
         match self {

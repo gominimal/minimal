@@ -880,7 +880,7 @@ async fn policy_shows_effective_egress() {
     );
 
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp, None).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::OwnIp, None, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -922,7 +922,7 @@ async fn policy_shows_effective_egress() {
         }
     };
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet, None).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet, None, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("subnets  10.0.0.0/8"),
@@ -931,6 +931,45 @@ async fn policy_shows_effective_egress() {
     assert!(
         !text.contains("ingress"),
         "a host-address session has no per-session ingress policy to show:\n{text}"
+    );
+
+    // NET-079: the per-box enforcement state rides its own runtime-facts
+    // reply beside the rules — never a field on the policy, whose strict
+    // shape an older `min` would reject over a key it has no field for —
+    // and the row the render prints is the state that reply carried, in the
+    // machine spelling. Whatever this host actually decides is what shows:
+    // the assertion is on the agreement between the reply and the row, not
+    // on the state, which is the host's to answer.
+    use minimald_rpc::{GetSessionRuntimeFacts, GetSessionRuntimeFactsRequest};
+    let resp = client
+        .oneshot_rpc::<GetSessionRuntimeFacts>(GetSessionRuntimeFactsRequest::Id(host_id))
+        .await
+        .unwrap();
+    let facts = match resp {
+        minimald_rpc::Errorable::Ok(facts) => facts,
+        minimald_rpc::Errorable::Err { error } => {
+            panic!("GetSessionRuntimeFacts failed: {error}")
+        }
+    };
+    let host_ip_enforcement =
+        facts.host_ip_enforcement.expect("a host-address session answers a state");
+    let mut out = Vec::new();
+    format_policy(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::HostNet,
+        Some(host_ip_enforcement),
+        None,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains(&format!(
+            "  per-box enforcement  {}\n",
+            host_ip_enforcement.machine_str()
+        )),
+        "the enforcement row must carry the runtime-facts reply's state, in \
+         its own machine spelling:\n{text}"
     );
 
     // A none box has no network, so it can carry no egress or ingress
@@ -955,7 +994,7 @@ async fn policy_shows_effective_egress() {
         }
     };
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::NoNet, None).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::NoNet, None, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert_eq!(
         text, "No network policy (NoNet)\n",
@@ -1021,7 +1060,6 @@ async fn policy_shows_deny_all_default() {
             false,
         ),
         ingress: None,
-        host_ip_enforcement: None,
     };
     assert_eq!(
         in_force.egress,
@@ -1029,7 +1067,7 @@ async fn policy_shows_deny_all_default() {
         "the in-force default for a bare own-address box is deny-all"
     );
     let mut out = Vec::new();
-    format_policy(&mut out, &in_force, sessions::NetworkMode::OwnIp, None).unwrap();
+    format_policy(&mut out, &in_force, sessions::NetworkMode::OwnIp, None, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("egress\n  deny all\n"),
@@ -1079,7 +1117,7 @@ async fn policy_shows_deny_all_default() {
     };
     assert_eq!(policy.egress, sessions::EffectiveEgress::AllowAll);
     let mut out = Vec::new();
-    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet, None).unwrap();
+    format_policy(&mut out, &policy, sessions::NetworkMode::HostNet, None, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         text.contains("egress\n  allow all\n"),
@@ -1116,7 +1154,6 @@ fn policy_shows_baseline_set() {
             false,
         ),
         ingress: None,
-        host_ip_enforcement: None,
     };
     let fabric = switch::SwitchSubnet::default();
     let mut out = Vec::new();
@@ -1124,6 +1161,7 @@ fn policy_shows_baseline_set() {
         &mut out,
         &deny_all,
         sessions::NetworkMode::OwnIp,
+        None,
         Some(fabric),
     )
     .unwrap();
@@ -1185,6 +1223,7 @@ fn policy_shows_baseline_set() {
         &mut out,
         &deny_all,
         sessions::NetworkMode::HostNet,
+        None,
         Some(fabric),
     )
     .unwrap();
@@ -1199,7 +1238,7 @@ fn policy_shows_baseline_set() {
     // and the set is left out rather than printed from the microVM plan the
     // session does not attach to.
     let mut out = Vec::new();
-    format_policy(&mut out, &deny_all, sessions::NetworkMode::OwnIp, None).unwrap();
+    format_policy(&mut out, &deny_all, sessions::NetworkMode::OwnIp, None, None).unwrap();
     let text = String::from_utf8(out).unwrap();
     assert!(
         !text.contains("node-plane baseline set"),

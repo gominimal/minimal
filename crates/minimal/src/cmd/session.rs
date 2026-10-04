@@ -1772,7 +1772,26 @@ pub async fn cmd_session_policy(
         .await
         .context("GetEffectiveSessionPolicy RPC failed")?;
 
-    // The ports the box published at runtime, listed beside the declaration
+    // NET-079's per-box enforcement answers beside the rules, over its own
+    // runtime-facts reply — never as a field on the policy, because the
+    // policy struct is `deny_unknown_fields`: an older `min` would reject the
+    // whole rules reply over a key it has no field for, so the fact rides a
+    // separate reply the way live ingress does. A client that cannot get it
+    // — an older daemon, a session mid-teardown — renders the rules with no
+    // enforcement row, silently: the row is an optional fact beside the
+    // declaration, and the same silence is what a session that is not
+    // host-address already prints.
+    let facts_lookup = match SessionLookup::parse(&args.session) {
+        SessionLookup::Id(id) => minimald_rpc::GetSessionRuntimeFactsRequest::Id(id),
+        SessionLookup::Name(n) => minimald_rpc::GetSessionRuntimeFactsRequest::Name(n),
+    };
+    let host_ip_enforcement = match client
+        .oneshot_rpc::<minimald_rpc::GetSessionRuntimeFacts>(facts_lookup)
+        .await
+    {
+        Ok(minimald_rpc::Errorable::Ok(facts)) => facts.host_ip_enforcement,
+        Ok(minimald_rpc::Errorable::Err { .. }) | Err(_) => None,
+    };
     // (NET-044) — the rows that make a `min net expose` visible rather than
     // only permitted. Built here rather than through a `SessionLookup`
     // conversion for the same reason the effective lookup above is: the
@@ -1819,7 +1838,7 @@ pub async fn cmd_session_policy(
             let fabric = (daemon_provider_kind(global) == paths::ProviderKind::Minvmd)
                 .then_some(switch::SwitchSubnet::default());
             let mut out = std::io::stdout();
-            format_policy(&mut out, &policy, record.network, fabric)?;
+            format_policy(&mut out, &policy, record.network, host_ip_enforcement, fabric)?;
             write_live_ingress(&mut out, &live)?;
             out.flush().context("Failed to write policy")?;
             Ok(())
@@ -1893,12 +1912,10 @@ pub fn write_classifier_advisory(
 /// cgroup tree, so the egress block that says what the box may reach also
 /// says whether this host can decide that per box — `none` beside a
 /// declaration that then describes the box's posture, not its fact: the
-/// state the box actually runs in, spelled in the machine's own words
-/// (`per_box`/`none`, the same spellings the record, the listing, and the
-/// daemon's log line carry), never an invented prose of its own. An
-/// own-address box, a none box, and a reply that carries no state say
-/// nothing there — the row a render prints from silence would be the
-/// decided-looking one a pre-field daemon never sent — the
+/// state the box actually runs in. An own-address box, a none box, and a
+/// reply that carries no state say nothing there — the row a render prints
+/// from silence would be the decided-looking one a daemon that predates
+/// the fact never sent — the
 /// node-plane baseline set the helper enumerates beside it (NET-130: the
 /// categories the in-VM daemon's own registry and cache fetches are to
 /// reach, one row a category's subnets, headed by the posture the
@@ -1907,7 +1924,14 @@ pub fn write_classifier_advisory(
 /// and the set binds nothing yet; in force, the set decides them whatever
 /// the box's own declaration resolves to, so it is what a deny-all box
 /// reads beside), and the ingress mappings spelled out.
-/// `network` is the session's network mode. `fabric` is the switch plan the
+/// `network` is the session's network mode. `host_ip_enforcement` is the
+/// per-box egress state the daemon's runtime-facts reply carried (NET-079):
+/// the box's own launch record lowered by the host's current fact, spelled
+/// in the machine's own words (`per_box`/`none`, the same spellings the
+/// record, the listing, and the daemon's log line carry), never an invented
+/// prose of its own. `None` — a session that is not host-address, or a
+/// daemon that predates the reply — prints no row at all. `fabric` is the
+/// switch plan the
 /// session's own-address surface leaves its frames on — the plan the
 /// host-side helper builds this enumeration from, named where the CLI knows
 /// it: the microVM backend's run path builds its registry and this set from
@@ -1929,6 +1953,7 @@ pub fn format_policy(
     out: &mut impl std::io::Write,
     effective: &sessions::EffectiveSessionPolicy,
     network: sessions::NetworkMode,
+    host_ip_enforcement: Option<sessions::HostIpEnforcement>,
     fabric: Option<switch::SwitchSubnet>,
 ) -> Result<(), anyhow::Error> {
     // A none box has no network, so it can carry no egress or ingress
@@ -1971,15 +1996,15 @@ pub fn format_policy(
     // at all — and a `deny all` printed beside an enforcement of `none` is
     // the honest rendering, the posture the box declared beside the state it
     // actually runs in, rather than a verdict that looks decided and is not.
-    // The value is the reply's, verbatim in the machine spelling: the row a
-    // person reads here names the same fact the record's
-    // `host_ip_enforcement` attribute and the daemon's log line carry, so the
+    // The value is the runtime-facts reply's, in the machine spelling: the
+    // row a person reads here names the same fact the record's
+    // `host_ip_enforcement` field and the daemon's log line carry, so the
     // three surfaces agree by construction. Printed only when the daemon
-    // reported a state — `None`, for a session that is not host-address or
-    // from a daemon that predates the field, prints nothing rather than a
-    // row silence never carried.
-    if let Some(enforcement) = &effective.host_ip_enforcement {
-        writeln!(out, "  per-box enforcement  {enforcement}")?;
+    // reported a state — `None`, for a session that is not host-address, or
+    // from a daemon too old to answer the facts reply, prints nothing
+    // rather than a row silence never carried.
+    if let Some(enforcement) = host_ip_enforcement {
+        writeln!(out, "  per-box enforcement  {}", enforcement.machine_str())?;
     }
     // The node-plane baseline set, beside the box's rules (NET-130): the
     // helper's built-in enumeration of the categories the in-VM daemon's own
@@ -2787,10 +2812,9 @@ mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: Some(DynamicIngress::Allow),
             }),
-            host_ip_enforcement: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  dynamic ingress  allow"),
@@ -2815,10 +2839,9 @@ mod tests {
                 dynamic_allowed_range: None,
                 dynamic_ingress: Some(DynamicIngress::Ask),
             }),
-            host_ip_enforcement: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  tcp  :8080 → :80"),
@@ -2839,10 +2862,9 @@ mod tests {
         let policy = EffectiveSessionPolicy {
             egress: EffectiveEgress::Declared(sessions::EgressPolicy::default()),
             ingress: None,
-            host_ip_enforcement: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains("egress\n"), "{rendered}");
         assert!(rendered.contains("  allow all\n"), "{rendered}");
@@ -2858,10 +2880,9 @@ mod tests {
         let deny_all = EffectiveSessionPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
-            host_ip_enforcement: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &deny_all, NetworkMode::OwnIp, None).unwrap();
+        format_policy(&mut out, &deny_all, NetworkMode::OwnIp, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("egress\n  deny all\n"),
@@ -2876,10 +2897,9 @@ mod tests {
         let allow_all = EffectiveSessionPolicy {
             egress: EffectiveEgress::AllowAll,
             ingress: None,
-            host_ip_enforcement: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &allow_all, NetworkMode::OwnIp, None).unwrap();
+        format_policy(&mut out, &allow_all, NetworkMode::OwnIp, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("egress\n  allow all\n"),
@@ -2888,22 +2908,29 @@ mod tests {
     }
 
     /// NET-079's per-box enforcement row in the policy render: printed as
-    /// the egress block's closing row when the daemon reported a state, in
-    /// the machine spelling the record and the daemon's log line carry —
-    /// and printed from silence never, because a row made of nothing would
-    /// be the decided-looking one a daemon that predates the field never
-    /// sent. The requirement's own case is the first: a deny-all
-    /// declaration beside an enforcement of `none` is the state the box
-    /// actually runs in, not a verdict that looks decided and is not.
+    /// the egress block's closing row when the daemon reported a state over
+    /// the runtime-facts reply, in the machine spelling the record and the
+    /// daemon's log line carry — and printed from silence never, because a
+    /// row made of nothing would be the decided-looking one a daemon that
+    /// predates the reply never sent. The requirement's own case is the
+    /// first: a deny-all declaration beside an enforcement of `none` is the
+    /// state the box actually runs in, not a verdict that looks decided and
+    /// is not.
     #[test]
     fn policy_render_carries_the_enforcement_row_when_the_host_reported_it() {
         let unenforced = EffectiveSessionPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
-            host_ip_enforcement: Some("none".to_string()),
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &unenforced, NetworkMode::HostNet, None).unwrap();
+        format_policy(
+            &mut out,
+            &unenforced,
+            NetworkMode::HostNet,
+            Some(sessions::HostIpEnforcement::None),
+            None,
+        )
+        .unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("egress\n  deny all\n  per-box enforcement  none\n"),
@@ -2915,10 +2942,16 @@ mod tests {
         let enforced = EffectiveSessionPolicy {
             egress: EffectiveEgress::AllowAll,
             ingress: None,
-            host_ip_enforcement: Some("per_box".to_string()),
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &enforced, NetworkMode::HostNet, None).unwrap();
+        format_policy(
+            &mut out,
+            &enforced,
+            NetworkMode::HostNet,
+            Some(sessions::HostIpEnforcement::PerBox),
+            None,
+        )
+        .unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             rendered.contains("  per-box enforcement  per_box\n"),
@@ -2927,14 +2960,14 @@ mod tests {
         );
 
         // No state reported, no row — the same silence an own-address box
-        // reads (its own render never carries the state at all).
+        // reads (its own render never carries the state at all), and the one
+        // a daemon too old to answer the facts reply leaves the caller with.
         let silent = EffectiveSessionPolicy {
             egress: EffectiveEgress::DenyAll,
             ingress: None,
-            host_ip_enforcement: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &silent, NetworkMode::HostNet, None).unwrap();
+        format_policy(&mut out, &silent, NetworkMode::HostNet, None, None).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
             !rendered.contains("per-box enforcement"),
@@ -3101,10 +3134,9 @@ mod tests {
                 dynamic_allowed_range: Some((3000, 3999)),
                 dynamic_ingress: Some(DynamicIngress::Allow),
             }),
-            host_ip_enforcement: None,
         };
         let mut out = Vec::new();
-        format_policy(&mut out, &policy, NetworkMode::OwnIp, None).unwrap();
+        format_policy(&mut out, &policy, NetworkMode::OwnIp, None, None).unwrap();
         write_live_ingress(&mut out, &live).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         let (declared, live_rows) = rendered

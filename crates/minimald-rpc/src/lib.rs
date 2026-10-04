@@ -458,12 +458,13 @@ pub struct SessionConfig {
     pub hooks_enabled: bool,
     /// Free-form attributes (typed by the caller), persisted onto the
     /// session's record. The daemon writes none of its own: NET-079's
-    /// per-box enforcement is a fact of the host reading the session, not of
-    /// the session's create, so it is derived at read time from the
-    /// daemon's own classifier fact and never recorded here. A client
-    /// supplying the daemon's own `host_ip_enforcement` key has it stripped
-    /// unconditionally, whatever the session's network mode — the state is
-    /// the host's verdict, never a caller's assertion.
+    /// per-box enforcement is a daemon-owned launch record, carried on the
+    /// session record's own `host_ip_enforcement` field — written only by
+    /// the box's launch, never by a create — and displayed as that record
+    /// lowered by the host's current fact, so it is never a client attr.
+    /// A client supplying the daemon's own `host_ip_enforcement` key has it
+    /// stripped unconditionally, whatever the session's network mode — the
+    /// state is the host's verdict, never a caller's assertion.
     #[serde(default)]
     pub attrs: std::collections::BTreeMap<String, String>,
 }
@@ -1209,6 +1210,64 @@ impl OneshotSshRpc for GetLiveIngress {
     const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetLiveIngress");
     type Request<'a> = GetLiveIngressRequest;
     type Response = Errorable<Vec<LiveMapping>>;
+}
+
+/// An RPC to read the runtime facts about a session a policy render wants
+/// beside its rules (NET-079): the per-box egress enforcement the session's
+/// box actually runs under — the same state [`ListSessionsEntry::host_ip_enforcement`]
+/// and the create response answer over, served the same way.
+///
+/// A separate reply rather than a field on [`EffectiveSessionPolicy`] because
+/// that policy struct is `deny_unknown_fields`: a strict struct an older `min`
+/// has no field for rejects a new key rather than ignoring it, so a fact that
+/// did not exist when that client was built must ride its own reply, the same
+/// shape live ingress takes ([`GetLiveIngress`]) — an older client that cannot
+/// ask for it never sees it, and a newer one degrades to silence rather than
+/// failing to read the rules at all. The facts are the daemon's to answer,
+/// because the enforcement is decided on the host's cgroup tree and recorded
+/// by the daemon at the box's own launch: no client can read either.
+pub struct GetSessionRuntimeFacts;
+
+/// Request for the [`GetSessionRuntimeFacts`] RPC: the same lookup as
+/// [`GetEffectiveSessionPolicyRequest`], over the same record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GetSessionRuntimeFactsRequest {
+    Name(String),
+    Id(SessionId),
+}
+
+/// The runtime facts [`GetSessionRuntimeFacts`] answers with.
+/// `deny_unknown_fields` is load-bearing, not tidiness, for the same reason
+/// [`FinalizeSessionResponse`]'s is: the reply rides an
+/// `#[serde(untagged)]` [`Errorable`], which tries `Ok(S)` first and takes
+/// it if it parses — and serde reads a missing `Option` field as `None`, so
+/// an all-optional struct would parse *any* object, including the daemon's
+/// `{"error": "..."}`. Without this, every failed facts read would decode
+/// as a successful one with nothing to report. The strictness costs nothing
+/// an older client can feel: only a client that asks for this reply ever
+/// decodes it, and one that fails to decode a later fact loses the optional
+/// row, never the rules — which is the whole reason the fact rides its own
+/// reply rather than a field on the policy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionRuntimeFacts {
+    /// The per-box egress enforcement the session's box actually runs under
+    /// (NET-079): the box's own launch record —
+    /// [`Record::host_ip_enforcement`](sessions::Record) — lowered to `none`
+    /// when the host can no longer decide per box and never raised above it,
+    /// and the host's own state only while the session's box has not
+    /// launched. `None` for a session that is not host-address, for a
+    /// host-address box the classifier refused, and when the record could not
+    /// be read back — the same states
+    /// [`ListSessionsEntry::host_ip_enforcement`] names.
+    pub host_ip_enforcement: Option<HostIpEnforcement>,
+}
+
+impl OneshotSshRpc for GetSessionRuntimeFacts {
+    const NAME: &'static str = constcat::concat!(RPC_SUBSYSTEM_PREFIX, "GetSessionRuntimeFacts");
+    type Request<'a> = GetSessionRuntimeFactsRequest;
+    type Response = Errorable<SessionRuntimeFacts>;
 }
 
 /// An RPC to list the lifecycle hooks composed into a session, and where
@@ -2057,6 +2116,83 @@ mod tests {
                 assert_eq!(c.host_ip_enforcement, None);
             }
             Errorable::Err { error } => panic!("expected Ok, got {error}"),
+        }
+    }
+
+    /// NET-079's enforcement state never rides the strict policy reply: an
+    /// older `min` built against the two-field [`EffectiveSessionPolicy`] —
+    /// `deny_unknown_fields`, the strictness that keeps an all-optional
+    /// struct from swallowing the daemon's `{"error":...}` replies under
+    /// the untagged [`Errorable`] — rejects a key it has no field for, so a
+    /// policy reply that grew the state would make every old client fail
+    /// `min session policy` outright. Pinned here as the contract that keeps
+    /// that from regressing: the reply this build serves decodes in the old
+    /// client's own strict shape, and the state answers over
+    /// [`GetSessionRuntimeFacts`] instead — a reply an old client simply
+    /// never asks for, and this build's own answer to it stays anchored the
+    /// same way the policy's `egress` is.
+    #[test]
+    fn effective_policy_reply_decodes_in_the_old_clients_strict_shape() {
+        // The reply this build serves: two fields, no enforcement key.
+        let reply = Errorable::Ok(EffectiveSessionPolicy {
+            egress: EffectiveEgress::DenyAll,
+            ingress: None,
+        });
+        let json = serde_json_lenient::to_string(&reply).expect("the policy reply serializes");
+        assert!(
+            !json.contains("host_ip_enforcement"),
+            "the strict policy reply must carry no enforcement key, got: {json}",
+        );
+
+        // The old client: the strict two-field shape it was built against,
+        // spelled as its own derive would spell it. It decodes the reply
+        // above because the reply never grew a field — and it refuses a
+        // reply that did, which is exactly why the state must ride its own
+        // RPC rather than a new field here.
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        #[serde(deny_unknown_fields)]
+        struct OldClientPolicy {
+            egress: EffectiveEgress,
+            ingress: Option<IngressPolicy>,
+        }
+        let decoded: Errorable<OldClientPolicy> = serde_json_lenient::from_str(&json)
+            .expect("the reply this build serves decodes in the old client's shape");
+        assert_eq!(
+            decoded,
+            Errorable::Ok(OldClientPolicy {
+                egress: EffectiveEgress::DenyAll,
+                ingress: None,
+            })
+        );
+        assert!(
+            serde_json_lenient::from_str::<Errorable<OldClientPolicy>>(
+                r#"{"egress":"deny_all","ingress":null,"host_ip_enforcement":"none"}"#
+            )
+            .is_err(),
+            "the old client refuses a policy reply that grew the key — the \
+             reason the state answers over its own runtime-facts reply",
+        );
+
+        // The runtime-facts reply keeps the property the strict shapes
+        // exist for: the reply is all-optional and serde reads a missing
+        // `Option` as `None`, so only `deny_unknown_fields` — rejecting the
+        // `error` key, the same load-bearing anchor
+        // [`FinalizeSessionResponse`] carries — makes the daemon's error
+        // answers fall through the untagged decode to `Err` rather than
+        // decoding as a facts object with nothing to report.
+        let facts = SessionRuntimeFacts {
+            host_ip_enforcement: Some(HostIpEnforcement::None),
+        };
+        assert_eq!(round_trip(&facts), facts);
+        match serde_json_lenient::from_str::<Errorable<SessionRuntimeFacts>>(
+            r#"{"error":"no session found"}"#,
+        )
+        .expect("an error reply is one of the untagged arms")
+        {
+            Errorable::Err { error } => assert_eq!(error, "no session found"),
+            Errorable::Ok(facts) => {
+                panic!("an error reply must not decode as facts, got {facts:?}")
+            }
         }
     }
 
