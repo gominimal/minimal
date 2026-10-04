@@ -104,10 +104,12 @@ the current directory).
 | `--allow-dns-hosts <HOST>` | | Destination DNS hostname the box may resolve and reach (e.g. `github.com`). Repeatable; unset means allow all |
 | `--allow-protocols <PROTO>` | | Outbound transport protocol the box may use: `tcp`, `udp`, or `icmp`. Repeatable; unset means allow all |
 | `--deny-subnets <CIDR>` | | Destination subnet the box may not reach, in CIDR form — subtracted from what the allow flags admit. Repeatable; unset means nothing is denied |
+| `--deny-all-egress` | | Declare deny-all egress: the box reaches no external address. Writes the deny-all `egress` section, every allow list present and empty. A box declared by flag reads in the record exactly like one whose `minimal.toml` carries the section. On a host-address box the host's classifier decides a declared deny-all per box. An undeclared box keeps the default the rollout phase resolves. Conflicts with every `--allow-*`/`--deny-*` rule flag |
 
-Together the four `--allow-*`/`--deny-*` flags form the box's `egress`
-declaration; naming any one of them stores it on the session, and `min
-session policy` shows what the session ended up with.
+Together the four `--allow-*`/`--deny-*` rule flags form the box's `egress`
+declaration. Naming one of them stores it on the session, and `min session
+policy` shows what the session ended up with. `--deny-all-egress` declares
+the whole section in one flag and cannot combine with them.
 
 Activating a path that already has a session is allowed, but warns: `min` names
 the existing session and creates a second one anyway. With two sessions on one
@@ -235,7 +237,7 @@ Renames an existing session.
 ### `session policy`
 
 ```
-min session policy <SESSION>
+min session policy <SESSION> [-o json]
 ```
 
 Prints the effective networking rules for `SESSION` (a UUID or session
@@ -249,16 +251,24 @@ to its rule or its default:
 ```
 egress
   subnets  10.0.0.0/8
-  dns hosts  allow all
+  dns hosts  allow-all
   protocols  tcp, udp
   deny subnets  169.254.169.254/32
 ```
 
-`subnets`, `dns hosts`, and `protocols` each read `allow all` when the
-matching flag was not given; `deny subnets` reads `(none)` when nothing is
-denied. The ingress block lists the published port mappings the session's
-`--ingress` flags declared (or `deny all` when none were), plus the dynamic
-port range when one is configured:
+`subnets`, `dns hosts`, and `protocols` each read `allow-all` when the
+matching flag was not given. `deny subnets` reads `(none)` when the
+declaration denies nothing. A deny-all declaration, the `egress` section
+with every allow list present and empty, prints as the one row `deny-all`.
+A box without an `egress` section prints the default the daemon resolved
+the absence to, by name and marked as what it is. `deny-all (default)`
+marks an own-address box once the deny-all default is in force.
+`allow-all (default)` marks a box behind the opt-out or one that shares
+its host's network namespace. The `(default)` mark distinguishes a verdict
+the box declared from the same verdict the default gave it. The ingress
+block lists the published port mappings the session's `--ingress` flags
+declared (or `deny-all` when none were). The `dynamic ports` row joins
+them when the ingress policy declares one:
 
 ```
 ingress
@@ -268,6 +278,50 @@ ingress
 A host-address (`--network host_ip`) session prints no ingress block at all:
 it shares its host's network namespace, so minimald applies no per-session
 ingress to it and there is no rule to state.
+
+The `live ingress` block lists the ports the box published at runtime with
+`min net expose`. Each row shows the address the forward binds on and the
+in-box port it delivers to:
+
+```
+live ingress (published at runtime)
+  tcp  127.0.64.21:3000 → :3000
+```
+
+The host binds a runtime publish at once. A frame reaches the box only
+through the relay gate its attach installed, and that gate admits only the
+ports the declaration named. So a port the box published at runtime reads
+`(pending; not yet reachable)` until the gate admits it. A row from a daemon
+older than the `pending` field reads `(unknown; daemon predates this field)`.
+The CLI never shows such a row as reachable.
+
+`-o json` (`--output json`) prints one `min/v1/session-policy` document on
+stdout instead of text. Each block the text output prints becomes a key:
+`network`, `egress`, `ingress`, and `live_ingress`. The `egress` object
+carries the verdict the gate enforces as `effective` and its origin as
+`source`. `effective` reads `deny-all`, `allow-all`, or `rules` when the
+declaration's own lists say the verdict. `source` reads `default` for the
+rollout's resolution of an absent section, `declared` for the box's own.
+A declared section appears under `rules`, its lists as the record holds
+them. The fields match the text output's `(default)` mark, so a client
+never recomputes the default rule to tell a declaration from a default.
+Each `live_ingress` row is the daemon's mapping object, with its `pending`
+state (`true`, `false`, or `null` for a daemon older than the field). The
+document leaves out the blocks the text output leaves out. A host-address
+session has no `ingress` key, and a `--network none` box has only `schema`
+and `network`. The `ingress` block has a `kind` tag, `deny_all` or
+`declared`, so a client reads one field to branch.
+
+With `-o json`, a failed run writes one `min/v1/error` object on stderr and
+exits non-zero, with no plain-text error line. The `code` field names the
+failure: `not_found` for a missing session, `daemon_unreachable`, or
+`policy_unavailable`. The code is `output_failed` when the CLI cannot write
+its own document to stdout, such as on a full disk. Any other failure has
+the code `unspecified`. The `message` field holds the text mode's error
+chain, and `hint` says what to do next. An `unspecified` object has no
+`hint`. When the
+reader closes stdout early, the run writes nothing and exits 141,
+the shell's SIGPIPE convention.
 
 ### `session hooks`
 

@@ -67,6 +67,11 @@ russh.workspace = true
 # Canonical state-dir base + provider-instance dir layout (`state`, `sock`,
 # `volume`).
 paths.workspace = true
+# The box ids a proxy attachment names its boxes by (NET-133, BEP-070): one
+# UUIDv7 minted per creation on the host, outside the VM, with its random
+# fields from the OS CSPRNG — never a counter or a digest of the box's
+# facts.
+uuid.workspace = true
 version.workspace = true
 
 [dev-dependencies]
