@@ -2791,7 +2791,15 @@ impl Session {
         // withdrawable by its publisher — and the watcher reading the same
         // set is answered with it on its next poll, so the port is never
         // asked of the switch again while this publication stands.
-        reservation.record();
+        if !reservation.record() {
+            // A revocation cleared the reservation while the bind was in
+            // flight, so it never saw this forward: this surface unbinds
+            // the one it holds (design §7.1), and the caller hears the
+            // box's spawn is gone, the answer a revoked publish shares with
+            // the stale-spawn arm below.
+            crate::net::policy::remove_ingress(&control, &[forwarder]).await;
+            return Err(ExposeFailure::Refused(ExposeRefusal::NotAttached));
+        }
         if let Err(stale) = self
             .live_ingress
             .record(crate::net::provider::LiveIngressForward {

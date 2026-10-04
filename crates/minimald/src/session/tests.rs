@@ -7761,6 +7761,137 @@ async fn cancelled_publish_releases_its_reservation() {
     drop(listener);
 }
 
+/// Ingress revocation unbinds (design §7.1), including a bind it could not
+/// see: a revocation that clears the box's publication set while a surface's
+/// bind is in flight leaves that surface holding a forward nobody else
+/// names. The surface that bound it unbinds it itself, so no forward
+/// outlives the revocation. The expose answers with the typed not-attached
+/// refusal; the watcher admits nothing and settles, never retrying the
+/// revoked port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revocation_during_in_flight_bind_leaves_no_forward() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+    let manager = server.state.sessions_manager().await;
+
+    // Two ports in the box's range, with nothing listening on either yet.
+    let mut probes: Vec<std::net::TcpListener> = (0..2).map(|_| listening_socket()).collect();
+    probes.sort_by_key(port_of);
+    let a_port = port_of(&probes[0]);
+    let b_port = port_of(&probes[1]);
+    drop(probes);
+    let switch = std::net::Ipv4Addr::new(100, 64, 128, 83);
+    let loopback = std::net::Ipv4Addr::new(127, 0, 64, 83);
+    let (handle, gate, served, gate_sender, id) = box_with_scripted_plan(
+        &mut client,
+        &manager,
+        "ownrevoke",
+        switch,
+        loopback,
+        (a_port, b_port),
+        vec![
+            (a_port, GateAnswer::Held(200)), // 1: the expose's bind on `a`
+            (b_port, GateAnswer::Held(200)), // 2: the watcher's bind on `b`
+        ],
+    )
+    .await;
+    let publications = crate::session::listen_plan_seam::publications_of(id)
+        .expect("the launch handed its publication set back");
+
+    // The expose surface: its bind on `a` is held at the stand-in, the set
+    // is revoked under it, and the bind then stands.
+    let exposing = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.expose_dynamic(a_port).await })
+    };
+    soon(|| served_naming(&served, loopback, a_port).len() == 1).await;
+    publications.revoke_all();
+    gate_sender
+        .send(1)
+        .expect("the gate opens for the held bind");
+    match exposing.await.expect("the exposing task ends") {
+        Err(crate::net::policy::ExposeFailure::Refused(
+            crate::net::policy::ExposeRefusal::NotAttached,
+        )) => {}
+        other => panic!("a publish revoked mid-bind is refused as not attached: {other:?}"),
+    }
+    let a_records = served_naming(&served, loopback, a_port);
+    assert_eq!(
+        a_records.len(),
+        2,
+        "the bind and the expose's own unbind of it: {a_records:?}"
+    );
+    assert!(
+        a_records[0].starts_with("POST /services/forwarder/expose ")
+            && a_records[1].starts_with("POST /services/forwarder/unexpose "),
+        "the forward the revocation never saw is unbound by its binder: {a_records:?}"
+    );
+    assert!(
+        publications.held_by(a_port).is_none(),
+        "the revoked publish writes nothing back into the set"
+    );
+    assert!(
+        !gate.admits_tcp(a_port),
+        "nothing is admitted for a publish revoked mid-bind"
+    );
+
+    // The watcher: the box's process listens on `b`, the watcher's bind is
+    // held at the stand-in, the set is revoked under it, and the bind then
+    // stands.
+    let b_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, b_port))
+        .expect("the box's process listens on its own port");
+    soon(|| served_naming(&served, loopback, b_port).len() == 1).await;
+    publications.revoke_all();
+    gate_sender
+        .send(2)
+        .expect("the gate opens for the held bind");
+    soon(|| served_naming(&served, loopback, b_port).len() == 2).await;
+    // Several poll intervals with the listener still standing: the watcher
+    // settled the revoked port, so it neither admits nor binds it again.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let b_records = served_naming(&served, loopback, b_port);
+    assert_eq!(
+        b_records.len(),
+        2,
+        "the bind and the watcher's own unbind of it, never a retry: {b_records:?}"
+    );
+    assert!(
+        b_records[0].starts_with("POST /services/forwarder/expose ")
+            && b_records[1].starts_with("POST /services/forwarder/unexpose "),
+        "the forward the revocation never saw is unbound by its binder: {b_records:?}"
+    );
+    assert!(
+        !gate.admits_tcp(b_port),
+        "the watcher admits nothing for a publish revoked mid-bind"
+    );
+    assert!(
+        publications.held_by(b_port).is_none(),
+        "the revoked publish writes nothing back into the set"
+    );
+    let logged = capture.contents();
+    assert!(
+        !logged.lines().any(|line| {
+            line.contains("session=ownrevoke")
+                && line.contains("published a listening port on the box's address")
+                && line.contains(&format!("port={b_port}"))
+        }),
+        "the watcher never reports a revoked publish as published: {logged}"
+    );
+    // The line follows the unbind's answer, so it is awaited.
+    soon(|| {
+        capture.contents().lines().any(|line| {
+            line.contains("session=ownrevoke")
+                && line.contains("unbound a listening port whose publication was revoked mid-bind")
+                && line.contains(&format!("port={b_port}"))
+        })
+    })
+    .await;
+
+    handle.stop().await;
+    drop(b_listener);
+}
+
 /// The box's stop is a revocation, not a publisher's withdrawal: it unbinds
 /// every runtime publication the box holds — the watcher's and the
 /// expose's alike, whichever owner holds each port — and the publication

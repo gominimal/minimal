@@ -353,6 +353,9 @@ impl BoxPublications {
     /// the set stops naming ports the revocation unbound. The publisher's
     /// own lifecycle withdrawal ([`Self::withdraw`]) stays owner-checked;
     /// this is the ingress revocation's half.
+    ///
+    /// Any future revocation path (an expose-revoke, a `dynamic_ingress`
+    /// policy change) calls this, with no owner check.
     pub fn revoke_all(&self) {
         self.set
             .lock()
@@ -392,15 +395,26 @@ impl Reservation {
     /// listed by the policy surfaces, withdrawable by its publisher — and
     /// the guard disarms. Consumes the guard, so a committed entry has no
     /// drop left that could take it down.
-    pub fn record(mut self) {
+    ///
+    /// Returns whether the reservation was still standing. `false` means a
+    /// revocation cleared it under the bind: nothing is committed, and the
+    /// forward the caller just bound is one the revocation never saw, so
+    /// the caller unbinds it itself — ingress revocation unbinds (design
+    /// §7.1), and nothing else names that forward to take it down.
+    #[must_use = "a `false` record leaves a bound forward only its caller can unbind"]
+    pub fn record(mut self) -> bool {
         self.recorded = true;
         let mut set = self.set.set.lock().expect("box publications lock poisoned");
-        if let Some(entry) = set
+        match set
             .ports
             .get_mut(&self.port)
             .filter(|e| e.token == self.token)
         {
-            entry.published = true;
+            Some(entry) => {
+                entry.published = true;
+                true
+            }
+            None => false,
         }
     }
 }
@@ -419,7 +433,13 @@ impl Drop for Reservation {
         if self.recorded {
             return;
         }
-        let mut set = self.set.set.lock().expect("box publications lock poisoned");
+        // Never `expect` here: a drop can run during an unwind, and a
+        // second panic there aborts. A poisoned map is still the map.
+        let mut set = self
+            .set
+            .set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if set
             .ports
             .get(&self.port)
@@ -983,12 +1003,22 @@ impl WatchState {
                         .await
                         {
                             Ok(mapping) => {
+                                self.reported_contention.remove(&port);
                                 // The bind stood: the reservation commits
                                 // as this watcher's publication, and the
                                 // port is a mapping from here — served,
                                 // listed, withdrawable by its publisher.
-                                reservation.record();
-                                self.reported_contention.remove(&port);
+                                if !reservation.record() {
+                                    // A revocation cleared the reservation
+                                    // under the bind, so the forward this
+                                    // watcher just bound is one it never
+                                    // saw: this watcher unbinds it, admits
+                                    // nothing, and settles — a revoked
+                                    // port is not retried.
+                                    self.unbind_revoked(port, &mapping).await;
+                                    return Appearance::Settled;
+                                }
+                                self.plan.gate.admit_published(port);
                                 self.plan.gate.admit_published(port);
                                 self.forwards.insert(port, mapping);
                                 tracing::info!(
@@ -1047,6 +1077,32 @@ impl WatchState {
                 );
                 Appearance::Settled
             }
+        }
+    }
+
+    /// Unbinds the forward a publish bound under a reservation a revocation
+    /// cleared while the bind was in flight. The revocation never saw this
+    /// forward, so this watcher, the one that holds it, takes it down; the
+    /// gate never admitted the port, so there is nothing to withdraw there.
+    /// A failed unexpose is said and left: the revocation's own pass has
+    /// already run, so there is no later pass to hand it to.
+    async fn unbind_revoked(&mut self, port: u16, mapping: &ExposedMapping) {
+        match unexpose_mapping(&self.plan.control, mapping).await {
+            Ok(()) => tracing::info!(
+                session = %self.plan.box_name,
+                host = %self.plan.published,
+                port,
+                owner = %PublicationOwner::Listen.as_str(),
+                "unbound a listening port whose publication was revoked mid-bind"
+            ),
+            Err(e) => tracing::warn!(
+                session = %self.plan.box_name,
+                host = %self.plan.published,
+                port,
+                owner = %PublicationOwner::Listen.as_str(),
+                error = %e,
+                "unbinding a listening port revoked mid-bind failed"
+            ),
         }
     }
 
@@ -2608,10 +2664,10 @@ mod tests {
             // before the watcher ever polls: the set both surfaces read,
             // holding the port the way a runtime `min net expose` does.
             |publications| {
-                publications
+                let reservation = publications
                     .reserve(port, PublicationOwner::Expose)
-                    .expect("nothing holds the port yet")
-                    .record();
+                    .expect("nothing holds the port yet");
+                assert!(reservation.record(), "nothing revoked the reservation");
             },
         );
         let (lines, _guard) = captured_lines();
@@ -2687,10 +2743,10 @@ mod tests {
             (PublicationOwner::Listen, PublicationOwner::Expose),
             (PublicationOwner::Expose, PublicationOwner::Listen),
         ] {
-            publications
+            let reservation = publications
                 .reserve(8080, holder)
-                .expect("the first surface to reserve wins the port")
-                .record();
+                .expect("the first surface to reserve wins the port");
+            assert!(reservation.record(), "nothing revoked the reservation");
             match publications.reserve(8080, other) {
                 Err(held) => assert_eq!(
                     held,
@@ -2753,7 +2809,7 @@ mod tests {
         let published = publications
             .reserve(8080, PublicationOwner::Listen)
             .expect("the failed reservation gave the port back");
-        published.record();
+        assert!(published.record(), "nothing revoked the reservation");
         assert_eq!(
             publications.held_by(8080),
             Some(PublicationOwner::Listen),
@@ -2769,7 +2825,10 @@ mod tests {
             .reserve(8081, PublicationOwner::Expose)
             .expect("nothing holds the other port yet");
         publications.revoke_all();
-        stale.record();
+        assert!(
+            !stale.record(),
+            "a record after a revocation reports the reservation gone"
+        );
         assert!(
             publications.held_by(8081).is_none(),
             "a record after a revocation writes nothing back"
