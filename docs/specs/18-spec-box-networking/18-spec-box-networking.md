@@ -133,7 +133,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-003** THE SYSTEM SHALL resolve `host.min.internal` from host-address, own-address, and VM-backed boxes to the address that reaches the host's loopback: `127.0.0.1` on the host, the switch's host-gateway address inside boxes.
   tier:     T0
   verify:   cargo nextest run -p minimald host_min_internal_resolves_to_host_reach_address_per_mode
-  <!-- S1a/AC2; prose 3; ubiquitous; "inside boxes" per design §7.1 without qualification: an own-address box on a native host sits on the switch too; a host-address box on a native host shares the host's namespace and its answer; resolution only: reach over the name is local reach under the box's egress rules (NET-079; design §7.1 local names), so a deny-all box resolves it and reaches nothing -->
+  <!-- S1a/AC2; prose 3; ubiquitous; "inside boxes" per design §7.1 without qualification: an own-address box on a native host sits on the switch too; a host-address box on a native host shares the host's namespace and its answer; resolution only: reach over the name is local reach under the box's egress rules (NET-079; design §7.1 local names), so a deny-all box resolves it and reaches nothing; box→host reach over the name is default-deny except configured host exposures (design §7.1), so an allow-all box reaches only those -->
   - WHERE the host is VM-backed, WHILE a box is a host-address box THE SYSTEM SHALL resolve its lookups through the node's DNS layer and never through the host's own resolver.
     tier:   T0
     verify: cargo nextest run -p minimald host_ip_box_resolves_through_node_dns_layer
@@ -142,7 +142,7 @@ included, with every refusal logged (NET-001 to NET-004).
 - **NET-004** WHEN a box connects to the literal `100.64.255.254` THE SYSTEM SHALL route the connection as `host.min.internal` and emit a deprecation notice.
   tier:     T0
   verify:   cargo nextest run -p minimald legacy_host_literal_routes_with_deprecation
-  <!-- S1a/AC2; prose 3; event-driven; "for one release" is a plan fact -->
+  <!-- S1a/AC2; prose 3; event-driven; "for one release" is a plan fact; routing as `host.min.internal` means the literal reaches what that name reaches: box→host default-deny except configured host exposures (design §7.1), so the deprecated spelling grants nothing the name does not -->
 
 - **NET-006** THE SYSTEM SHALL answer `*.min.internal` names only to lookups that originate on the machine.
   tier:     T0
