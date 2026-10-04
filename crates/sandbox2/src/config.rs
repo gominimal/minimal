@@ -510,11 +510,10 @@ impl Config {
     #[must_use]
     pub fn command_env(&self) -> BTreeMap<String, String> {
         let mut env = BTreeMap::new();
-        // The layout default `PATH`, set below; captured up front so a composed
-        // `PATH` can expand `$PATH`/`${PATH}` against it without re-borrowing
-        // `env` while the `set` closure holds it mutably.
+        // The layout default `PATH`; a composed `PATH` expands `$PATH`/`${PATH}`
+        // against it.
         let default_path = if let WdSetup::Session { .. } = &self.wd {
-            "/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin"
+            "/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin" // adds /home/.local/bin
         } else {
             "/usr/bin:/bin:/usr/sbin:/sbin"
         };
@@ -527,7 +526,7 @@ impl Config {
             set("XDG_STATE_HOME", "/home/.local/state");
             set("XDG_CONFIG_HOME", "/home/.config");
             set("XDG_DATA_HOME", "/home/.local/share");
-            set("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/home/.local/bin"); // adds /home/.local/bin
+            set("PATH", default_path);
             // A styled default shell prompt for interactive sessions. Set as a
             // plain default here (not forced) so a user's composition var can
             // override it: the composed `env_vars` are applied further down and
@@ -550,7 +549,7 @@ impl Config {
             set("XDG_STATE_HOME", "/state/state");
             set("XDG_CONFIG_HOME", "/state/home");
             set("XDG_DATA_HOME", "/state/data");
-            set("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+            set("PATH", default_path);
         }
         set("XDG_CACHE_HOME", "/state/cache");
         set("XDG_RUNTIME_DIR", "/run");
@@ -592,25 +591,7 @@ impl Config {
         // directories are not lost. Every other variable stays literal.
         self.env_vars.iter().for_each(|(var, val)| {
             if var == "PATH" {
-                let expanded = val.replace("${PATH}", default_path);
-                let mut expanded_path = String::with_capacity(expanded.len());
-                let mut remaining = expanded.as_str();
-                while let Some(index) = remaining.find("$PATH") {
-                    expanded_path.push_str(&remaining[..index]);
-                    let after_reference = &remaining[index + "$PATH".len()..];
-                    let continues_variable = after_reference
-                        .chars()
-                        .next()
-                        .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
-                    if continues_variable {
-                        expanded_path.push_str("$PATH");
-                    } else {
-                        expanded_path.push_str(default_path);
-                    }
-                    remaining = after_reference;
-                }
-                expanded_path.push_str(remaining);
-                set(var, &expanded_path);
+                set(var, &expand_path_reference(val, default_path));
             } else {
                 set(var, val);
             }
@@ -933,6 +914,31 @@ impl Config {
     }
 }
 
+/// Replaces each `${PATH}` and `$PATH` reference in `value` with `default`.
+/// A `$PATH` followed by a character that continues a variable name (such as
+/// `$PATH_SUFFIX`) is a different variable and stays literal.
+fn expand_path_reference(value: &str, default: &str) -> String {
+    let expanded = value.replace("${PATH}", default);
+    let mut expanded_path = String::with_capacity(expanded.len());
+    let mut remaining = expanded.as_str();
+    while let Some(index) = remaining.find("$PATH") {
+        expanded_path.push_str(&remaining[..index]);
+        let after_reference = &remaining[index + "$PATH".len()..];
+        let continues_variable = after_reference
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+        if continues_variable {
+            expanded_path.push_str("$PATH");
+        } else {
+            expanded_path.push_str(default);
+        }
+        remaining = after_reference;
+    }
+    expanded_path.push_str(remaining);
+    expanded_path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,6 +1023,21 @@ mod tests {
         assert_eq!(
             literal.command_env().get("PATH").map(String::as_str),
             Some("/opt/bin"),
+        );
+    }
+
+    /// A non-session sandbox expands a composed `PATH` against its own layout
+    /// default, which has no `/home/.local/bin`.
+    #[test]
+    fn a_build_sandbox_expands_a_composed_path_against_its_default() {
+        let mut config = Config::new("test");
+        config
+            .env_vars
+            .insert("PATH".to_string(), "/opt/bin:$PATH".to_string());
+
+        assert_eq!(
+            config.command_env().get("PATH").map(String::as_str),
+            Some("/opt/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
         );
     }
 
