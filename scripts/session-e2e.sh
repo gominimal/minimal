@@ -14094,11 +14094,13 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
 # switch is asked anything — but not the host row, and an in-range publish
 # is answered with nothing written on: the box reads a failed bind. Carrying
 # the range into the host-side registration (the minvmd/sessions half of
-# NET-043) is what lets the publish arms below run on a VM lane; until it
-# lands they run where no gate sits in the ask's way — a host-native daemon
-# with a switch attached — and everywhere else they say so with this reason.
+# NET-043, deferred to T80, gominimal/minimal#1878) is what lets the publish
+# arms below run on a VM lane; until it lands they run where no gate sits in
+# the ask's way — a host-native daemon with a switch attached. The skip is
+# lane-gated: only a VM lane (E2E_VM) may take it, and only on the refusal
+# this gap produces; the same refusal on a native lane is a failure.
 runtime_publish_gap_reason() { # $1 = the port the box asked for, $2 = the declared range
-  echo "the publish for port $1 was decided allow by the box's stance ($2) but refused by the host side, which carries only the create's declared --ingress mappings and not the dynamic range — carrying the range into the host-side registration (the minvmd/sessions half of NET-043) is what lets this arm run on a VM lane"
+  echo "expected on a VM lane until T80 (gominimal/minimal#1878) lands: the publish for port $1 was decided allow by the box's stance ($2) but refused by the host side, which carries only the create's declared --ingress mappings and not the dynamic range — carrying the range into the host-side registration (the minvmd/sessions half of NET-043) is what lets this arm run on a VM lane"
 }
 
 # ---------------------------------------------------------------------------
@@ -14218,9 +14220,10 @@ proof_min_net_expose_publishes_lists_and_refuses() {
   # runs the publish arm whole below, while a bind the host side refused —
   # the gap `runtime_publish_gap_reason` above this case names, the one
   # refusal an in-range ask of an attached allow box can meet that is not
-  # the stance's own — skips the publish arm and holds the case to what every
-  # target can still prove: the stance's own typed refusals, and a listing
-  # that carries no publication at all.
+  # the stance's own — skips the publish arm on a VM lane only, and holds the
+  # case to what every target can still prove: the stance's own typed
+  # refusals, and a listing that carries no publication at all. The same
+  # refusal on a native lane has no gap to blame and fails.
   mnl session exec "$mnx_sid" "/usr/bin/min net expose $mnx_port" \
     >"$WORK/mnx-expose.out" 2>"$WORK/mnx-expose.err"
   mnx_expose_rc=$?
@@ -14240,6 +14243,11 @@ proof_min_net_expose_publishes_lists_and_refuses() {
   else
     case "$mnx_expose_err" in
       *"publishing port $mnx_port failed:"*)
+        if [ -z "${E2E_VM:-}" ]; then
+          echo "::error::the in-range expose was refused by the host side on a native lane (got: '$mnx_expose_err') — the VM-lane gap T80 (gominimal/minimal#1878) defers has no host gate here, so this refusal is a defect, not that gap"
+          cat "$WORK/mnx-expose.err" 2>/dev/null || true
+          fail
+        fi
         echo "publish arm: SKIPPED — $(runtime_publish_gap_reason "$mnx_port" "$mnx_lo-$mnx_hi")"
         echo "  (the box read: $mnx_expose_err)"
         ;;
@@ -14901,9 +14909,10 @@ PY
   # carry a runtime publish at all. The row appears and the arm runs whole
   # below, peer and host; the row is still absent after sixteen of the
   # watcher's own polls and the publish was refused by the host side — the
-  # gap `runtime_publish_gap_reason` names — and the arm says so as a skip,
-  # never as a failure: the case's enforcement legs, the refusals above,
-  # have already run.
+  # gap `runtime_publish_gap_reason` names — and on a VM lane the arm says so
+  # as a skip, never as a failure: the case's enforcement legs, the refusals
+  # above, have already run. A native lane has no such gap, so there the
+  # absent row fails.
   mnl session exec "$lp_sid" \
     "nohup /usr/bin/socat TCP-LISTEN:$lp_listen_port,reuseaddr,fork SYSTEM:\"cat /home/lp-http200\" >/dev/null 2>&1 & echo \$! > /home/lp.pid" \
     >/dev/null 2>>"$WORK/lp-responder.err" \
@@ -14944,6 +14953,11 @@ PY
         fail
         ;;
     esac
+    if [ -z "${E2E_VM:-}" ]; then
+      echo "::error::the in-range listen on port $lp_listen_port was never listed as published on a native lane — the VM-lane gap T80 (gominimal/minimal#1878) defers has no host gate here, so an unpublished listen is a defect, not that gap"
+      printf '%s\n' "$lp_policy" | sed 's/^/  /'
+      fail
+    fi
     echo "in-range arm: SKIPPED — $(runtime_publish_gap_reason "$lp_listen_port" "$lp_lo-$lp_hi")"
     echo "  (the listen stood through the watcher's own polls and was never listed as published on either of the box's policy renderings)"
     echo "--- min session policy (text), the listing this skip was read off ---"
