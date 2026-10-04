@@ -96,9 +96,11 @@ runtime_packages = ["<additional runtime package>"] # optional
 The `[stack]` section configures the [stack](../concepts/stacks.md) to use for building code, if any.
 See [stack specs](./stack-specs.md) for how stacks themselves are defined.
 
-`use` is an accepted alias for the canonical `name` key; both parse. `[harness]`
-is accepted as a deprecated alias for `[stack]`, pending removal after
-July 2026; prefer `[stack]` in new configs.
+`use` is an accepted alias for the canonical `name` key, and both parse.
+`[harness]` is a deprecated alias for `[stack]`, pending removal after
+July 2026. Prefer `[stack]` in new configs. A file that uses `[harness]` loads
+with a warning to rename it to `[stack]`, and a file that sets both is an
+error.
 
 The environment variables and packages configured on a stack are inherited on all tasks in this repository.
 

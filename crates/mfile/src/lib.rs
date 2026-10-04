@@ -848,7 +848,13 @@ pub enum Layout {
 }
 
 /// The loaded representation of the `minimal.toml` file.
+///
+/// `remote = "Self"` turns the derives into inherent `File::serialize` /
+/// `File::deserialize` functions, so the trait impls below can fold the
+/// deprecated `[harness]` table into `stack` on every load path (disk, bytes,
+/// and wire alike).
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(remote = "Self")]
 pub struct File {
     /// The previous link in the software supply chain.
     #[serde(alias = "base")]
@@ -860,10 +866,18 @@ pub struct File {
     #[serde(default, alias = "default")]
     pub defaults: Defaults,
     /// The stack configured on this repository, if any.
-    ///
-    /// TODO: Remove `harness` alias after July 2026.
-    #[serde(default, alias = "harness")]
+    #[serde(default)]
     pub stack: Option<Stack>,
+    /// The deprecated spelling of `[stack]`. Deserialization moves it into
+    /// `stack` and sets `deprecated_harness`, so it is always `None` after a
+    /// load.
+    ///
+    /// TODO: Remove `[harness]` support after July 2026.
+    #[serde(default, skip_serializing)]
+    harness: Option<Stack>,
+    /// Whether `stack` was spelled `[harness]`, for the deprecation warning.
+    #[serde(skip)]
+    deprecated_harness: bool,
 
     /// Task definitions, invoked with `minimal run <task name>`.
     // CodeRabbit flagged this `HashMap` -> `BTreeMap` swap as a breaking API
@@ -905,6 +919,28 @@ pub struct File {
     /// What layout this repo/layer is using, if loaded from disk.
     #[serde(skip)]
     layout: Option<Layout>,
+}
+
+impl serde::Serialize for File {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        File::serialize(self, serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for File {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut file = File::deserialize(deserializer)?;
+        if let Some(harness) = file.harness.take() {
+            if file.stack.is_some() {
+                return Err(serde::de::Error::custom(
+                    "both [stack] and [harness] are set; [harness] is a deprecated name for [stack], so remove it",
+                ));
+            }
+            file.stack = Some(harness);
+            file.deprecated_harness = true;
+        }
+        Ok(file)
+    }
 }
 
 /// Maps a key that is unknown at the top level of an mfile to the nesting
@@ -999,6 +1035,22 @@ impl File {
                 }
             }
         }
+        // serde takes one action key as `task.action` and leaves any other in
+        // `task.extra`. Refuse the task here, before `warn_unknown_fields`
+        // would misreport the extra action key as unknown and suggest an
+        // upgrade.
+        for (task_name, task) in &self.tasks {
+            let extra_actions = TaskAction::KEYS
+                .iter()
+                .filter(|k| task.extra.contains_key(**k))
+                .map(|k| k.to_string());
+            let keys: Vec<String> = std::iter::once(task.action.key().to_string())
+                .chain(extra_actions)
+                .collect();
+            if keys.len() > 1 {
+                return Err(Error::MultipleTaskActions(task_name.clone(), keys));
+            }
+        }
         self.warn_unknown_fields();
         Ok(())
     }
@@ -1082,6 +1134,10 @@ impl File {
             {
                 return;
             }
+        }
+
+        if self.deprecated_harness {
+            tracing::warn!("`[harness]` is deprecated; rename it to `[stack]` in {MFILE_NAME}");
         }
 
         let mut was_unknown_fields = false;
@@ -1493,6 +1549,8 @@ mod tests {
                 ]))),
                 defaults: Default::default(),
                 stack: None,
+                harness: None,
+                deprecated_harness: false,
                 tasks: [(
                     "test".to_string(),
                     Task {
@@ -2490,6 +2548,100 @@ mod tests {
         assert_eq!(count_unknown_warnings(&capture), 2);
 
         drop(guard);
+    }
+
+    /// `[harness]` loads as `[stack]`, and the disk load warns once that it is
+    /// deprecated, naming `[stack]` as the replacement.
+    #[test]
+    fn harness_loads_as_stack_and_warns_deprecated() {
+        let body = "name = \"shell\"\nbuild_packages = [\"gcc\"]\n";
+        let via_stack: File = toml::from_str(&format!("[stack]\n{body}")).unwrap();
+        let via_harness: File = toml::from_str(&format!("[harness]\n{body}")).unwrap();
+        assert!(via_stack.stack.is_some());
+        assert_eq!(via_harness.stack, via_stack.stack);
+
+        // Serializing never writes the deprecated spelling back out.
+        let out = toml::to_string(&via_harness).unwrap();
+        assert!(out.contains("[stack]") && !out.contains("harness"), "{out}");
+
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(MFILE_NAME), format!("[harness]\n{body}")).unwrap();
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let file = File::from_dir(dir.path()).unwrap();
+        file.validate().unwrap();
+        drop(guard);
+
+        assert_eq!(file.stack, via_stack.stack);
+        let out = capture.contents();
+        let deprecated: Vec<_> = out
+            .lines()
+            .filter(|l| l.contains("`[harness]` is deprecated; rename it to `[stack]`"))
+            .collect();
+        assert_eq!(deprecated.len(), 1, "{out}");
+        assert!(!out.contains("update to a newer version"), "{out}");
+    }
+
+    #[test]
+    fn harness_and_stack_together_is_an_error() {
+        let err = toml::from_str::<File>("[stack]\nname = \"a\"\n\n[harness]\nname = \"b\"\n")
+            .expect_err("both [stack] and [harness] must be refused");
+        assert!(
+            err.to_string().contains("both [stack] and [harness]"),
+            "{err}"
+        );
+    }
+
+    /// A task with two action keys is refused with an error naming the task
+    /// and both keys, instead of running one and calling the other unknown.
+    #[test]
+    fn task_with_two_actions_is_refused() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(MFILE_NAME),
+            "[tasks.both]\nexec = [\"echo\", \"from-exec\"]\nbash = \"echo from-bash\"\n",
+        )
+        .unwrap();
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let err = File::from_dir(dir.path()).expect_err("two actions must be refused");
+        drop(guard);
+
+        assert!(matches!(err, Error::MultipleTaskActions(..)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("task `both` sets more than one action ("),
+            "{msg}"
+        );
+        assert!(msg.contains("exec") && msg.contains("bash"), "{msg}");
+        assert!(msg.ends_with("); set exactly one"), "{msg}");
+        let out = capture.contents();
+        assert!(!out.contains("unknown fields in task"), "{out}");
+        assert!(!out.contains("update to a newer version"), "{out}");
+    }
+
+    #[test]
+    fn task_with_one_action_passes_validate() {
+        for action in [
+            "exec = [\"echo\", \"hi\"]",
+            "bash = \"echo hi\"",
+            "echo = \"hi\"",
+            "cmdcmd = [\"gen\"]",
+        ] {
+            let file: File = toml::from_str(&format!("[tasks.one]\n{action}\n")).unwrap();
+            file.validate().unwrap_or_else(|e| panic!("{action}: {e}"));
+            assert!(file.tasks["one"].extra.is_empty(), "{action}");
+        }
     }
 
     fn count_unknown_warnings(capture: &CaptureWriter) -> usize {

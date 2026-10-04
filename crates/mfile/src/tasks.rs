@@ -143,6 +143,21 @@ impl Default for TaskAction {
 }
 
 impl TaskAction {
+    /// The `[tasks.<name>]` keys that each select an action. A task sets
+    /// exactly one; serde takes one as [Task::action] and leaves any other in
+    /// [Task::extra].
+    pub const KEYS: [&'static str; 4] = ["exec", "bash", "cmdcmd", "echo"];
+
+    /// The `[tasks.<name>]` key this action was set with.
+    pub fn key(&self) -> &'static str {
+        match self {
+            TaskAction::Exec(_) => "exec",
+            TaskAction::Bash(_) => "bash",
+            TaskAction::CmdCmd(_) => "cmdcmd",
+            TaskAction::Echo(_) => "echo",
+        }
+    }
+
     /// Constructs a [TaskAction] that represents the execve of the given string.
     pub fn exec_from_str(s: &str) -> Self {
         Self::Exec(StrOrList::Single(s.to_string()))

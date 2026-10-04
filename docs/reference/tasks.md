@@ -60,6 +60,9 @@ all; useful for pointers and reminders:
 echo = "Docs live at https://docs.minimal.dev"
 ```
 
+Each task sets exactly one action. If a task sets two, such as `exec` and
+`bash`, the file fails to load with an error that names the task and both keys.
+
 When [args](#args) are set on the task, arguments can be substituted into the invocation using
 Nickel's string interpolation [syntax](https://nickel-lang.org/user-manual/syntax/#strings):
 
