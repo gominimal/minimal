@@ -1682,11 +1682,9 @@ async fn deny_all_egress_flag_declares_every_allow_list_empty() {
 /// never an empty list (NET-075's CLI half): `Some(vec![])` on an allow
 /// dimension is the deny-all section, so a value that silently vanished
 /// would turn a typo into deny-all — the strongest posture the box can
-/// carry, reached by accident. The CIDR dimensions are refused by the
-/// daemon's policy validation naming the entry; the protocol dimension by
-/// the CLI's own parser; and the hostname dimension, which has no syntax
-/// to validate (any name is a host name, resolved at connect), keeps the
-/// empty value as the entry it was typed — never a silently emptied list.
+/// carry, reached by accident. The CIDR and hostname dimensions are refused
+/// by the daemon's policy validation naming the entry, and the protocol
+/// dimension by the CLI's own parser.
 #[tokio::test]
 async fn empty_egress_flag_value_is_a_validation_error() {
     let (_daemon, args) = setup().await;
@@ -1773,34 +1771,22 @@ async fn empty_egress_flag_value_is_a_validation_error() {
         "the refusal must name the typed reason: {rendered}"
     );
 
-    // `--allow-dns-hosts ""`: no syntax to validate, so the entry stands as
-    // typed — a declared host that resolves nothing, and a list that is
-    // still the caller's one entry, never an emptied one.
-    cmd_activate(
+    // `--allow-dns-hosts ""`: not a DNS hostname, so the daemon's typed
+    // validation names the entry rather than dropping it into an empty list.
+    let err = cmd_activate(
         &args,
         activate_args(vec![], vec![String::new()], vec![], vec![]),
     )
     .await
-    .expect("a host name has no syntax to refuse");
-    let mut client = connect_daemon(&args).await.unwrap();
-    use minimald_rpc::{GetSessionPolicy, GetSessionPolicyRequest};
-    let strict = client
-        .oneshot_rpc::<GetSessionPolicy>(GetSessionPolicyRequest::Name(
-            "empty-egress-value".to_string(),
-        ))
-        .await
-        .unwrap();
-    let strict = match strict {
-        minimald_rpc::Errorable::Ok(strict) => strict,
-        minimald_rpc::Errorable::Err { error } => {
-            panic!("GetSessionPolicy failed: {error}")
-        }
-    };
-    let egress = strict.egress.expect("the flag values declared a section");
-    assert_eq!(
-        egress.allow_dns_hosts,
-        Some(vec![String::new()]),
-        "the empty hostname stays the entry it was typed, never an empty list"
+    .expect_err("an empty allow-dns-hosts value is not a hostname");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("allow_dns_hosts entry"),
+        "the refusal must name the dimension: {rendered}"
+    );
+    assert!(
+        rendered.contains("is not a valid DNS hostname"),
+        "the refusal must name the typed reason: {rendered}"
     );
 }
 
