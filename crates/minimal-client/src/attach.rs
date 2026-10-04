@@ -242,6 +242,12 @@ pub fn remote_command(command: &[String]) -> Option<String> {
 /// down instead of erroring, leaving the client with ssh's rc 255 — the same
 /// status a command's own `exit 255` produces. Refusing here, before ssh is
 /// contacted, keeps the failure a clear client-side error.
+///
+/// The limit applies to the whole encoded wire for both forms on purpose. A
+/// multi-word argv is stricter than it needs to be for `E2BIG` alone, since
+/// each word is its own `execve` argument, but the whole wire still rides in
+/// one SSH exec request and must fit the transport's packet limit. Do not
+/// relax this into a per-word check without also bounding the packet.
 pub const MAX_EXEC_COMMAND_BYTES: usize = 128 * 1024;
 
 /// Encode a command for the wire, refusing one that exceeds
@@ -255,8 +261,8 @@ pub fn checked_remote_command(command: &[String]) -> anyhow::Result<Option<Strin
         && wire.len() >= MAX_EXEC_COMMAND_BYTES
     {
         anyhow::bail!(
-            "the command is {} KiB; min session exec carries at most {} KiB of arguments; pass large data on stdin or in a file under /workbench",
-            wire.len().div_ceil(1024),
+            "the command is {} bytes once encoded; min session exec needs it under {} KiB once encoded; pass large data on stdin or in a file under /workbench",
+            wire.len(),
             MAX_EXEC_COMMAND_BYTES / 1024,
         );
     }
@@ -395,7 +401,8 @@ mod tests {
         let over = "x".repeat(MAX_EXEC_COMMAND_BYTES - prefix_len + 1);
         let err = checked_remote_command(&[over]).unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("min session exec carries at most 128 KiB"));
+        assert!(msg.contains("needs it under 128 KiB once encoded"));
+        assert!(msg.contains(&format!("{} bytes", MAX_EXEC_COMMAND_BYTES + 1)));
     }
 
     /// The interactive attach path negotiates the session-key config: each
