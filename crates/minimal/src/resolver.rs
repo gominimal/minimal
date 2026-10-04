@@ -2709,13 +2709,13 @@ pub(crate) async fn host_answerer_read(status: ZoneAnswererStatus) -> HostAnswer
             answerer_bound: false,
             held_no_channel: true,
         },
-        ZoneAnswererStatus::Holder { port } | ZoneAnswererStatus::Registered { port } => {
-            HostAnswererRead {
-                port: Some(port),
-                answerer_bound: answerer_bound_at(port).await,
-                held_no_channel: false,
-            }
-        }
+        ZoneAnswererStatus::Holder { port }
+        | ZoneAnswererStatus::Registered { port }
+        | ZoneAnswererStatus::ManagerHeld { port } => HostAnswererRead {
+            port: Some(port),
+            answerer_bound: answerer_bound_at(port).await,
+            held_no_channel: false,
+        },
     }
 }
 
@@ -2825,8 +2825,23 @@ fn reply_answers_host_row(reply: &Message) -> bool {
 /// and the line says that instead. `None` for the pre-acquisition state —
 /// nothing to name yet, and the verb prints nothing for a listener still
 /// coming up, exactly as a native daemon's absent port does.
+///
+/// When the installed answerer host service holds the port (NET-122's host
+/// service), the line says the zone is manager-held and names the channel
+/// this VM's table publishes over — the hook probe's manager-held answer,
+/// as against the session-held interim the other two answered arms name.
 #[must_use]
 pub fn vm_host_answerer_line(status: ZoneAnswererStatus) -> Option<String> {
+    vm_host_answerer_line_at(status, &minvmd::net::answerer::resolve_channel_sock())
+}
+
+/// [`vm_host_answerer_line`] over a given machine-global channel path, so
+/// tests pin the wording without the host's path.
+#[must_use]
+pub(crate) fn vm_host_answerer_line_at(
+    status: ZoneAnswererStatus,
+    channel: &std::path::Path,
+) -> Option<String> {
     match status {
         ZoneAnswererStatus::Starting => None,
         ZoneAnswererStatus::Holder { port } => Some(format!(
@@ -2839,6 +2854,13 @@ pub fn vm_host_answerer_line(status: ZoneAnswererStatus) -> Option<String> {
              another VM host daemon holds it on 127.0.0.1:{port} (UDP); this \
              VM's table is registered with it · point the host's resolver at \
              it for *.{ZONE}"
+        )),
+        ZoneAnswererStatus::ManagerHeld { port } => Some(format!(
+            "manager-held: answered by the answerer host service · the \
+             service manager holds it on 127.0.0.1:{port} (UDP); this VM's \
+             table publishes to it over {} · point the host's resolver at it \
+             for *.{ZONE}",
+            channel.display()
         )),
         ZoneAnswererStatus::PortHeldNoChannel { port } => Some(format!(
             "not answered on the host · a process no zone-answerer channel \
@@ -2862,7 +2884,9 @@ pub(crate) async fn vm_host_name_surface(status: ZoneAnswererStatus) -> Option<L
     match status {
         ZoneAnswererStatus::Starting => None,
         ZoneAnswererStatus::PortHeldNoChannel { .. } => Some(LiveSurface::Proxy),
-        ZoneAnswererStatus::Holder { port } | ZoneAnswererStatus::Registered { port } => {
+        ZoneAnswererStatus::Holder { port }
+        | ZoneAnswererStatus::Registered { port }
+        | ZoneAnswererStatus::ManagerHeld { port } => {
             let detection = ls_detection().await;
             let answerer_bound = answerer_bound_at(port).await;
             live_name_surface_at(&detection, Some(port), answerer_bound).await
@@ -3115,6 +3139,45 @@ mod tests {
         // The pre-acquisition state prints nothing, like a daemon still
         // bringing a listener up.
         assert_eq!(vm_host_answerer_line(ZoneAnswererStatus::Starting), None);
+    }
+
+    /// The hook probe's two answers about who holds the zone: manager-held
+    /// when the answerer host service holds the port (the line names the
+    /// channel this VM's table publishes over), session-held when a VM host
+    /// daemon hosts the single-operator interim. Pinned because the session
+    /// e2e greps the manager-held wording after the handover.
+    #[test]
+    fn vm_host_answerer_line_says_manager_held_or_session_held() {
+        let channel = std::path::Path::new("/run/minimal/answerer.sock");
+        let line =
+            vm_host_answerer_line_at(ZoneAnswererStatus::ManagerHeld { port: 7_656 }, channel)
+                .expect("the manager-held state prints its line");
+        assert_eq!(
+            line,
+            "manager-held: answered by the answerer host service · the service \
+             manager holds it on 127.0.0.1:7656 (UDP); this VM's table publishes \
+             to it over /run/minimal/answerer.sock · point the host's resolver \
+             at it for *.min.internal"
+        );
+        assert!(
+            !line.contains("single-operator interim"),
+            "a manager-held zone is not the session-held interim: {line}"
+        );
+        for status in [
+            ZoneAnswererStatus::Holder { port: 7_656 },
+            ZoneAnswererStatus::Registered { port: 7_656 },
+        ] {
+            let line = vm_host_answerer_line_at(status, channel)
+                .expect("the session-held states print their lines");
+            assert!(
+                line.starts_with("answered by the VM host daemon (single-operator interim)"),
+                "the interim is session-held: {line}"
+            );
+            assert!(
+                !line.contains("manager-held"),
+                "the session-held interim never claims the service: {line}"
+            );
+        }
     }
 
     /// NET-138's session-start warning: the fact and the surface, the exact

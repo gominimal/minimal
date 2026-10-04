@@ -588,6 +588,15 @@ pub enum ZoneAnswererStatus {
         /// The machine's answerer port the holder serves.
         port: u16,
     },
+    /// The installed answerer host service holds the answerer port (NET-122's
+    /// host service): the service manager holds its sockets and this
+    /// daemon's table rows answer through it over the machine-global answerer
+    /// channel. The zone is manager-held, so it answers whether or not any
+    /// session holds it.
+    ManagerHeld {
+        /// The machine's answerer port the service serves.
+        port: u16,
+    },
     /// The answerer port is held by a process with no channel — a native
     /// minimald, or a foreign process — so this VM's names are not answered
     /// on the host and the hostname proxy remains the only surface.

@@ -138,7 +138,7 @@ const MAX_DATAGRAM: usize = 4096;
 /// own (this constant, the same install), re-surfacing the privileged step
 /// on a mismatch so an upgrade re-runs it and the installed copy is never
 /// left speaking a wire the daemon no longer understands.
-pub const CHANNEL_PROTOCOL_VERSION: u32 = 2;
+pub const CHANNEL_PROTOCOL_VERSION: u32 = 3;
 
 /// How long the serving side waits for a connecting node's hello before
 /// dropping the connection: a connection that never speaks is a stray
@@ -358,6 +358,37 @@ struct PublishRequest {
     rows: Vec<RegisteredRow>,
 }
 
+/// A node's request for a box's published address (design §7.1): the
+/// answerer — the installed service, or the interim while it hosts — picks
+/// the lowest free address of the box range and records it against the
+/// node and the box, so co-resident nodes never self-assign and never
+/// meet. Asking again for the same box hands back the same address.
+#[derive(Debug, Serialize, Deserialize)]
+struct AllocateRequest {
+    /// The box's name, as the node's registry holds it.
+    allocate: String,
+}
+
+/// A node's release of a box's published address: the box is gone, so the
+/// address returns to the range.
+#[derive(Debug, Serialize, Deserialize)]
+struct ReleaseAddressRequest {
+    /// The box's name, as the node's registry holds it.
+    release: String,
+}
+
+/// Any line a node sends after its hello.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum NodeLine {
+    /// A whole table's zone rows.
+    Publish(PublishRequest),
+    /// A box address request.
+    Allocate(AllocateRequest),
+    /// A box address release.
+    Release(ReleaseAddressRequest),
+}
+
 /// One row the serving side refused to hold, with the reason it named: the
 /// reply a publish carries names every row it did not take, so the node
 /// that sent it can warn about the name it lost — and about the address the
@@ -391,6 +422,9 @@ struct RegistrationReply {
     /// old wires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     holder: Option<String>,
+    /// The address an allocation handed out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    address: Option<Ipv4Addr>,
 }
 
 impl RegistrationReply {
@@ -401,6 +435,7 @@ impl RegistrationReply {
             error: None,
             refused: Vec::new(),
             holder: Some(holder.into()),
+            address: None,
         }
     }
 
@@ -411,6 +446,18 @@ impl RegistrationReply {
             error: None,
             refused,
             holder: None,
+            address: None,
+        }
+    }
+
+    /// The ack an allocation gets, carrying the address it handed out.
+    fn allocated(address: Ipv4Addr) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            refused: Vec::new(),
+            holder: None,
+            address: Some(address),
         }
     }
 
@@ -421,6 +468,7 @@ impl RegistrationReply {
             error: Some(reason.into()),
             refused: Vec::new(),
             holder: None,
+            address: None,
         }
     }
 }
@@ -449,6 +497,116 @@ struct NodeRows {
     rows: Vec<RegisteredRow>,
 }
 
+/// Who holds a published box address: the node, and the box's zone name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AddressHolder {
+    /// The node id the holder's hello carried.
+    node: String,
+    /// The box's canonical zone name.
+    name: String,
+}
+
+/// The machine's box-address book (design §7.1): every published box
+/// address the answerer handed out or a publish claimed, against the node
+/// and box that hold it. Allocation is host-global and arbitrated here, so
+/// no two nodes' boxes share an address. An address is released when its
+/// box goes (the node's release line) and when its node goes (the node's
+/// last connection ends); a restarted answerer starts empty and the nodes'
+/// re-publishes claim their addresses back, so an address is session-stable
+/// and no guest lease ever keys it.
+#[derive(Debug, Default)]
+struct AddressBook {
+    held: BTreeMap<Ipv4Addr, AddressHolder>,
+}
+
+/// The box addresses the answerer hands out: the reserved local range's
+/// `.2` to its last-but-one address (`.254` of the /24). The network
+/// address, `.1` and the broadcast address are never a box's.
+fn box_address_range() -> (Ipv4Addr, Ipv4Addr) {
+    let (network, prefix) = switch::RESERVED_LOCAL_RANGE;
+    let size = 1u32 << (32 - u32::from(prefix));
+    let first = u32::from(network);
+    (Ipv4Addr::from(first + 2), Ipv4Addr::from(first + size - 2))
+}
+
+/// Whether `address` is one the answerer hands a box.
+fn in_box_range(address: Ipv4Addr) -> bool {
+    let (first, last) = box_address_range();
+    first <= address && address <= last
+}
+
+impl AddressBook {
+    /// The address `name` of `node` holds, or the lowest free one, recorded
+    /// against them. Idempotent per box.
+    fn allocate(&mut self, node: &str, name: &str) -> Result<Ipv4Addr, String> {
+        if let Some((address, _)) = self
+            .held
+            .iter()
+            .find(|(_, holder)| holder.node == node && holder.name == name)
+        {
+            return Ok(*address);
+        }
+        let (first, last) = box_address_range();
+        let free = (u32::from(first)..=u32::from(last))
+            .map(Ipv4Addr::from)
+            .find(|address| !self.held.contains_key(address))
+            .ok_or_else(|| {
+                format!("every box address in {first}-{last} is held; none remains to hand out")
+            })?;
+        self.held.insert(
+            free,
+            AddressHolder {
+                node: node.to_string(),
+                name: name.to_string(),
+            },
+        );
+        Ok(free)
+    }
+
+    /// Records `address` against `name` of `node`, as a publish claims it;
+    /// refused when another node holds it.
+    fn claim(&mut self, node: &str, name: &str, address: Ipv4Addr) -> Result<(), String> {
+        if let Some(holder) = self.held.get(&address)
+            && holder.node != node
+        {
+            return Err(format!(
+                "another node ({}) holds the address {address}; the answerer hands each \
+                 box its own",
+                holder.node
+            ));
+        }
+        self.held.insert(
+            address,
+            AddressHolder {
+                node: node.to_string(),
+                name: name.to_string(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Releases the address `name` of `node` holds, if any.
+    fn release(&mut self, node: &str, name: &str) -> Option<Ipv4Addr> {
+        let address = self
+            .held
+            .iter()
+            .find(|(_, holder)| holder.node == node && holder.name == name)
+            .map(|(address, _)| *address)?;
+        self.held.remove(&address);
+        Some(address)
+    }
+
+    /// Releases every address `node` holds.
+    fn release_node(&mut self, node: &str) {
+        self.held.retain(|_, holder| holder.node != node);
+    }
+}
+
+/// The canonical zone name of a box a node names by its registry name.
+fn box_zone_name(name: &str) -> String {
+    canonical(&format!("{name}.{}", zone_answer::ZONE_APEX))
+}
+
 /// The rows other VM host daemons published over the channel, keyed by the
 /// connection that filed them: a publish is held while its connection
 /// lives, replaced by the connection's next line, and retired with the
@@ -458,6 +616,9 @@ struct NodeRows {
 #[derive(Debug, Default)]
 struct RegisteredTables {
     rows: Mutex<BTreeMap<u64, NodeRows>>,
+    /// The box addresses handed out and claimed. Locked after `rows` when
+    /// both are held, never before.
+    book: Mutex<AddressBook>,
 }
 
 /// What one publish left in the tables: the rows the connection now holds,
@@ -547,6 +708,32 @@ impl RegisteredTables {
                 });
                 continue;
             }
+            // A box's published address is the answerer's to hand out
+            // (design §7.1): one inside the box range that no other node
+            // holds is this node's, recorded so no allocation hands it on;
+            // any other address of the reserved range is never a box's.
+            if let Some(address) = row.address
+                && address != Ipv4Addr::LOCALHOST
+            {
+                if !in_box_range(address) {
+                    let (first, last) = box_address_range();
+                    refused.push(RefusedRow {
+                        name: row.name,
+                        reason: format!(
+                            "the address {address} is outside the box address range \
+                             {first}-{last} the answerer hands out"
+                        ),
+                    });
+                    continue;
+                }
+                if let Err(reason) = self.book().claim(node, &name, address) {
+                    refused.push(RefusedRow {
+                        name: row.name,
+                        reason,
+                    });
+                    continue;
+                }
+            }
             accepted.push(row);
         }
         let outcome = PublishOutcome {
@@ -566,14 +753,51 @@ impl RegisteredTables {
     /// Retires the publish `connection` filed: the connection is over, so
     /// its names answer nothing here anymore. The retired rows come back,
     /// so the retirement's own log line can name them.
+    ///
+    /// The node's box addresses go with its last connection: a node that
+    /// left holds nothing, and its re-publish on reconnect claims them back.
     fn remove(&self, connection: u64) -> Option<NodeRows> {
-        self.rows
+        let mut rows = self.rows.lock().expect(
+            "the registered tables' lock is never held across a panic, so it cannot \
+             be poisoned",
+        );
+        let removed = rows.remove(&connection);
+        if let Some(gone) = &removed
+            && !rows.values().any(|held| held.node == gone.node)
+        {
+            self.book().release_node(&gone.node);
+        }
+        removed
+    }
+
+    /// The address book, locked.
+    fn book(&self) -> std::sync::MutexGuard<'_, AddressBook> {
+        self.book
             .lock()
-            .expect(
-                "the registered tables' lock is never held across a panic, so it cannot \
-                 be poisoned",
-            )
-            .remove(&connection)
+            .expect("the address book's lock is never held across a panic")
+    }
+
+    /// Hands `name` of `node` a box address (see [`AddressBook::allocate`]).
+    fn allocate(&self, node: &str, name: &str) -> Result<Ipv4Addr, String> {
+        self.book().allocate(node, name)
+    }
+
+    /// Releases the box address `name` of `node` holds.
+    fn release_address(&self, node: &str, name: &str) -> Option<Ipv4Addr> {
+        self.book().release(node, name)
+    }
+
+    /// Records the addresses of the hosting node's own rows, so the interim
+    /// never hands another node an address one of its own boxes holds.
+    fn claim_own(&self, node: &str, rows: &[RegisteredRow]) {
+        let mut book = self.book();
+        for row in rows {
+            if let Some(address) = row.address
+                && in_box_range(address)
+            {
+                let _ = book.claim(node, &canonical(&row.name), address);
+            }
+        }
     }
 
     /// Every published row with the connection that filed it, flattened
@@ -1113,8 +1337,9 @@ fn parse_hello(line: &str) -> Result<Hello, String> {
     serde_json_lenient::from_str(line).map_err(|error| error.to_string())
 }
 
-/// Parses one publish line, the same way ([`parse_hello`]).
-fn parse_publish(line: &str) -> Result<PublishRequest, String> {
+/// Parses one line a node sends after its hello, the same way
+/// ([`parse_hello`]).
+fn parse_node_line(line: &str) -> Result<NodeLine, String> {
     serde_json_lenient::from_str(line).map_err(|error| error.to_string())
 }
 
@@ -1513,7 +1738,55 @@ fn accept_publish(
     registered: &RegisteredTables,
     own: Option<&Arc<BoxRegistry>>,
 ) -> bool {
-    let outcome = match parse_publish(line) {
+    let publish = match parse_node_line(line) {
+        Ok(NodeLine::Publish(publish)) => Ok(publish),
+        Ok(NodeLine::Allocate(request)) => {
+            let reply = match registered.allocate(node, &box_zone_name(&request.allocate)) {
+                Ok(address) => {
+                    tracing::info!(
+                        component = COMPONENT,
+                        node = %node,
+                        name = %request.allocate,
+                        %address,
+                        "handed a box its published address"
+                    );
+                    RegistrationReply::allocated(address)
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        component = COMPONENT,
+                        node = %node,
+                        name = %request.allocate,
+                        %reason,
+                        "could not hand a box a published address"
+                    );
+                    RegistrationReply::refused(reason)
+                }
+            };
+            return reply_or_end(stream, connection, registered, &reply);
+        }
+        Ok(NodeLine::Release(request)) => {
+            if let Some(address) =
+                registered.release_address(node, &box_zone_name(&request.release))
+            {
+                tracing::info!(
+                    component = COMPONENT,
+                    node = %node,
+                    name = %request.release,
+                    %address,
+                    "released a gone box's published address"
+                );
+            }
+            return reply_or_end(
+                stream,
+                connection,
+                registered,
+                &RegistrationReply::published(Vec::new()),
+            );
+        }
+        Err(error) => Err(error),
+    };
+    let outcome = match publish {
         Ok(publish) => {
             let outcome =
                 registered.install_validated(connection, node, publish.rows, &reserved_names(own));
@@ -1564,6 +1837,24 @@ fn accept_publish(
     }
 }
 
+/// Writes `reply`, ending the connection (and retiring its rows) when the
+/// write fails. Returns whether the connection may carry on.
+fn reply_or_end(
+    stream: &mut UnixStream,
+    connection: u64,
+    registered: &RegisteredTables,
+    reply: &RegistrationReply,
+) -> bool {
+    match write_reply(stream, reply) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::debug!(component = COMPONENT, %error, "channel reply failed");
+            registered.remove(connection);
+            false
+        }
+    }
+}
+
 // ── the node: the publish's held connection ───────────────────────────────────
 
 /// One node's publish, held by the connection it arrived on: dropping this
@@ -1597,21 +1888,7 @@ impl Registration {
     /// and about an address the host may not be told — when it happens,
     /// not at the first lookup that finds the row absent.
     fn send(&mut self, rows: Vec<RegisteredRow>) -> io::Result<Vec<RefusedRow>> {
-        let _ = self.stream.set_read_timeout(Some(CHANNEL_REPLY_TIMEOUT));
-        write_line(&mut self.stream, &PublishRequest { rows })?;
-        let reply_line = read_reply_line(&mut self.stream)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "the answerer closed the channel",
-            )
-        })?;
-        let reply: RegistrationReply =
-            serde_json_lenient::from_str(reply_line.trim()).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("the answerer's reply did not parse: {error}"),
-                )
-            })?;
+        let reply = self.request(&PublishRequest { rows })?;
         if !reply.ok {
             return Err(io::Error::new(
                 // PermissionDenied, not ConnectionRefused: the answerer is
@@ -1625,6 +1902,51 @@ impl Registration {
             ));
         }
         Ok(reply.refused)
+    }
+
+    /// Asks the answerer for box `name`'s published address over the held
+    /// connection. The outer error is the connection's (the caller
+    /// reconnects); the inner one is the answerer's refusal.
+    fn allocate(&mut self, name: &str) -> io::Result<Result<Ipv4Addr, String>> {
+        let reply = self.request(&AllocateRequest {
+            allocate: name.to_string(),
+        })?;
+        Ok(if reply.ok {
+            reply
+                .address
+                .ok_or_else(|| "the answerer acknowledged the request with no address".to_string())
+        } else {
+            Err(reply
+                .error
+                .unwrap_or_else(|| "the answerer refused the request".to_string()))
+        })
+    }
+
+    /// Releases box `name`'s published address over the held connection.
+    fn release_address(&mut self, name: &str) -> io::Result<()> {
+        self.request(&ReleaseAddressRequest {
+            release: name.to_string(),
+        })
+        .map(|_| ())
+    }
+
+    /// One request line and its reply, bounded like every reply the node
+    /// waits for.
+    fn request<T: Serialize>(&mut self, line: &T) -> io::Result<RegistrationReply> {
+        let _ = self.stream.set_read_timeout(Some(CHANNEL_REPLY_TIMEOUT));
+        write_line(&mut self.stream, line)?;
+        let reply_line = read_reply_line(&mut self.stream)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the answerer closed the channel",
+            )
+        })?;
+        serde_json_lenient::from_str(reply_line.trim()).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the answerer's reply did not parse: {error}"),
+            )
+        })
     }
 
     /// Whether the answerer's end of the connection is still there: a peek
@@ -1797,7 +2119,73 @@ enum HandoverCommand {
     Release(std::sync::mpsc::Sender<ReleaseReply>),
     /// Re-bind the interim at once.
     Cancel(std::sync::mpsc::Sender<ReleaseReply>),
+    /// Hand box `name` its published address, from whichever answerer this
+    /// daemon reaches: its own book while it hosts the interim, the
+    /// answerer's over the channel otherwise.
+    Allocate {
+        /// The box's registry name.
+        name: String,
+        /// Where the address (or the refusal) goes.
+        reply: std::sync::mpsc::Sender<Result<Ipv4Addr, String>>,
+    },
+    /// Release box `name`'s published address.
+    ReleaseAddress {
+        /// The box's registry name.
+        name: String,
+    },
 }
+
+/// Answers a command the current state cannot serve: an allocation is
+/// refused with `why`, a handover request is a no-op, a release has
+/// nothing to release.
+fn refuse_command(command: HandoverCommand, why: &str) {
+    match command {
+        HandoverCommand::Release(reply) | HandoverCommand::Cancel(reply) => {
+            let _ = reply.send(ReleaseReply::no_op(
+                "this VM host daemon hosts no interim answerer",
+            ));
+        }
+        HandoverCommand::Allocate { reply, .. } => {
+            let _ = reply.send(Err(why.to_string()));
+        }
+        HandoverCommand::ReleaseAddress { .. } => {}
+    }
+}
+
+/// Waits `bound` for a table ping while refusing every command that
+/// arrives with `why`: the acquisition's wait in a state with no answerer
+/// to allocate from, so a registration hears the reason at once rather
+/// than at its own timeout.
+fn wait_refusing(
+    pings: &std::sync::mpsc::Receiver<()>,
+    commands: &std::sync::mpsc::Receiver<HandoverCommand>,
+    bound: Duration,
+    why: &str,
+) {
+    let deadline = Instant::now() + bound;
+    loop {
+        while let Ok(command) = commands.try_recv() {
+            refuse_command(command, why);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match pings.recv_timeout(remaining.min(CONNECTION_POLL)) {
+            Ok(()) => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(remaining.min(CONNECTION_POLL));
+            }
+        }
+    }
+}
+
+/// Why a box cannot be handed an address while this daemon reaches no
+/// answerer.
+const NO_ANSWERER: &str = "this VM host daemon reaches no zone answerer to hand the box an \
+                           address (see the zone-answerer lines in its log); box addresses \
+                           are allocated host-wide by the answerer, never by the node";
 
 /// The answer to a release or a cancel: whether it changed anything, and
 /// the sentence the daemon logged for it.
@@ -1887,6 +2275,77 @@ impl AnswererStatus {
     #[must_use]
     pub fn release_cancel(&self) -> ReleaseReply {
         self.ask(HandoverCommand::Cancel, "nothing to re-bind")
+    }
+
+    /// Asks the machine's answerer for box `name`'s published address
+    /// (design §7.1): allocation is host-global, arbitrated by the answerer
+    /// this daemon reaches, so co-resident nodes never self-assign.
+    ///
+    /// # Errors
+    ///
+    /// The reason no address was handed out: no answerer reachable, the
+    /// range exhausted, or no answer in time.
+    pub fn allocate(&self, name: &str) -> Result<Ipv4Addr, String> {
+        let Some(sender) = self.sender() else {
+            return Err(NO_ANSWERER.to_string());
+        };
+        let (reply_to, reply) = std::sync::mpsc::channel();
+        if sender
+            .send(HandoverCommand::Allocate {
+                name: name.to_string(),
+                reply: reply_to,
+            })
+            .is_err()
+        {
+            return Err(NO_ANSWERER.to_string());
+        }
+        reply
+            .recv_timeout(RELEASE_REPLY_TIMEOUT)
+            .unwrap_or_else(|_| {
+                Err("the zone answerer did not hand out an address in time".to_string())
+            })
+    }
+
+    /// Releases box `name`'s published address: the box is gone.
+    pub fn release_address(&self, name: &str) {
+        if let Some(sender) = self.sender() {
+            let _ = sender.send(HandoverCommand::ReleaseAddress {
+                name: name.to_string(),
+            });
+        }
+    }
+
+    fn sender(&self) -> Option<std::sync::mpsc::Sender<HandoverCommand>> {
+        self.0
+            .commands
+            .lock()
+            .expect("the answerer command lock is never held across a panic")
+            .clone()
+    }
+
+    /// A status whose allocations a test thread answers from its own book,
+    /// as node `node` — the stand-in for the acquisition loop in tests that
+    /// register boxes without one.
+    #[cfg(test)]
+    pub(crate) fn allocating_for_tests(node: &str) -> Self {
+        let status = Self::starting();
+        let commands = status.attach_commands();
+        let node = node.to_string();
+        std::thread::spawn(move || {
+            let mut book = AddressBook::default();
+            while let Ok(command) = commands.recv() {
+                match command {
+                    HandoverCommand::Allocate { name, reply } => {
+                        let _ = reply.send(book.allocate(&node, &box_zone_name(&name)));
+                    }
+                    HandoverCommand::ReleaseAddress { name } => {
+                        book.release(&node, &box_zone_name(&name));
+                    }
+                    other => refuse_command(other, NO_ANSWERER),
+                }
+            }
+        });
+        status
     }
 
     fn ask(
@@ -1987,6 +2446,8 @@ enum Wake {
     Loss,
     /// The cadence bound ran out.
     Cadence,
+    /// A command arrived for the held connection to serve.
+    Command(HandoverCommand),
 }
 
 /// Waits for the next wake after a publish lands: the registry's table
@@ -1999,11 +2460,15 @@ enum Wake {
 /// service restart a short absence window.
 fn wait_for_wake(
     pings: &mut std::sync::mpsc::Receiver<()>,
+    commands: &std::sync::mpsc::Receiver<HandoverCommand>,
     held: Option<&Registration>,
     bound: Duration,
 ) -> Wake {
     let deadline = Instant::now() + bound;
     loop {
+        if let Ok(command) = commands.try_recv() {
+            return Wake::Command(command);
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Wake::Cadence;
@@ -2028,22 +2493,62 @@ fn wait_for_wake(
 /// reconnects — and the caller reconnects next pass.
 fn wait_out_wake(
     pings: &mut std::sync::mpsc::Receiver<()>,
-    registration: Registration,
+    commands: &std::sync::mpsc::Receiver<HandoverCommand>,
+    mut registration: Registration,
     status: &AnswererStatus,
     port: u16,
     erroring: &mut bool,
 ) -> Option<Registration> {
-    match wait_for_wake(pings, Some(&registration), PORT_RECHECK) {
-        Wake::Table | Wake::Cadence => Some(registration),
-        Wake::Loss => {
-            surface_error(
-                status,
-                port,
-                erroring,
-                "the answerer's end of the channel closed (a service restart, or the \
-                 interim holder's exit)",
-            );
-            None
+    loop {
+        match wait_for_wake(pings, commands, Some(&registration), PORT_RECHECK) {
+            Wake::Table | Wake::Cadence => return Some(registration),
+            Wake::Command(command) => {
+                if !serve_over_channel(&mut registration, command) {
+                    surface_error(
+                        status,
+                        port,
+                        erroring,
+                        "the answerer channel failed while serving a box address request",
+                    );
+                    return None;
+                }
+            }
+            Wake::Loss => {
+                surface_error(
+                    status,
+                    port,
+                    erroring,
+                    "the answerer's end of the channel closed (a service restart, or the \
+                     interim holder's exit)",
+                );
+                return None;
+            }
+        }
+    }
+}
+
+/// Serves one command over the held connection: an allocation or a
+/// release goes to the answerer that holds the port; a handover request
+/// is a no-op for a daemon that hosts nothing. Returns whether the
+/// connection survived.
+fn serve_over_channel(registration: &mut Registration, command: HandoverCommand) -> bool {
+    match command {
+        HandoverCommand::Allocate { name, reply } => match registration.allocate(&name) {
+            Ok(result) => {
+                let _ = reply.send(result);
+                true
+            }
+            Err(error) => {
+                let _ = reply.send(Err(format!(
+                    "the answerer channel failed during the request: {error}"
+                )));
+                false
+            }
+        },
+        HandoverCommand::ReleaseAddress { name } => registration.release_address(&name).is_ok(),
+        other => {
+            refuse_command(other, NO_ANSWERER);
+            true
         }
     }
 }
@@ -2136,6 +2641,9 @@ fn acquire(
     // The backoff between attempts on a channel that is present but not
     // answering, doubling to the re-check cadence.
     let mut retry = CHANNEL_RETRY;
+    // The status a held connection reports: which answerer took the rows,
+    // as the last publish's hello ack named it.
+    let mut held_status = ZoneAnswererStatus::Registered { port };
     loop {
         // ── the publish arm, a held connection: re-publish the whole
         // table, idempotent. A send that fails is the connection's end —
@@ -2145,9 +2653,16 @@ fn acquire(
             match registration.send(zone_rows(&registry)) {
                 Ok(refused) => {
                     erroring = false;
-                    status.set(ZoneAnswererStatus::Registered { port });
+                    status.set(held_status);
                     warn_refused(node, refused);
-                    held = wait_out_wake(&mut pings, registration, status, port, &mut erroring);
+                    held = wait_out_wake(
+                        &mut pings,
+                        &commands,
+                        registration,
+                        status,
+                        port,
+                        &mut erroring,
+                    );
                 }
                 Err(error) => {
                     surface_error(
@@ -2183,7 +2698,8 @@ fn acquire(
             Ok(published) => {
                 retry = CHANNEL_RETRY;
                 erroring = false;
-                status.set(ZoneAnswererStatus::Registered { port });
+                held_status = registered_status(&published.holder, port);
+                status.set(held_status);
                 warn_refused(node, published.refused);
                 if !published_once {
                     published_once = true;
@@ -2191,6 +2707,7 @@ fn acquire(
                 }
                 held = wait_out_wake(
                     &mut pings,
+                    &commands,
                     published.registration,
                     status,
                     port,
@@ -2212,7 +2729,7 @@ fn acquire(
                         paths.global.display()
                     ),
                 );
-                let _ = pings.recv_timeout(retry);
+                wait_refusing(&pings, &commands, retry, NO_ANSWERER);
                 retry = (retry * 2).min(PORT_RECHECK);
                 continue;
             }
@@ -2244,7 +2761,7 @@ fn acquire(
                     &mut erroring,
                     &format!("the answerer channel is present but did not answer: {error}"),
                 );
-                let _ = pings.recv_timeout(retry);
+                wait_refusing(&pings, &commands, retry, NO_ANSWERER);
                 retry = (retry * 2).min(PORT_RECHECK);
                 continue;
             }
@@ -2263,10 +2780,12 @@ fn acquire(
                     while pings.try_recv().is_ok() {}
                     erroring = false;
                     retry = CHANNEL_RETRY;
-                    status.set(ZoneAnswererStatus::Registered { port });
+                    held_status = registered_status(&published.holder, port);
+                    status.set(held_status);
                     warn_refused(node, published.refused);
                     held = wait_out_wake(
                         &mut pings,
+                        &commands,
                         published.registration,
                         status,
                         port,
@@ -2283,7 +2802,7 @@ fn acquire(
                      channel (a native minimald, another state dir's VM host daemon, or \
                      a foreign process)",
                 );
-                let _ = pings.recv_timeout(PORT_RECHECK);
+                wait_refusing(&pings, &commands, PORT_RECHECK, NO_ANSWERER);
             }
             Err(error) => {
                 tracing::warn!(
@@ -2292,9 +2811,20 @@ fn acquire(
                     "could not bind the zone answerer's port; the box zone answers only \
                      from another VM host daemon's table"
                 );
-                let _ = pings.recv_timeout(PORT_RECHECK);
+                wait_refusing(&pings, &commands, PORT_RECHECK, NO_ANSWERER);
             }
         }
+    }
+}
+
+/// The status a node that published its rows reports, by the holder its
+/// hello ack named: the manager-held service, or another VM host daemon
+/// hosting the single-operator interim.
+fn registered_status(holder: &str, port: u16) -> ZoneAnswererStatus {
+    if holder == SERVICE_HOLDER {
+        ZoneAnswererStatus::ManagerHeld { port }
+    } else {
+        ZoneAnswererStatus::Registered { port }
     }
 }
 
@@ -2313,7 +2843,8 @@ fn announce_publish(holder: &str, port: u16, channel: &Path, node: &str) {
         node = %node,
         channel = %channel.display(),
         "the zone answerer is held by {whose}; registered this table's zone rows with it \
-         over the channel and hosts nothing here"
+         over the channel at {} and hosts nothing here",
+        channel.display()
     );
 }
 
@@ -2365,11 +2896,17 @@ fn host_interim(
             "no answerer service is installed and no interim channel answers; this \
              VM's host daemon holds the host loopback answerer port itself as the \
              single-operator interim: the box zone answers here, from this \
-             host-authored table"
+             host-authored table, and this state dir's other nodes publish over \
+             the interim channel at {}",
+            paths.interim.display()
         );
         // One table of published rows, shared by the answers and the
         // channel that fills them.
         let registered = Arc::new(RegisteredTables::new());
+        // This node's own boxes keep their addresses: the book the interim
+        // hands addresses from starts with them, so no co-resident node is
+        // handed one of them.
+        registered.claim_own(node, &zone_rows(registry));
         let answerer = HostAnswerer::new(registry.clone(), Arc::clone(&registered));
         let channel_stop = match hold_channel(
             &paths.interim,
@@ -2420,6 +2957,14 @@ fn host_interim(
                         "no release is pending; the interim answerer is serving",
                     ));
                 }
+                // The interim is the answerer: its own boxes are handed
+                // addresses from the same book its channel's nodes are.
+                Ok(HandoverCommand::Allocate { name, reply }) => {
+                    let _ = reply.send(registered.allocate(node, &box_zone_name(&name)));
+                }
+                Ok(HandoverCommand::ReleaseAddress { name }) => {
+                    registered.release_address(node, &box_zone_name(&name));
+                }
                 // The door closed (the status went with its daemon): serve
                 // for the process's life, as the interim always did.
                 Err(_) => {
@@ -2454,7 +2999,16 @@ fn host_interim(
                         "the interim answerer is already released",
                     ));
                 }
-                Err(_) => {}
+                Ok(HandoverCommand::Allocate { reply, .. }) => {
+                    let _ = reply.send(Err(
+                        "the zone answerer is being handed over to the answerer service; \
+                         retry once it answers"
+                            .to_string(),
+                    ));
+                }
+                // The book went with the released interim; the service's
+                // starts from the nodes' re-publishes.
+                Ok(HandoverCommand::ReleaseAddress { .. }) | Err(_) => {}
             }
             if paths.marker.exists()
                 && let Ok(published) = connect_and_publish(&paths.global, node, zone_rows(registry))
@@ -3704,14 +4258,15 @@ mod tests {
             .expect("the helper's thread spawns");
 
         // The helper found the channel and published there: its status says
-        // its rows answer through the holder, never that it holds the port.
+        // its rows answer through the manager-held service, never that it
+        // holds the port.
         assert_eq!(
             await_status(
                 || probe.get(),
                 "the helper never said what the machine's answerer is"
             ),
-            ZoneAnswererStatus::Registered { port },
-            "a daemon whose channel the service holds publishes, and reports that"
+            ZoneAnswererStatus::ManagerHeld { port },
+            "a daemon whose channel the service holds publishes, and reports the service"
         );
 
         // Its box name answers through the service's listener, at its own
@@ -4148,7 +4703,7 @@ mod tests {
                 || a_probe.get(),
                 "the first daemon never said what the machine's answerer is"
             ),
-            ZoneAnswererStatus::Registered { port },
+            ZoneAnswererStatus::ManagerHeld { port },
             "the first daemon published to the service"
         );
         assert_eq!(
@@ -4156,7 +4711,7 @@ mod tests {
                 || b_probe.get(),
                 "the second daemon never said what the machine's answerer is"
             ),
-            ZoneAnswererStatus::Registered { port },
+            ZoneAnswererStatus::ManagerHeld { port },
             "the second daemon published to the service"
         );
         let reply = await_answer(
@@ -4242,12 +4797,12 @@ mod tests {
         // episode the restart opened is over.
         await_status_is(
             &a_probe,
-            ZoneAnswererStatus::Registered { port },
+            ZoneAnswererStatus::ManagerHeld { port },
             "the first daemon never re-published its status",
         );
         await_status_is(
             &b_probe,
-            ZoneAnswererStatus::Registered { port },
+            ZoneAnswererStatus::ManagerHeld { port },
             "the second daemon never re-published its status",
         );
 
@@ -4447,6 +5002,159 @@ mod tests {
         probe
     }
 
+    /// Box addresses are host-global (design §7.1): the answerer hands
+    /// each node's boxes the lowest free address of `.2`-`.254`, so two
+    /// nodes under separate state dirs never share one, even for boxes of
+    /// the same name; a publish of an address another node holds, or of an
+    /// address outside the box range, is refused; and an address returns
+    /// to the range when its box is released or its node leaves.
+    #[test]
+    fn two_nodes_never_share_a_box_address() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the service");
+        let (port, channel, listener, channel_listener) = service_sockets(&dir);
+        let (stop, _handle) = start_service(listener, channel_listener);
+        let paths = || ChannelPaths {
+            global: dir.path().join("no-global.sock"),
+            interim: channel.clone(),
+            marker: dir.path().join("no-marker"),
+            release_window: RELEASE_WINDOW,
+        };
+        let empty_registry = || {
+            let registry = BoxRegistry::new(SUBNET);
+            registry.register_node_namespace(7654);
+            registry
+        };
+        let node_a = node_id_for(&dir.path().join("state-a"), "default");
+        let node_b = node_id_for(&dir.path().join("state-b"), "default");
+        let a = start_daemon(empty_registry(), port, paths(), &node_a);
+        let b = start_daemon(empty_registry(), port, paths(), &node_b);
+        await_status_is(
+            &a,
+            ZoneAnswererStatus::ManagerHeld { port },
+            "node a never reached the service",
+        );
+        await_status_is(
+            &b,
+            ZoneAnswererStatus::ManagerHeld { port },
+            "node b never reached the service",
+        );
+
+        // Two nodes' boxes of the same name: distinct addresses, both in
+        // the box range, the lowest first.
+        let a_web = a
+            .allocate("web")
+            .expect("node a's box is handed an address");
+        let b_web = b
+            .allocate("web")
+            .expect("node b's box is handed an address");
+        assert_eq!(
+            a_web,
+            Ipv4Addr::new(127, 0, 64, 2),
+            "the lowest box address first"
+        );
+        assert_eq!(
+            b_web,
+            Ipv4Addr::new(127, 0, 64, 3),
+            "the next free one for node b"
+        );
+        assert_ne!(a_web, b_web, "two nodes never share a box address");
+        assert_eq!(
+            a.allocate("web"),
+            Ok(a_web),
+            "asking again for the same box hands back the same address"
+        );
+        let a_db = a.allocate("db").expect("node a's second box");
+        assert!(
+            a_db != a_web && a_db != b_web && in_box_range(a_db),
+            "a third box takes a third address: {a_db}"
+        );
+
+        // A publish of another node's address is refused, and so is every
+        // address of the reserved range outside the box range.
+        let node_c = node_id_for(&dir.path().join("state-c"), "default");
+        let intruder = connect_and_publish(
+            &channel,
+            &node_c,
+            vec![
+                published_row("intruder", a_web),
+                published_row("network", Ipv4Addr::new(127, 0, 64, 0)),
+                published_row("one", Ipv4Addr::new(127, 0, 64, 1)),
+                published_row("broadcast", Ipv4Addr::new(127, 0, 64, 255)),
+            ],
+        )
+        .expect("node c's connection is served");
+        assert_eq!(
+            intruder.refused.len(),
+            4,
+            "every row is refused: {:?}",
+            intruder.refused
+        );
+        assert!(
+            intruder.refused[0].reason.contains("holds the address"),
+            "the held address is refused naming its holder: {}",
+            intruder.refused[0].reason
+        );
+        for refused in &intruder.refused[1..] {
+            assert!(
+                refused.reason.contains("outside the box address range"),
+                "a reserved-range address outside .2-.254 is refused: {}",
+                refused.reason
+            );
+        }
+        drop(intruder);
+
+        // A released box's address returns to the range: the next box of
+        // either node is handed it.
+        a.release_address("db");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let b_api = loop {
+            let address = b.allocate("api").expect("node b's next box");
+            if address == a_db || Instant::now() > deadline {
+                break address;
+            }
+            b.release_address("api");
+            std::thread::sleep(CONNECTION_POLL);
+        };
+        assert_eq!(
+            b_api, a_db,
+            "the released address is the lowest free one again"
+        );
+
+        // A node that leaves releases its addresses.
+        let node_d = node_id_for(&dir.path().join("state-d"), "default");
+        let mut leaving = connect_and_publish(&channel, &node_d, Vec::new())
+            .expect("node d connects")
+            .registration;
+        let d_box = leaving
+            .allocate("box")
+            .expect("the channel serves node d")
+            .expect("node d's box is handed an address");
+        drop(leaving);
+        let node_e = node_id_for(&dir.path().join("state-e"), "default");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut arriving = connect_and_publish(&channel, &node_e, Vec::new())
+                .expect("node e connects")
+                .registration;
+            let e_box = arriving
+                .allocate("box")
+                .expect("the channel serves node e")
+                .expect("node e's box is handed an address");
+            if e_box == d_box {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "node d's address {d_box} never returned after it left (node e got {e_box})"
+            );
+            arriving.release_address("box").expect("node e releases");
+            drop(arriving);
+            std::thread::sleep(CONNECTION_POLL);
+        }
+
+        stop.store(true, Ordering::SeqCst);
+    }
+
     /// The machine-global channel is one path per host: nothing of a node's
     /// state dir or VM name enters it, while the interim's channel and the
     /// node id are per state dir — so two nodes under separate state dirs
@@ -4610,7 +5318,7 @@ mod tests {
 
         await_status_is(
             &status,
-            ZoneAnswererStatus::Registered { port },
+            ZoneAnswererStatus::ManagerHeld { port },
             "the released daemon never published to the service",
         );
         let reply = await_a_record(

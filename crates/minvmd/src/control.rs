@@ -225,8 +225,12 @@ fn serve_request(
     request: BoxControlRequest,
 ) -> std::io::Result<()> {
     match request {
-        BoxControlRequest::Register(request) => register_and_reply(stream, boxes, request),
-        BoxControlRequest::Withdraw(request) => withdraw_and_reply(stream, boxes, request),
+        BoxControlRequest::Register(request) => {
+            register_and_reply(stream, boxes, answerer, request)
+        }
+        BoxControlRequest::Withdraw(request) => {
+            withdraw_and_reply(stream, boxes, answerer, request)
+        }
         BoxControlRequest::AnswererStatus => {
             let reply = BoxControlReply::Status(answerer.get());
             write_reply(stream, &reply)
@@ -399,9 +403,14 @@ fn parse_request(line: &str) -> Result<BoxControlRequest, serde_json_lenient::Er
 /// success, the reason on a refusal. One info line per registration names
 /// the box, both addresses and the declared egress the row carries: the
 /// diagnostic a bundle's VM host daemon log is read for.
+///
+/// The box's published address is the machine answerer's to hand out
+/// (design §7.1), asked for before the row is filled: a node never
+/// self-assigns one, so two state dirs' boxes never share an address.
 fn register_and_reply(
     stream: &mut UnixStream,
     boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
     request: RegisterBoxRequest,
 ) -> std::io::Result<()> {
     // The declaration as the row received it; `null` for a box with no
@@ -413,7 +422,23 @@ fn register_and_reply(
         egress: request.egress,
         credentialed_upstream: request.credentialed_upstream,
     };
-    let reply = match boxes.register_client_box(spec) {
+    let loopback_addr = match answerer.allocate(&request.name) {
+        Ok(address) => address,
+        Err(reason) => {
+            tracing::warn!(
+                box = %request.name,
+                %reason,
+                "box registration refused: the zone answerer handed out no address"
+            );
+            return write_reply(
+                stream,
+                &BoxControlReply::Error {
+                    error: format!("the zone answerer could not allocate a box address: {reason}"),
+                },
+            );
+        }
+    };
+    let reply = match boxes.register_client_box_at(spec, loopback_addr) {
         Ok(record) => {
             tracing::info!(
                 box = %record.name(),
@@ -428,6 +453,8 @@ fn register_and_reply(
             })
         }
         Err(error) => {
+            // The address goes back: no row holds it.
+            answerer.release_address(&request.name);
             tracing::debug!(
                 box = %request.name,
                 error = %error,
@@ -450,6 +477,7 @@ fn register_and_reply(
 fn withdraw_and_reply(
     stream: &mut UnixStream,
     boxes: &BoxRegistry,
+    answerer: &AnswererStatus,
     request: WithdrawBoxRequest,
 ) -> std::io::Result<()> {
     let reply = match boxes.withdraw_client_box(
@@ -458,6 +486,9 @@ fn withdraw_and_reply(
         request.loopback_address,
     ) {
         Ok(withdrawn) => {
+            // The box is gone, so its published address returns to the
+            // machine's range — the answerer's release is idempotent.
+            answerer.release_address(&request.name);
             if withdrawn.is_some() {
                 tracing::info!(
                     box = %request.name,
@@ -558,7 +589,7 @@ mod tests {
     ) -> std::io::Result<(PathBuf, JoinHandle<()>, BoxRegistry, AnswererStatus)> {
         let sock_path = dir.join(CONTROL_SOCK_FILE);
         let boxes = BoxRegistry::new(SUBNET);
-        let answerer = AnswererStatus::starting();
+        let answerer = AnswererStatus::allocating_for_tests("control-test-node");
         let handle = spawn(sock_path.clone(), boxes.clone(), answerer.clone())?;
         // Wait until the socket accepts rather than racing the bind.
         for _ in 0..500 {
@@ -658,11 +689,9 @@ mod tests {
         );
         assert_eq!(
             web.loopback_address,
-            switch::AddressPlan::default()
-                .loopback_slice_for_switch(SUBNET)
-                .expect("the default subnet is planned")
-                .first(),
-            "the first box takes the first address of the slice the host switch publishes at"
+            Ipv4Addr::new(127, 0, 64, 2),
+            "the first box takes the lowest box address the machine's answerer hands out \
+             (design §7.1): never the range's network address or .1"
         );
 
         // The registration's one info line names the box, both addresses
@@ -705,15 +734,8 @@ mod tests {
         );
         assert_eq!(
             db.loopback_address,
-            Ipv4Addr::from(
-                u32::from(
-                    switch::AddressPlan::default()
-                        .loopback_slice_for_switch(SUBNET)
-                        .expect("the default subnet is planned")
-                        .first()
-                ) + 1
-            ),
-            "the second box takes the next published loopback address"
+            Ipv4Addr::new(127, 0, 64, 3),
+            "the second box takes the answerer's next free box address"
         );
 
         // A malformed request is answered with the reason, not a hang.
@@ -1120,6 +1142,7 @@ mod tests {
         for state in [
             ZoneAnswererStatus::Holder { port },
             ZoneAnswererStatus::Registered { port },
+            ZoneAnswererStatus::ManagerHeld { port },
             ZoneAnswererStatus::PortHeldNoChannel { port },
         ] {
             answerer.set(state);
