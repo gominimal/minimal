@@ -177,10 +177,17 @@ pub struct BoxRecord {
 /// half would call two rows with different runtime admissions equal. Two
 /// records are equal when every dimension matches, the runtime set under
 /// its own lock included — an instantaneous comparison, never a stable
-/// ordering across concurrent reports.
+/// ordering across concurrent reports. The set is compared through one
+/// lock at a time, each side's taken and released before the other's: a
+/// row compared with itself — and the table's live rows are the
+/// registrations' own Arcs, so [`BoxRegistry::register`]'s caller holds
+/// the very record the table resolves — must never take its own lock
+/// twice, which a std mutex refuses. The rate window the half also holds
+/// is the limiter's bookkeeping, never the row's identity, so it is not
+/// compared.
 impl PartialEq for BoxRecord {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
+        if !(self.name == other.name
             && self.box_id == other.box_id
             && self.switch_addr == other.switch_addr
             && self.loopback_addr == other.loopback_addr
@@ -192,15 +199,23 @@ impl PartialEq for BoxRecord {
             && self.credentialed_upstream == other.credentialed_upstream
             && self.dynamic_ingress == other.dynamic_ingress
             && self.dynamic_range == other.dynamic_range
-            && *self
-                .runtime_ports
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                == *other
-                    .runtime_ports
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-            && self.egress_allow_list == other.egress_allow_list
+            && self.egress_allow_list == other.egress_allow_list)
+        {
+            return false;
+        }
+        let own_ports = self
+            .runtime_ports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ports
+            .clone();
+        let other_ports = other
+            .runtime_ports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ports
+            .clone();
+        own_ports == other_ports
     }
 }
 
