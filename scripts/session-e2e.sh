@@ -16342,9 +16342,13 @@ while True:
     fail
   fi
   TWO_VM_NAME=""
-  tw_pin_err="$(cat "$WORK/two-vm-pinned.err" "$tw_alpha/run.log" 2>/dev/null || true)"
-  if [[ "$tw_pin_err" != *"$tw_held"* ]] || [[ "$tw_pin_err" != *"never redraws"* ]]; then
-    echo "::error::the failed start does not name the configured port $tw_held and that it never redraws (T93)"
+  # The detach's own stderr — what the CLI's autospawn error carries — must
+  # name the port, the holder and why inline.
+  tw_pin_err="$(cat "$WORK/two-vm-pinned.err" 2>/dev/null || true)"
+  if [[ "$tw_pin_err" != *"hostname proxy port $tw_held held by"* ]] \
+     || [[ "$tw_pin_err" != *"never redraw"* ]]; then
+    echo "::error::the failed start does not name the configured port $tw_held, its holder, and that it never redraws (T93)"
+    cat "$tw_alpha/run.log" 2>/dev/null || true
     printf '%s\n' "$tw_pin_err"
     fail
   fi
