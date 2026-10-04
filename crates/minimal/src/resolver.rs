@@ -1603,10 +1603,11 @@ pub enum LiveSurface {
     /// the terminal publish outcome the VM host daemon reports (T93): the
     /// port another process on the host holds, or the redraws that ran
     /// out — or that its publish is unconfirmed (the VM is up, the publish
-    /// is not one the host saw land). Carries its own port because the status that reported it named
-    /// the port the failure is about, which is not the serving port a
-    /// reply's discovery field would carry — and names the cause because
-    /// "not serving" alone does not tell a user which thing to free.
+    /// is not one the host saw land). Carries its own port because the
+    /// status that reported it named the port the failure is about, which
+    /// is not the serving port a reply's discovery field would carry — and
+    /// names the cause because "not serving" alone does not tell a user
+    /// which thing to free.
     ProxyNotServing { port: u16, cause: ProxyDownCause },
 }
 

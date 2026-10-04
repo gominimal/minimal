@@ -748,9 +748,10 @@ pub enum ZoneAnswererStatus {
 /// the terminal publish outcomes the supervisor itself reached — the port
 /// it reserved is held by another process on the host, or the draws to find
 /// a free one ran out — or that its publish is unconfirmed, the one
-/// non-terminal state: the VM is up, the publish is not one the host saw. A host that merely has no switch to publish through
-/// says nothing here: that boot's proxy never attempted a publish, and its
-/// story stays the daemon log's, not a cause this status could name.
+/// non-terminal state: the VM is up, the publish is not one the host saw. A
+/// host that merely has no switch to publish through says nothing here: that
+/// boot's proxy never attempted a publish, and its story stays the daemon
+/// log's, not a cause this status could name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyDownCause {
