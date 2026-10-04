@@ -242,15 +242,15 @@ pub fn remote_command(command: &[String]) -> Option<String> {
 /// the connection rather than returning an error — indistinguishable from the
 /// command's own exit 255. Refusing here, before ssh is contacted, turns both
 /// into one clear client-side error.
-pub const MAX_EXEC_COMMAND_BYTES: usize = 128 * 1024;
+pub const MAX_EXEC_COMMAND_BYTES: usize = 128 * 1024 - 1;
 
 /// Refuse an encoded exec command that exceeds [`MAX_EXEC_COMMAND_BYTES`].
 pub fn ensure_exec_command_fits(wire: &str) -> Result<(), anyhow::Error> {
     if wire.len() > MAX_EXEC_COMMAND_BYTES {
         anyhow::bail!(
-            "the command is {} KiB; min session exec carries at most {} KiB of arguments — pass large data on stdin or in a file under /workbench",
+            "the command is {} KiB; min session exec carries at most {} bytes of arguments — pass large data on stdin or in a file under /workbench",
             wire.len().div_ceil(1024),
-            MAX_EXEC_COMMAND_BYTES / 1024,
+            MAX_EXEC_COMMAND_BYTES,
         );
     }
     Ok(())
@@ -523,8 +523,8 @@ mod tests {
         );
     }
 
-    /// A command that encodes to exactly the limit is accepted; one byte over
-    /// is refused before ssh is ever contacted.
+    /// 131,071 bytes are accepted; 131,072 bytes are refused before ssh is
+    /// contacted.
     #[test]
     fn exec_command_size_guard_refuses_over_limit() {
         let at_limit = "x".repeat(MAX_EXEC_COMMAND_BYTES);
@@ -534,7 +534,7 @@ mod tests {
         let err = ensure_exec_command_fits(&over).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("min session exec carries at most 128 KiB"),
+            msg.contains("min session exec carries at most 131071 bytes"),
             "unexpected message: {msg}"
         );
     }
