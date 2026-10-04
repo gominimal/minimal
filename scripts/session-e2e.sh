@@ -119,10 +119,9 @@
 #                                    keeps serving; a run's box ends with
 #                                    its run's command, its client killed
 #                                    mid-command
-#   proxy_refuses_like_direct        the proxy never serves reach the switch
-#                                    would refuse: paired direct/proxied
-#                                    attempts, h2 closed, h2c stripped
-#                                    (NET-069..071, 135)
+#   proxy_refuses_like_direct        the proxy refuses exactly as the switch
+#                                    does: paired direct/proxied attempts,
+#                                    h2 closed, h2c stripped (NET-069..071, 135)
 #   native_resolution_without_proxy_env
 #                                    NET-009/122/123: the advisory, the probe,
 #                                    and host-OS resolution with no proxies
@@ -10297,12 +10296,10 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
 # the lane's absence can refuse the proxy's address — gets silence at the
 # proxy's address and one rate-limited warn line in the daemon's log, the
 # refused frame's source (the box's own switch address) and the rule that
-# dropped it named. The control runs first: the same box's probe to the host
-# alias — the address the switch NATs to the host's loopback, local reach
-# the box's own rules decide, where nothing listens at the proxy's port —
-# is reset by the host's stack, which proves the fabric and both gates'
-# admit path are answering this box, so the silence at the proxy's address
-# is the lane's, not weather.
+# dropped it named. The control runs first: the same box's probe to the
+# node's own address on the switch is reset by the VM's own stack, which
+# proves the fabric and the gate's admit path are answering this box, so
+# the silence at the proxy's address is the lane's, not weather.
 proof_box_without_credentialed_lane_cannot_reach_proxy() {
   echo "::group::a box without a credentialed lane cannot reach the proxy's address (NET-134)"
   if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
@@ -10313,10 +10310,10 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
 
   cred_begin
 
-  local proxy_ip proxy_port host_alias nolane_sid nolane_ip start_ms elapsed_ms
+  local proxy_ip proxy_port node_ip nolane_sid nolane_ip start_ms elapsed_ms
   proxy_ip="100.64.255.252"
   proxy_port="8118"
-  host_alias="100.64.255.254"
+  node_ip="100.64.255.253"
 
   CRED_NO_LANE_SEED_DIR="$(hook_mktemp /tmp/mnlcredn.XXXXXX)"
   hook_seed_preamble > "$CRED_NO_LANE_SEED_DIR/minimal.toml"
@@ -10347,25 +10344,21 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
     cred_fail
   }
 
-  # The control: the host alias — the host's exposure address on the
-  # switch, the one a configured host exposure is reached through, which
-  # gvproxy NATs to the host's loopback for every port. Reach over the
-  # alias is local reach under the box's rules (design §7.1) and an
-  # allow-all row admits it on both legs, so the frame crosses the box's
-  # relay, the gate and the switch and the host's kernel resets the
-  # connect: nothing on the host's loopback listens on the proxy's port
-  # (8118's listener lives on the host-side peer at the proxy's address).
-  # A reset here proves resolution, the fabric and both gates' admit path
-  # are all live for this box; the proxy's address is two addresses away
-  # with a whole different answer. (The node's own address — the control
-  # this case used to run — is the relay's own silent drop now, NET-062's
-  # sub-clause: the machine's control surface is never a box's
-  # destination, whatever its rules say.)
+  # The control: the node's own address on the switch — the in-VM daemon's,
+  # which the switch forwards back into the VM's own stack. It sits inside
+  # the box's own block, so an allow-all row's frame crosses the box's
+  # relay, the gate and the switch and comes back; nothing in the VM
+  # listens on the proxy's port there (the guest's own egress proxy is a
+  # different port, and 8118's listener lives on the host-side peer at
+  # the proxy's address), so the VM's kernel resets the connect. A reset
+  # here proves resolution, the fabric and the gate's admit path are all
+  # live for this box; the proxy's address is one address away with a whole
+  # different answer.
   mnl session exec "$nolane_sid" \
-    "/usr/bin/socat /dev/null TCP:$host_alias:$proxy_port,connect-timeout=8" \
+    "/usr/bin/socat /dev/null TCP:$node_ip:$proxy_port,connect-timeout=8" \
     >/dev/null 2>"$WORK/cred-nolane-control.err"
   if ! grep -q 'Connection refused' "$WORK/cred-nolane-control.err" 2>/dev/null; then
-    echo "::error::the control probe to the host alias was not reset — the fabric or the gates are not answering this box, so the silence at the proxy's address below would prove nothing. Control stderr:"
+    echo "::error::the control probe to the node's own address was not reset — the fabric or the gate is not answering this box, so the silence at the proxy's address below would prove nothing. Control stderr:"
     cat "$WORK/cred-nolane-control.err" 2>/dev/null || true
     cred_fail
   fi
@@ -10435,7 +10428,7 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
   rm -rf "$CRED_NO_LANE_SEED_DIR"
   CRED_NO_LANE_SEED_DIR=""
   cred_restore
-  echo "a box without a credentialed lane cannot reach the proxy's address OK (control reset at the host alias, silence at $proxy_ip:$proxy_port for ${elapsed_ms}ms from $nolane_ip, refused at the box's relay so the host gate stayed silent)"
+  echo "a box without a credentialed lane cannot reach the proxy's address OK (control reset at the node's own address, silence at $proxy_ip:$proxy_port for ${elapsed_ms}ms from $nolane_ip, refused at the box's relay so the host gate stayed silent)"
   echo "::endgroup::"
 }
 
@@ -13468,17 +13461,12 @@ proof_proxy_refuses_like_direct() {
   }
   # One proxied attempt from a box: the status line and the body, via the
   # proxy at $3 — host loopback from a host-address box, the daemon's own
-  # switch address from a box with a lease. The exit code lands in
-  # PAR_PROXIED_RC the way the direct helper's lands in PAR_RC, so a leg
-  # that never completed a connect can be told from one that was refused
-  # (curl 28, the drop, and 7, the reset — the same pair par_direct's
-  # comment spells).
+  # switch address from a box with a lease.
   par_proxied() { # $1 box, $2 url, $3 proxy address, $4 max-time
     local out
     out="$(mnl session exec "$1" \
       "curl -sS --max-time $4 -x http://$3 -o /home/par.body -w '%{http_code}' '$2'" \
-      2>"$WORK/par-proxied.err")"
-    PAR_PROXIED_RC=$?
+      2>"$WORK/par-proxied.err")" || true
     PAR_STATUS="$(printf '%s\n' "$out" | tail -n1 | tr -d '\r\n')"
     PAR_BODY="$(mnl session exec "$1" 'cat /home/par.body' 2>/dev/null || true)"
   }
@@ -13755,12 +13743,11 @@ PAR_EO
   # over, not the switch binary: the pairs go BETWEEN boxes — an own-address
   # target's lease, and a caller whose lease the egress verdict reads. On a
   # VM lane both boxes stand on the switch and the daemon serves the proxy
-  # from inside it (a box's only route to that proxy was the daemon's own
-  # switch address, which NET-062's sub-clause has since closed to boxes —
-  # pair 5's proxied half holds the closed shape). On a native host the
-  # daemon is off the switch — a lease is deliberately not host-answerable
-  # (NET-127/128) — so a direct attempt from the host's namespace cannot
-  # route to a box's lease, and the pair would not be honest to run there.
+  # from inside it (a denied caller reaches it at the daemon's own switch
+  # address). On a native host the daemon is off the switch — a lease is
+  # deliberately not host-answerable (NET-127/128) — so a direct attempt from
+  # the host's namespace cannot route to a box's lease, and the pair would
+  # not be honest to run there.
   if [ -n "$E2E_VM" ]; then
     PAR_OWN_SEED_DIR="$(hook_mktemp /tmp/mnlpx.XXXXXX)"
     hook_seed_preamble > "$PAR_OWN_SEED_DIR/minimal.toml"
@@ -13844,25 +13831,13 @@ PAR_EO
 
     # ---- pair 5 (NET-070): a caller whose egress rules deny the target -----
     # The caller is an own-address box whose ONE allowed destination is the
-    # daemon's own address on the switch — the literal is the default switch
-    # subnet's daemon address (the subnet every lane this script runs on
-    # uses; the alias literal the min.internal proof prints carries the same
-    # posture), and the declaration now spells the subtracted destination on
-    # purpose: NET-062's sub-clause closed that address, the machine's
-    # control surface, ahead of the rules, so an `allow_subnets` that names
-    # it admits nothing at it — and the proxied leg's silence below is the
-    # deny set's, not the rules'. The switch's resolver and ARP keep their
-    # built-in carve-outs, so the box still resolves names; every other
-    # destination, the target's lease chief among them, is denied by the
-    # caller's own compiled rules. Both legs refuse, one gate apart: the
-    # direct leg is the caller's rules dropping the target's lease, and the
-    # proxied leg is the caller's own relay dropping the connect to the
-    # machine's address, so the request never reaches the proxy — no reach
-    # a direct connection would not have (NET-070/NET-071), held from the
-    # box's side rather than the proxy's. The 403 the proxy's caller check
-    # owes an attributed caller is the unit proofs' half: that check runs
-    # the same compiled rules at the TARGET's lease, which no member of the
-    # deny set is, so nothing about it moved with the address closing.
+    # daemon's own address on the switch — where the in-guest proxy listens.
+    # The switch's resolver and ARP keep their built-in carve-outs, so the
+    # box still resolves names; every other destination, the target's lease
+    # chief among them, is denied by the caller's own compiled rules. The
+    # literal is the default switch subnet's daemon address (the subnet every
+    # lane this script runs on uses; the alias literal the min.internal proof
+    # prints carries the same posture).
     PAR_CALLER_SEED_DIR="$(hook_mktemp /tmp/mnlpy.XXXXXX)"
     hook_seed_preamble > "$PAR_CALLER_SEED_DIR/minimal.toml"
     mkdir "$PAR_CALLER_SEED_DIR/.git"
@@ -13892,25 +13867,20 @@ PAR_EO
     par_proxied "$PAR_CALLER_SID" "http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/" "100.64.255.253:7654" 20
     par_pair "a caller whose egress rules deny the target" \
       "$par_direct_line" \
-      "GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/ via the proxy at the daemon's switch address -> HTTP ${PAR_STATUS:-<none>}, the connect dropped at the caller's own relay ($(head -n1 "$WORK/par-proxied.err" 2>/dev/null || true))"
+      "GET http://$PAR_OWN_NAME.min.internal:$PAR_OWN_PORT/ via the proxy at the daemon's switch address -> HTTP ${PAR_STATUS:-<none>} ($(head -n1 "$WORK/par-proxied.err" 2>/dev/null || true))"
     [ "$par_direct_rc" -eq 28 ] || {
       echo "::error::the denied caller's direct attempt did not end in a connect timeout (curl exit $par_direct_rc, expected 28) — the caller's egress gate did not drop it"
       echo "--- curl stderr ---"; cat "$WORK/par-direct.err" 2>/dev/null || true
       fail
     }
-    [ "${PAR_PROXIED_RC:-0}" -eq 28 ] || {
-      echo "::error::the denied caller's proxied attempt did not end in a connect timeout (curl exit ${PAR_PROXIED_RC:-0}, expected 28) — the caller's own relay must drop its connect to the daemon's own address, the machine's control surface (NET-062's sub-clause), so the request never reaches the proxy at all; a reset (exit 7) would mean the box's declaration bought reach the deny set owns"
+    [ "${PAR_STATUS:-}" = 403 ] || {
+      echo "::error::the denied caller's proxied attempt did not get the proxy's 403 (got '${PAR_STATUS:-<none>}')"
       echo "--- curl stderr ---"; cat "$WORK/par-proxied.err" 2>/dev/null || true
       fail
     }
-    [ "${PAR_STATUS:-}" = 000 ] || {
-      echo "::error::the denied caller's proxied attempt through the daemon's own address got HTTP ${PAR_STATUS:-<none>} — the proxy must never see a request a box's rules deny the target of (NET-070: no reach a direct connection would not have)"
-      echo "--- curl stderr ---"; cat "$WORK/par-proxied.err" 2>/dev/null || true
-      fail
-    }
-    echo "  (the refusals are one rule each — no ingress mapping for pair 4, egress-undeclared-subnet for pair 5's"
-    echo "   direct leg and the infrastructure deny set for its proxied one — decided by the same compiled policy;"
-    echo "   the records are the guest daemon's on this lane and ride the diagnostics bundle a failing run writes)"
+    echo "  (both pairs' refusals are one rule each — no ingress mapping for pair 4, egress-undeclared-subnet for pair 5 —"
+    echo "   decided by the same compiled policy on both legs; the records are the guest daemon's on this lane and ride"
+    echo "   the diagnostics bundle a failing run writes)"
 
     mnl session destroy --force "$PAR_CALLER_SID" >/dev/null 2>&1 || true
     mnl session destroy --force "$PAR_OWN_SID" >/dev/null 2>&1 || true
