@@ -75,7 +75,7 @@
 #![cfg(minvmd_libkrun)]
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -1357,7 +1357,43 @@ fn spoofed_flow(
 /// the marker it then pushes has nowhere to land (#1845).
 const CONNECTION_BUDGET: Duration = Duration::from_secs(30);
 
-/// A host TCP listener the fabric's NAT maps the host alias's port to. Every
+/// The host's own non-loopback IPv4 address: the source address of its
+/// default route, read by connecting a UDP socket (no packet is sent) toward
+/// a TEST-NET-1 address. A box reaches it as ordinary egress through the
+/// switch's NAT, the way it reaches any host on the runner's network.
+///
+/// The address must sit outside every range the relay drops or reserves on
+/// its own — loopback, the switch plan's 100.64/10, and the reserved local
+/// range — so a verdict at it is the box's declared union's and never an
+/// infrastructure drop. Any other answer fails the test rather than skip it.
+fn host_interface_address() -> Ipv4Addr {
+    let probe = UdpSocket::bind(("0.0.0.0", 0)).expect("binding the route probe");
+    probe
+        .connect(("192.0.2.1", 9))
+        .expect("the runner has no default IPv4 route to read its address from");
+    let IpAddr::V4(addr) = probe.local_addr().expect("route probe address").ip() else {
+        panic!("vm_escape_integration: the runner's default route has no IPv4 source");
+    };
+    let in_block = |base: Ipv4Addr, prefix: u32| {
+        let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+        u32::from(addr) & mask == u32::from(base) & mask
+    };
+    let (reserved, reserved_prefix) = sessions::core::loopback::RESERVED_LOCAL_RANGE;
+    assert!(
+        !addr.is_unspecified()
+            && !in_block(Ipv4Addr::new(127, 0, 0, 0), 8)
+            && !in_block(Ipv4Addr::new(100, 64, 0, 0), 10)
+            && !in_block(reserved, u32::from(reserved_prefix)),
+        "vm_escape_integration: the runner's interface address {addr} is loopback, \
+         inside the switch plan's 100.64/10, or in the reserved local range \
+         {reserved}/{reserved_prefix}; the relay decides those by its own drops, \
+         not the boxes' declared union, so this harness cannot use it"
+    );
+    addr
+}
+
+/// A host TCP listener on the host's own interface address, which a box
+/// reaches through the fabric's NAT as ordinary egress. Every
 /// connection's first bytes are the marker its sender sent; the shared list
 /// is what the test's verdicts read. Each connection is read on its own
 /// thread, so a sender slow to push — or one that never pushes — holds up
@@ -1570,26 +1606,34 @@ async fn vm_escape_bounded_to_resident_union() {
         return;
     };
     let guest = Guest::boot(&gvproxy);
-    let subnet = switch::DEFAULT_SUBNET;
-    let alias = subnet.host_alias();
 
-    // The destination: a host listener the switch's NAT maps the host alias
-    // to, live for the whole of the test.
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("binding the host listener");
+    // The destination: a host listener on the host's own interface address,
+    // live for the whole of the test, reached through the switch's NAT as
+    // ordinary egress — relay, gate, switch, NAT. Not the host alias: box→host
+    // reach over the alias is default-deny except configured host exposures
+    // (design §7.1, gominimal/inbox#867), so a box's own relay drops it
+    // whatever the box declares, and the positive controls could never pass.
+    let host = host_interface_address();
+    let listener = TcpListener::bind((host, 0)).expect("binding the host listener");
     let port = listener.local_addr().expect("listener address").port();
     let listener = HostListener::spawn(listener);
+    let host_cidr = format!("{host}/32");
 
     // Two resident boxes with disjoint declared egress. Both declare the
-    // fabric (which carries the host alias their own probes reach: a box's
-    // own declared traffic, admitted by its own declaration), and each
-    // declares a private range the other does not — the disjoint half the
-    // cross-box spoof would have to buy.
+    // host listener's address (the destination their own probes reach: a
+    // box's own declared traffic, admitted by its own declaration) and the
+    // fabric, and each declares a private range the other does not — the
+    // disjoint half the cross-box spoof would have to buy.
     let mut box_a = open_box(
         &guest,
         sessions::NetworkMode::OwnIp,
         sessions::EgressPolicy {
             allow_protocols: Some(vec![sessions::IpProto::Tcp, sessions::IpProto::Udp]),
-            allow_subnets: Some(vec!["10.0.0.0/8".to_string(), "100.64.0.0/16".to_string()]),
+            allow_subnets: Some(vec![
+                "10.0.0.0/8".to_string(),
+                "100.64.0.0/16".to_string(),
+                host_cidr.clone(),
+            ]),
             allow_dns_hosts: None,
             deny_subnets: None,
         },
@@ -1604,6 +1648,7 @@ async fn vm_escape_bounded_to_resident_union() {
             allow_subnets: Some(vec![
                 "192.168.0.0/16".to_string(),
                 "100.64.0.0/16".to_string(),
+                host_cidr.clone(),
             ]),
             allow_dns_hosts: None,
             deny_subnets: None,
@@ -1656,7 +1701,7 @@ async fn vm_escape_bounded_to_resident_union() {
         ("box-a", &mut box_a, "own-a-reached"),
         ("box-b", &mut box_b, "own-b-reached"),
     ] {
-        let command = format!("echo {marker} > /dev/tcp/{alias}/{port}");
+        let command = format!("echo {marker} > /dev/tcp/{host}/{port}");
         let (_, stderr, exit) = box_session
             .exec(&command)
             .await
@@ -1664,7 +1709,7 @@ async fn vm_escape_bounded_to_resident_union() {
         assert_eq!(
             exit,
             Some(0),
-            "{label}'s own probe to {alias}:{port} failed; stderr: {stderr}"
+            "{label}'s own probe to {host}:{port} failed; stderr: {stderr}"
         );
         assert!(
             listener.wait_for(marker, Duration::from_secs(10)),
@@ -1672,7 +1717,7 @@ async fn vm_escape_bounded_to_resident_union() {
         );
         attempts.push(Attempt {
             source: Ipv4Addr::UNSPECIFIED,
-            destination: alias,
+            destination: host,
             port,
             verdict: format!("{label}'s own declared traffic arrived (positive control)"),
         });
@@ -1700,7 +1745,7 @@ async fn vm_escape_bounded_to_resident_union() {
         let flow = SpoofedFlow {
             src,
             src_mac: [0x02, 0x50, 0x64, 0x00, 0x64, src.octets()[3]],
-            dst: alias,
+            dst: host,
             dst_port: port,
             src_port: 40_000 + u16::from(src.octets()[3]),
             marker: format!("spoof-{src}-arrived"),
@@ -1712,7 +1757,7 @@ async fn vm_escape_bounded_to_resident_union() {
         let verdict = match spoofed_flow(&guest.gate_sock, &flow, DROP_DEADLINE) {
             Ok(marker_ack) => panic!(
                 "vm_escape_integration: a spoofed in-plan source no row holds \
-                 ({src}) completed a flow to {alias}:{port}; the gate must drop \
+                 ({src}) completed a flow to {host}:{port}; the gate must drop \
                  it (NET-085) [{marker_ack}]"
             ),
             Err(e) => {
@@ -1739,7 +1784,7 @@ async fn vm_escape_bounded_to_resident_union() {
         };
         attempts.push(Attempt {
             source: src,
-            destination: alias,
+            destination: host,
             port,
             verdict,
         });
@@ -1753,7 +1798,7 @@ async fn vm_escape_bounded_to_resident_union() {
     let flow = SpoofedFlow {
         src: outside_plan,
         src_mac: [0x02, 0x50, 0x64, 0x00, 0x00, 0x07],
-        dst: alias,
+        dst: host,
         dst_port: port,
         src_port: 40_000,
         marker: "spoof-203.0.113.7-arrived".to_string(),
@@ -1777,7 +1822,7 @@ async fn vm_escape_bounded_to_resident_union() {
     };
     attempts.push(Attempt {
         source: outside_plan,
-        destination: alias,
+        destination: host,
         port,
         verdict,
     });
@@ -1786,6 +1831,21 @@ async fn vm_escape_bounded_to_resident_union() {
             && guest.log_contains(&format!("source={outside_plan}")),
         "the gate dropped spoofed source {outside_plan} without its \
          unknown-source line naming it"
+    );
+    // And for the source, not the destination: the runner's address is no
+    // address the gate holds as infrastructure, so no refusal here is
+    // `egress-infrastructure-destination` — every negative above is the
+    // bound's own, never an infrastructure drop passing for it.
+    let host_text = host.to_string();
+    let infrastructure: Vec<String> = guest
+        .log_lines(&["egress-infrastructure-destination"])
+        .into_iter()
+        .filter(|line| line.contains(&host_text))
+        .collect();
+    assert!(
+        infrastructure.is_empty(),
+        "the gate refused the runner's address {host} as infrastructure, so the \
+         harness's refusals would not be the resident union's: {infrastructure:?}"
     );
 
     // The cross-box pairs — a spoofed box address tried at a destination only

@@ -10377,10 +10377,11 @@ proof_deny_all_box_reaches_proxy_and_no_other_host_port() {
 # the lane's absence can refuse the proxy's address — gets silence at the
 # proxy's address and one rate-limited warn line in the daemon's log, the
 # refused frame's source (the box's own switch address) and the rule that
-# dropped it named. The control runs first: the same box's probe to the
-# node's own address on the switch is reset by the VM's own stack, which
-# proves the fabric and the gate's admit path are answering this box, so
-# the silence at the proxy's address is the lane's, not weather.
+# dropped it named. The control runs first: the same box's probe to a
+# sibling box's lease, at a port the sibling publishes but nothing listens
+# on, is reset by the sibling's own stack, which proves the fabric and the
+# gates' admit path are answering this box, so the silence at the proxy's
+# address is the lane's, not weather.
 proof_box_without_credentialed_lane_cannot_reach_proxy() {
   echo "::group::a box without a credentialed lane cannot reach the proxy's address (NET-134)"
   if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
@@ -10391,10 +10392,11 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
 
   cred_begin
 
-  local proxy_ip proxy_port node_ip nolane_sid nolane_ip start_ms elapsed_ms
+  local proxy_ip proxy_port nolane_sid nolane_ip start_ms elapsed_ms
+  local sibling_sid sibling_ip sibling_port
   proxy_ip="100.64.255.252"
   proxy_port="8118"
-  node_ip="100.64.255.253"
+  sibling_port="18090"
 
   CRED_NO_LANE_SEED_DIR="$(hook_mktemp /tmp/mnlcredn.XXXXXX)"
   hook_seed_preamble > "$CRED_NO_LANE_SEED_DIR/minimal.toml"
@@ -10425,21 +10427,36 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
     cred_fail
   }
 
-  # The control: the node's own address on the switch — the in-VM daemon's,
-  # which the switch forwards back into the VM's own stack. It sits inside
-  # the box's own block, so an allow-all row's frame crosses the box's
-  # relay, the gate and the switch and comes back; nothing in the VM
-  # listens on the proxy's port there (the guest's own egress proxy is a
-  # different port, and 8118's listener lives on the host-side peer at
-  # the proxy's address), so the VM's kernel resets the connect. A reset
-  # here proves resolution, the fabric and the gate's admit path are all
-  # live for this box; the proxy's address is one address away with a whole
-  # different answer.
+  # The control: a sibling own-address box's lease, at a port the sibling
+  # publishes (so its ingress gate admits the SYN) and nothing in it
+  # listens on. An allow-all row admits the lease, so the frame crosses the
+  # box's relay, the gate and the switch to the sibling, whose kernel
+  # resets the connect. A reset here proves the fabric and the gates' admit
+  # path are live for this box; the proxy's address is a whole different
+  # answer. The switch's own addresses cannot be the control: the node
+  # address and the host alias are the relay's own silent drops (NET-062's
+  # sub-clause, design §7.1), whatever the box's rules say.
+  sibling_sid="$(mkdir -p "$CRED_NO_LANE_SEED_DIR/sibling/.git" \
+    && hook_seed_preamble > "$CRED_NO_LANE_SEED_DIR/sibling/minimal.toml" \
+    && cd "$CRED_NO_LANE_SEED_DIR/sibling" && mnl session activate . --no-prompt \
+    --name e2e-cred-sibling --network own_ip \
+    --ingress "$sibling_port:$sibling_port" 2>"$WORK/cred-sibling.err")" || {
+    echo "::error::'min session activate --network own_ip --ingress ...' failed for the no-lane case's control sibling"
+    cat "$WORK/cred-sibling.err" 2>/dev/null || true
+    cred_fail
+  }
+  sibling_sid="$(printf '%s\n' "$sibling_sid" | tail -n1 | tr -d '\r')"
+  sibling_ip="$(cred_box_ip "$sibling_sid" "$WORK/cred-sibling-fib.out" "$WORK/cred-sibling-fib.err")"
+  if [ -z "$sibling_ip" ]; then
+    echo "::error::could not determine the control sibling's switch address from /proc/net/fib_trie"
+    echo "--- fib_trie ---"; cat "$WORK/cred-sibling-fib.out" 2>/dev/null || true
+    cred_fail
+  fi
   mnl session exec "$nolane_sid" \
-    "/usr/bin/socat /dev/null TCP:$node_ip:$proxy_port,connect-timeout=8" \
+    "/usr/bin/socat /dev/null TCP:$sibling_ip:$sibling_port,connect-timeout=8" \
     >/dev/null 2>"$WORK/cred-nolane-control.err"
   if ! grep -q 'Connection refused' "$WORK/cred-nolane-control.err" 2>/dev/null; then
-    echo "::error::the control probe to the node's own address was not reset — the fabric or the gate is not answering this box, so the silence at the proxy's address below would prove nothing. Control stderr:"
+    echo "::error::the control probe to the sibling's lease $sibling_ip:$sibling_port was not reset — the fabric or the gates are not answering this box, so the silence at the proxy's address below would prove nothing. Control stderr:"
     cat "$WORK/cred-nolane-control.err" 2>/dev/null || true
     cred_fail
   fi
@@ -10505,11 +10522,12 @@ proof_box_without_credentialed_lane_cannot_reach_proxy() {
     cred_fail
   fi
 
+  mnl session destroy --force "$sibling_sid" >/dev/null 2>&1 || true
   mnl session destroy --force "$nolane_sid" >/dev/null 2>&1 || true
   rm -rf "$CRED_NO_LANE_SEED_DIR"
   CRED_NO_LANE_SEED_DIR=""
   cred_restore
-  echo "a box without a credentialed lane cannot reach the proxy's address OK (control reset at the node's own address, silence at $proxy_ip:$proxy_port for ${elapsed_ms}ms from $nolane_ip, refused at the box's relay so the host gate stayed silent)"
+  echo "a box without a credentialed lane cannot reach the proxy's address OK (control reset at the sibling's lease $sibling_ip:$sibling_port, silence at $proxy_ip:$proxy_port for ${elapsed_ms}ms from $nolane_ip, refused at the box's relay so the host gate stayed silent)"
   echo "::endgroup::"
 }
 
@@ -10581,15 +10599,16 @@ proof_proxy_sees_boxes_by_address() {
   # cred_restore puts the lane's own filter back on every exit.
   export RUST_LOG="warn,minimald::exec=info,minvmd=info,switch::bep_host=debug"
 
-  local proxy_ip proxy_port node_ip sock sock_wait
+  local proxy_ip proxy_port sock sock_wait
   local psba_sid_a psba_sid_b psba_sid_c
+  local psba_sibling_sid psba_sibling_ip psba_sibling_port
   local psba_ip_a psba_ip_b psba_ip_c
   local psba_reason psba_wait psba_seen psba_line
   local psba_pos_issue psba_pos_delivered
   local psba_box psba_want_lane psba_ip_var psba_sid_var
   proxy_ip="100.64.255.252"
   proxy_port="8118"
-  node_ip="100.64.255.253"
+  psba_sibling_port="18090"
   # The refusal reason a same-uid host process earns at the acceptor, per
   # OS: on Linux the kernel names the unix peer's process and this script's
   # is not the host daemon's; off Linux no pid comes with the credentials,
@@ -10856,18 +10875,39 @@ proof_proxy_sees_boxes_by_address() {
   done
 
   # The laneless box, against the fabric the two answers just proved live:
-  # its control probe to the node's own address on the switch is reset by
-  # the VM's own stack — resolution, the fabric and the gate's admit path
-  # all answer this box — and its probe to the proxy's address runs out its
+  # its control probe to a sibling own-address box's lease, at a port the
+  # sibling publishes (so its ingress gate admits the SYN) and nothing in it
+  # listens on, is reset by the sibling's own stack — resolution, the fabric
+  # and the gates' admit path all answer this box. The switch's own
+  # addresses cannot be the control: the node address and the host alias
+  # are the relay's own silent drops (NET-062's sub-clause, design §7.1),
+  # whatever the box's rules say. Its probe to the proxy's address runs out its
   # window with no reset: the box's own relay dropped the SYN inside the
   # guest, before the switch, exactly the no-lane refusal. The acceptor
   # never saw it, so the pool never recorded a delivery for its address,
   # and the host gate's log says nothing about the frame.
+  psba_sibling_sid="$(mkdir -p "$PSBA_SEED_DIR_C/sibling/.git" \
+    && hook_seed_preamble > "$PSBA_SEED_DIR_C/sibling/minimal.toml" \
+    && cd "$PSBA_SEED_DIR_C/sibling" && mnl session activate . --no-prompt \
+    --name e2e-psba-sibling --network own_ip \
+    --ingress "$psba_sibling_port:$psba_sibling_port" 2>"$WORK/psba-sibling.err")" || {
+    echo "::error::'min session activate --network own_ip --ingress ...' failed for the laneless box's control sibling"
+    cat "$WORK/psba-sibling.err" 2>/dev/null || true
+    cred_fail
+  }
+  psba_sibling_sid="$(printf '%s\n' "$psba_sibling_sid" | tail -n1 | tr -d '\r')"
+  cred_wait_registered "the laneless box's control sibling" "e2e-psba-sibling"
+  psba_sibling_ip="$(cred_box_ip "$psba_sibling_sid" "$WORK/psba-sibling-fib.out" "$WORK/psba-sibling-fib.err")"
+  if [ -z "$psba_sibling_ip" ]; then
+    echo "::error::could not determine the control sibling's switch address from /proc/net/fib_trie"
+    echo "--- fib_trie ---"; cat "$WORK/psba-sibling-fib.out" 2>/dev/null || true
+    cred_fail
+  fi
   mnl session exec "$psba_sid_c" \
-    "/usr/bin/socat /dev/null TCP:$node_ip:$proxy_port,connect-timeout=8" \
+    "/usr/bin/socat /dev/null TCP:$psba_sibling_ip:$psba_sibling_port,connect-timeout=8" \
     >/dev/null 2>"$WORK/psba-nolane-control.err"
   if ! grep -q 'Connection refused' "$WORK/psba-nolane-control.err" 2>/dev/null; then
-    echo "::error::the laneless box's control probe to the node's own address was not reset — the fabric or the gate is not answering this box, so its silence at the proxy's address below would prove nothing. Control stderr:"
+    echo "::error::the laneless box's control probe to the sibling's lease $psba_sibling_ip:$psba_sibling_port was not reset — the fabric or the gates are not answering this box, so its silence at the proxy's address below would prove nothing. Control stderr:"
     cat "$WORK/psba-nolane-control.err" 2>/dev/null || true
     cred_fail
   fi
@@ -11013,6 +11053,7 @@ PY
 
   mnl session destroy --force "$psba_sid_b" >/dev/null 2>&1 || true
   mnl session destroy --force "$psba_sid_c" >/dev/null 2>&1 || true
+  mnl session destroy --force "$psba_sibling_sid" >/dev/null 2>&1 || true
   rm -rf "$PSBA_SEED_DIR_A" "$PSBA_SEED_DIR_B" "$PSBA_SEED_DIR_C"
   PSBA_SEED_DIR_A=""
   PSBA_SEED_DIR_B=""
@@ -11042,26 +11083,33 @@ PY
 #     shuttle's own protocol at the gate's landing edge — the /connect
 #     upgrade head and length-framed Ethernet frames, the byte stream a root
 #     escapee's connection carries past that edge — wearing each source
-#     address in turn against a host listener the fabric's NAT maps the host
-#     alias to.
+#     address in turn against a host listener on the runner's own interface
+#     address, which a box reaches through the fabric's NAT as ordinary
+#     egress.
+#
+# Not the host alias: box-to-host reach over the alias is default-deny except
+# configured host exposures (design §7.1, gominimal/inbox#867), so a box's own
+# relay drops a probe to it whatever the box declares, and the positive
+# controls could never pass. The runner's address is the default route's
+# source address; the case fails (it does not skip) when that address is
+# unspecified, loopback, inside the switch plan's 100.64/10, or in the
+# reserved local range 127.0.64.0/24, because the relay decides those by its
+# own drops rather than by the boxes' declared union.
 #
 # Two resident boxes with disjoint declared egress bound the union: box A
-# declares 10.0.0.0/8, box B 192.168.0.0/16, and both declare the fabric
-# (100.64.0.0/16), which carries the host alias — inside the union for a
-# box's own address, and the node-plane baseline set's one category-pair
-# (NET-130: the alias is the registry and the cache, shown beside the rules
-# by `min session policy`). The arms:
+# declares 10.0.0.0/8, box B 192.168.0.0/16, and both declare the runner's
+# address as a /32 (the destination their own probes reach) and the fabric
+# (100.64.0.0/16), which carries the host alias, the node-plane baseline
+# set's one category-pair (NET-130: the alias is the registry and the cache,
+# shown beside the rules by `min session policy`). The arms:
 #
-#   * each box's own probe to the host alias arrives — the whole chain
-#     working, and the union's fabric half live for a box's own address;
+#   * each box's own probe to the runner's address arrives — the whole chain
+#     working, and the union's declared half live for a box's own address;
 #   * a made-up in-plan lease — an address the plan could hand out and no
-#     row holds — reaches the alias under the shipped interim, the spoofer's
-#     liveness bracket: its frames traverse the gate, the switch and the NAT
-#     when nothing refuses them, and the gate's interim line names the
-#     source. Recorded the way the in-crate harness records it, so the arm
-#     is flip-stable: when the per-box default binds, the same flow is
-#     refused before any frame leaves the VM and the unknown-source line
-#     names it instead;
+#     row holds — never reaches the runner's address, a destination both
+#     rows declare: it is dropped before any frame leaves the VM, under the
+#     gate's own unregistered rule, and the drop line names the source —
+#     the receipt for the frames the spoofer spoke;
 #   * box A's address toward 192.168.77.7, declared only by box B — the
 #     union's other half — is refused: the row that holds the source address
 #     decides, and box A's row does not cover it (the RFC 1918 the
@@ -11070,16 +11118,13 @@ PY
 #     same way from the other side;
 #   * box A's address toward 198.51.100.7 — beyond the whole union — is
 #     refused by box A's own rules (egress-undeclared-subnet);
-#   * a made-up in-plan lease toward that same 198.51.100.7 is ADMITTED under
-#     the shipped Announced phase: an in-plan source no row holds reaches
-#     every destination until T89 (gominimal/minimal#1925) drops a source no
-#     box holds. Asserted as the known interim gap it is, keyed to the phase
-#     the gate's own start-up line names, so the arm flips with it: under
-#     the enforced phase it asserts the gate's drop line and an absent
-#     marker instead. Never claimed as bounded: NET-085 stays open on #1925.
-#     The bound this case proves is the one for a RESIDENT box's address,
-#     the address an escapee can actually wear: that address reaches only
-#     the declared union plus the baseline set;
+#   * a made-up in-plan lease toward that same 198.51.100.7 is dropped the
+#     same way: an in-plan source no row holds never leaves the VM, toward
+#     the union's far side like every other destination, whatever the
+#     egress default's phase (NET-085, the T89 drop, gominimal/minimal#1951).
+#     The bound this case proves covers the address an escapee forges and a
+#     RESIDENT box's own alike: each reaches only the declared union plus
+#     the baseline set;
 #   * an address outside the plan's lease block is refused outright
 #     (egress-unknown-source), under either posture: outside the plan there
 #     is no lease to spoof.
@@ -11106,7 +11151,7 @@ proof_escape_reaches_only_declared_union() {
   local esu_sid_a="" esu_sid_b="" esu_ip_a="" esu_ip_b=""
   local esu_rec_a="" esu_rec_b="" esu_out="" esu_rows="" esu_line=""
   local esu_route="" esu_v6="" esu_cmdline="" esu_policy="" esu_caps=""
-  local esu_log0="" esu_log0_lines=0 esu_alias="100.64.255.254"
+  local esu_log0="" esu_log0_lines=0 esu_host=""
   local esu_gate_sock="" esu_listener_log=""
   # The loop-carried variables below stay function-local on purpose: sid_var
   # in particular is a name the proxy-source case (bepb_*) also writes, and a
@@ -11134,8 +11179,9 @@ proof_escape_reaches_only_declared_union() {
   fi
 
   # The two seeds: the disjoint declared egress rides on the box specs — one
-  # private range each, plus the fabric they share, so a box's own probe to
-  # the host alias is inside its own declaration.
+  # private range each, plus the runner's address and the fabric they share,
+  # so a box's own probe to the runner's address is inside its own
+  # declaration.
   ESU_A_SEED_DIR="$(hook_mktemp /tmp/mnlesc-a.XXXXXX)"
   hook_seed_preamble > "$ESU_A_SEED_DIR/minimal.toml"
   mkdir "$ESU_A_SEED_DIR/.git"
@@ -11192,17 +11238,49 @@ proof_escape_reaches_only_declared_union() {
     fail
   }
 
-  if python3 -c "import socket; socket.create_connection(('127.0.0.1', $ESU_LISTEN_PORT), 2)" \
+  # The destination: the runner's own non-loopback IPv4 address, the source
+  # address of its default route, read by connecting a UDP socket toward a
+  # TEST-NET-1 address (no packet is sent) — the same read on Linux and
+  # macOS, and the one the in-crate harness makes
+  # (crates/minvmd/tests/vm_escape_integration.rs, host_interface_address).
+  # A box reaches it through the switch's NAT as ordinary egress. Not the
+  # host alias: box-to-host reach over the alias is default-deny except
+  # configured host exposures (design §7.1, gominimal/inbox#867), so each
+  # box's own relay drops a probe to it whatever the box declares.
+  esu_host="$(python3 -c "
+import socket
+probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+probe.connect(('192.0.2.1', 9))
+print(probe.getsockname()[0])
+" 2>"$WORK/esu-host.err")" || esu_host=""
+  # It must sit outside every range the relay drops or reserves on its own:
+  # loopback, the switch plan's 100.64/10 and the reserved local range. A
+  # verdict there would be the relay's own drop, never the declared union's,
+  # so any other answer fails the case rather than skipping it.
+  if [ -z "$esu_host" ] || ! python3 -c "
+import ipaddress, sys
+addr = ipaddress.IPv4Address(sys.argv[1])
+blocked = ('127.0.0.0/8', '100.64.0.0/10', '127.0.64.0/24')
+sys.exit(1 if addr.is_unspecified or any(addr in ipaddress.ip_network(n) for n in blocked) else 0)
+" "$esu_host" 2>>"$WORK/esu-host.err"; then
+    echo "::error::the runner's interface address ('$esu_host') is unreadable, unspecified, loopback, inside the switch plan's 100.64/10, or in the reserved local range 127.0.64.0/24; the relay decides those by its own drops, not the boxes' declared union, so the escape-union proof cannot use it"
+    cat "$WORK/esu-host.err" 2>/dev/null || true
+    esu_fail
+  fi
+  echo "the runner's interface address (the listener's, declared by both boxes as a /32): $esu_host"
+
+  if python3 -c "import socket; socket.create_connection(('$esu_host', $ESU_LISTEN_PORT), 2)" \
       2>/dev/null; then
-    echo "::error::127.0.0.1:$ESU_LISTEN_PORT already answers on this host; the escape-union proof needs it free for its listener"
+    echo "::error::$esu_host:$ESU_LISTEN_PORT already answers on this host; the escape-union proof needs it free for its listener"
     esu_fail
   fi
 
-  # The listener: host loopback behind the fabric's NAT (the host alias maps
-  # to 127.0.0.1 for every port), one line per event, flushed as it happens,
-  # so a marker is readable the moment its sender pushed it.
+  # The listener: on the runner's interface address, behind the fabric's NAT
+  # as ordinary egress, one line per event, flushed as it happens, so a
+  # marker is readable the moment its sender pushed it.
   cat > "$WORK/esu-listener.py" <<'ESU_LISTENER_EOF'
-"""The host listener the fabric's NAT maps the host alias to.
+"""The host listener on the runner's interface address, reached through the
+fabric's NAT as ordinary egress.
 
 Every accepted connection is read on its own thread and held open for its
 budget: the NAT dials this listener when the SYN arrives, before the
@@ -11221,6 +11299,7 @@ BUDGET = 30.0
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--host", required=True)
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--log", required=True)
     args = parser.parse_args()
@@ -11234,10 +11313,10 @@ def main():
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(("127.0.0.1", args.port))
+    listener.bind((args.host, args.port))
     listener.listen(16)
     listener.settimeout(0.2)
-    log(f"listening on 127.0.0.1:{args.port}")
+    log(f"listening on {args.host}:{args.port}")
 
     def read_connection(conn):
         at = time.monotonic() - started
@@ -11275,7 +11354,8 @@ if __name__ == "__main__":
     main()
 ESU_LISTENER_EOF
   : > "$esu_listener_log"
-  python3 "$WORK/esu-listener.py" --port "$ESU_LISTEN_PORT" --log "$esu_listener_log" \
+  python3 "$WORK/esu-listener.py" --host "$esu_host" --port "$ESU_LISTEN_PORT" \
+    --log "$esu_listener_log" \
     >"$WORK/esu-listener.out" 2>"$WORK/esu-listener.err" &
   ESU_LISTENER_PID=$!
   esu_line=""
@@ -11284,11 +11364,11 @@ ESU_LISTENER_EOF
     sleep 0.25
   done
   if [ -z "$esu_line" ]; then
-    echo "::error::the host listener never came up on 127.0.0.1:$ESU_LISTEN_PORT"
+    echo "::error::the host listener never came up on $esu_host:$ESU_LISTEN_PORT"
     cat "$WORK/esu-listener.err" 2>/dev/null || true
     esu_fail
   fi
-  echo "host listener: $esu_line (behind the fabric's NAT, which maps $esu_alias to 127.0.0.1)"
+  echo "host listener: $esu_line (the runner's interface address, behind the fabric's NAT as ordinary egress)"
 
   esu_gate_lines() {
     # The gate's own lines for one source under one rule, this case's lines
@@ -11379,9 +11459,10 @@ ESU_LISTENER_EOF
   esu_sid_a="$(cd "$ESU_A_SEED_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . \
     --no-prompt --name e2e-esc-a --network own_ip \
     --allow-subnets 10.0.0.0/8 --allow-subnets 100.64.0.0/16 \
+    --allow-subnets "$esu_host/32" \
     --allow-protocols tcp \
     2>"$WORK/esu-activate-a.err")" || {
-    echo "::error::box A's activate (--network own_ip, 10.0.0.0/8 and the fabric declared) failed"
+    echo "::error::box A's activate (--network own_ip, 10.0.0.0/8, the fabric and $esu_host/32 declared) failed"
     cat "$WORK/esu-activate-a.err" 2>/dev/null || true
     esu_fail
   }
@@ -11395,9 +11476,10 @@ ESU_LISTENER_EOF
   esu_sid_b="$(cd "$ESU_B_SEED_DIR" && RUST_LOG="warn,minvmd=info" mnl session activate . \
     --no-prompt --name e2e-esc-b --network own_ip \
     --allow-subnets 192.168.0.0/16 --allow-subnets 100.64.0.0/16 \
+    --allow-subnets "$esu_host/32" \
     --allow-protocols tcp \
     2>"$WORK/esu-activate-b.err")" || {
-    echo "::error::box B's activate (--network own_ip, 192.168.0.0/16 and the fabric declared) failed"
+    echo "::error::box B's activate (--network own_ip, 192.168.0.0/16, the fabric and $esu_host/32 declared) failed"
     cat "$WORK/esu-activate-b.err" 2>/dev/null || true
     esu_fail
   }
@@ -11441,8 +11523,8 @@ ESU_LISTENER_EOF
     echo "::error::a registration record does not name the switch address it allocated (A: $esu_ip_a, B: $esu_ip_b)"
     esu_fail
   fi
-  echo "box A: $esu_sid_a at switch address $esu_ip_a (declared 10.0.0.0/8 + the fabric)"
-  echo "box B: $esu_sid_b at switch address $esu_ip_b (declared 192.168.0.0/16 + the fabric)"
+  echo "box A: $esu_sid_a at switch address $esu_ip_a (declared 10.0.0.0/8 + the fabric + $esu_host/32)"
+  echo "box B: $esu_sid_b at switch address $esu_ip_b (declared 192.168.0.0/16 + the fabric + $esu_host/32)"
 
   # ---- path (a)'s precondition: the boxes hold no raw-socket capability ---
   # NET-083 (and the seal NET-084 rides on): the box may not forge frames on
@@ -11542,9 +11624,9 @@ ESU_LISTENER_EOF
     echo "box $esu_box's effective policy (the baseline set beside the rules):"
     printf '%s\n' "$esu_policy" | sed 's/^/  /'
     if [ "$esu_box" = a ]; then
-      esu_line='subnets  10.0.0.0/8, 100.64.0.0/16'
+      esu_line="subnets  10.0.0.0/8, 100.64.0.0/16, $esu_host/32"
     else
-      esu_line='subnets  192.168.0.0/16, 100.64.0.0/16'
+      esu_line="subnets  192.168.0.0/16, 100.64.0.0/16, $esu_host/32"
     fi
     if ! grep -q -- "$esu_line" <<<"$esu_policy"; then
       echo "::error::box $esu_box's policy does not show its declared subnets ('$esu_line')"
@@ -11861,9 +11943,9 @@ ESU_SPOOFER_EOF
   esu_probe() {
     # SID MARKER LABEL
     mnl session exec "$1" \
-      "echo $2 | /usr/bin/socat -u - TCP:$esu_alias:$ESU_LISTEN_PORT,connect-timeout=20" \
+      "echo $2 | /usr/bin/socat -u - TCP:$esu_host:$ESU_LISTEN_PORT,connect-timeout=20" \
       >"$WORK/esu-probe-$3.out" 2>"$WORK/esu-probe-$3.err" || {
-      echo "::error::box $3's own probe to $esu_alias:$ESU_LISTEN_PORT failed (its declared fabric half)"
+      echo "::error::box $3's own probe to $esu_host:$ESU_LISTEN_PORT failed (its declared $esu_host/32)"
       cat "$WORK/esu-probe-$3.err" 2>/dev/null || true
       esu_fail
     }
@@ -11884,21 +11966,21 @@ ESU_SPOOFER_EOF
     esu_fail
   }
   esu_rows="$esu_rows
-source=$esu_ip_a (box A's own probe) destination=$esu_alias:$ESU_LISTEN_PORT verdict=arrived (positive control: the box's own declared traffic)"
+source=$esu_ip_a (box A's own probe) destination=$esu_host:$ESU_LISTEN_PORT verdict=arrived (positive control: the box's own declared traffic)"
   esu_rows="$esu_rows
-source=$esu_ip_b (box B's own probe) destination=$esu_alias:$ESU_LISTEN_PORT verdict=arrived (positive control: the box's own declared traffic)"
-  echo "positive controls OK: both boxes' own declared traffic reached the listener through the fabric"
+source=$esu_ip_b (box B's own probe) destination=$esu_host:$ESU_LISTEN_PORT verdict=arrived (positive control: the box's own declared traffic)"
+  echo "positive controls OK: both boxes' own declared traffic reached the listener through the fabric's NAT"
 
   # ---- the arms, each a fresh connection at the gate's landing edge ---------
-  # The made-up in-plan lease first, toward the baseline set's own
-  # destination — the one arm that claims the address it wears (no row holds
-  # it, so its connection's end has nothing to withdraw). An address inside
-  # the plan's lease run that no row holds never leaves the VM, toward every
-  # destination the baseline set's own included, whatever the egress
-  # default's phase (NET-085): the gate drops it under its own rule
+  # The made-up in-plan lease first — the one arm that claims the address it
+  # wears (no row holds it, so its connection's end has nothing to withdraw)
+  # — toward the listener's own address, the one both boxes' rows declare. An
+  # address inside the plan's lease run that no row holds never leaves the
+  # VM, toward a destination the resident union declares and the baseline
+  # set's own alike (NET-085): the gate drops it under its own rule
   # (egress-unregistered-source), and the drop's line names the source — the
   # receipt this arm reads for the frames the spoofer spoke.
-  esu_run_spoofer madeup 100.64.0.99 "$esu_alias" esu-spoof-madeup-arrived 10 yes
+  esu_run_spoofer madeup 100.64.0.99 "$esu_host" esu-spoof-madeup-arrived 10 yes
   case "$esu_out" in
     outcome=refused*) : ;;
     *)
@@ -11915,7 +11997,7 @@ source=$esu_ip_b (box B's own probe) destination=$esu_alias:$ESU_LISTEN_PORT ver
     esu_fail
   }
   esu_rows="$esu_rows
-source=100.64.0.99 destination=$esu_alias:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unregistered-source — an in-plan lease no row holds, dropped toward the baseline set's own destination)"
+source=100.64.0.99 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unregistered-source — an in-plan lease no row holds, dropped toward a destination both rows declare)"
 
   # Box A's address toward box B's private half — inside the union, outside
   # the row that holds the worn address: the gate's infrastructure rule
@@ -11984,9 +12066,9 @@ source=$esu_ip_a destination=198.51.100.7:$ESU_LISTEN_PORT verdict=refused at th
   # 198.51.100.7 is TEST-NET-2, unreachable past the switch, so the
   # spoofer's outcome line (a plain timeout: no SYN-ACK, whether the gate
   # dropped the SYN or nothing answered it) is not what this arm reads — the
-  # gate's own drop line is. A fresh made-up address, not the alias arm's
-  # 100.64.0.99, so its line is its own: the gate rate-limits one line per
-  # source per rule per interval.
+  # gate's own drop line is. A fresh made-up address, not the first made-up
+  # arm's 100.64.0.99, so its line is its own: the gate rate-limits one line
+  # per source per rule per interval.
   esu_run_spoofer madeup-beyond 100.64.0.98 198.51.100.7 esu-spoof-madeup-beyond 3 yes
   case "$esu_out" in
     outcome=refused*) : ;;
@@ -12036,7 +12118,7 @@ source=$esu_ip_b destination=10.0.0.7:$ESU_LISTEN_PORT verdict=refused at the ga
   # unique to this arm, but the window discipline applies anyway: the count
   # must grow past the arm's own baseline.
   esu_prior="$(esu_gate_lines 203.0.113.7 egress-unknown-source | wc -l)"
-  esu_run_spoofer outside 203.0.113.7 "$esu_alias" esu-spoof-outside 3 no
+  esu_run_spoofer outside 203.0.113.7 "$esu_host" esu-spoof-outside 3 no
   case "$esu_out" in
     outcome=refused*) : ;;
     *)
@@ -12053,7 +12135,19 @@ source=$esu_ip_b destination=10.0.0.7:$ESU_LISTEN_PORT verdict=refused at the ga
     esu_fail
   }
   esu_rows="$esu_rows
-source=203.0.113.7 destination=$esu_alias:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unknown-source — outside the plan there is no lease to spoof)"
+source=203.0.113.7 destination=$esu_host:$ESU_LISTEN_PORT verdict=refused at the gate (egress-unknown-source — outside the plan there is no lease to spoof)"
+
+  # And for the destination: the runner's address is no address the gate
+  # holds as infrastructure, so no refusal in this case is
+  # egress-infrastructure-destination at it — every negative above is the
+  # bound's own, never an infrastructure drop passing for it.
+  esu_line="$(esu_case_log 2>/dev/null | grep -F 'egress-infrastructure-destination' \
+    | grep -F -e "\"$esu_host\"" -e "\"$esu_host:" || true)"
+  if [ -n "$esu_line" ]; then
+    echo "::error::the gate refused the runner's address $esu_host as infrastructure, so this case's refusals would not be the resident union's:"
+    printf '%s\n' "$esu_line" | sed 's/^/  /'
+    esu_fail
+  fi
 
   # ---- the record: each attempt with the gate's verdict beside it ----------
   echo "the attempts against the resident union, each with the gate's verdict:"
@@ -12075,7 +12169,7 @@ source=203.0.113.7 destination=$esu_alias:$ESU_LISTEN_PORT verdict=refused at th
   rm -rf "$ESU_A_SEED_DIR" "$ESU_B_SEED_DIR"
   ESU_A_SEED_DIR=""
   ESU_B_SEED_DIR=""
-  echo "escape reaches only the declared union OK (an escapee wearing any in-plan address — a resident box's own, or a made-up lease no row holds — reaches only the union of the resident boxes' declared egress plus the baseline set: each resident-address spoof was refused at the host-side gate beyond its own row's declaration, and each made-up lease was dropped under the gate's unregistered rule toward the baseline set's own destination and the union's far side alike, whatever the egress default's phase; both boxes hold neither CAP_NET_RAW nor CAP_NET_ADMIN, no IPv6 route in the guest, the baseline set beside the rules). NET-085"
+  echo "escape reaches only the declared union OK (an escapee wearing any in-plan address — a resident box's own, or a made-up lease no row holds — reaches only the union of the resident boxes' declared egress plus the baseline set: each resident-address spoof was refused at the host-side gate beyond its own row's declaration, and each made-up lease was dropped under the gate's unregistered rule toward a destination the resident union declares and the union's far side alike, whatever the egress default's phase; both boxes hold neither CAP_NET_RAW nor CAP_NET_ADMIN, no IPv6 route in the guest, the baseline set beside the rules). NET-085"
   echo "::endgroup::"
 }
 
@@ -12581,37 +12675,75 @@ proof_min_internal_names_through_proxy() {
       'the box has not published this port'
     proxy_want 403 "" 'the box has not published this port'
 
-    # NET-003's own-address half: the box resolves host.min.internal through
-    # the switch zone, to the alias gvproxy NATs to the host's loopback.
-    proxy_assert_host_by_name "$PROXY_OWN_SID" "NET-003 (own-address box)" own
+    # NET-003's own-address half, narrowed to resolution: the box resolves
+    # host.min.internal through the switch zone, to the host alias. Box→host
+    # reach over that alias is default-deny except configured host exposures
+    # (design §7.1), and this box's switch has none, so the reach is not
+    # asserted here. TODO(host-exposure): the positive reach arm comes back
+    # with a configured exposure (gominimal/inbox#867).
+    proxy_own_resolved="$(mnl session exec "$PROXY_OWN_SID" \
+      "getent ahostsv4 host.min.internal" 2>"$WORK/proxy-own-resolve.err" \
+      | awk 'NR == 1 { print $1 }' | tr -d '\r')" || true
+    echo "NET-003 (own-address box): host.min.internal resolved in the box: ${proxy_own_resolved:-<none>}"
+    if [ "${proxy_own_resolved:-}" != "$PROXY_HOST_ALIAS" ]; then
+      echo "::error::NET-003 (own-address box): host.min.internal did not resolve to the switch's host alias (expected $PROXY_HOST_ALIAS, got '${proxy_own_resolved:-<none>}')"
+      echo "--- getent stderr ---"; cat "$WORK/proxy-own-resolve.err" 2>/dev/null || true
+      fail
+    fi
 
-    # NET-004: the deprecated literal itself. It must still reach the host's
-    # loopback, and the box's egress relay must notice the connection — the
-    # notice is the reason the address is deprecated. The relay runs in the
-    # daemon, and every lane that has a switch (MINVMD_GVPROXY_BIN, the gate
-    # around this half) also runs with E2E_VM=1 — the justfile's `e2e-env`
-    # and the KVM lane set the pair together — so the `hook_log_readable`
-    # branch below is UNREACHABLE FROM CI: it serves developer runs only, a
-    # host driving a native daemon against a switch by hand. The switch lanes
-    # CI does run assert the routing and name the notice, whose emission the
-    # switch.rs unit tests pin.
-    proxy_request "$PROXY_OWN_SID" "NET-004: the deprecated literal still reaches the host's loopback" \
-      "http://$PROXY_HOST_ALIAS:$PROXY_HOST_PORT/marker" direct ""
-    proxy_want 200 "$PROXY_HOST_MARKER" ""
+    # NET-004: the deprecated literal itself. Box→host reach over the alias
+    # is default-deny except configured host exposures (design §7.1), and
+    # none is configured, so the box's own relay drops the connect: no
+    # answer and no reset until the timeout, and the relay names the drop
+    # under the infrastructure deny set's rule. The deprecation notice is
+    # not asserted: the relay emits it only for a frame its verdict admits,
+    # and the alias admits none without an exposure. TODO(host-exposure):
+    # the positive reach arm comes back with a configured exposure
+    # (gominimal/inbox#867); the notice on a drop is gominimal/inbox#868.
+    #
+    # The relay runs in the daemon, and every lane that has a switch
+    # (MINVMD_GVPROXY_BIN, the gate around this half) also runs with
+    # E2E_VM=1 — the justfile's `e2e-env` and the KVM lane set the pair
+    # together — so the `hook_log_readable` branch below is UNREACHABLE FROM
+    # CI: it serves developer runs only, a host driving a native daemon
+    # against a switch by hand. The switch lanes CI does run assert the
+    # silent drop, whose log line the switch.rs unit tests pin.
+    proxy_alias_before="$(proxy_daemon_log_lines)"
+    proxy_alias_start_ms="$(now_ms)"
+    mnl session exec "$PROXY_OWN_SID" \
+      "/usr/bin/socat /dev/null TCP:$PROXY_HOST_ALIAS:$PROXY_HOST_PORT,connect-timeout=10" \
+      >/dev/null 2>"$WORK/proxy-alias.err" && {
+      echo "::error::NET-004: the own-address box completed a connection to the host alias $PROXY_HOST_ALIAS:$PROXY_HOST_PORT with no host exposure configured"
+      fail
+    }
+    proxy_alias_elapsed_ms=$(( $(now_ms) - proxy_alias_start_ms ))
+    echo "NET-004: connect $PROXY_HOST_ALIAS:$PROXY_HOST_PORT from the own-address box -> elapsed=${proxy_alias_elapsed_ms}ms socat: $(tail -n1 "$WORK/proxy-alias.err" 2>/dev/null)"
+    if grep -q 'Connection refused' "$WORK/proxy-alias.err" 2>/dev/null; then
+      echo "::error::NET-004: the connection to the host alias was reset — the frame got past the box's relay, which must drop it silently"
+      cat "$WORK/proxy-alias.err" 2>/dev/null || true
+      fail
+    fi
+    if [ "$proxy_alias_elapsed_ms" -lt 5000 ]; then
+      echo "::error::NET-004: the connection to the host alias failed in ${proxy_alias_elapsed_ms}ms — a fast failure, not the silent drop being asserted"
+      cat "$WORK/proxy-alias.err" 2>/dev/null || true
+      fail
+    fi
     if hook_log_readable; then
-      proxy_notice=""
+      proxy_alias_drop=""
       for _ in $(seq 1 10); do
-        proxy_notice="$(grep -h -- 'deprecated literal host address' "$(proxy_daemon_log)" 2>/dev/null | tail -n1)"
-        [ -n "$proxy_notice" ] && break
+        proxy_alias_drop="$(proxy_daemon_log_since "$proxy_alias_before" \
+          | grep -F -- 'egress-infrastructure-destination' \
+          | grep -F -- "$PROXY_HOST_ALIAS:$PROXY_HOST_PORT" | tail -n1)"
+        [ -n "$proxy_alias_drop" ] && break
         sleep 0.25
       done
-      if [ -z "$proxy_notice" ]; then
-        echo "::error::the box's egress relay did not log the connection to the deprecated literal"
+      if [ -z "$proxy_alias_drop" ]; then
+        echo "::error::the box's egress relay did not log the dropped connection to the host alias under 'egress-infrastructure-destination'"
         fail
       fi
-      echo "daemon log: $proxy_notice"
+      echo "daemon log: $proxy_alias_drop"
     else
-      echo "NET-004 notice: (guest-side daemon log on this lane; its emission is pinned by the switch.rs unit tests)"
+      echo "NET-004 drop line: (guest-side daemon log on this lane; its emission is pinned by the switch.rs unit tests)"
     fi
 
     mnl session destroy --force "$PROXY_OWN_SID" >/dev/null 2>&1 || true
