@@ -790,6 +790,151 @@ mod tests {
         );
     }
 
+    /// NET-078/NET-133: a host-address box still delivers as the cohort. The
+    /// host's own address outside the box host — the cohort address
+    /// host-address boxes arrive from — is a row like a box's when the host
+    /// published one there: its registration issues the cohort's attachment,
+    /// the pool grows it a share like any box row's, and a delivered
+    /// connection from it carries the cohort's own id, which is the shape
+    /// the cross-check answers. The node namespace stays excluded beside it:
+    /// no share, no attachment, and nothing delivered from it.
+    #[tokio::test]
+    async fn host_address_box_still_delivers_as_cohort() {
+        use switch::bep_host::BepBoxSource;
+
+        let subnet = SwitchSubnet::default();
+        let proxy_ip = subnet.box_egress_proxy_address();
+        let cohort_ip = subnet.host_alias();
+        let attachments = Attachments::new();
+        let registry = crate::box_registry::BoxRegistry::new(subnet)
+            .feeding_proxy_attachments(attachments.clone());
+
+        // The node's own row, as run.rs publishes it at boot: not a box, so
+        // no share and no attachment — pinned by the pool's count below. The
+        // host's row at the cohort address is published the way the host
+        // publishes one: an explicit registration at its own address, a row
+        // like a box's, outside the run boxes are handed from.
+        registry.register_node_namespace(7654);
+        let cohort = registry.register(crate::box_registry::BoxRegistration::new(
+            "host",
+            cohort_ip,
+            Ipv4Addr::LOCALHOST,
+        ));
+
+        // The cohort's attachment: issued by its registration, naming the
+        // cohort by the id its row holds — the id a delivery from the
+        // cohort address arrives as — while the node namespace's row
+        // bought none.
+        let attachment = attachments
+            .by_source(cohort_ip.octets())
+            .expect("the cohort row issued the cohort's attachment");
+        assert_eq!(
+            attachment.box_id(),
+            cohort.box_id(),
+            "the cohort's attachment carries the id its row holds"
+        );
+        assert_ne!(
+            attachment.box_id(),
+            [0u8; 16],
+            "the cohort's id is a minted UUIDv7, never the all-zero non-id"
+        );
+        assert!(
+            attachments.by_source(subnet.daemon_ip().octets()).is_none(),
+            "the node namespace is not a box and no cohort either: its row buys \
+             no attachment"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proxy_sock = dir.path().join("bep-stub.sock");
+        let token = [0x5au8; TOKEN_LEN];
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let stub = spawn(proxy_sock.clone(), start_rx).expect("the stand-in binds its socket");
+        start_tx
+            .send(StubStart {
+                token,
+                daemon_pid: std::process::id(),
+                attachments: attachments.clone(),
+            })
+            .expect("the supervisor hands the start facts over the channel");
+
+        let wire = BepWire::new(proxy_sock, token);
+        let boxes = Arc::new(crate::box_registry::RegisteredBoxes::new(
+            registry.table(),
+            attachments.clone(),
+        ));
+        let mut lane = TestLane::new(subnet, wire, boxes.clone());
+        drive(&mut lane, 2).await;
+        assert_eq!(
+            lane.pool_len(),
+            DEFAULT_PER_SOURCE_CAP,
+            "the cohort row holds a share like a box's; the node's adds none"
+        );
+        assert_eq!(
+            boxes.box_id_for_source(cohort_ip),
+            Some(attachment.box_id()),
+            "the pool's id lookup resolves the cohort address to the cohort's \
+             attachment, never to a bare row"
+        );
+        assert_eq!(
+            boxes.box_id_for_source(subnet.daemon_ip()),
+            None,
+            "the node namespace resolves to nothing: the one shape the pool's \
+             no-attachment abort is for"
+        );
+
+        // A connection rides the lane from the cohort address, the way the
+        // host's own traffic arrives — and it is delivered and answered,
+        // attributed to the cohort's id by the cross-check.
+        lane.add_box(cohort_ip);
+        drive(&mut lane, 1).await;
+        lane.boxes_mut()[0].arp_for(proxy_ip);
+        drive(&mut lane, 3).await;
+        let flow = lane.boxes_mut()[0].connect(proxy_ip, PROXY_PORT);
+        drive(&mut lane, 40).await;
+        let answer = read_flow(&mut lane, 0, flow, 8).await;
+        assert_eq!(
+            String::from_utf8_lossy(&answer),
+            format!(
+                "source={}:{} destination={}:{}\n",
+                cohort_ip,
+                FIRST_CLIENT_PORT,
+                proxy_ip,
+                PROXY_PORT
+            ),
+            "the cohort's connection was delivered and answered, arriving as \
+             the cohort from its own address"
+        );
+        assert!(
+            stub.refusals().is_empty(),
+            "the cohort's delivery was refused for nothing"
+        );
+        assert_eq!(
+            stub.presented().len(),
+            1,
+            "one answer, attributed to the cohort's id"
+        );
+
+        // The node namespace stays excluded: its address holds no share, so
+        // the pool's screen refuses its connection before any listener
+        // answers — and nothing from it was presented as the cohort.
+        lane.add_box(subnet.daemon_ip());
+        drive(&mut lane, 1).await;
+        lane.boxes_mut()[1].arp_for(proxy_ip);
+        drive(&mut lane, 3).await;
+        let from_daemon = lane.boxes_mut()[1].connect(proxy_ip, PROXY_PORT);
+        drive(&mut lane, 40).await;
+        assert_eq!(
+            lane.boxes()[1].flow_state(from_daemon),
+            State::Closed,
+            "a connection from the node namespace's address was reset"
+        );
+        assert_eq!(
+            stub.presented().len(),
+            1,
+            "nothing from the node namespace was presented as the cohort"
+        );
+    }
+
     /// NET-133/T44: a box's attachment reaches the proxy before its first
     /// connection. The attachment is issued host-side, by the registration
     /// that publishes the box's row, and issued **ahead** of the row: the

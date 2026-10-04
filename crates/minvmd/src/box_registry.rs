@@ -1714,6 +1714,132 @@ mod tests {
         }
     }
 
+    /// BEP-070, one id names one box, so a registration that presents an id a
+    /// live row or attachment already holds is refused — before any address
+    /// is spent, so the refusal leaves no new fact on the host — and said
+    /// as one warn line naming the id, so a tail reads which identity the
+    /// registration claimed. What the refusal guards is a box claiming
+    /// another box's identity from outside: a fresh mint never meets it, and
+    /// a re-registration presenting its own ended box's id does not either,
+    /// because an ended box holds nothing in the live set — the shape the
+    /// CLI's autospawn retry's re-registration takes.
+    #[test]
+    fn colliding_box_id_refused() {
+        let (log, _guard) = crate::net::egress_gate::test_support::capture_log();
+        let attachments = crate::bep_attach::Attachments::new();
+        let registry = BoxRegistry::new(SUBNET).feeding_proxy_attachments(attachments.clone());
+        let web = registry
+            .register_client_box(ClientBoxSpec {
+                name: "web".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                box_id: None,
+            })
+            .expect("the plan has an address for the first box");
+        assert!(
+            attachments.holds_id(web.box_id()),
+            "the box's id is held by its row's attachment, the half of the live \
+             set a source's delivery resolves through"
+        );
+
+        // A registration presenting the live row's id claims the web box's
+        // identity: refused, and the refusal names the id it claimed.
+        let refused = registry
+            .register_client_box(ClientBoxSpec {
+                name: "impostor".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                box_id: Some(web.box_id()),
+            })
+            .expect_err("an id a live box holds is not a second box's to claim");
+        assert_eq!(
+            refused,
+            AllocationError::CollidingBoxId { id: web.box_id() },
+            "the refusal names the colliding id, the one the registration claimed"
+        );
+
+        // The refusal spent nothing: no row was published for the impostor,
+        // the live row is untouched, and the hand-out run's next address is
+        // still the next registration's to take.
+        let rows = registry.table().rows();
+        assert_eq!(rows.len(), 1, "a refused registration publishes no row");
+        assert_eq!(
+            row_identity(&rows[0]),
+            row_identity(&web),
+            "the live row is the live box's, untouched by the refusal"
+        );
+        let next = registry
+            .register_client_box(ClientBoxSpec {
+                name: "db".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                box_id: None,
+            })
+            .expect("the plan has a second hand-out address");
+        assert_eq!(
+            next.switch_addr(),
+            Ipv4Addr::from(u32::from(web.switch_addr()) + 1),
+            "the refusal spent no address: the next registration takes the \
+             hand-out run's next, the address the refused one would have spent"
+        );
+
+        // One warn line names the refusal and the id it refused — the line a
+        // bundle's daemon log tail reads a refused registration by.
+        let logged = log.contents();
+        assert_eq!(
+            logged
+                .matches(
+                    "refused a box registration whose id a live row or attachment already holds"
+                )
+                .count(),
+            1,
+            "one warn line per refused registration, got: {logged}"
+        );
+        assert!(
+            logged.contains(&format!(
+                "box_id={}",
+                crate::bep_attach::BoxIdText(&web.box_id())
+            )),
+            "the warn line names the id the registration claimed, got: {logged}"
+        );
+
+        // An ended box's id is free of the live set: the CLI's autospawn
+        // retry withdraws its box's row and re-registers presenting the id
+        // its first registration minted, and that re-registration is
+        // answered — with the same id, the recreated box staying the
+        // identity its first creation made it.
+        assert!(
+            registry
+                .withdraw_client_box("web", web.switch_addr(), web.loopback_addr())
+                .expect("the withdrawing client is the row's creator")
+                .is_some(),
+            "the row was published"
+        );
+        let recreated = registry
+            .register_client_box(ClientBoxSpec {
+                name: "web".to_string(),
+                ingress_ports: Vec::new(),
+                egress: None,
+                credentialed_upstream: None,
+                box_id: Some(web.box_id()),
+            })
+            .expect("an ended box's id is not a live row's to collide with");
+        assert_eq!(
+            recreated.box_id(),
+            web.box_id(),
+            "the re-registration held the box's identity: one id per box, across \
+             the end that did not end it"
+        );
+        assert_ne!(
+            recreated.switch_addr(),
+            web.switch_addr(),
+            "the recreation spent the run's next address, never a spent one again"
+        );
+    }
+
     /// NET-138's trust boundary: the guest never sources a row. The table the
     /// gate holds is read-only by construction — `BoxTable`'s only operations
     /// are lookups — and what that means behaviourally is that no amount of
