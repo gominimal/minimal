@@ -170,14 +170,15 @@ impl ProxyListener {
 ///
 /// * **The resolver's port on the gateway** (NET-079): TCP or UDP to
 ///   [`DNS_PORT`] falls through to the box's own rules, which still decide
-///   it — the UDP carve-out above already admits the query under any
-///   declaration, and a TCP query keeps the verdict its rules would give
-///   it anywhere else, so the opening adds a ceiling over the gateway
-///   without moving any floor. Every other port, and any protocol with no
-///   port to name one by, points at the switch itself and is the set's
-///   drop.
+///   it — the UDP carve-out ahead of the set's arm already admits the query
+///   under any declaration, and a TCP query keeps the verdict its rules
+///   would give it anywhere else, so the opening adds a ceiling over the
+///   gateway without moving any floor. Every other port, and any protocol
+///   with no port to name one by, points at the switch itself and is the
+///   set's drop.
 /// * **The proxy's peer address on a credentialed lane** (NET-134): the
-///   [`ProxyListener`] arms above already decide that address — the
+///   [`ProxyListener`] arms ahead of the set's own already decide that
+///   address — the
 ///   listener's whole triple for a box that declared the lane, and
 ///   nothing else — so the set names the address only to hold it for a
 ///   rule set compiled without a listener at all, where no lane exists to
@@ -273,7 +274,8 @@ impl SwitchOwnAddresses {
             // (a UDP query, or TCP when the answer truncates) — and nothing
             // else: a protocol with no port to name one by points at the
             // switch itself, and a frame with no readable port fails the
-            // opening closed, the way it fails the carve-out above.
+            // opening closed, the way it fails the carve-out ahead of this
+            // arm in the verdict.
             let resolver_query =
                 (proto == IPPROTO_TCP || proto == IPPROTO_UDP) && dst_port == DNS_PORT;
             (!resolver_query).then_some(reason)
@@ -283,9 +285,9 @@ impl SwitchOwnAddresses {
             && listener.is_none_or(|listener| listener.addr != self.bep_peer)
         {
             // The peer's opening is the lane's, decided by the listener arms
-            // above for every rule set that carries one; the set holds the
-            // address for a compile that carries none, where no lane exists
-            // to open it.
+            // ahead of this one for every rule set that carries a listener;
+            // the set holds the address for a compile that carries none,
+            // where no lane exists to open it.
             Some(reason)
         } else if dst == self.host_alias
             && !self.host_exposure_ports.is_empty()
