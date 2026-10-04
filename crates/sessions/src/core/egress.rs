@@ -90,8 +90,11 @@ const ETHERTYPE_ARP: u16 = 0x0806;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 /// `EtherType` for IPv6.
 const ETHERTYPE_IPV6: u16 = 0x86DD;
-/// IPv4 protocol number for UDP.
-const IPPROTO_UDP: u8 = 17;
+/// The reply-flow record's first protocol — UDP, the one the resolver
+/// carve-out reads, beside the TCP of [`IPPROTO_TCP`], for the gates'
+/// record and reply arms: a gate that ends a retraction's records reads
+/// it here, so its purge keys by the number the recording keyed.
+pub const IPPROTO_UDP: u8 = 17;
 /// The port DNS is served on: the resolver carve-out's port (NET-079).
 const DNS_PORT: u16 = 53;
 
