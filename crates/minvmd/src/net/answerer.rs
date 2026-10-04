@@ -514,10 +514,23 @@ struct AddressHolder {
 /// last connection ends); a restarted answerer starts empty and the nodes'
 /// re-publishes claim their addresses back, so an address is session-stable
 /// and no guest lease ever keys it.
+///
+/// A released address is quarantined for [`REUSE_QUARANTINE`], the positive
+/// answer TTL the zone serves: until it passes, a host resolver may still
+/// hold the old name's answer, and a client connecting by it must not reach
+/// a different box. Only the box that held it may take it back early.
 #[derive(Debug, Default)]
 struct AddressBook {
     held: BTreeMap<Ipv4Addr, AddressHolder>,
+    /// Released addresses still inside their quarantine: who held each and
+    /// when it was released.
+    released: BTreeMap<Ipv4Addr, (AddressHolder, Instant)>,
 }
+
+/// How long a released box address stays out of allocation: the positive
+/// TTL every zone answer carries ([`zone_answer::ANSWER_TTL_SECS`]), the
+/// longest a host resolver may keep answering the old name with it.
+const REUSE_QUARANTINE: Duration = Duration::from_secs(zone_answer::ANSWER_TTL_SECS as u64);
 
 /// The box addresses the answerer hands out: the reserved local range's
 /// `.2` to its last-but-one address (`.254` of the /24). The network
@@ -536,9 +549,18 @@ fn in_box_range(address: Ipv4Addr) -> bool {
 }
 
 impl AddressBook {
-    /// The address `name` of `node` holds, or the lowest free one, recorded
-    /// against them. Idempotent per box.
+    /// [`Self::allocate_at`], now.
     fn allocate(&mut self, node: &str, name: &str) -> Result<Ipv4Addr, String> {
+        self.allocate_at(node, name, Instant::now())
+    }
+
+    /// The address `name` of `node` holds, or the lowest free one whose
+    /// quarantine has passed by `now`, recorded against them. Idempotent
+    /// per box; a box re-registered inside its old address's quarantine
+    /// gets that address back. When every free address is still
+    /// quarantined, the allocation fails naming when the first one frees —
+    /// it never hands an address out early.
+    fn allocate_at(&mut self, node: &str, name: &str, now: Instant) -> Result<Ipv4Addr, String> {
         if let Some((address, _)) = self
             .held
             .iter()
@@ -546,26 +568,64 @@ impl AddressBook {
         {
             return Ok(*address);
         }
+        self.released
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) < REUSE_QUARANTINE);
+        let holder = AddressHolder {
+            node: node.to_string(),
+            name: name.to_string(),
+        };
+        let own = self
+            .released
+            .iter()
+            .find(|(_, (was, _))| *was == holder)
+            .map(|(address, _)| *address);
         let (first, last) = box_address_range();
-        let free = (u32::from(first)..=u32::from(last))
-            .map(Ipv4Addr::from)
-            .find(|address| !self.held.contains_key(address))
-            .ok_or_else(|| {
-                format!("every box address in {first}-{last} is held; none remains to hand out")
-            })?;
-        self.held.insert(
-            free,
-            AddressHolder {
-                node: node.to_string(),
-                name: name.to_string(),
-            },
-        );
+        let free = own.or_else(|| {
+            (u32::from(first)..=u32::from(last))
+                .map(Ipv4Addr::from)
+                .find(|address| {
+                    !self.held.contains_key(address) && !self.released.contains_key(address)
+                })
+        });
+        let Some(free) = free else {
+            let next = self
+                .released
+                .values()
+                .map(|(_, at)| REUSE_QUARANTINE.saturating_sub(now.saturating_duration_since(*at)))
+                .min();
+            return Err(match next {
+                Some(wait) => format!(
+                    "every box address in {first}-{last} is held or was released less than \
+                     {} s ago (the answer TTL a host resolver may still serve it under); the \
+                     next one frees in {} s",
+                    REUSE_QUARANTINE.as_secs(),
+                    wait.as_secs().max(1)
+                ),
+                None => {
+                    format!("every box address in {first}-{last} is held; none remains to hand out")
+                }
+            });
+        };
+        self.released.remove(&free);
+        self.held.insert(free, holder);
         Ok(free)
     }
 
-    /// Records `address` against `name` of `node`, as a publish claims it;
-    /// refused when another node holds it.
+    /// [`Self::claim_at`], now.
     fn claim(&mut self, node: &str, name: &str, address: Ipv4Addr) -> Result<(), String> {
+        self.claim_at(node, name, address, Instant::now())
+    }
+
+    /// Records `address` against `name` of `node`, as a publish claims it;
+    /// refused when another node holds it, or when another box released it
+    /// less than the quarantine ago.
+    fn claim_at(
+        &mut self,
+        node: &str,
+        name: &str,
+        address: Ipv4Addr,
+        now: Instant,
+    ) -> Result<(), String> {
         if let Some(holder) = self.held.get(&address)
             && holder.node != node
         {
@@ -575,30 +635,58 @@ impl AddressBook {
                 holder.node
             ));
         }
-        self.held.insert(
-            address,
-            AddressHolder {
-                node: node.to_string(),
-                name: name.to_string(),
-            },
-        );
+        let holder = AddressHolder {
+            node: node.to_string(),
+            name: name.to_string(),
+        };
+        if let Some((was, at)) = self.released.get(&address)
+            && now.saturating_duration_since(*at) < REUSE_QUARANTINE
+            && *was != holder
+        {
+            return Err(format!(
+                "the address {address} was released less than {} s ago (the answer TTL a \
+                 host resolver may still serve it under); it is not reused before then",
+                REUSE_QUARANTINE.as_secs()
+            ));
+        }
+        self.released.remove(&address);
+        self.held.insert(address, holder);
         Ok(())
     }
 
-    /// Releases the address `name` of `node` holds, if any.
+    /// [`Self::release_at`], now.
     fn release(&mut self, node: &str, name: &str) -> Option<Ipv4Addr> {
+        self.release_at(node, name, Instant::now())
+    }
+
+    /// Releases the address `name` of `node` holds, if any, into its
+    /// quarantine.
+    fn release_at(&mut self, node: &str, name: &str, now: Instant) -> Option<Ipv4Addr> {
         let address = self
             .held
             .iter()
             .find(|(_, holder)| holder.node == node && holder.name == name)
             .map(|(address, _)| *address)?;
-        self.held.remove(&address);
+        if let Some(holder) = self.held.remove(&address) {
+            self.released.insert(address, (holder, now));
+        }
         Some(address)
     }
 
-    /// Releases every address `node` holds.
+    /// Releases every address `node` holds into its quarantine.
     fn release_node(&mut self, node: &str) {
-        self.held.retain(|_, holder| holder.node != node);
+        let now = Instant::now();
+        let gone: Vec<Ipv4Addr> = self
+            .held
+            .iter()
+            .filter(|(_, holder)| holder.node == node)
+            .map(|(address, _)| *address)
+            .collect();
+        for address in gone {
+            if let Some(holder) = self.held.remove(&address) {
+                self.released.insert(address, (holder, now));
+            }
+        }
     }
 }
 
@@ -3877,7 +3965,11 @@ mod tests {
              node row: every VM's node row is the same name, so the channel \
              would only refuse it"
         );
-        let published = connect_and_publish(&channel, "a test node", rows.clone())
+        // Published as the node the second daemon's own acquisition loop
+        // below is (`acquire_loop_at`'s node id): the same node coming
+        // back, which may re-take its released address inside the reuse
+        // quarantine that keeps it from any other node.
+        let published = connect_and_publish(&channel, crate::state::vm_name(), rows.clone())
             .expect("the holder accepts the table");
         assert!(
             published.refused.is_empty(),
@@ -5002,12 +5094,135 @@ mod tests {
         probe
     }
 
+    /// With no answerer service installed (no marker), no channel and the
+    /// hook port free, a node hosts the interim and hands its own boxes
+    /// their addresses: nothing about the host's resolver (no
+    /// systemd-resolved, no resolver hook at all) enters the acquisition,
+    /// so own-address box registration never depends on it.
+    #[test]
+    fn interim_host_allocates_without_a_service_or_a_resolver_hook() {
+        let dir = tempfile::TempDir::new().expect("a temp dir");
+        let port = free_port();
+        let status = start_daemon(
+            web_registry().0,
+            port,
+            test_paths(&dir, RELEASE_WINDOW),
+            "node-without-service",
+        );
+        await_status_is(
+            &status,
+            ZoneAnswererStatus::Holder { port },
+            "the node never hosted the interim",
+        );
+        let first = status
+            .allocate("box-a")
+            .expect("the interim hands out an address");
+        let second = status.allocate("box-b").expect("and another");
+        assert!(
+            in_box_range(first) && in_box_range(second) && first != second,
+            "the interim allocates distinct box addresses: {first}, {second}"
+        );
+    }
+
+    /// A released box address is quarantined for the positive answer TTL
+    /// (design §7.1): a host resolver may still answer the old name with it
+    /// that long, so no other box is handed it before then — the lowest
+    /// address whose quarantine has passed goes first, an older free
+    /// address is preferred, and with nothing else free the allocation
+    /// fails naming the wait rather than handing the address out early. A
+    /// claim by another box is refused the same way; the box that held it
+    /// may take it back. Driven on an injected clock, no sleeps.
+    #[test]
+    fn released_address_is_not_reused_within_the_answer_ttl() {
+        let ttl = Duration::from_secs(u64::from(zone_answer::ANSWER_TTL_SECS));
+        assert_eq!(
+            REUSE_QUARANTINE, ttl,
+            "the quarantine is the served answer TTL"
+        );
+        let t0 = Instant::now();
+        let mut book = AddressBook::default();
+        let a = book.allocate_at("node-a", "a", t0).expect(".2");
+        let b = book.allocate_at("node-a", "b", t0).expect(".3");
+        assert_eq!(
+            (a, b),
+            (Ipv4Addr::new(127, 0, 64, 2), Ipv4Addr::new(127, 0, 64, 3))
+        );
+
+        // .2 is released; inside the TTL another box is handed .4, not .2.
+        assert_eq!(book.release_at("node-a", "a", t0), Some(a));
+        let inside = (t0 + ttl).checked_sub(Duration::from_millis(1)).unwrap();
+        let c = book
+            .allocate_at("node-b", "c", inside)
+            .expect("a fresh address");
+        assert_eq!(
+            c,
+            Ipv4Addr::new(127, 0, 64, 4),
+            "the quarantined .2 is skipped"
+        );
+        assert!(
+            book.claim_at("node-b", "intruder", a, inside).is_err(),
+            "another box's claim of a quarantined address is refused"
+        );
+
+        // An older free address is preferred: .4 released later than .2,
+        // and once .2's quarantine has passed it goes first.
+        assert_eq!(
+            book.release_at("node-b", "c", t0 + Duration::from_secs(5)),
+            Some(c)
+        );
+        let after_a = t0 + ttl;
+        assert_eq!(
+            book.allocate_at("node-b", "d", after_a),
+            Ok(a),
+            "the lowest address whose quarantine has passed"
+        );
+        let e = book
+            .allocate_at("node-b", "e", after_a)
+            .expect("the next fresh one");
+        assert_eq!(
+            e,
+            Ipv4Addr::new(127, 0, 64, 5),
+            "the still-quarantined .4 is skipped"
+        );
+
+        // The box that held a quarantined address may take it back.
+        assert_eq!(book.release_at("node-a", "b", after_a), Some(b));
+        assert_eq!(
+            book.allocate_at("node-a", "b", after_a),
+            Ok(b),
+            "a box re-registered gets its own address back"
+        );
+
+        // With every other address held, the allocation fails naming the
+        // wait — it never hands the quarantined address out early.
+        let mut full = AddressBook::default();
+        let (first, last) = box_address_range();
+        for (index, _) in (u32::from(first)..=u32::from(last)).enumerate() {
+            full.allocate_at("node-a", &format!("box{index}"), t0)
+                .expect("the range holds it");
+        }
+        let freed = full.release_at("node-a", "box0", t0).expect("box0 held .2");
+        let refused = full
+            .allocate_at("node-b", "late", t0 + Duration::from_secs(10))
+            .expect_err("nothing is free outside the quarantine");
+        assert!(
+            refused.contains("released less than 15 s ago") && refused.contains("frees in 5 s"),
+            "the refusal names the quarantine and the wait: {refused}"
+        );
+        assert_eq!(
+            full.allocate_at("node-b", "late", t0 + ttl),
+            Ok(freed),
+            "once the TTL has passed the address is handed out"
+        );
+    }
+
     /// Box addresses are host-global (design §7.1): the answerer hands
     /// each node's boxes the lowest free address of `.2`-`.254`, so two
     /// nodes under separate state dirs never share one, even for boxes of
     /// the same name; a publish of an address another node holds, or of an
-    /// address outside the box range, is refused; and an address returns
-    /// to the range when its box is released or its node leaves.
+    /// address outside the box range, is refused; and an address released
+    /// by its box or its departed node is not handed to another box inside
+    /// the answer TTL.
     #[test]
     fn two_nodes_never_share_a_box_address() {
         let dir = tempfile::TempDir::new().expect("a temp dir for the service");
@@ -5103,24 +5318,27 @@ mod tests {
         }
         drop(intruder);
 
-        // A released box's address returns to the range: the next box of
-        // either node is handed it.
+        // A released box's address leaves the holder's book, but not into
+        // another box's hands inside the answer TTL: the next box is handed
+        // a fresh address (the reuse after the TTL is
+        // `released_address_is_not_reused_within_the_answer_ttl`'s).
         a.release_address("db");
         let deadline = Instant::now() + Duration::from_secs(10);
         let b_api = loop {
             let address = b.allocate("api").expect("node b's next box");
-            if address == a_db || Instant::now() > deadline {
+            if address != a_db || Instant::now() > deadline {
                 break address;
             }
             b.release_address("api");
             std::thread::sleep(CONNECTION_POLL);
         };
-        assert_eq!(
-            b_api, a_db,
-            "the released address is the lowest free one again"
+        assert!(
+            b_api != a_db && b_api != a_web && b_api != b_web && in_box_range(b_api),
+            "a released address is not handed to another box within the answer TTL: {b_api}"
         );
 
-        // A node that leaves releases its addresses.
+        // A node that leaves releases its addresses — into the same
+        // quarantine, so the node that arrives next is handed another one.
         let node_d = node_id_for(&dir.path().join("state-d"), "default");
         let mut leaving = connect_and_publish(&channel, &node_d, Vec::new())
             .expect("node d connects")
@@ -5130,27 +5348,20 @@ mod tests {
             .expect("the channel serves node d")
             .expect("node d's box is handed an address");
         drop(leaving);
+        std::thread::sleep(CONNECTION_POLL * 3);
         let node_e = node_id_for(&dir.path().join("state-e"), "default");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let mut arriving = connect_and_publish(&channel, &node_e, Vec::new())
-                .expect("node e connects")
-                .registration;
-            let e_box = arriving
-                .allocate("box")
-                .expect("the channel serves node e")
-                .expect("node e's box is handed an address");
-            if e_box == d_box {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "node d's address {d_box} never returned after it left (node e got {e_box})"
-            );
-            arriving.release_address("box").expect("node e releases");
-            drop(arriving);
-            std::thread::sleep(CONNECTION_POLL);
-        }
+        let mut arriving = connect_and_publish(&channel, &node_e, Vec::new())
+            .expect("node e connects")
+            .registration;
+        let e_box = arriving
+            .allocate("box")
+            .expect("the channel serves node e")
+            .expect("node e's box is handed an address");
+        assert_ne!(
+            e_box, d_box,
+            "a departed node's address is not handed on within the answer TTL"
+        );
+        drop(arriving);
 
         stop.store(true, Ordering::SeqCst);
     }
