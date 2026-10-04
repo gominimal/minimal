@@ -962,6 +962,11 @@ fn run_foreground() -> Result<()> {
                 );
                 let _ = child.kill();
                 let _ = child.wait();
+                // Release this VM's own reservation before the re-draw: a
+                // second open's flock contends with the held fd even in this
+                // process, so the refused port, freed meanwhile, would read
+                // as another VM's reservation and be skipped.
+                drop(node_port);
                 node_port = assign_node_proxy_port(&ports_dir)
                     .context("redrawing the node's proxy port after a refused publish")?;
                 boxes.register_node_namespace(node_port.port);
