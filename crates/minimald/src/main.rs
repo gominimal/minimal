@@ -644,6 +644,11 @@ async fn async_main() -> Result<(), MainError> {
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         }
     }
+    // VM-wide kernel settings every session on the VM shares, before any box
+    // starts. Never on a native daemon: those are the host's to set.
+    if is_minimal_microvm() {
+        guest::apply_microvm_sysctls();
+    }
 
     // NET-079: the daemon's own classifier leaf, entered at start so its own
     // traffic is decided as the daemon's (NET-080), never classed with a
