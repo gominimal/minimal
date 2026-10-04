@@ -933,6 +933,25 @@ impl Server {
         let zone_answerer_port = config.zone_answerer_port;
         let state = ServerStateHandle::new(config, log_release).await?;
 
+        // Bring up the actor of every active session restored from the
+        // store, so each one's box name routes from daemon start rather than
+        // from the first RPC that names the session. Spawned, so the accept
+        // loop does not wait on it; the manager's mailbox orders it ahead of
+        // any RPC that arrives meanwhile.
+        #[cfg(target_os = "linux")]
+        {
+            let manager = state.sessions_manager().await;
+            tokio::spawn(async move {
+                if let Err(error) = manager.resume_active_sessions().await {
+                    tracing::warn!(
+                        %error,
+                        "could not resume active sessions at daemon start; their names \
+                         register when an RPC first names each session",
+                    );
+                }
+            });
+        }
+
         // Start minimald's host-side egress proxy (B5, on its configured,
         // default, or OS-selected port) and the box-zone answerer beside it
         // for the server's lifetime, and in a microVM (DM1) publish them on

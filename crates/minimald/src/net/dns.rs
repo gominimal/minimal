@@ -883,6 +883,18 @@ impl HostnameRegistry {
             .is_some_and(|registration| registration.id != session_id)
     }
 
+    /// The session name whose route `session_name`'s box name answers with
+    /// now, if any. The lookup goes through the name's hostname, which is
+    /// case-folded, so it also finds a route registered under a name that
+    /// differs from `session_name` only in ASCII case — the collision
+    /// [`Self::register`] warns about and then overwrites.
+    #[must_use]
+    pub fn hostname_owner(&self, session_name: &str) -> Option<String> {
+        self.by_host
+            .get(&Hostname::for_ptask(session_name))
+            .map(|route| route.session().to_owned())
+    }
+
     /// Reports the lease an `OwnIp` box attached with (from the attach path)
     /// and registers the session's box name against it now, so the name routes
     /// exactly when the box is reachable. On a VM host the lease is the route;
