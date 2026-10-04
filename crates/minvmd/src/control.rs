@@ -601,7 +601,7 @@ fn serve_request(
     audit_path: &Path,
     request: BoxControlRequest,
 ) -> std::io::Result<()> {
-    match (&request, door) {
+    match (request, door) {
         (BoxControlRequest::Register(request), ControlDoor::Host) => {
             register_and_reply(stream, boxes, request)
         }
@@ -635,7 +635,7 @@ fn serve_request(
         // that serves it — one warn line per refusal, because a verb on
         // the wrong door is a client built against another posture, not a
         // frame to drop silently.
-        (request, door) => refused_wrong_door(stream, request, door),
+        (request, door) => refused_wrong_door(stream, &request, door),
     }
 }
 
@@ -964,7 +964,7 @@ fn admit_report_and_reply(
                 switch_address = %request.switch_address,
                 port = request.port,
                 proto = %request.proto,
-                source = source,
+                source = %source,
                 "recorded the box's runtime-admitted port in the host-held grant"
             );
             append_audit_copy(audit_path, &record, &request);
@@ -981,7 +981,7 @@ fn admit_report_and_reply(
                 switch_address = %request.switch_address,
                 port = request.port,
                 proto = %request.proto,
-                source = source,
+                source = %source,
                 reason = %refusal,
                 "refused the in-VM daemon's port report against the host-held grant"
             );
@@ -1013,14 +1013,14 @@ fn withdraw_report_and_reply(
             switch_address = %request.switch_address,
             port = request.port,
             proto = %request.proto,
-            source = source,
+            source = %source,
             "withdrew the box's runtime-admitted port from the host-held grant"
         ),
         None => tracing::info!(
             switch_address = %request.switch_address,
             port = request.port,
             proto = %request.proto,
-            source = source,
+            source = %source,
             "no live row holds the withdrawn port; the grant's goal state already holds"
         ),
     }
@@ -1617,6 +1617,15 @@ mod tests {
             BoxControlReply::Status(status) => {
                 panic!("a withdrawal is answered with the pair, got the status {status:?}")
             }
+            BoxControlReply::Row(..) => {
+                panic!("a withdrawal echoes the pair it went by, never a row")
+            }
+            BoxControlReply::NoRow { .. } => {
+                panic!("a withdrawal echoes the pair it went by, never a no-row marker")
+            }
+            BoxControlReply::PortRecorded { .. } => {
+                panic!("a withdrawal echoes the pair it went by, never a port report")
+            }
         }
         assert!(
             registry
@@ -1694,6 +1703,15 @@ mod tests {
                 BoxControlReply::Status(status) => {
                     panic!("a withdrawal must be refused, got the status {status:?}")
                 }
+                BoxControlReply::Row(..) => {
+                    panic!("a foreign pair's withdrawal must be refused, got a row")
+                }
+                BoxControlReply::NoRow { .. } => {
+                    panic!("a foreign pair's withdrawal must be refused, got a no-row marker")
+                }
+                BoxControlReply::PortRecorded { .. } => {
+                    panic!("a foreign pair's withdrawal must be refused, got a port report")
+                }
             }
         }
         assert!(
@@ -1731,6 +1749,15 @@ mod tests {
             }
             BoxControlReply::Status(status) => {
                 panic!("a repeat withdrawal echoes the pair, got the status {status:?}")
+            }
+            BoxControlReply::Row(..) => {
+                panic!("a repeat withdrawal echoes the pair, never a row")
+            }
+            BoxControlReply::NoRow { .. } => {
+                panic!("a repeat withdrawal echoes the pair, never a no-row marker")
+            }
+            BoxControlReply::PortRecorded { .. } => {
+                panic!("a repeat withdrawal echoes the pair, never a port report")
             }
         }
 
@@ -2406,7 +2433,7 @@ mod tests {
         )
         .expect("the read is answered");
         assert!(
-            matches!(read, BoxControlReply::Row(row) if row.name == "web"),
+            matches!(&read, BoxControlReply::Row(row) if row.name == "web"),
             "a live box's name answers its row, got {read:?}"
         );
 

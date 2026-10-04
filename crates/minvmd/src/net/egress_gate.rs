@@ -2080,19 +2080,20 @@ fn switch_rows_of(rows: &[Arc<BoxRecord>], dictionary: &mut Vec<String>) -> Opti
             };
             names.push(index);
         }
-        // The row's runtime-published set — the ports the in-VM daemon
-        // reported and the grant admitted (NET-138), the only ones a
-        // retraction at its address is applied for — joins the declared
-        // ports here: a retraction of a runtime-published port is applied,
-        // while a declared port's forward never is (the declaration is not
-        // the box's runtime fact to retract).
+        // The row's admitted set for the publish decision (NET-138): the
+        // ports its declaration named plus the runtime ports the grant
+        // recorded — the set a publish at its address is admitted by, so a
+        // port the in-VM daemon reported inside the grant reaches the box
+        // through the gate for as long as the row holds it. The runtime
+        // half rides beside as the retraction's own set: a retraction of a
+        // runtime-published port is applied, while a declared port's
+        // forward never is (the declaration is not the box's runtime fact
+        // to retract).
+        let mut ports = record.admitted_ports().to_vec();
+        ports.extend(record.runtime_port_numbers());
         switch_rows.push(
-            SwitchRow::of(
-                record.switch_addr().octets(),
-                record.admitted_ports().to_vec(),
-                names,
-            )
-            .with_published(record.runtime_port_numbers()),
+            SwitchRow::of(record.switch_addr().octets(), ports, names)
+                .with_published(record.runtime_port_numbers()),
         );
     }
     Some(switch_rows)
@@ -11984,6 +11985,123 @@ mod tests {
                 spoken, expose,
                 "the declared forward still publishes after its refused withdrawal"
             );
+        }
+    }
+
+    /// NET-138: the gate's admitted set for a box is its declared ports
+    /// plus the runtime ports its row recorded — the half that makes a
+    /// port the in-VM daemon reported inside the grant reachable through
+    /// the gate. The publish of a runtime-admitted port is applied by the
+    /// row; a port inside the grant's range that no report recorded stays
+    /// refused; and once the withdrawal report removes the port, the same
+    /// publish is refused again — the admission lives exactly as long as
+    /// the row holds it.
+    #[tokio::test]
+    async fn admitted_runtime_port_reaches_the_box_through_the_gate() {
+        let registry = BoxRegistry::new(SUBNET);
+        registry.register(
+            BoxRegistration::new("web", Ipv4Addr::from(LEASE), Ipv4Addr::LOCALHOST)
+                .with_admitted_ports([8080])
+                .with_dynamic_ingress(sessions::DynamicIngress::Ask, Some((3000, 3999))),
+        );
+        let mut h = gate_connected(registry.clone()).await;
+
+        // The in-VM daemon's report, inside the grant the registration
+        // holds — recorded by the host while the gate is already serving,
+        // so the row the gate decides by carries the port as its live
+        // runtime half.
+        registry
+            .admit_runtime_port(
+                Ipv4Addr::from(LEASE),
+                3000,
+                sessions::IpProto::Tcp,
+                std::time::Instant::now(),
+            )
+            .expect("the report is inside the grant the row holds");
+
+        // The publish of the runtime-admitted port — the mapping that makes
+        // it reachable — is applied: it reaches the switch whole, and the
+        // switch's answer reaches the guest back.
+        let expose = expose_request("127.0.0.1:3000", "100.64.0.9:3000", "tcp");
+        h.guest
+            .write_all(&expose)
+            .await
+            .expect("writing the runtime-admitted port's publish");
+        let mut spoken = vec![0u8; expose.len()];
+        read_within(&mut h.switch, &mut spoken).await;
+        assert_eq!(
+            spoken, expose,
+            "the runtime-admitted port's publish reached the switch"
+        );
+        let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        h.switch
+            .write_all(answer)
+            .await
+            .expect("writing gvproxy's answer");
+        let mut seen = vec![0u8; answer.len()];
+        read_within(&mut h.guest, &mut seen).await;
+        assert_eq!(seen, answer, "the publish's answer reaches the guest");
+
+        // A port inside the grant's range that no report recorded is not
+        // admitted — the report is the only way a runtime port enters the
+        // set — and its publish is refused at the row's address, before a
+        // byte reaches the switch.
+        let (mut guest, mut switch) = connect_control(&h).await;
+        let unreported = expose_request("127.0.0.1:3500", "100.64.0.9:3500", "tcp");
+        guest
+            .write_all(&unreported)
+            .await
+            .expect("writing the unreported port's publish");
+        wait_for_log(&h.log, "port_or_name=port 3500").await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains("rule_matched=\"egress-undeclared-publish-record\""),
+            "the refusal names its own class, got: {logged}"
+        );
+        assert!(
+            logged.contains("source=100.64.0.9"),
+            "the refusal names the box whose row refused the record, got: {logged}"
+        );
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!("{n} byte(s) of the refused publish reached the switch"),
+            Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+            Err(_) => panic!("the gate left the switch side hanging"),
+        }
+        expect_teardown(&mut guest).await;
+
+        // The withdrawal report removes the port, and the same publish is
+        // refused: the admission lives exactly as long as the row holds it.
+        // The refusal itself is the second one this box and rule asked for
+        // inside the drops' rate window, so its warn line is the window's to
+        // keep — the proof is behavioural: nothing of the publish reaches
+        // the switch, and the guest's side comes down.
+        registry.withdraw_runtime_port(Ipv4Addr::from(LEASE), 3000, sessions::IpProto::Tcp);
+        let row = h
+            .table
+            .by_source(LEASE)
+            .expect("the box's row is still published");
+        assert!(
+            row.runtime_port_numbers().is_empty(),
+            "the withdrawal report removed the row's runtime port: {:?}",
+            row.runtime_port_numbers()
+        );
+        let (mut guest, mut switch) = connect_control(&h).await;
+        guest
+            .write_all(&expose)
+            .await
+            .expect("writing the withdrawn port's publish");
+        expect_teardown(&mut guest).await;
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(DEADLINE, switch.read(&mut probe)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => panic!(
+                "{n} byte(s) of the withdrawn port's publish reached the switch; \
+                 the admission outlived the row's hold on the port"
+            ),
+            Ok(Err(e)) => panic!("reading the switch end failed: {e}"),
+            Err(_) => panic!("the gate left the switch side hanging"),
         }
     }
 

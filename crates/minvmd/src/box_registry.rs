@@ -128,8 +128,10 @@ type Rows = BTreeMap<[u8; 4], Arc<BoxRecord>>;
 /// attach and name the namespace, and for the publish half of the gate, which
 /// reads the ports and names as the records a switch publish may carry. Owned
 /// outright, so no borrow of a client's declaration survives the registration
-/// that built it.
-#[derive(Debug, PartialEq, Eq)]
+/// that built it. Not [`PartialEq`]: the row's runtime half is interior and
+/// mutable ([`RowRuntime`]), so no two records the same registration built
+/// stay comparable for the record's life.
+#[derive(Debug)]
 pub struct BoxRecord {
     name: String,
     box_id: BoxId,
@@ -169,6 +171,40 @@ pub struct BoxRecord {
     /// reads.
     egress_allow_list: Vec<String>,
 }
+
+/// Manual because the row's runtime half is interior ([`RowRuntime`]): the
+/// derive cannot compare through a mutex, and equality that ignored the
+/// half would call two rows with different runtime admissions equal. Two
+/// records are equal when every dimension matches, the runtime set under
+/// its own lock included — an instantaneous comparison, never a stable
+/// ordering across concurrent reports.
+impl PartialEq for BoxRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.box_id == other.box_id
+            && self.switch_addr == other.switch_addr
+            && self.loopback_addr == other.loopback_addr
+            && self.admitted_ports == other.admitted_ports
+            && self.declared_names == other.declared_names
+            && self.egress == other.egress
+            && self.resolves_names == other.resolves_names
+            && self.dns_hosts == other.dns_hosts
+            && self.credentialed_upstream == other.credentialed_upstream
+            && self.dynamic_ingress == other.dynamic_ingress
+            && self.dynamic_range == other.dynamic_range
+            && *self
+                .runtime_ports
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                == *other
+                    .runtime_ports
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            && self.egress_allow_list == other.egress_allow_list
+    }
+}
+
+impl Eq for BoxRecord {}
 
 /// A row's mutable runtime half: the ports the in-VM daemon's admit reports
 /// recorded — each the port and protocol pair the report named, so one port
@@ -613,8 +649,10 @@ pub enum WithdrawError {
 /// and which check refused it, in one sentence the wire carries verbatim.
 ///
 /// Refused reports record nothing: not the port, not a rate timestamp, not
-/// a fact the host did not already hold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+/// a fact the host did not already hold. Not `Copy`: every variant that
+/// names a box carries its [`String`] name, and the refusal is built once,
+/// answered with, and dropped.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PortReportRefusal {
     /// No row is held at the switch address the report named — the box was
     /// never registered, its row was withdrawn, or the daemon restarted
@@ -1270,13 +1308,13 @@ impl BoxRegistry {
             .rows
             .read()
             .expect("the row lock is never held across a panic, so it cannot be poisoned");
-        let record = rows
-            .get(&switch_addr.octets())
-            .ok_or_else(|| PortReportRefusal::NoRow {
-                switch_addr,
-                port,
-                proto,
-            })?;
+        let record =
+            rows.get(&switch_addr.octets())
+                .ok_or(PortReportRefusal::NoRow {
+                    switch_addr,
+                    port,
+                    proto,
+                })?;
         let name = record.name().to_string();
         match record.dynamic_ingress() {
             DynamicIngress::Deny => {
@@ -1290,7 +1328,11 @@ impl BoxRegistry {
         }
         let range = record
             .dynamic_range()
-            .ok_or_else(|| PortReportRefusal::NoAllowedRange { name, port, proto })?;
+            .ok_or_else(|| PortReportRefusal::NoAllowedRange {
+                name: name.clone(),
+                port,
+                proto,
+            })?;
         if port < range.0 || port > range.1 {
             return Err(PortReportRefusal::OutsideAllowedRange {
                 name,
@@ -2098,6 +2140,8 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
             })
             .expect("the default plan has hand-out addresses");
         assert_eq!(
@@ -2125,6 +2169,8 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
             })
             .expect("the carved subnet has hand-out addresses");
         assert_eq!(
@@ -2139,6 +2185,8 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
                 })
                 .expect("the slice holds 32 published addresses");
         }
@@ -2150,6 +2198,8 @@ mod tests {
                         ingress_ports: Vec::new(),
                         egress: None,
                         credentialed_upstream: None,
+                        dynamic_ingress: None,
+                        dynamic_allowed_range: None,
                     }),
                     Err(AllocationError::LoopbackExhausted)
                 ),
@@ -2175,6 +2225,8 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
             })
             .expect("the plan has an address for the first box");
         assert!(
@@ -2192,6 +2244,8 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
+                    dynamic_ingress: None,
+                    dynamic_allowed_range: None,
                 },
                 web.box_id(),
             )
@@ -2218,6 +2272,8 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
+                dynamic_ingress: None,
+                dynamic_allowed_range: None,
             })
             .expect("the plan has a second hand-out address");
         assert_eq!(
@@ -2263,6 +2319,8 @@ mod tests {
             ingress_ports: vec![8080],
             egress: None,
             credentialed_upstream: None,
+            dynamic_ingress: None,
+            dynamic_allowed_range: None,
         };
         let first = registry
             .register_client_box(spec())
@@ -2888,24 +2946,32 @@ mod tests {
                 },
                 "the range is inclusive, so {outside} alone is outside it"
             );
+            assert_eq!(
+                refused.to_string(),
+                format!(
+                    "runtime port {outside} is outside box allow-box's allowed range 3000-3999"
+                ),
+                "the refusal names the port, the box and the range it missed"
+            );
         }
-        assert_eq!(
-            refused.to_string(),
-            "runtime port 4000 is outside box allow-box's allowed range 3000-3999",
-            "the refusal names the port, the box and the range it missed"
-        );
         for boundary in [3000, 3999] {
             registry
                 .admit_runtime_port(allow.switch_addr(), boundary, IpProto::Tcp, Instant::now())
                 .unwrap_or_else(|refusal| panic!("the range's own ends record, got {refusal}"));
         }
 
-        // Every refusal recorded nothing: no port, no rate timestamp — the
-        // row holds no runtime port a refused report named, and the reports
-        // the refusals refused paced nothing.
+        // Every refusal recorded nothing: no port a refused report named
+        // sits on any row it was checked against — the allow row holds only
+        // the boundaries that recorded, and the refusals paced no rate
+        // timestamp the rows' later reports answer to.
+        assert_eq!(
+            allow.runtime_port_numbers(),
+            vec![3000, 3999],
+            "only the range's own ends recorded on the allow row: no refused \
+             report's port joined them"
+        );
         assert!(
-            allow.runtime_port_numbers().is_empty()
-                && denied.runtime_port_numbers().is_empty()
+            denied.runtime_port_numbers().is_empty()
                 && ungranted.runtime_port_numbers().is_empty()
                 && rangeless.runtime_port_numbers().is_empty(),
             "a refused report records no port on any row it was checked against"
