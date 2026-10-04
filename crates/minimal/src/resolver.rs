@@ -1069,7 +1069,7 @@ pub(crate) fn set_handover_controls(controls: Vec<String>) {
 /// the daemons connect to are one path by one definition.
 pub(crate) fn answerer_install() -> Option<AnswererInstall> {
     let channel = minvmd::net::answerer::resolve_channel_sock();
-    Some(AnswererInstall {
+    let install = AnswererInstall {
         operator: operator_name(),
         channel_dir: channel.parent().unwrap_or(&channel).display().to_string(),
         channel: channel.display().to_string(),
@@ -1078,7 +1078,37 @@ pub(crate) fn answerer_install() -> Option<AnswererInstall> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone(),
-    })
+    };
+    if let Some(value) = unquotable_value(&install) {
+        tracing::warn!(
+            value,
+            "the answerer service step is left out of the advisory: a path it would carry \
+             holds a quote, `$`, a backtick, a backslash or a line break, which the privileged \
+             command cannot quote safely; the VM host daemon keeps the interim answerer"
+        );
+        return None;
+    }
+    Some(install)
+}
+
+/// The first value of `install` the privileged command could not carry
+/// inside its nested quotes — the payload is single-quoted inside double
+/// quotes on Linux and double-quoted inside single quotes on macOS, so any
+/// quote, `$`, backtick, backslash or line break in an interpolated path
+/// would end a quoting context in a root-run command. `None` when every
+/// value is safe to render.
+fn unquotable_value(install: &AnswererInstall) -> Option<&str> {
+    let unsafe_char = |c: char| matches!(c, '\'' | '"' | '$' | '`' | '\\' | '\n' | '\r' | '\0');
+    [
+        &install.operator,
+        &install.channel_dir,
+        &install.channel,
+        &install.source,
+    ]
+    .into_iter()
+    .chain(install.controls.iter())
+    .map(String::as_str)
+    .find(|value| value.chars().any(unsafe_char))
 }
 
 /// The deadline on the installed copy's one protocol probe: the second
@@ -3189,6 +3219,45 @@ mod tests {
     // daemon's control socket answers is the fact both verbs surface, and
     // the wording is pinned here because the session e2e greps `min ls`
     // for exactly this line.
+    #[test]
+    fn answerer_install_refuses_unquotable_paths() {
+        let base = AnswererInstall {
+            operator: "operator".to_string(),
+            channel_dir: "/run/minimal".to_string(),
+            channel: "/run/minimal/answerer.sock".to_string(),
+            source: "/home/operator/.local/bin/min-answerer".to_string(),
+            controls: vec!["/home/operator/.minimal/vm/control.sock".to_string()],
+        };
+        assert_eq!(unquotable_value(&base), None, "plain paths render");
+        let spaced = AnswererInstall {
+            source: "/Users/an operator/Application Support/min-answerer".to_string(),
+            ..base.clone()
+        };
+        assert_eq!(
+            unquotable_value(&spaced),
+            None,
+            "a space is quoted, not refused"
+        );
+        for bad in ["'", "\"", "$", "`", "\\", "\n", "\r"] {
+            let source = AnswererInstall {
+                source: format!("/home/o{bad}brien/min-answerer"),
+                ..base.clone()
+            };
+            assert!(
+                unquotable_value(&source).is_some(),
+                "source carrying {bad:?} is refused"
+            );
+            let control = AnswererInstall {
+                controls: vec![format!("/home/o{bad}brien/control.sock")],
+                ..base.clone()
+            };
+            assert!(
+                unquotable_value(&control).is_some(),
+                "control carrying {bad:?} is refused"
+            );
+        }
+    }
+
     #[test]
     fn vm_host_answerer_line_names_the_holder() {
         // The lone-holder shape: this VM's minvmd holds the port.
