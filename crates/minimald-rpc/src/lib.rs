@@ -703,7 +703,7 @@ pub enum BoxControlRequest {
 /// forgeable from inside the escape boundary, and the answerer's port is
 /// held on the host's loopback, where only the host's own client can read
 /// it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ZoneAnswererStatus {
     /// The answerer's acquisition has not finished its first pass: the
@@ -752,7 +752,7 @@ pub enum ZoneAnswererStatus {
 /// host that merely has no switch to publish through says nothing here: that
 /// boot's proxy never attempted a publish, and its story stays the daemon
 /// log's, not a cause this status could name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyDownCause {
     /// Another process on the host holds the published port — for a port
@@ -769,6 +769,15 @@ pub enum ProxyDownCause {
     /// the host can vouch for either, so the surfaces say "unconfirmed"
     /// rather than "serving" until the guest's late report clears it.
     PublishUnconfirmed,
+    /// The VM came up with its publish unconfirmed, and the guest's late
+    /// report then said the port is held: the VM stays up with no hostname
+    /// proxy — not a start failure, so it never reads like one. Names the
+    /// holder as the host saw it when the report landed (`pid <pid>
+    /// (<exe>)`), or `None` when the host would not name it.
+    PortHeldAfterStart {
+        /// Who holds the port, when the host let the supervisor see it.
+        holder: Option<String>,
+    },
 }
 
 /// The addresses a successful registration hands back

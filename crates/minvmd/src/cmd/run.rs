@@ -953,7 +953,7 @@ fn run_foreground() -> Result<()> {
                 // teardown window reads *why*, not merely that the proxy is
                 // down. The reservation drops with the assignment below, so
                 // the kernel releases the port this start held.
-                proxy_publish.set_down(port, cause);
+                proxy_publish.set_down(port, cause.clone());
                 let _ = child.kill();
                 let _ = child.wait();
                 crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
@@ -968,8 +968,12 @@ fn run_foreground() -> Result<()> {
                         format!("{publish_tries} publish tries exhausted, every drawn port taken")
                     }
                     // Never a failure's cause: an unconfirmed publish is
-                    // `UpUnconfirmed`, not `FailStart`.
+                    // `UpUnconfirmed`, and a late refusal lands after the
+                    // start, never as `FailStart`.
                     ProxyDownCause::PublishUnconfirmed => "the publish is unconfirmed".to_string(),
+                    ProxyDownCause::PortHeldAfterStart { .. } => {
+                        "the port was held after the start".to_string()
+                    }
                 };
                 tracing::error!(port, %holder, %why, "the VM start failed on the proxy publish");
                 bail!("{}", proxy_port_failure(port, &holder, &why));
@@ -996,11 +1000,17 @@ fn run_foreground() -> Result<()> {
                         return;
                     }
                     MarkerEvent::ProxyPortHeld(held) if held == port => {
+                        // The VM stays up: the cause says so, and names the
+                        // holder the host can see now, so the surfaces never
+                        // recycle the start failure's words for a VM that
+                        // started.
+                        let holder = port_holder(port).map(|(_, holder)| holder);
                         tracing::warn!(
                             port,
+                            holder = holder.as_deref().unwrap_or("unnamed"),
                             "the guest's late report says the hostname proxy's port is held"
                         );
-                        proxy_publish.set_down(port, ProxyDownCause::PortHeld);
+                        proxy_publish.set_down(port, ProxyDownCause::PortHeldAfterStart { holder });
                         return;
                     }
                     _ => {}
@@ -1583,6 +1593,15 @@ fn proxy_failure_line(log: &str) -> Option<&str> {
 #[cfg(target_os = "linux")]
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn port_holder(port: u16) -> Option<(u32, String)> {
+    port_holder_with(std::path::Path::new("/proc"), port)
+}
+
+/// [`port_holder`] read from the procfs mounted at `proc`: a root it cannot
+/// read names no holder, so a host this cannot read is `None` — the
+/// unnamed holder the publish watch takes as unknown, never as foreign.
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn port_holder_with(proc: &std::path::Path, port: u16) -> Option<(u32, String)> {
     // The listening sockets on the port, on loopback or the wildcard — the
     // addresses whose holder refuses a bind of 127.0.0.1:<port>.
     const HOLDING_ADDRS: &[&str] = &[
@@ -1593,8 +1612,8 @@ fn port_holder(port: u16) -> Option<(u32, String)> {
         "0000000000000000FFFF00000100007F",
     ];
     let mut sockets = Vec::new();
-    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let Ok(text) = std::fs::read_to_string(table) else {
+    for table in ["net/tcp", "net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(proc.join(table)) else {
             continue;
         };
         for line in text.lines().skip(1) {
@@ -1615,7 +1634,7 @@ fn port_holder(port: u16) -> Option<(u32, String)> {
     if sockets.is_empty() {
         return None;
     }
-    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+    for entry in std::fs::read_dir(proc).ok()?.flatten() {
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -1657,7 +1676,16 @@ fn port_holder(port: u16) -> Option<(u32, String)> {
 #[cfg(target_os = "macos")]
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn port_holder(port: u16) -> Option<(u32, String)> {
-    let output = std::process::Command::new("/usr/sbin/lsof")
+    port_holder_with(std::path::Path::new("/usr/sbin/lsof"), port)
+}
+
+/// [`port_holder`] asked of the `lsof` at `lsof`: one that is missing or
+/// fails names no holder, so the tool's failure is `None` — the unnamed
+/// holder the publish watch takes as unknown, never as foreign.
+#[cfg(target_os = "macos")]
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn port_holder_with(lsof: &std::path::Path, port: u16) -> Option<(u32, String)> {
+    let output = std::process::Command::new(lsof)
         .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpc"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -2693,6 +2721,86 @@ mod tests {
             None,
             "a start that failed on something else lifts nothing"
         );
+    }
+
+    /// The holder lookup names the pid of a listener in another process —
+    /// procfs on Linux, `lsof` on macOS — which is what the publish watch
+    /// matches against the pids this supervisor spawned (T93).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn port_holder_identifies_a_child_listener_pid() {
+        use std::io::BufRead;
+        // A separate process listening on a port it draws itself, printing
+        // the port once it listens; it exits when its stdin closes.
+        let mut child = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import socket, sys\n\
+                 s = socket.socket()\n\
+                 s.bind(('127.0.0.1', 0))\n\
+                 s.listen()\n\
+                 print(s.getsockname()[1], flush=True)\n\
+                 sys.stdin.read()\n",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3 runs the child listener");
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("the child's stdout"))
+            .read_line(&mut line)
+            .expect("the child prints its port");
+        let port: u16 = line.trim().parse().expect("the child's port");
+        let holder = super::port_holder(port);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            holder.map(|(pid, _)| pid),
+            Some(child.id()),
+            "the holder is the child that listens on 127.0.0.1:{port}"
+        );
+    }
+
+    /// A lookup tool that is missing or fails names no holder: `None`, which
+    /// the publish watch classifies as unknown, never as foreign
+    /// (`control::tests::no_report_unknown_or_silent_is_up_unconfirmed` covers
+    /// `classify_no_report_holder(true, None, ..)`).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn port_holder_is_none_when_the_lookup_fails() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a listener");
+        let port = listener.local_addr().expect("its address").port();
+        let missing = std::path::Path::new("/nonexistent/port-holder-tool");
+        assert_eq!(
+            super::port_holder_with(missing, port),
+            None,
+            "a missing lookup tool names no holder"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            super::port_holder_with(std::path::Path::new("/usr/bin/false"), port),
+            None,
+            "a failing lsof names no holder"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            // The listener is visible in the tables, but no process's fds
+            // are readable: the host would not name the holder.
+            let proc = tempfile::tempdir().expect("a fake procfs");
+            std::fs::create_dir(proc.path().join("net")).expect("its net dir");
+            for table in ["tcp", "tcp6"] {
+                std::fs::copy(
+                    std::path::Path::new("/proc/net").join(table),
+                    proc.path().join("net").join(table),
+                )
+                .expect("the real socket table");
+            }
+            assert_eq!(
+                super::port_holder_with(proc.path(), port),
+                None,
+                "a listener whose holder the host will not show names no holder"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]

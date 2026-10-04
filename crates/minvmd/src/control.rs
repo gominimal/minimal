@@ -177,7 +177,7 @@ pub(crate) fn classify_no_report_holder(
 /// What the supervisor does with what it learned about the publish (T93):
 /// [`decide_publish`]'s verdict, composed of facts the reservation and the
 /// port's origin already hold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) enum PublishDecision {
     /// The VM may come up: the proxy published — the guest said so, or the
@@ -335,6 +335,7 @@ impl ProxyPublishStatus {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
             .map(|(port, cause)| ZoneAnswererStatus::ProxyNotServing { port, cause })
     }
 }
@@ -1386,7 +1387,7 @@ mod tests {
             ZoneAnswererStatus::Registered { port },
             ZoneAnswererStatus::PortHeldNoChannel { port },
         ] {
-            answerer.set(state);
+            answerer.set(state.clone());
             let reply = control(&sock_path, &BoxControlRequest::AnswererStatus)
                 .expect("the status read is answered");
             assert_eq!(
@@ -1608,6 +1609,19 @@ mod tests {
                 cause: ProxyDownCause::PortHeld,
             }),
             "a confirm never clears a terminal cause"
+        );
+        // A late refusal after an unconfirmed start: the VM stays up, and the
+        // read carries the holder over the wire so the CLI can name it.
+        let late = ProxyDownCause::PortHeldAfterStart {
+            holder: Some("pid 4242 (python3)".to_string()),
+        };
+        proxy_publish.set_unconfirmed(port);
+        proxy_publish.set_down(port, late.clone());
+        proxy_publish.confirm(port);
+        assert_eq!(
+            control(&sock_path, &BoxControlRequest::AnswererStatus).expect("the read is answered"),
+            BoxControlReply::Status(ZoneAnswererStatus::ProxyNotServing { port, cause: late }),
+            "a late refusal rides the read with its holder, and a confirm never clears it"
         );
     }
 

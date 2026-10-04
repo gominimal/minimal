@@ -944,7 +944,7 @@ pub(crate) async fn activate_session(
     let (vm_answerer, answerer_port, answerer_bound, held_no_channel, proxy_down) =
         match vm_host_answerer_status(global).await {
             Some(status) => {
-                let read = crate::resolver::host_answerer_read(status).await;
+                let read = crate::resolver::host_answerer_read(status.clone()).await;
                 (
                     Some(status),
                     read.port,
