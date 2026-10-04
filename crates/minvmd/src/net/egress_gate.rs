@@ -2348,10 +2348,7 @@ fn published_protocol(body: &[u8]) -> Option<u8> {
         .protocol;
     match protocol.as_str() {
         "tcp" => Some(egress::IPPROTO_TCP),
-        // The shared table publishes TCP's number and keeps UDP's private,
-        // so the client's own spelling is read here as the number itself —
-        // the same two the decision's shape check admits.
-        "udp" => Some(17),
+        "udp" => Some(egress::IPPROTO_UDP),
         _ => None,
     }
 }
