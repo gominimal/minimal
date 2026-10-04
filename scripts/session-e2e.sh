@@ -1076,6 +1076,26 @@ if grep -q "Cannot set" "$WORK/exec-locale.err"; then
   echo "--- stderr ---"; cat "$WORK/exec-locale.err"
   fail
 fi
+# A multi-word argv that names a missing program must exit 127 with a plain
+# "command not found" message, not the debug-wrapped `Error: Other(` the
+# daemon used to print when the nsenter shim returned NsenterError::Spawn.
+mnl session exec "$sid" -- nosuchcmd - >/dev/null 2>"$WORK/exec-missing.err"
+rc=$?
+if [ "$rc" -ne 127 ]; then
+  echo "::error::'min session exec $sid -- nosuchcmd -' exited $rc (expected 127)"
+  echo "--- stderr ---"; cat "$WORK/exec-missing.err" 2>/dev/null || true
+  fail
+fi
+if ! grep -q "command not found" "$WORK/exec-missing.err"; then
+  echo "::error::missing-program exec stderr did not contain 'command not found'"
+  echo "--- stderr ---"; cat "$WORK/exec-missing.err" 2>/dev/null || true
+  fail
+fi
+if grep -q "Error: Other(" "$WORK/exec-missing.err"; then
+  echo "::error::missing-program exec stderr contained the debug wrapper 'Error: Other('"
+  echo "--- stderr ---"; cat "$WORK/exec-missing.err" 2>/dev/null || true
+  fail
+fi
 echo "session exec proof OK"
 echo "::endgroup::"
 }
