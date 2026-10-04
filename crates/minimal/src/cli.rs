@@ -655,6 +655,11 @@ pub(crate) fn parse_ingress_mapping(spec: &str) -> Result<sessions::PortMapping,
     let internal_port = int
         .parse::<u16>()
         .map_err(|_| anyhow::anyhow!("ingress '{spec}': invalid internal port '{int}'"))?;
+    if internal_port == 0 {
+        anyhow::bail!(
+            "ingress '{spec}': internal port 0 is reserved — choose an internal port >= 1"
+        );
+    }
     Ok(sessions::PortMapping {
         external_port,
         internal_port,
