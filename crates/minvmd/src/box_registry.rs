@@ -819,11 +819,13 @@ impl BoxRegistry {
 
     /// Whether some live row or attachment already holds `id` (BEP-070):
     /// the collision check every client-driven registration runs on the id
-    /// it minted. Ids are never freed or reused; this set is every record
-    /// the host holds an id in today. No box or revocation record outlives
-    /// its box on this host yet, so a record type that does — a revocation
-    /// scoped to an id, a retained box record — joins this check when it
-    /// lands.
+    /// it minted. It covers live records only, which is every record the
+    /// host holds an id in today. An id is never reused because no client
+    /// can present one and the mint never draws the same UUIDv7 twice, not
+    /// because this check remembers spent ids. No box or revocation record
+    /// outlives its box on this host yet, so a record type that does — a
+    /// revocation scoped to an id, a retained box record — joins this check
+    /// when it lands.
     fn holds_box_id(&self, id: BoxId) -> bool {
         let rows = self
             .rows

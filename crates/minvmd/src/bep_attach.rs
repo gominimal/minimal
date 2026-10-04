@@ -284,10 +284,11 @@ impl Attachments {
     /// Whether some live attachment already holds `id`: one half of the
     /// collision check every registration runs on the id it minted (the
     /// rows the registry holds are the other, BEP-070), so a registration
-    /// can never share an identity with a live box. Ids are never freed: a
-    /// withdrawn attachment leaves this set, but its id stays spent for
-    /// good — no registration can present it, and the mint never makes it
-    /// again.
+    /// can never share an identity with a live box. The check covers live
+    /// attachments only: a withdrawn attachment leaves this set, and its id
+    /// with it. An id is never reused because no registration can present
+    /// one and the mint never draws the same UUIDv7 twice, not because this
+    /// set remembers it.
     #[must_use]
     pub fn holds_id(&self, id: BoxId) -> bool {
         self.rows
