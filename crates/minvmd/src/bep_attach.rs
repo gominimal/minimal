@@ -100,13 +100,16 @@ fn mint_box_id(name: &str, switch_addr: Ipv4Addr, loopback_addr: Ipv4Addr) -> Bo
 /// host's own facts about it — and beside it the addressing the host
 /// assigned: the switch address, which is the source address the box's
 /// delivered connections arrive from, and the loopback address the box is
-/// published at. Nothing in it is sourced from the VM.
+/// published at. Carried with them, whether the box declared a credentialed
+/// upstream (NET-134): the lane that lets the box reach the proxy at all,
+/// held where the VM cannot reach it. Nothing in it is sourced from the VM.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Attachment {
     name: String,
     box_id: BoxId,
     switch_addr: Ipv4Addr,
     loopback_addr: Ipv4Addr,
+    credentialed_upstream: bool,
 }
 
 impl Attachment {
@@ -137,6 +140,17 @@ impl Attachment {
     #[must_use]
     pub fn loopback_addr(&self) -> Ipv4Addr {
         self.loopback_addr
+    }
+
+    /// Whether this box declared a credentialed upstream (NET-134): the lane
+    /// whose infrastructure the proxy's listener is, so a connection this
+    /// box delivers is one its session paid for the reach of. The
+    /// attachment is the row's own copy of the row's facts, so the lane
+    /// travels with it — withdrawn and re-issued with the row, never
+    /// editable by anything the guest says.
+    #[must_use]
+    pub fn declares_credentialed_upstream(&self) -> bool {
+        self.credentialed_upstream
     }
 }
 
@@ -189,9 +203,13 @@ impl Attachments {
     /// as the row's re-registration replaces the row: the attachment's
     /// reach is the newest registration's.
     ///
-    /// One info line names the issue — the box id and the address — so a
-    /// diagnostic bundle's daemon log tail carries each attachment the host
-    /// gave.
+    /// The lane travels with the addressing: `credentialed_upstream` is the
+    /// box's own NET-134 declaration, reduced to the fact the proxy and a
+    /// diagnostic both read — whether this box may reach the proxy at all.
+    ///
+    /// One info line names the issue — the box id, the address, and the
+    /// lane — so a diagnostic bundle's daemon log tail carries each
+    /// attachment the host gave.
     ///
     /// # Panics
     ///
@@ -202,12 +220,14 @@ impl Attachments {
         name: &str,
         switch_addr: Ipv4Addr,
         loopback_addr: Ipv4Addr,
+        credentialed_upstream: bool,
     ) -> Arc<Attachment> {
         let attachment = Arc::new(Attachment {
             name: name.to_string(),
             box_id: mint_box_id(name, switch_addr, loopback_addr),
             switch_addr,
             loopback_addr,
+            credentialed_upstream,
         });
         self.rows
             .write()
@@ -216,6 +236,7 @@ impl Attachments {
         tracing::info!(
             box_id = %BoxIdText(&attachment.box_id),
             switch_addr = %attachment.switch_addr,
+            credentialed_upstream = attachment.credentialed_upstream,
             "issued a box egress proxy attachment, ahead of the box's first connection"
         );
         attachment
@@ -347,10 +368,19 @@ mod tests {
             "a fresh table holds nothing"
         );
 
-        let web = attachments.issue("web", Ipv4Addr::new(100, 64, 0, 9), Ipv4Addr::LOCALHOST);
+        let web = attachments.issue(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            Ipv4Addr::LOCALHOST,
+            false,
+        );
         assert_eq!(web.name(), "web");
         assert_eq!(web.switch_addr(), Ipv4Addr::new(100, 64, 0, 9));
         assert_eq!(web.loopback_addr(), Ipv4Addr::LOCALHOST);
+        assert!(
+            !web.declares_credentialed_upstream(),
+            "a box that declared nothing carries no lane"
+        );
         assert_eq!(
             attachments.by_source([100, 64, 0, 9]).as_deref(),
             Some(web.as_ref()),
@@ -366,13 +396,23 @@ mod tests {
         );
 
         // A second box beside the first: one attachment each, and each box
-        // is named by its own id.
-        attachments.issue("db", Ipv4Addr::new(100, 64, 0, 10), Ipv4Addr::LOCALHOST);
+        // is named by its own id. The second declares a credentialed
+        // upstream, so its attachment carries the lane the first lacks.
+        attachments.issue(
+            "db",
+            Ipv4Addr::new(100, 64, 0, 10),
+            Ipv4Addr::LOCALHOST,
+            true,
+        );
         assert_eq!(attachments.rows().len(), 2);
         let db = attachments
             .by_source([100, 64, 0, 10])
             .expect("the second box's attachment is held");
         assert_ne!(web.box_id(), db.box_id(), "each box is named by its own id");
+        assert!(
+            db.declares_credentialed_upstream(),
+            "the lane is the row's own fact, held per box"
+        );
 
         // Withdrawal retires the one it names and nothing else, and is
         // idempotent: an address with no attachment withdraws nothing.
@@ -410,7 +450,12 @@ mod tests {
     fn one_line_per_attachment_issued_and_withdrawn() {
         let (log, _guard) = capture_log();
         let attachments = Attachments::new();
-        let web = attachments.issue("web", Ipv4Addr::new(100, 64, 0, 9), Ipv4Addr::LOCALHOST);
+        let web = attachments.issue(
+            "web",
+            Ipv4Addr::new(100, 64, 0, 9),
+            Ipv4Addr::LOCALHOST,
+            true,
+        );
 
         let issued = "issued a box egress proxy attachment";
         let logged = log.contents();
@@ -426,6 +471,10 @@ mod tests {
         assert!(
             logged.contains("switch_addr=100.64.0.9"),
             "the issue line names the address, got: {logged}"
+        );
+        assert!(
+            logged.contains("credentialed_upstream=true"),
+            "the issue line names the lane, got: {logged}"
         );
         assert!(
             !logged.contains("since_box_end"),

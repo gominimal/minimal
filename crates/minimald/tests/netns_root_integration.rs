@@ -200,6 +200,7 @@ fn sudo(args: &[&str]) -> Output {
 const SOCKET_PROBE_C: &str = r#"
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <errno.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -262,8 +263,8 @@ int main(int argc, char **argv) {
         close(fd);
 
         fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd >= 0) { close(fd); fprintf(stderr, "AF_INET after attach unexpectedly succeeded\n"); return 21; }
-        if (errno != EAFNOSUPPORT) { fprintf(stderr, "AF_INET after attach wrong errno %d\n", errno); return 22; }
+        if (fd < 0) { perror("AF_INET after attach"); return 21; }
+        close(fd);
 
         fd = socket(AF_VSOCK, SOCK_STREAM, 0);
         if (fd >= 0) { close(fd); fprintf(stderr, "AF_VSOCK after attach unexpectedly succeeded\n"); return 23; }
@@ -278,12 +279,71 @@ int main(int argc, char **argv) {
     close(fd);
 
     fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd >= 0) { close(fd); fprintf(stderr, "AF_INET unexpectedly succeeded\n"); return 2; }
-    if (errno != EAFNOSUPPORT) { fprintf(stderr, "AF_INET wrong errno %d\n", errno); return 3; }
+    if (fd < 0) { perror("AF_INET"); return 2; }
+    close(fd);
 
     fd = socket(AF_INET6, SOCK_STREAM, 0);
-    if (fd >= 0) { close(fd); fprintf(stderr, "AF_INET6 unexpectedly succeeded\n"); return 4; }
-    if (errno != EAFNOSUPPORT) { fprintf(stderr, "AF_INET6 wrong errno %d\n", errno); return 5; }
+    if (fd < 0) { perror("AF_INET6"); return 4; }
+    close(fd);
+
+    /* Bind and connect on 127.0.0.1 must succeed: loopback is inside the
+     * box, and the none seal admits the inet family its namespace confines. */
+    {
+        int listener = socket(AF_INET, SOCK_STREAM, 0);
+        if (listener < 0) { perror("AF_INET listener"); return 11; }
+        struct sockaddr_in lo = {0};
+        lo.sin_family = AF_INET;
+        lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        lo.sin_port = 0; /* ephemeral */
+        if (bind(listener, (struct sockaddr *)&lo, sizeof lo) < 0) {
+            perror("bind 127.0.0.1");
+            close(listener);
+            return 12;
+        }
+        if (listen(listener, 1) < 0) {
+            perror("listen 127.0.0.1");
+            close(listener);
+            return 13;
+        }
+        socklen_t lo_len = sizeof lo;
+        if (getsockname(listener, (struct sockaddr *)&lo, &lo_len) < 0) {
+            perror("getsockname 127.0.0.1");
+            close(listener);
+            return 14;
+        }
+        int conn = socket(AF_INET, SOCK_STREAM, 0);
+        if (conn < 0) { perror("AF_INET connector"); close(listener); return 15; }
+        if (connect(conn, (struct sockaddr *)&lo, sizeof lo) < 0) {
+            perror("connect 127.0.0.1");
+            close(conn);
+            close(listener);
+            return 16;
+        }
+        close(conn);
+        close(listener);
+    }
+
+    /* A connect to a non-loopback address must fail: the none box's network
+     * namespace has no route to anything but lo. */
+    {
+        struct sockaddr_in addr = {0};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = 0x08080808; /* 8.8.8.8 */
+        addr.sin_port = htons(53);
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) { perror("AF_INET for connect"); return 8; }
+        if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) {
+            close(fd);
+            fprintf(stderr, "connect to 8.8.8.8 unexpectedly succeeded\n");
+            return 9;
+        }
+        if (errno != ENETUNREACH) {
+            fprintf(stderr, "connect to 8.8.8.8 wrong errno %d (expected ENETUNREACH %d)\n", errno, ENETUNREACH);
+            close(fd);
+            return 10;
+        }
+        close(fd);
+    }
 
     fd = socket(AF_VSOCK, SOCK_STREAM, 0);
     if (fd >= 0) { close(fd); fprintf(stderr, "AF_VSOCK unexpectedly succeeded\n"); return 6; }
@@ -382,10 +442,13 @@ fn proc_session_and_tty(pid: u32) -> (u32, i32) {
 }
 
 /// NET-038. A none box refuses every socket family that reaches outside the
-/// sandbox, `AF_VSOCK` included.  The test builds a real sandbox with an
-/// isolated `NetPlan`, installs the production socket-family filter, and runs
-/// a static probe inside that asserts `AF_INET`, `AF_INET6`, and `AF_VSOCK`
-/// all fail with `EAFNOSUPPORT` while `AF_UNIX` still works.
+/// sandbox, `AF_VSOCK` included, while its own loopback stays usable.  The
+/// test builds a real sandbox with an isolated `NetPlan`, installs the
+/// production socket-family filter, and runs a static probe inside that
+/// asserts `AF_INET` and `AF_INET6` sockets open, a bind-and-connect on
+/// `127.0.0.1` succeeds, a connect to a non-loopback address fails with
+/// `ENETUNREACH`, and `AF_VSOCK` fails with `EAFNOSUPPORT` while `AF_UNIX`
+/// still works.
 ///
 /// The plan comes from the production provider, not the `NetPlan::none()`
 /// constructor: `network_for(NetworkMode::NoNet)` maps every no-net consumer
@@ -459,8 +522,9 @@ async fn network_none_blocks_all_outside_sockets() {
 /// box the way the session host launches a real one — `set_session_leader()`
 /// before the command is built, a pty slave on the box's stdin — injects a
 /// second process into its namespaces with the production nsenter shim, and
-/// verifies that the injected process can still create an `AF_UNIX` socket —
-/// the local family the minenv socket and `min` helper rely on.
+/// verifies that the injected process can still create `AF_UNIX` and `AF_INET`
+/// sockets — the local families the minenv socket and `min` helper rely on —
+/// while `AF_VSOCK` stays refused.
 ///
 /// Driving the session-leader runctl is what makes this a launch-path proof:
 /// the none-box launch swaps the built command for a seccomp closure, and if
@@ -1398,6 +1462,7 @@ async fn netns_ownip_ptask_to_ptask() {
             dynamic_ingress: None,
         }),
         egress: None,
+        credentialed_upstream: None,
     };
     let mut b = Ptask::provision("peer-b", lease_b, subnet, &sock, &b_policy).await;
 
@@ -1488,6 +1553,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
             dynamic_ingress: None,
         }),
         egress: None,
+        credentialed_upstream: None,
     };
     let mut ptask = Ptask::provision("ingress", lease, subnet, &sock, &gate_policy).await;
 
