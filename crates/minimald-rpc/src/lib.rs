@@ -623,6 +623,20 @@ pub struct RegisterBoxRequest {
     /// nothing, exactly as one that never asked for a lane does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentialed_upstream: Option<CredentialedUpstream>,
+    /// The box's dynamic-ingress stance (NET-045), from the same create
+    /// inputs the session record holds: the stance half of the grant the
+    /// host-side row holds a runtime port report against — a report under
+    /// `allow` records in range, one under `ask` records what the attached
+    /// human answered yes to, and `deny`, the stance an absent declaration
+    /// carries, admits nothing. The host decides; the guest only reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_ingress: Option<DynamicIngress>,
+    /// The range the stance admits runtime ports in, inclusive at both
+    /// ends — the grant's range half. `None` permits nothing even under an
+    /// `allow` stance, the same meaning the create request's absent range
+    /// carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_allowed_range: Option<(u16, u16)>,
 }
 
 /// The withdrawal a destroyed session's client sends for the row its
@@ -2968,11 +2982,15 @@ mod tests {
             r#""declared_ports":[8080,9090]"#,
             r#""runtime_ports":[3000]"#,
         ] {
-            assert!(wire.contains(field), "the row answer spells {field}: {wire}");
+            assert!(
+                wire.contains(field),
+                "the row answer spells {field}: {wire}"
+            );
         }
         assert_eq!(round_trip(&row), row);
         assert_eq!(
-            serde_json_lenient::from_str::<BoxControlReply>(&wire).expect("decodes as its own reply"),
+            serde_json_lenient::from_str::<BoxControlReply>(&wire)
+                .expect("decodes as its own reply"),
             row
         );
 
@@ -2984,17 +3002,13 @@ mod tests {
         };
         assert_eq!(round_trip(&no_row), no_row);
         assert_eq!(
-            serde_json_lenient::from_str::<BoxControlReply>(
-                r#"{"name":"web","no_row":true}"#
-            )
-            .expect("the no-row answer decodes"),
+            serde_json_lenient::from_str::<BoxControlReply>(r#"{"name":"web","no_row":true}"#)
+                .expect("the no-row answer decodes"),
             no_row
         );
         assert_ne!(
-            serde_json_lenient::from_str::<BoxControlReply>(
-                r#"{"name":"web","no_row":true}"#
-            )
-            .expect("the no-row answer decodes"),
+            serde_json_lenient::from_str::<BoxControlReply>(r#"{"name":"web","no_row":true}"#)
+                .expect("the no-row answer decodes"),
             row,
             "a no-row answer is never a live row's answer"
         );

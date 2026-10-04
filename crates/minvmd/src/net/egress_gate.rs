@@ -2080,16 +2080,20 @@ fn switch_rows_of(rows: &[Arc<BoxRecord>], dictionary: &mut Vec<String>) -> Opti
             };
             names.push(index);
         }
-        // The row's runtime-published set — the ports the box's own listens
-        // published, the only ones a retraction at its address is applied
-        // for — is empty until listen-publishing (NET-016, NET-017) lands:
-        // today no guest retraction at a held address is applied, and a
-        // declared port's forward never is.
-        switch_rows.push(SwitchRow::of(
-            record.switch_addr().octets(),
-            record.admitted_ports().to_vec(),
-            names,
-        ));
+        // The row's runtime-published set — the ports the in-VM daemon
+        // reported and the grant admitted (NET-138), the only ones a
+        // retraction at its address is applied for — joins the declared
+        // ports here: a retraction of a runtime-published port is applied,
+        // while a declared port's forward never is (the declaration is not
+        // the box's runtime fact to retract).
+        switch_rows.push(
+            SwitchRow::of(
+                record.switch_addr().octets(),
+                record.admitted_ports().to_vec(),
+                names,
+            )
+            .with_published(record.runtime_port_numbers()),
+        );
     }
     Some(switch_rows)
 }
