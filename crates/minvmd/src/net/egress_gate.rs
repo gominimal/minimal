@@ -1516,6 +1516,10 @@ async fn relay_control(
         // The interim's admission is the one publish the gate applies whose
         // reach no row bounds, and the host must be able to see it pass.
         warn_interim_publish(&limiter, &decision);
+        // And the lease it named is one the guest daemon vouched for while
+        // no row held it, whatever the request published: the fact the
+        // live-lease drop line reads ([`PublishedForwards::lease_live_at`]).
+        forwards.note_vouched(decision.request.switch_addr());
     }
     // The applied request is filed with the publish ledger: a forwarder's
     // listener and the address its publish was applied at are what a later
@@ -1812,6 +1816,11 @@ struct ControlDecision {
 #[derive(Debug, Default)]
 struct PublishedForwards {
     applied: Mutex<Vec<AppliedPublish>>,
+    /// The rowless addresses an applied switch request named as the box's
+    /// own — a port publish, a zone name, a retraction alike — oldest first,
+    /// bounded at [`LEASES_VOUCHED_TRACKED`]. Each is a lease the guest
+    /// daemon vouched for while no row held it ([`Self::lease_live_at`]).
+    vouched: Mutex<Vec<[u8; 4]>>,
 }
 
 /// A forwarder listener: its loopback address and port.
@@ -1824,11 +1833,15 @@ type AppliedPublish = (Listener, [u8; 4], u16, u8);
 /// How many applied publishes' attributions the ledger keeps.
 const PUBLISHED_FORWARDS_TRACKED: usize = 1024;
 
+/// How many vouched rowless leases the ledger keeps.
+const LEASES_VOUCHED_TRACKED: usize = 1024;
+
 impl PublishedForwards {
     /// A ledger with no applied publishes in it.
     fn new() -> Self {
         Self {
             applied: Mutex::new(Vec::new()),
+            vouched: Mutex::new(Vec::new()),
         }
     }
 
@@ -1902,21 +1915,47 @@ impl PublishedForwards {
             .any(|(_, at, port, p)| *at == addr && *port == inside && *p == proto)
     }
 
-    /// Whether any applied publish stands at `addr`: some publish the switch
-    /// applied at that address — whose own request named the address as the
-    /// box's, so the guest daemon vouched for the lease — and no retraction
-    /// has removed since. This is the host-observable fact that a live
-    /// namespace holds the address, and the only one: an ARP claim the guest
-    /// sends for it is itself a frame from a source no row holds, so it never
-    /// reaches the switch to make a lease live there. The one drop line it
-    /// informs is the unregistered source's ([`DropLimiter::warn_live_lease`]):
-    /// a frame from such an address is a live lease no published namespace
-    /// holds — its box predates host registration (T66, #1711) — and the
-    /// line says so instead of the generic one. It informs the line only,
-    /// never the verdict: the frame drops either way, and the gate registers
-    /// no box from what the guest says it holds.
-    fn publish_stands_at(&self, addr: [u8; 4]) -> bool {
-        self.lock().iter().any(|(_, at, _, _)| *at == addr)
+    /// Notes a rowless address an applied switch request named as the
+    /// box's own: the interim applied it, so the guest daemon vouched for
+    /// the lease while no row held it. Whatever the request carried — a
+    /// port publish, a zone name, a retraction — counts the same.
+    fn note_vouched(&self, addr: [u8; 4]) {
+        let mut vouched = self
+            .vouched
+            .lock()
+            .expect("the vouched set's lock is held only across a lookup or an update");
+        if vouched.contains(&addr) {
+            return;
+        }
+        if vouched.len() >= LEASES_VOUCHED_TRACKED {
+            vouched.remove(0);
+        }
+        vouched.push(addr);
+    }
+
+    /// Whether `addr` is a live guest lease: an applied switch request
+    /// named it as a box's own, whatever it published — a rowless address
+    /// the interim applied a port publish, a zone name or a retraction at,
+    /// or one an applied publish still stands at. This is the
+    /// host-observable fact that a live namespace holds the address, and
+    /// the only one: an ARP claim the guest sends for it is itself a frame
+    /// from a source no row holds, so it never reaches the switch to make a
+    /// lease live there. A lease that has spoken no switch request at all is
+    /// indistinguishable at the gate from a made-up one. The one drop line
+    /// it informs is the unregistered source's
+    /// ([`DropLimiter::warn_live_lease`]): a frame from such an address is
+    /// a live lease no published namespace holds — its box predates host
+    /// registration (T66, #1711) — and the line says so instead of the
+    /// generic one. It informs the line only, never the verdict: the frame
+    /// drops either way, and the gate registers no box from what the guest
+    /// says it holds.
+    fn lease_live_at(&self, addr: [u8; 4]) -> bool {
+        let vouched = self
+            .vouched
+            .lock()
+            .expect("the vouched set's lock is held only across a lookup or an update")
+            .contains(&addr);
+        vouched || self.lock().iter().any(|(_, at, _, _)| *at == addr)
     }
 
     fn lock(&self) -> MutexGuard<'_, Vec<AppliedPublish>> {
@@ -2782,15 +2821,16 @@ async fn relay_frames_to_switch(
             }
             Err(GateDrop::UnregisteredSource { src }) => {
                 // The one drop whose line the gate's own ledger can point a
-                // host at a remedy through: an applied publish standing at the
-                // address is the host-observable fact that a live namespace
-                // holds the lease — the box predates host registration, so
-                // its line says to restart it. A source nothing published for
-                // takes the generic line, and both drop the frame exactly the
-                // same way: the publish informs the line, never the verdict,
+                // host at a remedy through: an applied switch request that
+                // named the address — a port publish or only a zone name — is
+                // the host-observable fact that a live namespace holds the
+                // lease — the box predates host registration, so its line
+                // says to restart it. A source no request named takes the
+                // generic line, and both drop the frame exactly the same
+                // way: the request informs the line, never the verdict,
                 // and the gate registers no box from what the guest says it
                 // holds.
-                if forwards.publish_stands_at(src) {
+                if forwards.lease_live_at(src) {
                     limiter.warn_live_lease(src);
                 } else {
                     limiter.warn_unregistered(src);
@@ -3553,8 +3593,8 @@ fn gate_verdict(
     // (T66, #1711) is the only thing that ever publishes, or a task
     // sandbox's, or an escapee's made-up one — and drops under its own rule
     // ([`UNREGISTERED_SOURCE_RULE`]), whose line can even name the remedy
-    // when the gate's ledger holds an applied publish at the address
-    // ([`PublishedForwards::publish_stands_at`], a live lease whose box
+    // when an applied switch request named the address as a box's own
+    // ([`PublishedForwards::lease_live_at`], a live lease whose box
     // predates host registration). The relay picks the line; the drop is
     // the same either way, and no phase the gate was built under reaches it.
     let record = match table.by_source(src) {
@@ -4058,8 +4098,8 @@ impl DropLimiter {
     }
 
     /// Emits the drop's line for one live lease no published namespace
-    /// holds: a source an applied publish still stands at
-    /// ([`PublishedForwards::publish_stands_at`]), so a namespace the guest
+    /// holds: a source an applied switch request named as a box's own
+    /// ([`PublishedForwards::lease_live_at`]), so a namespace the guest
     /// daemon vouched for holds it, alive, while no row the registry holds
     /// is keyed by it — its box predates host registration (T66, #1711). The
     /// one unregistered source a host can do something about, and the line
@@ -8572,6 +8612,71 @@ mod tests {
         assert!(
             h.table.by_source(lease).is_none(),
             "an applied publish registers no box at the lease it named"
+        );
+    }
+
+    /// A guest lease that has published only its zone name — no port, so
+    /// no forward stands at it — is still a live lease the guest daemon
+    /// vouched for: the applied zone-name request named the address as the
+    /// box's own. A frame from it drops like any rowless source, and the
+    /// drop's line is the live lease's, naming the lease and the remedy,
+    /// not the generic unregistered one. The request informs the line only:
+    /// the frame drops, and no row is minted from it.
+    #[tokio::test]
+    async fn unregistered_lease_with_only_a_zone_name_warns() {
+        let registry = BoxRegistry::new(SUBNET);
+        tcp_lan_box(&registry, LEASE);
+        let mut h = gate_connected(registry).await;
+
+        // The zone name alone, at an in-plan lease no row holds: the shape a
+        // box that predates host registration speaks before it publishes
+        // any port. Applied under the interim.
+        let lease = [100, 64, 0, 10];
+        let body = br#"{"name":"min.internal.","records":[{"name":"web","ip":"100.64.0.10"}]}"#;
+        let mut request = b"POST /services/dns/add HTTP/1.1\r\nHost: localhost\r\n\
+                           Content-Type: application/json\r\n"
+            .to_vec();
+        request.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        request.extend_from_slice(body);
+        h.guest
+            .write_all(&request)
+            .await
+            .expect("writing the zone-name request");
+        let mut spoken = vec![0u8; request.len()];
+        read_within(&mut h.switch, &mut spoken).await;
+        assert_eq!(spoken, request, "the zone-name request reached the switch");
+        wait_for_log(&h.log, UNREGISTERED_PUBLISH_RULE).await;
+
+        // The lease's frame: dropped, under the live lease's line.
+        let (mut guest, mut switch) = connect_over(&h).await;
+        let from_lease = ipv4_frame(lease, 6, [10, 1, 2, 3], 80);
+        let marker = ipv4_frame(LEASE, 6, [10, 1, 2, 3], 80);
+        send_frame(&mut guest, &from_lease).await;
+        send_frame(&mut guest, &marker).await;
+        assert_eq!(
+            expect_frame(&mut switch).await,
+            marker,
+            "the zone-name-only lease's frame drops; the marker passes"
+        );
+        expect_silence(&mut switch).await;
+        wait_for_log(&h.log, UNREGISTERED_LIVE_LEASE_RULE).await;
+        let logged = h.log.contents();
+        assert!(
+            logged.contains(&format!("source={}", Ipv4Addr::from(lease))),
+            "the live-lease line names the lease, got: {logged}"
+        );
+        assert!(
+            logged.contains("predates host registration"),
+            "the live-lease line names the remedy, got: {logged}"
+        );
+        assert!(
+            !logged.contains(UNREGISTERED_SOURCE_RULE),
+            "the zone-name-only lease takes the live-lease line, not the generic \
+             one, got: {logged}"
+        );
+        assert!(
+            h.table.by_source(lease).is_none(),
+            "an applied zone name registers no box at the lease it named"
         );
     }
 
