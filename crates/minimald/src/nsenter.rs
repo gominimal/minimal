@@ -778,7 +778,15 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(source) => {
-            let Some((code, msg)) = spawn_failure_code_and_message(&source) else {
+            // The child's `chdir` fails with the same `ENOENT` as a missing
+            // program; a missing working directory is not "command not found".
+            let chdir_missing = args.chdir.as_ref().is_some_and(|dir| !dir.is_dir());
+            let mapped = if chdir_missing {
+                None
+            } else {
+                spawn_failure_code_and_message(&source)
+            };
+            let Some((code, msg)) = mapped else {
                 return Err(NsenterError::Spawn { program, source });
             };
             eprintln!("{program}: {msg}", program = program.display());
@@ -801,19 +809,19 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
 /// Maps a failed `spawn` to the shell's exit-code and message conventions:
 /// `ENOENT` is "command not found" (127), `EACCES` is "permission denied"
 /// (126), and `ENOEXEC` is "cannot execute" (126). Any other failure — a
-/// fork's `ENOMEM` included — is not the program's to report, so it is `None`
-/// and stays a [`NsenterError::Spawn`].
+/// fork's `ENOMEM`, or an `EPERM` from a `pre_exec` hook, included — is not the
+/// program's to report, so it is `None` and stays a [`NsenterError::Spawn`].
+/// `EACCES` is matched by errno rather than [`std::io::ErrorKind::PermissionDenied`],
+/// which also covers `EPERM`.
 ///
 /// The message is the plain text a shell would print, without the debug
 /// wrapper `main` adds to [`NsenterError`] — a script must be able to tell
 /// "not found" from the command's own failure.
 fn spawn_failure_code_and_message(source: &std::io::Error) -> Option<(i32, String)> {
-    match source.kind() {
-        std::io::ErrorKind::NotFound => Some((127, "command not found".to_string())),
-        std::io::ErrorKind::PermissionDenied => Some((126, "permission denied".to_string())),
-        _ if source.raw_os_error() == Some(libc::ENOEXEC) => {
-            Some((126, format!("cannot execute: {source}")))
-        }
+    match source.raw_os_error()? {
+        libc::ENOENT => Some((127, "command not found".to_string())),
+        libc::EACCES => Some((126, "permission denied".to_string())),
+        libc::ENOEXEC => Some((126, format!("cannot execute: {source}"))),
         _ => None,
     }
 }
@@ -845,7 +853,8 @@ mod tests {
     /// A failed spawn maps to the shell's exit-code and message conventions:
     /// `ENOENT` is "command not found" (127), `EACCES` is "permission denied"
     /// (126), and `ENOEXEC` is "cannot execute" (126). Anything else, such as
-    /// the fork's `ENOMEM`, is left to [`NsenterError::Spawn`].
+    /// the fork's `ENOMEM` or a `pre_exec` hook's `EPERM`, is left to
+    /// [`NsenterError::Spawn`].
     #[test]
     fn spawn_failures_map_to_shell_exit_codes_and_messages() {
         let not_found = std::io::Error::from_raw_os_error(libc::ENOENT);
@@ -865,6 +874,9 @@ mod tests {
 
         let fork_failed = std::io::Error::from_raw_os_error(libc::ENOMEM);
         assert_eq!(spawn_failure_code_and_message(&fork_failed), None);
+
+        let hook_refused = std::io::Error::from_raw_os_error(libc::EPERM);
+        assert_eq!(spawn_failure_code_and_message(&hook_refused), None);
     }
 
     /// The fail-closed gate on the injection path: a none-box injection
