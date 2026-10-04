@@ -2445,7 +2445,7 @@ pub(crate) fn advisory_at(
                 .to_string()
         });
     }
-    if let Some(fact) = answerer_fact(&answerer, install.is_some()) {
+    if let Some(fact) = answerer_fact(answerer, install.is_some()) {
         facts.push(fact);
     }
     if !hook.routes(port) {
