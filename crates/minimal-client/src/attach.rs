@@ -252,7 +252,7 @@ pub const MAX_EXEC_COMMAND_BYTES: usize = 128 * 1024;
 pub fn checked_remote_command(command: &[String]) -> anyhow::Result<Option<String>> {
     let wire = remote_command(command);
     if let Some(wire) = wire.as_deref()
-        && wire.len() > MAX_EXEC_COMMAND_BYTES
+        && wire.len() >= MAX_EXEC_COMMAND_BYTES
     {
         anyhow::bail!(
             "the command is {} KiB; min session exec carries at most {} KiB of arguments; pass large data on stdin or in a file under /workbench",
@@ -383,6 +383,14 @@ mod tests {
         let under = "x".repeat(MAX_EXEC_COMMAND_BYTES - prefix_len - 1);
         let wire = checked_remote_command(&[under]).unwrap().unwrap();
         assert_eq!(wire.len(), MAX_EXEC_COMMAND_BYTES - 1);
+
+        // The per-argument limit includes the terminating NUL, so a wire of
+        // exactly the limit still fails with E2BIG once ssh execs it. Refuse
+        // the boundary too, not just lengths above it.
+        let at_limit = "x".repeat(MAX_EXEC_COMMAND_BYTES - prefix_len);
+        let boundary_wire = remote_command(&[at_limit.clone()]).unwrap();
+        assert_eq!(boundary_wire.len(), MAX_EXEC_COMMAND_BYTES);
+        assert!(checked_remote_command(&[at_limit]).is_err());
 
         let over = "x".repeat(MAX_EXEC_COMMAND_BYTES - prefix_len + 1);
         let err = checked_remote_command(&[over]).unwrap_err();
