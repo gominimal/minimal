@@ -357,6 +357,9 @@ async fn task_producer(
         // directory the interactive session sees at `/home`. The daemon's own
         // ambient home is `/` inside the guest, and expanding against that
         // dropped package-declared files onto the read-only rootfs (#1204).
+        // The task then runs in the session layout (home at `/home`, tree at
+        // `/workbench`), and a patch that expanded into either directory is
+        // mounted at the matching path there, keeping its declared mode.
         let session_paths = session.paths().await?;
         let mut env = ctx
             .make_env_with_network(

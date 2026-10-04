@@ -268,37 +268,14 @@ impl<C: Channel> Sandbox<C> {
                 std::os::unix::fs::symlink("lib", &out_usr_lib64)
                     .map_err(|e| Error::IO("create output usr/lib64 symlink", out_usr_lib64, e))?;
             }
-            WdSetup::BoundDir {
-                path: _,
-                fs_mappings,
-                read_only: _,
-            } => {
+            WdSetup::BoundDir { .. } => {
                 let rootfs_cwd = rootfs.join(config.wd.bound_dir_sandbox_cwd());
                 fs::create_dir_all(&rootfs_cwd)
                     .map_err(|e| Error::IO("create shadow cwd tree", rootfs_cwd, e))?;
-
-                // Create bind-mount targets
-                for m in fs_mappings {
-                    let sp = m.path_in_sandbox();
-                    let sp = match sp.strip_prefix("/") {
-                        Some(stripped) => stripped,
-                        None => &sp,
-                    };
-                    let p = rootfs.join(sp);
-
-                    if m.is_file {
-                        fs::create_dir_all(p.parent().unwrap())
-                            .map_err(|e| Error::IO("create mapping parent", p, e))?;
-                    } else {
-                        fs::create_dir_all(&p)
-                            .map_err(|e| Error::IO("create mapping target", p, e))?;
-                    }
-                }
             }
             WdSetup::Session {
-                home: _,
-                working: _,
                 working_name_override,
+                ..
             } => {
                 let rootfs_cwd = rootfs.join(
                     working_name_override
@@ -311,6 +288,24 @@ impl<C: Channel> Sandbox<C> {
                 let rootfs_home = rootfs.join(SESSION_HOME);
                 fs::create_dir_all(&rootfs_home)
                     .map_err(|e| Error::IO("create home", rootfs_home.clone(), e))?;
+            }
+        }
+
+        // Create bind-mount targets for the file mappings (none for an
+        // isolated working directory).
+        for m in config.wd.fs_mappings() {
+            let sp = m.path_in_sandbox();
+            let sp = match sp.strip_prefix("/") {
+                Some(stripped) => stripped,
+                None => &sp,
+            };
+            let p = rootfs.join(sp);
+
+            if m.is_file {
+                fs::create_dir_all(p.parent().unwrap())
+                    .map_err(|e| Error::IO("create mapping parent", p, e))?;
+            } else {
+                fs::create_dir_all(&p).map_err(|e| Error::IO("create mapping target", p, e))?;
             }
         }
 
@@ -1937,6 +1932,7 @@ impl<C: Channel> Sandbox<C> {
                 home,
                 working,
                 working_name_override,
+                ..
             } => {
                 // mount the given home path to /{SESSION_HOME}
                 Self::bind_mount(
@@ -1966,20 +1962,20 @@ impl<C: Channel> Sandbox<C> {
                 )?;
             }
         }
-        // Mount in any file mappings
-        if let WdSetup::BoundDir { fs_mappings, .. } = &self.config.wd {
-            for m in fs_mappings {
-                let opts = BindOpts {
-                    recursive: !m.is_file,
-                    read_only: m.read_only,
-                };
-                Self::bind_mount(
-                    Path::new(&m.host_path),
-                    &m.path_in_sandbox(),
-                    opts,
-                    &mut container,
-                )?;
-            }
+        // Mount in any file mappings. hakoniwa applies mounts sorted by
+        // target, so a mapping inside a session's `/home` or `/workbench`
+        // lands on top of that directory's own mount.
+        for m in self.config.wd.fs_mappings() {
+            let opts = BindOpts {
+                recursive: !m.is_file,
+                read_only: m.read_only,
+            };
+            Self::bind_mount(
+                Path::new(&m.host_path),
+                &m.path_in_sandbox(),
+                opts,
+                &mut container,
+            )?;
         }
 
         if let Some(hn) = &self.config.hostname {
