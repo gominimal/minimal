@@ -168,6 +168,9 @@ fn e2e_enabled() -> Option<PathBuf> {
 struct Guest {
     sock_path: PathBuf,
     gate_sock: PathBuf,
+    /// The VM host daemon's box control socket, where each box is registered
+    /// before its session is created, as `min session activate` does.
+    control_sock: PathBuf,
     gvproxy: PathBuf,
     /// The VMM child's pid from `status --json`, killed directly when
     /// `minvmd stop` fails.
@@ -312,6 +315,7 @@ impl Guest {
             // The gate binds the socket beside the switch socket, which sits
             // beside the bridge socket.
             gate_sock: provider_dir.join("gvproxy-gate.sock"),
+            control_sock: provider_dir.join(minvmd::control::CONTROL_SOCK_FILE),
             gvproxy: gvproxy.to_path_buf(),
             vmm_pid: None,
             _state: state,
@@ -454,6 +458,7 @@ impl BoxSession {
     /// the handle for execs.
     async fn open(
         sock_path: &Path,
+        control_sock: &Path,
         network: sessions::NetworkMode,
         egress: sessions::EgressPolicy,
         label: &str,
@@ -513,7 +518,7 @@ impl BoxSession {
                 .map_err(|e| format!("request_subsystem: {e}"))?;
 
             let policy = sessions::SessionPolicy {
-                egress: Some(egress),
+                egress: Some(egress.clone()),
                 ..Default::default()
             };
             // Unique per invocation — minimald dedups sessions by name and
@@ -527,16 +532,22 @@ impl BoxSession {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
+            let name = format!("vm-escape-{label}-{uniq:x}");
+            // The box's row, filed with the VM host the way `min session
+            // activate` files it: a box with no row is an unregistered
+            // source the gate drops unconditionally (NET-085), so a box
+            // whose own declared traffic is a positive control must hold one.
+            let addresses = common::register_box(control_sock, &name, Some(egress))?;
             let req = CreateSessionRequest {
                 config: minimald_rpc::SessionConfig {
-                    name: Some(format!("vm-escape-{label}-{uniq:x}")),
+                    name: Some(name),
                     project_path: paths::HostAbsPath::try_new("/tmp")
                         .map_err(|e| format!("project_path: {e}"))?,
                     network,
                     policy,
-                    // No registration happened on this path: the box attaches
-                    // as an unregistered one always has.
-                    box_addresses: None,
+                    // The addresses the registration handed back, so the
+                    // in-VM daemon attaches the box at its row's lease.
+                    box_addresses: Some(addresses),
                     // The serde default, and what every non-`--no-hooks`
                     // activation sends. This session only runs execs, so it
                     // declares no hooks either way.
@@ -836,7 +847,15 @@ async fn open_box(
     tokio::time::sleep(Duration::from_millis(500)).await;
     let mut last = "not attempted".to_string();
     for attempt in 1..=6 {
-        match BoxSession::open(&guest.sock_path, network, egress.clone(), label).await {
+        match BoxSession::open(
+            &guest.sock_path,
+            &guest.control_sock,
+            network,
+            egress.clone(),
+            label,
+        )
+        .await
+        {
             Ok(session) => return session,
             Err(e) => {
                 last = e;
