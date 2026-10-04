@@ -9761,15 +9761,21 @@ proof_escape_reaches_only_declared_union() {
   local esu_gate_sock="" esu_listener_log=""
   echo "::group::escape into the VM reaches only the declared union (NET-085)"
 
-  if [ "$min_daemon" != minvmd ]; then
+  if [ "$min_daemon" != minvmd ] && [ -z "$E2E_VM" ]; then
     echo "escape-union proof SKIPPED (this run's daemon is minimald: a native host has no VM boundary for an escapee to cross — the proof runs where the CLI is VM-backed, which macOS is with no flag at all)"
     echo "::endgroup::"
     return 0
   fi
+  # A VM-backed run without a switch is a broken lane, not a skip: every VM
+  # target exports the switch binary (the justfile's e2e-env, every CI VM
+  # lane, the release smokes) because minvmd boots the VM's switch — and with
+  # it the host-side egress gate — from MINVMD_GVPROXY_BIN, so a VM lane that
+  # reaches here without it could not boot a VM with a gate at all, and the
+  # bound NET-085 names would silently never be tested. The native skip above
+  # stays: a minimald host genuinely has nothing to prove here.
   if [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
-    echo "escape-union proof SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so there is no host-side egress gate to test the bound at)"
-    echo "::endgroup::"
-    return 0
+    echo "::error::no MINVMD_GVPROXY_BIN on this VM-backed run: the switch binary the host-side egress gate stands beside is missing, so the escape-union proof has no gate to test the bound at"
+    fail
   fi
 
   # The two seeds: the disjoint declared egress rides on the box specs — one
