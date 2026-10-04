@@ -235,7 +235,7 @@ Renames an existing session.
 ### `session policy`
 
 ```
-min session policy <SESSION>
+min session policy <SESSION> [-o json]
 ```
 
 Prints the effective networking rules for `SESSION` (a UUID or session
@@ -268,6 +268,38 @@ ingress
 A host-address (`--network host_ip`) session prints no ingress block at all:
 it shares its host's network namespace, so minimald applies no per-session
 ingress to it and there is no rule to state.
+
+Ports the box published at runtime (`min net expose`) are listed beside the
+declaration under `live ingress`, one row a publish — the address its
+forward is bound on and the in-box port it delivers to:
+
+```
+live ingress (published at runtime)
+  tcp  127.0.64.21:3000 → :3000
+```
+
+A runtime publish is bound on the host at once, but the frame only reaches
+the box through the relay gate its attach installed, and that gate admits
+the ports the *declaration* named — so a port published at runtime reads
+`(pending; not yet reachable)` until the gate's admitted set grows to
+include it. A row from a daemon older than the `pending` field reads
+`(unknown; daemon predates this field)` instead: unknown, never reachable.
+
+`-o json` (`--output json`) prints one `min/v1/session-policy` document on
+stdout instead of text, for scripts. The blocks the text rendering prints
+carry over as keys — `network`, `egress`, `ingress`, and `live_ingress`,
+the live rows as the RPC's own mapping objects with each one's `pending`
+state carried (`null` for a daemon older than the field) — and the ones the
+text rendering suppresses are absent rather than nulled: a host-address
+session carries no `ingress` key, and a `--network none` box carries
+`schema` and `network` alone. The `ingress` block is tagged by `kind` —
+`deny_all` or `declared` — so a client branches on one field.
+
+A failed run answers with one `min/v1/error` object on stderr and a
+non-zero exit, never a plain-text line beside it: `code` names the failure
+(`not_found` for a missing session, `daemon_unreachable`,
+`policy_unavailable`), `message` carries the same chain the text mode's
+error line would, and `hint` names what to do about it.
 
 ### `session hooks`
 
