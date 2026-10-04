@@ -9759,6 +9759,12 @@ proof_escape_reaches_only_declared_union() {
   local esu_route="" esu_v6="" esu_cmdline="" esu_policy="" esu_caps=""
   local esu_log0="" esu_log0_lines=0 esu_alias="100.64.255.254"
   local esu_gate_sock="" esu_listener_log=""
+  # The loop-carried variables below stay function-local on purpose: sid_var
+  # in particular is a name the proxy-source case (bepb_*) also writes, and a
+  # global left behind here would shadow that case's next read with a stale
+  # esu_ session id — the dispatch runs the two cases back to back.
+  local esu_box="" sid_var="" esu_set="" esu_between=""
+  local esu_prior=0 esu_beyond_rule=""
   echo "::group::escape into the VM reaches only the declared union (NET-085)"
 
   if [ "$min_daemon" != minvmd ] && [ -z "$E2E_VM" ]; then
