@@ -498,7 +498,10 @@ pub enum ExposeRefusal {
     /// The port is held already by this box's other runtime surface — the
     /// reservation or publication that holds it, whichever surface that
     /// is, named by the owner the loser is refused with.
-    AlreadyPublished { port: u16, owner: super::listeners::PublicationOwner },
+    AlreadyPublished {
+        port: u16,
+        owner: super::listeners::PublicationOwner,
+    },
 }
 
 impl fmt::Display for ExposeRefusal {

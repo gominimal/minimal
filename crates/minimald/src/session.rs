@@ -2526,9 +2526,7 @@ impl Session {
             Err(crate::net::policy::ExposeFailure::Refused(
                 refusal @ crate::net::policy::ExposeRefusal::AlreadyPublished { .. },
             )) => {
-                let crate::net::policy::ExposeRefusal::AlreadyPublished {
-                    owner, ..
-                } = refusal
+                let crate::net::policy::ExposeRefusal::AlreadyPublished { owner, .. } = refusal
                 else {
                     unreachable!("matched AlreadyPublished above")
                 };
@@ -2732,10 +2730,10 @@ impl Session {
         // fails, a box that stopped under the bind, a request cancelled
         // mid-publish — each by the guard's own token, so a release never
         // touches whatever holds the port since.
-        let reservation = match self.publications.reserve(
-            port,
-            crate::net::listeners::PublicationOwner::Expose,
-        ) {
+        let reservation = match self
+            .publications
+            .reserve(port, crate::net::listeners::PublicationOwner::Expose)
+        {
             Ok(reservation) => reservation,
             Err(held) => {
                 return Err(ExposeFailure::Refused(ExposeRefusal::AlreadyPublished {

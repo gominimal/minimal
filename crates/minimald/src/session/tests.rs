@@ -7364,8 +7364,7 @@ async fn concurrent_expose_and_listen_publish_bind_once() {
     // before the launch, and the box's ingress does not permit it — the
     // port no surface may publish. The three in range stay free until each
     // phase binds its own listener on them.
-    let mut probes: Vec<std::net::TcpListener> =
-        (0..4).map(|_| listening_socket()).collect();
+    let mut probes: Vec<std::net::TcpListener> = (0..4).map(|_| listening_socket()).collect();
     probes.sort_by_key(port_of);
     let denied_socket = probes.remove(0);
     let denied_port = port_of(&denied_socket);
@@ -7446,13 +7445,16 @@ async fn concurrent_expose_and_listen_publish_bind_once() {
     // The bind resolves, the reservation commits, and the watcher's next
     // observation settles on the skip: the publication that stands is the
     // expose's own, never the watcher's, and the skip admits nothing.
-    gate_sender.send(1).expect("the gate opens for the held bind");
+    gate_sender
+        .send(1)
+        .expect("the gate opens for the held bind");
     let mapping = exposing
         .await
         .expect("the exposing task ends")
         .expect("the held bind stood, so the expose publishes its port");
     assert_eq!(
-        mapping.local, format!("{loopback}:{a_port}"),
+        mapping.local,
+        format!("{loopback}:{a_port}"),
         "the expose binds at its own address at its own port number"
     );
     soon(|| {
@@ -7525,7 +7527,9 @@ async fn concurrent_expose_and_listen_publish_bind_once() {
              switch: {other:?}"
         ),
     }
-    gate_sender.send(2).expect("the gate opens for the held bind");
+    gate_sender
+        .send(2)
+        .expect("the gate opens for the held bind");
     soon(|| gate.admits_tcp(b_port)).await;
     assert_eq!(
         served_naming(&served, loopback, b_port).len(),
@@ -7826,11 +7830,11 @@ async fn revocation_withdraws_regardless_of_owner() {
 }
 
 /// A respawn frees the ports its predecessor published: the publication
-/// set belongs to one launch, so a stopped box's publications never answer
-/// for its successor — the same port is exposable again after the respawn,
-/// and listen-publishable: the respawned box's watcher publishes it once
-/// the box's process binds it, and the expose asking then is the duplicate
-/// the fresh set says it is.
+/// set belongs to one launch, so the ports a dead spawn published never
+/// answer for its successor — the same port is exposable again after the
+/// respawn, and listen-publishable: the respawned box's watcher publishes
+/// it once the box's process binds it, and the expose asking then is the
+/// duplicate the fresh set says it is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn respawn_frees_published_ports() {
     let _capture = crate::test_harness::captured_log();
@@ -7853,7 +7857,7 @@ async fn respawn_frees_published_ports() {
     )
     .await;
 
-    // The first box publishes the port at runtime, and its set holds it.
+    // The first launch publishes the port at runtime, and its set holds it.
     handle
         .expose_dynamic(port)
         .await
@@ -7865,16 +7869,15 @@ async fn respawn_frees_published_ports() {
         served.lock().expect("served lock")
     );
 
-    // The box stops — the publication comes down with it — and respawns:
-    // the plan the next launch carries is seeded again, the way a real
-    // launch gathers its own facts for every launch it runs.
-    handle.stop().await;
-    assert_eq!(
-        served_naming(&served, loopback, port).len(),
-        2,
-        "the stop unbound the first box's publish: {:?}",
-        served.lock().expect("served lock")
-    );
+    // The launch's spawn ends — its host is killed — and the box's next
+    // launch respawns it: the plan the next launch carries is seeded again,
+    // the way a real launch gathers its own facts for every launch it runs.
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box's host resolves");
+    host.kill(false).await.expect("the box's spawn ends");
+    soon(|| !host.is_alive()).await;
     let sock = handle
         .net_switch()
         .await
@@ -7905,22 +7908,22 @@ async fn respawn_frees_published_ports() {
         .expect("the respawned box publishes the port the dead spawn held");
     assert_eq!(
         served_naming(&served, loopback, port).len(),
-        3,
+        2,
         "the second publish is one more bind: {:?}",
         served.lock().expect("served lock")
     );
 
-    // Stop and respawn once more, and this time the box's own process binds
-    // the port: the respawn's watcher publishes it — the port is
-    // listen-publishable again, owned by the listen surface now — and the
-    // expose asking after it is the typed duplicate the fresh set says.
-    handle.stop().await;
-    assert_eq!(
-        served_naming(&served, loopback, port).len(),
-        4,
-        "the stop unbound the second publish: {:?}",
-        served.lock().expect("served lock")
-    );
+    // The second spawn ends and respawns once more, and this time the box's
+    // own process binds the port: the respawn's watcher publishes it — the
+    // port is listen-publishable again, owned by the listen surface now —
+    // and the expose asking after it is the typed duplicate the fresh set
+    // says it is.
+    let host = handle
+        .ensure_host("tester".to_string())
+        .await
+        .expect("the box's host resolves again");
+    host.kill(false).await.expect("the second spawn ends");
+    soon(|| !host.is_alive()).await;
     let sock = handle
         .net_switch()
         .await
@@ -7955,8 +7958,8 @@ async fn respawn_frees_published_ports() {
     }
     assert_eq!(
         served_naming(&served, loopback, port).len(),
-        5,
-        "the watcher's publish is the only bind of the third launch: {:?}",
+        3,
+        "the watcher's publish is the only new bind of the third launch: {:?}",
         served.lock().expect("served lock")
     );
     handle.stop().await;

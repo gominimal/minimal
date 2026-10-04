@@ -395,7 +395,11 @@ impl Reservation {
     pub fn record(mut self) {
         self.recorded = true;
         let mut set = self.set.set.lock().expect("box publications lock poisoned");
-        if let Some(entry) = set.ports.get_mut(&self.port).filter(|e| e.token == self.token) {
+        if let Some(entry) = set
+            .ports
+            .get_mut(&self.port)
+            .filter(|e| e.token == self.token)
+        {
             entry.published = true;
         }
     }
@@ -802,9 +806,8 @@ impl WatchState {
         // binds, and the contended one is re-read the moment after its
         // holder's bind resolved — recorded by its winner, released for
         // this watcher to publish.
-        self.listening.retain(|port| {
-            !self.backoff.contains_key(port) && !contended.contains(port)
-        });
+        self.listening
+            .retain(|port| !self.backoff.contains_key(port) && !contended.contains(port));
     }
 
     /// NET-016: one listening port appeared, published unless the switch is
@@ -819,9 +822,7 @@ impl WatchState {
             // The streak's backoff has not elapsed: this poll does not ask.
             // The appearance is still owed, and the backoff book holds the
             // port out of the poll's table until the wait is done.
-            Some(wait) if wait.retry_at > std::time::Instant::now() => {
-                return Appearance::Owing
-            }
+            Some(wait) if wait.retry_at > std::time::Instant::now() => return Appearance::Owing,
             Some(wait) => wait.refusals,
             None => 0,
         };
