@@ -503,7 +503,11 @@ pub enum PolicyError {
     /// length over 253, or characters outside `[A-Za-z0-9-_.]`. Rejected at
     /// launch so a name that can never match is named where it can be fixed,
     /// rather than stored verbatim as an allow rule that admits nothing.
-    #[error("egress allow_dns_hosts entry {host:?} is not a valid DNS hostname")]
+    #[error(
+        "egress allow_dns_hosts entry {host:?} is not a valid DNS hostname \
+         (wildcards are not supported; write an internationalized name in its \
+         punycode xn-- form)"
+    )]
     InvalidDnsHost { host: String },
     /// An ingress `dynamic_allowed_range` was given with its lower bound above
     /// its upper bound (e.g. `(8443, 8000)`). The range is inclusive, so a
@@ -626,11 +630,11 @@ fn is_valid_cidr(s: &str) -> bool {
 /// One trailing dot is tolerated because the DNS gate strips it before
 /// matching, so `example.com.` and `example.com` name the same host.
 fn is_valid_dns_host(s: &str) -> bool {
-    if s.is_empty() || s.len() > 253 || s.chars().any(char::is_whitespace) {
+    if s.chars().any(char::is_whitespace) {
         return false;
     }
     let name = s.strip_suffix('.').unwrap_or(s);
-    if name.is_empty() {
+    if name.is_empty() || name.len() > 253 {
         return false;
     }
     name.split('.').all(|label| {
@@ -864,6 +868,30 @@ pub struct Record {
 }
 
 impl Record {
+    /// [`Record::validate_policy`] plus the checks a record must pass only
+    /// when it is created: added after records were already stored, they
+    /// would strand an existing session if they ran on every launch.
+    ///
+    /// # Errors
+    ///
+    /// Any error [`Record::validate_policy`] returns, or
+    /// [`PolicyError::InvalidDnsHost`] when an egress `allow_dns_hosts` entry
+    /// is not a valid DNS hostname.
+    pub fn validate_new_policy(&self) -> Result<(), PolicyError> {
+        self.validate_policy()?;
+        if let Some(bad) = self
+            .policy
+            .egress
+            .as_ref()
+            .and_then(EgressPolicy::first_invalid_dns_host)
+        {
+            return Err(PolicyError::InvalidDnsHost {
+                host: bad.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Validates that this record's networking policy is compatible with its
     /// network mode (R2.1/R2.3, as amended for host-address egress): an egress
     /// policy is accepted on an [`NetworkMode::OwnIp`] and on a
@@ -873,6 +901,11 @@ impl Record {
     /// `OwnIp`-only, since the switch's static forwarder is the only ingress
     /// surface minimald can apply per-session. Returns an error naming the
     /// first incompatible section.
+    ///
+    /// Runs on every launch, so it holds only checks every stored record
+    /// already passed when it was created; a check added later goes in
+    /// [`Record::validate_new_policy`] instead, so an upgrade never strands a
+    /// session that was accepted before it.
     ///
     /// # Errors
     ///
@@ -888,9 +921,7 @@ impl Record {
     /// that targets box port 0. For a `PTask` that accepts egress, returns
     /// [`PolicyError::InvalidSubnet`] when an egress `allow_subnets` entry is
     /// not a valid CIDR prefix, [`PolicyError::InvalidDenySubnet`] when a
-    /// `deny_subnets` entry is not, [`PolicyError::InvalidDnsHost`] when an
-    /// `allow_dns_hosts` entry is not a valid DNS hostname,
-    /// [`PolicyError::InvalidDynamicRange`] when
+    /// `deny_subnets` entry is not, [`PolicyError::InvalidDynamicRange`] when
     /// the ingress `dynamic_allowed_range` lower bound exceeds its upper bound,
     /// or [`PolicyError::PrivilegedDynamicRange`] when that lower bound is a
     /// privileged host port (< 1024). Does not validate `dynamic_ingress`, which
@@ -939,16 +970,6 @@ impl Record {
         {
             return Err(PolicyError::InvalidDenySubnet {
                 cidr: bad.to_owned(),
-            });
-        }
-        if let Some(bad) = self
-            .policy
-            .egress
-            .as_ref()
-            .and_then(EgressPolicy::first_invalid_dns_host)
-        {
-            return Err(PolicyError::InvalidDnsHost {
-                host: bad.to_owned(),
             });
         }
         if self.network == NetworkMode::OwnIp {
@@ -1539,9 +1560,12 @@ mod tests {
                 };
                 let record = record_with(network, SessionPolicy::new(Some(egress), None));
                 assert_eq!(
-                    record.validate_policy(),
+                    record.validate_new_policy(),
                     Err(PolicyError::InvalidDnsHost { host: host.into() })
                 );
+                // Launch-time validation leaves it alone: a session stored
+                // before the check existed must still attach after an upgrade.
+                assert_eq!(record.validate_policy(), Ok(()));
             }
         }
     }

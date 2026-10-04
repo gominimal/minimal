@@ -92,7 +92,7 @@ fn build_record(
         attrs: config.attrs,
     };
     record
-        .validate_policy()
+        .validate_new_policy()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     Ok(record)
 }
