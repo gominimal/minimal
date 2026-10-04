@@ -29,8 +29,10 @@ pub async fn cmd_proxy(global: &GlobalArgs, args: ProxyArgs) -> Result<(), anyho
 /// daemon's accept backlog, so a single refused connect must not fail the
 /// proxy outright. A full backlog surfaces as `ConnectionRefused` on macOS
 /// and as `WouldBlock` (`EAGAIN` from the non-blocking connect) on Linux, so
-/// both are retried; a `NotFound` (no socket file) means the daemon is not
-/// running and fails immediately.
+/// both are retried. A `NotFound` (no socket file) fails immediately: it
+/// usually means the daemon is not running, but it also covers the short
+/// unlink-then-bind window of a daemon re-binding its socket, which this
+/// helper does not retry.
 async fn connect_with_retry(socket_path: &str) -> Result<tokio::net::UnixStream, anyhow::Error> {
     let mut last_err = None;
     for _ in 0..client::CONNECT_RETRIES {
@@ -50,7 +52,8 @@ async fn connect_with_retry(socket_path: &str) -> Result<tokio::net::UnixStream,
             }
         }
     }
-    Err(last_err.unwrap()).with_context(|| format!("connect to {}", socket_path))
+    Err(last_err.expect("CONNECT_RETRIES > 0, so at least one attempt ran and failed"))
+        .with_context(|| format!("connect to {}", socket_path))
 }
 
 /// Bridge proxy stdio to the daemon socket until either side closes.
