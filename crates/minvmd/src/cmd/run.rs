@@ -812,6 +812,11 @@ fn run_foreground() -> Result<()> {
     // the guest's late report, if it ever comes, confirms it after the loop.
     let mut unconfirmed_port = None;
     loop {
+        // This boot's publish generation (T93): drawn fresh for every boot,
+        // handed beside the port, and echoed by the guest in every publish
+        // report, so a report is told apart from a killed boot's even when
+        // both boots were handed the same port.
+        let publish_generation = draw_publish_generation();
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("__krun-vmm");
         // Forward the state-dir override and VM name so the VMM child resolves the
@@ -832,6 +837,10 @@ fn run_foreground() -> Result<()> {
             // the in-VM daemon starts no answerer on a VM-backed host
             // (NET-138), and the host answerer serves the zone.
             .env(crate::vm::NODE_PROXY_PORT_ENV, node_port.port.to_string())
+            .env(
+                crate::vm::PUBLISH_GENERATION_ENV,
+                publish_generation.to_string(),
+            )
             .spawn()
             .with_context(|| format!("spawning VMM child: {}", exe.display()))?;
 
@@ -867,21 +876,27 @@ fn run_foreground() -> Result<()> {
         // Wait for the guest to write `READY\n` on the marker socket. The wait
         // is env-configurable (`MINVMD_READY_TIMEOUT_SECS`): a cold multi-GiB
         // VM can take ~20s+ to reach userspace, so a fixed 5s was too short.
-        // A publish report this boot could not have sent — the guest reports
-        // only after READY — is a straggler from a redraw's killed boot, and
-        // is skipped rather than mistaken for a beacon.
-        if let Err(e) = wait_boot_beacon(
+        // A publish report inside the wait is this boot's own when it carries
+        // this boot's generation — kept, and handed to the watch below, since
+        // nothing in the channel orders a report after READY — and a killed
+        // boot's straggler otherwise, skipped rather than mistaken for a
+        // beacon.
+        let early_report = match wait_boot_beacon(
             &marker_events,
             ready_timeout,
+            publish_generation,
             &volume_path,
             volume_preexisted,
         ) {
-            let _ = child.kill();
-            let _ = child.wait();
-            crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
-            return Err(e);
-            // guard drops here → StartingGuard resets state to Stopped (R4.6)
-        }
+            Ok(early_report) => early_report,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                crate::cmd::discard_fresh_volume_image(&volume_path, volume_preexisted);
+                return Err(e);
+                // guard drops here → StartingGuard resets state to Stopped (R4.6)
+            }
+        };
 
         // T93: watch what became of the port this start reserved. The guest
         // reports the publish's outcome over the marker channel — served, or
@@ -899,7 +914,13 @@ fn run_foreground() -> Result<()> {
             // the VMM child. A listener on the port with one of these pids
             // is this VM's own publish, whatever the report did.
             let own_pids = [gvproxy.pid(), child_pid];
-            let outcome = watch_proxy_publish(node_port.port, &marker_events, &own_pids);
+            let outcome = watch_proxy_publish(
+                node_port.port,
+                &marker_events,
+                &own_pids,
+                publish_generation,
+                early_report,
+            );
             crate::control::decide_publish(!node_port.configured, publish_tries, outcome)
         } else {
             tracing::warn!(
@@ -922,7 +943,7 @@ fn run_foreground() -> Result<()> {
                      up and its publish is shown as unconfirmed until a report arrives"
                 );
                 proxy_publish.set_unconfirmed(port);
-                unconfirmed_port = Some(port);
+                unconfirmed_port = Some((port, publish_generation));
                 break;
             }
             crate::control::PublishDecision::Redraw { port } => {
@@ -986,12 +1007,17 @@ fn run_foreground() -> Result<()> {
     // here on — nothing past the start reads it — so a late serving report
     // for the port clears the state, and a late refusal says the port is
     // held after all.
-    if let Some(port) = unconfirmed_port {
+    // Only a report the running boot sent counts: its own generation, or —
+    // from a guest too old to echo one — none.
+    if let Some((port, generation)) = unconfirmed_port {
         let proxy_publish = proxy_publish.clone();
         std::thread::spawn(move || {
             for event in marker_events {
+                if event.is_straggler_for(generation, true) {
+                    continue;
+                }
                 match event {
-                    MarkerEvent::ProxyServing(published) if published == port => {
+                    MarkerEvent::ProxyServing(published, _) if published == port => {
                         tracing::info!(
                             port,
                             "the guest's late report confirms the hostname proxy's publish"
@@ -999,7 +1025,7 @@ fn run_foreground() -> Result<()> {
                         proxy_publish.confirm(port);
                         return;
                     }
-                    MarkerEvent::ProxyPortHeld(held) if held == port => {
+                    MarkerEvent::ProxyPortHeld(held, _) if held == port => {
                         // The VM stays up: the cause says so, and names the
                         // holder the host can see now, so the surfaces never
                         // recycle the start failure's words for a VM that
@@ -1950,28 +1976,114 @@ fn fallback_port(
 /// it. Pinned beside its guest-side twin (minimald's
 /// `PROXY_PORT_HELD_BEACON`); the guest's report is a terminal fact, so the
 /// two names must agree for the watch below to see it.
-#[cfg(minvmd_libkrun)]
+#[cfg(any(minvmd_libkrun, test))]
 const PROXY_PORT_HELD_LINE: &str = "PROXY_PORT_HELD";
 
 /// The first line of the guest's publish report (T93): the port named on the
 /// line after it is serving. Pinned beside its guest-side twin (minimald's
 /// `PROXY_SERVING_BEACON`).
-#[cfg(minvmd_libkrun)]
+#[cfg(any(minvmd_libkrun, test))]
 const PROXY_SERVING_LINE: &str = "PROXY_SERVING";
 
 /// One classified connection off the marker socket (T93): the boot beacon —
-/// `READY` or `MOUNT_FAILED` — or one of the guest's publish reports.
-#[cfg(minvmd_libkrun)]
+/// `READY` or `MOUNT_FAILED` — or one of the guest's publish reports. A
+/// report carries the publish generation the guest echoed from its boot
+/// line, or `None` from a guest too old to echo one.
+#[cfg(any(minvmd_libkrun, test))]
+#[derive(Debug, PartialEq, Eq)]
 enum MarkerEvent {
     /// The boot beacon, exactly as [`crate::cmd::read_ready_beacon`] leaves
     /// it: `Ok(Ready)`, `Ok(MountFailed)`, or the reason the line was none
     /// of them.
     Beacon(Result<crate::cmd::BootBeacon, String>),
     /// The guest published the hostname proxy: it is serving on the port.
-    ProxyServing(u16),
+    ProxyServing(u16, Option<u64>),
     /// The guest's publish was refused for address-in-use: the port is
     /// taken, and the guest has stopped retrying — the terminal report.
-    ProxyPortHeld(u16),
+    ProxyPortHeld(u16, Option<u64>),
+}
+
+#[cfg(any(minvmd_libkrun, test))]
+impl MarkerEvent {
+    /// Whether this event is a publish report some other boot sent
+    /// ([`report_fate`]); a beacon never is.
+    fn is_straggler_for(&self, boot_generation: u64, after_ready: bool) -> bool {
+        match self {
+            Self::Beacon(..) => false,
+            Self::ProxyServing(_, reported) | Self::ProxyPortHeld(_, reported) => {
+                report_fate(*reported, boot_generation, after_ready) == ReportFate::Straggler
+            }
+        }
+    }
+}
+
+/// What becomes of one publish report the running boot's watch reads (T93).
+#[cfg(any(minvmd_libkrun, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportFate {
+    /// The running boot's own report: handed to the publish decision.
+    Keep,
+    /// Another boot's report — a killed boot's, from a redraw or an earlier
+    /// start: dropped with a line naming both generations.
+    Straggler,
+}
+
+/// Whose report this is, by the publish generation the guest echoed
+/// (T93). The port cannot tell: a killed boot and the next one are often
+/// handed the same port — the preferred one, across starts — while the
+/// generation is drawn fresh for every boot. A report carrying this boot's
+/// generation is this boot's, before or after READY, since nothing in the
+/// marker channel orders a report after the beacon; any other generation is
+/// a straggler. A report with no generation comes from a guest too old to
+/// echo one: before READY it is a straggler and after READY it is kept —
+/// the behaviour that guest was built against, so mixed versions do not
+/// regress.
+#[cfg(any(minvmd_libkrun, test))]
+fn report_fate(reported: Option<u64>, boot_generation: u64, after_ready: bool) -> ReportFate {
+    match reported {
+        Some(generation) if generation == boot_generation => ReportFate::Keep,
+        Some(_) => ReportFate::Straggler,
+        None if after_ready => ReportFate::Keep,
+        None => ReportFate::Straggler,
+    }
+}
+
+/// A fresh publish generation for one boot (T93): a discriminator, not a
+/// secret, so it need only be distinct per boot, within a start and across
+/// starts. `RandomState` seeds from the OS's
+/// randomness once per thread and steps per instance; the pid and the clock
+/// folded in keep two supervisors apart even if their seeds met.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn draw_publish_generation() -> u64 {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    hasher.finish()
+}
+
+/// Parses one publish report's lines (T93): the verb, the port, and the
+/// publish generation the guest echoed — an empty third line, which is what
+/// a guest too old to echo one leaves, is `None`. `None` overall when the
+/// report is malformed: an unknown verb, a port that is not one, or a
+/// generation that does not parse.
+#[cfg(any(minvmd_libkrun, test))]
+fn parse_publish_report(verb: &str, port: &str, generation: &str) -> Option<MarkerEvent> {
+    let port = port.trim().parse::<u16>().ok()?;
+    let generation = match generation.trim() {
+        "" => None,
+        raw => Some(raw.parse::<u64>().ok()?),
+    };
+    match verb.trim() {
+        PROXY_PORT_HELD_LINE => Some(MarkerEvent::ProxyPortHeld(port, generation)),
+        PROXY_SERVING_LINE => Some(MarkerEvent::ProxyServing(port, generation)),
+        _ => None,
+    }
 }
 
 /// The marker socket's file, removed at the supervisor's exit (T93): the
@@ -2023,8 +2135,10 @@ fn spawn_marker_gate(
 /// consuming it (T93): [`crate::cmd::read_ready_beacon`] reads the beacon's
 /// own first line, so the gate may only peek. A publish report consumes its
 /// two lines here — verb, then port — and anything else is handed to the
-/// beacon reader whole. `None` is a report whose port did not parse: warned
-/// here, dropped, and the connection over with.
+/// beacon reader whole. A report's third line is the publish generation,
+/// absent from an older guest's report ([`parse_publish_report`]). `None` is
+/// a report that did not parse: warned here, dropped, and the connection
+/// over with.
 #[cfg(minvmd_libkrun)]
 fn classify_marker_connection(
     reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
@@ -2037,20 +2151,22 @@ fn classify_marker_connection(
     {
         let mut verb = String::new();
         let mut port = String::new();
+        let mut generation = String::new();
         let _ = reader.read_line(&mut verb);
         let _ = reader.read_line(&mut port);
-        match (verb.trim(), port.trim().parse::<u16>()) {
-            (PROXY_PORT_HELD_LINE, Ok(port)) => Some(MarkerEvent::ProxyPortHeld(port)),
-            (PROXY_SERVING_LINE, Ok(port)) => Some(MarkerEvent::ProxyServing(port)),
-            (verb, port) => {
-                tracing::warn!(
-                    verb,
-                    port_parsed = port.is_ok(),
-                    "a malformed publish report arrived on the marker socket; ignoring it"
-                );
-                None
-            }
+        // The guest half-closes after its report, so an older guest's
+        // two-line report ends here at EOF with the line left empty.
+        let _ = reader.read_line(&mut generation);
+        let event = parse_publish_report(&verb, &port, &generation);
+        if event.is_none() {
+            tracing::warn!(
+                verb = verb.trim(),
+                port = port.trim(),
+                generation = generation.trim(),
+                "a malformed publish report arrived on the marker socket; ignoring it"
+            );
         }
+        event
     } else {
         Some(MarkerEvent::Beacon(crate::cmd::read_ready_beacon(
             reader,
@@ -2061,43 +2177,128 @@ fn classify_marker_connection(
 
 /// Waits for this boot's READY beacon, the env-configurable bound around it
 /// (T93's redraws reuse it: every fresh boot is a boot). A publish report
-/// arriving inside the wait is a straggler from a redraw's killed boot —
-/// this boot's guest reports only after its own READY — so it is skipped
-/// with a line, never mistaken for the beacon.
+/// carrying this boot's generation ([`report_fate`]) is this boot's own —
+/// the guest's publish drive runs beside its boot path, and nothing in the
+/// marker channel orders the report after READY — so it is kept and
+/// returned for the publish watch; any other report is a killed boot's
+/// straggler, skipped with a line, never mistaken for the beacon.
 #[cfg(minvmd_libkrun)]
 fn wait_boot_beacon(
     events: &std::sync::mpsc::Receiver<MarkerEvent>,
     ready_timeout: std::time::Duration,
+    boot_generation: u64,
     volume_path: &std::path::Path,
     volume_preexisted: bool,
-) -> Result<()> {
+) -> Result<Option<crate::control::GuestPublish>> {
+    let Ok(BootBeaconWait {
+        beacon,
+        early_report,
+    }) = await_boot_beacon(events, ready_timeout, boot_generation)
+    else {
+        return Err(anyhow::anyhow!(
+            "boot timed out waiting for READY marker after {} s (raise {} to wait longer)",
+            ready_timeout.as_secs(),
+            crate::cmd::READY_TIMEOUT_ENV,
+        ));
+    };
+    match beacon {
+        Ok(crate::cmd::BootBeacon::Ready) => Ok(early_report),
+        Ok(crate::cmd::BootBeacon::MountFailed { reason }) => Err(crate::cmd::mount_failed_error(
+            &reason,
+            volume_path,
+            volume_preexisted,
+        )),
+        Err(e) => Err(anyhow::anyhow!("boot failed: {e}")),
+    }
+}
+
+/// What the READY wait read ([`await_boot_beacon`]): the boot beacon, and
+/// this boot's own publish report when it arrived first.
+#[cfg(any(minvmd_libkrun, test))]
+#[derive(Debug)]
+struct BootBeaconWait {
+    beacon: Result<crate::cmd::BootBeacon, String>,
+    early_report: Option<crate::control::GuestPublish>,
+}
+
+/// The channel half of [`wait_boot_beacon`]: reads events until the beacon,
+/// keeping the first report this boot sent ([`report_fate`], before READY)
+/// and skipping every straggler. `Err` when the bound expires first.
+#[cfg(any(minvmd_libkrun, test))]
+fn await_boot_beacon(
+    events: &std::sync::mpsc::Receiver<MarkerEvent>,
+    ready_timeout: std::time::Duration,
+    boot_generation: u64,
+) -> Result<BootBeaconWait, std::sync::mpsc::RecvTimeoutError> {
+    let deadline = std::time::Instant::now() + ready_timeout;
+    let mut early_report = None;
     loop {
-        match events.recv_timeout(ready_timeout) {
-            Ok(MarkerEvent::Beacon(Ok(crate::cmd::BootBeacon::Ready))) => return Ok(()),
-            Ok(MarkerEvent::Beacon(Ok(crate::cmd::BootBeacon::MountFailed { reason }))) => {
-                return Err(crate::cmd::mount_failed_error(
-                    &reason,
-                    volume_path,
-                    volume_preexisted,
-                ));
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match events.recv_timeout(remaining)? {
+            MarkerEvent::Beacon(beacon) => {
+                return Ok(BootBeaconWait {
+                    beacon,
+                    early_report,
+                });
             }
-            Ok(MarkerEvent::Beacon(Err(e))) => return Err(anyhow::anyhow!("boot failed: {e}")),
-            Ok(MarkerEvent::ProxyServing(port)) | Ok(MarkerEvent::ProxyPortHeld(port)) => {
-                tracing::warn!(
-                    port,
-                    "a publish report from a killed boot arrived while waiting for \
-                     the READY marker; skipping it"
+            event if event.is_straggler_for(boot_generation, false) => {
+                log_straggler(
+                    &event,
+                    boot_generation,
+                    "while waiting for the READY marker",
                 );
-                continue;
             }
-            Err(_) => {
-                return Err(anyhow::anyhow!(
-                    "boot timed out waiting for READY marker after {} s (raise {} to wait longer)",
-                    ready_timeout.as_secs(),
-                    crate::cmd::READY_TIMEOUT_ENV,
-                ));
+            event => {
+                if early_report.is_none() {
+                    early_report = publish_report_of(event);
+                }
             }
         }
+    }
+}
+
+/// One line per dropped straggler report (T93): the port it names, the
+/// generation it carried, and this boot's generation, so the log says whose
+/// report was skipped and why.
+#[cfg(any(minvmd_libkrun, test))]
+fn log_straggler(event: &MarkerEvent, boot_generation: u64, when: &str) {
+    if let MarkerEvent::ProxyServing(port, reported) | MarkerEvent::ProxyPortHeld(port, reported) =
+        event
+    {
+        tracing::warn!(
+            port,
+            report_generation = ?reported,
+            boot_generation,
+            when,
+            "skipped a publish report another boot sent"
+        );
+    }
+}
+
+/// A kept publish report as the decision reads it, re-probed host-side and
+/// logged (T93), so the daemon's log names the outcome the supervisor
+/// *checked* for the port, not only the one the guest claimed. `None` for a
+/// beacon.
+#[cfg(any(minvmd_libkrun, test))]
+fn publish_report_of(event: MarkerEvent) -> Option<crate::control::GuestPublish> {
+    match event {
+        MarkerEvent::ProxyServing(published, _) => {
+            tracing::info!(
+                port = published,
+                port_answers = loopback_answers(published),
+                "the guest published the hostname proxy; re-probed the port"
+            );
+            Some(crate::control::GuestPublish::Serving { port: published })
+        }
+        MarkerEvent::ProxyPortHeld(held, _) => {
+            tracing::info!(
+                port = held,
+                port_answers = loopback_answers(held),
+                "the guest's publish was refused for address-in-use; re-probed the port"
+            );
+            Some(crate::control::GuestPublish::PortHeld { port: held })
+        }
+        MarkerEvent::Beacon(..) => None,
     }
 }
 
@@ -2125,7 +2326,9 @@ const NO_REPORT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// names the publish outcome the supervisor *checked* for the port, not only
 /// the one the guest claimed; and nothing the guest says changes which port
 /// is reserved — the report names a fact, the reservation is the
-/// supervisor's own and moves only by its own decision.
+/// supervisor's own and moves only by its own decision. Only this boot's
+/// report counts ([`report_fate`]): `early_report` is the one the READY
+/// wait already kept, and the watch reads it first.
 ///
 /// With no report at the bound, the holder decides
 /// ([`crate::control::NoReportHolder`]): a listener whose pid is one of
@@ -2138,9 +2341,16 @@ fn watch_proxy_publish(
     port: u16,
     events: &std::sync::mpsc::Receiver<MarkerEvent>,
     own_pids: &[u32],
+    boot_generation: u64,
+    early_report: Option<crate::control::GuestPublish>,
 ) -> crate::control::GuestPublish {
     use crate::control::{GuestPublish, NoReportHolder, classify_no_report_holder};
-    if let Some(reported) = await_publish_report(events, PUBLISH_WATCH_BOUND) {
+    // This boot's report, when it beat READY: the READY wait already kept
+    // and re-probed it.
+    if let Some(reported) = early_report {
+        return reported;
+    }
+    if let Some(reported) = await_publish_report(events, PUBLISH_WATCH_BOUND, boot_generation) {
         return reported;
     }
     let port_answers = loopback_answers(port);
@@ -2180,7 +2390,7 @@ fn watch_proxy_publish(
                 "the publish watch expired without the guest's report and the \
                  port's holder cannot be named; waiting a short grace for the report"
             );
-            if let Some(reported) = await_publish_report(events, NO_REPORT_GRACE) {
+            if let Some(reported) = await_publish_report(events, NO_REPORT_GRACE, boot_generation) {
                 return reported;
             }
         }
@@ -2188,36 +2398,27 @@ fn watch_proxy_publish(
     GuestPublish::NoReport { port, holder }
 }
 
-/// The guest's publish report, if one arrives inside `bound` (T93): serving,
-/// or refused for address-in-use, each re-probed and logged. A beacon inside
-/// the wait is a straggler from a redraw's killed boot — this boot's beacon
-/// is already read — and is skipped. `None` at the bound.
-#[cfg(minvmd_libkrun)]
+/// The guest's publish report, if one arrives inside `bound` (T93): served,
+/// or refused for address-in-use, each re-probed and logged
+/// ([`publish_report_of`]). A report another boot sent ([`report_fate`],
+/// after READY) is skipped with a line, and so is a beacon inside the wait —
+/// a straggler from a redraw's killed boot, since this boot's beacon is
+/// already read. `None` at the bound.
+#[cfg(any(minvmd_libkrun, test))]
 fn await_publish_report(
     events: &std::sync::mpsc::Receiver<MarkerEvent>,
     bound: std::time::Duration,
+    boot_generation: u64,
 ) -> Option<crate::control::GuestPublish> {
     let deadline = std::time::Instant::now() + bound;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         match events.recv_timeout(remaining) {
-            Ok(MarkerEvent::ProxyServing(published)) => {
-                tracing::info!(
-                    port = published,
-                    port_answers = loopback_answers(published),
-                    "the guest published the hostname proxy; re-probed the port"
-                );
-                return Some(crate::control::GuestPublish::Serving { port: published });
-            }
-            Ok(MarkerEvent::ProxyPortHeld(held)) => {
-                tracing::info!(
-                    port = held,
-                    port_answers = loopback_answers(held),
-                    "the guest's publish was refused for address-in-use; re-probed the port"
-                );
-                return Some(crate::control::GuestPublish::PortHeld { port: held });
-            }
             Ok(MarkerEvent::Beacon(..)) => continue,
+            Ok(event) if event.is_straggler_for(boot_generation, true) => {
+                log_straggler(&event, boot_generation, "while watching the publish");
+            }
+            Ok(event) => return publish_report_of(event),
             Err(_) => return None,
         }
     }
@@ -2252,6 +2453,149 @@ mod tests {
     fn exited(code: i32) -> std::process::ExitStatus {
         use std::os::unix::process::ExitStatusExt as _;
         std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    /// The marker channel as the gate feeds it: every event already sent,
+    /// the sender dropped, so a wait reads them in order and then ends.
+    fn marker_channel(
+        events: Vec<super::MarkerEvent>,
+    ) -> std::sync::mpsc::Receiver<super::MarkerEvent> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for event in events {
+            tx.send(event).unwrap();
+        }
+        rx
+    }
+
+    fn ready() -> super::MarkerEvent {
+        super::MarkerEvent::Beacon(Ok(crate::cmd::BootBeacon::Ready))
+    }
+
+    const WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+    #[test]
+    fn a_publish_refusal_before_ready_is_not_dropped() {
+        // T93: the guest's publish drive runs beside its boot path, so this
+        // boot's refusal can reach the marker channel before READY. It
+        // carries this boot's generation, so the READY wait keeps it, the
+        // watch reads it, and the decision redraws the drawn port instead
+        // of calling the publish unconfirmed.
+        let (port, generation) = (7654, 41);
+        let events = marker_channel(vec![
+            super::MarkerEvent::ProxyPortHeld(port, Some(generation)),
+            ready(),
+        ]);
+        let wait = super::await_boot_beacon(&events, WAIT, generation).unwrap();
+        assert_eq!(wait.beacon, Ok(crate::cmd::BootBeacon::Ready));
+        let outcome = wait.early_report;
+        assert_eq!(
+            outcome,
+            Some(crate::control::GuestPublish::PortHeld { port })
+        );
+        assert_eq!(
+            crate::control::decide_publish(true, 1, outcome.unwrap()),
+            crate::control::PublishDecision::Redraw { port },
+            "a drawn port the guest found taken is redrawn"
+        );
+    }
+
+    #[test]
+    fn a_killed_boots_report_with_the_same_port_is_dropped() {
+        // A killed boot and the next one are often handed the same port, so
+        // only the generation tells them apart: the killed boot's report is
+        // skipped before READY and after it, and the watch proceeds to this
+        // boot's own report.
+        let (port, killed, current) = (7654, 7, 8);
+        let events = marker_channel(vec![
+            super::MarkerEvent::ProxyPortHeld(port, Some(killed)),
+            ready(),
+            super::MarkerEvent::ProxyPortHeld(port, Some(killed)),
+            super::MarkerEvent::ProxyServing(port, Some(current)),
+        ]);
+        let wait = super::await_boot_beacon(&events, WAIT, current).unwrap();
+        assert_eq!(wait.beacon, Ok(crate::cmd::BootBeacon::Ready));
+        assert_eq!(
+            wait.early_report, None,
+            "the killed boot's report is dropped"
+        );
+        assert_eq!(
+            super::await_publish_report(&events, WAIT, current),
+            Some(crate::control::GuestPublish::Serving { port }),
+            "the watch skips the straggler and reads this boot's report"
+        );
+    }
+
+    #[test]
+    fn an_older_guests_tokenless_report_counts_only_after_ready() {
+        // A guest too old to echo a generation: before READY its report is
+        // a straggler, after READY it is the running boot's — today's
+        // behaviour, so mixed versions do not regress.
+        let port = 7654;
+        let events = marker_channel(vec![
+            super::MarkerEvent::ProxyServing(port, None),
+            ready(),
+            super::MarkerEvent::ProxyPortHeld(port, None),
+        ]);
+        let wait = super::await_boot_beacon(&events, WAIT, 3).unwrap();
+        assert_eq!(wait.early_report, None);
+        assert_eq!(
+            super::await_publish_report(&events, WAIT, 3),
+            Some(crate::control::GuestPublish::PortHeld { port })
+        );
+    }
+
+    #[test]
+    fn report_fate_keeps_only_the_running_boots_reports() {
+        use super::{ReportFate, report_fate};
+        assert_eq!(report_fate(Some(5), 5, false), ReportFate::Keep);
+        assert_eq!(report_fate(Some(5), 5, true), ReportFate::Keep);
+        assert_eq!(report_fate(Some(4), 5, false), ReportFate::Straggler);
+        assert_eq!(report_fate(Some(4), 5, true), ReportFate::Straggler);
+        assert_eq!(report_fate(None, 5, false), ReportFate::Straggler);
+        assert_eq!(report_fate(None, 5, true), ReportFate::Keep);
+    }
+
+    #[test]
+    fn a_publish_report_parses_with_its_generation() {
+        assert_eq!(
+            super::parse_publish_report("PROXY_PORT_HELD\n", "7654\n", "123\n"),
+            Some(super::MarkerEvent::ProxyPortHeld(7654, Some(123)))
+        );
+        assert_eq!(
+            super::parse_publish_report("PROXY_SERVING\n", "7654\n", "123\n"),
+            Some(super::MarkerEvent::ProxyServing(7654, Some(123)))
+        );
+    }
+
+    #[test]
+    fn a_publish_report_without_a_generation_still_parses() {
+        // An older guest's two-line report: the third read meets EOF.
+        assert_eq!(
+            super::parse_publish_report("PROXY_PORT_HELD\n", "7654\n", ""),
+            Some(super::MarkerEvent::ProxyPortHeld(7654, None))
+        );
+        assert_eq!(
+            super::parse_publish_report("PROXY_SERVING\n", "7654\n", ""),
+            Some(super::MarkerEvent::ProxyServing(7654, None))
+        );
+    }
+
+    #[test]
+    fn a_malformed_publish_report_is_rejected() {
+        assert_eq!(super::parse_publish_report("PROXY_SERVING", "x", ""), None);
+        assert_eq!(
+            super::parse_publish_report("PROXY_SERVING", "7654", "x"),
+            None
+        );
+        assert_eq!(super::parse_publish_report("PROXY_ELSE", "7654", ""), None);
+    }
+
+    #[test]
+    fn every_boot_draws_its_own_publish_generation() {
+        assert_ne!(
+            super::draw_publish_generation(),
+            super::draw_publish_generation()
+        );
     }
 
     #[test]

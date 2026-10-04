@@ -66,6 +66,31 @@ pub fn handed_proxy_port() -> Result<Option<u16>, HandedPortError> {
     handed_port(HANDED_PROXY_PORT_TOKEN)
 }
 
+/// Boot token the VM host puts beside [`HANDED_PROXY_PORT_TOKEN`] to hand the
+/// guest daemon its boot's publish generation (T93): a value the host draws
+/// fresh for every boot and the daemon echoes in every publish report, so
+/// the host tells this boot's report from a killed boot's even when both
+/// were handed the same port. Mirrors the token `minvmd`'s `vm.rs` writes —
+/// keep the two in step.
+pub const HANDED_PUBLISH_GENERATION_TOKEN: &str = "MINIMALD_PUBLISH_GENERATION";
+
+/// The publish generation the VM host handed this boot, if it handed one: an
+/// older minvmd hands none, and a value that does not parse is treated the
+/// same way — the report then goes out without one, which the host reads as
+/// an older guest's, never as another boot's.
+pub fn handed_publish_generation() -> Option<u64> {
+    parse_publish_generation(
+        std::env::var(HANDED_PUBLISH_GENERATION_TOKEN)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Decodes a handed publish generation from its raw boot-token value.
+fn parse_publish_generation(raw: Option<&str>) -> Option<u64> {
+    raw?.trim().parse::<u64>().ok()
+}
+
 /// A boot token the host put a port on that does not carry one (NET-025):
 /// present on the command line but not a port number. Surfaced, not
 /// swallowed: a handoff that arrived broken is a host or transport fault
@@ -1547,6 +1572,15 @@ fn mount_if_absent(target: &str, source: &str, fstype: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The publish generation the host handed is echoed as handed; none
+    /// handed, or one that does not parse, is a report without one (T93).
+    #[test]
+    fn the_publish_generation_is_read_off_the_boot_line() {
+        assert_eq!(parse_publish_generation(Some("42")), Some(42));
+        assert_eq!(parse_publish_generation(None), None);
+        assert_eq!(parse_publish_generation(Some("not-a-generation")), None);
+    }
 
     /// The handed port is read off the environment the kernel passes
     /// through from the boot token: a present token parses, an absent one

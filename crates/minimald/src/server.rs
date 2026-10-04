@@ -1639,35 +1639,49 @@ pub(crate) fn next_host_publish_port(port: u16) -> Option<u16> {
 #[cfg(target_os = "linux")]
 const VM_HOST_MARKER_PORT: u32 = 7350;
 
-/// Writes the two-line `PROXY_SERVING\n<port>\n` report to the given async
-/// writer. Factored out of [`report_proxy_serving`] so tests can exercise
-/// the format with an in-memory writer, the twin of guest.rs's
+/// The lines of one publish report: the verb, the port, and — when the boot
+/// line handed one — the boot's publish generation, echoed so the VM host
+/// can tell this boot's report from a killed boot's (T93). Without a
+/// generation the report is the two lines an older host parses.
+#[cfg(target_os = "linux")]
+fn publish_report(verb: &str, port: u16, generation: Option<u64>) -> String {
+    match generation {
+        Some(generation) => format!("{verb}\n{port}\n{generation}\n"),
+        None => format!("{verb}\n{port}\n"),
+    }
+}
+
+/// Writes the `PROXY_SERVING\n<port>\n[<generation>\n]` report to the given
+/// async writer. Factored out of [`report_proxy_serving`] so tests can
+/// exercise the format with an in-memory writer, the twin of guest.rs's
 /// `write_ready_beacon`.
 #[cfg(target_os = "linux")]
 async fn write_proxy_serving_report<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     port: u16,
+    generation: Option<u64>,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt as _;
 
     writer
-        .write_all(format!("PROXY_SERVING\n{port}\n").as_bytes())
+        .write_all(publish_report("PROXY_SERVING", port, generation).as_bytes())
         .await
 }
 
-/// Writes the two-line `PROXY_PORT_HELD\n<port>\n` report — the terminal
-/// address-in-use failure, naming the host port the host already held — to
-/// the given async writer, factored out for tests like
+/// Writes the `PROXY_PORT_HELD\n<port>\n[<generation>\n]` report — the
+/// terminal address-in-use failure, naming the host port the host already
+/// held — to the given async writer, factored out for tests like
 /// [`write_proxy_serving_report`].
 #[cfg(target_os = "linux")]
 async fn write_proxy_port_held_report<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     port: u16,
+    generation: Option<u64>,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt as _;
 
     writer
-        .write_all(format!("PROXY_PORT_HELD\n{port}\n").as_bytes())
+        .write_all(publish_report("PROXY_PORT_HELD", port, generation).as_bytes())
         .await
 }
 
@@ -1740,7 +1754,8 @@ async fn report_publish_outcome(payload: &[u8], label: &str) {
 #[cfg(target_os = "linux")]
 async fn report_proxy_serving(port: u16) {
     let mut payload = Vec::new();
-    let _ = write_proxy_serving_report(&mut payload, port).await;
+    let generation = crate::guest::handed_publish_generation();
+    let _ = write_proxy_serving_report(&mut payload, port, generation).await;
     report_publish_outcome(&payload, "PROXY_SERVING").await;
 }
 
@@ -1752,7 +1767,8 @@ async fn report_proxy_serving(port: u16) {
 #[cfg(target_os = "linux")]
 async fn report_proxy_port_held(port: u16) {
     let mut payload = Vec::new();
-    let _ = write_proxy_port_held_report(&mut payload, port).await;
+    let generation = crate::guest::handed_publish_generation();
+    let _ = write_proxy_port_held_report(&mut payload, port, generation).await;
     report_publish_outcome(&payload, "PROXY_PORT_HELD").await;
 }
 
@@ -4012,7 +4028,9 @@ mod tests {
         let port = 19_911u16;
 
         let (mut writer, reader) = tokio::io::duplex(4096);
-        write_proxy_serving_report(&mut writer, port).await.unwrap();
+        write_proxy_serving_report(&mut writer, port, None)
+            .await
+            .unwrap();
         drop(writer);
         assert_eq!(
             drain(reader).await,
@@ -4021,7 +4039,7 @@ mod tests {
         );
 
         let (mut writer, reader) = tokio::io::duplex(4096);
-        write_proxy_port_held_report(&mut writer, port)
+        write_proxy_port_held_report(&mut writer, port, None)
             .await
             .unwrap();
         drop(writer);
@@ -4029,6 +4047,25 @@ mod tests {
             drain(reader).await,
             format!("PROXY_PORT_HELD\n{port}\n"),
             "the PROXY_PORT_HELD report must be two lines naming the port"
+        );
+
+        // With the boot's publish generation handed, every report echoes it
+        // on a third line (T93), the line the host keeps or drops it by.
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        write_proxy_serving_report(&mut writer, port, Some(42))
+            .await
+            .unwrap();
+        drop(writer);
+        assert_eq!(drain(reader).await, format!("PROXY_SERVING\n{port}\n42\n"));
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        write_proxy_port_held_report(&mut writer, port, Some(42))
+            .await
+            .unwrap();
+        drop(writer);
+        assert_eq!(
+            drain(reader).await,
+            format!("PROXY_PORT_HELD\n{port}\n42\n")
         );
     }
 
