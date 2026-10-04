@@ -1678,7 +1678,7 @@ proof_own_ip_egress_declared_and_enforced() {
   # enforcement shape with an explicit deny-all declaration (deny 0.0.0.0/0);
   # the unit and CLI tests already cover the in-force resolution, and the
   # announcement above covers the transition notice. This is a stand-in for
-  # NET-074's REACH only: NET-075's observable is the word `deny all` in
+  # NET-074's REACH only: NET-075's observable is the word `deny-all` in
   # `min session policy`, which an explicit-rule box cannot show — it shows
   # its rule — so that rendering stays with the CLI tests that pin it.
   deny_all_sid="$(cd "$EGRESS_SEED_DIR" && mnl session activate . --no-prompt \
@@ -1790,7 +1790,7 @@ proof_own_ip_egress_declared_and_enforced() {
 #
 # The refused-connect half is driven, not skipped: the box is declared
 # deny-all (`min session activate --deny-all-egress`, the flag form of the
-# strict `deny all` shape — allow_subnets, allow_dns_hosts and
+# strict `deny-all` shape — allow_subnets, allow_dns_hosts and
 # allow_protocols each an empty list), so it lands in boxes/deny, where
 # the loaded table refuses its connections. A connection the box opens
 # itself to an address it declared no exception for is asserted refused
@@ -2115,7 +2115,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   echo "refusal: a declaration that names rules the loaded table cannot enforce per box (deny_subnets 0.0.0.0/0, allow_subnets 10.0.0.0/8) is refused at the create with each rule named — this host decides per box, and its classifier enforces deny-all or nothing on a box's leaf"
 
   # ---- the box's own egress, before: the declaration as `min session policy`
-  # reads it back — a declared deny-all box reads `deny all` by name, beside
+  # reads it back — a declared deny-all box reads a bare `deny-all` row, with no `(default)` mark, beside
   # the per-box enforcement the host's fact carries — and one connection the
   # box itself opens, to an address its declaration names no exception for,
   # which the loaded table's deny chain must refuse: a
@@ -2129,8 +2129,8 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
     cat "$WORK/net080-policy-before.err" 2>/dev/null || true
     fail
   }
-  if [[ "$net080_policy_before" != *"deny all"* ]]; then
-    echo "::error::the box's policy does not read back the deny-all declaration it was activated with (deny all)"
+  if ! printf '%s\n' "$net080_policy_before" | grep -qx '  deny-all'; then
+    echo "::error::the box's policy does not read back the deny-all declaration it was activated with (a bare deny-all row)"
     printf '%s\n' "$net080_policy_before"
     fail
   fi
@@ -2139,7 +2139,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
     printf '%s\n' "$net080_policy_before"
     fail
   fi
-  echo "policy: the box's deny-all declaration reads back deny all, with per-box enforcement per_box beside it"
+  echo "policy: the box's deny-all declaration reads back deny-all, with per-box enforcement per_box beside it"
   mnl session exec "$net080_sid" \
     "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://1.1.1.1" \
     >"$WORK/net080-ctrl-before.out" 2>"$WORK/net080-ctrl-before.err"
@@ -2223,7 +2223,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
     diff <(printf '%s\n' "$net080_policy_before") <(printf '%s\n' "$net080_policy_after") || true
     fail
   fi
-  echo "egress unchanged: 'min session policy' reads back the same declaration as before the fetch (deny all beside per-box enforcement per_box, and the box still in the deny subtree)"
+  echo "egress unchanged: 'min session policy' reads back the same declaration as before the fetch (deny-all beside per-box enforcement per_box, and the box still in the deny subtree)"
 
   # ---- the box's own connect, after: refused again, now with the daemon's
   # own fetch completed in between as the reach control — the daemon fetched
