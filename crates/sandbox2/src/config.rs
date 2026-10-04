@@ -36,6 +36,15 @@ pub const BOX_GID: u32 = 1000;
 /// keeping one box from exhausting the host.
 pub const BOX_PTY_MAX: u32 = 1024;
 
+/// The data string the launch path remounts the box's `/dev/pts` with. A
+/// devpts remount resets every option it is not given to the kernel default
+/// (`ptmxmode=0000`, `mode=0600`), so the string restates the options the
+/// box's devpts was mounted with (`ptmxmode=0666,mode=620`, hakoniwa's devfs
+/// setup) and adds the per-instance `max=`. Without `ptmxmode=0666` the
+/// box's `/dev/ptmx` (a link to `pts/ptmx`) becomes unopenable for the box's
+/// unprivileged user, and no program in the box can open a PTY.
+pub const BOX_DEVPTS_REMOUNT_DATA: &std::ffi::CStr = c"ptmxmode=0666,mode=620,max=1024";
+
 /// A capability no box may hold: its kernel number (these are ABI, assigned
 /// once and never reused) and its name, for the launch log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -967,6 +976,24 @@ fn fit_box_name(name: &str, budget: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_devpts_remount_keeps_the_box_ptmx_open_and_caps_at_box_pty_max() {
+        let data = BOX_DEVPTS_REMOUNT_DATA.to_str().expect("ASCII options");
+        let opts: Vec<&str> = data.split(',').collect();
+        assert!(
+            opts.contains(&"ptmxmode=0666"),
+            "a remount without ptmxmode resets it to 0000 and the box cannot open /dev/ptmx"
+        );
+        assert!(
+            opts.contains(&"mode=620"),
+            "the box's slave mode survives the remount"
+        );
+        assert!(
+            opts.contains(&format!("max={BOX_PTY_MAX}").as_str()),
+            "the remount caps the instance at BOX_PTY_MAX"
+        );
+    }
 
     #[test]
     fn a_box_name_within_budget_is_kept() {
