@@ -949,15 +949,16 @@ pub(crate) async fn activate_session(
     // means this VM's names are not answered on the host whatever this
     // host's hook and range say, so neither is read and the warning says
     // the fact instead of the advisory.
-    let (vm_answerer, answerer_port, answerer_bound, held_no_channel) =
+    let (vm_answerer, answerer_port, answerer_bound, held_no_channel, proxy_down) =
         match vm_host_answerer_status(global).await {
             Some(status) => {
-                let read = crate::resolver::host_answerer_read(status).await;
+                let read = crate::resolver::host_answerer_read(status.clone()).await;
                 (
                     Some(status),
                     read.port,
                     read.answerer_bound,
                     read.held_no_channel,
+                    read.proxy_down,
                 )
             }
             None => (
@@ -965,6 +966,7 @@ pub(crate) async fn activate_session(
                 created.zone_answerer_port,
                 created.answerer_bound,
                 false,
+                None,
             ),
         };
     // The interim itself, named at every session start on a VM-backed host
@@ -1006,6 +1008,25 @@ pub(crate) async fn activate_session(
                 crate::resolver::LiveSurface::Proxy,
                 created.hostname_proxy_port,
             )
+        );
+    } else if let Some((port, cause)) = proxy_down {
+        // T93: the VM host daemon's own verdict on the hostname proxy's
+        // publication — a terminal publish failure, named with the port it
+        // is about and its cause instead of a bare "not serving" — printed
+        // at every session start, TTY and non-TTY alike, because the names
+        // this session is about to rely on are the ones the line says
+        // cannot resolve. No host read runs in this arm — no detection, no
+        // liveness query, no range probe — because the status is the VM
+        // host daemon's answer on the proxy's publication, and no host
+        // probe can move it.
+        let surface = crate::resolver::LiveSurface::ProxyNotServing { port, cause };
+        tracing::info!(
+            surface = ?surface,
+            "session start decided the live name surface for this host"
+        );
+        eprintln!(
+            "{}",
+            crate::resolver::name_surface_line(surface, created.hostname_proxy_port)
         );
     } else if let Some(answerer_port) = answerer_port {
         let detection = crate::resolver::session_detection().await;
@@ -4142,6 +4163,7 @@ mod tests {
             sock_path.clone(),
             registry.clone(),
             minvmd::net::answerer::AnswererStatus::starting(),
+            minvmd::control::ProxyPublishStatus::default(),
         )
         .expect("the control server binds its socket");
         let global = GlobalArgs {

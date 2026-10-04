@@ -6880,6 +6880,7 @@ async fn box_with_scripted_plan(
         switch,
         &listen_policy_over(range),
         crate::net::SwitchSubnet::default(),
+        None,
     ));
     crate::session::listen_plan_seam::seed(
         id,

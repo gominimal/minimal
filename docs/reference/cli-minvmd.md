@@ -49,6 +49,8 @@ Starts the microVM supervisor (foreground by default).
 | `--detach` | Spawn the supervisor in the background and return once the host UDS is accepting connections |
 | `--timeout <SECONDS>` | Timeout in seconds to wait for the host UDS when using `--detach` (default: `8`) |
 
+The VM's hostname proxy takes port `7654` when no other process or VM holds it, and a free port otherwise. To pin the port, set `MINVMD_NODE_PROXY_PORT` for `minvmd run` or for the `min` command that starts it. If another process holds a pinned port, the start fails.
+
 ### `status`
 
 ```

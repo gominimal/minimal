@@ -2038,8 +2038,8 @@ async fn ls_shows_vm_per_box() {
             json: false,
         },
         &single[0].resp,
-        surfaces[1],
-        answerers[1],
+        surfaces[1].clone(),
+        answerers[1].clone(),
     )
     .expect("format_ls on the same listing");
     assert_eq!(

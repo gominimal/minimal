@@ -947,10 +947,10 @@ impl AnswererStatus {
     /// The state the acquisition loop last wrote.
     #[must_use]
     pub fn get(&self) -> ZoneAnswererStatus {
-        *self
-            .0
+        self.0
             .lock()
             .expect("the answerer status lock is never held across a panic")
+            .clone()
     }
 
     /// The acquisition loop's own writer: called at every pass, with the

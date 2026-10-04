@@ -959,7 +959,10 @@ impl Session {
         let name = registry_name(record);
         // Scoped: the switch lock is dropped before the registry is taken, so
         // no path holds both.
-        let subnet = self.net_switch.lock().await.subnet();
+        let (subnet, hostname_proxy_port) = {
+            let switch = self.net_switch.lock().await;
+            (switch.subnet(), switch.hostname_proxy_port())
+        };
         match record.network {
             sessions::NetworkMode::OwnIp => {
                 // NET-010/NET-011: finalize publishes the box's declaration
@@ -1143,7 +1146,13 @@ impl Session {
                     }
                     None => published,
                 };
-                reg.register_caller(record.id, &name, &record.policy, subnet);
+                reg.register_caller(
+                    record.id,
+                    &name,
+                    &record.policy,
+                    subnet,
+                    hostname_proxy_port,
+                );
                 let declared = crate::net::switch::declared_request_ports(Some(&record.policy));
                 if let Some(hand) = handed {
                     // The hand is the box's own address whether this
