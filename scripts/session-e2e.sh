@@ -146,6 +146,10 @@
 #                                   two daemons on one machine routing
 #   retired_surfaces_gone            NET-109/110: the retired surfaces are gone,
 #                                    and a direct-tcpip forward relays for real
+#   two_named_vms_on_one_machine     NET-052..059: a second named VM with its
+#                                    own state, one `min ls` listing both,
+#                                    box names resolving to their VM, both
+#                                    routing at once, stop one leaves the other
 #   github_only_allowlist            NET-066/067/072/073/136 + NET-068's e2e
 #                                    half: a hostname-only allowlist runs a
 #                                    real toolchain against github.com and
@@ -192,17 +196,19 @@ set -uo pipefail # not -e: capture failures so we can dump diagnostics
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 E2E_VM="${E2E_VM:-}"
 
-# The three Linux fresh-install KVM proofs are documented as VM-backed cases
-# (NET-049/NET-051, plus the stock-install integration case), the
-# unpublished-port refusal proof is one by its own subject (NET-014 on the VM
-# host), and each is invoked directly by its task test line. When called that
-# way, behave as if the caller exported the KVM lane environment variables:
-# E2E_VM=1 and E2E_MINIMAL_ARGS="--provider local-minvmd". Without this the
-# script's min_daemon probe defaults to minimald on Linux and the standalone
-# case fails before it reaches the proof.
+# The VM-backed cases documented as such above and invoked directly by their
+# task test lines: the fresh-install KVM activation proofs (NET-049/NET-051),
+# the stock-install integration case, the two-named-VMs integration case
+# (NET-052..059), and the unpublished-port refusal proof, which is one by its
+# own subject (NET-014 on the VM host). When called that way, behave as if the
+# caller exported the KVM lane environment variables: E2E_VM=1 and
+# E2E_MINIMAL_ARGS="--provider local-minvmd". Without this the script's
+# min_daemon probe defaults to minimald on Linux and the standalone case fails
+# before it reaches the proof.
 case "${1:-}" in
   fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
-    | linux_stock_install_runs_vm_boxes | unpublished_port_refused_on_vm_host)
+    | linux_stock_install_runs_vm_boxes | two_named_vms_on_one_machine \
+    | unpublished_port_refused_on_vm_host)
     E2E_VM="${E2E_VM:-1}"
     if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
       E2E_MINIMAL_ARGS="--provider local-minvmd"
@@ -261,6 +267,10 @@ RECOVER_SWITCH_HOLD="" # where beat C parks it mid-proof
 RETIRED_SEED_DIR="" # seeded by the retired-surfaces proof below; removed on teardown
 RETIRED_FWD_PID="" # the `min net forward` it starts; killed on teardown
 EGRESS_SEED_DIR="" # seeded by the own-IP egress proof below; removed on teardown
+TWO_VM_NAME="" # the named VM the two-named-VMs proof creates; stopped on teardown
+TWO_VM_SEED_A_DIR="" # that proof's default-VM box seed; removed on teardown
+TWO_VM_SEED_B_DIR="" # its named-VM box seed; removed on teardown
+TWO_VM_FWD_PID="" # the `min net forward` it starts; killed on teardown
 DA_ORIGIN_SEED_DIR="" # the deny-all answer proof's origin box seed; teardown
 DA_TARGET_SEED_DIR="" # its deny-all target box's seed; removed on teardown
 DA_SIBLING_SEED_DIR="" # its sibling box's seed; removed on teardown
@@ -556,6 +566,13 @@ teardown() {
   if [ -n "$E2E_VM" ]; then
     minvmd stop >/dev/null 2>&1 || true
   fi
+  # The named VM the two-named-VMs proof may have created: it is NOT the
+  # default VM `minvmd stop` above took down, and a leaked one keeps its own
+  # supervisor, VMM and switch alive — the same wedge a leaked default VM
+  # leaves, one directory deeper.
+  if [ -n "$TWO_VM_NAME" ]; then
+    minvmd --vm "$TWO_VM_NAME" stop >/dev/null 2>&1 || true
+  fi
   # The daemon-fetch proof's classifier tree+table, if a mid-proof death left
   # them: the daemon stop above comes first because the uninstall refuses while
   # a live leaf or process holds the tree (its own guard) — and the daemon sits
@@ -628,6 +645,15 @@ teardown() {
   [ -n "$SECOND_SEED_DIR" ] && rm -rf "$SECOND_SEED_DIR"
   [ -n "$RETIRED_SEED_DIR" ] && rm -rf "$RETIRED_SEED_DIR"
   [ -n "$EGRESS_SEED_DIR" ] && rm -rf "$EGRESS_SEED_DIR"
+  [ -n "$TWO_VM_SEED_A_DIR" ] && rm -rf "$TWO_VM_SEED_A_DIR"
+  [ -n "$TWO_VM_SEED_B_DIR" ] && rm -rf "$TWO_VM_SEED_B_DIR"
+  # The two-named-VMs proof's forward holds a laptop-side listener; INT is
+  # the documented stop, KILL the backstop.
+  if [ -n "$TWO_VM_FWD_PID" ]; then
+    kill -INT "$TWO_VM_FWD_PID" 2>/dev/null || true
+    sleep 0.5 2>/dev/null || true
+    kill -9 "$TWO_VM_FWD_PID" 2>/dev/null || true
+  fi
   [ -n "$DA_ORIGIN_SEED_DIR" ] && rm -rf "$DA_ORIGIN_SEED_DIR"
   [ -n "$DA_TARGET_SEED_DIR" ] && rm -rf "$DA_TARGET_SEED_DIR"
   [ -n "$DA_SIBLING_SEED_DIR" ] && rm -rf "$DA_SIBLING_SEED_DIR"
@@ -12909,6 +12935,779 @@ proof_linux_stock_install_runs_vm_boxes() {
 }
 
 # ---------------------------------------------------------------------------
+# Two named VMs on one machine, end to end (NET-052..NET-059). The story a
+# second VM exists for: the boxes of one project must not see another's, and
+# the operator never says which VM they mean — the name decides. Driven the
+# way a user drives it, through `min` alone, on one host with both VMs up:
+#
+#   * `min --vm <name> session activate` creates the second VM — its own
+#     state directory, bridge socket and host daemon under a per-name
+#     subdirectory of the provider directory (NET-052/NET-054), the default
+#     VM's paths left exactly where they were (NET-053);
+#   * `min ls` — no flag — is ONE listing of both VMs: every box's row
+#     carries the VM it lives on (NET-057), and every routing fact is named
+#     per VM, because each VM's proxy publishes on a host port of its own
+#     (NET-059's discovery half);
+#   * `min session attach <box>` finds the VM from the box name alone, no
+#     global flag (NET-058): it lands in the OTHER VM's box, says which VM
+#     it landed in, and proves where it landed by reading a mark only that
+#     box wrote;
+#   * both VMs' box names route through the host's hostname surface at the
+#     same time (NET-059): a request through each VM's published port
+#     reaches that VM's box and is refused the other VM's name — the same
+#     per-daemon matrix the two-daemons proof pins natively, here for two
+#     VMs, entered from the host the way a laptop actually enters;
+#   * `min net forward`, the exposing verb this tree ships, addresses a box
+#     by name on the two-VM host and relays for real. `min net expose` —
+#     the verb NET-058 names beside attach, the one that reuses attach's
+#     box-name resolution (crates/minimal/src/attach.rs) — has not landed,
+#     so the cross-VM half of the exposing story is the resolution the
+#     attach above proves (its per-path pin is the
+#     box_name_resolves_vm_without_flag unit test); when it lands, this
+#     beat becomes its e2e;
+#   * stopping the NAMED VM leaves the default VM serving (NET-055): its
+#     boxes still listed, its host daemon still running, its published
+#     port still routing.
+#
+# The diagnostics this case owes are the two VM host daemons' own start
+# records: one line per boot, each naming its VM and its state directory
+# (crates/minvmd/src/cmd/run.rs), in the one log directory every VM of a
+# state base shares — the support bundle's answer to "which VM is this?".
+# Both boots happen INSIDE this case — the default VM is stopped first, so
+# neither record can belong to an earlier case's daemon — each under the
+# RUST_LOG ride that keeps the INFO record alive.
+proof_two_named_vms_on_one_machine() {
+  # Gates, by observed fact, in the fresh-install KVM proofs' shape: a
+  # native run hosts no VMs to name (its one daemon refuses `--vm`), a host
+  # without the guest images cannot boot even one VM, a switchless VM
+  # target can neither mint a box (the in-guest pkgs clone needs the
+  # switch's egress) nor publish either proxy (the publish rides the host
+  # gvproxy) so the routing half would be staging nothing, and on Linux the
+  # hypervisor is /dev/kvm — macOS needs no such gate, libkrun is its
+  # hypervisor.
+  if [ "$min_daemon" != minvmd ]; then
+    echo "two_named_vms_on_one_machine SKIPPED (this run drives '$min_daemon': a named VM is a minvmd-backed story)"
+    return 0
+  fi
+  locate_vm_guest_images
+  if [ ! -f "$STAGED_KERNEL" ] || [ ! -f "$STAGED_ROOTFS" ] || [ ! -f "$STAGED_INITRAMFS" ]; then
+    echo "two_named_vms_on_one_machine SKIPPED (guest images not available)"
+    return 0
+  fi
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] || [ ! -x "$MINVMD_GVPROXY_BIN" ]; then
+    echo "two_named_vms_on_one_machine SKIPPED (no MINVMD_GVPROXY_BIN: this target has no switch, so no box could mint and neither VM could publish its proxy)"
+    return 0
+  fi
+  if [ "$(uname -s)" = Linux ] && { [ ! -e /dev/kvm ] || [ ! -w /dev/kvm ]; }; then
+    echo "two_named_vms_on_one_machine SKIPPED (no writable /dev/kvm: this host cannot boot a VM)"
+    return 0
+  fi
+
+  echo "::group::two named VMs on one machine (NET-052..NET-059)"
+
+  # The case's own names. The VM is `alpha` — the name the minvmd fixtures
+  # use (crates/minvmd/tests/named_vm_integration.rs), so a reader maps this
+  # run onto them — and a legal one: 5 bytes of lowercase ASCII inside the
+  # 24-byte budget paths::validate_vm_name binds, adding exactly one path
+  # component to every socket below. $WORK is already one component deeper
+  # than a stock ~/.local/state, and the deepest path this case creates
+  # (alpha's switch socket) stays under the 108-byte sun_path bound
+  # crates/minvmd/src/sock.rs enforces.
+  TWO_VM_NAME="alpha"
+  tw_name="$TWO_VM_NAME"
+  TWO_VM_A_NAME="e2e-two-vm-a"   # the default VM's box
+  TWO_VM_B_NAME="e2e-two-vm-b"   # alpha's box
+  TWO_VM_A_PORT=18090            # box A's in-box responder
+  TWO_VM_B_PORT=18091            # box B's in-box responder
+  TWO_VM_LOCAL_PORT=18093         # the `min net forward` laptop-side listener
+  TWO_VM_A_MARKER="TWO_VM_A_OK"  # what box A's responder answers
+  TWO_VM_B_MARKER="TWO_VM_B_OK"  # what box B's responder answers
+  # The default VM's state directory is the provider root itself — its paths
+  # are unchanged (NET-053) — and the named VM's is the per-name
+  # subdirectory of it (NET-054).
+  tw_root="$XDG_STATE_HOME/minimal/providers/local-minvmd0"
+  tw_alpha="$tw_root/$tw_name"
+
+  # The named VM's own CLI surface: the same harness args plus the one flag
+  # that selects the VM, exactly as a user types it.
+  two_vm_mn() {
+    # shellcheck disable=SC2086
+    min ${E2E_MINIMAL_ARGS:-} --vm "$tw_name" "$@"
+  }
+
+  # The host port one VM's hostname proxy published, read from a `min ls`
+  # listing's discovery line: `HOSTNAME PROXY:  <vm> listening on
+  # 127.0.0.1:<port>`. awk's field compare, not a substring: the VM column
+  # is padded, and one VM's name can be a prefix of another's.
+  two_vm_ls_proxy_port() {
+    printf '%s\n' "${2:-}" | awk -v vm="$1" \
+      '$1 == "HOSTNAME" && $2 == "PROXY:" && $3 == vm {
+         sub(/^127\.0\.0\.1:/, "", $6); print $6; exit
+       }'
+  }
+
+  # One request from the HOST through one VM's published proxy port — the
+  # way a laptop enters: HTTP(S)_PROXY points at the published port, the
+  # request lands in that VM's in-guest proxy, which resolves the name in
+  # its own registry and dials its own box. The host's proxy env is
+  # stripped first: `-x` pins the proxy, but a NO_PROXY covering the name
+  # bypasses even a pinned one, and the probe would then measure the
+  # host's own path, not the VM's. $1 = the published port, $2 = the URL,
+  # $3 = the label the transcript line carries.
+  two_vm_route() {
+    TWO_VM_ROUTE_LABEL="$3"
+    TWO_VM_STATUS="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+      curl -sS --max-time 20 -x "http://127.0.0.1:$1" \
+      -o "$WORK/two-vm-route.body" -w '%{http_code}' "$2" 2>"$WORK/two-vm-route.err" \
+      | tail -n1 | tr -d '\r\n')"
+    TWO_VM_BODY="$(cat "$WORK/two-vm-route.body" 2>/dev/null || true)"
+    echo "$3: GET $2 via 127.0.0.1:$1 -> HTTP ${TWO_VM_STATUS:-<none>} ${TWO_VM_BODY:0:48}"
+  }
+  # Asserts the last `two_vm_route`: $1 = the HTTP status, $2 = a substring
+  # the body must carry ("" to skip).
+  two_vm_route_want() {
+    if [ "${TWO_VM_STATUS:-}" != "$1" ]; then
+      echo "::error::$TWO_VM_ROUTE_LABEL: expected HTTP $1, got '${TWO_VM_STATUS:-<none>}'"
+      echo "--- curl stderr ---"; cat "$WORK/two-vm-route.err" 2>/dev/null || true
+      fail
+    fi
+    if [ -n "$2" ] && [[ "${TWO_VM_BODY:-}" != *"$2"* ]]; then
+      echo "::error::$TWO_VM_ROUTE_LABEL: the answer does not carry '$2' (got: '${TWO_VM_BODY:-<empty>}')"
+      fail
+    fi
+  }
+
+  # The in-box responder, the proxy proof's socat form verbatim: socat is a
+  # launcher baseline package every box ships at /usr/bin, and the response
+  # is written by the SESSION's shell so the Content-Length can never drift
+  # from the body it frames. $1 = the runner (mnl or two_vm_mn), $2 = the
+  # session id, $3 = the listen port, $4 = the marker to answer with, $5 =
+  # the VM the box lives on, $6 = the box's name — the pair the error lines
+  # below name, so a red run's annotation says WHICH VM's story it carries.
+  #
+  # The socat probe's failure is three stories, and only one is about socat: an
+  # exec that never reached the box (its own stderr) reads the same as a box
+  # whose mint came up short, and an ssh that refused the VM guest's host key
+  # never reached the box either — but says so in its stderr, so it is told
+  # apart from both below. `session activate` prints an id only once the
+  # session is Active (crates/minimal/src/cmd/session.rs finalizes before it
+  # does), so a half-materialized box here would be a product bug, not a race
+  # — and the beats below say which story it is: the ls row carries the
+  # session's own status, the /usr/bin peek says whether the box was
+  # populated at all, and a host-key refusal dumps the record the pin read
+  # against beside the alias ssh asked for.
+  #
+  # The probe's first exec is also the box's MINT: a box mints at its first
+  # exec (crates/minimald/src/exec.rs services the request by ensuring the
+  # host), and this case is the only one in the lane whose exec runs against
+  # a freshly booted VM whose guest store is still empty — the shared
+  # session's mint warmed the default VM, but the named VM's guest has to
+  # redo the whole cold fetch beside a VM already holding the machine. So
+  # the probe retries its exec, bounded, in the shape the harness already
+  # gives a fresh activate's first exec (the policy gate's exec retry): a
+  # mint that fell over on a switch still settling gets its window, and the
+  # verdict itself is never loosened — socat must answer before the beats
+  # that need it run.
+  two_vm_start_responder() {
+    local runner="$1" sid="$2" port="$3" marker="$4" vm="$5" box="$6"
+    local attempt probe_ok="" ready
+    local tw_err="" tw_kh_dir="" tw_kh_alias="" tw_kh_rec=""
+    for attempt in 1 2 3; do
+      if "$runner" session exec "$sid" 'test -x /usr/bin/socat' \
+          >/dev/null 2>"$WORK/two-vm-socat.err"; then
+        probe_ok=1
+        break
+      fi
+      tw_err="$(cat "$WORK/two-vm-socat.err" 2>/dev/null || true)"
+      # An ssh host-key refusal is not a mint still settling: the record the
+      # pin reads is written by the VM's own host daemon as the guest reaches
+      # READY (crates/minvmd/src/cmd/mod.rs), before the bridge socket ever
+      # serves, so no window can produce it later. Retry only what a window
+      # can change.
+      if printf '%s' "$tw_err" | grep -Fiq "host key"; then
+        echo "probe: box $box on VM $vm — ssh refused the VM guest's host key before the box; not retrying (the record is written at boot, never minted)"
+        break
+      fi
+      [ "$attempt" -lt 3 ] || break
+      echo "probe: box $box on VM $vm — exec attempt $attempt failed; giving the mint its window and retrying"
+      sleep 2
+    done
+    if [ -z "$probe_ok" ]; then
+      tw_socat_err="$(cat "$WORK/two-vm-socat.err" 2>/dev/null || true)"
+      # The exec's own transport, named when it is the story: the ssh the exec
+      # rides pins the VM guest's host key against the record sitting beside
+      # THIS VM's bridge socket (crates/minimal-client/src/attach.rs), asking
+      # for the alias that socket's parent directory names — the provider
+      # directory's basename for the default VM, the VM's own name for a named
+      # one — while the record answers to whatever host the daemon keyed it
+      # on (crates/minvmd/src/cmd/mod.rs, the provider instance name). The two
+      # rules agree only for the default VM, so a refusal splits into two
+      # stories the record itself tells apart: the aliases disagree — every
+      # named VM, until the record is keyed the alias the client derives — or
+      # they agree and the key the guest presented is not the key the record
+      # holds. Both are transport facts, not box facts, so the alias, the
+      # record's own host and the record itself go in the lines below.
+      if printf '%s' "$tw_socat_err" | grep -Fiq "host key"; then
+        if [ "$vm" = default ]; then tw_kh_dir="$tw_root"; else tw_kh_dir="$tw_root/$vm"; fi
+        tw_kh_alias="$(basename "$tw_kh_dir")"
+        tw_kh_rec="$(awk 'NR==1 { print $1; exit }' "$tw_kh_dir/known_hosts" 2>/dev/null || true)"
+      fi
+      if [ -n "$tw_socat_err" ]; then
+        if [ -n "$tw_kh_alias" ] && [ -n "$tw_kh_rec" ] && [ "$tw_kh_alias" != "$tw_kh_rec" ]; then
+          echo "::error::box $box on VM $vm: ssh asked for host alias '$tw_kh_alias' but the record beside this VM's socket answers to '$tw_kh_rec' — two rules that agree only for the default VM, so this VM's ssh channels are refused at the key (both rules and their files are named below)"
+        elif [ -n "$tw_kh_alias" ] && [ -n "$tw_kh_rec" ]; then
+          echo "::error::box $box on VM $vm: the exec was refused at the VM guest's host key though the record beside this VM's socket answers to the alias ssh asked for ('$tw_kh_alias') — the key the guest presented is not the key the record holds (the record is dumped below)"
+        elif [ -n "$tw_kh_alias" ]; then
+          echo "::error::box $box on VM $vm: the exec was refused at the VM guest's host key but no record sits beside this VM's socket — a missing record waives the pin rather than enforcing it, so this refusal is not the record's doing (see below)"
+        else
+          echo "::error::box $box on VM $vm: the exec itself failed — the box never answered: $(printf '%s' "$tw_socat_err" | head -n1 | cut -c1-160)"
+        fi
+      else
+        echo "::error::box $box on VM $vm: the box answered but has no socat at /usr/bin/socat (a launcher baseline package — every box ships one)"
+      fi
+      echo "--- probe stderr (empty means the box answered, without socat) ---"
+      printf '%s\n' "$tw_socat_err"
+      if [ -n "$tw_kh_dir" ]; then
+        echo "--- VM $vm's recorded guest host key ($tw_kh_dir/known_hosts) ---"
+        if [ -f "$tw_kh_dir/known_hosts" ]; then
+          cat "$tw_kh_dir/known_hosts"
+          echo "ssh was asked for host alias '$tw_kh_alias' — the bridge socket's own directory's basename, the rule crates/minimal-client/src/attach.rs applies"
+          echo "the record's own host is '${tw_kh_rec:-<empty>}' — the provider instance name, the rule crates/minvmd/src/cmd/mod.rs applies"
+          echo "the two rules agree only for the default VM: a named VM's socket sits one directory deeper, so its alias is the VM's own name while its record is still keyed the instance name — until the record is keyed the alias the client derives (or the client asks for the record's key), every ssh channel into a named VM — exec, attach, forward — is refused at the key, and no retry window can change it"
+        else
+          echo "(absent — a missing record waives the pin rather than refusing it, so the refusal is not the record's doing)"
+        fi
+      fi
+      echo "--- the session's ls row (its status) ---"
+      "$runner" ls 2>/dev/null | grep -F -- "$sid" || true
+      echo "--- the box's /usr/bin (first entries) ---"
+      "$runner" session exec "$sid" 'ls /usr/bin' 2>&1 | head -n 20 || true
+      fail
+    fi
+    "$runner" session exec "$sid" \
+      "body=$marker; printf \"HTTP/1.1 200 OK\r\nContent-Length: \${#body}\r\nConnection: close\r\n\r\n%s\" \"\$body\" > /home/http200" \
+      >/dev/null 2>"$WORK/two-vm-responder.err" \
+      || { echo "::error::could not write the in-box responder's response"; cat "$WORK/two-vm-responder.err" 2>/dev/null || true; fail; }
+    "$runner" session exec "$sid" \
+      "nohup /usr/bin/socat TCP-LISTEN:$port,reuseaddr,fork SYSTEM:\"cat /home/http200\" >/dev/null 2>&1 &" \
+      >/dev/null 2>"$WORK/two-vm-responder.err" \
+      || { echo "::error::could not start the in-box responder"; cat "$WORK/two-vm-responder.err" 2>/dev/null || true; fail; }
+    ready=""
+    for _ in $(seq 1 40); do
+      if [ "$("$runner" session exec "$sid" \
+        "curl -sS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:$port/" \
+        2>/dev/null || true)" = "200" ]; then
+        ready=1; break
+      fi
+      sleep 0.25
+    done
+    if [ -z "$ready" ]; then
+      echo "::error::the in-box responder never answered a direct curl on 127.0.0.1:$port"
+      echo "--- responder stderr ---"; cat "$WORK/two-vm-responder.err" 2>/dev/null || true
+      fail
+    fi
+    echo "responder: $runner session $sid answers 127.0.0.1:$port with $marker"
+  }
+
+  # The VM host daemon log every VM of this state base shares (one dated
+  # file per day; the newest is the live one), and the lines it gained since
+  # a snapshot count. The two start records asserted below must be THIS
+  # run's, so they are read from the tail after the snapshot — never from
+  # the whole file, which on a whole-lane run carries the fresh-install
+  # proofs' boots too.
+  two_vm_minvmd_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
+      | sort | tail -n1
+  }
+  # $1 is the snapshot's file and $2 its line count. A rotation since the
+  # snapshot puts this run's lines in two files: the snapshot file's tail,
+  # then the whole newer one.
+  two_vm_log_since() {
+    local f
+    f="$(two_vm_minvmd_log)"
+    [ -n "$f" ] || return 0
+    if [ "$f" = "$1" ]; then
+      tail -n "+$(($2 + 1))" "$f"
+      return 0
+    fi
+    if [ -n "$1" ]; then tail -n "+$(($2 + 1))" "$1" 2>/dev/null; fi
+    cat "$f" 2>/dev/null
+  }
+
+  # Diagnostic capture only — never an assertion, never a failure. Each VM's
+  # host daemon runs one gvproxy whose `-listen` control socket sits beside
+  # that VM's state (crates/minvmd/src/net.rs; the default VM's at the
+  # provider root, a named VM's in its per-name subdirectory — the path
+  # recover's beat C reads), and serves the forwarder and lease tables over
+  # HTTP (docs/spikes/2026-06-21-gvproxy-attachment.md §5). Dumping both at
+  # each phase shows whether a port forward outlives the VM it pointed into:
+  # the KVM lane's default-VM proxy path dials a dead guest after a stop.
+  # $1 = the phase label the transcript lines carry.
+  two_vm_diag_forwarders() {
+    local phase="$1" vm sock found="" ep body
+    for vm in default "$tw_name"; do
+      if [ "$vm" = default ]; then sock="$tw_root/gvproxy-switch.sock"; else sock="$tw_alpha/gvproxy-switch.sock"; fi
+      if [ ! -S "$sock" ]; then
+        echo "T61-DIAG forwarders $phase: VM $vm has no control socket at $sock"
+        continue
+      fi
+      found=1
+      for ep in /services/forwarder/all /leases; do
+        body="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+          -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+          curl -sS --max-time 3 --unix-socket "$sock" "http://gvproxy$ep" 2>&1 || true)"
+        echo "T61-DIAG forwarders $phase: VM $vm GET $ep ($sock): ${body:-<empty>}"
+      done
+    done
+    if [ -z "$found" ]; then
+      echo "T61-DIAG forwarders $phase: no control socket at either candidate; gvproxy sockets under $tw_root:"
+      find "$tw_root" -maxdepth 2 -name '*.sock' 2>/dev/null | sed 's/^/  /' || true
+    fi
+    if [ -d /proc ]; then
+      local proc entry
+      for proc in /proc/[0-9]*; do
+        entry="$(tr '\0' ' ' 2>/dev/null <"$proc/cmdline" || true)"
+        case "$entry" in
+          *gvproxy*-listen*) echo "T61-DIAG forwarders $phase: live gvproxy pid ${proc#/proc/}: $entry" ;;
+        esac
+      done
+    else
+      pgrep -fl 'gvproxy.*-listen' 2>/dev/null \
+        | sed "s/^/T61-DIAG forwarders $phase: live gvproxy pid /" || true
+    fi
+  }
+
+  # ---- two VMs, each with its own box --------------------------------------
+  # The default VM comes down first, whatever an earlier case left running:
+  # both boots must happen in THIS case, or the two start records below
+  # could belong to an earlier case's daemon and the diagnostics beat would
+  # be vacuous. `stop --force` answers the exit prompt a live box would
+  # print, and `min stop` waits for the VM to finish shutting down
+  # (crates/minimal/src/autospawn.rs), so the status poll is a backstop,
+  # not the wait.
+  mnl stop --force >/dev/null 2>&1 || true
+  tw_stopped=""
+  for _ in $(seq 1 30); do
+    case "$(minvmd status --json 2>/dev/null || true)" in
+      *'"state":"stopped"'*) tw_stopped=1; break ;;
+    esac
+    sleep 1
+  done
+  if [ -z "$tw_stopped" ]; then
+    echo "::error::the default VM never reached 'stopped' after 'min stop --force' — a VM still up here would make the start-record assertion below someone else's"
+    minvmd status --json 2>&1 || true
+    fail
+  fi
+  echo "stop: the default VM is down; both boots happen in this case"
+  two_vm_diag_forwarders after-default-stop
+  # The shared log snapshot both start records must land after.
+  tw_log="$(two_vm_minvmd_log)"
+  tw_log_lines=0
+  if [ -n "$tw_log" ]; then tw_log_lines="$(wc -l < "$tw_log" | tr -d ' ')"; fi
+
+  # Box A on the default VM. The RUST_LOG filter rides each of the two
+  # activates that autospawn a daemon, command-local (the house pattern from
+  # drive_installed_vm_pair): the 'starting VM' record is INFO, a daemon's
+  # filter comes from RUST_LOG at autospawn, and this harness runs the whole
+  # lane at `warn` — which would drop the records the diagnostics beat
+  # asserts before they reached any sink.
+  TWO_VM_SEED_A_DIR="$(hook_mktemp /tmp/mnltwa.XXXXXX)"
+  hook_seed_preamble > "$TWO_VM_SEED_A_DIR/minimal.toml"
+  mkdir "$TWO_VM_SEED_A_DIR/.git"
+  tw_a_sid="$(cd "$TWO_VM_SEED_A_DIR" && RUST_LOG="warn,minvmd=info" \
+      mnl session activate . --no-prompt --name "$TWO_VM_A_NAME" \
+      2>"$WORK/two-vm-a-activate.err")" \
+    || { echo "::error::'min session activate' for the default VM's box failed"
+         echo "--- stderr ---"; cat "$WORK/two-vm-a-activate.err" 2>/dev/null || true
+         fail; }
+  tw_a_sid="$(printf '%s\n' "$tw_a_sid" | tail -n1 | tr -d '\r')"
+  echo "box A: $tw_a_sid ($TWO_VM_A_NAME) on VM default — min session activate, no flag"
+
+  # Box B on the NAMED VM — the case's own subject: `min --vm alpha session
+  # activate` creates the VM if it is not there, because autospawn forwards
+  # the name to the daemon it spawns (crates/minimal/src/autospawn.rs), so
+  # this one command is both the creation and the first use of it.
+  TWO_VM_SEED_B_DIR="$(hook_mktemp /tmp/mnltwb.XXXXXX)"
+  hook_seed_preamble > "$TWO_VM_SEED_B_DIR/minimal.toml"
+  mkdir "$TWO_VM_SEED_B_DIR/.git"
+  tw_b_sid="$(cd "$TWO_VM_SEED_B_DIR" && RUST_LOG="warn,minvmd=info" \
+      two_vm_mn session activate . --no-prompt --name "$TWO_VM_B_NAME" \
+      2>"$WORK/two-vm-b-activate.err")" \
+    || { echo "::error::'min --vm $tw_name session activate' failed to create the named VM and activate a box in it"
+         echo "--- stderr ---"; cat "$WORK/two-vm-b-activate.err" 2>/dev/null || true
+         fail; }
+  tw_b_sid="$(printf '%s\n' "$tw_b_sid" | tail -n1 | tr -d '\r')"
+  echo "box B: $tw_b_sid ($TWO_VM_B_NAME) on VM $tw_name — min --vm $tw_name session activate"
+
+  # ---- NET-052/053/054: each VM's own state, the default's unchanged ------
+  # The named VM's state directory is its own (NET-052): its state file and
+  # its bridge socket live under the per-name subdirectory (NET-054) — and
+  # the default VM's are still at the provider root, which is what NET-053
+  # means here: alpha exists now, and the default VM did not move.
+  [ -f "$tw_root/minvmd.toml" ] \
+    || { echo "::error::the default VM has no state file at $tw_root/minvmd.toml"; fail; }
+  [ -S "$tw_root/ssh.sock" ] \
+    || { echo "::error::the default VM's bridge socket is not at $tw_root/ssh.sock — its paths moved (NET-053)"; fail; }
+  [ -f "$tw_alpha/minvmd.toml" ] \
+    || { echo "::error::the named VM has no state file of its own at $tw_alpha/minvmd.toml (NET-052/NET-054)"; fail; }
+  [ -S "$tw_alpha/ssh.sock" ] \
+    || { echo "::error::the named VM's bridge socket is not in its own state directory (NET-052)"; fail; }
+  echo "state: default VM $tw_root/{minvmd.toml,ssh.sock} · named VM $tw_alpha/{minvmd.toml,ssh.sock}"
+
+  # And both host daemons are alive at once — the daemon half of NET-052, at
+  # the level only a real second VM reaches (the minvmd harness pins it with
+  # lock-holders standing in for daemons; these are the two boots).
+  tw_status_a="$(minvmd status --json 2>/dev/null || true)"
+  tw_status_b="$(minvmd --vm "$tw_name" status --json 2>/dev/null || true)"
+  case "$tw_status_a" in
+    *'"state":"running"'*) ;;
+    *) echo "::error::the default VM's host daemon is not running after its box activated ($tw_status_a)"
+       fail ;;
+  esac
+  case "$tw_status_b" in
+    *'"state":"running"'*) ;;
+    *) echo "::error::the named VM's host daemon is not running — two VMs each need a daemon of their own (NET-052) ($tw_status_b)"
+       fail ;;
+  esac
+  echo "daemons: default '$tw_status_a' · $tw_name '$tw_status_b'"
+  two_vm_diag_forwarders both-up
+
+  # ---- NET-057: one listing, both VMs, every box attributed ----------------
+  tw_ls="$(mnl ls 2>"$WORK/two-vm-ls.err")" \
+    || { echo "::error::'min ls' — no flag — failed on a two-VM host"
+         echo "--- stderr ---"; cat "$WORK/two-vm-ls.err" 2>/dev/null || true
+         fail; }
+  # The table's VM column: each box's row names the VM it lives on. awk
+  # field compare again — the column is padded, and a name can be a prefix.
+  if ! printf '%s\n' "$tw_ls" | awk -v vm=default -v sid="$tw_a_sid" \
+       '$1 == vm && $2 == sid { found = 1 } END { exit !found }'; then
+    echo "::error::min ls does not show box A's row attributed to VM default (NET-057)"
+    echo "--- min ls output ---"; printf '%s\n' "$tw_ls"
+    fail
+  fi
+  if ! printf '%s\n' "$tw_ls" | awk -v vm="$tw_name" -v sid="$tw_b_sid" \
+       '$1 == vm && $2 == sid { found = 1 } END { exit !found }'; then
+    echo "::error::min ls does not show box B's row attributed to VM $tw_name (NET-057)"
+    echo "--- min ls output ---"; printf '%s\n' "$tw_ls"
+    fail
+  fi
+  printf '%s\n' "$tw_ls" | sed 's/^/  /'
+  # The machine surface of the same statement: `min ls --json` stays ONE
+  # object whose single sessions array carries every VM's boxes, each
+  # attributed — a pipeline parsing `.sessions` sees both VMs without ever
+  # knowing a flag (crates/minimal/src/cmd/list.rs).
+  for tw_vm in default "$tw_name"; do
+    tw_json_has="$(mnl ls --json 2>/dev/null | python3 -c '
+import json, sys
+doc = json.load(sys.stdin)
+print("yes" if any(s.get("vm") == sys.argv[1] for s in doc["sessions"]) else "no")' \
+      "$tw_vm" 2>/dev/null || true)"
+    if [ "$tw_json_has" != "yes" ]; then
+      echo "::error::min ls --json's one sessions array does not attribute a box to VM '$tw_vm' (NET-057)"
+      mnl ls --json 2>&1 | head -40 || true
+      fail
+    fi
+  done
+  echo "min ls --json: both VMs' boxes in one sessions array, each entry attributed to its VM"
+
+  # ---- NET-059's discovery: two published ports, one per VM ----------------
+  tw_port_a="$(two_vm_ls_proxy_port default "$tw_ls")"
+  tw_port_b="$(two_vm_ls_proxy_port "$tw_name" "$tw_ls")"
+  if [ -z "$tw_port_a" ] || [ -z "$tw_port_b" ]; then
+    echo "::error::min ls did not report a HOSTNAME PROXY port for each VM — each VM's proxy must publish on a host port of its own, and the listing says which is whose (NET-059)"
+    echo "--- min ls output ---"; printf '%s\n' "$tw_ls"
+    fail
+  fi
+  if [ "$tw_port_a" = "$tw_port_b" ]; then
+    echo "::error::both VMs published the same host proxy port 127.0.0.1:$tw_port_a — each needs a port of its own for both to route at once (NET-059)"
+    fail
+  fi
+  echo "published proxy ports (min ls): default 127.0.0.1:$tw_port_a · $tw_name 127.0.0.1:$tw_port_b"
+
+  # ---- the in-box responders the routing matrix answers through ------------
+  two_vm_start_responder mnl "$tw_a_sid" "$TWO_VM_A_PORT" "$TWO_VM_A_MARKER" default "$TWO_VM_A_NAME"
+  two_vm_start_responder two_vm_mn "$tw_b_sid" "$TWO_VM_B_PORT" "$TWO_VM_B_MARKER" "$tw_name" "$TWO_VM_B_NAME"
+
+  # ---- NET-059: both names route at the same time, each through its VM -----
+  # From the HOST, through each VM's published port — the only surface the
+  # host has of either proxy, since each is reachable only inside its own
+  # guest. Two routing halves and two refusals: a registry is per daemon,
+  # so each VM's port answers its own boxes and refuses the other VM's
+  # names — the matrix NET-027 pins for two daemons, here for two VMs.
+  two_vm_route "$tw_port_a" "http://$TWO_VM_A_NAME.min.internal:$TWO_VM_A_PORT/" \
+    "NET-059: through the default VM's port, its own box's name routes"
+  two_vm_route_want 200 "$TWO_VM_A_MARKER"
+  two_vm_route "$tw_port_b" "http://$TWO_VM_B_NAME.min.internal:$TWO_VM_B_PORT/" \
+    "NET-059: through $tw_name's port, its own box's name routes — at the same time"
+  two_vm_route_want 200 "$TWO_VM_B_MARKER"
+  two_vm_route "$tw_port_a" "http://$TWO_VM_B_NAME.min.internal:$TWO_VM_B_PORT/" \
+    "NET-059 refusal: the default VM's port does not know $tw_name's box name"
+  two_vm_route_want 502 ""
+  two_vm_route "$tw_port_b" "http://$TWO_VM_A_NAME.min.internal:$TWO_VM_A_PORT/" \
+    "NET-059 refusal: $tw_name's port does not know the default VM's box name"
+  two_vm_route_want 502 ""
+
+  # ---- NET-058: the box name alone decides --------------------------------
+  # A mark only alpha's box wrote, so the attach below proves WHERE it
+  # landed by what it can read, not by trusting its own announcement.
+  two_vm_mn session exec "$tw_b_sid" \
+    "printf 'ATTACHED_IN_ALPHA_BOX_OK' > /home/two-vm-b.mark" \
+    >/dev/null 2>"$WORK/two-vm-mark.err" \
+    || { echo "::error::could not write the mark inside $tw_name's box"
+         cat "$WORK/two-vm-mark.err" 2>/dev/null || true
+         fail; }
+  # The attach is driven from a shell whose selected VM is the DEFAULT one —
+  # no --vm anywhere in its argv, exactly as a user's shell stands — so
+  # finding e2e-two-vm-b is the CLI's own work: ask the selected VM first,
+  # then every VM's socket, and say which one answered. Over a real pty (an
+  # interactive attach's own requirement), answering the exit prompt with
+  # `keep` so the session survives: it must still be live when the case stops
+  # the named VM below — the stopped-VM beats need a box that WAS listed, or
+  # its absence from the after-stop listing would prove nothing about the
+  # stop.
+  # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+  tw_attach_out="$(E2E_PTY_COMMANDS='cat /home/two-vm-b.mark
+exit' E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" - \
+    min ${E2E_MINIMAL_ARGS:-} session attach "$TWO_VM_B_NAME" \
+    2>"$WORK/two-vm-attach.err")" || {
+    echo "::error::the pty attach by box name failed"
+    echo "--- transcript ---"; printf '%s\n' "$tw_attach_out"
+    echo "--- stderr ---"; cat "$WORK/two-vm-attach.err" 2>/dev/null || true
+    fail
+  }
+  if [[ "$tw_attach_out" != *"Attaching to session $TWO_VM_B_NAME ("*"on VM $tw_name"* ]]; then
+    echo "::error::the attach did not announce the VM it resolved the box name to (NET-058)"
+    echo "--- transcript ---"; printf '%s\n' "$tw_attach_out"
+    fail
+  fi
+  if [[ "$tw_attach_out" != *"ATTACHED_IN_ALPHA_BOX_OK"* ]]; then
+    echo "::error::the attach landed outside $tw_name's box — the mark only that box wrote did not come back"
+    echo "--- transcript ---"; printf '%s\n' "$tw_attach_out"
+    fail
+  fi
+  printf '%s\n' "$tw_attach_out" | grep -F -- "on VM $tw_name" | sed 's/^/  /'
+  echo "attach by name: 'min session attach $TWO_VM_B_NAME' — no flag — landed in $tw_name's box and said so"
+
+  # ---- the shipping exposing verb: forward a box's service by name --------
+  # `min net forward` stays in the foreground, prints its banner on stderr
+  # once the laptop-side listener is bound, and relays every connection over
+  # the session's direct-tcpip channel. Here the SESSION it names is chosen
+  # by box name on a host running two VMs — the exposing verb this tree
+  # ships. `min net expose` (NET-058's other verb) has not landed; the
+  # cross-VM half of the exposing story is the resolution the attach above
+  # proved, and no assertion is staged for a verb that does not exist.
+  echo "opening the forward: min net forward $TWO_VM_A_NAME $TWO_VM_LOCAL_PORT:$TWO_VM_A_PORT"
+  # Not `mnl ... &`: mnl is a function, so `$!` would be a subshell that
+  # ignores SIGINT; exec the binary so the pid is `min`'s and Ctrl-C reaches
+  # it.
+  # shellcheck disable=SC2086
+  ( exec min ${E2E_MINIMAL_ARGS:-} net forward "$TWO_VM_A_NAME" \
+      "$TWO_VM_LOCAL_PORT:$TWO_VM_A_PORT" ) \
+    >"$WORK/two-vm-forward.out" 2>"$WORK/two-vm-forward.err" &
+  TWO_VM_FWD_PID=$!
+  tw_fwd_ready=""
+  for _ in $(seq 1 40); do
+    if grep -q "Forwarding localhost:$TWO_VM_LOCAL_PORT" "$WORK/two-vm-forward.err" 2>/dev/null; then
+      tw_fwd_ready=1; break
+    fi
+    kill -0 "$TWO_VM_FWD_PID" 2>/dev/null || break # died before it ever bound
+    sleep 0.25
+  done
+  if [ -z "$tw_fwd_ready" ]; then
+    echo "::error::'min net forward' by box name never bound its laptop-side listener (no 'Forwarding localhost:$TWO_VM_LOCAL_PORT' banner)"
+    echo "--- forward stderr ---"; cat "$WORK/two-vm-forward.err" 2>/dev/null || true
+    fail
+  fi
+  echo "forward banner: $(head -n1 "$WORK/two-vm-forward.err" 2>/dev/null || true)"
+  # The probe enters through the forward's own loopback listener, so the
+  # host's proxy env is stripped first: with an http_proxy set and no
+  # 127.0.0.1 exception, curl hands the request to that proxy instead of
+  # the just-bound forward, and the proof would fail on the host's
+  # settings, not the VM's.
+  tw_fwd_status="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+    -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+    curl -sS --max-time 20 -o "$WORK/two-vm-fwd.body" \
+    -w '%{http_code}' "http://127.0.0.1:$TWO_VM_LOCAL_PORT/" 2>"$WORK/two-vm-fwd.err")"
+  tw_fwd_rc=$?
+  tw_fwd_body="$(cat "$WORK/two-vm-fwd.body" 2>/dev/null || true)"
+  if [ "$tw_fwd_rc" -ne 0 ] || [ "$tw_fwd_status" != "200" ] \
+     || [[ "$tw_fwd_body" != *"$TWO_VM_A_MARKER"* ]]; then
+    echo "::error::the request through the forward did not reach the box its NAME named (curl exit $tw_fwd_rc, HTTP ${tw_fwd_status:-<none>}, body '${tw_fwd_body:0:48}')"
+    echo "--- curl stderr ---"; cat "$WORK/two-vm-fwd.err" 2>/dev/null || true
+    echo "--- forward stderr ---"; cat "$WORK/two-vm-forward.err" 2>/dev/null || true
+    fail
+  fi
+  echo "forward response: GET http://127.0.0.1:$TWO_VM_LOCAL_PORT/ -> HTTP $tw_fwd_status $tw_fwd_body"
+  kill -INT "$TWO_VM_FWD_PID" 2>/dev/null || true
+  for _ in $(seq 1 40); do
+    kill -0 "$TWO_VM_FWD_PID" 2>/dev/null || break
+    sleep 0.25
+  done
+  if kill -0 "$TWO_VM_FWD_PID" 2>/dev/null; then
+    echo "::error::the forward did not end on Ctrl-C"
+    echo "--- forward stderr ---"; cat "$WORK/two-vm-forward.err" 2>/dev/null || true
+    kill -9 "$TWO_VM_FWD_PID" 2>/dev/null || true
+    fail
+  fi
+  wait "$TWO_VM_FWD_PID" 2>/dev/null
+  tw_fwd_rc=$?
+  TWO_VM_FWD_PID=""
+  if [ "$tw_fwd_rc" -ne 0 ]; then
+    echo "::error::the forward exited $tw_fwd_rc on Ctrl-C (expected a clean 0)"
+    echo "--- forward stderr ---"; cat "$WORK/two-vm-forward.err" 2>/dev/null || true
+    fail
+  fi
+  echo "forward: closed on Ctrl-C, laptop-side listener gone with it"
+  echo "note: 'min net expose' has not landed — the cross-VM box-name resolution is the one the attach above proved; 'min net forward' is the shipping exposing verb"
+
+  # ---- NET-055: stopping one VM leaves the other serving -------------------
+  # The named VM goes down WITH its box still live — the order that makes the
+  # listing beats below mean what they claim. Destroying box B first would
+  # leave the stopped VM with no box, and a box-less VM contributes nothing
+  # by definition, not by behavior — so B is left live, and the listing right
+  # before the stop is asserted to carry both of $tw_name's contributions
+  # (its box's row, its proxy's discovery line), so what vanishes after can
+  # be pinned on the stop alone. The stop is itself how a live box ends on
+  # this path — `minvmd stop` force-drains the guest before it signals the
+  # VMM (crates/minvmd/src/cmd/stop.rs → rpc_client.rs, force: true), so a
+  # user stopping a VM with work still in it is the normal case. The default
+  # VM must not notice.
+  tw_ls_pre="$(mnl ls 2>"$WORK/two-vm-ls-pre.err")" \
+    || { echo "::error::'min ls' failed with both VMs running — the pre-stop baseline the beats below compare against needs it"
+         echo "--- min ls stdout ---"; printf '%s\n' "$tw_ls_pre"
+         echo "--- min ls stderr ---"; cat "$WORK/two-vm-ls-pre.err" 2>/dev/null || true
+         fail; }
+  if ! printf '%s\n' "$tw_ls_pre" | awk -v vm="$tw_name" -v sid="$tw_b_sid" \
+       '$1 == vm && $2 == sid { found = 1 } END { exit !found }'; then
+    echo "::error::box B is not in the listing right before the stop — the stopped-VM beats below need a box that WAS listed, or its vanishing would prove nothing about the stop"
+    echo "--- min ls output ---"; printf '%s\n' "$tw_ls_pre"
+    fail
+  fi
+  [ -n "$(two_vm_ls_proxy_port "$tw_name" "$tw_ls_pre")" ] \
+    || { echo "::error::the named VM's proxy discovery line is missing right before the stop — the post-stop absence below needs it present to be pinned on the stop"
+         echo "--- min ls output ---"; printf '%s\n' "$tw_ls_pre"
+         fail; }
+  echo "pre-stop: $tw_name still contributes its box's row and its proxy's discovery line to the one listing"
+  minvmd --vm "$tw_name" stop >"$WORK/two-vm-stop.out" 2>"$WORK/two-vm-stop.err" \
+    || { echo "::error::'minvmd --vm $tw_name stop' failed"
+         echo "--- stderr ---"; cat "$WORK/two-vm-stop.err" 2>/dev/null || true
+         fail; }
+  TWO_VM_NAME="" # teardown stops the named VM only while it may be alive
+  tw_stopped=""
+  for _ in $(seq 1 60); do
+    case "$(minvmd --vm "$tw_name" status --json 2>/dev/null || true)" in
+      *'"state":"stopped"'*) tw_stopped=1; break ;;
+    esac
+    sleep 1
+  done
+  if [ -z "$tw_stopped" ]; then
+    echo "::error::the named VM never reached 'stopped' after 'minvmd --vm $tw_name stop'"
+    minvmd --vm "$tw_name" status --json 2>&1 || true
+    fail
+  fi
+  echo "stop: minvmd --vm $tw_name stop -> '$(minvmd --vm "$tw_name" status --json 2>/dev/null || true)'"
+  two_vm_diag_forwarders after-stop
+  # The stopped VM contributes nothing to the one listing, silently. Both of
+  # the contributions the pre-stop listing above asserted are now gone, and
+  # the stop is the only thing that ran between: the listing spans every VM
+  # on the host — it enumerates state directories, so the down VM is still
+  # walked and its stale socket probed — and one that is down answers "not
+  # running": exit 0, no warning, no row for the box that was live in it, no
+  # discovery line for its proxy (list_other_vm → ProbeRefusal::NotRunning,
+  # crates/minimal/src/cmd/list.rs). And the default VM did not move: its box
+  # is still listed, its daemon still running, its published port still
+  # routing its box's name. The table keeps its VM column whatever the count
+  # of VMs (every row prints it, crates/minimal/src/cmd/list.rs), so the
+  # default's row is asserted by its id alone — the identity no stop can move.
+  tw_ls_after="$(mnl ls 2>"$WORK/two-vm-ls-after.err")" \
+    || { echo "::error::'min ls' failed with $tw_name stopped — a listing spanning every VM cannot error on one that is down (NET-055)"
+         echo "--- min ls stdout ---"; printf '%s\n' "$tw_ls_after"
+         echo "--- min ls stderr ---"; cat "$WORK/two-vm-ls-after.err" 2>/dev/null || true
+         fail; }
+  tw_ls_err="$(cat "$WORK/two-vm-ls-after.err" 2>/dev/null || true)"
+  if printf '%s\n' "$tw_ls_err" | grep -Fq -- "warning: skipping VM $tw_name"; then
+    echo "::error::the listing warned about the stopped $tw_name — a stopped VM is an answer, not a fault; it must be skipped silently"
+    echo "--- min ls stderr ---"; printf '%s\n' "$tw_ls_err"
+    fail
+  fi
+  if printf '%s\n' "$tw_ls_after" | grep -Fq -- "$tw_b_sid"; then
+    echo "::error::the stopped named VM's box is still in the listing — the box was live at the stop; a stopped VM must contribute nothing"
+    echo "--- min ls output ---"; printf '%s\n' "$tw_ls_after"
+    fail
+  fi
+  if [ -n "$(two_vm_ls_proxy_port "$tw_name" "$tw_ls_after")" ]; then
+    echo "::error::the stopped named VM's proxy discovery line is still in the listing — a stopped VM must contribute nothing"
+    echo "--- min ls output ---"; printf '%s\n' "$tw_ls_after"
+    fail
+  fi
+  if ! printf '%s\n' "$tw_ls_after" | grep -Fq -- "$tw_a_sid"; then
+    echo "::error::the default VM's box left the listing when $tw_name stopped (NET-055)"
+    echo "--- min ls output ---"; printf '%s\n' "$tw_ls_after"
+    fail
+  fi
+  case "$(minvmd status --json 2>/dev/null || true)" in
+    *'"state":"running"'*) ;;
+    *) echo "::error::the default VM's host daemon is no longer running after $tw_name stopped (NET-055)"
+       minvmd status --json 2>&1 || true
+       fail ;;
+  esac
+  two_vm_diag_forwarders before-net055-dial
+  two_vm_route "$tw_port_a" "http://$TWO_VM_A_NAME.min.internal:$TWO_VM_A_PORT/" \
+    "NET-055: with $tw_name stopped, the default VM still routes its box's name"
+  two_vm_route_want 200 "$TWO_VM_A_MARKER"
+  # And the named VM's state outlives its daemon: the stop ends the VM, not
+  # the state it was created with — it is still there to boot again.
+  [ -f "$tw_alpha/minvmd.toml" ] \
+    || { echo "::error::the named VM's state directory did not outlive its stop"; fail; }
+  echo "state after stop: $tw_alpha/minvmd.toml still on disk — the named VM's state outlives its daemon"
+  printf '%s\n' "$tw_ls_after" | sed 's/^/  /'
+
+  # ---- the diagnostics: each daemon log names its VM and state directory ---
+  # Two start records, one per boot, each naming the VM it started and the
+  # state directory it serves — read from the tail after the snapshot, so
+  # they are this run's on a whole-lane run too.
+  tw_rec_a=""
+  tw_rec_b=""
+  for _ in $(seq 1 40); do
+    [ -n "$tw_rec_a" ] || tw_rec_a="$(two_vm_log_since "$tw_log" "$tw_log_lines" \
+      | grep -F -- '"vm":"default"' | grep -F -- 'starting VM' | tail -n1 || true)"
+    [ -n "$tw_rec_b" ] || tw_rec_b="$(two_vm_log_since "$tw_log" "$tw_log_lines" \
+      | grep -F -- "\"vm\":\"$tw_name\"" | grep -F -- 'starting VM' | tail -n1 || true)"
+    [ -n "$tw_rec_a" ] && [ -n "$tw_rec_b" ] && break
+    sleep 0.5
+  done
+  if [ -z "$tw_rec_a" ] || [ -z "$tw_rec_b" ]; then
+    echo "::error::the VM host daemon log is missing a 'starting VM' record for one of the two VMs (default: '${tw_rec_a:-<none>}' · $tw_name: '${tw_rec_b:-<none>}')"
+    echo "--- log dir ---"; ls -la "$XDG_STATE_HOME/minimal/logs" 2>/dev/null || echo "(no log dir)"
+    echo "--- log (tail) ---"; tail -20 "$(two_vm_minvmd_log)" 2>/dev/null || true
+    fail
+  fi
+  # Each record names its own state directory, and the two differ — NET-054's
+  # per-name subdirectory as the log sees it.
+  case "$tw_rec_a" in
+    *'"state_dir":"'"$tw_root"'"'*) ;;
+    *) echo "::error::the default VM's start record does not name its state directory"
+       echo "--- record ---"; printf '%s\n' "$tw_rec_a"
+       fail ;;
+  esac
+  case "$tw_rec_b" in
+    *'"state_dir":"'"$tw_alpha"'"'*) ;;
+    *) echo "::error::the named VM's start record does not name its own state directory"
+       echo "--- record ---"; printf '%s\n' "$tw_rec_b"
+       fail ;;
+  esac
+  echo "VM host daemon start record (default): $tw_rec_a"
+  echo "VM host daemon start record ($tw_name): $tw_rec_b"
+
+  mnl session destroy --force "$tw_a_sid" >/dev/null 2>&1 \
+    || { echo "::error::could not destroy the default VM's box"; fail; }
+  echo "destroy: box A on VM default — min session destroy --force"
+  echo "two named VMs on one machine OK (own state each, one listing with both, box names resolving to their VM, both routing at once, stop one leaves the other)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
 # Dispatch on the first argument: every proof in today's order when none is
 # given, or exactly the named one. The names are the proof functions' suffixes.
 case "${1:-}" in
@@ -12951,6 +13750,7 @@ case "${1:-}" in
     proof_retired_surfaces_gone
     proof_switch_steers_proxy_mac_frames_to_the_host_stack
     proof_switch_answers_no_arp_for_the_proxy_address
+    proof_two_named_vms_on_one_machine
     proof_github_only_allowlist
     proof_unpublished_port_refused_on_vm_host
     proof_proxy_sees_each_vm_box_by_its_switch_address
@@ -12974,7 +13774,7 @@ case "${1:-}" in
     | min_internal_names_through_proxy | own_ip_deny_all_box_answers_published_port \
     | proxy_refuses_like_direct | retired_surfaces_gone \
     | fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
-    | linux_stock_install_runs_vm_boxes \
+    | linux_stock_install_runs_vm_boxes | two_named_vms_on_one_machine \
     | switch_steers_proxy_mac_frames_to_the_host_stack | switch_answers_no_arp_for_the_proxy_address \
     | github_only_allowlist | unpublished_port_refused_on_vm_host \
     | proxy_sees_each_vm_box_by_its_switch_address \
@@ -13000,6 +13800,7 @@ case "${1:-}" in
     echo "         min_internal_names_through_proxy own_ip_deny_all_box_answers_published_port"
     echo "         proxy_refuses_like_direct retired_surfaces_gone"
     echo "         switch_steers_proxy_mac_frames_to_the_host_stack switch_answers_no_arp_for_the_proxy_address"
+    echo "         two_named_vms_on_one_machine"
     echo "         github_only_allowlist unpublished_port_refused_on_vm_host"
     echo "         proxy_sees_each_vm_box_by_its_switch_address"
     echo "         deny_all_box_reaches_proxy_and_no_other_host_port"
