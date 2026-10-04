@@ -580,15 +580,17 @@ impl Config {
             set("PYTHONHASHSEED", "0");
         }
 
-        // Locale. Sessions get a safe, always-present `C.UTF-8` floor: it's
-        // built into glibc so it never triggers "cannot set locale" warnings
-        // the way `en_US.utf8` does when that locale isn't generated in the
-        // rootfs, and setting only `LANG` (the lowest-precedence locale knob,
-        // no `LC_ALL`) lets a session's composed `env_vars` or a client's
-        // forwarded `LANG`/`LC_*` override it. Build/task sandboxes keep the
-        // fixed `en_US.utf8` + `LC_ALL` they always had, for output stability.
+        // Locale. Sessions get an `en_US.UTF-8` floor: it is the locale the
+        // session rootfs actually ships (`locale -a` lists `en_US.utf8`, not
+        // `C.UTF-8`), so it never triggers "cannot set locale" warnings the
+        // way `C.UTF-8` does. Setting only `LANG` (the lowest-precedence
+        // locale knob, no `LC_ALL`) lets a session's composed `env_vars` or a
+        // client's forwarded `LANG`/`LC_*` override it. Build/task sandboxes
+        // keep the fixed `en_US.utf8` + `LC_ALL` they always had, for output
+        // stability. glibc normalizes the `UTF-8` codeset to `utf8`, so both
+        // spellings resolve to the same shipped locale.
         if let WdSetup::Session { .. } = &self.wd {
-            set("LANG", "C.UTF-8");
+            set("LANG", "en_US.UTF-8");
         } else {
             set("LANG", "en_US.utf8");
             set("LC_ALL", "en_US.utf8");
@@ -1057,7 +1059,7 @@ mod tests {
         let env = config.command_env();
         assert_eq!(env.get("HOME").map(String::as_str), Some("/home"));
         assert_eq!(env.get("USER").map(String::as_str), Some("dev"));
-        assert_eq!(env.get("LANG").map(String::as_str), Some("C.UTF-8"));
+        assert_eq!(env.get("LANG").map(String::as_str), Some("en_US.UTF-8"));
     }
 
     /// Composed variables are policy; the layout defaults are only a floor.

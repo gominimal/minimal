@@ -2805,16 +2805,19 @@ async fn report_box_closure(
     watch: std::time::Duration,
 ) {
     let deadline = std::time::Instant::now() + watch;
-    // The last line this closure left, so a replacement is logged as the
-    // new finding it is rather than skipped as a repeat.
-    let mut seen: Option<String> = None;
+    // The lines this closure has left so far, so a replacement or an
+    // appended line is logged as the new finding it is rather than skipped
+    // as a repeat — and a line already said is not said twice.
+    let mut seen: Vec<String> = Vec::new();
     loop {
         match tokio::fs::read_to_string(&report).await {
-            Ok(line) => {
-                let line = line.trim().to_string();
-                if seen.as_deref() != Some(line.as_str()) {
-                    seen = Some(line.clone());
-                    if say_closure_line(&line, &session) {
+            Ok(content) => {
+                for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    if seen.iter().any(|s| s == line) {
+                        continue;
+                    }
+                    seen.push(line.to_string());
+                    if say_closure_line(line, &session) {
                         // The box's fate is known: the closure died, and it
                         // died having said so. The daemon owes the tree one
                         // line per launch, not a file per session.
@@ -2834,7 +2837,7 @@ async fn report_box_closure(
             }
         }
         if std::time::Instant::now() > deadline {
-            if seen.is_none() {
+            if seen.is_empty() {
                 tracing::warn!(
                     session = %session,
                     report = %report.display(),
@@ -2910,6 +2913,14 @@ fn say_closure_line(line: &str, session: &str) -> bool {
             errno,
             "remounting the box's /dev/pts with a per-instance max failed; \
              the box runs on the shared PTY pool",
+        );
+    } else if let Some(errno) = line.strip_prefix("lo-down errno ") {
+        tracing::warn!(
+            session = %session,
+            errno = errno,
+            "the box could not bring up the loopback interface of its own \
+             network namespace: it runs, but nothing in it can reach \
+             127.0.0.1 or ::1",
         );
     } else if let Some(failed) = line.strip_prefix("failed ") {
         let (step, errno) = failed
