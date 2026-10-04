@@ -1752,13 +1752,13 @@ proof_own_ip_egress_declared_and_enforced() {
 
 # ---------------------------------------------------------------------------
 # NET-080 end to end under the real table: the daemon's own package fetch
-# survives a host-address box on the same host and is recorded as
+# survives a deny-all host-address box on the same host and is recorded as
 # node-plane traffic, naming the box it fetched for. Every other proof in
 # this script runs on a host whose classifier step has not run — the daemon
 # places no box, and every box is unenforced — so this one installs the real
 # thing and drives the user path across it: the privileged step's tree and
 # table at the /sys/fs/cgroup/minimald.slice the daemon itself looks for, a
-# host-address box declared with no egress section, an in-box `min add` of
+# host-address box declared deny-all (`--deny-all-egress`), an in-box `min add` of
 # a registry package (never a source build: that leg is issue #1872,
 # outside this proof), and the node-plane record naming the box and the
 # package. Under the same loaded table the proof drives the refusal too: a
@@ -1784,24 +1784,19 @@ proof_own_ip_egress_declared_and_enforced() {
 # everywhere: a VM lane's daemon runs in the guest, and the table is a host
 # install the proof has no seat inside the guest to make.
 #
-# The one thing this seat cannot drive is said in the transcript, not
-# skipped silently: a connection FROM the box refused. The table refuses
-# exactly the deny subtree's connections, and a box reaches that subtree
-# only by admitting no destination at all — the strict `deny all` shape
-# (allow_subnets, allow_dns_hosts and allow_protocols each an empty list),
-# which the shipped CLI cannot type, because every egress flag maps an
-# empty list to an unset field (crates/minimal/src/cmd/session.rs). This
-# proof's box declares no section and so lands in boxes/allow, where the
-# loaded table refuses nothing on a box's behalf; a CLI declaration that
-# names rules the table cannot enforce lands nowhere now — the refusal
-# legs inside this proof refuse it at the create. The live refusal this
-# proof does pin is the daemon's own: host_ip_enforcement=per_box is the
-# verdict a host gets only when the daemon's probe connection out of a
-# deny leaf was refused by this table, read fresh before this box's
-# launch. The
-# deny subtree's refusal of a box's own connection is owned live by the
-# root lane: deny_all_host_ip_box_answers_the_proxy_over_a_loaded_table,
-# with snat_identity_is_seen_by_the_peer for the node plane's identity.
+# The refused-connect half is driven, not skipped: the box is declared
+# deny-all (`min session activate --deny-all-egress`, the flag form of the
+# strict `deny all` shape — allow_subnets, allow_dns_hosts and
+# allow_protocols each an empty list), so it lands in boxes/deny, where
+# the loaded table refuses its connections. A connection the box opens
+# itself to an address it declared no exception for is asserted refused
+# twice, before the daemon's own fetch and after it, so the refusal reads
+# as the table's verdict, not the weather's — the daemon's fetch (run
+# against an empty package cache, so it really fetches) completes between
+# them on this same host as the reach control. What the table cannot
+# enforce is still refused at the create: the legs inside this proof
+# assert the typed refusal for a CLI declaration naming rules a host-
+# address box cannot enforce.
 proof_daemon_fetch_under_deny_all_host_address_box() {
   echo "::group::the daemon's own fetch under a loaded classifier table (NET-080)"
 
@@ -1999,23 +1994,22 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   # ---- the box: the activate launches it, into a leaf of the placed
   # daemon's tree, under the table this proof loaded. The daemon is up
   # already, so this call runs at the lane's own filter. The box declares
-  # no egress section — the one shape a host that decides per box has a
-  # verdict for. `--deny-subnets 0.0.0.0/0` is not the CLI's deny-all
-  # spelling (the strict deny-all shape is three empty allow lists, which
-  # the shipped CLI cannot type: every egress flag maps an empty list to
-  # an unset field, crates/minimal/src/cmd/session.rs) — a deny entry
-  # names a rule the per-box classifier cannot enforce, so under this
-  # table the create refuses it, the legs after the launch record say.
-  # Either way the box lands in boxes/allow, where the table refuses
-  # nothing on a box's behalf; the refusal is the difference.
+  # deny-all egress, by the CLI's own spelling of it: `--deny-all-egress`
+  # writes the strict deny-all section — every allow list present and
+  # empty, nothing denied on top — the one shape the per-box classifier
+  # has a deny verdict for, so under this table the box lands in
+  # boxes/deny, the subtree whose chain refuses every connection the box
+  # itself opens. A declaration that names a rule the table cannot
+  # enforce per box is still refused at the create, as the legs after the
+  # launch record say over the flags that spell those rules.
   net080_sid="$(cd "$NET080_SEED_DIR" && mnl session activate . --no-prompt --name e2e-net080 \
-    --network host_ip 2>"$WORK/net080-activate.err")" || {
-    echo "::error::'min session activate --network host_ip' failed under the loaded table"
+    --network host_ip --deny-all-egress 2>"$WORK/net080-activate.err")" || {
+    echo "::error::'min session activate --network host_ip --deny-all-egress' failed under the loaded table"
     cat "$WORK/net080-activate.err" 2>/dev/null || true
     fail
   }
   net080_sid="$(printf '%s\n' "$net080_sid" | tail -n1 | tr -d '\r')"
-  echo "activate: the host-address box $net080_sid is declared with no egress section, launched by a daemon already inside the slice"
+  echo "activate: the host-address box $net080_sid is declared deny-all (--deny-all-egress), launched by a daemon already inside the slice"
 
   # ---- the capability gate: this proof drives a box, so a host that cannot
   # run one cannot run it. Observed fact, degraded on a developer host, a
@@ -2042,19 +2036,49 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   # deny leaf was refused the way this table refuses — so pinning it pins
   # the table refusing, not merely loaded.
   net080_launch="$(net080_log 'egress verdict is decided on its classifier leaf')"
-  if [[ "$net080_launch" != *'"classifier":"allow"'* ]]; then
-    echo "::error::the box's launch record does not name the allow subtree a CLI-declared box lands in: $net080_launch"
+  if [[ "$net080_launch" != *'"classifier":"deny"'* ]]; then
+    echo "::error::the box's launch record does not name the deny subtree a deny-all declaration lands in: $net080_launch"
     fail
   fi
-  if [[ "$net080_launch" != *"boxes/allow/$net080_sid"* ]]; then
-    echo "::error::the box's launch record does not name this box's own leaf (boxes/allow/$net080_sid): $net080_launch"
+  if [[ "$net080_launch" != *"boxes/deny/$net080_sid"* ]]; then
+    echo "::error::the box's launch record does not name this box's own leaf (boxes/deny/$net080_sid): $net080_launch"
     fail
   fi
   if [[ "$net080_launch" != *'"host_ip_enforcement":"per_box"'* ]]; then
     echo "::error::the box's launch record does not say per_box: the daemon's probe out of a deny leaf was not refused by the loaded table, so this host does not decide per box and the fetch below would not be node plane at all: $net080_launch"
     fail
   fi
-  echo "launch: the box is placed in its own leaf boxes/allow/$net080_sid, in the allow subtree, and the host decides per box — the daemon's probe connection out of a deny leaf was refused by the loaded table before this launch"
+  echo "launch: the box is placed in its own leaf boxes/deny/$net080_sid, in the deny subtree, and the host decides per box — the daemon's probe connection out of a deny leaf was refused by the loaded table before this launch"
+
+  # ---- the sun_path budget: every act this proof drives below reaches the
+  # box through the daemon, and inside the sandbox the box's own `min`
+  # helper talks to its environment socket — the deepest AF_UNIX path this
+  # lane creates, and one the in-box 'min add' cannot do without. The
+  # kernel caps sun_path at 108 bytes, one of them the terminating NUL, so
+  # 107 are usable; the sandbox builder truncates a box name that would not
+  # fit and refuses a base dir that leaves no room for one at all, so the
+  # fact this proof must hold is the lane's own choice of state root: it
+  # runs under $WORK itself, not a $WORK/state hop — the hop is bytes a
+  # box's socket cannot spare (the lane's state-dir comment says why).
+  # Measured on the real sockets rather than trusted from the builder:
+  # the deepest live box socket under the state root, this deny-all box's
+  # own among them, must fit the 107.
+  net080_sock_len=0
+  for net080_sock in "$XDG_STATE_HOME"/minimal/tasks/*/run/minenv_sock; do
+    [ -S "$net080_sock" ] || continue
+    if [ "${#net080_sock}" -gt "$net080_sock_len" ]; then
+      net080_sock_len="${#net080_sock}"
+    fi
+  done
+  if [ "$net080_sock_len" -eq 0 ]; then
+    echo "::error::no live box socket under $XDG_STATE_HOME/minimal/tasks: the deny-all box this proof just launched is not there"
+    fail
+  fi
+  if [ "$net080_sock_len" -gt 107 ]; then
+    echo "::error::the deepest box socket under this state root is $net080_sock_len bytes, past the 107 an AF_UNIX sun_path holds — the state dir is too deep for a box's socket paths"
+    fail
+  fi
+  echo "sun_path: the deepest live box socket under the state root is $net080_sock_len bytes, inside the 107 the kernel accepts — the deny-all box's own socket included"
 
   # ---- the refusal half: a declaration that names a rule the loaded table
   # cannot enforce per box — every deny_subnets entry, every allow list
@@ -2087,19 +2111,22 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   echo "refusal: a declaration that names rules the loaded table cannot enforce per box (deny_subnets 0.0.0.0/0, allow_subnets 10.0.0.0/8) is refused at the create with each rule named — this host decides per box, and its classifier enforces deny-all or nothing on a box's leaf"
 
   # ---- the box's own egress, before: the declaration as `min session policy`
-  # reads it back — a box that declared no section reads the daemon's
-  # resolved default, allow all for a host-address box (the deny-all
-  # default is an own-address one, NET-074/NET-077) — and one connection
-  # out of the box, printed either way (weather cannot be told from
-  # enforcement from this seat), and asserted after only where this
-  # before-half answered.
+  # reads it back — a declared deny-all box reads `deny all` by name, beside
+  # the per-box enforcement the host's fact carries — and one connection the
+  # box itself opens, to an address its declaration names no exception for,
+  # which the loaded table's deny chain must refuse: a
+  # completed connection out of a deny leaf means the table is not deciding
+  # this box, whatever the launch record said. The address is an IP literal,
+  # so this half tests the connect and not the box's name resolution — a
+  # deny-all box resolves only through the box zone's answerer (NET-079),
+  # and a name would fail there for a reason this half is not about.
   net080_policy_before="$(mnl session policy "$net080_sid" 2>"$WORK/net080-policy-before.err")" || {
     echo "::error::'min session policy' failed for the host-address box"
     cat "$WORK/net080-policy-before.err" 2>/dev/null || true
     fail
   }
-  if [[ "$net080_policy_before" != *"allow all"* ]]; then
-    echo "::error::the box's policy does not read back the resolved default its no-section declaration carries (allow all)"
+  if [[ "$net080_policy_before" != *"deny all"* ]]; then
+    echo "::error::the box's policy does not read back the deny-all declaration it was activated with (deny all)"
     printf '%s\n' "$net080_policy_before"
     fail
   fi
@@ -2108,23 +2135,22 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
     printf '%s\n' "$net080_policy_before"
     fail
   fi
-  echo "policy: the box's no-section declaration reads back allow all, with per-box enforcement per_box beside it"
-  net080_answered=0
+  echo "policy: the box's deny-all declaration reads back deny all, with per-box enforcement per_box beside it"
   mnl session exec "$net080_sid" \
-    "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://example.com" \
+    "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://1.1.1.1" \
     >"$WORK/net080-ctrl-before.out" 2>"$WORK/net080-ctrl-before.err"
   net080_rc=$?
   net080_status_before="$(cat "$WORK/net080-ctrl-before.out" 2>/dev/null)"
   # The egress proof's judge: curl always writes its -w line, so a real
   # answer is a zero exit OR any status back, whatever curl then thought of
-  # the certificate.
+  # the certificate — and the refusal this half asserts is neither.
   if [ "$net080_rc" -eq 0 ] \
      || { [ -n "$net080_status_before" ] && [ "$net080_status_before" != "HTTP:000" ]; }; then
-    net080_answered=1
-    echo "control: the box completed a connection to https://example.com ($net080_status_before) — the cohort's egress under the loaded table"
-  else
-    echo "control: the box did not complete a connection to https://example.com in this run (rc=$net080_rc) — either weather, or the declared deny enforced somewhere this seat cannot see; the connection half is printed, and asserted after only if this before-half had answered"
+    echo "::error::the deny-all box completed a connection to 1.1.1.1:443 (rc=$net080_rc, $net080_status_before): the loaded table did not refuse the connection its deny chain owns"
+    cat "$WORK/net080-ctrl-before.err" 2>/dev/null || true
+    fail
   fi
+  echo "refused: the box's own connection to 1.1.1.1:443 did not complete (rc=$net080_rc, ${net080_status_before:-no status}) — the deny chain's verdict on a connection the box opened itself"
 
   # ---- the install inside the box, driven like a user: a REAL pty attach (a
   # pipe cannot answer the session-exit prompt), the driver's default stream
@@ -2193,24 +2219,26 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
     diff <(printf '%s\n' "$net080_policy_before") <(printf '%s\n' "$net080_policy_after") || true
     fail
   fi
-  echo "egress unchanged: 'min session policy' reads back the same declaration as before the fetch (allow all beside per-box enforcement per_box, and the box still in the allow subtree)"
-  if [ "$net080_answered" -eq 1 ]; then
-    mnl session exec "$net080_sid" \
-      "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://example.com" \
-      >"$WORK/net080-ctrl-after.out" 2>"$WORK/net080-ctrl-after.err"
-    net080_rc=$?
-    net080_status_after="$(cat "$WORK/net080-ctrl-after.out" 2>/dev/null)"
-    if [ "$net080_rc" -ne 0 ] \
-       && { [ -z "$net080_status_after" ] || [ "$net080_status_after" = "HTTP:000" ]; }; then
-      echo "::error::the box's own egress changed across the daemon's fetch: the connection this run's before-half completed ($net080_status_before) did not complete after"
-      cat "$WORK/net080-ctrl-after.err" 2>/dev/null || true
-      fail
-    fi
-    echo "egress unchanged: the box completed the same connection after the fetch as before ($net080_status_after)"
-  fi
+  echo "egress unchanged: 'min session policy' reads back the same declaration as before the fetch (deny all beside per-box enforcement per_box, and the box still in the deny subtree)"
 
-  # ---- the half this seat cannot drive, said rather than skipped -----------
-  echo "refused-connect half: pinned here only through the daemon's own probe — the per_box verdict above is the host's fresh fact that the loaded table refuses a connection out of a deny leaf. A connection from THIS box cannot be driven: it declared no egress section, so it sits in boxes/allow, where the loaded table refuses nothing on a box's behalf; and a CLI declaration that names rules the table cannot enforce no longer lands anywhere — the legs above refused it at the create. What still cannot be typed is the one box the deny subtree is for: a box that admits no destination at all, the strict 'deny all' shape, which the shipped CLI cannot express (every egress flag maps an empty list to an unset field, crates/minimal/src/cmd/session.rs). The deny subtree's refusal of a box's own connection is owned live by the root lane's deny_all_host_ip_box_answers_the_proxy_over_a_loaded_table, with snat_identity_is_seen_by_the_peer for the node plane's identity"
+  # ---- the box's own connect, after: refused again, now with the daemon's
+  # own fetch completed in between as the reach control — the daemon fetched
+  # this proof's package from upstream on this same host in this same run
+  # (the empty package cache made it fetch), so the host's external reach is
+  # a fact of this run, and the box's refused connection reads as the
+  # loaded table's verdict, not the weather's.
+  mnl session exec "$net080_sid" \
+    "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://1.1.1.1" \
+    >"$WORK/net080-ctrl-after.out" 2>"$WORK/net080-ctrl-after.err"
+  net080_rc=$?
+  net080_status_after="$(cat "$WORK/net080-ctrl-after.out" 2>/dev/null)"
+  if [ "$net080_rc" -eq 0 ] \
+     || { [ -n "$net080_status_after" ] && [ "$net080_status_after" != "HTTP:000" ]; }; then
+    echo "::error::the box completed a connection to 1.1.1.1:443 after the daemon's own fetch completed on this same host (rc=$net080_rc, $net080_status_after): the refusal cannot be the weather's — the loaded table is not deciding this box's connection"
+    cat "$WORK/net080-ctrl-after.err" 2>/dev/null || true
+    fail
+  fi
+  echo "refused while the fetch completed: the box's own connection to 1.1.1.1:443 did not complete after the daemon's fetch completed on this same host (rc=$net080_rc, ${net080_status_after:-no status}) — the deny subtree's verdict on the box's own connection, with the node plane's completed reach saying it is not the weather"
 
   # ---- the proof's own uninstall, and the check that it took ---------------
   if ! net080_unwind; then
@@ -2224,7 +2252,7 @@ proof_daemon_fetch_under_deny_all_host_address_box() {
   fi
   rm -rf "$NET080_SEED_DIR"; NET080_SEED_DIR=""
   echo "cleanup: the tree and the table this proof installed are gone; the host is as this proof found it"
-  echo "daemon's own fetch under a loaded classifier table OK (NET-080: the box sits in the allow subtree, the host decides per_box over the loaded table, the daemon's own fetch left from its own leaf and is recorded as node-plane traffic naming the box and the package, and a declaration naming rules the table cannot enforce is refused at the create with the rule named)"
+  echo "daemon's own fetch under a loaded classifier table OK (NET-080: the box is declared deny-all and sits in the deny subtree, the host decides per_box over the loaded table, the daemon's own fetch left from its own leaf and is recorded as node-plane traffic naming the box and the package, the box's own connection to an undeclared address is refused before and after the fetch while the fetch itself completes, and a declaration naming rules the table cannot enforce is refused at the create with the rule named)"
   echo "::endgroup::"
 }
 

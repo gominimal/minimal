@@ -571,7 +571,8 @@ pub(crate) async fn activate_session(
             || !args.deny_subnets.is_empty();
         has_egress.then_some(sessions::EgressPolicy {
             allow_subnets: (!args.allow_subnets.is_empty()).then(|| args.allow_subnets.clone()),
-            allow_dns_hosts: (!args.allow_dns_hosts.is_empty()).then(|| args.allow_dns_hosts.clone()),
+            allow_dns_hosts: (!args.allow_dns_hosts.is_empty())
+                .then(|| args.allow_dns_hosts.clone()),
             allow_protocols: (!allow_protocols.is_empty()).then_some(allow_protocols),
             deny_subnets: (!args.deny_subnets.is_empty()).then(|| args.deny_subnets.clone()),
         })
