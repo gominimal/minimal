@@ -33,7 +33,10 @@ pub const BOX_GID: u32 = 1000;
 /// `/dev/pts` with `max=<BOX_PTY_MAX>` (see `exec_box_program`), so each box
 /// is bounded by its own instance rather than the shared pool. 1024 is a
 /// working value: it leaves room for the PTYs a real session needs while
-/// keeping one box from exhausting the host.
+/// keeping one box from exhausting the host. Only the guest VM raises
+/// `kernel.pty.max`; on a native Linux host the shared pool stays at the
+/// kernel default (4096 minus the 1024 reserve), so a few boxes at this cap
+/// can still exhaust it.
 pub const BOX_PTY_MAX: u32 = 1024;
 
 /// The data string the launch path remounts the box's `/dev/pts` with. A

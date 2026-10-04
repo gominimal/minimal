@@ -364,7 +364,7 @@ pub fn enter_rootfs(device: &str) -> std::io::Result<()> {
     // it still boots, just with the smaller shared pool.
     if let Err(e) = std::fs::write(
         format!("{NEWROOT}/proc/sys/kernel/pty/max"),
-        format!("{}\n", GUEST_PTY_MAX),
+        format!("{GUEST_PTY_MAX}\n"),
     ) {
         tracing::warn!(error = %e, "raising kernel.pty.max; several boxes at their PTY cap may exhaust the shared pool");
     }

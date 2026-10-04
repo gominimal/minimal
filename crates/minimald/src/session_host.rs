@@ -2867,7 +2867,13 @@ const CLOSURE_REPORT_WATCH: std::time::Duration = std::time::Duration::from_secs
 /// the line settles the box's fate: `true` for a `failed` line, which the
 /// closure writes on its way to `_exit(127)` and nothing follows; `false`
 /// for a `cover` line, which it writes while still heading for its exec.
+/// A cover line may carry a refused devpts remount after a `; `, since the
+/// report holds one line; each part is said on its own.
 fn say_closure_line(line: &str, session: &str) -> bool {
+    if let Some((cover, devpts)) = line.split_once("; ") {
+        let settled = say_closure_line(cover, session);
+        return say_closure_line(devpts, session) || settled;
+    }
     if line == "cover cgroup2" {
         tracing::info!(
             session = %session,

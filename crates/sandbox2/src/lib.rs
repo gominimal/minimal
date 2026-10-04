@@ -1298,6 +1298,41 @@ fn exec_box_program(
     force_cover_fallback: bool,
     closure_report: Option<&Path>,
 ) -> ! {
+    // Cap the box's PTY count before the credentials drop: PTYs are a
+    // machine-wide pool, and the box's devpts instance was mounted without a
+    // per-instance `max=`, so it draws from the one kernel-wide counter and a
+    // single box can starve every other box and the session host's own
+    // shells. The remount needs CAP_SYS_ADMIN over this mount namespace,
+    // which the box's user namespace still holds here, as it does for the
+    // classifier cover below. Best-effort: a box whose remount is refused
+    // still runs, on the shared pool as today. A leaf-bearing box records the
+    // refusal on its cover line for the daemon to warn; a leaf-less box has
+    // no report to record it in, so its refusal goes unreported (no in-child
+    // log: this runs between fork and exec, where a subscriber lock held at
+    // fork never releases). The refusal rides on the cover line rather than
+    // a line of its own because the report holds one line, and a later line
+    // replaces an earlier one.
+    //
+    // A devpts remount resets every option it is not given, and a remount
+    // without MS_NOSUID/MS_NOEXEC clears those flags, so both the data and
+    // the flags restate what the box's devpts was mounted with.
+    // SAFETY: `mount(2)` with valid C strings; `data` carries the devpts
+    // options and is read for the duration of the call.
+    let devpts_refused = if unsafe {
+        libc::mount(
+            c"devpts".as_ptr(),
+            c"/dev/pts".as_ptr(),
+            c"devpts".as_ptr(),
+            libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NOEXEC,
+            config::BOX_DEVPTS_REMOUNT_DATA.as_ptr().cast(),
+        )
+    } == -1
+    {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        format!("; devpts max={} errno {errno}", config::BOX_PTY_MAX)
+    } else {
+        String::new()
+    };
     // The box's classifier leaf (NET-079), taken in the order the
     // confinement rests on: join first, *then* unshare the cgroup namespace,
     // so its root is the leaf the process just entered — the box's own view
@@ -1369,12 +1404,15 @@ fn exec_box_program(
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 refused = Some(format!("errno {errno}"));
             } else {
-                write_closure_report(closure_report, "cover cgroup2");
+                write_closure_report(closure_report, &format!("cover cgroup2{devpts_refused}"));
                 set_box_cover_marker("cgroup2");
             }
         }
         if let Some(why) = refused {
-            write_closure_report(closure_report, &format!("cover tmpfs-fallback {why}"));
+            write_closure_report(
+                closure_report,
+                &format!("cover tmpfs-fallback {why}{devpts_refused}"),
+            );
             set_box_cover_marker("tmpfs-fallback");
             // SAFETY: `mount(2)` as above, with tmpfs, which takes no
             // options but the flags (an empty one is all the cover needs).
@@ -1396,38 +1434,6 @@ fn exec_box_program(
                 );
             }
         }
-    }
-    // Cap the box's PTY count before the credentials drop: PTYs are a
-    // machine-wide pool, and the box's devpts instance was mounted without a
-    // per-instance `max=`, so it draws from the one kernel-wide counter and a
-    // single box can starve every other box and the session host's own
-    // shells. The remount needs CAP_SYS_ADMIN over this mount namespace,
-    // which the box's user namespace still holds here — the same moment the
-    // classifier cover above is mounted. Best-effort: a box whose remount is
-    // refused still runs, on the shared pool as today, and the refusal is
-    // recorded for the daemon to warn (no in-child log: this runs between
-    // fork and exec, where a subscriber lock held at fork never releases).
-    //
-    // A devpts remount resets every option it is not given, and a remount
-    // without MS_NOSUID/MS_NOEXEC clears those flags, so both the data and
-    // the flags restate what the box's devpts was mounted with.
-    // SAFETY: `mount(2)` with valid C strings; `data` carries the devpts
-    // options and is read for the duration of the call.
-    if unsafe {
-        libc::mount(
-            c"devpts".as_ptr(),
-            c"/dev/pts".as_ptr(),
-            c"devpts".as_ptr(),
-            libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NOEXEC,
-            config::BOX_DEVPTS_REMOUNT_DATA.as_ptr().cast(),
-        )
-    } == -1
-    {
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        write_closure_report(
-            closure_report,
-            &format!("devpts max={} errno {errno}", config::BOX_PTY_MAX),
-        );
     }
     // SAFETY: `assume_box_credentials` is async-signal-safe; this is the
     // pre-exec moment it is for, with the namespace built and CAP_SETPCAP in
@@ -4640,6 +4646,7 @@ ff02::2\tip6-allrouters
     /// it.
     #[cfg(target_os = "linux")]
     const CGROUP_PROBE_C: &str = r#"
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -4691,6 +4698,9 @@ int main(int argc, char **argv) {
                         leaving the leaf, which is what confinement forbids)
                         and a sibling leaf's cgroup.procs (the file a pid is
                         written into to join another box's verdict);
+         MOUNTINFO:<path>  the mountinfo line of the mount on top of the
+                        path: the box's /dev/pts, after its devpts remount;
+         OPENPTY        whether the box's own user can open a PTY pair;
          HOLD:<path>    stay in the leaf until that path appears, so the test
                         can read the host's side of the tree — the leaf's
                         cgroup.procs, which the kernel empties the moment the
@@ -4724,6 +4734,42 @@ int main(int argc, char **argv) {
             } else {
                 printf("open %s: errno %d\n", path, errno);
             }
+        } else if (strncmp(argv[i], "MOUNTINFO:", 10) == 0) {
+            /* The last /proc/self/mountinfo line whose mount point is the
+               path: the mount on top, its per-mount flags and its
+               superblock options. */
+            const char *path = argv[i] + 10;
+            char found[1024] = "absent";
+            char row[1024];
+            FILE *mi = fopen("/proc/self/mountinfo", "r");
+            while (mi && fgets(row, sizeof row, mi)) {
+                char point[512];
+                if (sscanf(row, "%*s %*s %*s %*s %511s", point) == 1 &&
+                    strcmp(point, path) == 0) {
+                    row[strcspn(row, "\n")] = 0;
+                    snprintf(found, sizeof found, "%s", row);
+                }
+            }
+            if (mi) fclose(mi);
+            printf("mountinfo %s: %s\n", path, found);
+        } else if (strcmp(argv[i], "OPENPTY") == 0) {
+            /* Whether the box's own user can open a PTY pair: the master
+               through /dev/ptmx, then the slave it names. */
+            printf("openpty uid: %ld\n", (long)getuid());
+            int master = posix_openpt(O_RDWR | O_NOCTTY);
+            int err = 0;
+            if (master < 0) {
+                err = errno;
+            } else if (grantpt(master) != 0 || unlockpt(master) != 0) {
+                err = errno;
+            } else {
+                const char *name = ptsname(master);
+                int slave = name ? open(name, O_RDWR | O_NOCTTY) : -1;
+                if (slave < 0) err = name ? errno : ENOENT;
+                else close(slave);
+            }
+            if (master >= 0) close(master);
+            printf("openpty: errno %d\n", err);
         } else if (strncmp(argv[i], "HOLD:", 5) == 0) {
             release = argv[i] + 5;
         }
@@ -5076,6 +5122,74 @@ int main(int argc, char **argv) {
         let held = launch_box_probe(name, leaf, probe_args, false).await;
         held.release_hold();
         held.report().await
+    }
+
+    /// The devpts remount, in a real box launched from the production path:
+    /// the box's `/dev/pts` carries the per-instance `max=` cap, keeps the
+    /// `nosuid,noexec` it was mounted with, and keeps `ptmxmode=0666`, so the
+    /// box's own unprivileged user can still open a PTY pair. A remount that
+    /// restated only `max=` would reset `ptmxmode` to 0000 and break every
+    /// PTY in every box; this is the test that catches it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn box_devpts_is_capped_and_still_opens_a_pty() {
+        if let Some(reason) = user_namespaces_restriction() {
+            eprintln!(
+                "skipping box_devpts_is_capped_and_still_opens_a_pty: this \
+                 host denies the unprivileged user namespace every sandbox \
+                 starts by unsharing: {reason}"
+            );
+            return;
+        }
+        let probe_args = vec!["MOUNTINFO:/dev/pts".to_string(), "OPENPTY".to_string()];
+        let report = box_probe_report("pty-probe", None, &probe_args).await;
+
+        let mount = report
+            .get("mountinfo /dev/pts")
+            .cloned()
+            .unwrap_or_else(|| "no report".to_string());
+        eprintln!("the box's /dev/pts: {mount}");
+        let (per_mount, superblock) = mount
+            .split_once(" - ")
+            .unwrap_or_else(|| panic!("the box's /dev/pts is not a mountinfo line: {mount:?}"));
+        let mount_flags: Vec<&str> = per_mount
+            .split_whitespace()
+            .nth(5)
+            .unwrap_or_default()
+            .split(',')
+            .collect();
+        for flag in ["nosuid", "noexec"] {
+            assert!(
+                mount_flags.contains(&flag),
+                "the box's /dev/pts keeps {flag} across the remount: {mount:?}"
+            );
+        }
+        let super_opts: Vec<&str> = superblock
+            .split_whitespace()
+            .nth(2)
+            .unwrap_or_default()
+            .split(',')
+            .collect();
+        let max = format!("max={}", config::BOX_PTY_MAX);
+        assert!(
+            super_opts.contains(&max.as_str()),
+            "the box's devpts instance is capped at BOX_PTY_MAX: {mount:?}"
+        );
+        assert!(
+            super_opts.contains(&"ptmxmode=666"),
+            "the box's ptmx stays openable by its user: {mount:?}"
+        );
+
+        assert_eq!(
+            report.get("openpty uid").map(String::as_str),
+            Some(config::BOX_UID.to_string().as_str()),
+            "the PTY is opened as the box's own unprivileged user"
+        );
+        assert_eq!(
+            report.get("openpty").map(String::as_str),
+            Some("errno 0"),
+            "the box's user opens a PTY pair after the remount"
+        );
     }
 
     /// The daemon-side probe: a throwaway child of this process migrates

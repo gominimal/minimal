@@ -2290,6 +2290,17 @@ fn a_failed_closure_line_settles_the_boxs_fate_a_cover_line_does_not() {
          runs on the shared PTY pool"
     );
     assert!(
+        !super::say_closure_line("cover cgroup2; devpts max=1024 errno 22", "a session"),
+        "a devpts refusal carried on the cover line is as non-terminal as both parts"
+    );
+    assert!(
+        !super::say_closure_line(
+            "cover tmpfs-fallback errno 22; devpts max=1024 errno 1",
+            "a session"
+        ),
+        "the fallback cover keeps its errno when a devpts refusal rides on it"
+    );
+    assert!(
         super::say_closure_line(
             "failed covering the bound classifier tree errno 1",
             "a session"
