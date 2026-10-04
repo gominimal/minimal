@@ -1924,6 +1924,8 @@ fn cli_reference_documents_network_flags() {
     for row in [
         "--network <none|host_ip|own_ip>",
         "--ingress <EXT:INT[/PROTO]>",
+        "--dynamic-ingress <allow|ask|deny>",
+        "--dynamic-range <LO-HI>",
     ] {
         assert!(
             section.contains(row),
