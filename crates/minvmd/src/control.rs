@@ -544,16 +544,22 @@ mod tests {
         control(sock_path, &BoxControlRequest::Register(request.clone()))
     }
 
-    /// The registered box's two addresses, asserted as the reply the daemon
-    /// hands back.
-    fn handed(reply: BoxControlReply) -> BoxAddresses {
+    /// The registered box the daemon hands back — both addresses and the
+    /// box's own id — panicked into the test when the reply is a refusal or
+    /// a status instead.
+    fn handed(reply: BoxControlReply) -> RegisteredBox {
         match reply {
-            BoxControlReply::Addresses(addresses) => addresses,
+            BoxControlReply::Registered(web) => web,
+            BoxControlReply::Addresses(addresses) => {
+                panic!("a registration is answered with the registered box, got bare addresses {addresses:?}")
+            }
             BoxControlReply::Error { error } => {
-                panic!("a valid request is answered with addresses, refused with {error}")
+                panic!("a valid request is answered with the registered box, refused with {error}")
             }
             BoxControlReply::Status(status) => {
-                panic!("a registration is answered with addresses, got the status {status:?}")
+                panic!(
+                    "a registration is answered with the registered box, got the status {status:?}"
+                )
             }
         }
     }
@@ -569,7 +575,7 @@ mod tests {
     fn box_addresses_allocated_on_host_and_handed_to_daemon() {
         let capture = server_capture();
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let (sock_path, _server, _boxes, _answerer) =
+        let (sock_path, _server, registry, _answerer) =
             spawn_server(dir.path()).expect("server binds");
 
         // The first registration is handed the hand-out run's first switch
@@ -589,6 +595,7 @@ mod tests {
                         deny_subnets: None,
                     }),
                     credentialed_upstream: None,
+                    box_id: None,
                 },
             )
             .expect("first registration is answered"),
@@ -607,9 +614,25 @@ mod tests {
                 .first(),
             "the first box takes the first address of the slice the host switch publishes at"
         );
+        assert_eq!(
+            web.box_id,
+            minimald_rpc::BoxId::from_bytes(
+                registry
+                    .table()
+                    .by_source(web.switch_address.octets())
+                    .expect("the registration published the row the reply speaks for")
+                    .box_id()
+            ),
+            "the reply carries the id the published row holds — the box's own id"
+        );
+        assert_ne!(
+            web.box_id,
+            minimald_rpc::BoxId::from_bytes([0u8; 16]),
+            "the id is a minted UUIDv7, never the all-zero non-id"
+        );
 
-        // The registration's one info line names the box, both addresses
-        // it handed back, and the declared egress the row carries.
+        // The registration's one info line names the box, its id, both
+        // addresses it handed back, and the declared egress the row carries.
         let log = capture.contents();
         assert!(
             log.contains("registered box with the VM host daemon; addresses allocated"),
@@ -622,13 +645,18 @@ mod tests {
             "the info line names the box and the addresses it handed back: {log}"
         );
         assert!(
+            log.contains(&format!("box_id={}", web.box_id)),
+            "the info line carries the box's own id in the one spelling a tail reads: {log}"
+        );
+        assert!(
             log.contains(r#""allow_subnets":["10.0.0.0/8"]"#)
                 && log.contains(r#""allow_protocols":["tcp"]"#),
             "the info line carries the declared egress allow-list: {log}"
         );
 
         // The second registration takes the next address on both runs —
-        // sequential allocation, no reuse.
+        // sequential allocation, no reuse — and mints the next box its own
+        // id: one id per creation, never shared.
         let db = handed(
             register(
                 &sock_path,
@@ -637,9 +665,14 @@ mod tests {
                     ingress_ports: vec![5432],
                     egress: None,
                     credentialed_upstream: None,
+                    box_id: None,
                 },
             )
             .expect("second registration is answered"),
+        );
+        assert_ne!(
+            db.box_id, web.box_id,
+            "the second box is created as its own identity, not the first's"
         );
         assert_eq!(
             db.switch_address,
@@ -681,6 +714,7 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
+                    box_id: None,
                 },
             )
             .expect("server still serves after a refused request"),
@@ -706,6 +740,7 @@ mod tests {
                     deny_subnets: None,
                 }),
                 credentialed_upstream: None,
+                box_id: None,
             })
             .expect("the default plan has addresses to allocate");
 
@@ -760,6 +795,7 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
+                box_id: None,
             })
             .expect_err("an unplanned subnet has no slice to allocate from");
         assert!(
@@ -805,6 +841,7 @@ mod tests {
                         deny_subnets: None,
                     }),
                     credentialed_upstream: None,
+                    box_id: None,
                 },
             )
             .expect("the registration is answered"),
@@ -828,7 +865,14 @@ mod tests {
         .expect("the withdrawal is answered");
         match reply {
             BoxControlReply::Addresses(echoed) => {
-                assert_eq!(echoed, web, "the withdrawal echoes the pair it went by");
+                assert!(
+                    echoed.switch_address == web.switch_address
+                        && echoed.loopback_address == web.loopback_address,
+                    "the withdrawal echoes the pair it went by: {echoed:?}"
+                );
+            }
+            BoxControlReply::Registered(..) => {
+                panic!("a withdrawal echoes the pair it went by, never a registered box")
             }
             BoxControlReply::Error { error } => {
                 panic!("the creator's withdrawal is answered with the pair, refused with {error}")
@@ -878,6 +922,7 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
+                    box_id: None,
                 },
             )
             .expect("the marker box is registered"),
@@ -905,6 +950,9 @@ mod tests {
                 BoxControlReply::Addresses(..) => {
                     panic!("a foreign pair's withdrawal must be refused, got addresses")
                 }
+                BoxControlReply::Registered(..) => {
+                    panic!("a foreign pair's withdrawal must be refused, got a registered box")
+                }
                 BoxControlReply::Status(status) => {
                     panic!("a withdrawal must be refused, got the status {status:?}")
                 }
@@ -931,7 +979,14 @@ mod tests {
         .expect("the repeat withdrawal is answered");
         match again {
             BoxControlReply::Addresses(echoed) => {
-                assert_eq!(echoed, web, "the repeat withdrawal echoes the pair too");
+                assert!(
+                    echoed.switch_address == web.switch_address
+                        && echoed.loopback_address == web.loopback_address,
+                    "the repeat withdrawal echoes the pair too: {echoed:?}"
+                );
+            }
+            BoxControlReply::Registered(..) => {
+                panic!("a repeat withdrawal echoes the pair, never a registered box")
             }
             BoxControlReply::Error { error } => {
                 panic!("no row at the address is success, refused with {error}")
@@ -1068,7 +1123,7 @@ mod tests {
 
         // The read mutates nothing: a row published before it is still
         // published after, and the next registration is still answered
-        // with addresses.
+        // with the registered box.
         let web = handed(
             register(
                 &sock_path,
@@ -1077,6 +1132,7 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
+                    box_id: None,
                 },
             )
             .expect("a registration still answers around the read"),

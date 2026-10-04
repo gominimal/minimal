@@ -414,7 +414,7 @@ pub enum AllocationError {
     /// so the refusal leaves no new fact on the host.
     #[error(
         "box id {} is already held by a live row or attachment",
-        crate::bep_attach::BoxIdText(&self.id)
+        crate::bep_attach::BoxIdText(id)
     )]
     CollidingBoxId {
         /// The id a live row or attachment already holds.
@@ -1650,6 +1650,7 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
+                box_id: None,
             })
             .expect("the default plan has hand-out addresses");
         assert_eq!(
@@ -1677,6 +1678,7 @@ mod tests {
                 ingress_ports: Vec::new(),
                 egress: None,
                 credentialed_upstream: None,
+                box_id: None,
             })
             .expect("the carved subnet has hand-out addresses");
         assert_eq!(
@@ -1691,6 +1693,7 @@ mod tests {
                     ingress_ports: Vec::new(),
                     egress: None,
                     credentialed_upstream: None,
+                    box_id: None,
                 })
                 .expect("the slice holds 32 published addresses");
         }
@@ -1702,6 +1705,7 @@ mod tests {
                         ingress_ports: Vec::new(),
                         egress: None,
                         credentialed_upstream: None,
+                        box_id: None,
                     }),
                     Err(AllocationError::LoopbackExhausted)
                 ),
@@ -2035,7 +2039,7 @@ mod tests {
         let attachments = crate::bep_attach::Attachments::new();
         let registry = BoxRegistry::new(SUBNET).feeding_proxy_attachments(attachments.clone());
         let lease = [100, 64, 0, 9];
-        registry.register(BoxRegistration::new(
+        let row = registry.register(BoxRegistration::new(
             "web",
             Ipv4Addr::from(lease),
             Ipv4Addr::LOCALHOST,
@@ -2044,15 +2048,21 @@ mod tests {
         let mut harness = gate_over(registry).await;
 
         // The box's attachment is held before its traffic: issued by the
-        // registration, ahead of the row.
+        // registration, ahead of the row, carrying the box's own id — the
+        // one its row holds.
         let attachment = attachments
             .by_source(lease)
             .expect("the registration issued the box's attachment");
         assert_eq!(attachment.switch_addr(), Ipv4Addr::from(lease));
+        assert_eq!(
+            attachment.box_id(),
+            row.box_id(),
+            "the attachment carries the box's own id, the one its row holds"
+        );
         assert_ne!(
             attachment.box_id(),
-            crate::bep_attach::NO_BOX_ID,
-            "the attachment names the box, not the no-claim value"
+            [0u8; 16],
+            "the attachment names the box, never the all-zero non-id"
         );
 
         // The box's frame, admitted by its row: the traffic the

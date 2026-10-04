@@ -129,7 +129,7 @@ impl Attachment {
 /// form every diagnostic that names a box id uses — the same spelling the
 /// wire's own [`minimald_rpc::BoxId`] renders — so a tail can compare two
 /// lines for the same box.
-pub(crate) struct BoxIdText<'a>(&'a BoxId);
+pub(crate) struct BoxIdText<'a>(pub(crate) &'a BoxId);
 
 impl fmt::Display for BoxIdText<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -340,12 +340,23 @@ mod tests {
         // mints, which is two boxes.
         assert_ne!(mint_box_id(), mint_box_id(), "two creations name two boxes");
 
-        // The attachments agree: issuing the same box facts twice — the
-        // same name, the same addresses, the shape of a box recreated on
-        // its own facts — gives each creation its own id, so the id names
-        // the creation, never the facts.
+        // The attachments agree: a box recreated on its own facts — the same
+        // name, the same addresses, its first creation ended and a second
+        // begun, the shape a recreate takes — carries a second mint's id,
+        // so the id names the creation, never the facts. The first
+        // creation's id goes with the first creation: the table holds the
+        // second id alone.
         let attachments = Attachments::new();
         let first = attachments.issue(name, mint_box_id(), switch, loopback, false);
+        assert!(
+            attachments.holds_id(first.box_id()),
+            "the table holds the id its own attachment carries"
+        );
+        attachments.withdraw(switch, Instant::now());
+        assert!(
+            !attachments.holds_id(first.box_id()),
+            "the ended box's id went with it: the table no longer holds it"
+        );
         let second = attachments.issue(name, mint_box_id(), switch, loopback, false);
         assert_ne!(
             first.box_id(),
@@ -353,12 +364,12 @@ mod tests {
             "a box recreated on its own facts carries a new id"
         );
         assert!(
-            attachments.holds_id(first.box_id()),
-            "the table holds the id its own attachment carries"
+            !attachments.holds_id(first.box_id()) && attachments.holds_id(second.box_id()),
+            "the table holds the recreated box's id, and it alone"
         );
         assert!(
             !attachments.holds_id([0u8; 16]),
-            "no attachment holds the no-claim value"
+            "no attachment holds the all-zero non-id"
         );
     }
 
