@@ -221,6 +221,21 @@
 #                                    egress plus the baseline set; also
 #                                    pins no CAP_NET_RAW/CAP_NET_ADMIN in
 #                                    a box and no IPv6 route in the guest
+#   host_ip_deny_all
+#                                    NET-079 end to end, both halves: on a
+#                                    host that decides per box, a deny-all
+#                                    host-address box reaches only the
+#                                    answerer Minimal owns for it, every
+#                                    connection it opens itself is
+#                                    refused, and it cannot leave its
+#                                    classifier leaf — while the daemon's
+#                                    own package fetch on the same host
+#                                    completes and is recorded as node-
+#                                    plane traffic; on a native host that
+#                                    cannot decide per box, the session
+#                                    start prints the advisory naming its
+#                                    cause, and the box runs unenforced,
+#                                    never refused on that ground
 #   daemon_fetch_under_deny_all_host_address_box
 #                                    NET-080 under the loaded classifier table:
 #                                    the privileged step's tree and table
@@ -345,6 +360,14 @@ NET080_SEED_DIR="" # seeded by the daemon-fetch proof below; removed on teardown
 # not leave a host's packet filter deciding behind it, so the teardown unloads
 # whatever this flag says is ours.
 NET080_CLASSIFIER_INSTALLED=""
+# The same three for the host_ip_deny_all proof: the two project seeds its two
+# halves activate against (removed on teardown like every other seed), and the
+# classifier tree+table its decided half installs (its own, removed before the
+# proof returns; the teardown covers a death between install and return, for
+# the same reason the NET-080 flag above exists).
+HIDA_SEED_DIR="" # the decided half's project seed; removed on teardown
+HIDA_UNENFORCED_SEED_DIR="" # the unenforced half's project seed; removed on teardown
+HIDA_CLASSIFIER_INSTALLED=""
 if [ -z "${E2E_PROJECT_DIR:-}" ]; then
   # Native: self-seed a small throwaway — never $ROOT (uploading the whole repo,
   # and scaffolding over its `.minimal/`, is the very clobber #758 prevents).
@@ -637,6 +660,14 @@ teardown() {
     sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 || true
     NET080_CLASSIFIER_INSTALLED=""
   fi
+  # The host_ip_deny_all proof installs its own classifier tree+table (its
+  # decided half) and removes it before it returns — this is the same net under
+  # the failure paths, and its ordering reason is the same as the NET-080 one
+  # above: the uninstall refuses while a live leaf or process holds the tree.
+  if [ -n "$HIDA_CLASSIFIER_INSTALLED" ]; then
+    sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1 || true
+    HIDA_CLASSIFIER_INSTALLED=""
+  fi
   [ -n "$SEED_DIR" ] && rm -rf "$SEED_DIR"
   [ -n "$SEEDED_MFILE" ] && rm -f "$SEEDED_MFILE"
   [ -n "$TASK_SEED_DIR" ] && rm -rf "$TASK_SEED_DIR"
@@ -721,6 +752,8 @@ teardown() {
   [ -n "$UPR_T_SEED_DIR" ] && rm -rf "$UPR_T_SEED_DIR"
   [ -n "$UPR_P_SEED_DIR" ] && rm -rf "$UPR_P_SEED_DIR"
   [ -n "$NET080_SEED_DIR" ] && rm -rf "$NET080_SEED_DIR"
+  [ -n "$HIDA_SEED_DIR" ] && rm -rf "$HIDA_SEED_DIR"
+  [ -n "$HIDA_UNENFORCED_SEED_DIR" ] && rm -rf "$HIDA_UNENFORCED_SEED_DIR"
   [ -n "$BOXREG_SEED_DIR" ] && rm -rf "$BOXREG_SEED_DIR"
   [ -n "$BOXREG_CTRLC_SEED_DIR" ] && rm -rf "$BOXREG_CTRLC_SEED_DIR"
   # The proxy-source proof's two boxes: their project dirs are removed on its
@@ -1771,6 +1804,985 @@ proof_own_ip_egress_declared_and_enforced() {
   mnl session destroy --force "$deny_all_sid" >/dev/null 2>&1 || true
   rm -rf "$EGRESS_SEED_DIR"; EGRESS_SEED_DIR=""
   echo "own-IP egress declared and enforced OK"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# NET-079 end to end, with the NET-080 fact that rides beside it: a
+# host-address box declared deny-all on a host that decides per box, and
+# the same declaration on a native host that cannot decide. The proof's
+# sentence is this case's contract, in its own order:
+#
+#   * The decided half runs under this case's own classifier install (the
+#     same arrangement the daemon-fetch case below carries: the
+#     privileged step's tree and table, removed before it returns). The
+#     box reaches ONLY the resolver Minimal owns for it — its
+#     resolv.conf names the answerer's address and nothing else, its own
+#     name resolves through the answerer (the one destination the deny
+#     chain admits, reached through the table's DNS retarget), every name
+#     outside the box zone fails at resolution (the answerer refuses it
+#     and the box has no other resolver), and every connection the box
+#     opens itself is refused — to the answerer's own port over TCP, to
+#     the hostname proxy's port, to an undeclared address. And it cannot
+#     leave its cgroup: its own processes are members of its classifier
+#     leaf (read from the tree this case installed), the cover the launch
+#     mounted over the tree is the box's whole view of the hierarchy, and
+#     no spelling of another leaf opens inside it. The daemon's own
+#     package fetch on this same host still completes — an in-box
+#     `min add` against a daemon started on an empty cache — and is
+#     recorded as node-plane traffic naming this box and the package,
+#     with the box's own connection still refused after it.
+#   * The unenforced half runs on the host as this case found it, after
+#     the decided half's uninstall: a fresh daemon, the same deny-all
+#     declaration, and the advisory NET-079 owes a native host that
+#     cannot decide per box — printed at the session start on the
+#     person's own stderr, naming its cause in words, saying the boxes
+#     run unenforced whatever their declarations say, and naming the
+#     install command exactly when the missing step is the cause (never
+#     for a mount that cannot confine a box, which no install ends). The
+#     create record carries the same advisory on the daemon's log beside
+#     its cause, the launch records the unenforced state, the box is
+#     never refused on that ground, and its own connection to an
+#     undeclared address completes — the proof it really did run
+#     unenforced, with the lane's own reach as the control.
+#
+# Lane gating, by observed fact: a VM lane's daemon runs in the guest and
+# the table is a host install, and a guest's creates carry no advisory
+# (its causes name its image's builder, not anything the person starting
+# a session could run), so both halves are native-lane subjects and the
+# whole case skips there. The decided half's gates are the daemon-fetch
+# case's own (nft, ip, passwordless sudo, no host install to replace, the
+# installer's mount rehearsal, a derivable source identity): where one
+# misses, the decided half degrades to a warning off CI — a lane fault on
+# CI, which claims to load the table — and the unenforced half still
+# runs, because a host that cannot load the table is exactly the host
+# that cannot decide per box. The case runs immediately before the
+# daemon-fetch case on purpose: both install and remove their own
+# classifier tree and table and respawn the daemon pair under their own
+# filters, so neither may rely on the daemon or the packet filter the
+# other left behind.
+proof_host_ip_deny_all() {
+  local hida_why="" hida_src="" hida_rust_log="" hida_cache=""
+  local hida_install_out="" hida_place_out="" hida_daemons=""
+  local hida_pid="" hida_proc="" hida_comm=""
+  local hida_sid="" hida_activate_err="" hida_launch="" hida_records=""
+  local hida_warm_sid="" hida_warm_activate_err="" hida_warm_launch=""
+  local hida_ls="" hida_answerer_line="" hida_proxy_port="" hida_host_ns=""
+  local hida_resolv="" hida_err="" hida_rc="" hida_status="" hida_tail=""
+  local hida_cover="" hida_cgroup="" hida_write="" hida_write_msg="" hida_sib=""
+  local hida_exec_pid="" hida_exec_client="" hida_leaf_procs=""
+  local hida_attach_out="" hida_policy=""
+  local hida_un_sid="" hida_un_activate_err="" hida_un_records=""
+  local hida_un_create="" hida_un_cause="" hida_un_launch="" hida_un_policy=""
+  local hida_un_gate="" hida_un_rc="" hida_un_status="" hida_host_rc=""
+  local hida_host_status=""
+  echo "::group::a deny-all host-address box per box, and unenforced (NET-079)"
+
+  # The daemon's file log is JSON lines (crates/mlog/src/lib.rs), so every
+  # needle below is the JSON spelling of the field or message it pins — and
+  # the needles that name a session (its id, its name, its leaf) are what
+  # keep a whole-lane run's earlier records out of this case's assertions:
+  # every record this case reads is one an earlier case's daemon may have
+  # written too. `|| true` because a find -exec whose grep finds nothing
+  # exits nonzero, and the callers assert on the captured text.
+  hida_log() { # $1 = the fixed string; prints the matching daemon-log lines
+    find "$XDG_STATE_HOME/minimal/logs" -name 'minimald.log.*' -type f \
+      -exec grep -hF -- "$1" {} + 2>/dev/null || true
+  }
+
+  # The decided half's own uninstall, in the order the installer requires:
+  # the box's leaf empties when the session is destroyed, the daemon's when
+  # it stops — the uninstall refuses while a live leaf or process holds the
+  # tree, its own guard, which is why the stop comes before it. Returns the
+  # uninstall's exit status, so the happy path can fail on a removal that
+  # did not happen.
+  hida_unwind() {
+    if [ -n "${hida_warm_sid:-}" ]; then
+      mnl session destroy --force "$hida_warm_sid" >/dev/null 2>&1 || true
+    fi
+    if [ -n "${hida_sid:-}" ]; then
+      mnl session destroy --force "$hida_sid" >/dev/null 2>&1 || true
+    fi
+    mnl stop --force >/dev/null 2>&1 || true
+    if [ -n "$HIDA_CLASSIFIER_INSTALLED" ]; then
+      sudo -n "$ROOT/scripts/install-host-classifier.sh" --uninstall >/dev/null 2>&1
+    fi
+  }
+
+  # A VM lane's daemon is in the guest, the classifier table is a host
+  # install, and a guest daemon carries no create advisory — so both halves
+  # of this case are native-lane subjects. The skip is a fact about the
+  # target, never about the host's capability.
+  if [ -n "$E2E_VM" ]; then
+    echo "host_ip_deny_all proof SKIPPED (VM-backed target: minimald runs in the guest, the classifier table is a host install, and the guest daemon's creates carry no advisory; the native lane decides per box and advises)"
+    echo "::endgroup::"
+    return 0
+  fi
+
+  # The record filter both halves warm their own daemon under: the launch
+  # and node-plane records this case reads are INFO from
+  # minimald::session_host and minimald::net::classifier, the
+  # advisory-bearing create record is INFO from minimald::rpc, and the
+  # lane's default filter would drop all of them before they reached the
+  # file this case reads them from.
+  hida_rust_log="warn,minimald::exec=info,minimald::net::classifier=info,minimald::session_host=info,minimald::rpc=info"
+
+  # ---- the decided half's gates: one fact each, printed when it is missing.
+  # Where one misses the decided half does not run and the unenforced half
+  # below still does — a host that cannot load the table is exactly the one
+  # that cannot decide per box.
+  hida_why=""
+  if ! command -v nft >/dev/null 2>&1; then
+    hida_why="no nft on PATH: the classifier table is loaded with it"
+  elif ! command -v ip >/dev/null 2>&1; then
+    hida_why="no ip on PATH: the decided half cannot derive the default-route source address the install renders both identities from"
+  elif ! sudo -n true >/dev/null 2>&1; then
+    hida_why="no passwordless sudo: the install that loads the tree and the table needs root"
+  elif [ -e /sys/fs/cgroup/minimald.slice ] || sudo -n nft list table inet minimal_class >/dev/null 2>&1; then
+    hida_why="this host already carries a classifier install (the tree at /sys/fs/cgroup/minimald.slice or the table inet minimal_class), and this case replaces no host's own"
+  elif ! "$ROOT/scripts/install-host-classifier.sh" --print-ruleset \
+      --cohort-address 127.0.0.1 --node-plane-address 127.0.0.1 \
+      >/dev/null 2>"$WORK/hida-mount.err"; then
+    # The installer's own mount rehearsal, unprivileged and touching nothing:
+    # it runs the same mount check an install runs, so its refusing is the
+    # one fact the cheaper gates cannot read — no cgroup2 mount with
+    # nsdelegate, rooted at the hierarchy's own root, covers the tree.
+    hida_why="the installer's own mount check refuses this host: $(head -n1 "$WORK/hida-mount.err" 2>/dev/null || true)"
+  else
+    # The host's own default-route source address: the one identity both
+    # planes are rendered from. The install refuses half a classification,
+    # and this case refuses to guess an address it cannot derive.
+    hida_src="$(ip route get 1.1.1.1 2>/dev/null \
+      | sed -n 's/.* src \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+    [ -n "$hida_src" ] \
+      || hida_why="no default-route source address to render the install's two identities from"
+  fi
+  if [ -n "$hida_why" ]; then
+    if [ -n "${CI:-}" ]; then
+      echo "::error::a CI native lane must be able to load the classifier table: $hida_why"
+      fail
+    fi
+    echo "::warning::the decided half of the host_ip_deny_all proof SKIPPED — the classifier table cannot be loaded on this host"
+    echo "  ($hida_why)"
+    echo "  the unenforced half below still runs: a host that cannot load the table is the one it is about"
+    echo "  the decided half is asserted on the native CI lane, where the privileged step's tree and table load"
+  fi
+
+  if [ -z "$hida_why" ]; then
+    # ---- the decided half: the install, the box, and everything the box
+    # opens. The daemon is stopped first, so the one this half drives starts
+    # under the install; the flag is set before the install's nft
+    # transaction, so a death between it and the last note still leaves the
+    # teardown a table to remove.
+    mnl stop --force >/dev/null 2>&1 || true
+    HIDA_CLASSIFIER_INSTALLED=1
+    # The installer's notes are captured as this lane's user, not as root:
+    # $WORK is the lane's own work dir, which root need not and must not
+    # own, so the redirects staying the caller's is the intent, and sudo's
+    # privilege ends at the script it runs.
+    # shellcheck disable=SC2024
+    if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" \
+        --cohort-address "$hida_src" --node-plane-address "$hida_src" \
+        >"$WORK/hida-install.out" 2>"$WORK/hida-install.err"; then
+      echo "::error::the classifier install failed, so no table is loaded and the decided half has nothing to decide with"
+      echo "--- installer stderr ---"; cat "$WORK/hida-install.err" 2>/dev/null || true
+      fail
+    fi
+    hida_install_out="$(cat "$WORK/hida-install.out" 2>/dev/null || true)"
+    if [[ "$hida_install_out" != *"installed the classifier tree"* ]] \
+       || [[ "$hida_install_out" != *"loaded the classifier table"* ]]; then
+      echo "::error::the classifier install did not report both its tree and its table"
+      echo "--- installer output ---"; printf '%s\n' "$hida_install_out"
+      fail
+    fi
+    if [ ! -e /sys/fs/cgroup/minimald.slice/classifier-table ]; then
+      echo "::error::the table's presence marker is missing at /sys/fs/cgroup/minimald.slice/classifier-table: the daemon reads no per-box verdict without it"
+      fail
+    fi
+    echo "install: the privileged step laid out the tree at /sys/fs/cgroup/minimald.slice and loaded the classifier table inet minimal_class, both identities $hida_src — the host's own source, so the classification is in force and no packet changes the source it would have left with anyway"
+
+    # ---- this case's own project: the seed the box is declared against.
+    HIDA_SEED_DIR="$(hook_mktemp /tmp/mnlhida.XXXXXX)"
+    hook_seed_preamble >"$HIDA_SEED_DIR/minimal.toml"
+    mkdir "$HIDA_SEED_DIR/.git"
+
+    # ---- the daemon, started and placed BEFORE the box it will launch. The
+    # warm-up is a daemon-touching call that starts no session, so the
+    # daemon this half drives autospawns on it, detached, and keeps the
+    # filter and the package cache below for its whole life. The cache is
+    # this half's own and empty — the lane's is warm by now, and a fully
+    # cached add fetches nothing, so no fetch and no node-plane record —
+    # under $WORK so it shares the state dir's device (the daemon
+    # hardlinks built packages from its cache into the session rootfs, and
+    # a hardlink cannot cross filesystems).
+    hida_cache="$WORK/hida-cache"
+    if ! RUST_LOG="$hida_rust_log" XDG_CACHE_HOME="$hida_cache" \
+        mnl ls >/dev/null 2>"$WORK/hida-warm.err"; then
+      echo "::error::this case's daemon did not come up under its own filter and its own empty package cache"
+      cat "$WORK/hida-warm.err" 2>/dev/null || true
+      fail
+    fi
+    echo "warm: the daemon this case drives is up, under this case's record filter and against an empty package cache of its own"
+
+    # ---- the daemon's placement: the one migration it cannot make itself.
+    # A native daemon starts wherever its starter left it (user.slice), so
+    # the common ancestor of its starting cgroup and the slice is the
+    # root-owned hierarchy root — the barrier that stops a box climbing out
+    # is the same fact that stops the daemon climbing in. The installer's
+    # --pid step is the supported placement, and the placement probe is per
+    # launch, so the next box this daemon launches is decided on a leaf of
+    # its own. Found off /proc, keyed on comm (a cmdline match would take an
+    # editor holding a file under crates/minimald for the daemon itself)
+    # and on this account, so another account's daemon is never placed in
+    # this case's tree.
+    hida_daemons=""
+    for hida_proc in /proc/[0-9]*; do
+      [ -r "$hida_proc/comm" ] || continue
+      read -r hida_comm <"$hida_proc/comm" 2>/dev/null || continue
+      [ "$hida_comm" = "$min_daemon" ] || continue
+      [ -O "$hida_proc" ] || continue
+      hida_daemons="$hida_daemons${hida_daemons:+ }${hida_proc#/proc/}"
+    done
+    hida_pid="${hida_daemons%% *}"
+    if [ -z "$hida_pid" ] || [ "${hida_daemons#"$hida_pid"}" != "" ]; then
+      echo "::error::expected exactly one $min_daemon under this account to place in its leaf, found: ${hida_daemons:-none}"
+      fail
+    fi
+    # shellcheck disable=SC2024
+    if ! sudo -n "$ROOT/scripts/install-host-classifier.sh" --pid "$hida_pid" \
+        >"$WORK/hida-place.out" 2>"$WORK/hida-place.err"; then
+      echo "::error::the installer's --pid step could not place $min_daemon $hida_pid in its leaf"
+      echo "--- installer stderr ---"; cat "$WORK/hida-place.err" 2>/dev/null || true
+      fail
+    fi
+    hida_place_out="$(cat "$WORK/hida-place.out" 2>/dev/null || true)"
+    if [[ "$hida_place_out" != *"placed $hida_pid in"* ]]; then
+      echo "::error::the --pid step did not report placing $min_daemon $hida_pid"
+      echo "--- installer output ---"; printf '%s\n' "$hida_place_out"
+      fail
+    fi
+    echo "place: $min_daemon $hida_pid is inside the slice, so the box this case launches is decided on a leaf of its own"
+
+    # ---- the daemon's own fact, turned the one way it is: a launch. A
+    # create answers from the last read the host gave it — the start-up
+    # read, then each host-address launch's re-read — never a fresh probe
+    # of its own, and this case's daemon started outside the slice, before
+    # the --pid step above placed it, so its start-up read could not place
+    # its probe child in a leaf and left the fact carrying the very cause
+    # the placement just ruled out. The re-read runs per launch, so one
+    # throwaway host-address box, driven to its launch and destroyed,
+    # turns the fact: its launch reads the table's effect with the daemon
+    # inside the tree, and the create for the box this half is about then
+    # answers a fact that says per_box. The throwaway box's own create is
+    # the one create that may still carry the start-up read's cause — the
+    # placement clears a cause for the reads after it, not for the fact
+    # the daemon already answered with — so its activation's stderr is
+    # printed below, never asserted: a daemon that started inside the tree
+    # (a Delegate=yes unit) read decided at start-up and owes this create
+    # no advisory either.
+    hida_warm_sid="$(cd "$HIDA_SEED_DIR" && mnl session activate . --no-prompt \
+      --name e2e-hida-warm --network host_ip 2>"$WORK/hida-warm-activate.err")" || {
+      echo "::error::the throwaway host-address box that turns the daemon's classifier fact failed to activate"
+      cat "$WORK/hida-warm-activate.err" 2>/dev/null || true
+      fail
+    }
+    hida_warm_sid="$(printf '%s\n' "$hida_warm_sid" | tail -n1 | tr -d '\r')"
+    hida_warm_activate_err="$(cat "$WORK/hida-warm-activate.err" 2>/dev/null || true)"
+    if [[ "$hida_warm_activate_err" == *"cannot decide a host-address box's"* ]]; then
+      echo "warm create: the throwaway box's start printed the advisory the start-up read left the fact carrying — the placement above clears the cause for reads after it, and the launch that turns the fact is the next beat:"
+      printf '%s\n' "$hida_warm_activate_err" | sed 's/^/  /'
+    fi
+
+    # ---- the capability gate, on this half's first driven box: this half
+    # drives boxes, so a host that cannot run one cannot run it. Observed
+    # fact, degraded on a developer host, a lane fault on CI (the posture
+    # proof's rule).
+    if ! mnl session exec "$hida_warm_sid" 'true' >"$WORK/hida-warm-gate.err" 2>&1 \
+       && ! { sleep 1; mnl session exec "$hida_warm_sid" 'true' >"$WORK/hida-warm-gate.err" 2>&1; }; then
+      if [ -z "${CI:-}" ]; then
+        echo "::warning::host_ip_deny_all proof SKIPPED — this host cannot run a session sandbox, so no box can be driven"
+        echo "  (exec: $(head -n1 "$WORK/hida-warm-gate.err" 2>/dev/null || true))"
+        echo "  the tree and table this case installed are uninstalled below; asserted on the native CI lane"
+        hida_unwind || true
+        echo "::endgroup::"
+        return 0
+      fi
+      echo "::error::a CI native lane that cannot run a session sandbox cannot drive NET-079: the box is the proof"
+      cat "$WORK/hida-warm-gate.err" 2>/dev/null || true
+      fail
+    fi
+
+    # ---- the placement's proof, and the fact turned: the throwaway box's
+    # launch re-read the table's effect with the daemon inside the tree,
+    # so its record says per_box — the fact the box this half is about
+    # will be created against. Pinned by the throwaway box's own leaf,
+    # because the deny-all box below writes a record of its own into the
+    # same log.
+    hida_warm_launch="$(hida_log 'egress verdict is decided on its classifier leaf')"
+    hida_warm_launch="$(printf '%s\n' "$hida_warm_launch" \
+      | grep -F -- "boxes/allow/$hida_warm_sid" || true)"
+    if [[ "$hida_warm_launch" != *'"host_ip_enforcement":"per_box"'* ]]; then
+      echo "::error::the throwaway box's launch record does not say per_box: the placement did not take effect at the launch's re-read, so the create for the deny-all box below would answer a fact that still carries a cause: $hida_warm_launch"
+      fail
+    fi
+    if ! mnl session destroy --force "$hida_warm_sid" \
+        >/dev/null 2>"$WORK/hida-warm-destroy.err"; then
+      echo "::error::the throwaway box would not destroy, so its leaf would hold the tree this case's own uninstall removes at the end"
+      cat "$WORK/hida-warm-destroy.err" 2>/dev/null || true
+      fail
+    fi
+    echo "refresh: the throwaway box's launch (leaf boxes/allow/$hida_warm_sid) re-read the host with the daemon inside the slice — the fact now says per_box, and it is what the deny-all box's create answers"
+
+    # ---- the box: the activate launches it, into a leaf of the placed
+    # daemon's tree, under the table this case loaded, declared deny-all by
+    # the CLI's own spelling of it. The activation's stderr is captured
+    # whole: the fact this create answers from is the one the throwaway
+    # box's launch just turned — per_box, on a host whose table is loaded
+    # and whose daemon is placed — so a decided host's create carries no
+    # classifier advisory, and the capture must carry none either: the
+    # start said nothing because there was nothing to say.
+    hida_sid="$(cd "$HIDA_SEED_DIR" && mnl session activate . --no-prompt --name e2e-hida \
+      --network host_ip --deny-all-egress 2>"$WORK/hida-activate.err")" || {
+      echo "::error::'min session activate --network host_ip --deny-all-egress' failed under the loaded table"
+      cat "$WORK/hida-activate.err" 2>/dev/null || true
+      fail
+    }
+    hida_sid="$(printf '%s\n' "$hida_sid" | tail -n1 | tr -d '\r')"
+    hida_activate_err="$(cat "$WORK/hida-activate.err" 2>/dev/null || true)"
+    if [[ "$hida_activate_err" == *"cannot decide a host-address box's"* ]]; then
+      echo "::error::the activation on a decided host printed the classifier advisory anyway: the create reply carried a cause the refresh launch above just ruled out of the fact"
+      printf '%s\n' "$hida_activate_err"
+      fail
+    fi
+    echo "activate: the host-address box $hida_sid is declared deny-all (--deny-all-egress) on a host that decides per box, and the start printed no classifier advisory"
+
+    # ---- the box's launch: the exec is what starts a session's box (it
+    # launches on first use, not at the activate), and the record that
+    # launch leaves is read next. The capability gate above already
+    # answered whether this host can drive a box, so a failure here is a
+    # fault, not a degraded host.
+    if ! mnl session exec "$hida_sid" 'true' >"$WORK/hida-gate.err" 2>&1 \
+       && ! { sleep 1; mnl session exec "$hida_sid" 'true' >"$WORK/hida-gate.err" 2>&1; }; then
+      echo "::error::the deny-all box's own exec failed: the box this half is about cannot be driven"
+      cat "$WORK/hida-gate.err" 2>/dev/null || true
+      fail
+    fi
+
+    # ---- the box's launch record: the subtree its declaration picked, the
+    # leaf it was placed in, and the fresh verdict the host read before it.
+    # `per_box` is not a claim the launch makes about itself: it is the
+    # verdict a host gets only when the daemon's probe connection out of a
+    # deny leaf was refused the way this table refuses. Named by this
+    # box's own leaf, because the throwaway box's launch record above
+    # lives in the same log.
+    hida_launch="$(hida_log 'egress verdict is decided on its classifier leaf')"
+    hida_launch="$(printf '%s\n' "$hida_launch" \
+      | grep -F -- "boxes/deny/$hida_sid" || true)"
+    if [[ "$hida_launch" != *'"classifier":"deny"'* ]]; then
+      echo "::error::the box's launch record does not name the deny subtree a deny-all declaration lands in: $hida_launch"
+      fail
+    fi
+    if [[ "$hida_launch" != *"boxes/deny/$hida_sid"* ]]; then
+      echo "::error::the box's launch record does not name this box's own leaf (boxes/deny/$hida_sid): $hida_launch"
+      fail
+    fi
+    if [[ "$hida_launch" != *'"host_ip_enforcement":"per_box"'* ]]; then
+      echo "::error::the box's launch record does not say per_box: the daemon's probe out of a deny leaf was not refused by the loaded table, so this host does not decide per box and nothing below reads as its verdict: $hida_launch"
+      fail
+    fi
+    echo "launch: the box is placed in its own leaf boxes/deny/$hida_sid, in the deny subtree, and the host decides per box (host_ip_enforcement=per_box)"
+
+    # ---- the surfaces: the daemon's answerer and the hostname proxy, the
+    # two host-loopback listeners this box's connections are about to meet —
+    # printed because they are what the verdicts below are read against.
+    hida_ls="$(mnl ls 2>"$WORK/hida-ls.err" || true)"
+    hida_answerer_line="$(printf '%s\n' "$hida_ls" | grep -F -- 'ZONE ANSWERER' | head -n1 || true)"
+    if [ -z "$hida_answerer_line" ]; then
+      echo "::error::min ls reports no ZONE ANSWERER line: the daemon's answerer never came up, so the resolver this box is given is an address with nothing behind it"
+      fail
+    fi
+    hida_proxy_port="$(printf '%s\n' "$hida_ls" \
+      | sed -n 's/^HOSTNAME PROXY: *listening on 127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' | head -n1)"
+    if [ -z "$hida_proxy_port" ]; then
+      echo "::error::min ls did not name the port the hostname proxy listens on"
+      fail
+    fi
+    printf '%s\n' "$hida_answerer_line" | sed 's/^/  /'
+    echo "surfaces: the answerer above, and the hostname proxy on 127.0.0.1:$hida_proxy_port — the two listeners this box's connections meet below"
+
+    # ---- the resolver Minimal owns for this box: the plan's answerer
+    # address is all /etc/resolv.conf can name (the table retargets its
+    # DNS-port lookups onto the answerer's own port, the one port the deny
+    # chain admits), and nothing else is left in the box's resolver file —
+    # the host's own first nameserver, printed beside it, is not this box's.
+    hida_resolv="$(mnl session exec "$hida_sid" 'cat /etc/resolv.conf' \
+      2>"$WORK/hida-resolv.err")" || {
+      echo "::error::reading /etc/resolv.conf inside the box failed"
+      cat "$WORK/hida-resolv.err" 2>/dev/null || true
+      fail
+    }
+    if ! printf '%s\n' "$hida_resolv" | grep -qx 'nameserver 127.0.0.1'; then
+      echo "::error::the deny-all box's resolv.conf does not name the answerer's address as its one nameserver:"
+      printf '%s\n' "$hida_resolv"
+      fail
+    fi
+    hida_host_ns="$(grep -m1 '^nameserver' /etc/resolv.conf 2>/dev/null || true)"
+    echo "resolver: the box's /etc/resolv.conf names 127.0.0.1 alone — the answerer's address, the one destination its deny chain admits — while the host's own first nameserver is '${hida_host_ns:-none}'"
+
+    # ---- the box's own connections, each printed with its verdict. First
+    # its own name: the lookup must answer through the answerer (its only
+    # resolver, reached through the table's DNS retarget), and the connect
+    # must then be refused — a deny-all box serves what reaches it, but
+    # opens nothing. Port 9 is the discard port, an address with nothing
+    # listening, so the connect alone is what this beat reads.
+    mnl session exec "$hida_sid" \
+      "curl -sSv -o /dev/null --max-time 5 http://e2e-hida.min.internal:9/" \
+      >"$WORK/hida-ctrl-name.out" 2>"$WORK/hida-ctrl-name.err"
+    hida_rc=$?
+    hida_err="$(cat "$WORK/hida-ctrl-name.err" 2>/dev/null || true)"
+    if [[ "$hida_err" != *"Trying 127.0.0.1"* ]]; then
+      echo "::error::the box's own name did not resolve to the answerer's address: the lookup never reached the answerer, so the resolver the box was given is not the one it reaches"
+      printf '%s\n' "$hida_err"
+      fail
+    fi
+    if [[ "$hida_err" == *"Connected to"* ]]; then
+      echo "::error::the box's connection to its own name completed: the loaded table did not refuse a connection the box opened itself"
+      printf '%s\n' "$hida_err"
+      fail
+    fi
+    hida_tail="$(printf '%s\n' "$hida_err" | tail -n1)"
+    echo "verdict: GET http://e2e-hida.min.internal:9/ from the box — the name resolved to 127.0.0.1 through the answerer (the one resolver the box has, reached through the table's DNS retarget) and the connect was refused (rc=$hida_rc, ${hida_tail:-no detail})"
+
+    # A name outside the box zone: the answerer is authoritative for the
+    # box zone and refuses everything else, and the box has no other
+    # resolver — so the lookup itself must fail, never reach a connect.
+    mnl session exec "$hida_sid" \
+      "curl -sSv -o /dev/null --max-time 10 http://example.com/" \
+      >"$WORK/hida-ctrl-outzone.out" 2>"$WORK/hida-ctrl-outzone.err"
+    hida_rc=$?
+    hida_err="$(cat "$WORK/hida-ctrl-outzone.err" 2>/dev/null || true)"
+    if [[ "$hida_err" != *"Could not resolve"* ]]; then
+      echo "::error::the out-of-zone name did not fail at resolution: the box resolved a name the answerer refuses, so something other than the answerer resolved for it"
+      printf '%s\n' "$hida_err"
+      fail
+    fi
+    hida_tail="$(printf '%s\n' "$hida_err" | grep -i 'could not resolve' | head -n1)"
+    echo "verdict: GET http://example.com/ from the box — did not resolve (the answerer refuses every name outside the box zone, and the box has no other resolver): ${hida_tail:-no detail} (rc=$hida_rc)"
+
+    # The answerer's own port, over the wrong protocol: the chain's
+    # carve-out is UDP alone, so even the one address it admits refuses a
+    # connection the box opens itself.
+    mnl session exec "$hida_sid" \
+      "curl -sSv -o /dev/null --max-time 5 http://127.0.0.1:7656/" \
+      >"$WORK/hida-ctrl-ans.out" 2>"$WORK/hida-ctrl-ans.err"
+    hida_rc=$?
+    hida_err="$(cat "$WORK/hida-ctrl-ans.err" 2>/dev/null || true)"
+    if [[ "$hida_err" == *"Connected to"* ]]; then
+      echo "::error::the box completed a TCP connection to the answerer's port: the deny chain's carve-out admitted more than the resolver's DNS"
+      printf '%s\n' "$hida_err"
+      fail
+    fi
+    hida_tail="$(printf '%s\n' "$hida_err" | tail -n1)"
+    echo "verdict: connect to 127.0.0.1:7656 (the answerer's own port, over TCP) from the box — refused (rc=$hida_rc, ${hida_tail:-no detail}): the carve-out is the resolver's DNS alone"
+
+    # The hostname proxy's port — a Minimal-owned listener beside the
+    # answerer: only the replies to connections IT opens are admitted,
+    # never a connection the box opens.
+    mnl session exec "$hida_sid" \
+      "curl -sSv -o /dev/null --max-time 5 http://127.0.0.1:$hida_proxy_port/" \
+      >"$WORK/hida-ctrl-proxy.out" 2>"$WORK/hida-ctrl-proxy.err"
+    hida_rc=$?
+    hida_err="$(cat "$WORK/hida-ctrl-proxy.err" 2>/dev/null || true)"
+    if [[ "$hida_err" == *"Connected to"* ]]; then
+      echo "::error::the box completed a TCP connection to the hostname proxy's port: the deny chain admitted a connection the box opened itself"
+      printf '%s\n' "$hida_err"
+      fail
+    fi
+    hida_tail="$(printf '%s\n' "$hida_err" | tail -n1)"
+    echo "verdict: connect to the hostname proxy at 127.0.0.1:$hida_proxy_port from the box — refused (rc=$hida_rc, ${hida_tail:-no detail}): only reply-direction traffic is admitted"
+
+    # An undeclared address, the daemon-fetch case's own judge, before the
+    # fetch below: the box's own connection must not complete, so the
+    # refusal reads as the table's verdict and not the weather's.
+    mnl session exec "$hida_sid" \
+      "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://1.1.1.1" \
+      >"$WORK/hida-ctrl-before.out" 2>"$WORK/hida-ctrl-before.err"
+    hida_rc=$?
+    hida_status="$(cat "$WORK/hida-ctrl-before.out" 2>/dev/null)"
+    if [ "$hida_rc" -eq 0 ] \
+       || { [ -n "$hida_status" ] && [ "$hida_status" != "HTTP:000" ]; }; then
+      echo "::error::the deny-all box completed a connection to 1.1.1.1:443 (rc=$hida_rc, $hida_status): the loaded table did not refuse the connection its deny chain owns"
+      cat "$WORK/hida-ctrl-before.err" 2>/dev/null || true
+      fail
+    fi
+    hida_tail="$(printf '%s\n' "$(cat "$WORK/hida-ctrl-before.err" 2>/dev/null || true)" | tail -n1)"
+    echo "verdict: the box's own connection to 1.1.1.1:443 did not complete (rc=$hida_rc, ${hida_status:-no status}, ${hida_tail:-no detail}) — the deny chain's verdict on a connection the box opened itself"
+
+    # ---- the cgroup half: the box cannot leave its leaf. Its own view
+    # first — the cover the launch mounted over the tree the join went
+    # through, named by the marker the box's own environment carries, and
+    # the cgroup namespace root its /proc reports (the sandbox unshares a
+    # PID namespace too — hakoniwa's Container::new does — so the pid an
+    # exec prints below is its box pid, matched to the host-side tree by
+    # NSpid).
+    #
+    # The marker is set in the launch's pre-exec closure, so it lives in the
+    # environment of the box's launched process and what that process
+    # spawns. A `session exec` is injected beside it with the environment the
+    # daemon builds for it, never inheriting the launch's, so it is read
+    # where it lives: the environ of the leaf's members, as root (the leaf
+    # and those processes are the tree's and the box's, not this account's).
+    hida_cover="" hida_cover_pid=""
+    for hida_pid_m in $(sudo -n cat "/sys/fs/cgroup/minimald.slice/boxes/deny/$hida_sid/cgroup.procs" \
+        2>/dev/null || true); do
+      hida_cover="$(sudo -n cat "/proc/$hida_pid_m/environ" 2>/dev/null | tr '\0' '\n' \
+        | sed -n 's/^MINIMAL_CLASSIFIER_COVER=//p' | head -n1 || true)"
+      if [ -n "$hida_cover" ]; then hida_cover_pid="$hida_pid_m"; break; fi
+    done
+    case "$hida_cover" in
+      cgroup2 | tmpfs-fallback) ;;
+      *)
+        echo "::error::no process in the box's leaf boxes/deny/$hida_sid carries a classifier cover in its environment (MINIMAL_CLASSIFIER_COVER='$hida_cover'): the cover is the one fact the box can report for itself"
+        fail
+        ;;
+    esac
+    echo "cover marker: the box's launched process (pid $hida_cover_pid, a member of its leaf) carries MINIMAL_CLASSIFIER_COVER=$hida_cover in its own environment"
+    hida_cgroup="$(mnl session exec "$hida_sid" 'cat /proc/self/cgroup' \
+      2>"$WORK/hida-cgroup.err")" || {
+      echo "::error::reading /proc/self/cgroup inside the box failed"
+      cat "$WORK/hida-cgroup.err" 2>/dev/null || true
+      fail
+    }
+    if [ "$(printf '%s\n' "$hida_cgroup" | tail -n1)" != "0::/" ]; then
+      echo "::error::the box does not read its cgroup namespace root as its cgroup: $hida_cgroup"
+      fail
+    fi
+    echo "cgroup view: the box reads its own cgroup as 0::/ — the namespace root its leaf became when the launch unshared onto it"
+
+    # The write that would move the box: through the cover it is refused
+    # (a read-only mount under the design's cover; no such file under the
+    # recorded fallback's empty one) — and a sibling leaf's path does not
+    # resolve at all, because the cover is the box's whole view of the
+    # hierarchy.
+    mnl session exec "$hida_sid" \
+      'echo $$ > /sys/fs/cgroup/cgroup.procs; echo "write-rc=$?"' \
+      >"$WORK/hida-cgroup-write.out" 2>"$WORK/hida-cgroup-write.err"
+    hida_rc=$?
+    if [ "$hida_rc" -ne 0 ]; then
+      echo "::error::the in-box cgroup write probe itself failed (rc=$hida_rc)"
+      cat "$WORK/hida-cgroup-write.err" 2>/dev/null || true
+      fail
+    fi
+    hida_write="$(cat "$WORK/hida-cgroup-write.out" 2>/dev/null || true)"
+    case "$hida_write" in
+      write-rc=0)
+        echo "::error::the box wrote its own cgroup.procs: it can migrate out of the leaf its verdict is decided on"
+        fail
+        ;;
+      write-rc=[1-9]*)
+        hida_write_msg="$(head -n1 "$WORK/hida-cgroup-write.err" 2>/dev/null || true)"
+        echo "verdict: the box's own write into /sys/fs/cgroup/cgroup.procs was refused (${hida_write_msg:-rc nonzero}), under the $hida_cover cover — no migration the box itself can make"
+        ;;
+      *)
+        echo "::error::the in-box cgroup write probe printed no rc: '$hida_write'"
+        cat "$WORK/hida-cgroup-write.err" 2>/dev/null || true
+        fail
+        ;;
+    esac
+    mnl session exec "$hida_sid" \
+      'test -e /sys/fs/cgroup/boxes; echo "sibling-rc=$?"' \
+      >"$WORK/hida-cgroup-sib.out" 2>/dev/null
+    hida_rc=$?
+    hida_sib="$(cat "$WORK/hida-cgroup-sib.out" 2>/dev/null || true)"
+    if [ "$hida_rc" -ne 0 ] || [ "$hida_sib" != "sibling-rc=1" ]; then
+      echo "::error::the box still sees a sibling path under /sys/fs/cgroup (probe rc=$hida_rc, $hida_sib): the cover hides the tree the join went through"
+      fail
+    fi
+    echo "verdict: /sys/fs/cgroup/boxes does not exist inside the box — the cohort its leaf lives in is not a path the box can open"
+    if [ "$hida_cover" = cgroup2 ]; then
+      if ! mnl session exec "$hida_sid" 'cat /sys/fs/cgroup/memory.max' \
+          >"$WORK/hida-cgroup-memory.out" 2>/dev/null; then
+        echo "::error::the design's cover does not show the box its own cgroup files (/sys/fs/cgroup/memory.max)"
+        fail
+      fi
+      echo "cover: the design's cgroup2 cover — the box reads its own memory.max through the namespace root, and nothing else's"
+    else
+      echo "cover: the recorded tmpfs fallback — the box's tree view is an empty read-only mount, marked MINIMAL_CLASSIFIER_COVER=tmpfs-fallback in its own environment"
+    fi
+
+    # And the host-side twin: the box's own processes ARE members of the
+    # leaf its verdict is decided on. An exec prints its own pid and holds
+    # itself alive for the read; the leaf is read as root, because cgroup
+    # membership files are the tree's, not this account's, on every host.
+    # The hold is bash's own timed read on a pipe it keeps both ends of, so
+    # it needs no `sleep` binary in the box. The pid the exec prints is its
+    # pid in the box's PID namespace (hakoniwa's Container::new unshares it,
+    # and the shim joins it), while the leaf lists host pids — so the
+    # member is matched by the innermost NSpid its host /proc status names.
+    : >"$WORK/hida-exec-pid.out"
+    mnl session exec "$hida_sid" 'echo $$; read -rt 6 _ <> <(:) || :' \
+      >"$WORK/hida-exec-pid.out" 2>/dev/null &
+    hida_exec_client=$!
+    hida_exec_pid=""
+    for _ in $(seq 1 24); do
+      hida_exec_pid="$(head -n1 "$WORK/hida-exec-pid.out" 2>/dev/null || true)"
+      [ -n "$hida_exec_pid" ] && break
+      sleep 0.25
+    done
+    if [ -z "$hida_exec_pid" ]; then
+      echo "::error::no pid from the box's own exec: the leaf-membership read has nothing to read"
+      kill -9 "$hida_exec_client" 2>/dev/null || true
+      fail
+    fi
+    hida_leaf_procs="$(sudo -n cat "/sys/fs/cgroup/minimald.slice/boxes/deny/$hida_sid/cgroup.procs" \
+      2>"$WORK/hida-leaf.err")" || {
+      echo "::error::reading the box's classifier leaf failed: /sys/fs/cgroup/minimald.slice/boxes/deny/$hida_sid/cgroup.procs"
+      cat "$WORK/hida-leaf.err" 2>/dev/null || true
+      kill -9 "$hida_exec_client" 2>/dev/null || true
+      fail
+    }
+    hida_exec_host_pid="" hida_leaf_nspids=""
+    for hida_pid_m in $hida_leaf_procs; do
+      hida_nspid="$(sudo -n cat "/proc/$hida_pid_m/status" 2>/dev/null \
+        | sed -n 's/^NSpid:[[:space:]]*//p' | tr -s '[:space:]' ' ')"
+      hida_leaf_nspids="${hida_leaf_nspids:+$hida_leaf_nspids, }$hida_pid_m=[${hida_nspid% }]"
+      # Two or more fields: a process in a nested PID namespace, the
+      # innermost of which is the pid the box's own exec printed.
+      case "$hida_nspid" in
+        *" $hida_exec_pid" | *" $hida_exec_pid ")
+          hida_exec_host_pid="$hida_pid_m"; break ;;
+      esac
+    done
+    if [ -z "$hida_exec_host_pid" ]; then
+      echo "::error::the box's own process (pid $hida_exec_pid in the box's PID namespace) is not a member of its classifier leaf; the leaf holds (host pid=[NSpid]): ${hida_leaf_nspids:-<empty>}"
+      kill -9 "$hida_exec_client" 2>/dev/null || true
+      fail
+    fi
+    kill -INT "$hida_exec_client" 2>/dev/null || true
+    wait "$hida_exec_client" 2>/dev/null || true
+    echo "verdict: the box's own process (pid $hida_exec_pid in the box, host pid $hida_exec_host_pid) is a member of its classifier leaf boxes/deny/$hida_sid — placed there at the launch, and every path out of it is refused or absent inside the box"
+
+    # ---- the fetch: the daemon's own package fetch still completes as
+    # node-plane traffic — the NET-080 clause that rides with this one,
+    # driven the way a person drives it, through a REAL pty attach (a pipe
+    # cannot answer the session-exit prompt), against the daemon this case
+    # started on an empty cache above, so this add had to fetch.
+    # shellcheck disable=SC2086 # E2E_MINIMAL_ARGS must word-split.
+    hida_attach_out="$(E2E_PTY_ANSWER=keep python3 "$ROOT/scripts/e2e-attach-pty.py" "$ADD_TOOL" \
+      min ${E2E_MINIMAL_ARGS:-} session attach "$hida_sid" 2>"$WORK/hida-attach.err")" || {
+      echo "::error::the pty attach to the deny-all host-address box failed"
+      echo "--- transcript ---"; printf '%s\n' "$hida_attach_out"
+      echo "--- driver stderr ---"; cat "$WORK/hida-attach.err" 2>/dev/null || true
+      fail
+    }
+    if [[ "$hida_attach_out" != *TOOL_ABSENT_BEFORE* ]]; then
+      echo "::error::'$ADD_TOOL' was already present before 'min add' (a baseline tool proves nothing)"
+      echo "--- transcript tail ---"; printf '%s\n' "$hida_attach_out" | tail -n 20
+      fail
+    fi
+    if [[ "$hida_attach_out" != *"$ADD_TOOL_MARKER"* ]]; then
+      echo "::error::in-sandbox 'min add $ADD_TOOL' did not make it runnable (no '$ADD_TOOL_MARKER'): the fetch this half is about did not complete"
+      echo "--- transcript tail ---"; printf '%s\n' "$hida_attach_out" | tail -n 20
+      echo "--- driver stderr ---"; cat "$WORK/hida-attach.err" 2>/dev/null || true
+      fail
+    fi
+    echo "fetch: 'min add $ADD_TOOL' completed inside the deny-all box and made it runnable ('$ADD_TOOL_MARKER' round-tripped) — the daemon fetched it on this same host while the box itself reaches nothing"
+
+    # ---- the node-plane record: the fetch this case pinned its daemon's
+    # cache empty for, named for this box (any earlier case whose own add
+    # fetched records a fetch of its own; this needle pins THIS box's).
+    hida_records="$(hida_log "\"box_id\":\"$hida_sid\"")"
+    if [ -z "$hida_records" ]; then
+      echo "::error::the daemon log has no record naming this box: the daemon's own fetch was not recorded"
+      fail
+    fi
+    if [[ "$hida_records" != *"node-plane traffic"* ]]; then
+      echo "::error::the records naming this box are not node-plane records: $hida_records"
+      fail
+    fi
+    if [[ "$hida_records" != *'"leaf":"daemon"'* ]]; then
+      echo "::error::the node-plane record does not name the daemon's own leaf: $hida_records"
+      fail
+    fi
+    if [[ "$hida_records" != *"\"object\":\"$ADD_TOOL"* ]]; then
+      echo "::error::the node-plane record does not name the package fetched: $hida_records"
+      fail
+    fi
+    printf '%s\n' "$hida_records" | sed 's/^/record: /'
+    echo "record: the daemon's own fetch is recorded as node-plane traffic, from its own leaf beside the cohort — this box, the package, and the host it left for"
+
+    # ---- unchanged, and refused again: the declaration reads back as it
+    # did (the client-visible spelling of the state this half loaded), and
+    # the box's own connect is refused after the daemon's fetch completed
+    # on this same host — the reach control that makes the refusal the
+    # table's verdict and not the weather's.
+    hida_policy="$(mnl session policy "$hida_sid" 2>"$WORK/hida-policy.err")" || {
+      echo "::error::'min session policy' failed for the host-address box"
+      cat "$WORK/hida-policy.err" 2>/dev/null || true
+      fail
+    }
+    if ! printf '%s\n' "$hida_policy" | grep -qx '  deny-all'; then
+      echo "::error::the box's policy does not read back the deny-all declaration it was activated with (a bare deny-all row)"
+      printf '%s\n' "$hida_policy"
+      fail
+    fi
+    if [[ "$hida_policy" != *"per-box enforcement  per_box"* ]]; then
+      echo "::error::the box's policy does not say per_box beside its rules"
+      printf '%s\n' "$hida_policy"
+      fail
+    fi
+    echo "policy: the box's deny-all declaration reads back deny-all, with per-box enforcement per_box beside it — unchanged by the fetch that completed inside it"
+    mnl session exec "$hida_sid" \
+      "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://1.1.1.1" \
+      >"$WORK/hida-ctrl-after.out" 2>"$WORK/hida-ctrl-after.err"
+    hida_rc=$?
+    hida_status="$(cat "$WORK/hida-ctrl-after.out" 2>/dev/null)"
+    if [ "$hida_rc" -eq 0 ] \
+       || { [ -n "$hida_status" ] && [ "$hida_status" != "HTTP:000" ]; }; then
+      echo "::error::the box completed a connection to 1.1.1.1:443 after the daemon's own fetch completed on this same host (rc=$hida_rc, $hida_status): the refusal cannot be the weather's — the loaded table is not deciding this box's connection"
+      cat "$WORK/hida-ctrl-after.err" 2>/dev/null || true
+      fail
+    fi
+    hida_tail="$(printf '%s\n' "$(cat "$WORK/hida-ctrl-after.err" 2>/dev/null || true)" | tail -n1)"
+    echo "verdict: the box's own connection to 1.1.1.1:443 did not complete after the fetch completed (rc=$hida_rc, ${hida_status:-no status}, ${hida_tail:-no detail}) — the deny chain still owns the box's own connections"
+
+    # ---- this half's own uninstall, and the check that it took: the
+    # daemon-fetch case's own gate runs right after this one on the whole
+    # lane, and a residue here would read as a host install there.
+    if ! hida_unwind; then
+      echo "::error::the uninstall could not remove this case's classifier tree — a live leaf or process still holds it"
+      fail
+    fi
+    HIDA_CLASSIFIER_INSTALLED=""
+    if [ -e /sys/fs/cgroup/minimald.slice ]; then
+      echo "::error::the classifier tree is still at /sys/fs/cgroup/minimald.slice after the uninstall"
+      fail
+    fi
+    rm -rf "$HIDA_SEED_DIR"; HIDA_SEED_DIR=""
+    echo "cleanup: the tree and the table this case installed are gone; the host is as this case found it"
+  fi
+
+  # ---- the unenforced half: the host as this case leaves it. A fresh
+  # daemon under this case's record filter — the decided half stopped the
+  # placed one and its uninstall removed the tree; on a host whose gates
+  # never let the decided half run, the daemon that was running was the
+  # lane's own, under the lane's filter — then the same deny-all
+  # declaration, and the advisory NET-079 owes a native host that cannot
+  # decide per box.
+  mnl stop --force >/dev/null 2>&1 || true
+  if ! RUST_LOG="$hida_rust_log" mnl ls >/dev/null 2>"$WORK/hida-unwarm.err"; then
+    echo "::error::the unenforced half's daemon did not come up under this case's record filter"
+    cat "$WORK/hida-unwarm.err" 2>/dev/null || true
+    fail
+  fi
+  HIDA_UNENFORCED_SEED_DIR="$(hook_mktemp /tmp/mnlhidau.XXXXXX)"
+  hook_seed_preamble >"$HIDA_UNENFORCED_SEED_DIR/minimal.toml"
+  mkdir "$HIDA_UNENFORCED_SEED_DIR/.git"
+
+  # The activation: never refused on the classifier's ground — a host that
+  # cannot decide per box keeps the requirement's exception and runs the
+  # box unenforced — and its stderr carries the advisory that says so.
+  hida_un_sid="$(cd "$HIDA_UNENFORCED_SEED_DIR" && mnl session activate . --no-prompt \
+    --name e2e-hida-unenforced --network host_ip --deny-all-egress \
+    2>"$WORK/hida-un-activate.err")" || {
+    echo "::error::'min session activate --network host_ip --deny-all-egress' was refused on a host that cannot decide per box: the requirement's exception keeps the box running unenforced, never refused on that ground"
+    cat "$WORK/hida-un-activate.err" 2>/dev/null || true
+    fail
+  }
+  hida_un_sid="$(printf '%s\n' "$hida_un_sid" | tail -n1 | tr -d '\r')"
+  hida_un_activate_err="$(cat "$WORK/hida-un-activate.err" 2>/dev/null || true)"
+  if [[ "$hida_un_activate_err" != *"note: this host cannot decide a host-address box's egress verdict per box:"* ]]; then
+    echo "::error::the activation's stderr carries no classifier advisory: a native host that cannot decide per box owes the session start the cause in words"
+    printf '%s\n' "$hida_un_activate_err"
+    fail
+  fi
+  if [[ "$hida_un_activate_err" != *"While it cannot, its host-address boxes run unenforced"* ]]; then
+    echo "::error::the advisory does not say the boxes run unenforced — the outcome a native host's advisory owes"
+    printf '%s\n' "$hida_un_activate_err"
+    fail
+  fi
+  if [[ "$hida_un_activate_err" != *"whatever the boxes' declarations say"* ]]; then
+    echo "::error::the advisory does not carry the clause that says the declaration is not what is running here"
+    printf '%s\n' "$hida_un_activate_err"
+    fail
+  fi
+
+  # ---- the daemon's word on the same start: the create record carries the
+  # advisory whole beside its cause, and the launch record says the box ran
+  # unenforced — the lines a diagnostics bundle's daemon-log tail would
+  # carry for exactly this session (the task's diagnostics clause).
+  hida_un_records="$(hida_log "\"session_id\":\"$hida_un_sid\"")"
+  if [ -z "$hida_un_records" ]; then
+    echo "::error::the daemon log has no record naming this box's create: the advisory a create carries was not recorded"
+    fail
+  fi
+  hida_un_create="$(printf '%s\n' "$hida_un_records" | grep -F 'session create carried the classifier advisory' | head -n1)"
+  if [ -z "$hida_un_create" ]; then
+    echo "::error::no create record carrying the classifier advisory names this box"
+    printf '%s\n' "$hida_un_records"
+    fail
+  fi
+  if [[ "$hida_un_create" != *'"advisory":'* ]]; then
+    echo "::error::the create record carries no advisory field: the daemon log must show the advisory this start printed: $hida_un_create"
+    fail
+  fi
+  # The cause, from the record's own field — the two a native host's start
+  # can carry, each with its own rule for the install command: the missing
+  # step names the one command that ends it, a mount that cannot confine a
+  # box names none (installing the step over that tree would leave the
+  # cause standing). The stderr advisory must name the same cause, and its
+  # install command must follow the same rule.
+  hida_un_cause=""
+  case "$hida_un_create" in
+    *"the classifier's privileged step is not installed on this host"*)
+      hida_un_cause="the classifier's privileged step is not installed on this host"
+      ;;
+    *"no cgroup2 mount with nsdelegate covers the classifier tree"*)
+      hida_un_cause="no cgroup2 mount with nsdelegate covers the classifier tree, so a box could migrate out of its leaf"
+      ;;
+    *)
+      echo "::error::the create record names a cause this case does not know (a native start can carry the missing step or the mount that cannot confine, and the probe causes would have refused the box): $hida_un_create"
+      fail
+      ;;
+  esac
+  if [[ "$hida_un_activate_err" != *"$hida_un_cause"* ]]; then
+    echo "::error::the advisory's cause does not match the create record's own (expected: $hida_un_cause)"
+    printf '%s\n' "$hida_un_activate_err"
+    fail
+  fi
+  case "$hida_un_cause" in
+    "the classifier's privileged step is not installed on this host")
+      if [[ "$hida_un_activate_err" != *"install-host-classifier.sh"* ]]; then
+        echo "::error::the advisory names the missing step but not the command that installs it"
+        printf '%s\n' "$hida_un_activate_err"
+        fail
+      fi
+      echo "advisory: the cause is the missing step, and the advisory ends with the exact command that installs it"
+      ;;
+    *)
+      if [[ "$hida_un_activate_err" == *"install-host-classifier.sh"* ]]; then
+        echo "::error::the advisory names an install command for a host that cannot confine a box: installing the step over that tree would leave the cause standing"
+        printf '%s\n' "$hida_un_activate_err"
+        fail
+      fi
+      echo "advisory: the cause is the mount that cannot confine a box, and the advisory names no command — none would end it"
+      ;;
+  esac
+  printf '%s\n' "$hida_un_activate_err" | sed 's/^/  /'
+
+  # ---- the capability gate, before the records it launches: a box is
+  # launched on its FIRST use, not at the activate, so the exec below is
+  # what makes the launch this half's records name happen — the same order
+  # the daemon-fetch proof drives its own box in. The gate's failure does
+  # not end this half: the advisory and the create record above are this
+  # half's daemon-side proof and they are already asserted, and a host
+  # whose box dies at its first breath still writes the launch record
+  # (the placement the record names happens before the box's first process
+  # exists), so the beats below assert what a launch attempt still owes
+  # and only the connect beat — the one that needs the box ALIVE — skips.
+  hida_un_gate=""
+  if ! mnl session exec "$hida_un_sid" 'true' >"$WORK/hida-un-gate.err" 2>&1 \
+     && ! { sleep 1; mnl session exec "$hida_un_sid" 'true' >"$WORK/hida-un-gate.err" 2>&1; }; then
+    if [ -n "${CI:-}" ]; then
+      echo "::error::a CI native lane that cannot run a session sandbox cannot drive NET-079's unenforced half"
+      cat "$WORK/hida-un-gate.err" 2>/dev/null || true
+      fail
+    fi
+    hida_un_gate="1"
+    echo "::warning::the unenforced half of the host_ip_deny_all proof SKIPPED its connect beat — this host cannot run a session sandbox, so the box cannot be driven to connect"
+    echo "  (exec: $(head -n1 "$WORK/hida-un-gate.err" 2>/dev/null || true))"
+    echo "  the launch the exec attempt drove still writes the records below, and they are asserted; the connect beat is asserted on the native CI lane"
+  fi
+
+  # ---- the unenforced launch record: the daemon's own word beside the
+  # advisory the start printed — the line a diagnostics bundle's
+  # daemon-log tail would carry for exactly this session. Written by the
+  # launch the exec just drove, so a host whose box never even reached its
+  # placement leaves none; there the beats that read it degrade to a note
+  # (there is no launch to assert, and a spurious failure off CI would
+  # read as the proof's), while a gate that PASSED with no record is a
+  # defect, on any host.
+  hida_un_launch="$(hida_log "the session's host-address box runs unenforced on this host")"
+  if [ -z "$hida_un_launch" ]; then
+    if [ -z "$hida_un_gate" ]; then
+      echo "::error::the daemon log has no unenforced launch record: the launch the exec drove wrote none"
+      fail
+    fi
+    echo "note: the launch attempt left no unenforced launch record — the box never reached its placement; the record and the reads below it are asserted on the native CI lane"
+  else
+    if [[ "$hida_un_launch" != *'"session":"e2e-hida-unenforced"'* ]]; then
+      echo "::error::the unenforced launch record does not name this session: $hida_un_launch"
+      fail
+    fi
+    if [[ "$hida_un_launch" != *'"host_ip_enforcement":"none"'* ]]; then
+      echo "::error::the launch record does not say host_ip_enforcement=none: $hida_un_launch"
+      fail
+    fi
+    printf '%s\n' "$hida_un_launch" | sed 's/^/record: /'
+    echo "record: the session's host-address box runs unenforced on this host (host_ip_enforcement=none) — the daemon's own word beside the advisory the start printed"
+  fi
+
+  # ---- the client-visible state, and then the proof the box really did run
+  # unenforced: its own connection to an undeclared address completes. The
+  # state is the policy readback — the declaration as the CLI shows it,
+  # with the enforcement this host actually gave it — and it reads the
+  # session's record, which the launch above wrote its outcome on, so a
+  # launch that never happened leaves it nothing to say (and it degrades
+  # with the record above). The host's own connect to the same address is
+  # the control for the connect — the egress proof's weather rule: a lane
+  # without external reach degrades that one beat to a note, and the
+  # records above still carry the unenforced fact.
+  if [ -n "$hida_un_launch" ]; then
+    hida_un_policy="$(mnl session policy "$hida_un_sid" 2>"$WORK/hida-un-policy.err")" || {
+      echo "::error::'min session policy' failed for the unenforced box"
+      cat "$WORK/hida-un-policy.err" 2>/dev/null || true
+      fail
+    }
+    if ! printf '%s\n' "$hida_un_policy" | grep -qx '  deny-all'; then
+      echo "::error::the unenforced box's policy does not read back its deny-all declaration (a bare deny-all row)"
+      printf '%s\n' "$hida_un_policy"
+      fail
+    fi
+    if [[ "$hida_un_policy" != *"per-box enforcement  none"* ]]; then
+      echo "::error::the unenforced box's policy does not say none beside its rules"
+      printf '%s\n' "$hida_un_policy"
+      fail
+    fi
+    echo "policy: the box's deny-all declaration reads back deny-all, with per-box enforcement none beside it — the declaration ran, on a host that cannot decide it per box"
+  fi
+  if [ -n "$hida_un_gate" ]; then
+    echo "note: the box's own connect is skipped with the sandbox it needs — this half's proof here is the advisory, the create record, the launch record and the policy readback above"
+  else
+    curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://1.1.1.1 \
+      >"$WORK/hida-un-host.out" 2>"$WORK/hida-un-host.err"
+    hida_host_rc=$?
+    hida_host_status="$(cat "$WORK/hida-un-host.out" 2>/dev/null)"
+    if [ "$hida_host_rc" -eq 0 ] \
+       || { [ -n "$hida_host_status" ] && [ "$hida_host_status" != "HTTP:000" ]; }; then
+      # The lane reaches the address from here: the box must too — its
+      # declaration is not being enforced against it.
+      mnl session exec "$hida_un_sid" \
+        "curl -sS -o /dev/null -w 'HTTP:%{http_code}' --max-time 10 https://1.1.1.1" \
+        >"$WORK/hida-un-ctrl.out" 2>"$WORK/hida-un-ctrl.err"
+      hida_un_rc=$?
+      hida_un_status="$(cat "$WORK/hida-un-ctrl.out" 2>/dev/null)"
+      if [ "$hida_un_rc" -eq 0 ] \
+         || { [ -n "$hida_un_status" ] && [ "$hida_un_status" != "HTTP:000" ]; }; then
+        echo "verdict: the unenforced box's own connection to 1.1.1.1:443 completed (rc=$hida_un_rc, ${hida_un_status:-no status}) — the declaration runs unenforced, exactly as the advisory said (the host's own control: rc=$hida_host_rc, $hida_host_status)"
+      else
+        echo "::error::the unenforced box's connection to 1.1.1.1:443 did not complete (rc=$hida_un_rc, ${hida_un_status:-no status}) while the host's own did (rc=$hida_host_rc, $hida_host_status): the box is not running unenforced — its own declaration is being enforced against it"
+        cat "$WORK/hida-un-ctrl.err" 2>/dev/null || true
+        fail
+      fi
+    else
+      echo "note: this lane's own connect to 1.1.1.1:443 did not complete (rc=$hida_host_rc, ${hida_host_status:-no status}), so the unenforced box's connect is skipped as weather — the advisory, the create record and the unenforced launch record above are this half's proof"
+    fi
+  fi
+
+  mnl session destroy --force "$hida_un_sid" >/dev/null 2>&1 || true
+  rm -rf "$HIDA_UNENFORCED_SEED_DIR"; HIDA_UNENFORCED_SEED_DIR=""
+  echo "unenforced: the host that cannot decide per box said why at the session start, named its cause and the state it left the box in, and ran the box unenforced — never refused on that ground"
+  echo "host-address boxes under deny-all OK (NET-079: on a host that decides per box, a deny-all host-address box reaches only the answerer Minimal owns for it and cannot leave its classifier leaf, while the daemon's own package fetch on the same host completes and is recorded as node-plane traffic; on a native host that cannot decide per box, the session start says why in the advisory and the box runs unenforced)"
   echo "::endgroup::"
 }
 
@@ -7135,10 +8147,16 @@ proof_hostnames_recover_and_two_daemons_route() {
   # Whether 127.0.0.1:$1 is free to bind — the probe that picks the pin,
   # then confirms the holder took it. Deliberately a bind probe, not a
   # connect one: a held-but-never-listening socket is exactly the situation
-  # beat A stages.
+  # beat A stages. It binds with SO_REUSEADDR, as the daemon's own bind does
+  # (crates/minimald/src/net/proxy.rs `bind_listener`), so "free" means what
+  # the daemon would find: the TIME_WAIT sockets a stopped daemon's accepted
+  # connections leave on 7654 do not read as busy here while the daemon
+  # binds over them, and only a live listener does. The holders set it too,
+  # so they can take a port such leftovers still sit on.
   recover_port_free() {
     python3 -c 'import socket,sys
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
     s.bind(("127.0.0.1", int(sys.argv[1])))
 except OSError:
@@ -7365,6 +8383,7 @@ s.close()' "$1"
 
   python3 -c 'import socket,sys,time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", int(sys.argv[1])))
 s.listen(1)
 while True:
@@ -7563,6 +8582,7 @@ while True:
   if [ "$RECOVER_PIN" != 7654 ] && recover_port_free 7654; then
     python3 -c 'import socket,sys,time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", 7654))
 s.listen(1)
 while True:
@@ -16676,6 +17696,15 @@ case "${1:-}" in
     # are INFO, which the lane's default filter drops), and the daemon-fetch
     # proof respawns the pair again for its own needs.
     proof_escape_reaches_only_declared_union
+    # Second-to-last on purpose, for the same reasons the daemon-fetch proof
+    # below is last: it installs its own host classifier tree and table (its
+    # own, removed before it returns) and respawns the daemon pair under its
+    # own record filter, so nothing after it may rely on the lane's daemon or
+    # the host's packet filter as it found them — and it must run BEFORE the
+    # daemon-fetch proof because that proof's gates refuse a host that
+    # already carries a classifier install, and a residue here would read as
+    # one there.
+    proof_host_ip_deny_all
     # Last on purpose: the daemon-fetch proof installs a host classifier
     # tree and table (its own, removed before it returns) and stops the
     # daemon to place a fresh one inside the tree, so nothing after it may
@@ -16703,6 +17732,7 @@ case "${1:-}" in
     | proxy_sees_boxes_by_address \
     | published_proxy_routes_from_host \
     | escape_reaches_only_declared_union \
+    | host_ip_deny_all \
     | daemon_fetch_under_deny_all_host_address_box)
     "proof_$1"
     ;;
@@ -16731,6 +17761,7 @@ case "${1:-}" in
     echo "         proxy_sees_boxes_by_address"
     echo "         published_proxy_routes_from_host"
     echo "         escape_reaches_only_declared_union"
+    echo "         host_ip_deny_all"
     echo "         daemon_fetch_under_deny_all_host_address_box"
     exit 2
     ;;
