@@ -962,7 +962,14 @@ async fn policy_json_carries_schema_and_pending() {
         pending: None,
     };
     let mut out = Vec::new();
-    write_policy_json(&mut out, &policy, sessions::NetworkMode::OwnIp, None, &[pre_field]).unwrap();
+    write_policy_json(
+        &mut out,
+        &policy,
+        sessions::NetworkMode::OwnIp,
+        None,
+        &[pre_field],
+    )
+    .unwrap();
     let document: Value = serde_json_lenient::from_slice(&out).unwrap();
     let rows = document["live_ingress"]
         .as_array()

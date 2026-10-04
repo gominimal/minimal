@@ -1693,17 +1693,14 @@ mod tests {
         // key: it decodes as `None` — unknown, the renderings' own spelling
         // — never as the reachable reading a missing key could default
         // itself into.
-        let mut pre_field: serde_json_lenient::Value =
-            serde_json_lenient::from_str(&json).unwrap();
+        let mut pre_field: serde_json_lenient::Value = serde_json_lenient::from_str(&json).unwrap();
         pre_field
             .as_object_mut()
             .expect("a mapping encodes as an object")
             .remove("pending");
-        let decoded: LiveMapping = serde_json_lenient::from_str(&serde_json_lenient::to_string(
-            &pre_field,
-        )
-        .unwrap())
-        .unwrap();
+        let decoded: LiveMapping =
+            serde_json_lenient::from_str(&serde_json_lenient::to_string(&pre_field).unwrap())
+                .unwrap();
         assert_eq!(
             decoded.pending, None,
             "a pre-field reply decodes as unknown, not as not-pending: {json}"

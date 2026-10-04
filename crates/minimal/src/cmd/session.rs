@@ -3286,7 +3286,9 @@ mod tests {
         write_live_ingress(&mut out, std::slice::from_ref(&decoded)).unwrap();
         let rendered = String::from_utf8(out).unwrap();
         assert!(
-            rendered.contains("  tcp  127.0.64.21:3000 → :3000  (unknown; daemon predates this field)\n"),
+            rendered.contains(
+                "  tcp  127.0.64.21:3000 → :3000  (unknown; daemon predates this field)\n"
+            ),
             "a mapping the daemon could not classify reads as unknown, not as reachable: {rendered}"
         );
 
@@ -3308,10 +3310,9 @@ mod tests {
     /// `main`'s own tests, since writing it is the emitter's job now.
     #[test]
     fn policy_json_failures_map_to_the_machine_mode_payload() {
-        let missing = PolicyJsonFailure::SessionNotFound(
-            "No session found matching 'gone'".to_string(),
-        )
-        .machine_failure();
+        let missing =
+            PolicyJsonFailure::SessionNotFound("No session found matching 'gone'".to_string())
+                .machine_failure();
         assert_eq!(
             missing.code(),
             "not_found",
