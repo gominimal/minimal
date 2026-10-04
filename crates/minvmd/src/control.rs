@@ -59,7 +59,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use minimald_rpc::{
-    BoxAddresses, BoxControlReply, BoxControlRequest, RegisterBoxRequest, WithdrawBoxRequest,
+    BoxAddresses, BoxControlReply, BoxControlRequest, RegisterBoxRequest, RegisteredBox,
+    WithdrawBoxRequest,
 };
 
 use crate::box_registry::{BoxRegistry, ClientBoxSpec};
@@ -327,10 +328,11 @@ fn parse_request(line: &str) -> Result<BoxControlRequest, serde_json_lenient::Er
     serde_json_lenient::from_str(line)
 }
 
-/// Allocate the box into the table and write the reply — the addresses on
-/// success, the reason on a refusal. One info line per registration names
-/// the box, both addresses and the declared egress the row carries: the
-/// diagnostic a bundle's VM host daemon log is read for.
+/// Allocate the box into the table and write the reply — the addresses and
+/// the box id on success, the reason on a refusal. One info line per
+/// registration names the box, its id, both addresses and the declared
+/// egress the row carries: the diagnostic a bundle's VM host daemon log is
+/// read for.
 fn register_and_reply(
     stream: &mut UnixStream,
     boxes: &BoxRegistry,
@@ -339,24 +341,36 @@ fn register_and_reply(
     // The declaration as the row received it; `null` for a box with no
     // egress section. A plain struct of strings serialises infallibly.
     let declared_egress = serde_json_lenient::to_string(&request.egress).unwrap_or_default();
+    // The box's id: the one the client held — a re-registration
+    // presenting the identity its first registration created — or a
+    // fresh UUIDv7 minted here for this creation (BEP-070), minted
+    // before anything is allocated so the row, the reply and the
+    // attachment the row issues all hold the one identity.
+    let box_id = request.box_id.map_or_else(
+        crate::bep_attach::mint_box_id,
+        minimald_rpc::BoxId::to_bytes,
+    );
     let spec = ClientBoxSpec {
         name: request.name.clone(),
         ingress_ports: request.ingress_ports,
         egress: request.egress,
         credentialed_upstream: request.credentialed_upstream,
+        box_id: Some(box_id),
     };
     let reply = match boxes.register_client_box(spec) {
         Ok(record) => {
             tracing::info!(
                 box = %record.name(),
+                box_id = %crate::bep_attach::BoxIdText(&record.box_id()),
                 switch_address = %record.switch_addr(),
                 loopback_address = %record.loopback_addr(),
                 egress = %declared_egress,
                 "registered box with the VM host daemon; addresses allocated"
             );
-            BoxControlReply::Addresses(BoxAddresses {
+            BoxControlReply::Registered(RegisteredBox {
                 switch_address: record.switch_addr(),
                 loopback_address: record.loopback_addr(),
+                box_id: minimald_rpc::BoxId::from_bytes(record.box_id()),
             })
         }
         Err(error) => {

@@ -45,6 +45,8 @@ use sessions::core::egress::EgressRules;
 use sessions::core::zone_answer;
 use switch::SwitchSubnet;
 
+use crate::bep_attach::BoxId;
+
 /// The addresses of one relay's end, as the host reports them: the switch
 /// addresses whose relayed traffic that connection carried, for the
 /// registry to withdraw by. Reported, not held — the gate has no say over
@@ -95,6 +97,7 @@ type Rows = BTreeMap<[u8; 4], Arc<BoxRecord>>;
 #[derive(Debug, PartialEq, Eq)]
 pub struct BoxRecord {
     name: String,
+    box_id: BoxId,
     switch_addr: Ipv4Addr,
     loopback_addr: Ipv4Addr,
     admitted_ports: Vec<u16>,
@@ -110,6 +113,19 @@ impl BoxRecord {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The box's own id (BEP-070): minted once for this creation — by
+    /// the registration that published the row, or taken from the id a
+    /// re-registration presented — with its random bytes from the host's
+    /// OS CSPRNG. Unique per creation, so a box recreated with the same
+    /// name and addresses carries a different id, and the id never
+    /// returns to use: a revocation scoped to it stays scoped forever.
+    /// This is what the proxy's attachment names the box by and a
+    /// delivered connection's header carries (NET-133).
+    #[must_use]
+    pub fn box_id(&self) -> BoxId {
+        self.box_id
     }
 
     /// The namespace's address on the switch: the lease its frames must carry
@@ -225,6 +241,7 @@ impl BoxRecord {
 #[derive(Debug, Clone)]
 pub struct BoxRegistration {
     name: String,
+    box_id: Option<BoxId>,
     switch_addr: Ipv4Addr,
     loopback_addr: Ipv4Addr,
     admitted_ports: Vec<u16>,
@@ -237,11 +254,14 @@ impl BoxRegistration {
     /// A declaration for the namespace `name`, addressed at `switch_addr` on
     /// the switch and `loopback_addr` on the guest's loopback. The egress
     /// policy is absent (allow-all, the shipped default) until
-    /// [`with_egress_policy`](Self::with_egress_policy) declares one.
+    /// [`with_egress_policy`](Self::with_egress_policy) declares one, and
+    /// the box's id is minted at registration
+    /// ([`Self::with_box_id`] presents one instead).
     #[must_use]
     pub fn new(name: impl Into<String>, switch_addr: Ipv4Addr, loopback_addr: Ipv4Addr) -> Self {
         Self {
             name: name.into(),
+            box_id: None,
             switch_addr,
             loopback_addr,
             admitted_ports: Vec::new(),
@@ -249,6 +269,20 @@ impl BoxRegistration {
             egress: None,
             credentialed_upstream: None,
         }
+    }
+
+    /// The box's own id, when the registering side already holds one —
+    /// the id the box's first registration minted, which a
+    /// re-registration presents so the box stays the identity it was
+    /// created as (the CLI holds one across the autospawn retry's
+    /// re-registration, NET-133). Absent lets the registration mint one
+    /// ([`crate::bep_attach::mint_box_id`]), which the published row and
+    /// its attachment then hold: an explicit registration carries no id of
+    /// its own, and a client box's first registration never does either.
+    #[must_use]
+    pub fn with_box_id(mut self, id: BoxId) -> Self {
+        self.box_id = Some(id);
+        self
     }
 
     /// The ports this namespace admitted — the ingress **and** publish
@@ -320,6 +354,14 @@ pub struct ClientBoxSpec {
     /// refused under the box-to-host default-deny. The one field a client
     /// that predates NET-134 sends absent, every time.
     pub credentialed_upstream: Option<sessions::CredentialedUpstream>,
+    /// The box's id ([`BoxId`]), when the registering client already holds
+    /// one — the id its first registration minted, which a re-registration
+    /// presents so the box stays the identity it was created as. `None`,
+    /// the default, lets the host mint one for the box; the registration
+    /// reply hands the id the published row holds back, whatever minted
+    /// it. A registration whose id a live row or attachment already holds
+    /// is refused (BEP-070): one id names one box.
+    pub box_id: Option<BoxId>,
 }
 
 /// The run of `subnet`'s address plan the host hands registered boxes from:
@@ -366,6 +408,18 @@ pub enum AllocationError {
     /// addresses.
     #[error("the address plan does not serve subnet {0}; no box address can be allocated")]
     UnplannedSubnet(SwitchSubnet),
+    /// The id the registration presented is already held by a live row or
+    /// attachment: one id names one box (BEP-070), so a box claiming
+    /// another box's identity is refused — before any address is spent,
+    /// so the refusal leaves no new fact on the host.
+    #[error(
+        "box id {} is already held by a live row or attachment",
+        crate::bep_attach::BoxIdText(&self.id)
+    )]
+    CollidingBoxId {
+        /// The id a live row or attachment already holds.
+        id: BoxId,
+    },
 }
 
 /// Why a client-driven withdrawal was refused. The pair a withdrawal
@@ -576,8 +630,17 @@ impl BoxRegistry {
             .cloned()
             .unwrap_or_default();
         let resolves_names = !dns_hosts.is_empty();
+        // The box's own id (BEP-070): the one the registration presented,
+        // or a fresh UUIDv7 minted here for this creation — never a
+        // counter, never a digest of the declaration below. Minted once,
+        // before anything else, so the row and the attachment it issues
+        // hold the one identity this registration created the box with.
+        let box_id = registration
+            .box_id
+            .unwrap_or_else(crate::bep_attach::mint_box_id);
         let record = Arc::new(BoxRecord {
             name: registration.name,
+            box_id,
             // The lease the compiled rules check is the row's own switch
             // address: the one source its frames may carry. The resolver the
             // carve-out is keyed to is the switch this registry was built for
@@ -600,21 +663,22 @@ impl BoxRegistry {
             declared_names: registration.declared_names,
         });
         // NET-133: the box's proxy attachment is issued from the row's own
-        // host facts — the name, both addresses, the id minted from them —
-        // and issued **before** the row is visible, so the proxy holds the
-        // box ahead of its first connection: the box-egress pool's
-        // listeners are partitioned by rows, a delivered connection can only
-        // exist once the row made the box a share, and the share comes a
-        // pool turn after the row. The guest node's own namespace is not a
-        // box: its row buys no share in the pool (the same one address
-        // `RegisteredBoxes` excludes) and no attachment either — the plan
-        // keeps that address outside the run every client box is handed
-        // from, so excluding it names exactly the node row.
+        // host facts — the name, both addresses, and the box's own id
+        // minted above — and issued **before** the row is visible, so the
+        // proxy holds the box ahead of its first connection: the box-egress
+        // pool's listeners are partitioned by rows, a delivered connection
+        // can only exist once the row made the box a share, and the share
+        // comes a pool turn after the row. The guest node's own namespace
+        // is not a box: its row buys no share in the pool (the same one
+        // address `RegisteredBoxes` excludes) and no attachment either —
+        // the plan keeps that address outside the run every client box is
+        // handed from, so excluding it names exactly the node row.
         if let Some(attachments) = &self.attachments
             && record.switch_addr != self.subnet.daemon_ip()
         {
             attachments.issue(
                 record.name(),
+                record.box_id(),
                 record.switch_addr,
                 record.loopback_addr,
                 record.declares_credentialed_upstream(),
@@ -713,10 +777,32 @@ impl BoxRegistry {
     /// per-box default that eventually refuses it in force is the flip that
     /// lands with the last row source (T66's follow-up), not a change this
     /// registration makes.
+    ///
+    /// A spec that presents an id of its own — the id a re-registration
+    /// holds — is refused when a live row or attachment already holds it
+    /// ([`AllocationError::CollidingBoxId`], BEP-070): one id names one
+    /// box. The refusal is decided before any address is spent, and said
+    /// as one warn line naming the id, so a tail reads which identity the
+    /// registration claimed. A spec with no id mints one
+    /// ([`crate::bep_attach::mint_box_id`]) and can never collide.
     pub fn register_client_box(
         &self,
         spec: ClientBoxSpec,
     ) -> Result<Arc<BoxRecord>, AllocationError> {
+        // One id names one box (BEP-070): the check runs before any
+        // address is spent, so a refused registration leaves nothing
+        // behind — no row, no share, no attachment, no spent address.
+        // A fresh mint never meets this refusal; what it guards is an
+        // id presented from outside.
+        if let Some(id) = spec.box_id
+            && self.holds_box_id(id)
+        {
+            tracing::warn!(
+                box_id = %crate::bep_attach::BoxIdText(&id),
+                "refused a box registration whose id a live row or attachment already holds"
+            );
+            return Err(AllocationError::CollidingBoxId { id });
+        }
         let slice = self
             .loopback_slice
             .ok_or(AllocationError::UnplannedSubnet(self.subnet))?;
@@ -737,7 +823,30 @@ impl BoxRegistry {
         if let Some(declaration) = spec.credentialed_upstream {
             registration = registration.with_credentialed_upstream(declaration);
         }
+        if let Some(id) = spec.box_id {
+            registration = registration.with_box_id(id);
+        }
         Ok(self.register(registration))
+    }
+
+    /// Whether some live row or attachment already holds `id` (BEP-070):
+    /// the collision check a client-driven registration that arrives with
+    /// an id of its own runs. The mint's ids are unique per creation, so
+    /// what this catches is an id presented from outside — a box claiming
+    /// another box's identity. Rows whose attachments are gone still hold
+    /// their ids: an id never returns to use, so a withdrawn box's identity
+    /// is as spent as the box itself.
+    fn holds_box_id(&self, id: BoxId) -> bool {
+        let rows = self
+            .rows
+            .read()
+            .expect("the row lock is never held across a panic, so it cannot be poisoned");
+        if rows.values().any(|record| record.box_id == id) {
+            return true;
+        }
+        self.attachments
+            .as_ref()
+            .is_some_and(|attachments| attachments.holds_id(id))
     }
 
     /// Withdraws the client box's row when the pair `(name, switch_addr,
@@ -1227,6 +1336,76 @@ impl BoxTable {
             // host is shutting down. Nothing to withdraw for, nowhere to
             // say so that is not noise at teardown.
         }
+    }
+}
+
+/// The registered boxes the proxy's pool partitions its listeners by
+/// (NET-132): the box rows this registry publishes — every one a
+/// host-side fact the guest never asserts — polled by the pool every
+/// stack turn, so a row that lands grows its box's share within a turn
+/// and a row that leaves takes its sockets with it. The box id a
+/// delivery's header is filled from resolves through the same source
+/// (NET-133): the attachment the source's row holds, issued by the
+/// registration and withdrawn with it.
+///
+/// The guest node namespace's row is not one of them, so it buys no
+/// share (see the [`BepBoxSource`](switch::bep_host::BepBoxSource)
+/// impl) — and it holds no attachment either, so a delivery from it
+/// names nothing. The host's own address outside the box host — the
+/// cohort address host-address boxes arrive from (NET-078) — is a row
+/// like a box's when the host published one there: its attachment is
+/// the cohort's, and a delivered connection from it carries the
+/// cohort's id.
+pub struct RegisteredBoxes {
+    /// The registry's live read-only view: every registration and
+    /// withdrawal the table sees reaches the pool through it.
+    table: BoxTable,
+    /// The proxy's attachment table: what a delivery's box id resolves
+    /// by, looked up through and never written — the registry is the one
+    /// writer (NET-133).
+    attachments: crate::bep_attach::Attachments,
+}
+
+impl RegisteredBoxes {
+    /// The source over `table`'s rows and the proxy's `attachments` —
+    /// the two tables one registry writes, handed to the supervisor
+    /// that owns both.
+    #[must_use]
+    pub fn new(table: BoxTable, attachments: crate::bep_attach::Attachments) -> Self {
+        Self { table, attachments }
+    }
+}
+
+impl switch::bep_host::BepBoxSource for RegisteredBoxes {
+    fn box_switch_addresses(&self) -> Vec<Ipv4Addr> {
+        // The guest node namespace's row is the VM's own root netns, the
+        // daemon's tap — never a box, and a share in its name would
+        // partition the pool by a row no box ever speaks from. Its
+        // address is fixed, the subnet's daemon address, which sits
+        // outside the hand-out run every client box is allocated from,
+        // so excluding that one address names exactly the node row.
+        let node_addr = self.table.subnet().daemon_ip();
+        self.table
+            .rows()
+            .iter()
+            .map(|row| row.switch_addr())
+            .filter(|addr| *addr != node_addr)
+            .collect()
+    }
+
+    fn box_id_for_source(&self, source: Ipv4Addr) -> Option<crate::bep_attach::BoxId> {
+        // The delivery's id is the box's own — resolved through the
+        // attachment its source holds, the same host-side table the row
+        // the source is keyed by came from, never a fact the flow
+        // carries. A source with no attachment — the node namespace
+        // above all, which holds none — names nothing, and the pool
+        // aborts what it accepts from it rather than deliver a
+        // connection it cannot attribute. The host's cohort row
+        // (NET-078) holds one like any box's, so a host-address box's
+        // delivery carries the cohort's own id.
+        self.attachments
+            .by_source(source.octets())
+            .map(|attachment| attachment.box_id())
     }
 }
 
