@@ -110,7 +110,7 @@ fn package_suggestions(g: &Graph, input: &str) -> Vec<String> {
 
     for name in g.names() {
         let lower = name.to_lowercase();
-        if lower == input {
+        if name == input {
             continue;
         }
         if input.starts_with(&lower) {
@@ -2007,6 +2007,43 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "No such package: zzzz (try 'min package search zzzz')"
+        );
+    }
+
+    #[test]
+    fn package_not_found_suggests_case_insensitive_match() {
+        let mut opts = decode::LoadOptions::for_test();
+        opts.minimal_lib_path = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
+            .join("../stdlib/minimal-ncl");
+
+        let layer = decode::Layer::new_for_test_with(
+            indoc! {
+                "
+                let {BuildSpec, ..} = import \"minimal.ncl\" in
+
+                let
+                    Python = {
+                        name = \"Python\",
+                        build_deps = [],
+                        cmd = \"\",
+                    } | BuildSpec,
+                in
+                [Python]
+                "
+            }
+            .to_string(),
+            &opts,
+        )
+        .unwrap_or_else(|e| {
+            e.report_to_stderr();
+            panic!("spec parsing failed");
+        });
+
+        let graph = Graph::new().ingest(layer).unwrap();
+        let err = vec!["python".to_string()].as_bsrs(&graph).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No such package: python (did you mean: Python?)"
         );
     }
 }
