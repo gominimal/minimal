@@ -2724,6 +2724,160 @@ mod tests {
         );
     }
 
+    /// NET-043's host-side-only boundary: the dynamic ingress stance and
+    /// range are create inputs, and nothing a process inside the box can
+    /// send sets or widens them. The in-box expose request carries a port
+    /// and no policy field — a request spelling anything more than the
+    /// port is not a port number and is refused as one — so a publish,
+    /// allowed or refused, is decided against the stance the box was
+    /// created with and leaves the record's policy bit-identical. There is
+    /// no in-box verb that writes `IngressPolicy` at all; this pins the
+    /// boundary from the box's side: the only reachable request cannot
+    /// carry a stance, and the record the daemon holds after a successful
+    /// publish is the one the create stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_box_expose_cannot_change_ingress_policy() {
+        let server = crate::test_harness::TestServer::new().await;
+        let mut client = server.connect().await;
+        // The hand vouched for, so the registry publishes it: the allowed
+        // publish below binds at the box's own address.
+        let manager = server.state.sessions_manager().await;
+        manager.land_range_verdict(crate::net::dns::RangeVerdict::Present);
+        let web = crate::session::tests::finalize_dynamic_ingress_session(
+            &mut client,
+            "web",
+            std::net::Ipv4Addr::new(100, 64, 128, 61),
+            std::net::Ipv4Addr::new(127, 0, 64, 61),
+            Some(sessions::DynamicIngress::Allow),
+            Some((3000, 3999)),
+        )
+        .await;
+        let handle = manager
+            .get_session(crate::sessions::SessionKeyPredicate::Id(web))
+            .await
+            .unwrap()
+            .expect("the box resolves");
+        handle
+            .ensure_host("tester".to_string())
+            .await
+            .expect("the box launches its host");
+        let sock = handle
+            .net_switch()
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .control_socket();
+        let (forwarder, served) = crate::session::tests::fake_forwarder(sock, 200).await;
+        let (_state, _rootfs, _cwd, mut chan) = setup_channel_with(handle.downgrade(), "web");
+
+        // The stance the create stored — the fixed point every request below
+        // must leave bit-identical, including the range an in-box request
+        // would most want to widen.
+        let policy_at_create = client
+            .call::<minimald_rpc::GetSessionRecord>(&minimald_rpc::GetSessionRecordRequest::Id(web))
+            .await
+            .record
+            .expect("the create left a record")
+            .policy;
+        assert_eq!(
+            policy_at_create.ingress,
+            Some(sessions::IngressPolicy {
+                port_mappings: vec![],
+                dynamic_allowed_range: Some((3000, 3999)),
+                dynamic_ingress: Some(sessions::DynamicIngress::Allow),
+            }),
+            "the harness box is the one this test's stance describes"
+        );
+
+        // A publish the stance allows — the request that would have the
+        // best claim on the stance if any did.
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%3000", &mut ours).await;
+        drop(ours);
+        assert_eq!(
+            read_lines(&theirs),
+            vec!["msg:published port 3000 at 127.0.64.61:3000; not yet reachable"],
+            "the allowed publish is a fact — runtime-only, so the reply says \
+             so, the honesty the admission set owes (NET-047)"
+        );
+
+        // The refusal the range gives a port outside it — decided against
+        // the stored stance, typed as its own error.
+        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        #[expect(
+            clippy::large_futures,
+            reason = "the handle future carries the harness's whole channel; the test awaits \
+                      it to completion"
+        )]
+        chan.handle("net-expose%4200", &mut ours).await;
+        drop(ours);
+        assert_eq!(
+            read_lines(&theirs),
+            vec![
+                "error: port 4200 is outside this box's declared dynamic range 3000-3999"
+                    .to_string()
+            ],
+            "the out-of-range request is refused with its own typed error"
+        );
+
+        // A request trying to smuggle a stance in the port field: the
+        // request carries a port and no policy field, so this is not a port
+        // number — refused as one, not parsed as an in-box policy write.
+        for smuggle in [
+            "net-expose%3000:dynamic_ingress=allow",
+            "net-expose%3000-3999",
+        ] {
+            let (mut ours, theirs) = UnixStream::pair().unwrap();
+            #[expect(
+                clippy::large_futures,
+                reason = "the handle future carries the harness's whole channel; the test awaits \
+                          it to completion"
+            )]
+            chan.handle(smuggle, &mut ours).await;
+            drop(ours);
+            let lines = read_lines(&theirs);
+            assert!(
+                lines
+                    == vec![format!(
+                        "error: '{}' is not a port number",
+                        smuggle
+                            .split_once('%')
+                            .expect("the request names its verb")
+                            .1
+                    )],
+                "{smuggle}: the request carries a port and no policy field, so \
+                 anything more is not a port number, got: {lines:?}"
+            );
+        }
+        forwarder.abort();
+        assert_eq!(
+            served.lock().expect("served lock").len(),
+            1,
+            "only the allowed publish reached the switch: the refusals asked \
+             it nothing"
+        );
+
+        // The record after it all: the stance and the range the create
+        // stored, unchanged by a publish and by every refusal — no in-box
+        // path rewrote the policy the box runs under.
+        let policy_after = client
+            .call::<minimald_rpc::GetSessionRecord>(&minimald_rpc::GetSessionRecordRequest::Id(web))
+            .await
+            .record
+            .expect("the record still reads")
+            .policy;
+        assert_eq!(
+            policy_after, policy_at_create,
+            "no in-box request can set or rewrite the ingress policy"
+        );
+    }
+
     /// A variable a running session acquires has to reach two places: the shell,
     /// which exports it, and the daemon, which hands it to anything injected
     /// into the session later. `min add` is the source in production; this

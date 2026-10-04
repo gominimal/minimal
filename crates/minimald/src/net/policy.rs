@@ -1374,6 +1374,45 @@ mod tests {
     }
 
     #[test]
+    fn absent_dynamic_ingress_is_deny() {
+        // NET-043: an absent stance is not a permission waiting to be read.
+        // A declaration can carry a range — or even a mode-allow's range
+        // with the mode itself never spelled — and still deny every runtime
+        // publish, exactly as an explicit deny does: the stance is the fact
+        // the decision turns on, and only a spelled `allow` is an allow.
+        let absent = IngressPolicy {
+            dynamic_ingress: None,
+            dynamic_allowed_range: Some((3000, 3999)),
+            ..Default::default()
+        };
+        let explicit = IngressPolicy {
+            dynamic_ingress: Some(sessions::DynamicIngress::Deny),
+            dynamic_allowed_range: Some((3000, 3999)),
+            ..Default::default()
+        };
+        for port in [2999, 3000, 3500, 3999, 4000] {
+            assert_eq!(
+                dynamic_ingress_decision(Some(&absent), port),
+                dynamic_ingress_decision(Some(&explicit), port),
+                "an absent stance must decide exactly as the explicit deny at port {port}"
+            );
+            assert_eq!(
+                dynamic_ingress_decision(Some(&absent), port),
+                Err(ExposeRefusal::DeniedByPolicy),
+                "an absent stance denies the runtime publish at port {port}"
+            );
+        }
+        // The whole-declaration absence — the bare box's shape — denies the
+        // same way, so the deny is a property of the stance, not of the
+        // declaration around it.
+        assert_eq!(
+            dynamic_ingress_decision(None, 3000),
+            Err(ExposeRefusal::DeniedByPolicy),
+            "a box with no ingress declaration denies the runtime publish"
+        );
+    }
+
+    #[test]
     fn dynamic_ingress_decision_gates_on_the_declared_range() {
         // NET-047: an allowed request still has to be in the range the box
         // opted in — the bounds are inclusive, unset means nothing was opted

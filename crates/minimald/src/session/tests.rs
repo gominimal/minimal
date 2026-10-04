@@ -5303,6 +5303,78 @@ fn request_port(request: &str) -> Option<u16> {
     local.rsplit_once(':')?.1.parse().ok()
 }
 
+/// NET-043: the session-create info line names the dynamic ingress stance
+/// and the range the record holds, resolved the way the box runs them —
+/// an absent stance reads as the deny the policy module evaluates it as,
+/// not as a missing fact — so a diagnostics bundle's daemon-log tail shows
+/// which setting a box was created with, beside the egress facts that were
+/// already on the line. Both halves of the declaration are named: the mode
+/// the box's creator chose for it, and the range that bounds the dynamic
+/// requests the mode admits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_logs_dynamic_ingress() {
+    let capture = crate::test_harness::captured_log();
+    let server = TestServer::new().await;
+    let mut client = server.connect().await;
+
+    use minimald_rpc::{CreateSession, CreateSessionRequest};
+    // The allowing box over a range, and a bare box that declared nothing —
+    // the two halves a bundle has to tell apart, by the lines they left.
+    client
+        .call::<CreateSession>(&dynamic_ingress_session_req(
+            "dyn-allow-logged",
+            std::net::Ipv4Addr::new(100, 64, 128, 31),
+            std::net::Ipv4Addr::new(127, 0, 64, 31),
+            Some(sessions::DynamicIngress::Allow),
+            Some((3000, 3999)),
+        ))
+        .await
+        .unwrap();
+    client
+        .call::<CreateSession>(&CreateSessionRequest {
+            config: minimald_rpc::SessionConfig {
+                name: Some("dyn-bare-logged".to_string()),
+                project_path: paths::HostAbsPath::try_new("/uwu").unwrap(),
+                network: sessions::NetworkMode::OwnIp,
+                policy: sessions::SessionPolicy::default(),
+                box_addresses: None,
+                hooks_enabled: true,
+                attrs: Default::default(),
+            },
+            must_match_version: None,
+        })
+        .await
+        .unwrap();
+
+    let logged = capture.contents();
+    for (name, facts) in [
+        (
+            "dyn-allow-logged",
+            [
+                "dynamic_ingress=allow",
+                "dynamic_allowed_range=Some((3000, 3999))",
+            ],
+        ),
+        (
+            "dyn-bare-logged",
+            ["dynamic_ingress=deny", "dynamic_allowed_range=None"],
+        ),
+    ] {
+        let start_line = logged
+            .lines()
+            .find(|line| line.contains("session starts") && line.contains(name))
+            .unwrap_or_else(|| {
+                panic!("the session start must be logged for {name}, got: {logged}")
+            });
+        for fact in facts {
+            assert!(
+                start_line.contains(fact),
+                "the start line must name {fact}, got: {start_line}"
+            );
+        }
+    }
+}
+
 /// NET-043: a port-publish request from inside a box is decided against the
 /// box's own `dynamic_ingress` setting, on the local daemon — the un-enrolled
 /// host's shape, where the same daemon that owns the switch answers the box
