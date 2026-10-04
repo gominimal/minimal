@@ -2398,6 +2398,9 @@ mod tests {
             box_addresses: None,
             status: sessions::SessionStatus::Active,
             hooks_enabled: true,
+            // No launch ever minted these records, so none has recorded its
+            // outcome on one.
+            host_ip_enforcement: None,
             attrs: Default::default(),
         }
     }
