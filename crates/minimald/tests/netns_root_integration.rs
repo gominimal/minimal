@@ -1462,6 +1462,7 @@ async fn netns_ownip_ptask_to_ptask() {
             dynamic_ingress: None,
         }),
         egress: None,
+        credentialed_upstream: None,
     };
     let mut b = Ptask::provision("peer-b", lease_b, subnet, &sock, &b_policy).await;
 
@@ -1552,6 +1553,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
             dynamic_ingress: None,
         }),
         egress: None,
+        credentialed_upstream: None,
     };
     let mut ptask = Ptask::provision("ingress", lease, subnet, &sock, &gate_policy).await;
 

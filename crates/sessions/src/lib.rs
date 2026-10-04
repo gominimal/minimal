@@ -251,6 +251,31 @@ impl IngressPolicy {
     }
 }
 
+/// A box's declaration of a credentialed upstream (NET-134): the fact that
+/// the Box Egress Proxy — the node-local listener a box's credentialed
+/// traffic is steered through — is this box's infrastructure, reached at the
+/// proxy's own address on the switch whatever the box's egress rules say.
+///
+/// The declaration carries no fields of its own yet, and that is the point:
+/// the steering table and the credential grants that derive a box's
+/// credentialed upstream set are the Box Egress Proxy document's field
+/// schema, and this is the minimum of it the networking requirement binds
+/// here — the fact itself, which is all the host-side row needs to hold the
+/// box's lane open to the proxy's address. A policy that carries `Some`
+/// declaration puts its box on a credentialed lane; one that carries `None`
+/// declares nothing, and its box's frames to the proxy's address are refused
+/// under the box-to-host default-deny, never decided by its egress rules.
+/// When the proxy document lands it extends this declaration, and the row
+/// the fact fills is already waiting for it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+// An empty table today, so an unknown field would be one the proxy document
+// has not bound here yet — refused like every other field the policy schemas
+// do not know (the same `deny_unknown_fields` [`SessionPolicy`] carries),
+// rather than silently ignored into a shape no reader can tell from the
+// minimum.
+#[serde(deny_unknown_fields)]
+pub struct CredentialedUpstream {}
+
 /// The networking policy for a session: its egress and ingress configuration.
 ///
 /// `None` for a dimension means it was not configured (allow-all egress; the
@@ -269,13 +294,29 @@ pub struct SessionPolicy {
     pub egress: Option<EgressPolicy>,
     /// Ingress policy; `None` when no explicit ingress config is present.
     pub ingress: Option<IngressPolicy>,
+    /// The box's declaration of a credentialed upstream (NET-134): `Some`
+    /// marks the Box Egress Proxy's listener as this box's infrastructure —
+    /// the one destination its egress rules never decide — while `None`, the
+    /// absent declaration every policy without one carries, is no lane: the
+    /// proxy's address stays refused under the box-to-host default-deny.
+    /// Skipped when `None`, so a policy that declares nothing serializes
+    /// exactly as it did before this field existed — the shape every stored
+    /// record and every reading client already holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentialed_upstream: Option<CredentialedUpstream>,
 }
 
 impl SessionPolicy {
-    /// Builds a policy from its egress and ingress halves.
+    /// Builds a policy from its egress and ingress halves, carrying no
+    /// credentialed-upstream declaration (NET-134): the lane a box asks the
+    /// proxy for is its declaration's own, never a default.
     #[must_use]
     pub fn new(egress: Option<EgressPolicy>, ingress: Option<IngressPolicy>) -> Self {
-        Self { egress, ingress }
+        Self {
+            egress,
+            ingress,
+            credentialed_upstream: None,
+        }
     }
 }
 
@@ -907,6 +948,61 @@ mod tests {
         }"#;
         let r: Record = serde_json_lenient::from_str(json).expect("record must load");
         assert!(!r.hooks_enabled);
+    }
+
+    /// NET-134: the session policy gains a box's declaration of a
+    /// credentialed upstream — the minimum of the proxy document's field
+    /// schema — and that is all it needs to gain. The declaration parses from
+    /// the wire it rides to the host (`Some`), a policy written before the
+    /// field existed parses as no declaration (`None`), and a field the
+    /// minimum does not hold is refused rather than ignored: the proxy
+    /// document extends this declaration when it lands, and until then
+    /// nothing may smuggle a steering setting through it.
+    #[test]
+    fn credentialed_upstream_declaration_parses() {
+        let declared: SessionPolicy = serde_json_lenient::from_str(
+            r#"{"egress":null,"ingress":null,"credentialed_upstream":{}}"#,
+        )
+        .expect("a policy carrying the declaration must parse");
+        assert_eq!(
+            declared.credentialed_upstream,
+            Some(CredentialedUpstream {}),
+            "the declaration is carried on the policy, not swallowed"
+        );
+        // And it round-trips with the policy that carries it, so the host
+        // the registration reaches reads the same lane the client declared.
+        let json = serde_json_lenient::to_string(&declared).unwrap();
+        let round_tripped: SessionPolicy = serde_json_lenient::from_str(&json).unwrap();
+        assert_eq!(round_tripped, declared);
+
+        // A policy written before the field existed declares nothing: the
+        // absent declaration is the default, the JSON such a policy already
+        // serialized to still parses, and serializing it back changes
+        // nothing — the field rides additively, never as a migration.
+        let legacy: SessionPolicy =
+            serde_json_lenient::from_str(r#"{"egress":null,"ingress":null}"#)
+                .expect("a policy predating the field must still parse");
+        assert_eq!(
+            legacy.credentialed_upstream, None,
+            "no declaration in the JSON is no lane, not an error"
+        );
+        let json = serde_json_lenient::to_string(&legacy).unwrap();
+        assert!(
+            !json.contains("credentialed_upstream"),
+            "a policy with no declaration serializes exactly as it did before \
+             the field existed, got: {json}"
+        );
+
+        // The minimum holds no fields of its own: a steering setting the
+        // proxy document will bind is refused until that document lands,
+        // never silently dropped from a declaration that cannot carry it.
+        assert!(
+            serde_json_lenient::from_str::<SessionPolicy>(
+                r#"{"egress":null,"ingress":null,"credentialed_upstream":{"steering":"dns"}}"#
+            )
+            .is_err(),
+            "a field the minimum does not hold is refused, not ignored"
+        );
     }
 
     #[test]
