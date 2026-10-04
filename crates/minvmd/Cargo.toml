@@ -48,6 +48,15 @@ mlog.workspace = true
 # `net`, with the Box Egress Proxy's host-side stack peer (`switch::bep_host`,
 # NET-132) that `net` starts beside the switch.
 switch = { workspace = true, features = ["stack-peer"] }
+# The DNS wire format the host zone answerer (`net::answerer`) decodes
+# queries and encodes replies in — the same library the native daemon's
+# answerer uses, so the two agree on the wire by construction. Also the DNS
+# wire parsing for the host-side DNS admission table (`net::dns_pins`,
+# NET-081 deciding NET-066/067 outside the VM): the replies the gate's
+# ingress leg observes on their way to a box are pinned only by reading
+# them. The same parser minimald's in-VM gate reads, so both legs pin from
+# the same wire.
+hickory-proto.workspace = true
 # Async gvproxy switch supervision in `net`: the background exit-detection task
 # and the async `stop()` teardown run on the tokio runtime the networking layer
 # mandates (no blocking I/O in async context).
@@ -59,12 +68,6 @@ russh.workspace = true
 # `volume`).
 paths.workspace = true
 version.workspace = true
-# DNS wire parsing for the host-side DNS admission table (`net::dns_pins`,
-# NET-081 deciding NET-066/067 outside the VM): the replies the gate's
-# ingress leg observes on their way to a box are pinned only by reading
-# them. The same parser minimald's in-VM gate reads, so both legs pin from
-# the same wire.
-hickory-proto.workspace = true
 
 [dev-dependencies]
 camino.workspace = true
