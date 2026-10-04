@@ -1304,8 +1304,8 @@ fn node_ports_dir_in(
     use anyhow::Context as _;
     use std::os::unix::fs::DirBuilderExt as _;
     // The base is this user's own runtime dir (the XDG_RUNTIME_DIR contract,
-    // or macOS's Application Support): created 0700 when absent, never
-    // checked — the ports dir itself is the one that carries the claim, so
+    // or macOS's Application Support): created 0700 when absent and
+    // tightened to 0700 when this user owns it, never refused — the ports dir itself is the one that carries the claim, so
     // it is the one the owner/mode check refuses. The base is also the dir
     // the zone answerer's interim channel binds in, which refuses a dir open
     // to group or other, so a base created here under the umask's mode would
@@ -1319,6 +1319,12 @@ fn node_ports_dir_in(
             .mode(PORTS_DIR_MODE)
             .create(base)
             .context("creating the node-port reservation base")?;
+    } else {
+        // A base an earlier build created under the umask's mode: tightened
+        // to 0700 when this user owns it, so the interim channel binds there
+        // again; one another user owns is left for the answerer to refuse.
+        crate::sock::restrict_owned_dir(base)
+            .context("tightening the node-port reservation base")?;
     }
     let ports = base.join("ports");
     create_private_dir(&ports)?;
@@ -3249,6 +3255,30 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o700, "{} is created 0700", dir.display());
         }
+    }
+
+    #[test]
+    fn an_owned_wide_ports_base_is_tightened() {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        // A base an earlier build left at the umask's mode keeps the
+        // interim channel from binding; the next boot tightens it.
+        let root = tempfile::tempdir().expect("a test runtime dir");
+        let base = root.path().join("minimal");
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&base)
+            .expect("a wide base");
+        super::node_ports_dir_in(&base, false).expect("the ports dir is made");
+        let mode = std::fs::metadata(&base)
+            .expect("the base exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "{} is tightened to 0700",
+            base.display()
+        );
     }
 
     #[test]
