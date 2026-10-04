@@ -431,7 +431,14 @@ async fn serve_create_session(
                 },
                 // R2.1: a policy/network-mode mismatch is rejected at
                 // declaration time and surfaced as a clean typed error rather
-                // than a transport failure.
+                // than a transport failure. NET-079's refusal rides the same
+                // arm — a host-address declaration whose rules this host's
+                // classifier cannot enforce is refused at create while the
+                // host decides per box, and its typed error names each
+                // unenforced rule and ends with what to do about them, so
+                // the person who typed the declaration is told which parts
+                // could not be honoured — and what to type instead — rather
+                // than reading a transport failure off the activate.
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Errorable::Err {
                     error: e.to_string(),
                 },
@@ -3780,8 +3787,10 @@ mod tests {
     /// removed (the marker standing over a table whose refusal is gone), and
     /// as reinstalled, with the listing answering after each read the
     /// daemon's own launches answer through. The session is a host-address
-    /// box that declares an egress section, so no host's gate refuses it and
-    /// the listing's answer is the fact's alone.
+    /// box created over the start-up default fact — nothing read, nothing
+    /// decided — so the create gate that refuses a declaration's
+    /// unenforceable rules refuses nothing here, and the listing's answer is
+    /// the fact's alone, on any host.
     // The guard is taken before the server is even built and held across
     // the awaited re-reads on purpose: the fact is process-global, so under
     // libtest another test's read in the window would answer over it too.
@@ -3796,8 +3805,9 @@ mod tests {
         let server = TestServer::new().await;
         let mut client = server.connect().await;
 
-        // A host-address box no gate refuses: it declares an egress section,
-        // so its listing entry is the fact's, on any host.
+        // A host-address box created over the start-up default fact — nothing
+        // read, nothing decided — so the create gate refuses nothing here; the
+        // section it declares is what keeps the listing entry the fact's.
         let mut session = req("reread-proof", "/uwu");
         session.config.policy = SessionPolicy::new(
             Some(EgressPolicy {
@@ -3895,6 +3905,356 @@ mod tests {
         crate::session_host::clear_classifier_reading_standin();
         crate::session_host::clear_host_ip_enforcement_fact();
         drop(tree);
+    }
+
+    /// NET-079: on a host that decides per box, a host-address box whose
+    /// declaration names rules the classifier cannot enforce is refused at
+    /// create — before anything is allocated, so no record, no held name,
+    /// no actor survives the refusal — and the typed error the client reads
+    /// off the activate names each unenforced rule, says own-address boxes
+    /// enforce them, and ends with what to do about the rules it named. The
+    /// refusal rides this RPC's `InvalidInput` arm — the arm a kind other
+    /// than the typed one never reaches, answering as an internal error
+    /// instead — so the create's refusal is the same machine-mode code the
+    /// launch's identically-typed error carries. The daemon logs one info
+    /// line per refused create naming the box, the host's per-box value in
+    /// the machine spelling, and each unenforced rule; the refusal counter
+    /// counts each one. An own-address box's declaration is enforced on the
+    /// address the box holds, so it is never refused on this ground,
+    /// whatever the host decides.
+    // The guard is taken before the server is even built and held across the
+    // awaited creates on purpose: the fact is process-global, so under
+    // libtest another test's create in the window would answer over it too.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the fact is process-global, so the guard must span the awaited \
+                  creates it is set for"
+    )]
+    #[tokio::test]
+    async fn per_box_host_refuses_unenforceable_host_ip_declaration() {
+        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let capture = crate::test_harness::captured_log();
+        let refused_before = crate::sessions::refused_unenforceable_creates();
+
+        // The host decides per box: the state a loaded, refusing table reads,
+        // and the one the create gate answers over — the same bit the launch
+        // that follows re-reads for its own gate.
+        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::decided());
+
+        // The CLI's own spellings of a narrowing, each refused with the rule
+        // it names: `--deny-subnets` subtracts a range from an allow-all —
+        // a partial refusal the deny subtree does not spell — and
+        // `--allow-subnets` narrows what the box may reach — a narrowing the
+        // allow subtree refuses nothing to enforce.
+        let mut deny_a_range = req("refused-deny-range", "/uwu");
+        deny_a_range.config.policy = SessionPolicy::new(
+            Some(EgressPolicy {
+                deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                ..Default::default()
+            }),
+            None,
+        );
+        // The refusal arrives over the RPC's `InvalidInput` arm — the arm
+        // the typed error keys on, where any other kind answers as an
+        // internal error and the call never yields an `Errorable::Err` —
+        // so what the create reads here is the machine-mode code the
+        // launch's identically-typed refusal carries too.
+        let error = match client.call::<CreateSession>(&deny_a_range).await {
+            Errorable::Err { error } => error,
+            other => panic!("a per-box host refuses the denied range, got: {other:?}"),
+        };
+        assert!(
+            error.contains("deny_subnets 0.0.0.0/0"),
+            "the refusal names the rule it refused over, by field and entry: {error}"
+        );
+        assert!(
+            error.contains("this host decides a host-address box's egress verdict per box"),
+            "the refusal says whose verdict it is that cannot enforce the rule: {error}"
+        );
+        assert!(
+            error.contains("own-address boxes enforce them"),
+            "the refusal says own-address boxes enforce these rules, so the \
+             person who typed the declaration is told where they do work: {error}"
+        );
+        // The refusal ends with what to do: remove the rules, declare the
+        // one shape this host's classifier enforces, or take the mode that
+        // enforces them — the words a person reads last are the ones they
+        // can act on.
+        assert!(
+            error.contains("remove these rules")
+                && error.contains("declare deny-all egress")
+                && error.contains("all three allow lists present and empty"),
+            "the refusal names the remedy for the rules it refused: {error}"
+        );
+
+        let mut allow_a_subnet = req("refused-allow-list", "/uwu");
+        allow_a_subnet.config.policy = SessionPolicy::new(
+            Some(EgressPolicy {
+                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                ..Default::default()
+            }),
+            None,
+        );
+        let error = match client.call::<CreateSession>(&allow_a_subnet).await {
+            Errorable::Err { error } => error,
+            other => panic!("a per-box host refuses the narrowing allow list, got: {other:?}"),
+        };
+        assert!(
+            error.contains("allow_subnets"),
+            "the narrowing allow list is refused over the rule it names: {error}"
+        );
+
+        // The refusal is before anything is allocated: the store holds
+        // neither refused box.
+        let mngr = server.state.sessions_manager().await;
+        assert!(
+            mngr.list().await.unwrap().is_empty(),
+            "the refused creates allocated nothing — no record, no held name, \
+             no actor survived them"
+        );
+
+        // The counter counted each refusal, and each refusal logged one info
+        // line: the box, the host's per-box value, and each unenforced rule.
+        let refused_after = crate::sessions::refused_unenforceable_creates();
+        assert_eq!(
+            refused_after,
+            refused_before + 2,
+            "each refused create counted once, got {refused_after} after \
+             {refused_before} before"
+        );
+        let logged = capture.contents();
+        for (name, rule) in [
+            ("refused-deny-range", "deny_subnets 0.0.0.0/0"),
+            ("refused-allow-list", "allow_subnets"),
+        ] {
+            assert!(
+                logged.lines().any(|line| {
+                    line.contains("refused a create whose host-address declaration names rules")
+                        && line.contains(&format!("session_name=Some(\"{name}\")"))
+                        && line.contains("host_ip_enforcement=per_box")
+                        && line.contains(rule)
+                }),
+                "the refused create of {name} logged the box, the per-box value, \
+                 and the rule it refused over, got: {logged}"
+            );
+        }
+
+        // The refusal is the host-address mode's alone: an own-address box
+        // carrying the same narrowing is created, its verdict decided on the
+        // address it holds.
+        let own_address = own_ip_session(
+            &mut client,
+            "own-address-narrowed",
+            SessionPolicy::new(
+                Some(EgressPolicy {
+                    deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                    ..Default::default()
+                }),
+                None,
+            ),
+        )
+        .await;
+        assert!(
+            own_address != SessionId::nil(),
+            "an own-address box's narrowing is enforced, not refused"
+        );
+
+        crate::session_host::clear_host_ip_enforcement_fact();
+    }
+
+    /// NET-079: a host that decides per box refuses only the declarations
+    /// that ask for a verdict its table cannot make. A host-address box
+    /// with no egress section — the allow-all it is, every verdict the
+    /// classifier could decide for it enforced by its leaf — and a deny-all
+    /// box — the one shape the deny subtree enforces — are both created on
+    /// that host, their replies stating the per-box state the fact says,
+    /// and nothing is counted as refused.
+    // The guard is taken before the server is even built and held across the
+    // awaited creates on purpose: the fact is process-global, so under
+    // libtest another test's create in the window would answer over it too.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the fact is process-global, so the guard must span the awaited \
+                  creates it is set for"
+    )]
+    #[tokio::test]
+    async fn per_box_host_creates_host_ip_box_with_no_section_or_deny_all() {
+        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let refused_before = crate::sessions::refused_unenforceable_creates();
+
+        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::decided());
+
+        let plain = client
+            .call::<CreateSession>(&req("plain-host-address", "/uwu"))
+            .await
+            .unwrap();
+        assert_eq!(
+            plain.host_ip_enforcement.as_deref(),
+            Some("per_box"),
+            "a host-address box with no egress section is created on a \
+             per-box host, its reply stating the enforcement the fact says, \
+             got: {:?}",
+            plain.host_ip_enforcement
+        );
+
+        let mut deny_all = req("deny-all-host-address", "/uwu");
+        deny_all.config.policy = SessionPolicy::new(Some(EgressPolicy::deny_all()), None);
+        let deny_all = client.call::<CreateSession>(&deny_all).await.unwrap();
+        assert_eq!(
+            deny_all.host_ip_enforcement.as_deref(),
+            Some("per_box"),
+            "a deny-all host-address box is created on a per-box host — its \
+             shape is the deny subtree's own verdict, got: {:?}",
+            deny_all.host_ip_enforcement
+        );
+
+        // Both in the store, and neither counted as refused: the gate refused
+        // nothing a per-box verdict can enforce.
+        let mngr = server.state.sessions_manager().await;
+        let listed = mngr.list().await.unwrap();
+        assert_eq!(
+            listed.len(),
+            2,
+            "both boxes the per-box host can enforce are in the store: {listed:?}"
+        );
+        for name in ["plain-host-address", "deny-all-host-address"] {
+            assert!(
+                listed.iter().any(|s| s.name.as_deref() == Some(name)),
+                "{name} is in the store, got: {listed:?}"
+            );
+        }
+        assert_eq!(
+            crate::sessions::refused_unenforceable_creates(),
+            refused_before,
+            "an enforceable declaration is never counted as refused"
+        );
+
+        crate::session_host::clear_host_ip_enforcement_fact();
+    }
+
+    /// NET-079's exception, at the create: a host that cannot decide per
+    /// box creates every host-address box it is handed, whatever its
+    /// declaration names — the narrowing shapes a decided host refuses, the
+    /// deny-all shape, a box with no section, and the narrowed own-address
+    /// box — because the box will run unenforced on it and be recorded as
+    /// such, never refused on that ground. The probe cause that comes
+    /// closest to deciding — the step installed, the table's refusal gone —
+    /// creates them too: its own refusal is the *launch's*, for the box
+    /// whose declaration promises the verdict, and never the create's.
+    // The guard is taken before the server is even built and held across the
+    // awaited creates on purpose: the fact is process-global, so under
+    // libtest another test's create in the window would answer over it too.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the fact is process-global, so the guard must span the awaited \
+                  creates it is set for"
+    )]
+    #[tokio::test]
+    async fn unenforcing_host_still_creates_host_ip_box_with_any_declaration() {
+        let _fact_window = PROBE_TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let server = TestServer::new().await;
+        let mut client = server.connect().await;
+        let refused_before = crate::sessions::refused_unenforceable_creates();
+
+        // A host that cannot decide per box: the step never having run, the
+        // plainest cause — its boxes run unenforced and say so.
+        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+            classifier::Cause::StepNotInstalled,
+        ));
+
+        // Every declaration shape, created: the two narrowings a per-box
+        // host refuses, the deny-all shape, and no section at all.
+        let narrowing = SessionPolicy::new(
+            Some(EgressPolicy {
+                deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                ..Default::default()
+            }),
+            None,
+        );
+        let mut denied_range = req("unenforcing-deny-range", "/uwu");
+        denied_range.config.policy = narrowing.clone();
+        let denied_range = client.call::<CreateSession>(&denied_range).await.unwrap();
+        let mut narrowed = req("unenforcing-allow-list", "/uwu");
+        narrowed.config.policy = SessionPolicy::new(
+            Some(EgressPolicy {
+                allow_subnets: Some(vec!["10.0.0.0/8".to_string()]),
+                ..Default::default()
+            }),
+            None,
+        );
+        let narrowed = client.call::<CreateSession>(&narrowed).await.unwrap();
+        let mut deny_all = req("unenforcing-deny-all", "/uwu");
+        deny_all.config.policy = SessionPolicy::new(Some(EgressPolicy::deny_all()), None);
+        let deny_all = client.call::<CreateSession>(&deny_all).await.unwrap();
+        let plain = client
+            .call::<CreateSession>(&req("unenforcing-plain", "/uwu"))
+            .await
+            .unwrap();
+        for (id, why) in [
+            (denied_range.id, "a denied range over an allow-all"),
+            (narrowed.id, "a narrowing allow list"),
+            (deny_all.id, "the deny-all shape"),
+            (plain.id, "no egress section at all"),
+        ] {
+            assert!(
+                id != SessionId::nil(),
+                "a host that cannot decide per box creates {why}, runs it \
+                 unenforced and records that, never refusing it on this ground"
+            );
+        }
+
+        // The narrowed own-address box too: its verdict is its own, on the
+        // address it holds.
+        let own_address = own_ip_session(&mut client, "unenforcing-own-address", narrowing).await;
+        assert!(
+            own_address != SessionId::nil(),
+            "an own-address box's declaration is its own to enforce, whatever \
+             the host can decide"
+        );
+
+        // The probe cause nearest deciding — the tree installed, the table's
+        // refusal gone — creates the narrowing a decided host refuses: the
+        // create answers over the host's `can_decide_per_box` alone, and the
+        // launch's own refusal for the promised verdict is never a reason to
+        // hold the name or the record hostage here.
+        crate::session_host::set_host_ip_enforcement_fact(&classifier::Decision::undecidable(
+            classifier::Cause::TableNotEffective,
+        ));
+        let mut nearly_decided = req("unenforcing-nearly-decided", "/uwu");
+        nearly_decided.config.policy = SessionPolicy::new(
+            Some(EgressPolicy {
+                deny_subnets: Some(vec!["0.0.0.0/0".to_string()]),
+                ..Default::default()
+            }),
+            None,
+        );
+        let nearly_decided = client.call::<CreateSession>(&nearly_decided).await.unwrap();
+        assert!(
+            nearly_decided.id != SessionId::nil(),
+            "the probe cause that refuses a promised verdict at launch still \
+             creates the box whose declaration names it"
+        );
+
+        // Nothing was counted as refused: the exception keeps the creates.
+        let mngr = server.state.sessions_manager().await;
+        let listed = mngr.list().await.unwrap();
+        assert_eq!(
+            listed.len(),
+            6,
+            "every host-address box the undeciding hosts were handed was \
+             created: {listed:?}"
+        );
+        assert_eq!(
+            crate::sessions::refused_unenforceable_creates(),
+            refused_before,
+            "a host that cannot decide per box refuses no create on this ground"
+        );
+
+        crate::session_host::clear_host_ip_enforcement_fact();
     }
 
     /// Waits for the mock host's echo of `line`, which proves this session's
