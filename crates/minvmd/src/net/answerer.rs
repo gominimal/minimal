@@ -1044,21 +1044,36 @@ fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     Ok(cred.uid)
 }
 
-/// Off Linux the kernel offers one credential fact for a connected unix
-/// socket: the peer's uid, read with `getpeereid` — the same gate with the
-/// same answer ([`peer_uid`]'s Linux arm).
+/// Off Linux the kernel offers the same credential fact for a connected
+/// unix socket through `LOCAL_PEERCRED` (the BSD/macOS spelling of
+/// SO_PEERCRED): the kernel fills an `xucred` with the peer's uid, decided
+/// at connect time, so nothing the peer writes can influence what this
+/// reads — the same gate with the same answer ([`peer_uid`]'s Linux arm).
 #[cfg(not(target_os = "linux"))]
 fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
-    let mut uid = libc::uid_t::default();
-    let mut gid = libc::gid_t::default();
-    // SAFETY: getpeereid writes the peer's uid and gid into the two
-    // locals; the fd is the stream's own and stays valid for the
-    // borrow's life.
-    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    let mut cred = libc::xucred {
+        cr_version: 0,
+        cr_uid: 0,
+        cr_ngroups: 0,
+        cr_groups: [0; 16],
+    };
+    let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `size_of::<xucred>()` bytes into
+    // `cred`, whose length is passed alongside it; the fd is the stream's
+    // own and stays valid for the borrow's life.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERCRED,
+            std::ptr::addr_of_mut!(cred).cast(),
+            &mut len,
+        )
+    };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(uid)
+    Ok(cred.cr_uid)
 }
 
 /// The names no publish may take, the answerer's own: the host's own name
@@ -1462,7 +1477,11 @@ impl Registration {
             })?;
         if !reply.ok {
             return Err(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
+                // PermissionDenied, not ConnectionRefused: the answerer is
+                // there and answered no — ConnectionRefused is reserved for
+                // the connect itself, the marker of a channel socket file
+                // with no listener behind it.
+                io::ErrorKind::PermissionDenied,
                 reply
                     .error
                     .unwrap_or_else(|| "the answerer refused the publish".to_string()),
@@ -1520,10 +1539,12 @@ impl Drop for Registration {
 /// hello — the node's id, the protocol version this copy speaks — wait
 /// for the answerer's ack, then publish `rows` and wait for the ack that
 /// says they are held. A connect is what starts a socket-activated
-/// answerer, so this is the first thing a daemon does on the channel, and
-/// every way it can fail — a socket path absent, a connect refused, a
-/// hello that never gets its ack or gets it refused — is a distinct error
-/// the acquisition loop surfaces; none of them is a reason to host.
+/// answerer, so this is the first thing a daemon does on the channel. Two
+/// of the ways it can fail — a socket path absent, and a connect refused
+/// (the socket file of a dead holder with no listener behind it) — mean
+/// the channel is nobody's, and the acquisition loop hosts; every other
+/// way (a hello that never gets its ack or gets it refused) is a distinct
+/// error the loop surfaces, never a reason to host.
 fn connect_and_publish(sock: &Path, node: &str, rows: Vec<RegisteredRow>) -> io::Result<Published> {
     let mut registration = Registration {
         stream: UnixStream::connect(sock)?,
@@ -1557,7 +1578,11 @@ fn connect_and_publish(sock: &Path, node: &str, rows: Vec<RegisteredRow>) -> io:
         })?;
     if !reply.ok {
         return Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
+            // PermissionDenied, not ConnectionRefused: the answerer accepted
+            // the connect and answered no, so the channel is alive and
+            // somebody's — ConnectionRefused stays the connect's own kind,
+            // the marker of a socket file with no listener behind it.
+            io::ErrorKind::PermissionDenied,
             reply
                 .error
                 .unwrap_or_else(|| "the answerer refused the hello".to_string()),
@@ -1824,6 +1849,9 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: A
     let mut published_once = false;
     // Whether the loop is inside an error episode ([`surface_error`]).
     let mut erroring = false;
+    // Whether the corpse leftover has been said already: a channel socket
+    // file with no listener logs once, not per pass of a collision episode.
+    let mut stale_once = false;
     // The backoff between attempts on a channel that is present but not
     // answering, doubling to the re-check cadence.
     let mut retry = CHANNEL_RETRY;
@@ -1890,6 +1918,26 @@ fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: A
             // The channel socket path is absent: the answerer is nobody's,
             // and the host arm below decides this daemon's.
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            // A refused connect names a corpse: the socket file is present
+            // with no listener behind it, the leftover of an interim holder
+            // that died. A service manager's socket never refuses a connect
+            // (the manager accepts it and starts the answerer) and a live
+            // holder never refuses one either, so the file is nobody's —
+            // the answerer is nobody's too, and the host arm below takes
+            // this machine's, removing the leftover when it binds the
+            // channel for the siblings it answers.
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                if !stale_once {
+                    stale_once = true;
+                    tracing::info!(
+                        component = COMPONENT,
+                        channel = %channel.display(),
+                        "the answerer channel socket file is a dead holder's leftover: \
+                         nothing listens behind it, so this VM's host daemon takes the \
+                         zone answerer from here"
+                    );
+                }
+            }
             // A channel present that refuses or times out is an error,
             // never a reason to host: a connect starts a socket-activated
             // service, so an answerer that is installed and healthy always
@@ -3727,10 +3775,39 @@ mod tests {
     fn present_channel_that_refuses_is_an_error_not_a_host() {
         let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
         let channel = dir.path().join(CHANNEL_SOCK_FILE);
-        // A channel socket file present with nothing listening behind it:
-        // the crash shape, a service that died and left its socket file.
-        let listener = UnixListener::bind(&channel).expect("the dead channel binds");
-        drop(listener);
+        // A channel that is alive and says no: it accepts the connect — the
+        // connect is what starts a socket-activated answerer — and answers
+        // the hello with a refusal, the wire a version-mismatched or
+        // misconfigured service answers with. The machine has an answerer
+        // whose answer this table is not in; hosting a second one over it
+        // would fork the machine's one answerer.
+        let listener = UnixListener::bind(&channel).expect("the refusing channel binds");
+        let stop = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&stop);
+        std::thread::Builder::new()
+            .name("test-zone-refusing-channel".to_string())
+            .spawn(move || {
+                for stream in listener.incoming() {
+                    if gate.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let Ok(mut stream) = stream else { continue };
+                    // Read the hello, refuse it: one line in, one refusal
+                    // line out, whatever this daemon keeps sending.
+                    let mut line = String::new();
+                    let mut byte = [0u8; 1];
+                    while !line.contains('\n') {
+                        match stream.read(&mut byte) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => line.push(byte[0] as char),
+                        }
+                    }
+                    let _ = stream.write_all(
+                        b"{\"ok\":false,\"error\":\"this channel refuses every hello\"}\n",
+                    );
+                }
+            })
+            .expect("the refusing service's thread spawns");
 
         // The hook port is free — hosting it would be possible, and must not
         // happen.
@@ -3778,6 +3855,69 @@ mod tests {
             &buf,
             |line| line.contains("did not answer"),
             "the daemon never warned why it published nothing",
+        );
+        stop.store(true, Ordering::Relaxed);
+        // The refusing service gives up its socket so the temp dir can go.
+        let _ = std::fs::remove_file(dir.path().join(CHANNEL_SOCK_FILE));
+    }
+
+    /// The crash shape an interim holder leaves: its channel socket file
+    /// stays on the disk with nothing listening behind it, and the next
+    /// daemon to start must not read the leftover as a machine that has an
+    /// answerer. A service manager's socket never refuses a connect — the
+    /// manager accepts it and starts the answerer — so a refused connect
+    /// names the leftover as nobody's, and the daemon takes the machine's
+    /// answerer, replacing the dead file with its own live channel. This is
+    /// the fresh-daemon half of the KVM lane's `min ls` after a stopped
+    /// session: the line must name the VM host daemon again.
+    #[test]
+    fn a_dead_holders_socket_file_does_not_wedge_the_machine() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channel socket");
+        let channel = dir.path().join(CHANNEL_SOCK_FILE);
+        // The corpse: a channel socket file present, its holder gone.
+        let listener = UnixListener::bind(&channel).expect("the dead channel binds");
+        drop(listener);
+
+        let probe = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("the probe binds loopback");
+        let port = probe.local_addr().expect("the probe names its port").port();
+        drop(probe);
+
+        let (registry, web) = web_registry();
+        let status = AnswererStatus::starting();
+        let status_probe = status.clone();
+        let channel_probe = channel.clone();
+        std::thread::Builder::new()
+            .name("test-zone-corpse-channel".to_string())
+            .spawn(move || acquire_loop_at(registry, port, channel_probe, status))
+            .expect("the daemon's thread spawns");
+
+        // The daemon hosts, not errors: the machine's answerer is nobody's,
+        // so this one takes it — the recorded interim, same as a machine
+        // whose channel never existed.
+        assert_eq!(
+            await_status(
+                || status_probe.get(),
+                "the daemon never took the machine's answerer over the leftover"
+            ),
+            ZoneAnswererStatus::Holder { port },
+            "a dead holder's socket file is not a channel: the next daemon hosts"
+        );
+
+        // And the box zone answers here, from this daemon's own table.
+        let reply = query(port, "web.min.internal.", RecordType::A)
+            .expect("the recovering daemon answers the zone");
+        assert_eq!(
+            a_answer(&reply),
+            web,
+            "the box zone answers from the daemon that took over the leftover"
+        );
+
+        // The leftover is replaced by a live channel: a connect to the path
+        // now reaches the holder's own gate, so the next daemon publishes
+        // instead of hosting.
+        assert!(
+            UnixStream::connect(&channel).is_ok(),
+            "the holder re-bound the channel over the dead file"
         );
     }
 }
