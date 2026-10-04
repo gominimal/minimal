@@ -9789,6 +9789,48 @@ proof_escape_reaches_only_declared_union() {
   esu_gate_sock="$XDG_STATE_HOME/minimal/providers/local-minvmd0/gvproxy-gate.sock"
   esu_listener_log="$WORK/esu-listener.log"
   ESU_LISTEN_PORT=18094
+
+  # This case's failures must name the host daemon's own log — the sink the
+  # gate's drop and admit lines land in — scoped to the lines the daemon this
+  # case spawns wrote: the whole run's daemons share the daily-rotated file,
+  # so an unscoped grep reads the earlier cases' daemons too. The same two
+  # helpers the proxy-source case uses. Defined before the port probe below —
+  # the probe and the listener wait are the case's first failure paths, and
+  # under `set -uo pipefail` without `-e` a call ahead of a definition is a
+  # "command not found" the case would carry on from, not a failure.
+  esu_host_log() {
+    find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
+      | sort -r | head -n1
+  }
+  esu_case_log() {
+    local f
+    f="$(esu_host_log)"
+    [ -n "$f" ] || return 0
+    if [ "$f" = "$esu_log0" ] && [ "$esu_log0_lines" -gt 0 ]; then
+      tail -n +"$((esu_log0_lines + 1))" "$f" 2>/dev/null
+    else
+      # A rotation mid-case: the newest file postdates the snapshot, so every
+      # line in it is this case's.
+      cat "$f" 2>/dev/null
+    fi
+  }
+  # Every failure path below: stop the listener, name its record and the
+  # gate's own lines, then the global diagnostics.
+  esu_fail() {
+    if [ -n "${ESU_LISTENER_PID:-}" ]; then
+      kill "$ESU_LISTENER_PID" 2>/dev/null || true
+      ESU_LISTENER_PID=""
+    fi
+    echo "--- this case's listener record ---"
+    cat "$esu_listener_log" 2>/dev/null || true
+    echo "--- this case's gate lines ---"
+    esu_case_log 2>/dev/null \
+      | grep -e 'egress-unregistered-source' -e 'egress-unknown-source' \
+          -e 'egress-infrastructure-destination' -e 'egress-undeclared-subnet' \
+      || true
+    fail
+  }
+
   if python3 -c "import socket; socket.create_connection(('127.0.0.1', $ESU_LISTEN_PORT), 2)" \
       2>/dev/null; then
     echo "::error::127.0.0.1:$ESU_LISTEN_PORT already answers on this host; the escape-union proof needs it free for its listener"
@@ -9887,27 +9929,6 @@ ESU_LISTENER_EOF
   fi
   echo "host listener: $esu_line (behind the fabric's NAT, which maps $esu_alias to 127.0.0.1)"
 
-  # This case's failures must name the host daemon's own log — the sink the
-  # gate's drop and admit lines land in — scoped to the lines the daemon this
-  # case spawns wrote: the whole run's daemons share the daily-rotated file,
-  # so an unscoped grep reads the earlier cases' daemons too. The same two
-  # helpers the proxy-source case uses.
-  esu_host_log() {
-    find "$XDG_STATE_HOME/minimal/logs" -maxdepth 1 -name 'minvmd.log*' -type f 2>/dev/null \
-      | sort -r | head -n1
-  }
-  esu_case_log() {
-    local f
-    f="$(esu_host_log)"
-    [ -n "$f" ] || return 0
-    if [ "$f" = "$esu_log0" ] && [ "$esu_log0_lines" -gt 0 ]; then
-      tail -n +"$((esu_log0_lines + 1))" "$f" 2>/dev/null
-    else
-      # A rotation mid-case: the newest file postdates the snapshot, so every
-      # line in it is this case's.
-      cat "$f" 2>/dev/null
-    fi
-  }
   esu_gate_line() {
     # The gate's own line for one source under one rule, this case's lines
     # only; prints it, nonzero when this case's daemon wrote none.
@@ -9933,22 +9954,6 @@ ESU_LISTENER_EOF
       sleep 0.25
     done
     return 1
-  }
-  # Every failure path below: stop the listener, name its record and the
-  # gate's own lines, then the global diagnostics.
-  esu_fail() {
-    if [ -n "${ESU_LISTENER_PID:-}" ]; then
-      kill "$ESU_LISTENER_PID" 2>/dev/null || true
-      ESU_LISTENER_PID=""
-    fi
-    echo "--- this case's listener record ---"
-    cat "$esu_listener_log" 2>/dev/null || true
-    echo "--- this case's gate lines ---"
-    esu_case_log 2>/dev/null \
-      | grep -e 'egress-unregistered-source' -e 'egress-unknown-source' \
-          -e 'egress-infrastructure-destination' -e 'egress-undeclared-subnet' \
-      || true
-    fail
   }
 
   # Snapshot the shared host log before this case's daemon exists — the
