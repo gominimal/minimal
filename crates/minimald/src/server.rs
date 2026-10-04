@@ -3019,11 +3019,27 @@ mod tests {
     /// Drives the hostname proxy with a `GET` carrying `Host: <authority>`
     /// and returns the raw response the client read back — the proxy's own
     /// test-facing shape, driven through the port a daemon's startup bound.
+    /// The connect retries briefly: the proxy's serve task is spawned the
+    /// moment its listener binds, so a connect can land before the accept
+    /// loop is ready (or, on a busy host, after another process took the
+    /// probed port), and the first connect is not the proxy's answer.
     #[cfg(target_os = "linux")]
     async fn proxy_get(proxy_addr: SocketAddr, authority: &str) -> String {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-        let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let mut client = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match tokio::net::TcpStream::connect(proxy_addr).await {
+                    Ok(client) => return client,
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("connecting to the proxy at {proxy_addr}: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("the proxy must accept a connection once its listener is bound");
         let request = format!("GET / HTTP/1.1\r\nHost: {authority}\r\n\r\n");
         client.write_all(request.as_bytes()).await.unwrap();
         let mut response = Vec::new();
