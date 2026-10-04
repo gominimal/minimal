@@ -40,6 +40,19 @@ pub(crate) const NODE_PROXY_PORT_ENV: &str = "MINVMD_NODE_PROXY_PORT";
 /// handed (NET-025).
 const HOSTNAME_PROXY_PORT_TOKEN: &str = "MINIMALD_HOSTNAME_PROXY_PORT";
 
+/// The environment variable the supervisor hands the VMM child this boot's
+/// publish generation in (T93), beside [`NODE_PROXY_PORT_ENV`] and by the
+/// same transport: a token the supervisor draws fresh for every boot it
+/// spawns, so a publish report can be told apart from a killed boot's even
+/// when both boots were handed the same port.
+pub(crate) const PUBLISH_GENERATION_ENV: &str = "MINVMD_PUBLISH_GENERATION";
+
+/// The boot token the publish generation rides to the guest on, beside the
+/// port's token: the guest daemon echoes it in every publish report.
+/// Mirrors minimald's `HANDED_PUBLISH_GENERATION_TOKEN` — keep the two in
+/// step.
+const PUBLISH_GENERATION_TOKEN: &str = "MINIMALD_PUBLISH_GENERATION";
+
 /// Kernel command line every microVM boots with: the console the guest's
 /// stdout/stderr reaches the host boot log through, and IPv6 disabled (the v1
 /// network posture is IPv4-only — design §4.2 keeps IPv6 ULA dual-stack as a
@@ -261,7 +274,8 @@ impl VmConfig {
         // `set_kernel` outlives the call.
         let rust_log = std::env::var(GUEST_LOG_ENV).ok();
         let node_proxy_port = node_proxy_port_from_env()?;
-        let cmdline = kernel_cmdline(rust_log.as_deref(), node_proxy_port);
+        let publish_generation = publish_generation_from_env()?;
+        let cmdline = kernel_cmdline(rust_log.as_deref(), node_proxy_port, publish_generation);
         // The boot line at info, not debug: the kernel echoes it back as
         // `Kernel command line: …` only once its console is up, and this is
         // the one line that says what the guest was told to boot with — a
@@ -394,7 +408,10 @@ impl VmConfig {
 ///
 /// The values are injected rather than read from the process environment here,
 /// so this stays pure and unit-testable; the caller passes
-/// `std::env::var(GUEST_LOG_ENV).ok()` and `node_proxy_port_from_env()`. A
+/// `std::env::var(GUEST_LOG_ENV).ok()`, `node_proxy_port_from_env()` and
+/// `publish_generation_from_env()` — the boot's publish generation (T93),
+/// which the guest daemon echoes in its publish reports, rides beside the
+/// port and, like it, is never skipped. A
 /// `RUST_LOG` value that cannot survive the boot line is skipped (leaving the
 /// base line plus the port token byte-identical) with a warning, rather than
 /// corrupting the boot: whitespace would be split into separate boot tokens, an
@@ -406,14 +423,25 @@ impl VmConfig {
 // Only `apply` calls this, and `apply` needs libkrun; without it the crate is a
 // runtime-bailing stub, but the tests below still cover this on every target.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
-fn kernel_cmdline(rust_log: Option<&str>, proxy_port: Option<u16>) -> Cow<'static, str> {
+fn kernel_cmdline(
+    rust_log: Option<&str>,
+    proxy_port: Option<u16>,
+    publish_generation: Option<u64>,
+) -> Cow<'static, str> {
     // The port rides the boot line first: base, then the port token, then the
-    // filter when one is forwarded.
-    let base_with_port = match proxy_port {
-        Some(proxy) => Cow::Owned(format!(
+    // publish generation beside it, then the filter when one is forwarded.
+    let base_with_port = match (proxy_port, publish_generation) {
+        (Some(proxy), Some(generation)) => Cow::Owned(format!(
+            "{BASE_KERNEL_CMDLINE} {HOSTNAME_PROXY_PORT_TOKEN}={proxy} \
+             {PUBLISH_GENERATION_TOKEN}={generation}"
+        )),
+        (Some(proxy), None) => Cow::Owned(format!(
             "{BASE_KERNEL_CMDLINE} {HOSTNAME_PROXY_PORT_TOKEN}={proxy}"
         )),
-        None => Cow::Borrowed(BASE_KERNEL_CMDLINE),
+        (None, Some(generation)) => Cow::Owned(format!(
+            "{BASE_KERNEL_CMDLINE} {PUBLISH_GENERATION_TOKEN}={generation}"
+        )),
+        (None, None) => Cow::Borrowed(BASE_KERNEL_CMDLINE),
     };
 
     let Some(value) = rust_log else {
@@ -482,6 +510,32 @@ fn node_proxy_port_from_raw(proxy: Option<&str>) -> Result<Option<u16>, crate::e
     }
 }
 
+/// Reads this boot's publish generation the supervisor handed the VMM child
+/// (see [`PUBLISH_GENERATION_ENV`]). Strict like the port's decode: absent
+/// is a boot outside the supervisor (no token), and a value that is not a
+/// generation fails the boot naming the variable and the value.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn publish_generation_from_env() -> Result<Option<u64>, crate::error::VmError> {
+    publish_generation_from_raw(std::env::var(PUBLISH_GENERATION_ENV).ok().as_deref())
+}
+
+/// Decodes a handed publish generation from its raw env value.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn publish_generation_from_raw(raw: Option<&str>) -> Result<Option<u64>, crate::error::VmError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(generation) => Ok(Some(generation)),
+        Err(_) => Err(crate::error::VmError::Io {
+            source: std::io::Error::other(format!(
+                "environment variable {PUBLISH_GENERATION_ENV} carries {raw:?}, \
+                 which is not a publish generation"
+            )),
+        }),
+    }
+}
+
 /// Resolve the data-volume `(direct_io, sync_mode)` from the R1.9 environment
 /// tunables ([`DISK_DIRECT_IO_ENV`], [`DISK_SYNC_ENV`]). Defaults: `direct_io =
 /// false`, `sync_mode = Relaxed`.
@@ -533,7 +587,10 @@ mod tests {
     fn kernel_cmdline_without_a_host_filter_is_the_base_boot_line() {
         // The base line exactly: console plus IPv6 disabled, no empty token,
         // no trailing space.
-        assert_eq!(kernel_cmdline(None, None), "console=hvc0 ipv6.disable=1");
+        assert_eq!(
+            kernel_cmdline(None, None, None),
+            "console=hvc0 ipv6.disable=1"
+        );
     }
 
     #[test]
@@ -543,8 +600,8 @@ mod tests {
         // route table never gains an IPv6 entry, loopback's ::1 included —
         // nothing inside the escape boundary gets a v6 family to ride.
         let lines = [
-            kernel_cmdline(None, None),
-            kernel_cmdline(Some("debug"), None),
+            kernel_cmdline(None, None, None),
+            kernel_cmdline(Some("debug"), None, None),
         ];
         for line in lines {
             let tokens: Vec<&str> = line.split_whitespace().collect();
@@ -558,7 +615,7 @@ mod tests {
     #[test]
     fn kernel_cmdline_forwards_a_simple_filter() {
         assert_eq!(
-            kernel_cmdline(Some("debug"), None),
+            kernel_cmdline(Some("debug"), None, None),
             "console=hvc0 ipv6.disable=1 RUST_LOG=debug"
         );
     }
@@ -567,7 +624,7 @@ mod tests {
     fn kernel_cmdline_preserves_comma_separated_directives() {
         // The normal form of a real filter; commas are legal in a boot token.
         assert_eq!(
-            kernel_cmdline(Some("info,russh=debug,minimald=debug"), None),
+            kernel_cmdline(Some("info,russh=debug,minimald=debug"), None, None),
             "console=hvc0 ipv6.disable=1 RUST_LOG=info,russh=debug,minimald=debug"
         );
     }
@@ -578,11 +635,11 @@ mod tests {
         // corrupting the line, so the whole value is dropped — the base line
         // still boots, IPv6 disabled.
         assert_eq!(
-            kernel_cmdline(Some("info, russh=debug"), None),
+            kernel_cmdline(Some("info, russh=debug"), None, None),
             "console=hvc0 ipv6.disable=1"
         );
         assert_eq!(
-            kernel_cmdline(Some("info\trussh=debug"), None),
+            kernel_cmdline(Some("info\trussh=debug"), None, None),
             "console=hvc0 ipv6.disable=1"
         );
     }
@@ -590,7 +647,7 @@ mod tests {
     #[test]
     fn kernel_cmdline_skips_an_empty_filter() {
         assert_eq!(
-            kernel_cmdline(Some(""), None),
+            kernel_cmdline(Some(""), None, None),
             "console=hvc0 ipv6.disable=1"
         );
     }
@@ -600,7 +657,7 @@ mod tests {
         let huge = "minimald=trace,".repeat(500);
         assert!(huge.len() > COMMAND_LINE_SIZE);
         assert_eq!(
-            kernel_cmdline(Some(&huge), None),
+            kernel_cmdline(Some(&huge), None, None),
             "console=hvc0 ipv6.disable=1"
         );
     }
@@ -611,13 +668,13 @@ mod tests {
         // value yields a 2047-byte line that fills COMMAND_LINE_SIZE exactly
         // once NUL-terminated.
         let longest = "d".repeat(2010);
-        let line = kernel_cmdline(Some(&longest), None);
+        let line = kernel_cmdline(Some(&longest), None, None);
         assert_eq!(line.len(), COMMAND_LINE_SIZE - 1);
         assert!(line.ends_with(&longest));
 
         // One byte more must be skipped, not truncated.
         assert_eq!(
-            kernel_cmdline(Some(&"d".repeat(2011)), None),
+            kernel_cmdline(Some(&"d".repeat(2011)), None, None),
             "console=hvc0 ipv6.disable=1"
         );
     }
@@ -631,7 +688,7 @@ mod tests {
         // answerer (NET-138), so a token carrying one would be an admitted
         // port with nothing behind it.
         let handed = "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654";
-        assert_eq!(kernel_cmdline(None, Some(7654)), handed);
+        assert_eq!(kernel_cmdline(None, Some(7654), None), handed);
         assert!(
             !handed.contains("MINIMALD_ZONE_ANSWERER_PORT"),
             "the boot line must not carry a zone-answerer port: {handed}"
@@ -639,17 +696,17 @@ mod tests {
 
         // With both a filter and the port, the tokens share the line.
         assert_eq!(
-            kernel_cmdline(Some("debug"), Some(7654)),
+            kernel_cmdline(Some("debug"), Some(7654), None),
             "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 RUST_LOG=debug"
         );
 
         // A filter that would push the whole line past the buffer is skipped
         // while the port still boots: the line keeps the handed port and
         // drops the filter, rather than corrupting a token the guest binds.
-        let port_only = kernel_cmdline(None, Some(7654));
+        let port_only = kernel_cmdline(None, Some(7654), None);
         let oversized = "d".repeat(COMMAND_LINE_SIZE - port_only.len() - GUEST_LOG_ENV.len() - 1);
         assert_eq!(
-            kernel_cmdline(Some(&oversized), Some(7654)),
+            kernel_cmdline(Some(&oversized), Some(7654), None),
             port_only,
             "an oversized filter is skipped; the handed port still boots"
         );
@@ -667,6 +724,26 @@ mod tests {
             .to_string();
         assert!(
             garbage.contains(NODE_PROXY_PORT_ENV) && garbage.contains("no-port-here"),
+            "an undecodable value names the variable and the value, got: {garbage}"
+        );
+    }
+
+    #[test]
+    fn the_publish_generation_rides_the_boot_line_beside_the_port() {
+        // T93: the boot's publish generation travels the same way the port
+        // does, so the guest can echo it in every publish report.
+        assert_eq!(
+            kernel_cmdline(Some("debug"), Some(7654), Some(42)),
+            "console=hvc0 ipv6.disable=1 MINIMALD_HOSTNAME_PROXY_PORT=7654 \
+             MINIMALD_PUBLISH_GENERATION=42 RUST_LOG=debug"
+        );
+        assert_eq!(publish_generation_from_raw(None).unwrap(), None);
+        assert_eq!(publish_generation_from_raw(Some("42")).unwrap(), Some(42));
+        let garbage = publish_generation_from_raw(Some("not-a-generation"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            garbage.contains(PUBLISH_GENERATION_ENV) && garbage.contains("not-a-generation"),
             "an undecodable value names the variable and the value, got: {garbage}"
         );
     }

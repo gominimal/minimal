@@ -3299,6 +3299,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             &policy,
             SwitchSubnet::default(),
+            None,
         );
         assert!(
             gate.admits_direct_tcp(backend_port),
@@ -3390,7 +3391,7 @@ mod tests {
                 egress_allowing_the_target(),
             ),
         ] {
-            reg.register_caller(id, name, &policy, subnet);
+            reg.register_caller(id, name, &policy, subnet, None);
             reg.report_own_address(id, name, lease, BTreeMap::new());
         }
         let router = Router::new(Arc::new(reg), proxied_request_verdict);
@@ -3667,6 +3668,7 @@ mod tests {
                         credentialed_upstream: None,
                     },
                     subnet,
+                    None,
                 );
                 reg.report_own_address(client, "client", CALLER_LEASE, BTreeMap::new());
                 reg.caller_at(CALLER_LEASE)
@@ -3745,6 +3747,7 @@ mod tests {
                         target_lease,
                         &target_policy,
                         subnet,
+                        None,
                     );
                     prop_assert!(
                         gate.admits_direct_tcp(internal),
@@ -3783,6 +3786,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             &policy,
             SwitchSubnet::default(),
+            None,
         );
         assert!(
             !gate.admits_direct_tcp(18080),
@@ -3801,6 +3805,7 @@ mod tests {
                 "client",
                 &egress_allowing_the_target(),
                 SwitchSubnet::default(),
+                None,
             );
             reg.report_own_address(client, "client", CALLER_LEASE, BTreeMap::new());
             let caller = reg
