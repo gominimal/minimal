@@ -929,7 +929,14 @@ pub(crate) async fn activate_session(
             )
         );
     } else if let Some(answerer_port) = answerer_port {
-        let detection = crate::resolver::session_detection().await;
+        // The answerer service's step (NET-122's host service) is read
+        // beside the detection: whether the zone is manager-held or held
+        // only while a session holds it, and whether the installed copy
+        // speaks this daemon's channel protocol.
+        let (detection, answerer_step) = tokio::join!(
+            crate::resolver::session_detection(),
+            crate::resolver::read_answerer_step()
+        );
         // NET-018: name the live surface at the moment the user is about to
         // rely on the names — decided in the one function both verbs share
         // (`resolver`), from the same detection the advisory reads: this
@@ -965,6 +972,7 @@ pub(crate) async fn activate_session(
             surface_verdict
                 .as_ref()
                 .and_then(|verdict| verdict.range_present),
+            &answerer_step,
         );
         if let Some(advisory) = &name_advisory {
             eprintln!("{advisory}");
@@ -989,6 +997,8 @@ pub(crate) async fn activate_session(
                 range_present = ?verdict.range_present,
                 range_unit_state = ?detection.2.state,
                 range_unit_check = ?detection.2.failed_check,
+                answerer_manager_held = answerer_step.holds(),
+                answerer_step = ?answerer_step,
                 "session start decided the live name surface for this host, \
                  with the range unit's state beside it"
             );

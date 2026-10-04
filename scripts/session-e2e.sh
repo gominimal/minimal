@@ -5101,7 +5101,7 @@ proof_local_range_reserved_by_privileged_step() {
   # on macOS it spans several lines, because the two files' bytes ride
   # inside it as quoted heredocs, so the extraction runs from the
   # de-indented `sudo` line to the closing quote.
-  range_cmd="$(awk -v lead="Configure the host's resolver and reserve the local range with:" -v q="'" '
+  range_cmd="$(awk -v lead="Configure the host's resolver, reserve the local range, and install the box-zone answerer service with:" -v q="'" '
     index($0, lead) > 0 { started = 1; next }
     started && !first { sub(/^  /, ""); first = 1 }
     started { print; if (substr($0, length($0), 1) == q) exit }
@@ -5492,8 +5492,9 @@ proof_native_resolution_without_proxy_env() {
 
   # The command the advisory named: the line after its lead-in, de-indented —
   # exactly what a user would have copied off the terminal. The lead-in's
-  # shared prefix matches both platforms' wording ("…for the zone with:" on
-  # Linux, "…and reserve the local range with:" on macOS, whose command
+  # shared prefix matches both platforms' wording ("…and install the box-zone
+  # answerer service with:" on Linux, "…reserve the local range, and install
+  # the box-zone answerer service with:" on macOS, whose command
   # carries the range step NET-123 folds into it); the range-reserving case
   # below extracts the multi-line command whole.
   native_cmd="$(grep -A1 -F -- "Configure the host's resolver" \
@@ -6325,7 +6326,7 @@ proof_box_name_resolves_natively_without_proxy() {
   # NET-122: the advisory, on the activate's stderr — the exact command, no
   # prompt anywhere in the path. The command must name this platform's
   # mechanism and THIS daemon's answerer, and be one the user runs.
-  bn_cmd="$(grep -A1 -F -- "Configure the host's resolver for the zone with:" \
+  bn_cmd="$(grep -A1 -F -- "Configure the host's resolver and install the box-zone answerer service with:" \
     "$bn_err" 2>/dev/null | tail -n1 | sed 's/^  //')"
   if [ -n "$bn_cmd" ]; then
     case "$bn_cmd" in

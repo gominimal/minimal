@@ -42,6 +42,7 @@ pub const CHANNEL_SOCKET_NAME: &str = "Channel";
 
 /// The most sockets a unit hands one service: past this, `LISTEN_FDS` is not
 /// a unit's — it is a hostile environment, and no service allocates for it.
+#[cfg(any(test, not(target_os = "macos")))]
 const HANDED_SOCKET_LIMIT: usize = 1024;
 
 /// The `answerer` subcommand.
@@ -197,6 +198,7 @@ fn activate(name: &str) -> Result<OwnedFd> {
 /// refused rather than served). Pure over its arguments, so every arm is
 /// testable without touching the process's environment, which no test may
 /// race with another.
+#[cfg(any(test, not(target_os = "macos")))]
 fn activated_count(
     listen_fds: Option<&str>,
     listen_pid: Option<&str>,
