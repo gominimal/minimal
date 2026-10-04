@@ -527,10 +527,11 @@ pub struct ActivateArgs {
     /// Declare a credentialed upstream for this box (NET-134): the Box
     /// Egress Proxy's listener becomes the box's infrastructure, reachable
     /// whatever its `--allow-*`/`--deny-*` rules say. Without the flag every
-    /// frame this box sends to the proxy's address is dropped at the
-    /// host-side gate. The steering the proxy applies and the credentials it
-    /// redeems are the proxy document's; this declares the lane, nothing
-    /// more.
+    /// frame this box sends to the proxy's address is dropped — by the VM
+    /// host's egress gate on a VM-backed host, by the relay's own
+    /// `egress-uncredentialed-proxy-destination` drop on a native one. The
+    /// steering the proxy applies and the credentials it redeems are the
+    /// proxy document's; this declares the lane, nothing more.
     #[arg(long)]
     pub credentialed_upstream: bool,
     /// Apply the named loadout from `<config>/minimal/loadouts/<NAME>.toml`.
