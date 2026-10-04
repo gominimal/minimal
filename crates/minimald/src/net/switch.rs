@@ -794,7 +794,8 @@ fn drop_transport(reason: &DropReason) -> Proto {
         DropReason::UndeclaredProtocol { proto }
         | DropReason::DeniedSubnet { proto, .. }
         | DropReason::UncredentialedProxyDestination { proto, .. }
-        | DropReason::UndeclaredSubnet { proto, .. } => Proto::from_ipv4_number(*proto),
+        | DropReason::UndeclaredSubnet { proto, .. }
+        | DropReason::InfrastructureDestination { proto, .. } => Proto::from_ipv4_number(*proto),
     }
 }
 
@@ -2094,6 +2095,18 @@ pub fn declared_request_ports(policy: Option<&sessions::SessionPolicy>) -> BTree
 /// and the refusal a lane-less box is owed there belongs to the box's own
 /// path, which on a native host — no minvmd gate beside the relay — this
 /// leg is.
+///
+/// The switch's own addresses are compiled in with it (NET-062's
+/// sub-clause): the gateway, the host alias, the node address and the BEP
+/// peer `subnet` names, handed to the verdict so the relay — the only leg a
+/// native host runs — subtracts them from whatever the box's
+/// `egress.allow_subnets` admits, outside the three port-scoped openings
+/// the sub-clause lists (the resolver's port on the gateway, the proxy's
+/// listener on a credentialed lane, and the host alias as local reach under
+/// the box's rules — no host exposure is configured anywhere today, so the
+/// set is handed with none). The same compilation is the hostname proxy's
+/// caller check, so no reach the relay would refuse can be asked of the
+/// proxy instead (NET-071).
 #[must_use]
 pub fn compiled_egress(
     policy: Option<&sessions::SessionPolicy>,
@@ -2106,10 +2119,16 @@ pub fn compiled_egress(
         lease.octets(),
     );
     let proxy = subnet.box_egress_proxy_address().octets();
-    match policy.is_some_and(|policy| policy.credentialed_upstream.is_some()) {
+    let rules = match policy.is_some_and(|policy| policy.credentialed_upstream.is_some()) {
         true => rules.with_credentialed_upstream(proxy),
         false => rules.with_box_egress_proxy(proxy),
-    }
+    };
+    rules.with_switch_own_addresses(egress::SwitchOwnAddresses::new(
+        subnet.gateway().octets(),
+        subnet.host_alias().octets(),
+        subnet.daemon_ip().octets(),
+        proxy,
+    ))
 }
 
 /// The egress verdict a direct TCP connection from a box whose own frames are
@@ -3495,6 +3514,137 @@ pub(crate) mod tests {
             .expect("the relay survives a dropped frame")
             .expect("the switch side stays open");
         assert_eq!(next, sentinel);
+    }
+
+    /// NET-062's sub-clause on the native relay — the only leg a native
+    /// host runs, with no minvmd gate beside it: a box whose
+    /// `egress.allow_subnets` cover the whole switch subnet still cannot
+    /// open a flow to the switch's own addresses outside the three
+    /// port-scoped openings. The gateway outside the resolver's port and
+    /// the node address at every port never reach the switch, dropped
+    /// silently (never reset) and named by the rate-limited warn line under
+    /// the infrastructure deny set's own rule; the peer's listener is the
+    /// lane's opening, already pinned lane-less above. The openings still
+    /// forward: the resolver's port on the gateway, and the host alias,
+    /// reached as local reach under the box's own rules — no host exposure
+    /// is configured anywhere today, so the alias is the rules' own to
+    /// decide, and these rules admit it, the shape the VM host's gate
+    /// holds and the session e2e proves over `host.min.internal`
+    /// (NET-003).
+    #[tokio::test]
+    async fn native_relay_drops_flows_to_switch_addresses() {
+        let capture = crate::test_harness::captured_log();
+        let subnet = SwitchSubnet::default();
+        let gateway = subnet.gateway();
+        let node = subnet.daemon_ip();
+        let alias = subnet.host_alias();
+        // The default /16's own layout, read from the subnet rather than
+        // restated — pinned here so a renumbered subnet cannot quietly
+        // change what this proof says.
+        assert_eq!(gateway, Ipv4Addr::new(100, 64, 0, 1));
+        assert_eq!(node, Ipv4Addr::new(100, 64, 255, 253));
+        assert_eq!(alias, Ipv4Addr::new(100, 64, 255, 254));
+        // The box's own declaration covers the whole switch subnet: every
+        // frame below would be admitted by its rules alone, so the drops are
+        // the own-address set's, which [`compiled_egress`] now hands the
+        // verdict.
+        let covering = sessions::SessionPolicy {
+            egress: Some(sessions::EgressPolicy {
+                allow_protocols: None,
+                allow_subnets: Some(vec!["100.64.0.0/16".to_string()]),
+                allow_dns_hosts: None,
+                deny_subnets: None,
+            }),
+            ingress: None,
+            credentialed_upstream: None,
+        };
+        let mut harness = spawn_test_relay(&covering);
+
+        // The openings forward, verbatim: the resolver's port on the
+        // gateway over UDP and TCP alike, and the host alias as local reach
+        // under the rules (NET-003's shape).
+        let openings = [
+            udp_frame(LEASE, 40000, gateway, 53),
+            egress_tcp_frame(LEASE, gateway, 53),
+            egress_tcp_frame(LEASE, alias, 18081),
+        ];
+        for frame in &openings {
+            harness.box_end.write_all(frame).unwrap();
+            let seen =
+                tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+                    .await
+                    .expect("an opening's frame is forwarded")
+                    .expect("the switch side stays open");
+            assert_eq!(
+                &seen, frame,
+                "the openings forward verbatim under rules that admit them"
+            );
+        }
+
+        // The box reaches for the switch's own control surface — the
+        // gateway on another port, and the node address at the daemon's own
+        // port — then ARP as the sentinel: nothing before it arrives.
+        let api = egress_tcp_frame(LEASE, gateway, 443);
+        let node_ssh = egress_tcp_frame(LEASE, node, 7654);
+        let sentinel = arp_frame(LEASE);
+        harness.box_end.write_all(&api).unwrap();
+        harness.box_end.write_all(&node_ssh).unwrap();
+        harness.box_end.write_all(&sentinel).unwrap();
+        let seen = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay forwards the sentinel")
+            .expect("the switch side stays open");
+        assert_eq!(
+            seen, sentinel,
+            "neither the gateway nor the node address reached the switch"
+        );
+
+        // The drop says so, once per box per rule per interval — the two
+        // drops share the set's one rule, so the first is the line a
+        // bundle reads: the gateway's own (address, port), the protocol,
+        // the box, the direction, and the rule naming the infrastructure
+        // deny set.
+        let logged = capture.contents();
+        assert_eq!(
+            logged
+                .matches("rule_matched=\"egress-infrastructure-destination\"")
+                .count(),
+            1,
+            "the set's drop says one line: {logged}"
+        );
+        for expected in [
+            "network policy violation",
+            "session_id=\"100.64.0.9\"",
+            "direction=egress",
+            "remote_addr=100.64.0.1:443",
+            "proto=tcp",
+        ] {
+            assert!(
+                logged.contains(expected),
+                "missing {expected:?} in: {logged}"
+            );
+        }
+
+        // A drop is not a reset: nothing is written back toward the box.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        set_nonblocking(harness.box_end.as_raw_fd()).unwrap();
+        let mut probe = [0u8; 1];
+        let read = harness.box_end.read(&mut probe);
+        assert!(
+            matches!(read, Err(ref e) if e.kind() == io::ErrorKind::WouldBlock),
+            "the switch's own addresses are dropped, not reset: got {read:?}"
+        );
+
+        // And the drops broke nothing the rules do decide: a sibling's lease
+        // on the same subnet still forwards, the destination the box
+        // declared.
+        let sibling = egress_tcp_frame(LEASE, Ipv4Addr::new(100, 64, 0, 10), 80);
+        harness.box_end.write_all(&sibling).unwrap();
+        let seen = tokio::time::timeout(Duration::from_secs(5), read_framed(&mut harness.switch))
+            .await
+            .expect("the relay still forwards declared reach")
+            .expect("the switch side stays open");
+        assert_eq!(seen, sibling);
     }
 
     /// NET-134 on the relay leg, the first of the two a box's frame must
