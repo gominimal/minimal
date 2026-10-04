@@ -1984,9 +1984,7 @@ async fn policy_shows_unset_egress_as_named_default() {
     )
     .await;
     let resp = client
-        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(
-            declared_id,
-        ))
+        .oneshot_rpc::<GetEffectiveSessionPolicy>(GetEffectiveSessionPolicyRequest::Id(declared_id))
         .await
         .unwrap();
     let declared_policy = match resp {
