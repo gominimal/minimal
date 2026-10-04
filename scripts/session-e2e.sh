@@ -7523,8 +7523,34 @@ for row in json.load(open(sys.argv[1])):
   asr_expect_a e2e-asr-b.min.internal "$asr_b_ip"
 
   # ---- 5. stopping one node's session leaves the sibling answering ---------
+  local asr_a_gone asr_a_gone_done
+  asr_a_gone="$(date +%s)"
   mnl session destroy --force "$asr_a_sid" >/dev/null 2>&1 || true
+  asr_a_gone_done="$(date +%s)"
   echo "5. destroyed node A's session"
+
+  # ---- 5b. A's address is not reused inside the answer TTL ----------------
+  # Design §7.1: a released box address stays out of allocation for the
+  # positive answer TTL (15 s), since a host resolver may still answer A's
+  # name with it. Node B is warm, so a box it registers right now lands
+  # inside that window: it must not be handed A's address. The release can
+  # only have happened after the destroy began, so a box that finished
+  # registering within 15 s of that moment was allocated inside the TTL.
+  local asr_b2_sid asr_b2_ip asr_b2_done asr_b2_within
+  asr_b2_sid="$(asr_activate mnl2 e2e-asr-b2 "$WORK/asr-b2-activate.err")" || fail
+  asr_b2_done="$(date +%s)"
+  asr_b2_ip="$(asr_zone_address "$ASR_STATE2_DIR" e2e-asr-b2.min.internal)"
+  asr_b2_within=$((asr_b2_done - asr_a_gone))
+  if [ "$asr_b2_within" -lt 15 ]; then
+    if [ "$asr_b2_ip" = "$asr_a_ip" ]; then
+      echo "::error::node B's box was handed A's released address $asr_a_ip ${asr_b2_within} s after A's destroy began — inside the 15 s answer TTL"
+      fail
+    fi
+    echo "  inside the answer TTL (${asr_b2_within} s after A's destroy began), e2e-asr-b2 got $asr_b2_ip, not A's released $asr_a_ip"
+  else
+    echo "::error::node B's box registration took ${asr_b2_within} s, past the 15 s window, so the quarantine could not be observed on this host"
+    fail
+  fi
   asr_expect_nx e2e-asr-a.min.internal
   asr_expect_a e2e-asr-b.min.internal "$asr_b_ip"
 
@@ -7534,6 +7560,8 @@ for row in json.load(open(sys.argv[1])):
   asr_service_mid="$(asr_count "$asr_base_a" 'the manager-held answerer service')"
   mnl stop --force >/dev/null 2>&1 || true
   asr_bring_up "node A's fresh"
+  local asr_a2_start
+  asr_a2_start="$(date +%s)"
   asr_a2_sid="$(asr_activate mnl e2e-asr-a2 "$WORK/asr-a2-activate.err")" || fail
   if ! asr_wait_more "$asr_base_a" 'the manager-held answerer service' "$asr_service_mid"; then
     echo "::error::node A's fresh daemon did not publish to the manager-held answerer service"
@@ -7547,12 +7575,26 @@ for row in json.load(open(sys.argv[1])):
   fi
   asr_a2_ip="$(asr_zone_address "$asr_base_a" e2e-asr-a2.min.internal)"
   echo "6. a later session on a fresh node A published to the service; nothing bound the port"
+  # The reuse leg: A2 registered more than the TTL after A's address was
+  # released (the release finished by the time the destroy returned), so
+  # A's address is free again and, as the lowest free one, it is A2's.
+  if [ $((asr_a2_start - asr_a_gone_done)) -ge 15 ]; then
+    if [ "$asr_a2_ip" != "$asr_a_ip" ]; then
+      echo "::error::A2 registered $((asr_a2_start - asr_a_gone_done)) s after A's destroy, past the TTL, but got $asr_a2_ip, not the freed lowest address $asr_a_ip"
+      fail
+    fi
+    echo "  past the answer TTL ($((asr_a2_start - asr_a_gone_done)) s after A's destroy), e2e-asr-a2 reuses A's freed $asr_a_ip"
+  elif [ "$asr_a2_ip" = "$asr_a_ip" ]; then
+    echo "::error::A2 got A's released address $asr_a_ip within 15 s of A's destroy"
+    fail
+  fi
   asr_expect_a e2e-asr-a2.min.internal "$asr_a2_ip"
   asr_expect_a e2e-asr-b.min.internal "$asr_b_ip"
 
   # ---- cleanup: the host as found -----------------------------------------
   mnl session destroy --force "$asr_a2_sid" >/dev/null 2>&1 || true
   mnl2 session destroy --force "$asr_b_sid" >/dev/null 2>&1 || true
+  mnl2 session destroy --force "$asr_b2_sid" >/dev/null 2>&1 || true
   mnl2 stop --force >/dev/null 2>&1 || true
   ASR_STATE2_DIR=""
   # Node A goes down before the service does, so it never re-hosts the
