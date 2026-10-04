@@ -446,6 +446,7 @@ chmod 700 "$XDG_RUNTIME_DIR"
 # lanes (KVM/macOS) set MINVMD_GVPROXY_BIN themselves and their switch
 # lives guest-side, so this is native-only.
 E2E_NATIVE_SWITCH_DIR=""
+E2E_LANE_MINIMAL_BIN="${MINIMAL_BIN:-}"
 if [ -z "$E2E_VM" ] && [ "$(uname -s)" = Linux ] && [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
   gvproxy_prefix="${MINIMAL_BIN:-$HOME/.local/bin}"
   if [ -x "$gvproxy_prefix/gvproxy-min" ]; then
@@ -650,13 +651,15 @@ fi
 
 # Every CLI call goes through this so E2E_MINIMAL_ARGS applies uniformly.
 # Word-splitting of the args is intended.
-# On the native lane it also hands the staged switch prefix to the daemon
-# the call may autospawn (E2E_NATIVE_SWITCH_DIR above), call-locally, and
-# only when the caller has not named a prefix of its own.
+# On the native lane it also hands the switch prefix to the daemon the call
+# may autospawn (E2E_NATIVE_SWITCH_DIR above), call-locally. It replaces the
+# lane's own prefix (which may hold no switch, so the staged dir must win),
+# but never a prefix a proof swapped in for itself (an installed pair's).
 mnl() {
-  if [ -n "$E2E_NATIVE_SWITCH_DIR" ]; then
-    # shellcheck disable=SC2086,SC2031
-    MINIMAL_BIN="${MINIMAL_BIN:-$E2E_NATIVE_SWITCH_DIR}" min ${E2E_MINIMAL_ARGS:-} "$@"
+  # shellcheck disable=SC2031
+  if [ -n "$E2E_NATIVE_SWITCH_DIR" ] && [ "${MINIMAL_BIN:-}" = "$E2E_LANE_MINIMAL_BIN" ]; then
+    # shellcheck disable=SC2086
+    MINIMAL_BIN="$E2E_NATIVE_SWITCH_DIR" min ${E2E_MINIMAL_ARGS:-} "$@"
   else
     # shellcheck disable=SC2086
     min ${E2E_MINIMAL_ARGS:-} "$@"
