@@ -4404,15 +4404,17 @@ mod tests {
         // line naming the holder — on a line that names this test's channel,
         // so a co-resident test's own publish cannot speak for it — and
         // not the re-publish's debug line a warn-suppressed first publish
-        // would have been left with.
-        let log = buf.contents();
-        assert!(
-            log.lines().any(|line| {
+        // would have been left with. Awaited, not read once: the loop
+        // writes the Registered status before it logs the announcement,
+        // so the status alone does not mean the line has landed.
+        let channel_text = channel.to_string_lossy().into_owned();
+        await_log(
+            &buf,
+            |line| {
                 line.contains("registered this table's zone rows")
-                    && line.contains(channel.to_string_lossy().as_ref())
-            }),
-            "the first publish after a warn must still name its holder \
-             at info, got: {log}"
+                    && line.contains(channel_text.as_str())
+            },
+            "the first publish after a warn must still name its holder at info",
         );
     }
 
