@@ -2162,17 +2162,18 @@ pub async fn cmd_session_setup_zed(
 ///
 /// Rows are in setup order — project first, then loadouts in the order
 /// they were applied. Teardown runs the reverse.
-pub(crate) async fn cmd_session_hooks(
-    global: &GlobalArgs,
-    args: HooksArgs,
-) -> Result<(), anyhow::Error> {
+pub async fn cmd_session_hooks(global: &GlobalArgs, args: HooksArgs) -> Result<(), anyhow::Error> {
     ensure_daemon(global)?;
     let mut client = connect_daemon(global).await?;
 
+    // Resolve first, like every other session command, so a missing session
+    // is named in the error; then ask for the hooks of the record that
+    // resolved, so both calls target the same session.
+    let record = resolve_session(&mut client, &args.session).await?;
+
     use minimald_rpc::{GetSessionHooks, GetSessionHooksRequest};
-    let lookup: GetSessionHooksRequest = SessionLookup::parse(&args.session).into();
     let resp = client
-        .oneshot_rpc::<GetSessionHooks>(lookup)
+        .oneshot_rpc::<GetSessionHooks>(GetSessionHooksRequest::Id(record.id))
         .await
         .context("GetSessionHooks RPC failed")?;
 
