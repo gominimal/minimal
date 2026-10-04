@@ -23,8 +23,8 @@
 #     /usr/lib64 — their multiarch subdirs included) or be the kernel's
 #     vDSO (linux-vdso, or linux-gate on 32-bit x86), and an entry that
 #     resolves from nowhere is an offender too (nothing is "system" until
-#     it is shown to resolve from a system dir). The binary must also carry no RPATH and no RUNPATH entry at
-#     all: an embedded search path decides where root loads libraries
+#     it is shown to resolve from a system dir). The binary must also
+#     carry no RPATH and no RUNPATH entry at all: an embedded search path decides where root loads libraries
 #     from, and every system library is already on the loader's default
 #     path, so there is no legitimate use for one here.
 #   * macOS (`otool -L` + `otool -l`): every entry must live under /usr/lib
