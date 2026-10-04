@@ -975,11 +975,14 @@ async fn policy_json_carries_schema_and_pending() {
 }
 
 /// A `-o json` run that fails answers with the mode's error contract, not a
-/// plain-text line: the error that crosses to `main` is the typed
-/// `PolicyJsonExit` — what makes `main` end the run non-zero without
-/// printing a second line for the same failure, the `min/v1/error` object
-/// on stderr (whose one-object shape `write_policy_error`'s unit test pins)
-/// being the answer a client parses.
+/// plain-text line: the failure crosses to `main` as the typed
+/// `MachineModeFailure` — the generic payload every `-o json` command fails
+/// into, which `main`'s machine-mode error emitter (keyed on the output
+/// mode, shared by every command that takes `-o json`) writes as the one
+/// `min/v1/error` object on stderr, its one-object shape pinned by `main`'s
+/// own unit test. A missing session carries the architecture's `not_found`
+/// code — never a policy-specific spelling — with the kind of thing that
+/// was missing, a session, in the message and the hint.
 #[tokio::test]
 async fn policy_json_failure_answers_with_the_error_contract() {
     let (_daemon, args) = setup().await;
@@ -992,9 +995,23 @@ async fn policy_json_failure_answers_with_the_error_contract() {
     )
     .await
     .unwrap_err();
+    let failure = err
+        .downcast_ref::<MachineModeFailure>()
+        .expect("the failure crosses as the payload the emitter writes, not a message");
+    assert_eq!(
+        failure.code(),
+        "not_found",
+        "a missing session is the architecture's not-found code: {err:#}"
+    );
     assert!(
-        err.downcast_ref::<PolicyJsonExit>().is_some(),
-        "the failure crosses as the sentinel `main` downcasts, not a message: {err:#}"
+        failure.message().contains("session"),
+        "the message names the kind of thing that was missing: {}",
+        failure.message()
+    );
+    assert!(
+        failure.hint().contains("session"),
+        "the hint names the kind of thing that was missing: {}",
+        failure.hint()
     );
 }
 

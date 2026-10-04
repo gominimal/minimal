@@ -274,6 +274,74 @@ pub enum PolicyOutputFormat {
     Json,
 }
 
+/// The typed failure a machine-output run fails its walk into: the
+/// `code`, `message` and `hint` of the one `min/v1/error` object the CLI's
+/// `main` writes on stderr when the run ends non-zero. Keyed on the output
+/// mode rather than on any one command — every command that takes `-o json`
+/// fails into this, and `main`'s single machine-mode error emitter (keyed
+/// the same way, in `main.rs`, shared by all of them) is the only thing
+/// that turns one into bytes — so the next command that takes `-o json`
+/// calls the mechanism directly: its walk names the failure kinds it can
+/// tell apart and fails into this payload, with no sentinel of its own.
+///
+/// [`std::error::Error`] so the failure can ride the `anyhow` chain across
+/// the library boundary to `main`, the way the task-status type does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineModeFailure {
+    /// The failure's kind: a name a script branches on — the
+    /// architecture's codes, `not_found` for a missing thing (with the
+    /// kind of thing that was missing in the message and the hint),
+    /// `daemon_unreachable`, `policy_unavailable` — never a single
+    /// command's own spelling.
+    code: &'static str,
+    message: String,
+    hint: String,
+}
+
+impl MachineModeFailure {
+    /// One failure, from the three parts the error object carries.
+    #[must_use]
+    pub fn new(code: &'static str, message: String, hint: String) -> Self {
+        Self {
+            code,
+            message,
+            hint,
+        }
+    }
+
+    /// The failure's kind — the `code` of the error object.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    /// The message beside it: the same chain the text mode's error line
+    /// carries.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The hint beside them: one line naming what to do about the failure,
+    /// or the kind of thing that was missing.
+    #[must_use]
+    pub fn hint(&self) -> &str {
+        &self.hint
+    }
+}
+
+impl std::fmt::Display for MachineModeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the machine-mode error object on stderr says why: {} ({})",
+            self.message, self.code
+        )
+    }
+}
+
+impl std::error::Error for MachineModeFailure {}
+
 #[derive(Debug, Args)]
 pub struct LoadoutArgs {
     #[command(subcommand)]

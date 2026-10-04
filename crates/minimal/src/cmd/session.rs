@@ -2009,13 +2009,9 @@ pub fn write_live_ingress(
 /// The schema string of the document `min session policy -o json` writes:
 /// the stamp a client checks before it reads anything else, held as a
 /// constant so the renderer and the tests that pin the document cite one
-/// spelling.
+/// spelling. The failure's object carries its own stamp (`min/v1/error`),
+/// held beside the emitter that writes it, in `main`.
 pub const POLICY_JSON_SCHEMA: &str = "min/v1/session-policy";
-
-/// The schema string of the object a `-o json` failure writes to stderr —
-/// the same kind of stamp on a different document, so a client reads a
-/// failure the same way it reads the policy.
-const POLICY_ERROR_JSON_SCHEMA: &str = "min/v1/error";
 
 /// The ingress block as the document carries it: the declared policy, or
 /// `deny_all` where the text rendering writes that reading — the same
@@ -2163,8 +2159,10 @@ pub fn write_policy_json(
 }
 
 /// Why a `-o json` walk failed, tagged where the kinds can be told apart —
-/// each tag is the `code` the error document writes, a name a script can
-/// branch on rather than a message to parse.
+/// the tag carries this walk's own knowledge: the `code` the failure answers
+/// with (the architecture's names, so a script branches on one vocabulary
+/// across every machine-output command) and the hint naming the remedy, or
+/// the kind of thing that was missing.
 enum PolicyJsonFailure {
     /// No daemon to ask: the autospawn, the connection, or an RPC the daemon
     /// never answered.
@@ -2176,71 +2174,38 @@ enum PolicyJsonFailure {
 }
 
 impl PolicyJsonFailure {
-    /// The `code` of the error document this failure writes.
-    fn code(&self) -> &'static str {
+    /// The failure as the machine-mode error object carries it — the
+    /// generic payload every `-o json` command fails into (see
+    /// [`MachineModeFailure`]), this walk's kinds mapped onto it.
+    fn machine_failure(&self) -> MachineModeFailure {
         match self {
-            Self::DaemonUnreachable(_) => "daemon_unreachable",
-            Self::SessionNotFound(_) => "session_not_found",
-            Self::PolicyUnavailable(_) => "policy_unavailable",
+            Self::DaemonUnreachable(message) => MachineModeFailure::new(
+                "daemon_unreachable",
+                message.clone(),
+                "the daemon may be down or mid-restart; try again, and check \
+                 that --minimal-dir and --vm name the instance you meant"
+                    .to_string(),
+            ),
+            // The architecture's code for a missing thing, with the kind —
+            // a session — in the message (from the shared resolver, which
+            // already names it) and in the hint beside it.
+            Self::SessionNotFound(message) => MachineModeFailure::new(
+                "not_found",
+                message.clone(),
+                "no session by that name or id exists; `min ls` lists the \
+                 sessions there are"
+                    .to_string(),
+            ),
+            Self::PolicyUnavailable(message) => MachineModeFailure::new(
+                "policy_unavailable",
+                message.clone(),
+                "the session resolved but its effective policy could not be \
+                 read — the daemon may be mid-restart; try again"
+                    .to_string(),
+            ),
         }
     }
-
-    /// The `message` beside it: the whole error chain, read the way the text
-    /// mode's error line reads it.
-    fn message(&self) -> &str {
-        match self {
-            Self::DaemonUnreachable(message)
-            | Self::SessionNotFound(message)
-            | Self::PolicyUnavailable(message) => message,
-        }
-    }
 }
-
-/// The shape of the `min/v1/error` document.
-#[derive(serde::Serialize)]
-struct PolicyJsonErrorDoc<'a> {
-    schema: &'static str,
-    code: &'a str,
-    message: &'a str,
-}
-
-/// Writes one `min/v1/error` document to `err`: the only thing this mode
-/// puts on stderr, on any failure, so a client parses a failure the same way
-/// it parses the policy. Shared with the tests that pin the contract.
-pub fn write_policy_error(
-    err: &mut impl std::io::Write,
-    code: &str,
-    message: &str,
-) -> Result<(), anyhow::Error> {
-    let document = PolicyJsonErrorDoc {
-        schema: POLICY_ERROR_JSON_SCHEMA,
-        code,
-        message,
-    };
-    let encoded =
-        serde_json_lenient::to_string(&document).context("encoding the policy error document")?;
-    writeln!(err, "{encoded}").context("writing the policy error document")?;
-    Ok(())
-}
-
-/// A `-o json` failure that has already written its one `min/v1/error`
-/// document to stderr: carried as a typed error so the CLI's `main` can end
-/// the run non-zero without printing a second line for the same failure —
-/// [`crate::task::TaskExit`]'s precedent. The document is the contract; the
-/// exit code is the status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PolicyJsonExit;
-
-impl std::fmt::Display for PolicyJsonExit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the policy document could not be rendered; the JSON error on stderr says why"
-        )
-    }
-}
-
-impl std::error::Error for PolicyJsonExit {}
 
 /// The live-ingress half of either rendering's walk: the ports the box
 /// published at runtime, listed beside the declaration (NET-044) — the rows
@@ -2331,15 +2296,15 @@ async fn session_policy_json_inputs(
 /// The `-o json` rendering: the walk's inputs as one `min/v1/session-policy`
 /// document on stdout, or the failure's one `min/v1/error` object on stderr
 /// and a non-zero exit — never a document beside a plain-text error line,
-/// so a client parses exactly one thing.
+/// so a client parses exactly one thing. The walk never writes the object
+/// itself: it fails into the generic [`MachineModeFailure`] payload, which
+/// `main`'s machine-mode error emitter — keyed on the output mode, shared
+/// by every command that takes `-o json` — writes, so the error path is
+/// one mechanism rather than a per-command one.
 async fn session_policy_as_json(global: &GlobalArgs, session: &str) -> Result<(), anyhow::Error> {
     let (record, policy, live) = match session_policy_json_inputs(global, session).await {
         Ok(inputs) => inputs,
-        Err(failure) => {
-            let mut err = std::io::stderr();
-            write_policy_error(&mut err, failure.code(), failure.message())?;
-            return Err(PolicyJsonExit.into());
-        }
+        Err(failure) => return Err(failure.machine_failure().into()),
     };
     // The fabric the baseline set builds from — keyed the same way the text
     // rendering keys it (see the comment in [`cmd_session_policy`]): the
@@ -3334,42 +3299,48 @@ mod tests {
         );
     }
 
-    /// The document a `-o json` failure writes to stderr: one `min/v1/error`
-    /// object, its `code` a name a script can branch on and its `message`
-    /// the same chain the text mode's error line carries — so a client
-    /// parses a failure the same way it parses the policy, with no second,
-    /// plain-text line to also handle.
+    /// The walk's failure kinds map onto the machine-mode error payload:
+    /// the architecture's codes — `not_found` for a missing thing, with
+    /// the kind of thing that was missing (a session) in the message and
+    /// the hint, never a policy-specific spelling — beside the message and
+    /// the hint the object carries. The one-object shape the payload
+    /// becomes on stderr is pinned beside the emitter that writes it, in
+    /// `main`'s own tests, since writing it is the emitter's job now.
     #[test]
-    fn policy_json_error_document_is_one_object() {
-        let mut err = Vec::new();
-        write_policy_error(
-            &mut err,
-            "session_not_found",
-            "No session found matching 'gone'",
+    fn policy_json_failures_map_to_the_machine_mode_payload() {
+        let missing = PolicyJsonFailure::SessionNotFound(
+            "No session found matching 'gone'".to_string(),
         )
-        .unwrap();
-        let rendered = String::from_utf8(err).unwrap();
-        let document: serde_json_lenient::Value =
-            serde_json_lenient::from_str(rendered.trim_end()).unwrap();
+        .machine_failure();
         assert_eq!(
-            document["schema"].as_str(),
-            Some("min/v1/error"),
-            "the failure object carries its own schema stamp: {rendered}"
+            missing.code(),
+            "not_found",
+            "a missing session is the architecture's not-found code, not a \
+             policy spelling"
+        );
+        assert!(
+            missing.message().contains("session"),
+            "the message names the kind of thing that was missing: {}",
+            missing.message()
+        );
+        assert!(
+            missing.hint().contains("session"),
+            "the hint names the kind of thing that was missing: {}",
+            missing.hint()
+        );
+
+        // The other two kinds keep their own codes, the same vocabulary.
+        assert_eq!(
+            PolicyJsonFailure::DaemonUnreachable(String::new())
+                .machine_failure()
+                .code(),
+            "daemon_unreachable",
         );
         assert_eq!(
-            document["code"].as_str(),
-            Some("session_not_found"),
-            "the failure's kind is a name, not a message to parse: {rendered}"
-        );
-        assert_eq!(
-            document["message"].as_str(),
-            Some("No session found matching 'gone'"),
-            "the message beside it: {rendered}"
-        );
-        assert_eq!(
-            rendered.lines().count(),
-            1,
-            "one object, one line, nothing else: {rendered}"
+            PolicyJsonFailure::PolicyUnavailable(String::new())
+                .machine_failure()
+                .code(),
+            "policy_unavailable",
         );
     }
 

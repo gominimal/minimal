@@ -1,8 +1,10 @@
 //! The minimal CLI which pairs/talks-with minimald.
 
 use std::io::IsTerminal as _;
+use std::io::Write as _;
 use std::process::ExitCode;
 
+use anyhow::Context as _;
 use clap::{CommandFactory as _, Parser};
 use minimal::{ExecArgs, PolicyArgs, PolicyOutputFormat};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -104,6 +106,11 @@ async fn run() -> ExitCode {
             .init();
     }
 
+    // The output mode the run is under, read before the CLI is consumed:
+    // the error path keys on it (below), so a machine-output run answers a
+    // failure with its own contract rather than a plain-text line.
+    let output_mode = machine_output_mode(&cli);
+
     if let Err(e) = minimal::run(cli).await {
         // A task's non-zero exit (`min task run`) is a status to relay, not
         // an error to print — the task's own output already streamed through
@@ -111,11 +118,19 @@ async fn run() -> ExitCode {
         if let Some(&minimal::task::TaskExit(code)) = e.downcast_ref::<minimal::task::TaskExit>() {
             return ExitCode::from(code);
         }
-        // A `-o json` policy run that failed has already written its one
-        // `min/v1/error` object to stderr — the document is the contract, so
-        // there is no second, plain-text line to print for the same failure,
-        // only the non-zero status.
-        if e.downcast_ref::<minimal::PolicyJsonExit>().is_some() {
+        // A machine-output run answers its failure with the one
+        // `min/v1/error` object a client parses: the emitter below, keyed
+        // on the output mode the run was under rather than on the command,
+        // so the mechanism is one, shared by every command that takes
+        // `-o json` — each fails its walk into the generic
+        // [`minimal::MachineModeFailure`] payload, which is all this path
+        // downcasts. The object is the contract, so there is no second,
+        // plain-text line to print for the same failure, only the non-zero
+        // status.
+        if output_mode.is_some()
+            && let Some(failure) = e.downcast_ref::<minimal::MachineModeFailure>()
+        {
+            emit_machine_mode_error(failure);
             return ExitCode::FAILURE;
         }
         eprintln!("error: {e:#}");
@@ -165,6 +180,74 @@ fn stdout_is_data_contract(command: &Option<minimal::Command>) -> bool {
                 })
         )
     )
+}
+
+/// The machine output mode a run is under: the command's `-o`, the flag the
+/// architecture's machine-output contract hangs on — `json` for
+/// `min session policy -o json`, the one command that takes it today.
+/// `None` for every text run, and for a command that has not taken `-o
+/// json` yet, which is the same thing to the error path: its failure is a
+/// plain-text line. Both gates below key on this, so a command joins the
+/// machine mode by growing an `output` flag, and nothing else about its
+/// error path changes.
+fn machine_output_mode(cli: &minimal::Cli) -> Option<PolicyOutputFormat> {
+    match &cli.command {
+        Some(minimal::Command::Session(minimal::SessionArgs {
+            command: minimal::SessionCommand::Policy(PolicyArgs { output, .. }),
+        })) => *output,
+        _ => None,
+    }
+}
+
+/// The schema stamp of the machine-mode error object — the same kind of
+/// stamp a document carries, on the object a failure answers with.
+const MACHINE_ERROR_SCHEMA: &str = "min/v1/error";
+
+/// The shape of the one `min/v1/error` object.
+#[derive(serde::Serialize)]
+struct MachineModeErrorDoc<'a> {
+    schema: &'static str,
+    code: &'a str,
+    message: &'a str,
+    hint: &'a str,
+}
+
+/// The machine-mode error object, encoded: the schema stamp, the `code` a
+/// script branches on, the message, and the hint — nothing else on the
+/// line, and no line beside it.
+fn machine_mode_error_line(failure: &minimal::MachineModeFailure) -> anyhow::Result<String> {
+    let object = MachineModeErrorDoc {
+        schema: MACHINE_ERROR_SCHEMA,
+        code: failure.code(),
+        message: failure.message(),
+        hint: failure.hint(),
+    };
+    serde_json_lenient::to_string(&object).context("encoding the machine-mode error object")
+}
+
+/// The machine-mode error emitter: writes the one `min/v1/error` object on
+/// stderr, the only thing the mode puts there on any failure, so a client
+/// parses a failure the same way it parses the document. Keyed on the
+/// output mode the failed run was under (the gate in the error path
+/// above), and generic over the payload: a command that takes `-o json`
+/// fails its walk into [`minimal::MachineModeFailure`] — carried through
+/// the `anyhow` chain, the way [`minimal::task::TaskExit`] is — and needs
+/// nothing else; the walk's own kinds name the code, message and hint, and
+/// this turns them into the object. `min ls --json` and its kin are
+/// untouched: their failure stays the plain-text line it always was.
+fn emit_machine_mode_error(failure: &minimal::MachineModeFailure) {
+    let mut err = std::io::stderr();
+    match machine_mode_error_line(failure) {
+        // One object, one line — and a fallback the mode never wants, for
+        // an encode that cannot happen: the exit code is non-zero either
+        // way.
+        Ok(line) => {
+            let _ = writeln!(err, "{line}");
+        }
+        Err(error) => {
+            let _ = writeln!(err, "error: {error:#}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -226,5 +309,85 @@ mod tests {
             }),
         }));
         assert!(!stdout_is_data_contract(&cmd));
+    }
+
+    /// The error path's key: a `-o json` run is a machine-output run, a text
+    /// run is not, and a command that has not taken `-o json` yet is not
+    /// either — the same three-way split the subscriber gate makes, read
+    /// before the CLI is consumed so the failed run can still be asked what
+    /// mode it was in.
+    #[test]
+    fn machine_output_mode_keys_on_the_output_flag() {
+        let cli = minimal::Cli {
+            global_args: minimal::GlobalArgs::default(),
+            command: Some(Command::Session(minimal::SessionArgs {
+                command: minimal::SessionCommand::Policy(PolicyArgs {
+                    session: "web".to_string(),
+                    output: Some(PolicyOutputFormat::Json),
+                }),
+            })),
+        };
+        assert_eq!(machine_output_mode(&cli), Some(PolicyOutputFormat::Json));
+
+        let cli = minimal::Cli {
+            global_args: minimal::GlobalArgs::default(),
+            command: Some(Command::Session(minimal::SessionArgs {
+                command: minimal::SessionCommand::Policy(PolicyArgs {
+                    session: "web".to_string(),
+                    output: None,
+                }),
+            })),
+        };
+        assert_eq!(machine_output_mode(&cli), None);
+
+        let cli = minimal::Cli {
+            global_args: minimal::GlobalArgs::default(),
+            command: None,
+        };
+        assert_eq!(machine_output_mode(&cli), None);
+    }
+
+    /// The one object a machine-output failure answers with: a
+    /// `min/v1/error` stamp, the `code` a script branches on, the message,
+    /// and the hint — one line, nothing else, so a client parses a failure
+    /// the same way it parses the document. Pinned here, beside the emitter
+    /// that writes it.
+    #[test]
+    fn machine_mode_error_object_is_one_stamped_line() {
+        let failure = minimal::MachineModeFailure::new(
+            "not_found",
+            "No session found matching 'gone'".to_string(),
+            "no session by that name or id exists; `min ls` lists the \
+             sessions there are"
+                .to_string(),
+        );
+        let line = machine_mode_error_line(&failure).unwrap();
+        let document: serde_json_lenient::Value =
+            serde_json_lenient::from_str(line.trim_end()).unwrap();
+        assert_eq!(
+            document["schema"].as_str(),
+            Some("min/v1/error"),
+            "the failure object carries its own schema stamp: {line}"
+        );
+        assert_eq!(
+            document["code"].as_str(),
+            Some("not_found"),
+            "the failure's kind is a name, not a message to parse: {line}"
+        );
+        assert_eq!(
+            document["message"].as_str(),
+            Some("No session found matching 'gone'"),
+            "the message beside it, the kind of thing that was missing: {line}"
+        );
+        assert_eq!(
+            document["hint"].as_str(),
+            Some("no session by that name or id exists; `min ls` lists the sessions there are"),
+            "the hint names the remedy, and the kind of thing that was missing: {line}"
+        );
+        assert_eq!(
+            line.lines().count(),
+            1,
+            "one object, one line, nothing else: {line}"
+        );
     }
 }
