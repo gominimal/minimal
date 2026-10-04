@@ -10915,37 +10915,75 @@ proof_min_internal_names_through_proxy() {
       'the box has not published this port'
     proxy_want 403 "" 'the box has not published this port'
 
-    # NET-003's own-address half: the box resolves host.min.internal through
-    # the switch zone, to the alias gvproxy NATs to the host's loopback.
-    proxy_assert_host_by_name "$PROXY_OWN_SID" "NET-003 (own-address box)" own
+    # NET-003's own-address half, narrowed to resolution: the box resolves
+    # host.min.internal through the switch zone, to the host alias. Box→host
+    # reach over that alias is default-deny except configured host exposures
+    # (design §7.1), and this box's switch has none, so the reach is not
+    # asserted here. TODO(host-exposure): the positive reach arm comes back
+    # with a configured exposure once the host-exposure task lands.
+    proxy_own_resolved="$(mnl session exec "$PROXY_OWN_SID" \
+      "getent ahostsv4 host.min.internal" 2>"$WORK/proxy-own-resolve.err" \
+      | awk 'NR == 1 { print $1 }' | tr -d '\r')" || true
+    echo "NET-003 (own-address box): host.min.internal resolved in the box: ${proxy_own_resolved:-<none>}"
+    if [ "${proxy_own_resolved:-}" != "$PROXY_HOST_ALIAS" ]; then
+      echo "::error::NET-003 (own-address box): host.min.internal did not resolve to the switch's host alias (expected $PROXY_HOST_ALIAS, got '${proxy_own_resolved:-<none>}')"
+      echo "--- getent stderr ---"; cat "$WORK/proxy-own-resolve.err" 2>/dev/null || true
+      fail
+    fi
 
-    # NET-004: the deprecated literal itself. It must still reach the host's
-    # loopback, and the box's egress relay must notice the connection — the
-    # notice is the reason the address is deprecated. The relay runs in the
-    # daemon, and every lane that has a switch (MINVMD_GVPROXY_BIN, the gate
-    # around this half) also runs with E2E_VM=1 — the justfile's `e2e-env`
-    # and the KVM lane set the pair together — so the `hook_log_readable`
-    # branch below is UNREACHABLE FROM CI: it serves developer runs only, a
-    # host driving a native daemon against a switch by hand. The switch lanes
-    # CI does run assert the routing and name the notice, whose emission the
-    # switch.rs unit tests pin.
-    proxy_request "$PROXY_OWN_SID" "NET-004: the deprecated literal still reaches the host's loopback" \
-      "http://$PROXY_HOST_ALIAS:$PROXY_HOST_PORT/marker" direct ""
-    proxy_want 200 "$PROXY_HOST_MARKER" ""
+    # NET-004: the deprecated literal itself. Box→host reach over the alias
+    # is default-deny except configured host exposures (design §7.1), and
+    # none is configured, so the box's own relay drops the connect: no
+    # answer and no reset until the timeout, and the relay names the drop
+    # under the infrastructure deny set's rule. The deprecation notice is
+    # not asserted: the relay emits it only for a frame its verdict admits,
+    # and the alias admits none without an exposure. TODO(host-exposure):
+    # the positive reach arm and the notice come back with a configured
+    # exposure once the host-exposure task lands.
+    #
+    # The relay runs in the daemon, and every lane that has a switch
+    # (MINVMD_GVPROXY_BIN, the gate around this half) also runs with
+    # E2E_VM=1 — the justfile's `e2e-env` and the KVM lane set the pair
+    # together — so the `hook_log_readable` branch below is UNREACHABLE FROM
+    # CI: it serves developer runs only, a host driving a native daemon
+    # against a switch by hand. The switch lanes CI does run assert the
+    # silent drop, whose log line the switch.rs unit tests pin.
+    proxy_alias_before="$(proxy_daemon_log_lines)"
+    proxy_alias_start_ms="$(now_ms)"
+    mnl session exec "$PROXY_OWN_SID" \
+      "/usr/bin/socat /dev/null TCP:$PROXY_HOST_ALIAS:$PROXY_HOST_PORT,connect-timeout=10" \
+      >/dev/null 2>"$WORK/proxy-alias.err" && {
+      echo "::error::NET-004: the own-address box completed a connection to the host alias $PROXY_HOST_ALIAS:$PROXY_HOST_PORT with no host exposure configured"
+      fail
+    }
+    proxy_alias_elapsed_ms=$(( $(now_ms) - proxy_alias_start_ms ))
+    echo "NET-004: connect $PROXY_HOST_ALIAS:$PROXY_HOST_PORT from the own-address box -> elapsed=${proxy_alias_elapsed_ms}ms socat: $(tail -n1 "$WORK/proxy-alias.err" 2>/dev/null)"
+    if grep -q 'Connection refused' "$WORK/proxy-alias.err" 2>/dev/null; then
+      echo "::error::NET-004: the connection to the host alias was reset — the frame got past the box's relay, which must drop it silently"
+      cat "$WORK/proxy-alias.err" 2>/dev/null || true
+      fail
+    fi
+    if [ "$proxy_alias_elapsed_ms" -lt 5000 ]; then
+      echo "::error::NET-004: the connection to the host alias failed in ${proxy_alias_elapsed_ms}ms — a fast failure, not the silent drop being asserted"
+      cat "$WORK/proxy-alias.err" 2>/dev/null || true
+      fail
+    fi
     if hook_log_readable; then
-      proxy_notice=""
+      proxy_alias_drop=""
       for _ in $(seq 1 10); do
-        proxy_notice="$(grep -h -- 'deprecated literal host address' "$(proxy_daemon_log)" 2>/dev/null | tail -n1)"
-        [ -n "$proxy_notice" ] && break
+        proxy_alias_drop="$(proxy_daemon_log_since "$proxy_alias_before" \
+          | grep -F -- 'egress-infrastructure-destination' \
+          | grep -F -- "$PROXY_HOST_ALIAS:$PROXY_HOST_PORT" | tail -n1)"
+        [ -n "$proxy_alias_drop" ] && break
         sleep 0.25
       done
-      if [ -z "$proxy_notice" ]; then
-        echo "::error::the box's egress relay did not log the connection to the deprecated literal"
+      if [ -z "$proxy_alias_drop" ]; then
+        echo "::error::the box's egress relay did not log the dropped connection to the host alias under 'egress-infrastructure-destination'"
         fail
       fi
-      echo "daemon log: $proxy_notice"
+      echo "daemon log: $proxy_alias_drop"
     else
-      echo "NET-004 notice: (guest-side daemon log on this lane; its emission is pinned by the switch.rs unit tests)"
+      echo "NET-004 drop line: (guest-side daemon log on this lane; its emission is pinned by the switch.rs unit tests)"
     fi
 
     mnl session destroy --force "$PROXY_OWN_SID" >/dev/null 2>&1 || true
