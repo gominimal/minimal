@@ -1151,31 +1151,52 @@ where
                         // A child that stops reading stdin parks this
                         // write; race it against client loss so the
                         // disconnect still reaches the kill path below.
+                        //
+                        // `write_all` is not cancel-safe: if the
+                        // client-loss branch wins the select, dropping
+                        // the write future mid-flight loses the bytes it
+                        // had already accepted. Pin the write and loop
+                        // the select until it completes, so a dropped
+                        // client-loss sender only disables that branch
+                        // and never discards stdin data.
                         if let Some(cs) = child_stdin.as_mut() {
-                            tokio::select! {
-                                res = cs.write_all(&stdin_buf[..n]) => {
-                                    if let Err(err) = res {
-                                        tracing::warn!(
-                                            %channel_id, error = %err,
-                                            "exec: failed to write stdin to child; closing child stdin",
-                                        );
-                                        child_stdin = None;
+                            let write_failed = {
+                                let write = cs.write_all(&stdin_buf[..n]);
+                                tokio::pin!(write);
+                                let mut write_failed = false;
+                                loop {
+                                    tokio::select! {
+                                        res = &mut write => {
+                                            if let Err(err) = res {
+                                                tracing::warn!(
+                                                    %channel_id, error = %err,
+                                                    "exec: failed to write stdin to child; closing child stdin",
+                                                );
+                                                write_failed = true;
+                                            }
+                                            break;
+                                        }
+                                        res = client_lost.wait_for(|lost| *lost), if client_watch_open => {
+                                            if res.is_err() {
+                                                // Sender dropped without signalling:
+                                                // stop polling this branch so a
+                                                // dropped sender cannot spin the loop.
+                                                client_watch_open = false;
+                                            } else {
+                                                tracing::warn!(
+                                                    %channel_id,
+                                                    "exec: ssh client disconnected; killing child",
+                                                );
+                                                ssh_write_failed = true;
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
-                                res = client_lost.wait_for(|lost| *lost), if client_watch_open => {
-                                    if res.is_err() {
-                                        // Sender dropped without signalling:
-                                        // stop polling this branch so a
-                                        // dropped sender cannot spin the loop.
-                                        client_watch_open = false;
-                                    } else {
-                                        tracing::warn!(
-                                            %channel_id,
-                                            "exec: ssh client disconnected; killing child",
-                                        );
-                                        ssh_write_failed = true;
-                                    }
-                                }
+                                write_failed
+                            };
+                            if write_failed {
+                                child_stdin = None;
                             }
                         }
                     }
