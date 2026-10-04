@@ -34,7 +34,7 @@ pub use mfile_search_strategy::MFileSearchStrategy;
 mod project_setup;
 pub use project_setup::ProjectSetup;
 
-pub use env::{Env, PatchHome, interpolate_task_strings};
+pub use env::{Env, PatchHome, WdLayout, interpolate_task_strings};
 use tokio::sync::Semaphore;
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
 
@@ -894,6 +894,7 @@ impl Context {
             packages,
             std::sync::Arc::new(sandbox2::HostNet),
             home,
+            WdLayout::BoundDir,
         )
         .await
     }
@@ -907,6 +908,11 @@ impl Context {
     /// `home` is the directory `~/`-rooted patch paths expand against; see
     /// [`PatchHome`] for why every caller states it rather than letting
     /// the conversion read the ambient one.
+    ///
+    /// `wd_layout` chooses how the sandbox's working directory is laid out;
+    /// see [`WdLayout`]. Callers that run a task inside a session pass
+    /// [`WdLayout::Session`] so the task sees `/workbench` and `/home` rather
+    /// than the daemon's internal tree.
     // Left positional: public library API; `make_env` already forwards here, so
     // a struct would only relocate the same argument list.
     #[allow(clippy::too_many_arguments)]
@@ -921,6 +927,7 @@ impl Context {
         packages: S,
         network: std::sync::Arc<dyn sandbox2::Network>,
         home: PatchHome,
+        wd_layout: WdLayout,
     ) -> Result<env::Env<'a>, Error> {
         let mfile = self.minimal_file();
 
@@ -995,6 +1002,7 @@ impl Context {
                 state_base_dir,
                 transitives: transitive_deps,
                 cwd: wd,
+                wd_layout,
                 patches,
                 home,
                 env_vars,
