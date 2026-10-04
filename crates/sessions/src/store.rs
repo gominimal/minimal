@@ -1164,6 +1164,12 @@ mod tests {
                 switch_address: std::net::Ipv4Addr::new(100, 64, 0, 2),
                 loopback_address: std::net::Ipv4Addr::new(127, 0, 64, 0),
             }),
+            // `None` is the honest value for this own-address record: only a
+            // host-address box's launch ever writes the field, so a
+            // `Some` here would model a record no daemon writes. The
+            // round-trip of a `Some` is proved at the daemon's own launch
+            // record, which a client reads back through `GetSessionRecord`.
+            host_ip_enforcement: None,
             attrs: [("color".to_string(), "blue".to_string())]
                 .into_iter()
                 .collect(),
