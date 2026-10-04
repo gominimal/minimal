@@ -10287,7 +10287,13 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       fail
     fi
     po_t0=$(now_ms)
-    po_name_code="$(curl -sS --max-time 20 -x "http://127.0.0.1:$po_proxy_port" \
+    # Every proxy env var the runner may carry is cleared, the way the
+    # min.internal proof clears them: `-x` overrides the positive ones, but
+    # NO_PROXY/no_proxy OVERRIDES `-x`, so one that is set sends this leg
+    # resolving the name itself instead of through the proxy it names.
+    po_name_code="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+      curl -sS --max-time 20 -x "http://127.0.0.1:$po_proxy_port" \
       -o "$WORK/po-name.body" -w '%{http_code}' \
       "http://$PO_BOX_NAME.min.internal:$PO_EXT/" 2>"$WORK/po-name.err")"
     po_name_rc=$?
@@ -10333,7 +10339,11 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     # Refused by name, instantly: the proxy answers with its own
     # published-port refusal rather than dialing (NET-014).
     po_t0=$(now_ms)
-    po_und_code="$(curl -sS --max-time 20 -x "http://127.0.0.1:$po_proxy_port" \
+    # The same proxy-env clearing as the permitted leg above: this request
+    # goes through the proxy `-x` names, whatever the runner inherited.
+    po_und_code="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+      curl -sS --max-time 20 -x "http://127.0.0.1:$po_proxy_port" \
       -o "$WORK/po-undeclared-name.body" -w '%{http_code}' \
       "http://$PO_BOX_NAME.min.internal:$PO_UNDECLARED/" 2>"$WORK/po-undeclared-name.err")"
     po_und_rc=$?
@@ -10419,7 +10429,11 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
       fail
     fi
     po_t0=$(now_ms)
-    po_name2_code="$(curl -sS --max-time 20 -x "http://127.0.0.1:$po_proxy_port" \
+    # And the same clearing here: this leg is the NET-015 answer, and a
+    # NO_PROXY the runner set must not take the request out of the proxy.
+    po_name2_code="$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+      -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+      curl -sS --max-time 20 -x "http://127.0.0.1:$po_proxy_port" \
       -o "$WORK/po-name2.body" -w '%{http_code}' \
       "http://$PO_BOX_NAME.min.internal:$PO_EXT/" 2>"$WORK/po-name2.err")"
     po_name2_rc=$?
@@ -10717,17 +10731,28 @@ proof_port_publishes_on_listen_and_box_outlives_client() {
     PO_TASK_PID=""
     echo "run: SIGKILLed the client mid-run (the task keeps ticking; its next output is the write the daemon loses)"
     po_box_ended=""
+    po_task_ls=""
     for _ in $(seq 1 90); do
-      po_task_ls="$(mnl ls 2>/dev/null)"
-      if [[ "$po_task_ls" != *task-e2e-port-run-* ]]; then
-        po_box_ended=1
-        break
+      po_task_ls_now="$(mnl ls 2>/dev/null)"
+      # An EMPTY listing is no answer at all: an `mnl ls` that answers nothing
+      # — the daemon momentarily busy destroying the very box this wait reads,
+      # say — reads as "no box listed" to the glob, which would green the
+      # NET-131 assertion below without ever observing the delist. Only a
+      # listing that says something counts as a verdict, so an empty one
+      # leaves it untouched and keeps the last listing that did answer for the
+      # failure arm.
+      if [ -n "$po_task_ls_now" ]; then
+        po_task_ls="$po_task_ls_now"
+        if [[ "$po_task_ls_now" != *task-e2e-port-run-* ]]; then
+          po_box_ended=1
+          break
+        fi
       fi
       sleep 1
     done
     if [ -z "$po_box_ended" ]; then
       echo "::error::the run's box is STILL listed after its client was killed — a box created for a run must end with the run (NET-131)"
-      echo "--- min ls ---"; printf '%s\n' "$po_task_ls"
+      echo "--- min ls (the last listing that answered) ---"; printf '%s\n' "${po_task_ls:-<min ls never answered a listing this wait could read>}"
       fail
     fi
     echo "run: the box ended with its run — no stranded session, client or no client (NET-131)"
