@@ -209,6 +209,16 @@ impl OwnAddressReporter {
             .published_own_address(self.session_id)
     }
 
+    /// The ports this box yields at a shared address, each with the box that
+    /// holds it (NET-129, first-come): recorded when the box published, read
+    /// here so the attach skips those forwards rather than failing on them.
+    pub(crate) fn shared_port_collisions(&self) -> Vec<crate::net::dns::SharedPortCollision> {
+        self.registry
+            .read()
+            .expect("hostname registry lock poisoned")
+            .shared_port_collisions(self.session_id)
+    }
+
     /// Withdraws `session_name`'s box name if this session still owns it —
     /// the failed attach's other half (NET-121): a bind that failed, or an
     /// address nobody handed, leaves no name standing that says "reachable

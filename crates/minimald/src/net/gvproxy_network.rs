@@ -304,8 +304,16 @@ async fn finish_own_ip_attach(
     let exposed = match (ingress, published) {
         (Some(ingress), _) if ingress.port_mappings.is_empty() => Vec::new(),
         (Some(ingress), Some(published)) => {
-            match crate::net::policy::apply_ingress(&control, published, lease_ip, ingress, gate)
-                .await
+            // The ports this box yields at a shared address (NET-129,
+            // first-come) are known state from its publish, not a failed
+            // bind: their forwards are skipped and the box stays usable.
+            let yielded = own_address
+                .map(crate::net::provider::OwnAddressReporter::shared_port_collisions)
+                .unwrap_or_default();
+            match crate::net::policy::apply_ingress(
+                &control, published, lease_ip, ingress, gate, &yielded,
+            )
+            .await
             {
                 Ok(exposed) => exposed,
                 // The failure is already said — one warn per failed bind,
@@ -1870,6 +1878,115 @@ mod tests {
             locals_of(&unbound, "/services/forwarder/unexpose"),
             vec![format!("{HANDED}:8080"), format!("{HANDED}:9090")],
             "teardown unbinds what the hand addressed: {unbound:?}"
+        );
+        fake.abort();
+    }
+
+    /// NET-129, first-come at a shared address: a box whose declared port
+    /// another box at the same address already holds yields that port. Its
+    /// attach reads the collision its publish recorded and skips that
+    /// forward, so it never asks the forwarder for a bind the forwarder would
+    /// refuse ("proxy already running"). The attach succeeds, the box's
+    /// other forwards bind, its name registers, and the skipped port is said
+    /// in one warn line naming the port and the box that holds it.
+    #[tokio::test]
+    async fn a_yielded_shared_address_port_is_skipped_and_the_attach_succeeds() {
+        const LEASE: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 10);
+        const SHARED: Ipv4Addr = Ipv4Addr::LOCALHOST;
+        let capture = crate::test_harness::captured_log();
+        let dir = tempfile::TempDir::new().unwrap();
+        let scenario = attach_scenario(&dir, "gvproxy.sock");
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let (handed_tx, _handed_rx) = mpsc::channel(4);
+        // The forwarder refuses the held port exactly as the real one does,
+        // so an attach that asked for it would fail.
+        let fake = spawn_control_channel_deciding(
+            scenario.control_path.clone(),
+            |path, body| {
+                if path == "/services/forwarder/expose" && body.contains(&format!("{SHARED}:8080"))
+                {
+                    (500, "proxy already running".to_string())
+                } else {
+                    ok()
+                }
+            },
+            events_tx,
+            handed_tx,
+        );
+        let switch = vm_host_switch();
+        let policy = declared_two_ports();
+
+        // Finalize has run for both boxes: the holder published 8080 first,
+        // and this box (the nil id) yields it.
+        let holder = sessions::SessionId::parse_str("00000000-0000-0000-0000-0000000000a1")
+            .expect("a valid id");
+        {
+            let mut reg = scenario.registry.write().expect("registry lock");
+            reg.publish_own_address(holder, "holder", SHARED, BTreeSet::from([8080]));
+            reg.register_own_ip(holder, "holder", BTreeSet::from([8080]));
+            let collisions = reg.publish_own_address(
+                sessions::SessionId::nil(),
+                "web",
+                SHARED,
+                BTreeSet::from([8080, 9090]),
+            );
+            assert_eq!(
+                collisions.iter().map(|c| c.port).collect::<Vec<_>>(),
+                vec![8080],
+                "the later box yields the held port"
+            );
+            reg.register_own_ip(
+                sessions::SessionId::nil(),
+                "web",
+                BTreeSet::from([8080, 9090]),
+            );
+        }
+
+        let guard = crate::net::gvproxy_network::complete_own_ip_attach(
+            &switch,
+            scenario.tap_fd,
+            ControlChannel::Unix(scenario.control_path.clone()),
+            LEASE,
+            "web",
+            Some(&policy),
+            Some(&scenario.reporter),
+            false,
+        )
+        .await
+        .expect("a yielded port does not fail the attach");
+        let events = collect_until(&mut events_rx, "/services/dns/add", 1).await;
+        assert_eq!(
+            locals_of(&events, "/services/forwarder/expose"),
+            vec![format!("{SHARED}:9090")],
+            "the yielded port is never asked for; the other forward binds: {events:?}"
+        );
+        assert_eq!(
+            scenario
+                .registry
+                .read()
+                .expect("registry lock")
+                .zone_entry("web.min.internal", &[]),
+            dns::ZoneEntry::Held {
+                owner: "web".to_string(),
+                address: Some(SHARED),
+            },
+            "the yielding box's name stays registered"
+        );
+        let log = capture.contents();
+        assert!(
+            log.lines().any(|line| {
+                line.contains("declared ingress port not bound")
+                    && line.contains("port=8080")
+                    && line.contains("other=holder")
+            }),
+            "the skipped port is said with the box that holds it: {log}"
+        );
+        Box::new(guard).teardown().await;
+        let unbound = collect_until(&mut events_rx, "/services/forwarder/unexpose", 1).await;
+        assert_eq!(
+            locals_of(&unbound, "/services/forwarder/unexpose"),
+            vec![format!("{SHARED}:9090")],
+            "teardown unbinds only what the attach bound: {unbound:?}"
         );
         fake.abort();
     }

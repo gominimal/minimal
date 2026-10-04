@@ -1581,6 +1581,7 @@ async fn netns_ingress_static_port_mapping_exposes_then_unexposes() {
         lease.ip,
         &ingress,
         None,
+        &[],
     )
     .await
     .expect("apply ingress");

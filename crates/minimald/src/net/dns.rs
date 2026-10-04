@@ -368,6 +368,10 @@ struct OwnPublished {
     address: Ipv4Addr,
     /// The external ports the box's declaration publishes on it.
     ports: BTreeSet<u16>,
+    /// The ports of `ports` another box at the same address held first: the
+    /// box yields them (first-come), so its attach binds no forward for
+    /// them and the box stays usable.
+    yielded: Vec<SharedPortCollision>,
 }
 
 /// A same-address port collision a publish found (NET-129): a port two boxes
@@ -958,6 +962,12 @@ impl HostnameRegistry {
     /// **reported**, never fixed by translating a port. One warn line here for
     /// the daemon log per collision, and the list returned for the
     /// session-start report.
+    ///
+    /// The address is first-come: the box that published a port first holds
+    /// it, and the later box yields it. The collisions are recorded on the
+    /// later box ([`Self::shared_port_collisions`]), so its attach skips the
+    /// yielded forwards instead of failing on a bind the forwarder refuses,
+    /// and a re-publish of the holder does not turn the collision around.
     pub fn publish_own_address(
         &mut self,
         session_id: SessionId,
@@ -977,13 +987,34 @@ impl HostnameRegistry {
                 "two boxes publish one port at a shared loopback address"
             );
         }
-        self.own_published
-            .insert(session_id, OwnPublished { address, ports });
+        self.own_published.insert(
+            session_id,
+            OwnPublished {
+                address,
+                ports,
+                yielded: collisions.clone(),
+            },
+        );
         collisions
+    }
+
+    /// The ports a box yields at its shared address, each with the box that
+    /// holds it (NET-129, first-come): the collisions its last publish
+    /// recorded. Empty for a box with no publish, or one that holds every
+    /// port it declares. The attach path skips these forwards, and the
+    /// session reports them.
+    #[must_use]
+    pub fn shared_port_collisions(&self, session_id: SessionId) -> Vec<SharedPortCollision> {
+        self.own_published
+            .get(&session_id)
+            .map(|own| own.yielded.clone())
+            .unwrap_or_default()
     }
 
     /// The collision list between `session_id`/address/ports and every other
     /// recorded own-address publish sharing the same address and a port.
+    /// A port another box itself yields is not held by that box, so it is no
+    /// collision: the holder stays the holder when it publishes again.
     fn own_address_collisions(
         &self,
         session_id: SessionId,
@@ -1002,6 +1033,7 @@ impl HostnameRegistry {
                     .unwrap_or_else(|| other.to_string());
                 own.ports
                     .intersection(ports)
+                    .filter(|port| !own.yielded.iter().any(|y| y.port == **port))
                     .map(move |port| SharedPortCollision {
                         port: *port,
                         other: other_name.clone(),
@@ -2802,6 +2834,57 @@ mod tests {
                 .is_empty(),
             "the same port on a different address is not a collision"
         );
+    }
+
+    /// NET-129's shared address is first-come: the later box records the
+    /// ports it yields, with the box that holds each, and a re-publish of the
+    /// holder (a rename, a resume) neither reports a collision of its own nor
+    /// turns the collision around. The yielding box's attach reads the
+    /// record and skips those forwards.
+    #[test]
+    fn shared_address_collision_is_recorded_on_the_later_box_first_come() {
+        let node = Ipv4Addr::new(127, 0, 64, 200);
+        let mut reg = HostnameRegistry::new("dev", false).with_node_address(node);
+        let first = id("1");
+        let second = id("2");
+        let ports = BTreeSet::from([8080u16, 9090]);
+        reg.publish_own_address(first, "first", node, ports.clone());
+        reg.register_own_ip(first, "first", ports.clone());
+        let held = vec![SharedPortCollision {
+            port: 8080,
+            other: "first.min.internal".to_string(),
+        }];
+        assert_eq!(
+            reg.publish_own_address(second, "second", node, BTreeSet::from([8080u16, 7070])),
+            held
+        );
+        reg.register_own_ip(second, "second", BTreeSet::from([8080u16, 7070]));
+        assert_eq!(
+            reg.shared_port_collisions(second),
+            held,
+            "the later box records the port it yields and who holds it"
+        );
+        assert!(
+            reg.shared_port_collisions(first).is_empty(),
+            "the holder yields nothing"
+        );
+
+        // The holder publishes again: still the holder.
+        assert!(
+            reg.publish_own_address(first, "first", node, ports.clone())
+                .is_empty(),
+            "a holder's re-publish does not collide with the box that yielded to it"
+        );
+        assert!(reg.shared_port_collisions(first).is_empty());
+        // The yielding box publishes again: it still yields.
+        assert_eq!(
+            reg.publish_own_address(second, "second", node, BTreeSet::from([8080u16, 7070])),
+            held
+        );
+
+        // The box's publish going away takes its record with it.
+        reg.unpublish_own_address(second);
+        assert!(reg.shared_port_collisions(second).is_empty());
     }
 
     /// The deprecated three-label form resolves to the same entry as the

@@ -306,6 +306,11 @@ impl PortForwarder {
 /// box has no relay — the netns proofs — where a forwarder simply has no
 /// gate to revoke through.
 ///
+/// `yielded` is the ports the box yields at a shared address (NET-129,
+/// first-come): another box holds each one, so its forward is known state,
+/// not a failure. It is skipped, with one warn line naming the port and the
+/// box that holds it, and the box's other forwards bind as usual.
+///
 /// On the first failure the already-bound forwards are rolled back so a
 /// partial apply does not leak forwards onto the switch, and the original
 /// error is returned. The failure says its own line first (NET-121's sub 2):
@@ -321,9 +326,24 @@ pub async fn apply_ingress(
     ptask_ip: Ipv4Addr,
     ingress: &IngressPolicy,
     gate: Option<&Arc<super::switch::SessionGate>>,
+    yielded: &[super::dns::SharedPortCollision],
 ) -> io::Result<Vec<PortForwarder>> {
     let mut bound: Vec<PortForwarder> = Vec::with_capacity(ingress.port_mappings.len());
     for mapping in &ingress.port_mappings {
+        if let Some(collision) = yielded
+            .iter()
+            .find(|collision| collision.port == mapping.external_port)
+        {
+            tracing::warn!(
+                port = mapping.external_port,
+                address = %published,
+                other = %collision.other,
+                action = "shared-address-port-collision",
+                "declared ingress port not bound: another box at the shared \
+                 address holds it"
+            );
+            continue;
+        }
         let req = expose_request(mapping, published, ptask_ip);
         match post_json(control, "/services/forwarder/expose", &req).await {
             Ok(()) => bound.push(PortForwarder {
