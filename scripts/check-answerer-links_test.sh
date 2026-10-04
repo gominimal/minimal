@@ -249,12 +249,15 @@ tdata="" # the canned output files for the same case
 # exists for fails loudly rather than printing nothing.
 fake() {
     local tool="$1" flag="$2" body="$3"
-    printf '%s\n' "$body" >"$tdata/$tool.$flag"
+    # The canned output's file name marks each upper-case letter of the flag
+    # with a ^, so `otool -L` and `otool -l` stay two files on a
+    # case-insensitive filesystem (the macOS default).
+    printf '%s\n' "$body" >"$tdata/$tool.$(printf '%s' "$flag" | sed 's/[A-Z]/^&/g')"
     if [ "$flag" = "-" ]; then
         printf '#!/usr/bin/env bash\ncat "%s"\n' "$tdata/$tool.-" >"$tbin/$tool"
     else
         # shellcheck disable=SC2016  # $1 is expanded by the fake, not here
-        printf '#!/usr/bin/env bash\nf="%s.$1"\n[ -f "$f" ] || { echo "fake %s: no canned output for $1" >&2; exit 1; }\ncat "$f"\n' \
+        printf '#!/usr/bin/env bash\nf="%s.$(printf %%s "$1" | sed '"'"'s/[A-Z]/^&/g'"'"')"\n[ -f "$f" ] || { echo "fake %s: no canned output for $1" >&2; exit 1; }\ncat "$f"\n' \
             "$tdata/$tool" "$tool" >"$tbin/$tool"
     fi
     chmod +x "$tbin/$tool"
