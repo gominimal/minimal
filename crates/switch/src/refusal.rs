@@ -405,6 +405,11 @@ pub const FOREIGN_SOURCE_MAC_RULE: &str = "foreign source mac";
 /// a source already holding its share's cap of the listener pool.
 pub const SHARE_SPENT_RULE: &str = "per-source share spent";
 
+/// Rule text for the box egress proxy's pool aborting an accepted
+/// connection from a source whose box holds no attachment (NET-133): no
+/// attachment, no delivery.
+pub const NO_ATTACHMENT_RULE: &str = "no box attachment";
+
 /// What a refusal answers for: the audit line's rule and its reason. A
 /// `Copy` pair of `&'static str`s — the vocabulary is the codebase's rule
 /// constants, which is also what bounds the emitter's overflow buckets
@@ -448,6 +453,15 @@ pub const FOREIGN_SOURCE_MAC: Class = Class {
 pub const SHARE_SPENT: Class = Class {
     rule: SHARE_SPENT_RULE,
     reason: "the source already holds its share of the pool",
+};
+
+/// An accepted connection the box egress proxy's pool aborted because its
+/// source's box holds no attachment (NET-133): the row bought the share the
+/// connection took, but nothing names the box to attribute a delivery to,
+/// so nothing is presented from it.
+pub const NO_ATTACHMENT: Class = Class {
+    rule: NO_ATTACHMENT_RULE,
+    reason: "the source's box holds no proxy attachment",
 };
 
 /// What the refused connection reached for, as the audit line names it: the
