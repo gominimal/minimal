@@ -528,6 +528,11 @@ enum SessionMessage {
     /// deterministically here — without disturbing the lifecycle.
     #[cfg(test)]
     PeekPendingAsks(oneshot::Sender<Vec<(AskId, u16)>>),
+    /// Test-only: turn on the finalize package check that test builds leave
+    /// off (see [`Session::check_packages_at_finalize`]). Acknowledged once
+    /// set, so a finalize sent after the ack sees it.
+    #[cfg(test)]
+    CheckPackagesAtFinalize(oneshot::Sender<()>),
 }
 
 /// The key an ask parks under (NET-045): minted per request the session
@@ -679,6 +684,15 @@ pub struct Session {
     /// finish; every live one is aborted by [`Session::stop_running`], so a
     /// session that goes away takes its forwards down with it (NET-105).
     forwards: Vec<tokio::task::AbortHandle>,
+
+    /// Whether [`Self::finalize`] resolves the composition's package names
+    /// before promoting the record (see [`Self::check_composed_packages`]).
+    /// On in every production build. Off by default under
+    /// `test`/`test-support`, whose sessions run offline and compose names
+    /// (the scaffolded `base`/`vim`, for one) that only an upstream declares;
+    /// a test that wants the check turns it on through
+    /// [`SessionHandle::check_packages_at_finalize`].
+    check_packages_at_finalize: bool,
 }
 
 /// Why a session host was launched.
@@ -749,6 +763,7 @@ impl Session {
             // Forwards are registered as their channels open; a session
             // starts with none.
             forwards: Vec::new(),
+            check_packages_at_finalize: !cfg!(any(test, feature = "test-support")),
             // The same for the ports the box publishes at runtime: nothing is
             // live until a `min net expose` inside it lands (NET-044).
             live_ingress: Default::default(),
@@ -1703,6 +1718,15 @@ impl Session {
                         .collect(),
                 );
             }
+            #[cfg(test)]
+            SessionMessage::CheckPackagesAtFinalize(r) => {
+                self.check_packages_at_finalize = true;
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "the asker may already be gone; there is nothing to answer then"
+                )]
+                let _ = r.send(());
+            }
         }
         ControlFlow::Continue(())
     }
@@ -2025,6 +2049,20 @@ impl Session {
                              (upload hook scripts, then retry FinalizeSession)",
                         ));
                     }
+                }
+
+                // Every composed package name has to resolve before the
+                // record is promoted: otherwise activate hands back an id
+                // for a session whose first spawn fails with `no such
+                // package`. Refusing here leaves the record unpromoted,
+                // and the client's activate cleanup removes it.
+                if self.check_packages_at_finalize
+                    && let SessionInner::Active {
+                        composition: Some(comp),
+                        ..
+                    } = &self.inner
+                {
+                    self.check_composed_packages(comp).await?;
                 }
 
                 // Materialize the composition's patches into the
@@ -3712,6 +3750,65 @@ impl Session {
         mctx::Context::new(self.workspace_config(&wsp)?).map_err(|e| e.to_string())
     }
 
+    /// Refuse a composition that names a package the session's graph does
+    /// not declare, naming each such package and who declared it (the
+    /// project or a loadout).
+    ///
+    /// Resolves names only, through the lookup the launch uses
+    /// ([`crate::env::session_package`]): nothing is built, and the graph is
+    /// dropped here, since the launch evaluates its own. A context or graph
+    /// that cannot be evaluated at all (an upstream that does not resolve)
+    /// is not judged here; the launch reports it, as it did before this
+    /// check existed.
+    async fn check_composed_packages(&self, comp: &Composition) -> Result<(), std::io::Error> {
+        if comp.packages().is_empty() {
+            return Ok(());
+        }
+        let ctx = match self.build_context(true).await {
+            Ok(ctx) => ctx,
+            Err(error) => {
+                tracing::warn!(%error, "package check skipped at finalize: no session context");
+                return Ok(());
+            }
+        };
+        // CPU-heavy (nickel evaluation), so on the blocking pool, as the
+        // launch runs it.
+        let graph = tokio::task::spawn_blocking(move || {
+            let mut ctx = ctx;
+            ctx.graph_from_all_packages().map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(std::io::Error::other)?;
+        let graph = match graph {
+            Ok(graph) => graph,
+            Err(error) => {
+                tracing::warn!(%error, "package check skipped at finalize: no package graph");
+                return Ok(());
+            }
+        };
+        let unknown: Vec<String> = comp
+            .packages()
+            .iter()
+            .filter_map(|p| {
+                crate::env::session_package(&graph, p.package())
+                    .err()
+                    .map(|e| {
+                        format!(
+                            "{e} (declared by {})",
+                            sessions::core::source::Provenanced::source(p)
+                        )
+                    })
+            })
+            .collect();
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{}; the session was not activated", unknown.join("; ")),
+        ))
+    }
+
     async fn paths(&self) -> SessionPaths {
         let obj = self.record.object().await.unwrap();
 
@@ -4155,6 +4252,22 @@ impl SessionHandle {
         // Ignore send errors - the recv will also fail.
         let _ = self.0.send(SessionMessage::IsBusy(send)).await;
         recv.await.unwrap_or(false)
+    }
+
+    /// Test-only: turn on the finalize package check for this session (see
+    /// [`SessionMessage::CheckPackagesAtFinalize`]).
+    #[cfg(test)]
+    pub(crate) async fn check_packages_at_finalize(&self) {
+        let (send, recv) = oneshot::channel();
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "a dead actor fails the recv below"
+        )]
+        let _ = self
+            .0
+            .send(SessionMessage::CheckPackagesAtFinalize(send))
+            .await;
+        recv.await.expect("the session actor should ack the switch");
     }
 
     /// Test-only peek at the actor's held [`Composition`]. Bumps the
