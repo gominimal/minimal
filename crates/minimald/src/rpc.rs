@@ -3051,10 +3051,12 @@ mod tests {
         }
     }
 
-    /// NET-079's per-box enforcement, derived at read time from the daemon's
-    /// one classifier fact: a listing shows the same state the create
-    /// response said for a host-address box (this test's default create is
-    /// one), and the fact a test that set its own wrote. The guard is taken
+    /// NET-079's per-box enforcement is a daemon-owned launch record, never
+    /// a client attr, displayed as the record lowered by the current fact.
+    /// A box no launch has recorded yet shows the daemon's one classifier
+    /// fact: a listing shows the same state the create response said for a
+    /// host-address box (this test's default create is one, never
+    /// launched), and the fact a test that set its own wrote. The guard is taken
     /// before the server is built and held across the awaited creates on
     /// purpose: the fact is process-global, so under libtest — where the
     /// tests of one binary share a process — a listing driven by another
