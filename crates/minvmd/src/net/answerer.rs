@@ -26,10 +26,11 @@
 //! connect is what starts a socket-activated service, so a channel that
 //! refuses or times out is an error surfaced at session start, never a
 //! reason to hold the port. Not installed, the node tries the interim's
-//! per-state-dir channel, and only when that is absent does it host the
+//! per-user channel, and only when that is absent does it host the
 //! answerer itself, as the recorded interim (NET-138): it binds the port
 //! and the interim channel both, serves the zone from its own table merged
-//! with the rows of its state dir's other VMs, and they publish into it.
+//! with the rows of the operator's other nodes (named VMs and VMs under
+//! other state dirs alike), and they publish into it.
 //! Never both: a port held with no channel behind it is a surfaced
 //! collision, not a fallback. The privileged step hands the port over from
 //! a hosting daemon by asking it to release (over the control socket):
@@ -261,23 +262,85 @@ pub fn resolve_install_marker() -> PathBuf {
     debug_path_override(INSTALL_MARKER_ENV).unwrap_or_else(|| PathBuf::from(INSTALL_MARKER))
 }
 
-/// The interim holder's channel for a state base: the provider-instance dir
-/// every VM under that state dir shares (`<state>/providers/local-minvmd0/`),
-/// so co-resident VMs of one state dir publish into the interim one of them
-/// hosts. Per state dir by design: two state dirs on a host without the
-/// service do not share it, and their second node's collision is surfaced.
-fn interim_channel_sock_for(base: &paths::DaemonAbsPath) -> PathBuf {
-    paths::provider_instance_dir(base, paths::ProviderKind::Minvmd, 0)
-        .as_utf8_path()
-        .as_std_path()
-        .join(CHANNEL_SOCK_FILE)
+/// The interim holder's channel's file name, in the operator's per-user
+/// run dir ([`interim_channel_sock`]).
+pub const INTERIM_CHANNEL_SOCK_FILE: &str = "answerer-interim.sock";
+
+/// The interim holder's channel for the operator: one per user, whatever
+/// the node's state dir, so every state dir the operator runs resolves the
+/// same path — the node that hosts the interim binds it, and every other
+/// node of the operator (a named VM, or a VM under another `--minimal-dir`)
+/// publishes into it instead of binding (NET-081: a second helper writes
+/// into it over the same channel). The pure half: `runtime_dir` is
+/// `$XDG_RUNTIME_DIR` on Linux, `home` the operator's home on macOS, and
+/// `uid` the operator's.
+fn interim_channel_sock_from(
+    runtime_dir: Option<PathBuf>,
+    home: Option<PathBuf>,
+    uid: u32,
+) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        let _ = (runtime_dir, uid);
+        home.unwrap_or_else(|| PathBuf::from("/var/empty"))
+            .join("Library/Application Support/minimal/run")
+            .join(INTERIM_CHANNEL_SOCK_FILE)
+    } else {
+        let _ = home;
+        match runtime_dir.filter(|dir| dir.is_absolute()) {
+            Some(dir) => dir.join("minimal").join(INTERIM_CHANNEL_SOCK_FILE),
+            None => PathBuf::from(format!("/tmp/minimal-{uid}")).join(INTERIM_CHANNEL_SOCK_FILE),
+        }
+    }
 }
 
-/// This daemon's interim channel ([`interim_channel_sock_for`] over its
-/// own state base).
+/// This operator's interim channel ([`interim_channel_sock_from`] over the
+/// process's own environment and uid).
 #[must_use]
 pub fn interim_channel_sock() -> PathBuf {
-    interim_channel_sock_for(&crate::state::state_base_dir())
+    // SAFETY: geteuid only reads the process's own uid.
+    let uid = unsafe { libc::geteuid() };
+    interim_channel_sock_from(
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        uid,
+    )
+}
+
+/// Makes the interim channel's directory ready to bind in: created 0700
+/// when absent; refused when it exists owned by another uid or open to
+/// group or other — the `/tmp/minimal-<uid>` fallback lives in a shared,
+/// sticky dir another user could have pre-created.
+fn prepare_interim_dir(sock: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+    let Some(dir) = sock.parent() else {
+        return Ok(());
+    };
+    match std::fs::symlink_metadata(dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir),
+        Err(error) => Err(error),
+        Ok(meta) => {
+            // SAFETY: geteuid only reads the process's own uid.
+            let uid = unsafe { libc::geteuid() };
+            if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "the interim answerer channel's dir {} is not a directory owned by \
+                         uid {uid} with mode 0700 (owner {}, mode {:o}); refusing to bind in it",
+                        dir.display(),
+                        meta.uid(),
+                        meta.mode() & 0o7777
+                    ),
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// A node's id for a state base and VM name: the canonical state dir — so
@@ -300,13 +363,13 @@ pub fn node_id() -> String {
 }
 
 /// The paths one acquisition decides over: the machine-global channel, the
-/// interim's per-state-dir channel, the install marker that says whether
+/// interim's per-user channel, the install marker that says whether
 /// the service is installed, and the release window a handover waits.
 #[derive(Debug, Clone)]
 struct ChannelPaths {
     /// The installed service's machine-global channel.
     global: PathBuf,
-    /// The interim holder's per-state-dir channel.
+    /// The interim holder's per-user channel.
     interim: PathBuf,
     /// The installed service's marker file.
     marker: PathBuf,
@@ -1549,7 +1612,7 @@ fn hold_channel(
     expected_uid: u32,
 ) -> io::Result<Arc<AtomicBool>> {
     crate::sock::check_uds_path_len(sock)?;
-    crate::sock::prepare_socket_dir(sock)?;
+    prepare_interim_dir(sock)?;
     crate::sock::remove_stale_socket(sock)?;
     let listener = UnixListener::bind(sock)?;
     crate::sock::enforce_socket_permissions(sock)?;
@@ -2269,6 +2332,105 @@ fn wait_refusing(
     }
 }
 
+/// The process holding UDP `127.0.0.1:port`, as its pid and executable,
+/// when the host lets this process see it: on Linux by the socket's inode
+/// in `/proc/net/udp` and the fd that names it, on macOS by `lsof`. `None`
+/// when it is not knowable (another user's process, no `lsof`).
+fn hook_port_holder(port: u16) -> Option<(u32, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        let wanted = [
+            format!("0100007F:{port:04X}"),
+            format!("00000000:{port:04X}"),
+        ];
+        let table = std::fs::read_to_string("/proc/net/udp").ok()?;
+        let inode = table.lines().skip(1).find_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            (fields.len() > 9 && wanted.iter().any(|want| fields[1] == want))
+                .then(|| fields[9].to_string())
+        })?;
+        let target = format!("socket:[{inode}]");
+        for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+                continue;
+            };
+            if fds.flatten().any(|fd| {
+                std::fs::read_link(fd.path()).is_ok_and(|link| link.as_os_str() == target.as_str())
+            }) {
+                let exe = std::fs::read_link(entry.path().join("exe")).map_or_else(
+                    |_| "an unreadable executable".to_string(),
+                    |exe| exe.display().to_string(),
+                );
+                return Some((pid, exe));
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("/usr/sbin/lsof")
+            .args(["-nP", "-t", &format!("-iUDP@127.0.0.1:{port}")])
+            .output()
+            .ok()?;
+        let pid: u32 = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()?
+            .trim()
+            .parse()
+            .ok()?;
+        let comm = std::process::Command::new("/bin/ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        let exe = String::from_utf8_lossy(&comm.stdout).trim().to_string();
+        Some((
+            pid,
+            if exe.is_empty() {
+                "an unnamed executable".to_string()
+            } else {
+                exe
+            },
+        ))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = port;
+        None
+    }
+}
+
+/// The error a node with no answerer channel and the hook port held
+/// surfaces, and every box registration fails with: the port, the holder
+/// when known, and the remedy for its kind.
+fn channelless_holder_error(port: u16, holder: Option<(u32, String)>) -> String {
+    let native = holder.as_ref().is_some_and(|(_, exe)| {
+        Path::new(exe)
+            .file_name()
+            .is_some_and(|name| name == "minimald")
+    });
+    let who = holder.map_or_else(
+        || "a process this daemon cannot identify".to_string(),
+        |(pid, exe)| format!("pid {pid} ({exe})"),
+    );
+    if native {
+        format!(
+            "the zone answerer's hook port 127.0.0.1:{port} is held by a native minimald, \
+             {who}, with no answerer channel, so no box can be handed an address: install \
+             the answerer service (min session start prints the command); native daemons \
+             publish into it once T90 lands"
+        )
+    } else {
+        format!(
+            "the zone answerer's hook port 127.0.0.1:{port} is held by {who}, which has no \
+             answerer channel, so no box can be handed an address: free port {port} or set \
+             the hook port"
+        )
+    }
+}
+
 /// Why a box cannot be handed an address while this daemon reaches no
 /// answerer.
 const NO_ANSWERER: &str = "this VM host daemon reaches no zone answerer to hand the box an \
@@ -2387,8 +2549,9 @@ impl AnswererStatus {
         {
             return Err(NO_ANSWERER.to_string());
         }
+        // Bounded past the handover window an allocation may wait out.
         reply
-            .recv_timeout(RELEASE_REPLY_TIMEOUT)
+            .recv_timeout(RELEASE_WINDOW + RELEASE_REPLY_TIMEOUT)
             .unwrap_or_else(|_| {
                 Err("the zone answerer did not hand out an address in time".to_string())
             })
@@ -2513,8 +2676,22 @@ fn acquire_loop(registry: BoxRegistry, port: u16, status: AnswererStatus) {
 /// temporary channel: `channel` is the interim's, and no service is
 /// installed (the marker and the global channel are paths nothing holds),
 /// so the decision is the interim's publish-or-host alone.
+/// Makes the dir a test's interim channel sits in mode 0700, the per-user
+/// run dir's mode [`prepare_interim_dir`] requires.
+#[cfg(test)]
+fn private_test_dir(sock: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    if let Some(dir) = sock.parent() {
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
 #[cfg(test)]
 fn acquire_loop_at(registry: BoxRegistry, port: u16, channel: PathBuf, status: AnswererStatus) {
+    // The interim's dir must be the operator's alone; a test's temp dir is
+    // created with the umask's mode, so make it private as the per-user run
+    // dir is.
+    private_test_dir(&channel);
     let paths = ChannelPaths {
         global: channel.with_file_name("no-global-channel.sock"),
         marker: channel.with_file_name("no-install-marker"),
@@ -2691,12 +2868,12 @@ fn warn_refused(node: &str, refused: Vec<RefusedRow>) {
 /// what starts a socket-activated service, so a channel that refuses or
 /// times out is an error surfaced at session start, never a reason to host.
 /// With the marker absent, a socket at the global path is a leftover and
-/// is logged as one; the node then tries the interim's per-state-dir
+/// is logged as one; the node then tries the interim's per-user
 /// channel — present and answering, it publishes there — and only when that
 /// is absent (or a dead holder's corpse) does the port decide: free, this
 /// daemon hosts the answerer itself as the recorded interim and holds the
-/// interim channel beside it for any co-resident VM; held, the collision is
-/// surfaced. Never both.
+/// interim channel beside it for the operator's other nodes; held by a
+/// process with no channel, the error is surfaced. Never both.
 ///
 /// A publish that lands lives for the session: the loop re-publishes the
 /// whole table on every change ping — idempotent, so a row that went is
@@ -2881,25 +3058,23 @@ fn acquire(
                     );
                 }
             }
+            // No answerer channel and the hook port held: the holder is no
+            // node of this operator's (those publish over the per-user
+            // interim channel), so nothing here can answer or allocate. A
+            // loud error naming the port, the holder and the remedy — every
+            // box registration fails with it until the port frees.
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-                surface_error(
-                    status,
-                    port,
-                    &mut erroring,
-                    "the zone answerer's port is held by a process with no answerer \
-                     channel (a native minimald, another state dir's VM host daemon, or \
-                     a foreign process)",
-                );
-                wait_refusing(&pings, &commands, PORT_RECHECK, NO_ANSWERER);
+                let why = channelless_holder_error(port, hook_port_holder(port));
+                surface_error(status, port, &mut erroring, &why);
+                wait_refusing(&pings, &commands, PORT_RECHECK, &why);
             }
             Err(error) => {
-                tracing::warn!(
-                    component = COMPONENT,
-                    %error,
-                    "could not bind the zone answerer's port; the box zone answers only \
-                     from another VM host daemon's table"
+                let why = format!(
+                    "could not bind the zone answerer's hook port 127.0.0.1:{port}: {error}; \
+                     free port {port} or set the hook port"
                 );
-                wait_refusing(&pings, &commands, PORT_RECHECK, NO_ANSWERER);
+                surface_error(status, port, &mut erroring, &why);
+                wait_refusing(&pings, &commands, PORT_RECHECK, &why);
             }
         }
     }
@@ -2954,8 +3129,8 @@ enum WindowEnd {
 /// finds the port taken returns `None` for the caller's next pass to
 /// surface.
 ///
-/// The interim holds its per-state-dir channel beside the port, so the
-/// co-resident VMs of its state dir publish into it; a release stops both,
+/// The interim holds its per-user channel beside the port, so the
+/// operator's other nodes, whatever their state dir, publish into it; a release stops both,
 /// removes the channel's socket file, and answers the release once the
 /// port is free.
 fn host_interim(
@@ -3079,6 +3254,10 @@ fn host_interim(
         let _ = release.send(ReleaseReply::acted(detail));
         // ── the window: the service's channel, a cancel, or the bound.
         let deadline = Instant::now() + paths.release_window;
+        // Box address requests that arrive mid-handover wait for the
+        // service's channel, for the rest of the window, rather than being
+        // refused: they are served there once it answers.
+        let mut queued: Vec<HandoverCommand> = Vec::new();
         let end = loop {
             match commands.recv_timeout(RELEASE_POLL) {
                 Ok(HandoverCommand::Cancel(reply_to)) => break WindowEnd::Cancelled(reply_to),
@@ -3087,16 +3266,11 @@ fn host_interim(
                         "the interim answerer is already released",
                     ));
                 }
-                Ok(HandoverCommand::Allocate { reply, .. }) => {
-                    let _ = reply.send(Err(
-                        "the zone answerer is being handed over to the answerer service; \
-                         retry once it answers"
-                            .to_string(),
-                    ));
-                }
-                // The book went with the released interim; the service's
-                // starts from the nodes' re-publishes.
-                Ok(HandoverCommand::ReleaseAddress { .. }) | Err(_) => {}
+                Ok(
+                    command @ (HandoverCommand::Allocate { .. }
+                    | HandoverCommand::ReleaseAddress { .. }),
+                ) => queued.push(command),
+                Err(_) => {}
             }
             if paths.marker.exists()
                 && let Ok(published) = connect_and_publish(&paths.global, node, zone_rows(registry))
@@ -3108,9 +3282,12 @@ fn host_interim(
             }
         };
         match end {
-            WindowEnd::Switched(published) => {
+            WindowEnd::Switched(mut published) => {
                 status.set_hosting(false);
                 announce_publish(&published.holder, port, &paths.global, node);
+                for command in queued {
+                    serve_over_channel(&mut published.registration, command);
+                }
                 return Some(published);
             }
             WindowEnd::Cancelled(reply_to) => {
@@ -3130,6 +3307,16 @@ fn host_interim(
                     paths.release_window.as_secs()
                 );
             }
+        }
+        // The window ended without the service: the queued requests fail,
+        // naming why, rather than being served by an interim book that no
+        // longer holds the addresses the service's nodes may republish.
+        for command in queued {
+            refuse_command(
+                command,
+                "answerer handover did not complete: the answerer service's channel did not \
+                 answer within the release window",
+            );
         }
         match UdpSocket::bind((Ipv4Addr::LOCALHOST, port)) {
             Ok(bound) => socket = bound,
@@ -5053,16 +5240,22 @@ mod tests {
         // The leftover is replaced by a live channel: a connect to the path
         // now reaches the holder's own gate, so the next daemon publishes
         // instead of hosting.
-        assert!(
-            UnixStream::connect(&channel).is_ok(),
-            "the holder re-bound the channel over the dead file"
-        );
+        // Bound right after the holder's status flips, so polled briefly.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while UnixStream::connect(&channel).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "the holder re-bound the channel over the dead file"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// The channel paths a test acquisition decides over, all in `dir`: the
     /// service's global channel, the interim's, and the install marker —
     /// none of them created here.
     fn test_paths(dir: &tempfile::TempDir, window: Duration) -> ChannelPaths {
+        private_test_dir(&dir.path().join(CHANNEL_SOCK_FILE));
         ChannelPaths {
             global: dir.path().join("global.sock"),
             interim: dir.path().join(CHANNEL_SOCK_FILE),
@@ -5366,10 +5559,11 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
     }
 
-    /// The machine-global channel is one path per host: nothing of a node's
-    /// state dir or VM name enters it, while the interim's channel and the
-    /// node id are per state dir — so two nodes under separate state dirs
-    /// meet on the one global channel and never share an interim or an id.
+    /// The machine-global channel is one path per host and the interim's
+    /// channel one path per operator: nothing of a node's state dir or VM
+    /// name enters either, so every state dir of one operator meets on the
+    /// same interim (and, once installed, on the one global channel), while
+    /// the node id stays per state dir.
     #[test]
     fn channel_path_is_machine_global_across_state_dirs() {
         assert_eq!(
@@ -5378,38 +5572,122 @@ mod tests {
             "with no test override the channel is the machine-global path"
         );
         #[cfg(not(target_os = "macos"))]
-        assert_eq!(GLOBAL_CHANNEL_SOCK, "/run/minimal/answerer.sock");
+        {
+            assert_eq!(GLOBAL_CHANNEL_SOCK, "/run/minimal/answerer.sock");
+            assert_eq!(
+                interim_channel_sock_from(Some(PathBuf::from("/run/user/1000")), None, 1000),
+                PathBuf::from("/run/user/1000/minimal/answerer-interim.sock"),
+                "the interim channel is the operator's, in XDG_RUNTIME_DIR"
+            );
+            assert_eq!(
+                interim_channel_sock_from(None, None, 1000),
+                PathBuf::from("/tmp/minimal-1000/answerer-interim.sock"),
+                "without XDG_RUNTIME_DIR it falls back to a per-uid /tmp dir"
+            );
+        }
         #[cfg(target_os = "macos")]
-        assert_eq!(
-            GLOBAL_CHANNEL_SOCK,
-            "/Library/Application Support/minimal/run/answerer.sock"
+        {
+            assert_eq!(
+                GLOBAL_CHANNEL_SOCK,
+                "/Library/Application Support/minimal/run/answerer.sock"
+            );
+            assert_eq!(
+                interim_channel_sock_from(None, Some(PathBuf::from("/Users/op")), 501),
+                PathBuf::from(
+                    "/Users/op/Library/Application Support/minimal/run/answerer-interim.sock"
+                ),
+                "the interim channel is the operator's, under their home"
+            );
+        }
+        assert_ne!(
+            interim_channel_sock(),
+            PathBuf::from(GLOBAL_CHANNEL_SOCK),
+            "the interim is never the global channel"
         );
         let a = tempfile::TempDir::new().expect("a first state dir");
         let b = tempfile::TempDir::new().expect("a second state dir");
-        let base = |dir: &tempfile::TempDir| {
-            paths::DaemonAbsPath::try_new(dir.path().to_str().expect("a utf-8 dir"))
-                .expect("an absolute dir")
-        };
-        let (a_interim, b_interim) = (
-            interim_channel_sock_for(&base(&a)),
-            interim_channel_sock_for(&base(&b)),
-        );
-        assert_ne!(
-            a_interim, b_interim,
-            "each state dir has its own interim channel"
-        );
-        assert!(a_interim.starts_with(a.path()) && b_interim.starts_with(b.path()));
-        for interim in [&a_interim, &b_interim] {
-            assert_ne!(
-                *interim,
-                PathBuf::from(GLOBAL_CHANNEL_SOCK),
-                "no state dir's interim is the global channel"
-            );
-        }
         assert_ne!(
             node_id_for(a.path(), "default"),
             node_id_for(b.path(), "default"),
             "two state dirs' default VMs are two nodes"
+        );
+    }
+
+    /// The interim's per-user dir is refused when another uid could have
+    /// placed it: a dir open to group or other is not bound in, and an
+    /// absent one is created 0700.
+    #[test]
+    fn interim_dir_is_created_private_and_a_wide_one_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::TempDir::new().expect("a temp dir");
+        let fresh = dir.path().join("fresh").join(INTERIM_CHANNEL_SOCK_FILE);
+        prepare_interim_dir(&fresh).expect("an absent dir is created");
+        let mode = std::fs::metadata(fresh.parent().expect("a parent"))
+            .expect("the dir exists")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "created 0700");
+        let wide = dir.path().join("wide");
+        std::fs::create_dir(&wide).expect("a wide dir");
+        std::fs::set_permissions(&wide, std::fs::Permissions::from_mode(0o777)).expect("made wide");
+        let refused = prepare_interim_dir(&wide.join(INTERIM_CHANNEL_SOCK_FILE))
+            .expect_err("a dir open to others is refused");
+        assert!(
+            refused.to_string().contains("refusing to bind"),
+            "{refused}"
+        );
+    }
+
+    /// Two state dirs of one operator, no service installed: the first node
+    /// hosts the interim on the hook port and binds the per-user interim
+    /// channel; the second, from its own state dir, finds that channel and
+    /// publishes into it instead of colliding on the port — its name
+    /// answers through the first node's interim, and its status says it is
+    /// registered with another node's interim.
+    #[test]
+    fn second_state_dir_publishes_into_the_first_ones_interim() {
+        let dir = tempfile::TempDir::new().expect("a temp dir");
+        let port = free_port();
+        // One operator's paths, shared by both state dirs: the interim is
+        // per user, not per state dir.
+        let paths = || test_paths(&dir, RELEASE_WINDOW);
+        let node_a = node_id_for(&dir.path().join("state-a"), "default");
+        let node_b = node_id_for(&dir.path().join("state-b"), "default");
+        let (a_registry, a_web) = named_box_registry("web-a", 9);
+        let (b_registry, b_web) = named_box_registry("web-b", 10);
+        let a = start_daemon(a_registry, port, paths(), &node_a);
+        await_status_is(
+            &a,
+            ZoneAnswererStatus::Holder { port },
+            "node a never hosted the interim",
+        );
+        let b = start_daemon(b_registry, port, paths(), &node_b);
+        await_status_is(
+            &b,
+            ZoneAnswererStatus::Registered { port },
+            "node b, from another state dir, never published into a's interim",
+        );
+        for (name, address) in [
+            ("web-a.min.internal.", a_web),
+            ("web-b.min.internal.", b_web),
+        ] {
+            let reply = await_a_record(
+                || query(port, name, RecordType::A),
+                "a name never answered through the interim",
+            );
+            assert_eq!(
+                a_answer(&reply),
+                address,
+                "{name} answers through a's interim"
+            );
+        }
+        // And b's boxes are handed addresses from the interim's book, so
+        // they never meet a's.
+        let a_box = a.allocate("box").expect("a's box");
+        let b_box = b.allocate("box").expect("b's box, through a's interim");
+        assert_ne!(
+            a_box, b_box,
+            "the two state dirs' boxes never share an address"
         );
     }
 
@@ -5549,6 +5827,103 @@ mod tests {
         );
         stop.store(true, Ordering::SeqCst);
         let _ = handle;
+    }
+
+    /// A box address request that arrives mid-handover waits for the
+    /// service's channel instead of being refused: once the service
+    /// answers, inside the window, the request is served there and the
+    /// box gets an address of the box range.
+    #[test]
+    fn allocation_during_handover_waits_then_proceeds() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channels");
+        let paths = test_paths(&dir, Duration::from_secs(15));
+        let port = free_port();
+        let status = start_daemon(web_registry().0, port, paths.clone(), "node-a");
+        await_status_is(
+            &status,
+            ZoneAnswererStatus::Holder { port },
+            "the daemon never hosted the interim",
+        );
+        std::fs::write(&paths.marker, b"").expect("the marker is written");
+        assert!(status.release().acted, "the hosting daemon releases");
+
+        // Mid-handover: the request is asked now, with no answerer up.
+        let asking = status.clone();
+        let asked = Instant::now();
+        let request = std::thread::spawn(move || asking.allocate("mid-handover"));
+        std::thread::sleep(RELEASE_POLL * 4);
+        assert!(
+            !request.is_finished(),
+            "the request waits instead of being refused"
+        );
+
+        // The service comes up inside the window; the request proceeds.
+        let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).expect("the port is free");
+        let channel_listener =
+            UnixListener::bind(&paths.global).expect("the service's channel binds");
+        let (stop, _handle) = start_service(listener, channel_listener);
+        let address = request
+            .join()
+            .expect("the requesting thread ends")
+            .expect("the request proceeds once the service answers");
+        assert!(in_box_range(address), "a box address: {address}");
+        assert!(
+            asked.elapsed() < Duration::from_secs(15),
+            "served inside the handover window"
+        );
+        await_status_is(
+            &status,
+            ZoneAnswererStatus::ManagerHeld { port },
+            "the released daemon never published to the service",
+        );
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    /// With no answerer channel and the hook port held by a process that
+    /// has none, the node cannot host and nothing can allocate: every box
+    /// registration fails loudly, naming the port, the holder (here this
+    /// test process, which holds the port) and the remedy — never a
+    /// fallback to a node-local address.
+    #[test]
+    fn registration_fails_naming_a_channelless_hook_port_holder() {
+        let dir = tempfile::TempDir::new().expect("a temp dir for the channels");
+        let squatter =
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("a foreign holder binds a port");
+        let port = squatter.local_addr().expect("the holder's port").port();
+        let status = start_daemon(
+            web_registry().0,
+            port,
+            test_paths(&dir, RELEASE_WINDOW),
+            "node-a",
+        );
+        await_status_is(
+            &status,
+            ZoneAnswererStatus::PortHeldNoChannel { port },
+            "the daemon never surfaced the held port",
+        );
+        let refused = status
+            .allocate("box")
+            .expect_err("no box is handed an address while the port is held");
+        assert!(
+            refused.contains(&format!("127.0.0.1:{port}")),
+            "the error names the port: {refused}"
+        );
+        assert!(
+            refused.contains(&format!("pid {}", std::process::id())),
+            "the error names the holder's pid: {refused}"
+        );
+        assert!(
+            refused.contains(&format!("free port {port} or set the hook port")),
+            "the error gives the remedy: {refused}"
+        );
+        // The native remedy, for a minimald holder.
+        let native = channelless_holder_error(port, Some((42, "/usr/bin/minimald".to_string())));
+        assert!(
+            native.contains("install the answerer service (min session start prints the command)")
+                && native.contains("pid 42"),
+            "{native}"
+        );
+        drop(squatter);
     }
 
     /// A release whose service never comes re-binds the interim on its own
