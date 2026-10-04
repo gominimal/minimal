@@ -3237,8 +3237,14 @@ mod tests {
             advisory.contains("its host-address boxes run unenforced"),
             "the advisory must say the state it leaves the box in, got: {advisory}"
         );
+        // The command's spelling is the install hint's own, pinned in the
+        // classifier crate; the pin here is that the advisory carries the
+        // whole of it, verbatim, whatever the hint currently says — a
+        // stock install ships no `scripts/` tree, so the hint names where
+        // the script lives in the repository instead.
+        let install = sandbox2::classifier::install_hint();
         assert!(
-            advisory.contains("sudo scripts/install-host-classifier.sh"),
+            advisory.contains(&install),
             "a missing step is the cause the install command ends, so the \
              advisory must carry it, got: {advisory}"
         );
@@ -3298,7 +3304,7 @@ mod tests {
             "the logged line must name the cause, got: {step_line}"
         );
         assert!(
-            step_line.contains("sudo scripts/install-host-classifier.sh"),
+            step_line.contains(&install),
             "the logged line must carry the command when one applies, got: {step_line}"
         );
         let confine_line = classifier_lines(&tail, &cannot_confine.id);
@@ -4381,7 +4387,7 @@ mod tests {
             "the clause holds only while no box is refused, got: {not_effective}"
         );
         assert!(
-            not_effective.contains("sudo scripts/install-host-classifier.sh"),
+            not_effective.contains(&sandbox2::classifier::install_hint()),
             "a table the marker vouches for but the probe does not is the one \
              the step's install reloads, so the advisory still carries the \
              command, got: {not_effective}"

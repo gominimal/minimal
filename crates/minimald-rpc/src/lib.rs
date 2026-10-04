@@ -2040,8 +2040,10 @@ mod tests {
                  installed on this host. While it cannot, its host-address \
                  boxes run unenforced — whatever the boxes' declarations \
                  say. Install the classifier's privileged step with:\n  \
-                 sudo scripts/install-host-classifier.sh --user <the account \
-                 this daemon runs as> --cohort-address <cohort address> \
+                 run: curl -fsSLO https://raw.githubusercontent.com/gominimal/\
+                 minimal/main/scripts/install-host-classifier.sh && sudo bash \
+                 ./install-host-classifier.sh --user <the account this \
+                 daemon runs as> --cohort-address <cohort address> \
                  --node-plane-address <node-plane address>"
                     .to_string(),
             ),
@@ -2057,7 +2059,7 @@ mod tests {
             "the advisory names its cause in words, got: {json}",
         );
         assert!(
-            json.contains("sudo scripts/install-host-classifier.sh"),
+            json.contains("sudo bash ./install-host-classifier.sh"),
             "the step's cause names the exact command that installs it, got: {json}",
         );
         assert_eq!(round_trip(&step_missing), step_missing);
