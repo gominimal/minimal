@@ -16,8 +16,8 @@
 //!   is the hostname proxy's: the box zone is the VM host daemon's to answer
 //!   (NET-138), so no answerer port is ever handed to a guest.
 //!
-//! Per the spec we keep this minimal and "run as pid-1, revisit if zombie
-//! reaping bites".
+//! pid 1 does not stay the daemon: it forks the daemon off and stays behind
+//! as an orphan reaper (see [`crate::reaper`]).
 
 use std::ffi::CString;
 use std::time::Duration;
@@ -136,14 +136,19 @@ pub fn probe_handed_node_port(proxy_port: Option<u16>) -> std::io::Result<()> {
 /// kernel runs the initramfs `/init` (this binary) as pid-1, and nothing else
 /// satisfies both halves.
 ///
-/// The lib side of the check `main` keeps for its own gating
-/// (`is_minimal_microvm` there, for `reboot(2)`): `argv[0]` is
+/// `main` gates on it too (`is_minimal_microvm` there, for `reboot(2)`):
+/// `argv[0]` is
 /// caller-controlled, so it cannot be trusted alone, and pid-1 alone is also
 /// no proof — a native daemon running as a container's init satisfies it. The
 /// classifier asks it one question only a guest answers "yes" to (design
 /// §7.1): a box this daemon cannot place is a box it refuses.
+///
+/// Also true in the daemon [`crate::reaper::split_init`] forks off the
+/// microVM's init, which is no longer pid 1 itself: only pid 1, having
+/// passed this same check, marks that child, so the mark stays unspoofable.
 pub fn is_microvm_daemon() -> bool {
-    is_microvm_init(std::process::id(), std::env::args_os().next().as_deref())
+    crate::reaper::forked_from_microvm_init()
+        || is_microvm_init(std::process::id(), std::env::args_os().next().as_deref())
 }
 
 /// Pure form of [`is_microvm_daemon`], so the spoofing cases stay testable —

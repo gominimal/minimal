@@ -15,6 +15,8 @@ mod maintenance;
 #[cfg(target_os = "linux")]
 pub mod net;
 pub mod nsenter;
+#[cfg(target_os = "linux")]
+pub mod reaper;
 pub mod rpc;
 mod sandbox_progress;
 pub mod server;
