@@ -162,6 +162,63 @@ fn ls_table_exposes_project_path_and_status() {
     );
 }
 
+/// NET-079's proof names the listing: a host-address box that runs
+/// unenforced shows egress enforcement `none` in the human `min ls`, not
+/// only in `--json`; one decided per box shows `per_box`; a box the daemon
+/// reports no enforcement for shows `-`.
+#[test]
+fn ls_table_shows_host_address_enforcement() {
+    let entry = |name: &str, n: u64, enforcement| minimald_rpc::ListSessionsEntry {
+        id: SessionId::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).unwrap(),
+        name: Some(name.to_string()),
+        project_path: Some(paths::HostAbsPath::try_new("/work/proj").unwrap()),
+        status: sessions::SessionStatus::Active,
+        git: None,
+        host_ip_enforcement: enforcement,
+        attrs: None,
+    };
+    let resp = ListSessionsResponse {
+        daemon_version: None,
+        hostname_routing_unavailable: None,
+        hostname_proxy_port: None,
+        zone_answerer_port: None,
+        answerer_bound: false,
+        resource_pool: None,
+        sessions: vec![
+            entry("decided", 1, Some(minimald_rpc::HostIpEnforcement::PerBox)),
+            entry("unenforced", 2, Some(minimald_rpc::HostIpEnforcement::None)),
+            entry("own-address", 3, None),
+        ],
+    };
+    let mut out = Vec::new();
+
+    format_ls(
+        &mut out,
+        &LsArgs {
+            raw: false,
+            json: false,
+        },
+        &resp,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+    let cells_of = |name: &str| -> Vec<String> {
+        text.lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("a row for {name} in:\n{text}"))
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    };
+    assert!(text.contains("EGRESS"), "header should list EGRESS: {text}");
+    assert_eq!(cells_of("decided")[3], "per_box", "got:\n{text}");
+    assert_eq!(cells_of("unenforced")[3], "none", "got:\n{text}");
+    assert_eq!(cells_of("own-address")[3], "-", "got:\n{text}");
+}
+
 #[tokio::test]
 async fn ls_empty() {
     let (_daemon, args) = setup().await;
