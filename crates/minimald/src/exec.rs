@@ -1259,7 +1259,27 @@ where
 
     let status = match child_exit {
         Some(status) => status,
-        None => process.wait().await,
+        // Already killed, or no disconnect signal left to watch.
+        None if ssh_write_failed || !client_watch_open => process.wait().await,
+        // The loop also ends when the child closes stdout and stderr but
+        // keeps running; a disconnect from then on must still kill it.
+        None => {
+            tokio::select! {
+                status = process.wait() => status,
+                res = client_lost.wait_for(|lost| *lost) => {
+                    let lost = res.is_ok();
+                    drop(res);
+                    if lost {
+                        tracing::warn!(
+                            %channel_id,
+                            "exec: ssh client disconnected; killing child",
+                        );
+                        let _ = process.start_kill();
+                    }
+                    process.wait().await
+                }
+            }
+        }
     };
     match status {
         Ok(code) => code.unwrap_or(1) as u32,
@@ -2979,6 +2999,60 @@ mod tests {
         assert_eq!(exit, 1);
         assert!(ctrl.was_killed());
         feeder.abort();
+    }
+
+    /// A child that closes stdout and stderr but keeps running ends the
+    /// I/O loop with the child still alive. A disconnect arriving while
+    /// the bridge waits on it must still kill the child; if it did not,
+    /// this test times out, since nothing else ever ends the child.
+    #[tokio::test]
+    async fn bridge_kills_child_with_closed_output_when_client_disconnects() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let (
+            process,
+            MockEndpoints {
+                stdin_reader: _stdin_reader,
+                stdout_writer,
+                stderr_writer,
+                ctrl,
+            },
+        ) = build_mock();
+        // Output closed, but the child never exits on its own.
+        drop(stdout_writer);
+        drop(stderr_writer);
+
+        let (closed_stdin_w, mut bridge_stdin) = duplex(64);
+        drop(closed_stdin_w);
+        let (_unused_stdout_peer, mut bridge_stdout) = duplex(64 * 1024);
+        let (_unused_stderr_peer, mut bridge_stderr) = duplex(64 * 1024);
+        let (client_lost_tx, client_lost_rx) = tokio::sync::watch::channel(false);
+
+        let bridge_task = tokio::spawn(async move {
+            bridge(
+                "test",
+                process,
+                &mut bridge_stdin,
+                &mut bridge_stdout,
+                &mut bridge_stderr,
+                client_lost_rx,
+            )
+            .await
+        });
+
+        // Let the loop see both EOFs and park on the final wait.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!bridge_task.is_finished());
+
+        client_lost_tx.send(true).unwrap();
+
+        let exit = timeout(Duration::from_secs(10), bridge_task)
+            .await
+            .expect("a lost client must kill a child whose output is already closed")
+            .unwrap();
+        assert_eq!(exit, 1);
+        assert!(ctrl.was_killed());
     }
 
     /// `min task run` from a terminal half-closes stdin before anything
