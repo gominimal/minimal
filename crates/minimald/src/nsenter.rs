@@ -780,7 +780,7 @@ pub fn shim_main(args: ShimArgs) -> Result<i32, NsenterError> {
         Err(source) => {
             // The child's `chdir` fails with the same `ENOENT` as a missing
             // program; a missing working directory is not "command not found".
-            let chdir_missing = args.chdir.as_ref().is_some_and(|dir| !dir.is_dir());
+            let chdir_missing = spawn_failed_on_missing_chdir(&source, args.chdir.as_deref());
             let mapped = if chdir_missing {
                 None
             } else {
@@ -824,6 +824,15 @@ fn spawn_failure_code_and_message(source: &std::io::Error) -> Option<(i32, Strin
         libc::ENOEXEC => Some((126, format!("cannot execute: {source}"))),
         _ => None,
     }
+}
+
+/// Whether a failed `spawn` is the child's `chdir` failing on a missing
+/// working directory rather than the program itself being missing. Only
+/// `ENOENT` is ambiguous between the two — `EACCES` and `ENOEXEC` are the
+/// program's own failure whichever syscall raised them, so they map
+/// unconditionally and never route through this discriminator.
+fn spawn_failed_on_missing_chdir(source: &std::io::Error, chdir: Option<&Path>) -> bool {
+    source.raw_os_error() == Some(libc::ENOENT) && chdir.is_some_and(|dir| !dir.is_dir())
 }
 
 /// The socket-family filter an injected process installs after joining a
@@ -877,6 +886,23 @@ mod tests {
 
         let hook_refused = std::io::Error::from_raw_os_error(libc::EPERM);
         assert_eq!(spawn_failure_code_and_message(&hook_refused), None);
+    }
+
+    /// Only `ENOENT` is ambiguous between a missing program and a missing
+    /// working directory. An `EACCES` from `chdir` (an inaccessible cwd) is
+    /// the program's own failure and must not be swallowed by the
+    /// missing-chdir discriminator, so it still maps to 126.
+    #[test]
+    fn missing_chdir_discriminator_only_swallows_enoent() {
+        let missing = std::io::Error::from_raw_os_error(libc::ENOENT);
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
+        let no_exec = std::io::Error::from_raw_os_error(libc::ENOEXEC);
+        let chdir = Some(Path::new("/definitely/not/here"));
+
+        assert!(spawn_failed_on_missing_chdir(&missing, chdir));
+        assert!(!spawn_failed_on_missing_chdir(&missing, None));
+        assert!(!spawn_failed_on_missing_chdir(&denied, chdir));
+        assert!(!spawn_failed_on_missing_chdir(&no_exec, chdir));
     }
 
     /// The fail-closed gate on the injection path: a none-box injection
