@@ -2298,6 +2298,85 @@ mod tests {
             "the hook should be appended exactly once: {body}"
         );
     }
+
+    /// Runs the installed `min` helper with `__min_rpc` stubbed out, so a
+    /// `patched-build` invocation can be checked without a daemon socket.
+    /// Returns `None` when the host has no bash, matching the repo's
+    /// self-skip-locally convention.
+    fn run_min_helper(rootfs: &Path, args: &str) -> Option<(String, String, i32)> {
+        let script = rootfs.join("usr/bin/min");
+        let out = std::process::Command::new("bash")
+            .args([
+                "-c",
+                r#"
+source "$1"
+__min_rpc() { echo "RPC-CALLED:$*" >&2; return 1; }
+min_patched_pkg $2
+rc=$?
+echo "rc=$rc"
+exit $rc
+"#,
+                "_",
+                script.to_str().unwrap(),
+                args,
+            ])
+            .output()
+            .map_err(|e| eprintln!("no bash to run the min helper with — skipping: {e}"))
+            .ok()?;
+        Some((
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.code().unwrap_or(-1),
+        ))
+    }
+
+    /// `min package patched-build --help` prints usage, exits 0, and makes no
+    /// RPC — `--help` must not be forwarded to the daemon as a package name.
+    #[test]
+    fn patched_build_help_prints_usage_without_rpc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+
+        let Some((stdout, stderr, code)) = run_min_helper(rootfs, "--help") else {
+            return;
+        };
+        assert_eq!(code, 0, "help should exit 0, got: {stdout} {stderr}");
+        assert!(
+            stderr.contains("Usage: min package patched-build <package-name>"),
+            "help should print usage, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("RPC-CALLED"),
+            "help must not reach the daemon, got: {stderr}"
+        );
+        assert!(stdout.contains("rc=0"), "got: {stdout}");
+    }
+
+    /// A missing name or a `-`-prefixed argument prints usage, exits 1, and
+    /// makes no RPC — it is a usage error, not a package name.
+    #[test]
+    fn patched_build_rejects_missing_or_flag_like_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path();
+        install_min_helpers(rootfs).unwrap();
+
+        for args in ["", "--bogus"] {
+            let Some((stdout, stderr, code)) = run_min_helper(rootfs, args) else {
+                return;
+            };
+            assert_eq!(code, 1, "`{args}` should exit 1, got: {stdout} {stderr}");
+            assert!(
+                stderr.contains("Usage: min package patched-build <package-name>"),
+                "`{args}` should print usage, got: {stderr}"
+            );
+            assert!(
+                !stderr.contains("RPC-CALLED"),
+                "`{args}` must not reach the daemon, got: {stderr}"
+            );
+        }
+    }
+
     use camino::Utf8PathBuf;
     use mctx::ConfigBuilder;
     use std::io::{BufRead, BufReader};
