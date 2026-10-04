@@ -195,7 +195,8 @@ E2E_VM="${E2E_VM:-}"
 # case fails before it reaches the proof.
 case "${1:-}" in
   fresh_linux_kvm_activate_local_minvmd | fresh_arm64_kvm_activate_local_minvmd \
-    | linux_stock_install_runs_vm_boxes | unpublished_port_refused_on_vm_host)
+    | linux_stock_install_runs_vm_boxes | unpublished_port_refused_on_vm_host \
+    | answerer_survives_session_stop)
     E2E_VM="${E2E_VM:-1}"
     if [ -z "${E2E_MINIMAL_ARGS:-}" ]; then
       E2E_MINIMAL_ARGS="--provider local-minvmd"
@@ -237,6 +238,9 @@ RANGE_INSTALLED="" # set when that proof ran its command; gates the unit teardow
 RANGE_RESOLVER_BEFORE="" # the resolver file's prior bytes, when it had any; restored on teardown
 ANSWERER_SERVICE_CHANNEL="" # set when a proof ran an advisory that installs the answerer service: its channel path; gates the service teardown
 BN_SEED_DIR="" # seeded by the browser-path proof below; removed on teardown
+ASR_SEED_DIR="" # seeded by the answerer-service proof below; removed on teardown
+ASR_STATE2_DIR="" # that proof's second node's state base; stopped on teardown
+ASR_REVERT_LINK="" # the link that proof's advisory pointed the host resolver at; reverted on teardown
 BN_API_SEED_DIR="" # its second box's seed; removed on teardown
 BN_REVERT_LINK="" # the link that proof pointed the host resolver at; reverted on teardown
 PROXY_SEED_DIR="" # seeded by the min.internal proxy proof; removed on teardown
@@ -492,9 +496,14 @@ else
   # instead of the run dying at the CLI gate with a build instruction the
   # caller cannot read mid-verify.
   if [ -z "$min_cli_dir" ] && command -v cargo >/dev/null 2>&1; then
-    echo "no usable 'min' on PATH and no build under target/; building the pair this run drives (cargo build --locked -p minimal --bin min -p $min_daemon --bin $min_daemon)"
+    # A VM-backed run also needs the answerer program the advisory's command
+    # copies into place (beside min or on PATH), which minvmd's crate builds.
+    min_extra_bin=""
+    [ "$min_daemon" = minvmd ] && min_extra_bin="--bin min-answerer"
+    echo "no usable 'min' on PATH and no build under target/; building the pair this run drives (cargo build --locked -p minimal --bin min -p $min_daemon --bin $min_daemon $min_extra_bin)"
+    # shellcheck disable=SC2086 # $min_extra_bin is one flag pair or empty
     if (cd "$ROOT" && cargo build --locked -p minimal --bin min \
-        -p "$min_daemon" --bin "$min_daemon") >"$WORK/cli-build.log" 2>&1; then
+        -p "$min_daemon" --bin "$min_daemon" $min_extra_bin) >"$WORK/cli-build.log" 2>&1; then
       for d in "$ROOT/target/debug" "${CARGO_TARGET_DIR:-/nonexistent}/debug"; do
         if [ -x "$d/min" ]; then
           min_cli_dir="$d"
@@ -572,6 +581,17 @@ teardown() {
   # The local-range proof installs a real LaunchDaemon on the macOS host;
   # a run that died between its install and its own cleanup must not leave
   # it behind — the same reasoning as the native link revert below.
+  # The answerer-service proof's second node and resolver link, before the
+  # service it publishes to goes.
+  if [ -n "$ASR_STATE2_DIR" ]; then
+    # shellcheck disable=SC2086
+    min ${E2E_MINIMAL_ARGS:-} --minimal-dir "$ASR_STATE2_DIR" stop --force >/dev/null 2>&1 || true
+  fi
+  [ -n "$ASR_SEED_DIR" ] && rm -rf "$ASR_SEED_DIR"
+  if [ -n "$ASR_REVERT_LINK" ]; then
+    sudo -n resolvectl revert "$ASR_REVERT_LINK" >/dev/null 2>&1 || true
+    sudo -n ip link del "$ASR_REVERT_LINK" >/dev/null 2>&1 || true
+  fi
   range_teardown_unit
   # Every proof that runs the advisory as root also installs the answerer
   # host service; a run that died after that must not leave it behind.
@@ -5426,6 +5446,11 @@ answerer_service_teardown() {
       dev.minimal.zone-answerer.service >/dev/null 2>&1 || true
   fi
   sudo -n rm -f "$ANSWERER_SERVICE_CHANNEL" >/dev/null 2>&1 || true
+  # And the directory it sat in, when the command made it and it is now
+  # empty (systemd's RuntimeDirectory= removes /run/minimal on stop itself;
+  # the macOS run dir is the command's mkdir). rmdir never removes a
+  # directory something else still uses.
+  sudo -n rmdir "$(dirname -- "$ANSWERER_SERVICE_CHANNEL")" >/dev/null 2>&1 || true
   ANSWERER_SERVICE_CHANNEL=""
 }
 
@@ -5725,14 +5750,19 @@ proof_native_resolution_without_proxy_env() {
         echo "--- activate stderr ---"; cat "$native_err" 2>/dev/null || true
         fail
       fi
-      # The command also installs the answerer host service: record the
+      # A native daemon's advisory carries no answerer step (NET-122: the
+      # host service is a VM-backed host's); should one appear, record the
       # channel it binds BEFORE running it, so a half-failed run still
       # leaves the teardown a service to remove.
-      ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$native_cmd")"
-      if [ -z "$ANSWERER_SERVICE_CHANNEL" ]; then
-        echo "::error::the advisory's command names no answerer channel, so this run could not undo the service it installs; it was not run (got: '$native_cmd')"
-        fail
-      fi
+      case "$native_cmd" in
+        *zone-answerer*)
+          ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$native_cmd")"
+          if [ -z "$ANSWERER_SERVICE_CHANNEL" ]; then
+            echo "::error::the advisory's command names no answerer channel, so this run could not undo the service it installs; it was not run (got: '$native_cmd')"
+            fail
+          fi
+          ;;
+      esac
       # Run the exact command the advisory printed — verbatim, as the user
       # would have. Passwordless sudo is the gate above, so it cannot prompt.
       if ! sh -c "$native_cmd" >"$WORK/native-cmd.out" 2>"$WORK/native-cmd.err"; then
@@ -6415,8 +6445,7 @@ proof_box_name_resolves_natively_without_proxy() {
   # NET-122: the advisory, on the activate's stderr — the exact command, no
   # prompt anywhere in the path. The command must name this platform's
   # mechanism and THIS daemon's answerer, and be one the user runs.
-  bn_cmd="$(advisory_command_from "$bn_err" \
-    "Configure the host's resolver and install the box-zone answerer service with:")"
+  bn_cmd="$(advisory_command_from "$bn_err" "Configure the host's resolver")"
   if [ -n "$bn_cmd" ]; then
     case "$bn_cmd" in
       *resolvectl*) ;;
@@ -6625,11 +6654,17 @@ proof_box_name_resolves_natively_without_proxy() {
       echo "--- activate stderr ---"; cat "$bn_err" 2>/dev/null || true
       fail
     fi
-    ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$bn_cmd")"
-    if [ -z "$ANSWERER_SERVICE_CHANNEL" ]; then
-      echo "::error::the advisory's command names no answerer channel, so this run could not undo the service it installs; it was not run (got: '$bn_cmd')"
-      fail
-    fi
+    # A native daemon's advisory carries no answerer step; should one
+    # appear, record its channel first so the teardown can remove it.
+    case "$bn_cmd" in
+      *zone-answerer*)
+        ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$bn_cmd")"
+        if [ -z "$ANSWERER_SERVICE_CHANNEL" ]; then
+          echo "::error::the advisory's command names no answerer channel, so this run could not undo the service it installs; it was not run (got: '$bn_cmd')"
+          fail
+        fi
+        ;;
+    esac
     if ! sh -c "$bn_cmd" >"$WORK/bn-cmd.out" 2>"$WORK/bn-cmd.err"; then
       echo "::error::the advisory's command did not run (are resolvectl and ip usable here?)"
       echo "--- command ---"; echo "$bn_cmd"
@@ -6948,6 +6983,438 @@ proof_box_name_resolves_natively_without_proxy() {
   rm -rf "$BN_SEED_DIR" "$BN_API_SEED_DIR"
   BN_SEED_DIR=""; BN_API_SEED_DIR=""
   echo "box names resolve natively in any browser OK (each lookup with its answer, each record, and the surface — printed)"
+  echo "::endgroup::"
+}
+
+# ---------------------------------------------------------------------------
+# The box-zone answerer as a host service, end to end (NET-122's host
+# service, NET-138's interim and its handover). VM-backed lanes only: a
+# native daemon's advisory omits the step, and the two resolution cases
+# above keep that lane's story. The case runs where a lane can install the
+# unit — the KVM lane through passwordless sudo with the systemd variant,
+# a macOS host only if it can install a LaunchDaemon — and a VM lane that
+# cannot FAILS rather than self-skips, so the pin is never silent:
+#
+#   1. Node A (this lane's state dir) starts with no service installed and
+#      hosts the interim on the hook port.
+#   2. A's session start prints the advisory; its command, run verbatim,
+#      asks A to release the port, installs the service, and starts it. A
+#      becomes a channel client of the manager-held service, and its box
+#      name still answers on the host.
+#   3. Node B starts under a second state dir (the `--minimal-dir`
+#      two-daemon pattern) and publishes over the one machine-global
+#      channel; its box name answers beside A's.
+#   4. A service restart under the two connected nodes answers both names
+#      again with no session action: the restarted process holds nothing
+#      until the nodes re-publish, so both answering is the re-publish.
+#   5. Destroying A's session withdraws A's name and leaves B's answering.
+#   6. A later session on a fresh A publishes to the service instead of
+#      binding the port.
+#
+# The service restart runs before the sibling stop, so the restart's
+# "both names answer again" is asserted while both nodes hold a live row.
+# Every host change — the units, the program copy, the channel socket, the
+# resolver link (Linux) or file (macOS), the second node — is undone here
+# and again by the EXIT trap, so the shared runner is left as found.
+proof_answerer_survives_session_stop() {
+  if [ -z "$E2E_VM" ]; then
+    echo "answerer survives session stop SKIPPED (native lane: the answerer host service is a VM-backed host's, and a native daemon's advisory omits the step)"
+    return 0
+  fi
+  echo "::group::the box-zone answerer host service survives a session stop (NET-122, NET-138)"
+  local asr_os asr_channel asr_marker
+  asr_os="$(uname -s)"
+  case "$asr_os" in
+    Linux)
+      asr_channel=/run/minimal/answerer.sock
+      asr_marker=/etc/systemd/system/dev.minimal.zone-answerer.socket
+      if ! command -v systemctl >/dev/null 2>&1 || ! command -v resolvectl >/dev/null 2>&1 \
+         || ! command -v ip >/dev/null 2>&1 || ! command -v dig >/dev/null 2>&1 \
+         || ! sudo -n true >/dev/null 2>&1; then
+        echo "::error::this VM lane cannot install the answerer service (needs systemctl, resolvectl, ip, dig and passwordless sudo); the case fails rather than self-skips, so the pin is never silent"
+        fail
+      fi
+      ;;
+    Darwin)
+      asr_channel="/Library/Application Support/minimal/run/answerer.sock"
+      asr_marker=/Library/LaunchDaemons/dev.minimal.zone-answerer.plist
+      if ! command -v launchctl >/dev/null 2>&1 || ! command -v dig >/dev/null 2>&1 \
+         || ! sudo -n true >/dev/null 2>&1; then
+        echo "::error::this macOS host cannot install the answerer LaunchDaemon (needs launchctl, dig and passwordless sudo); the case fails rather than self-skips, so the pin is never silent"
+        fail
+      fi
+      ;;
+    *)
+      echo "::error::no answerer service variant for $asr_os"
+      fail
+      ;;
+  esac
+
+  # A leftover service from a run killed past its EXIT trap would make A a
+  # channel client from its first start, so the interim this case hands
+  # over could never exist. Remove it first, the range case's reasoning.
+  if [ -e "$asr_marker" ] || [ -e "$asr_channel" ] \
+     || [ -e /usr/local/lib/minimal/dev.minimal.zone-answerer ] \
+     || [ -e /Library/PrivilegedHelperTools/dev.minimal.zone-answerer ]; then
+    echo "removing a leftover answerer service from a prior run, so node A starts from the interim"
+    ANSWERER_SERVICE_CHANNEL="$asr_channel"
+    answerer_service_teardown
+  fi
+
+  local asr_base_a="$XDG_STATE_HOME/minimal"
+  ASR_STATE2_DIR="$WORK/asr-state2"
+  mkdir -p "$ASR_STATE2_DIR"
+  mnl2() {
+    # shellcheck disable=SC2086
+    min ${E2E_MINIMAL_ARGS:-} --minimal-dir "$ASR_STATE2_DIR" "$@"
+  }
+
+  # A node's VM host daemon log candidates (the file log, then the detached
+  # supervisor's run.log), and the count of its zone-answerer lines that
+  # carry a phrase: the case reads each node's records as a count before
+  # and after the step that must add one, because earlier cases in a
+  # whole-lane run left records of their own in the shared log dir.
+  asr_log_candidates() {
+    find "$1/logs" -name 'minvmd.log*' -type f 2>/dev/null | sort -r
+    printf '%s\n' "$1/providers/local-minvmd0/run.log"
+  }
+  asr_count() {
+    # $1: the node's state base. $2: the phrase.
+    local f n=0 c
+    while IFS= read -r f; do
+      [ -f "$f" ] || continue
+      c="$(grep -F -- 'zone-answerer' "$f" 2>/dev/null | grep -cF -- "$2" || true)"
+      n=$((n + ${c:-0}))
+    done < <(asr_log_candidates "$1")
+    echo "$n"
+  }
+  asr_wait_more() {
+    # $1: state base. $2: phrase. $3: the count before. Polls 30 s.
+    local _i
+    for _i in $(seq 1 60); do
+      [ "$(asr_count "$1" "$2")" -gt "$3" ] && return 0
+      sleep 0.5
+    done
+    return 1
+  }
+  asr_dump_log() {
+    local f
+    echo "--- $1: minvmd zone-answerer lines (tail) ---"
+    while IFS= read -r f; do
+      [ -f "$f" ] || continue
+      grep -F -- 'zone-answerer' "$f" 2>/dev/null | tail -n8
+    done < <(asr_log_candidates "$1")
+  }
+  # The address the node's own zone dump holds for a live box name, polled.
+  asr_zone_address() {
+    # $1: state base. $2: the box's zone name.
+    local _i addr=""
+    for _i in $(seq 1 40); do
+      addr="$(python3 -c '
+import json, sys
+for row in json.load(open(sys.argv[1])):
+    if row.get("name") == sys.argv[2] and row.get("live"):
+        print(row.get("address") or "")
+        break
+' "$1/providers/local-minvmd0/zone.json" "$2" 2>/dev/null || true)"
+      [ -n "$addr" ] && break
+      sleep 0.5
+    done
+    printf '%s\n' "$addr"
+  }
+  # One A answer at the hook port carrying the expected address, polled for
+  # 20 s (a re-publish trails the event that triggers it by a poll).
+  asr_expect_a() {
+    # $1: name. $2: address.
+    local _i reply=""
+    for _i in $(seq 1 40); do
+      reply="$(dig +time=1 +tries=1 +noall +answer @127.0.0.1 -p "$asr_port" "$1" A 2>/dev/null || true)"
+      if printf '%s\n' "$reply" \
+          | awk -v want="$2" '$4 == "A" && $5 == want { found = 1 } END { exit !found }'; then
+        echo "  $1 answers $2 at 127.0.0.1:$asr_port"
+        return 0
+      fi
+      sleep 0.5
+    done
+    echo "::error::$1 did not answer $2 at 127.0.0.1:$asr_port within 20 s (last: '$reply')"
+    dig +time=1 +tries=1 @127.0.0.1 -p "$asr_port" "$1" A 2>&1 || true
+    asr_dump_log "$asr_base_a"
+    asr_dump_log "$ASR_STATE2_DIR"
+    fail
+  }
+  asr_expect_nx() {
+    # $1: name.
+    local _i reply=""
+    for _i in $(seq 1 40); do
+      reply="$(dig +time=1 +tries=1 @127.0.0.1 -p "$asr_port" "$1" A 2>/dev/null || true)"
+      case "$reply" in
+        *"status: NXDOMAIN"*) echo "  $1 answers NXDOMAIN"; return 0 ;;
+      esac
+      sleep 0.5
+    done
+    echo "::error::$1 still answers 20 s after its session was destroyed"
+    printf '%s\n' "$reply"
+    fail
+  }
+  asr_activate() {
+    # $1: the CLI function. $2: the session name. $3: stderr file.
+    # Prints the session id. The daemon autospawns under minvmd=info, so
+    # its answerer records reach its file log. Each node's guest starts on a
+    # fresh data volume, so its first compose fetches the stack cold and
+    # can outrun the CLI's 60 s ConfigureLoadout bound; the guest finishes
+    # that compose anyway, so one retry of a timed-out activate runs warm.
+    # The case's subject is the box's name row, not the compose time.
+    local sid attempt
+    for attempt in 1 2; do
+      if sid="$(cd "$ASR_SEED_DIR" && RUST_LOG="warn,minvmd=info" "$1" session activate . \
+          --no-prompt --no-loadouts --name "$2" --network own_ip 2>"$3")"; then
+        printf '%s\n' "$sid" | tail -n1 | tr -d '\r'
+        return 0
+      fi
+      if [ "$attempt" = 1 ] && grep -qF -- 'RPC timed out' "$3" 2>/dev/null; then
+        echo "  $2: the cold guest's first compose outran the RPC bound; retrying once warm" >&2
+        "$1" session destroy --force "$2" >/dev/null 2>&1 || true
+        continue
+      fi
+      break
+    done
+    echo "::error::'min session activate' of $2 failed" >&2
+    echo "--- stderr ---" >&2; cat "$3" >&2 2>/dev/null || true
+    return 1
+  }
+
+  # Node A's daemon comes up through `min ls` under minvmd=info, so the
+  # activates never ride a cold boot's SSH handshake; polled, because a
+  # cold boot (or a reboot beside a second running VM) can overrun one
+  # call's handshake bound while the daemon still comes up.
+  asr_bring_up() {
+    # $1: which daemon, for the error.
+    local _i
+    for _i in 1 2 3; do
+      if RUST_LOG="warn,minvmd=info" mnl ls >/dev/null 2>"$WORK/asr-up.err"; then
+        return 0
+      fi
+      sleep 2
+    done
+    echo "::error::'min ls' could not bring $1 VM host daemon up"
+    cat "$WORK/asr-up.err" 2>/dev/null || true
+    fail
+  }
+
+  ASR_SEED_DIR="$(hook_mktemp /tmp/mnlasr.XXXXXX)"
+  hook_seed_preamble > "$ASR_SEED_DIR/minimal.toml"
+  mkdir "$ASR_SEED_DIR/.git"
+
+  # ---- 1. node A hosts the interim -----------------------------------------
+  local asr_hosts_before
+  asr_hosts_before="$(asr_count "$asr_base_a" 'holds the host loopback')"
+  mnl stop --force >/dev/null 2>&1 || true
+  asr_bring_up "node A's"
+  if ! asr_wait_more "$asr_base_a" 'holds the host loopback' "$asr_hosts_before"; then
+    echo "::error::node A never hosted the interim answerer (no 'holds the host loopback' record) — is the hook port held by another daemon or a leftover service?"
+    asr_dump_log "$asr_base_a"
+    fail
+  fi
+  asr_port="$(asr_log_candidates "$asr_base_a" | while IFS= read -r f; do
+      [ -f "$f" ] && grep -F -- 'holds the host loopback' "$f" 2>/dev/null; done \
+    | tail -n1 | sed -n 's/.*"listener":"127\.0\.0\.1:\([0-9][0-9]*\)".*/\1/p')"
+  if [ -z "$asr_port" ]; then
+    asr_port=7656
+  fi
+  echo "1. node A hosts the interim answerer on 127.0.0.1:$asr_port"
+
+  local asr_a_sid asr_a_err="$WORK/asr-a-activate.err"
+  asr_a_sid="$(asr_activate mnl e2e-asr-a "$asr_a_err")" || fail
+  local asr_a_ip
+  asr_a_ip="$(asr_zone_address "$asr_base_a" e2e-asr-a.min.internal)"
+  if [ -z "$asr_a_ip" ]; then
+    echo "::error::node A's zone dump holds no live row for e2e-asr-a.min.internal"
+    fail
+  fi
+  asr_expect_a e2e-asr-a.min.internal "$asr_a_ip"
+
+  # ---- 2. the advisory hands the port to the service -----------------------
+  local asr_cmd
+  asr_cmd="$(advisory_command_from "$asr_a_err" "Configure the host's resolver")"
+  case "$asr_cmd" in
+    *zone-answerer*) ;;
+    *)
+      echo "::error::node A's session start printed no advisory carrying the answerer service step"
+      echo "--- activate stderr ---"; cat "$asr_a_err" 2>/dev/null || true
+      fail
+      ;;
+  esac
+  case "$asr_cmd" in
+    *" release --control "*) ;;
+    *)
+      echo "::error::the advisory's command does not ask the interim to release the port before it starts the unit"
+      echo "--- command ---"; printf '%s\n' "$asr_cmd"
+      fail
+      ;;
+  esac
+  # Record every undo BEFORE the run, so a half-failed command still
+  # leaves the teardown its targets.
+  if [ "$asr_os" = Linux ]; then
+    ASR_REVERT_LINK="$(printf '%s\n' "$asr_cmd" | sed -n 's/.*resolvectl dns \([^ ][^ ]*\) .*/\1/p' | head -n1)"
+    if [ -z "$ASR_REVERT_LINK" ]; then
+      echo "::error::could not find the link in the advisory's command, so it was not run"
+      printf '%s\n' "$asr_cmd"
+      fail
+    fi
+  else
+    if [ -f /etc/resolver/min.internal ]; then
+      RANGE_RESOLVER_BEFORE="$WORK/asr-resolver.before"
+      cp /etc/resolver/min.internal "$RANGE_RESOLVER_BEFORE"
+    fi
+    RANGE_INSTALLED=yes
+  fi
+  ANSWERER_SERVICE_CHANNEL="$(answerer_channel_of "$asr_cmd")"
+  if [ "$ANSWERER_SERVICE_CHANNEL" != "$asr_channel" ]; then
+    echo "::error::the advisory's command names channel '$ANSWERER_SERVICE_CHANNEL', not the machine-global $asr_channel; it was not run"
+    ANSWERER_SERVICE_CHANNEL="$asr_channel"
+    fail
+  fi
+  local asr_released_before asr_service_before
+  asr_released_before="$(asr_count "$asr_base_a" 'released the interim answerer')"
+  asr_service_before="$(asr_count "$asr_base_a" 'the manager-held answerer service')"
+  if ! sh -c "$asr_cmd" >"$WORK/asr-cmd.out" 2>"$WORK/asr-cmd.err"; then
+    echo "::error::the advisory's command did not run"
+    echo "--- command ---"; printf '%s\n' "$asr_cmd"
+    echo "--- output ---"; cat "$WORK/asr-cmd.out" "$WORK/asr-cmd.err" 2>/dev/null || true
+    asr_dump_log "$asr_base_a"
+    fail
+  fi
+  echo "2. ran the advisory's command (one sudo: resolver, release, service)"
+  if ! asr_wait_more "$asr_base_a" 'released the interim answerer' "$asr_released_before"; then
+    echo "::error::node A has no record of releasing the interim answerer"
+    asr_dump_log "$asr_base_a"
+    fail
+  fi
+  if ! asr_wait_more "$asr_base_a" 'the manager-held answerer service' "$asr_service_before"; then
+    echo "::error::node A never became a client of the manager-held answerer service"
+    asr_dump_log "$asr_base_a"
+    fail
+  fi
+  if [ "$asr_os" = Linux ]; then
+    if ! systemctl is-active --quiet dev.minimal.zone-answerer.socket; then
+      echo "::error::the answerer socket unit is not active after the command"
+      systemctl status dev.minimal.zone-answerer.socket 2>&1 | tail -n 15 || true
+      fail
+    fi
+    asr_holders="$(sudo -n ss -lunp 2>/dev/null | grep -F -- "127.0.0.1:$asr_port " || true)"
+    case "$asr_holders" in
+      *minvmd*)
+        echo "::error::a minvmd still holds 127.0.0.1:$asr_port after the handover: $asr_holders"
+        fail
+        ;;
+    esac
+    echo "  the hook port's holder: ${asr_holders:-<none listed>}"
+  else
+    if ! sudo -n launchctl print system/dev.minimal.zone-answerer >/dev/null 2>&1; then
+      echo "::error::the answerer LaunchDaemon is not loaded after the command"
+      fail
+    fi
+  fi
+  if ! sudo -n test -S "$asr_channel"; then
+    echo "::error::the machine-global channel socket $asr_channel is absent after the command"
+    fail
+  fi
+  echo "  node A released the port and publishes to the manager-held service over $asr_channel"
+  asr_expect_a e2e-asr-a.min.internal "$asr_a_ip"
+
+  # ---- 3. node B publishes over the one channel ------------------------------
+  local asr_b_sid asr_b_err="$WORK/asr-b-activate.err" asr_b_ip
+  asr_b_sid="$(asr_activate mnl2 e2e-asr-b "$asr_b_err")" || fail
+  if ! asr_wait_more "$ASR_STATE2_DIR" 'the manager-held answerer service' 0; then
+    echo "::error::node B never published to the manager-held answerer service"
+    asr_dump_log "$ASR_STATE2_DIR"
+    fail
+  fi
+  if [ "$(asr_count "$ASR_STATE2_DIR" 'holds the host loopback')" != 0 ]; then
+    echo "::error::node B hosted the answerer itself with the service installed"
+    asr_dump_log "$ASR_STATE2_DIR"
+    fail
+  fi
+  asr_b_ip="$(asr_zone_address "$ASR_STATE2_DIR" e2e-asr-b.min.internal)"
+  if [ -z "$asr_b_ip" ]; then
+    echo "::error::node B's zone dump holds no live row for e2e-asr-b.min.internal"
+    fail
+  fi
+  echo "3. node B (state dir $ASR_STATE2_DIR) publishes to the service"
+  asr_expect_a e2e-asr-b.min.internal "$asr_b_ip"
+  asr_expect_a e2e-asr-a.min.internal "$asr_a_ip"
+
+  # ---- 4. a service restart answers both names again -------------------------
+  local asr_pid_before asr_pid_after
+  if [ "$asr_os" = Linux ]; then
+    asr_pid_before="$(systemctl show -p MainPID --value dev.minimal.zone-answerer.service)"
+    sudo -n systemctl restart dev.minimal.zone-answerer.service
+    asr_pid_after="$(systemctl show -p MainPID --value dev.minimal.zone-answerer.service)"
+  else
+    asr_pid_before="$(sudo -n launchctl print system/dev.minimal.zone-answerer 2>/dev/null \
+      | sed -n 's/^[[:space:]]*pid = //p' | head -n1)"
+    sudo -n launchctl kickstart -k system/dev.minimal.zone-answerer
+    sleep 1
+    asr_pid_after="$(sudo -n launchctl print system/dev.minimal.zone-answerer 2>/dev/null \
+      | sed -n 's/^[[:space:]]*pid = //p' | head -n1)"
+  fi
+  echo "4. restarted the answerer service (pid ${asr_pid_before:-?} -> ${asr_pid_after:-on demand})"
+  if [ -n "$asr_pid_before" ] && [ "$asr_pid_before" = "$asr_pid_after" ]; then
+    echo "::error::the answerer service's process did not change across the restart (pid $asr_pid_before)"
+    fail
+  fi
+  asr_expect_a e2e-asr-a.min.internal "$asr_a_ip"
+  asr_expect_a e2e-asr-b.min.internal "$asr_b_ip"
+
+  # ---- 5. stopping one node's session leaves the sibling answering ---------
+  mnl session destroy --force "$asr_a_sid" >/dev/null 2>&1 || true
+  echo "5. destroyed node A's session"
+  asr_expect_nx e2e-asr-a.min.internal
+  asr_expect_a e2e-asr-b.min.internal "$asr_b_ip"
+
+  # ---- 6. a later session publishes instead of binding ----------------------
+  local asr_hosts_mid asr_service_mid asr_a2_sid asr_a2_ip
+  asr_hosts_mid="$(asr_count "$asr_base_a" 'holds the host loopback')"
+  asr_service_mid="$(asr_count "$asr_base_a" 'the manager-held answerer service')"
+  mnl stop --force >/dev/null 2>&1 || true
+  asr_bring_up "node A's fresh"
+  asr_a2_sid="$(asr_activate mnl e2e-asr-a2 "$WORK/asr-a2-activate.err")" || fail
+  if ! asr_wait_more "$asr_base_a" 'the manager-held answerer service' "$asr_service_mid"; then
+    echo "::error::node A's fresh daemon did not publish to the manager-held answerer service"
+    asr_dump_log "$asr_base_a"
+    fail
+  fi
+  if [ "$(asr_count "$asr_base_a" 'holds the host loopback')" != "$asr_hosts_mid" ]; then
+    echo "::error::node A's fresh daemon bound the hook port itself with the service installed"
+    asr_dump_log "$asr_base_a"
+    fail
+  fi
+  asr_a2_ip="$(asr_zone_address "$asr_base_a" e2e-asr-a2.min.internal)"
+  echo "6. a later session on a fresh node A published to the service; nothing bound the port"
+  asr_expect_a e2e-asr-a2.min.internal "$asr_a2_ip"
+  asr_expect_a e2e-asr-b.min.internal "$asr_b_ip"
+
+  # ---- cleanup: the host as found -----------------------------------------
+  mnl session destroy --force "$asr_a2_sid" >/dev/null 2>&1 || true
+  mnl2 session destroy --force "$asr_b_sid" >/dev/null 2>&1 || true
+  mnl2 stop --force >/dev/null 2>&1 || true
+  ASR_STATE2_DIR=""
+  # Node A goes down before the service does, so it never re-hosts the
+  # interim in the gap; the lane's next start finds the host as this case
+  # found it and hosts the interim afresh.
+  mnl stop --force >/dev/null 2>&1 || true
+  answerer_service_teardown
+  if [ -n "$ASR_REVERT_LINK" ]; then
+    sudo -n resolvectl revert "$ASR_REVERT_LINK" >/dev/null 2>&1 || true
+    if sudo -n ip link del "$ASR_REVERT_LINK" >/dev/null 2>&1; then
+      ASR_REVERT_LINK=""
+    else
+      echo "::warning::could not remove the dedicated link $ASR_REVERT_LINK"
+    fi
+  fi
+  range_teardown_unit
+  rm -rf "$ASR_SEED_DIR"; ASR_SEED_DIR=""
+  echo "answerer survives session stop OK (handover, two nodes, restart, sibling stop, later publish — each printed)"
   echo "::endgroup::"
 }
 
@@ -12874,6 +13341,14 @@ case "${1:-}" in
     proof_native_resolution_without_proxy_env
     proof_native_resolution_from_host_answerer_on_vm_host
     proof_box_name_resolves_natively_without_proxy
+    # The answerer-service proof installs a root-run unit; a macOS lane runs
+    # it only under the privileged opt-in (no macOS CI lane has the
+    # passwordless sudo), and a direct invocation without it fails.
+    if [ "$(uname -s)" != Darwin ] || [ "${MINIMAL_E2E_PRIVILEGED:-}" = 1 ]; then
+      proof_answerer_survives_session_stop
+    else
+      echo "answerer survives session stop SKIPPED in the whole-lane order (privileged: set MINIMAL_E2E_PRIVILEGED=1 on a macOS host with passwordless sudo)"
+    fi
     proof_hostnames_recover_and_two_daemons_route
     proof_min_internal_names_through_proxy
     proof_own_ip_deny_all_box_answers_published_port
@@ -12899,6 +13374,7 @@ case "${1:-}" in
     | native_resolution_from_host_answerer_on_vm_host \
     | local_range_reserved_by_privileged_step \
     | box_name_resolves_natively_without_proxy \
+    | answerer_survives_session_stop \
     | hostnames_recover_and_two_daemons_route \
     | min_internal_names_through_proxy | own_ip_deny_all_box_answers_published_port \
     | proxy_refuses_like_direct | retired_surfaces_gone \
@@ -12922,6 +13398,7 @@ case "${1:-}" in
     echo "         native_resolution_from_host_answerer_on_vm_host"
     echo "         local_range_reserved_by_privileged_step"
     echo "         box_name_resolves_natively_without_proxy"
+    echo "         answerer_survives_session_stop"
     echo "         fresh_linux_kvm_activate_local_minvmd fresh_arm64_kvm_activate_local_minvmd"
     echo "         linux_stock_install_runs_vm_boxes"
     echo "         hostnames_recover_and_two_daemons_route"
