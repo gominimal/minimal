@@ -2304,16 +2304,28 @@ proof_host_ip_deny_all() {
     # the cgroup namespace root its /proc reports (the sandbox unshares
     # ipc, cgroup, network and uts — never pid, so the pid an exec prints
     # below is the pid the host-side tree names).
-    hida_cover="$(mnl session exec "$hida_sid" 'printenv MINIMAL_CLASSIFIER_COVER' \
-      2>/dev/null || true)"
-    hida_cover="$(printf '%s\n' "$hida_cover" | tail -n1)"
+    #
+    # The marker is set in the launch's pre-exec closure, so it lives in the
+    # environment of the box's launched process and what that process
+    # spawns. A `session exec` is injected beside it with the environment the
+    # daemon builds for it, never inheriting the launch's, so it is read
+    # where it lives: the environ of the leaf's members, as root (the leaf
+    # and those processes are the tree's and the box's, not this account's).
+    hida_cover="" hida_cover_pid=""
+    for hida_pid_m in $(sudo -n cat "/sys/fs/cgroup/minimald.slice/boxes/deny/$hida_sid/cgroup.procs" \
+        2>/dev/null || true); do
+      hida_cover="$(sudo -n cat "/proc/$hida_pid_m/environ" 2>/dev/null | tr '\0' '\n' \
+        | sed -n 's/^MINIMAL_CLASSIFIER_COVER=//p' | head -n1 || true)"
+      if [ -n "$hida_cover" ]; then hida_cover_pid="$hida_pid_m"; break; fi
+    done
     case "$hida_cover" in
       cgroup2 | tmpfs-fallback) ;;
       *)
-        echo "::error::the box's own environment names no classifier cover (MINIMAL_CLASSIFIER_COVER='$hida_cover'): the cover is the one fact the box can report for itself"
+        echo "::error::no process in the box's leaf boxes/deny/$hida_sid carries a classifier cover in its environment (MINIMAL_CLASSIFIER_COVER='$hida_cover'): the cover is the one fact the box can report for itself"
         fail
         ;;
     esac
+    echo "cover marker: the box's launched process (pid $hida_cover_pid, a member of its leaf) carries MINIMAL_CLASSIFIER_COVER=$hida_cover in its own environment"
     hida_cgroup="$(mnl session exec "$hida_sid" 'cat /proc/self/cgroup' \
       2>"$WORK/hida-cgroup.err")" || {
       echo "::error::reading /proc/self/cgroup inside the box failed"
