@@ -541,7 +541,7 @@ pub struct WithdrawBoxRequest {
 }
 
 /// The one request line the control socket takes: which verb the client
-/// wants, `register` or `withdraw`, tagged in the line itself.
+/// wants, tagged in the line itself.
 ///
 /// The tag is the version corner, and it leans the safe way. A daemon that
 /// predates a verb cannot parse the tagged line and refuses it — and an old
@@ -563,6 +563,56 @@ pub enum BoxControlRequest {
     /// Withdraw the row a registration filled: the destroyed or failed
     /// session's creator presenting the pair the registration handed back.
     Withdraw(WithdrawBoxRequest),
+    /// Read the machine's zone-answerer status (see [`ZoneAnswererStatus`])
+    /// — the read-only verb: no row is touched, no state changes, the reply
+    /// is the status the answerer's acquisition last left.
+    AnswererStatus,
+}
+
+/// The VM host daemon's answerer status: the state of the machine's
+/// box-zone answerer as this daemon sees it (NET-138's single-operator
+/// interim), read over the control socket by the verbs that surface it —
+/// the session start and `min ls`.
+///
+/// The zone is answered by whichever VM host daemon bound the machine's
+/// answerer port — the holder — and every other VM host daemon on the
+/// machine registers its table's rows with the holder over the answerer
+/// channel, so one answerer serves every VM's names. The status says which
+/// of the states this daemon is in, so the client can say where to look and
+/// who holds the port; whether the answerer is *live* at that port is the
+/// client's own A query for `host.min.internal` to prove (the row the
+/// answerer itself holds), not a fact this status could vouch for.
+///
+/// The CLI reads this over the control socket and never through the in-VM
+/// daemon, because it is a host fact: a guest relaying a host fact is
+/// forgeable from inside the escape boundary, and the answerer's port is
+/// held on the host's loopback, where only the host's own client can read
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ZoneAnswererStatus {
+    /// The answerer's acquisition has not finished its first pass: the
+    /// daemon has not yet said which state it is in.
+    Starting,
+    /// This VM host daemon holds the machine's answerer port on the host
+    /// loopback and answers the zone from its own host-authored table.
+    Holder {
+        /// The port the answerer listens on.
+        port: u16,
+    },
+    /// Another VM host daemon on this machine holds the answerer port; this
+    /// daemon's table rows answer through it over the answerer channel.
+    Registered {
+        /// The machine's answerer port the holder serves.
+        port: u16,
+    },
+    /// The answerer port is held by a process with no channel — a native
+    /// minimald, or a foreign process — so this VM's names are not answered
+    /// on the host and the hostname proxy remains the only surface.
+    PortHeldNoChannel {
+        /// The machine's answerer port, held by a process with no channel.
+        port: u16,
+    },
 }
 
 /// The addresses a successful registration hands back
@@ -571,11 +621,12 @@ pub enum BoxControlRequest {
 /// host switch serves — the same pair the create request carries so the
 /// in-VM daemon attaches with it.
 ///
-/// The one reply line the control socket answers either verb with: the
-/// handed addresses, or the reason the verb did not happen. A registration
-/// hands the allocated pair back; a withdrawal echoes the pair it withdrew
-/// by, so the client can check the daemon meant the row it asked about.
-/// Untagged so the reply stays one flat JSON object either way.
+/// The one reply line the control socket answers any verb with: the handed
+/// addresses, or the reason the verb did not happen. A registration hands
+/// the allocated pair back; a withdrawal echoes the pair it withdrew by, so
+/// the client can check the daemon meant the row it asked about; the status
+/// verb answers the answerer's state. Untagged so the reply stays one flat
+/// JSON object either way.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum BoxControlReply {
@@ -585,6 +636,9 @@ pub enum BoxControlReply {
     /// The verb failed: `error` is a sentence naming why, for the client to
     /// warn with.
     Error { error: String },
+    /// The answerer-status read succeeded: the state of the machine's
+    /// zone answerer as the daemon holds it ([`ZoneAnswererStatus`]).
+    Status(ZoneAnswererStatus),
 }
 
 /// The request for a [`CreateSession`] RPC.
