@@ -11168,6 +11168,10 @@ source=$esu_ip_a destination=192.168.77.7:$ESU_LISTEN_PORT verdict=refused at th
     echo "::error::a refused spoof from box A's address still left a marker at the host listener"
     esu_fail
   fi
+  # The undeclared-subnet line carries no destination, so this arm counts new
+  # lines for box A's source. Box A must stay idle apart from the spoofer for
+  # the whole arm: do not add workload to box A here, or its own traffic could
+  # account for the line (T89 #1925 pins the destination instead).
   esu_wait_new_gate_line "$esu_ip_a" egress-undeclared-subnet "" "$esu_prior" >/dev/null || {
     echo "::error::the gate refused box A's address toward 198.51.100.7 without its undeclared-subnet line naming the source ($esu_prior such line(s) existed before the arm)"
     esu_fail
