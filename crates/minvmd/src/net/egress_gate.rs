@@ -3104,9 +3104,24 @@ impl ReplyTables {
             .flows
             .lock()
             .expect("the reply-flow table's lock is held only across one decision");
+        let before = flows.len();
         let outcome = flows.observe_inbound(reply_tuple_of(pkt), pkt.tcp_flags, now);
+        let recorded = usize::from(matches!(outcome, egress::InboundFlow::Recorded { .. }));
+        note_flows_ended(
+            record,
+            before + recorded - flows.len(),
+            "expired or closed by the client",
+        );
         match outcome {
             egress::InboundFlow::Recorded { filled } => {
+                tracing::debug!(
+                    switch_addr = %record.switch_addr(),
+                    namespace = %record.name(),
+                    port = pkt.dst.port(),
+                    client = %pkt.src,
+                    live = flows.len(),
+                    "recorded an inbound flow at the box's published port"
+                );
                 if entry.claim_first_record() {
                     tracing::info!(
                         switch_addr = %record.switch_addr(),
@@ -3160,7 +3175,10 @@ impl ReplyTables {
             .flows
             .lock()
             .expect("the reply-flow table's lock is held only across one decision");
-        flows.reply_admits(reply_tuple_of(pkt), pkt.tcp_flags, now)
+        let before = flows.len();
+        let admits = flows.reply_admits(reply_tuple_of(pkt), pkt.tcp_flags, now);
+        note_flows_ended(record, before - flows.len(), "expired or closed by the box");
+        admits
     }
 
     /// Retires the entries of the boxes whose traffic the relay that ended
@@ -3177,7 +3195,14 @@ impl ReplyTables {
             .lock()
             .expect("the reply-flow table's lock is held only across one decision");
         for src in sources {
-            boxes.remove(src);
+            if let Some(entry) = boxes.remove(src) {
+                let ended = entry
+                    .flows
+                    .lock()
+                    .expect("the reply-flow table's lock is held only across one decision")
+                    .len();
+                note_flows_ended(&entry.record, ended, "the box's row was withdrawn");
+            }
         }
     }
 
@@ -3201,7 +3226,44 @@ impl ReplyTables {
             .flows
             .lock()
             .expect("the reply-flow table's lock is held only across one decision");
+        let before = flows.len();
         flows.end_port(proto, port);
+        note_flows_ended(
+            &entry.record,
+            before - flows.len(),
+            "its publication was retracted",
+        );
+    }
+
+    /// How many inbound flows the gate holds records for, across every box —
+    /// the live-flow gauge a status surface reads beside the drop counters.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the status surface that reads it is a follow-up outside this gate; the \
+                      count is the tables' own length, live in every build"
+        )
+    )]
+    pub(crate) fn live_flows(&self) -> usize {
+        let boxes: Vec<_> = self
+            .inner
+            .boxes
+            .lock()
+            .expect("the reply-flow table's lock is held only across one decision")
+            .values()
+            .cloned()
+            .collect();
+        boxes
+            .iter()
+            .map(|entry| {
+                entry
+                    .flows
+                    .lock()
+                    .expect("the reply-flow table's lock is held only across one decision")
+                    .len()
+            })
+            .sum()
     }
 
     /// How many of the box's inbound flows have been refused at its
@@ -3251,6 +3313,21 @@ impl ReplyTables {
             .lock()
             .expect("the reply-flow table's lock is held only across one decision");
         flows.shrink_cap(cap);
+    }
+}
+
+/// The debug line for `ended` of the box's inbound-flow records leaving its
+/// table — a window that passed, a close, or a retraction — so a daemon log
+/// at debug reads each recorded flow's end beside its recording.
+fn note_flows_ended(record: &BoxRecord, ended: usize, why: &str) {
+    if ended > 0 {
+        tracing::debug!(
+            switch_addr = %record.switch_addr(),
+            namespace = %record.name(),
+            ended,
+            why,
+            "ended inbound-flow records"
+        );
     }
 }
 
@@ -5826,6 +5903,11 @@ mod tests {
             h.replies.record_count_of(LEASE),
             Some(2),
             "one record per admitted inbound flow, TCP and UDP alike"
+        );
+        assert_eq!(
+            h.replies.live_flows(),
+            2,
+            "the live-flow gauge counts the same records across the gate's boxes"
         );
 
         // The recording's bound, pinned from the outside: a dial at the
