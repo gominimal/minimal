@@ -1029,15 +1029,14 @@ const NODE_DEFAULT_PROXY_PORT: u16 = 7654;
 /// ([`log_node_port_assignment`]), so a boot that lands off the default port
 /// says which check refused it rather than only that something did.
 ///
-/// The bind probe refused the port: something holds it at an address the bind
-/// conflicts with — every host's wildcard listener, and on Linux a loopback
-/// listener too.
+/// The bind probe refused the port: something holds it on the loopback address
+/// the hostname surface is published on, or on the wildcard
+/// ([`tcp_bind_probe`]).
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 const SKIP_BIND_REFUSED: &str = "bind refused";
 
-/// A listener answered the connect probe on the loopback address: another
-/// VM's hostname surface, which on macOS the wildcard bind succeeds over
-/// without ever seeing.
+/// A listener answered the connect probe on the loopback address although both
+/// binds succeeded: the backstop behind [`tcp_bind_probe`].
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 const SKIP_LOOPBACK_ANSWERING: &str = "a listener is already answering on loopback";
 
@@ -1149,12 +1148,9 @@ const LOOPBACK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_mi
 /// else. Anything else the connect returns — a refusal, most often, or the
 /// timeout — means nothing is answering there.
 ///
-/// This is the second probe a TCP node port must pass, and the one that
-/// decides on macOS: std's listener sets `SO_REUSEADDR`, which on that host
-/// lets the wildcard bind succeed over a listener another VM's hostname
-/// surface already holds on the loopback address (minimald's proxy binds
-/// `127.0.0.1:<port>`), so the bind alone reports that port free. See
-/// [`assign_node_port`].
+/// This is the second probe a TCP node port must pass, a backstop behind the
+/// bind probe ([`tcp_bind_probe`]), which already refuses a port held on the
+/// loopback address on every host. See [`assign_node_port`].
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn loopback_answers(port: u16) -> bool {
     std::net::TcpStream::connect_timeout(
@@ -1171,19 +1167,14 @@ fn loopback_answers(port: u16) -> bool {
 /// taken by another process — a lost race the guest's own log tail shows
 /// (a handed port never silently moves, NET-024).
 ///
-/// For a TCP port, free is a two-probe answer, because the bind probe is not
-/// the same question on every host: on Linux a bind on the wildcard conflicts
-/// with a listener on any address of the port, while on macOS std's
-/// `SO_REUSEADDR` lets it succeed over another VM's listener on the loopback
-/// address — the one address the hostname surface is published on. So a TCP
-/// port is free only when the wildcard bind succeeds *and* no listener
-/// answers a connection on `127.0.0.1` at that port
-/// ([`loopback_answers`]), and the skip reason names which probe refused it.
-/// The fallback is held to the same two probes ([`fallback_port`]): the OS
-/// draws its candidates under the same `SO_REUSEADDR` semantics, so a draw
-/// another VM is already serving on loopback is passed over, never handed.
-/// The answerer's UDP probe is unchanged: a UDP socket never accepts a
-/// connection, so the bind is the whole question there.
+/// For a TCP port, free means the bind probe succeeds on the loopback address
+/// the hostname surface is published on and on the wildcard
+/// ([`tcp_bind_probe`]), *and* no listener answers a connection on
+/// `127.0.0.1` at that port ([`loopback_answers`]); the skip reason names
+/// which probe refused it. The fallback is held to the same probes
+/// ([`fallback_port`]). The answerer's UDP probe is unchanged: a UDP socket
+/// never accepts a connection, so the wildcard bind is the whole question
+/// there.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 fn assign_node_port(preferred: u16, udp: bool) -> Result<NodePortAssignment> {
     use anyhow::Context as _;
@@ -1192,8 +1183,7 @@ fn assign_node_port(preferred: u16, udp: bool) -> Result<NodePortAssignment> {
             let socket = std::net::UdpSocket::bind(("0.0.0.0", port))?;
             Ok(socket.local_addr()?.port())
         } else {
-            let listener = std::net::TcpListener::bind(("0.0.0.0", port))?;
-            Ok(listener.local_addr()?.port())
+            tcp_bind_probe(port)
         }
     };
     // Which probe refused the preferred port, when one did. The bind asks the
@@ -1223,6 +1213,31 @@ fn assign_node_port(preferred: u16, udp: bool) -> Result<NodePortAssignment> {
     })
 }
 
+/// The TCP bind probe: binds `127.0.0.1:<port>` — the exact address minimald's
+/// hostname proxy (through gvproxy's expose) publishes on — then the wildcard
+/// at the same port, releasing each socket before the next bind, and returns
+/// the port (the OS's draw when `port` is 0). Either bind refusing is
+/// `AddrInUse`.
+///
+/// Both binds are needed on macOS. std sets `SO_REUSEADDR`, and there
+/// that flag lets a wildcard bind succeed over another socket listening on
+/// `127.0.0.1:<port>`, and a loopback bind succeed over a wildcard listener.
+/// It never lets either bind succeed over a listener on its own exact address.
+/// So the loopback bind sees another VM's hostname surface, and the wildcard
+/// bind sees a wildcard holder that a loopback bind would otherwise coexist
+/// with. On Linux either bind alone refuses both shapes. The flag is kept
+/// rather than cleared: without it a `TIME_WAIT` connection left on the port
+/// by a stopped VM refuses the bind on both hosts, and a lone VM would be
+/// moved off the default port with nothing serving on it.
+#[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
+fn tcp_bind_probe(port: u16) -> std::io::Result<u16> {
+    let loopback = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))?;
+    let port = loopback.local_addr()?.port();
+    drop(loopback);
+    std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))?;
+    Ok(port)
+}
+
 /// How many candidates the OS-assigned fallback draws before giving up
 /// ([`fallback_port`]). The OS draws each candidate out of the ephemeral
 /// range, so a candidate that is already served on loopback is a rare draw
@@ -1248,15 +1263,19 @@ const FALLBACK_PORT_ATTEMPTS: usize = 8;
 fn fallback_port(mut next: impl FnMut() -> std::io::Result<u16>, udp: bool) -> Result<u16> {
     use anyhow::Context as _;
     for _ in 0..FALLBACK_PORT_ATTEMPTS {
-        let port = next()
-            .context("the node's default port is held and no OS-assigned port is available")?;
+        // A draw whose wildcard half is held is refused like a served one.
+        let port = match next() {
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            drawn => drawn
+                .context("the node's default port is held and no OS-assigned port is available")?,
+        };
         if udp || !loopback_answers(port) {
             return Ok(port);
         }
     }
     Err(anyhow::anyhow!(
         "no OS-assigned port is free: every one of the {FALLBACK_PORT_ATTEMPTS} \
-         candidates drawn is already answering on loopback"
+         candidates drawn is already held or answering on loopback"
     ))
 }
 
@@ -1412,14 +1431,9 @@ mod tests {
         // (minimald's proxy binds `127.0.0.1:<port>`), so the port one VM is
         // serving on is exactly the port the next VM wants: the assignment has
         // to skip it. Hold it the way the holder really does — on the loopback
-        // address alone, not the wildcard — because that is the one shape the
-        // two probes disagree about: on Linux the wildcard bind refuses it
-        // (reason `bind refused`), while on macOS std's SO_REUSEADDR lets the
-        // same bind succeed over it and the connect probe is what sees the
-        // listener (reason `a listener is already answering on loopback`).
-        // Either way one VM keeps its surface and the other is handed a port
-        // that is nobody else's, and the assignment's log line says which
-        // probe refused it.
+        // address alone, not the wildcard. One VM keeps its surface and the
+        // other is handed a port that is nobody else's, and the assignment's
+        // log line says which probe refused it.
         let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let served = held.local_addr().unwrap().port();
         assert!(
@@ -1438,6 +1452,40 @@ mod tests {
             ),
             "the skip names the probe that refused it, got: {:?}",
             assigned.skipped
+        );
+    }
+
+    #[test]
+    fn node_port_bind_probe_refuses_a_port_held_on_loopback() {
+        // The bind probe alone reports a port another VM serves on
+        // `127.0.0.1` as taken, on macOS as on Linux: std's SO_REUSEADDR lets
+        // a macOS wildcard bind succeed over that listener, so the probe binds
+        // the loopback address itself, where the flag masks nothing.
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let served = held.local_addr().unwrap().port();
+        let refused = super::tcp_bind_probe(served).unwrap_err();
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::AddrInUse,
+            "the bind probe reports 127.0.0.1:{served} as taken"
+        );
+        let assigned = super::assign_node_port(served, false).unwrap();
+        assert_ne!(assigned.port, served, "the served port is not handed");
+        assert_eq!(
+            assigned.skipped,
+            Some(super::SKIP_BIND_REFUSED),
+            "the bind probe, not the connect backstop, refuses it"
+        );
+
+        // A wildcard holder is taken too: on macOS a loopback bind with
+        // SO_REUSEADDR succeeds over it, which the wildcard half catches.
+        let held_any = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let served_any = held_any.local_addr().unwrap().port();
+        let refused_any = super::tcp_bind_probe(served_any).unwrap_err();
+        assert_eq!(
+            refused_any.kind(),
+            std::io::ErrorKind::AddrInUse,
+            "the bind probe reports a wildcard holder of {served_any} as taken"
         );
     }
 
