@@ -15,25 +15,38 @@
 #
 # What it refuses, per OS:
 #
-#   * Linux (`ldd` + `readelf -d`): every ldd entry must resolve inside the
-#     loader's default dirs (/lib, /lib64, /usr/lib, /usr/lib64 — their
-#     multiarch subdirs included) or be the kernel's linux-vdso, and an
-#     entry that resolves from nowhere is an offender too (nothing is
-#     "system" until it is shown to resolve from a system dir). The binary
-#     must also carry no RPATH and no RUNPATH entry at all: an embedded
-#     search path decides where root loads libraries from, and every system
-#     library is already on the loader's default path, so there is no
-#     legitimate use for one here.
+#   * Linux (`readelf -l`, then `ldd`, then `readelf -d`): the program
+#     interpreter (PT_INTERP) must be a system loader path — root runs it
+#     before any library, so it is the first thing checked, and a binary
+#     that is statically linked has none and passes. Every ldd entry must
+#     resolve inside the loader's default dirs (/lib, /lib64, /usr/lib,
+#     /usr/lib64 — their multiarch subdirs included) or be the kernel's
+#     linux-vdso, and an entry that resolves from nowhere is an offender
+#     too (nothing is "system" until it is shown to resolve from a system
+#     dir). The binary must also carry no RPATH and no RUNPATH entry at
+#     all: an embedded search path decides where root loads libraries
+#     from, and every system library is already on the loader's default
+#     path, so there is no legitimate use for one here.
 #   * macOS (`otool -L` + `otool -l`): every entry must live under /usr/lib
 #     or /System, and the binary must carry no LC_RPATH load command at all
 #     (minvmd's dev-build @loader_path rpath is exactly the shape a root
 #     answerer must not ship — see scripts/rewrite-macos-linkage.sh for the
 #     minvmd side of that rewrite).
 #
-# Every dependency and every rpath entry it finds is printed with its
-# verdict, one line per entry, so the log shows what the binary resolves
-# and why it failed. ldd honours LD_LIBRARY_PATH, so the check sees the
-# binary as the invoking environment would resolve it.
+# "Inside a system dir" means a whole path component: a path is in /usr/lib
+# only when it starts /usr/lib/, so /usr/local/lib, /usr/lib-x and
+# /usr/libexec are not /usr/lib; and no path the gate accepts may carry a
+# `..` component, which the loader walks to wherever it lands —
+# /usr/lib/../../tmp/libnope.so starts inside a system dir and names a place
+# root would load from.
+#
+# Every path it inspects — the interpreter, each dependency, each rpath
+# entry — is printed with its verdict, one line per entry, so the log shows
+# what the binary resolves and why it failed. The service manager starts
+# the answerer with a clean environment, so ldd runs under
+# `env -u LD_LIBRARY_PATH -u LD_PRELOAD`: the verdict must not depend on
+# who ran the gate or on what their environment would have injected into
+# the loader's search path.
 #
 # Usage: scripts/check-answerer-links.sh <binary>
 #
@@ -77,15 +90,124 @@ offender() {
     printf 'check-answerer-links: %s — verdict: offender (%s)\n' "$1" "$2"
 }
 
-# linux_check — ldd for the dependencies, readelf -d for RPATH/RUNPATH.
+# system_dir <path> — the system directory a path lives under, or nothing.
+# The prefix has to be a whole path component: /usr/local/lib, /usr/lib-x
+# and /usr/libexec do not start /usr/lib/, so they are not /usr/lib. Which
+# directories count depends on the half being run (`gate_os`, set in the
+# dispatch below): the loader's default dirs on Linux, /usr/lib and /System
+# on macOS.
+system_dir() {
+    if [ "$gate_os" = Darwin ]; then
+        case "$1" in
+            /usr/lib/*)   printf '/usr/lib' ;;
+            /System/*)    printf '/System' ;;
+        esac
+    else
+        case "$1" in
+            /lib/*)       printf '/lib' ;;
+            /lib64/*)     printf '/lib64' ;;
+            /usr/lib/*)   printf '/usr/lib' ;;
+            /usr/lib64/*) printf '/usr/lib64' ;;
+        esac
+    fi
+}
+
+# carries_dotdot <path> — true when the path has a `..` component. The
+# loader walks such a path to wherever it lands, so a system-dir prefix
+# proves nothing about where it ends up.
+carries_dotdot() {
+    [[ $1 =~ (^|/)\.\.(/|$) ]]
+}
+
+# path_state <path> — the shared verdict for one path: "dotdot" when it
+# carries a `..` component, "bad" when it lives under none of the system
+# dirs, or the system dir it lives under (the ok case). Every path the gate
+# inspects — dependencies, install names, the program interpreter — goes
+# through here, so the component rule is one rule on every OS.
+path_state() {
+    if carries_dotdot "$1"; then
+        printf 'dotdot'
+    else
+        local dir
+        dir="$(system_dir "$1")"
+        if [ -n "$dir" ]; then
+            printf '%s' "$dir"
+        else
+            printf 'bad'
+        fi
+    fi
+}
+
+# classify_dep <item> <path> — the verdict line for one resolved
+# dependency: an ldd entry on Linux, an install name on macOS.
+classify_dep() {
+    local item="$1" path="$2" state
+    state="$(path_state "$path")"
+    case "$state" in
+        bad)
+            offender "$item" "resolves outside $sysdirs; a root service loading a library from a user-writable path runs user-chosen code as root"
+            ;;
+        dotdot)
+            offender "$item" "carries a '..' path component; the loader walks it to wherever it lands, which is not provably a system directory"
+            ;;
+        *)
+            printf 'check-answerer-links: %s — verdict: ok (%s)\n' "$item" "$state"
+            ;;
+    esac
+}
+
+# linux_check — readelf -l for the interpreter, ldd for the dependencies,
+# readelf -d for RPATH/RUNPATH.
 linux_check() {
     command -v ldd >/dev/null 2>&1 || die "ldd is not on PATH — cannot inspect $bin"
     command -v readelf >/dev/null 2>&1 || die "readelf is not on PATH — cannot inspect $bin"
 
-    printf 'check-answerer-links: checking %s (Linux: ldd + readelf -d)\n' "$bin"
+    printf 'check-answerer-links: checking %s (Linux: readelf -l, ldd, readelf -d)\n' "$bin"
 
-    local ldd_out ldd_rc=0
-    ldd_out="$(ldd "$bin" 2>&1)" || ldd_rc=$?
+    # The program interpreter first: root runs it before any library, and
+    # the string is baked into the binary, so a loader path that is not
+    # provably the system's is user-chosen code running as root before
+    # anything else loads. A statically linked binary has none.
+    local interp_out interp_rc=0 interp interp_state interp_seen=0
+    interp_out="$(readelf -l "$bin" 2>&1)" || interp_rc=$?
+    if [ "$interp_rc" -ne 0 ]; then
+        die "readelf -l could not inspect $bin: $interp_out"
+    fi
+    while IFS= read -r interp; do
+        [ -n "$interp" ] || continue
+        interp_seen=$((interp_seen + 1))
+        interp_state="$(path_state "$interp")"
+        case "$interp_state" in
+            bad)
+                offender "interpreter $interp" "the program interpreter is not a system loader path: root runs it before any library, so a loader a user could plant there is user-chosen code running as root"
+                ;;
+            dotdot)
+                offender "interpreter $interp" "the program interpreter carries a '..' path component; the loader walks it to wherever it lands, which is not provably a system loader"
+                ;;
+            *)
+                printf 'check-answerer-links: interpreter %s — verdict: ok (%s)\n' "$interp" "$interp_state"
+                ;;
+        esac
+    done < <(
+        awk '
+            /Requesting program interpreter:/ {
+                s = $0
+                sub(/^.*Requesting program interpreter: /, "", s)
+                sub(/\]$/, "", s)
+                print s
+            }
+        ' <<<"$interp_out"
+    )
+    if [ "$interp_seen" -eq 0 ]; then
+        printf 'check-answerer-links: no program interpreter (statically linked) — verdict: ok\n'
+    fi
+
+    # ldd, under a scrubbed loader environment: the answerer is started by
+    # the service manager with a clean environment, so a verdict that
+    # depended on LD_LIBRARY_PATH or LD_PRELOAD would depend on who ran the
+    # gate rather than on what the release ships.
+    local ldd_out ldd_rc=0 state item path
+    ldd_out="$(env -u LD_LIBRARY_PATH -u LD_PRELOAD ldd "$bin" 2>&1)" || ldd_rc=$?
 
     # ldd exits 1 for a binary with no dynamic section as well — that is
     # the static case this gate passes, not an error.
@@ -95,20 +217,16 @@ linux_check() {
         if [ "$ldd_rc" -ne 0 ]; then
             die "ldd could not inspect $bin: $ldd_out"
         fi
-        local state item note
-        while IFS=$'\t' read -r state item note; do
+        while IFS=$'\t' read -r state item path; do
             case "$state" in
                 vdso)
                     printf 'check-answerer-links: %s — verdict: ok (the kernel vDSO)\n' "$item"
                     ;;
-                ok)
-                    printf 'check-answerer-links: %s — verdict: ok (%s)\n' "$item" "$note"
-                    ;;
-                bad)
-                    offender "$item" "resolves outside the loader's default dirs /lib, /lib64, /usr/lib, /usr/lib64; a root service loading a library from a user-writable path runs user-chosen code as root"
-                    ;;
                 missing)
                     offender "$item" "a dependency that resolves from nowhere is not provably a system library"
+                    ;;
+                dep)
+                    classify_dep "$item" "$path"
                     ;;
                 unknown)
                     die "unrecognized ldd line for $bin: $item"
@@ -116,38 +234,25 @@ linux_check() {
             esac
         done < <(
             awk '
-                function sysdir(p) {
-                    if (p ~ /^\/lib\//) return "/lib"
-                    if (p ~ /^\/lib64\//) return "/lib64"
-                    if (p ~ /^\/usr\/lib\//) return "/usr/lib"
-                    if (p ~ /^\/usr\/lib64\//) return "/usr/lib64"
-                    return ""
-                }
-                function emit(state, item, note) { print state "\t" item "\t" note }
+                function emit(s, i, p) { print s "\t" i "\t" p }
                 NF == 0 { next }
                 $1 ~ /^linux-vdso/ { emit("vdso", $1, ""); next }
-                $2 == "=>" && $3 == "not" && $4 == "found" { emit("missing", $1 " => not found", ""); next }
-                $2 == "=>" {
-                    p = $3
-                    emit(sysdir(p) == "" ? "bad" : "ok", $1 " => " p, sysdir(p))
+                $2 == "=>" && $3 == "not" && $4 == "found" {
+                    emit("missing", $1 " => not found", "")
                     next
                 }
-                $1 ~ /^\// {
-                    emit(sysdir($1) == "" ? "bad" : "ok", $1, sysdir($1))
-                    next
-                }
+                $2 == "=>" { emit("dep", $1 " => " $3, $3); next }
+                $1 ~ /^\// { emit("dep", $1, $1); next }
                 { emit("unknown", $0, "") }
             ' <<<"$ldd_out"
         )
     fi
 
-    local rpath_out rpath_rc=0
+    local rpath_out rpath_rc=0 saw_rpath=0 tag entry
     rpath_out="$(readelf -d "$bin" 2>&1)" || rpath_rc=$?
     if [ "$rpath_rc" -ne 0 ]; then
         die "readelf -d could not inspect $bin: $rpath_out"
     fi
-
-    local saw_rpath=0 tag entry
     while IFS=$'\t' read -r tag entry; do
         saw_rpath=1
         offender "($tag) $entry" "the answerer must carry no $tag entry at all: an embedded search path decides where root loads libraries from, and every system library is on the loader default path already"
@@ -172,25 +277,16 @@ macos_check() {
 
     printf 'check-answerer-links: checking %s (macOS: otool -L + otool -l)\n' "$bin"
 
-    local deps_out deps_rc=0
+    local deps_out deps_rc=0 path
     deps_out="$(otool -L "$bin" 2>&1)" || deps_rc=$?
     if [ "$deps_rc" -ne 0 ]; then
         die "otool -L could not inspect $bin: $deps_out"
     fi
-
-    local state item note
-    while IFS=$'\t' read -r state item note; do
-        case "$state" in
-            ok)
-                printf 'check-answerer-links: %s — verdict: ok (%s)\n' "$item" "$note"
-                ;;
-            bad)
-                offender "$item" "resolves outside /usr/lib and /System; a root service loading a library from a user-writable path runs user-chosen code as root"
-                ;;
-        esac
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        classify_dep "$path" "$path"
     done < <(
         awk '
-            function emit(state, item, note) { print state "\t" item "\t" note }
             NR == 1 { next } # the binary path otool -L prints as its header
             NF == 0 { next }
             {
@@ -198,20 +294,16 @@ macos_check() {
                 sub(/^[ \t]+/, "", n)
                 if (n ~ /:$/) { next } # a slice header (fat binaries)
                 if (match(n, / \(/)) n = substr(n, 1, RSTART - 1)
-                if (n ~ /^\/usr\/lib\//) emit("ok", n, "/usr/lib")
-                else if (n ~ /^\/System\//) emit("ok", n, "/System")
-                else emit("bad", n, "")
+                print n
             }
         ' <<<"$deps_out"
     )
 
-    local lc_out lc_rc=0
+    local lc_out lc_rc=0 saw_lcrpath=0 rpath
     lc_out="$(otool -l "$bin" 2>&1)" || lc_rc=$?
     if [ "$lc_rc" -ne 0 ]; then
         die "otool -l could not inspect $bin: $lc_out"
     fi
-
-    local saw_lcrpath=0 rpath
     while IFS= read -r rpath; do
         [ -n "$rpath" ] || continue
         saw_lcrpath=1
@@ -233,11 +325,21 @@ macos_check() {
     fi
 }
 
+gate_os=""
+sysdirs=""
 case "$(uname -s)" in
-    Linux) linux_check ;;
-    Darwin) macos_check ;;
+    Linux)
+        gate_os=Linux
+        sysdirs="the loader's default dirs /lib, /lib64, /usr/lib, /usr/lib64"
+        linux_check
+        ;;
+    Darwin)
+        gate_os=Darwin
+        sysdirs='/usr/lib and /System'
+        macos_check
+        ;;
     *)
-        die "unsupported OS: $(uname -s) — this gate knows the Linux (ldd, readelf) and macOS (otool) halves; refusing to pass a binary it cannot verify"
+        die "unsupported OS: $(uname -s) — this gate knows the Linux (readelf, ldd) and macOS (otool) halves; refusing to pass a binary it cannot verify"
         ;;
 esac
 
