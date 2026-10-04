@@ -10312,29 +10312,37 @@ def write_frame(sock, frame):
     sock.sendall(struct.pack("<H", len(frame)) + frame)
 
 
-def read_exact(sock, want, deadline):
-    buf = b""
-    while len(buf) < want:
+def read_frame(sock, rx, deadline):
+    """One length-framed frame, or None when the deadline passed first.
+
+    The bytes that arrived are kept in rx ACROSS calls — the deadline that
+    cuts a read short (await_marker_ack passes min(next_resend, end)) is the
+    attempt's, not the stream's alignment: a partly read frame dropped on the
+    floor would leave the next call reading mid-frame, and the flow would
+    misparse or lose the very ACK that answers its push. The next call
+    resumes the same frame where it stopped, the way the in-crate harness's
+    own reader holds its partly-read buffer
+    (crates/minvmd/tests/vm_escape_integration.rs, read_frame).
+    """
+    while True:
+        if len(rx) >= 2:
+            (length,) = struct.unpack("<H", rx[:2])
+            if length == 0:
+                del rx[:2]
+                return b""
+            if len(rx) >= 2 + length:
+                frame = bytes(rx[2:2 + length])
+                del rx[:2 + length]
+                return frame
         if time.monotonic() >= deadline:
             return None
         try:
-            chunk = sock.recv(want - len(buf))
+            chunk = sock.recv(65536)
         except socket.timeout:
             continue
         if not chunk:
             raise ConnectionError("the gate closed the connection")
-        buf += chunk
-    return buf
-
-
-def read_frame(sock, deadline):
-    head = read_exact(sock, 2, deadline)
-    if head is None:
-        return None
-    (length,) = struct.unpack("<H", head)
-    if length == 0:
-        return b""
-    return read_exact(sock, length, deadline)
+        rx += chunk
 
 
 def classify(frame, flow):
@@ -10376,7 +10384,7 @@ def answer_arp(sock, kind, flow, my_mac):
         write_frame(sock, arp_reply(requester_mac, flow["src"], requester_ip, my_mac))
 
 
-def await_marker_ack(sock, flow, push, deadline_secs, claim):
+def await_marker_ack(sock, flow, push, deadline_secs, claim, rx):
     want = (SPOOF_ISN + 1 + len(flow["marker"].encode())) & 0xFFFFFFFF
     end = time.monotonic() + deadline_secs
     next_resend = time.monotonic() + SPOOF_RESEND
@@ -10387,7 +10395,7 @@ def await_marker_ack(sock, flow, push, deadline_secs, claim):
         if now >= next_resend:
             write_frame(sock, push)
             next_resend = now + SPOOF_RESEND
-        frame = read_frame(sock, min(next_resend, end))
+        frame = read_frame(sock, rx, min(next_resend, end))
         if frame is None:
             continue
         kind = classify(frame, flow)
@@ -10401,6 +10409,7 @@ def await_marker_ack(sock, flow, push, deadline_secs, claim):
 
 def spoofed_flow(sock, flow, deadline_secs, claim):
     my_mac = mac_for(flow["src"])
+    rx = bytearray()
     end = time.monotonic() + deadline_secs
     sent_syn = False
     while True:
@@ -10418,7 +10427,7 @@ def spoofed_flow(sock, flow, deadline_secs, claim):
                           flow["dst_port"], SPOOF_ISN, 0, TCP_SYN, b""),
             )
             sent_syn = True
-        frame = read_frame(sock, end)
+        frame = read_frame(sock, rx, end)
         if frame is None:
             continue
         kind = classify(frame, flow)
@@ -10437,7 +10446,7 @@ def spoofed_flow(sock, flow, deadline_secs, claim):
                              flow["dst_port"], seq, ackno, TCP_PSH | TCP_ACK,
                              flow["marker"].encode())
             write_frame(sock, push)
-            return await_marker_ack(sock, flow, push, deadline_secs, claim)
+            return await_marker_ack(sock, flow, push, deadline_secs, claim, rx)
 
 
 def main():
