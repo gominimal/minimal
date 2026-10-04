@@ -1264,6 +1264,44 @@ fn project_has_mfile_false_when_absent() {
     assert!(!project_has_mfile(path));
 }
 
+/// `--sync none` drops a config only when one exists up the tree: a
+/// `minimal.toml` at the project root is detected from a nested subdir,
+/// so the notice fires for the case that would otherwise silently lose
+/// the project's packages, vars, patches and hooks.
+#[test]
+fn sync_none_drops_project_config_true_when_mfile_up_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(mfile::MFILE_NAME),
+        "[upstream]\nrepo = \"https://github.com/gominimal/pkgs\"\n",
+    )
+    .unwrap();
+    let root = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+    let subdir = root.join("nested/deep");
+    std::fs::create_dir_all(&subdir).unwrap();
+
+    assert!(sync_none_drops_project_config(&subdir));
+    let notice = sync_none_notice(&subdir).expect("a config to drop gets a notice");
+    assert!(notice.contains("minimal.toml is not sent"), "{notice}");
+}
+
+/// With no mfile anywhere up the tree, `--sync none` has nothing to
+/// drop, so the notice stays silent. Anchored in `$HOME` for the same
+/// reason as [`resolve_upload_root_returns_input_when_no_mfile`]: the
+/// upward walk stops there, so "no mfile up the tree" is guaranteed.
+#[test]
+fn sync_none_drops_project_config_false_when_no_mfile() {
+    let Some(home) = std::env::home_dir() else {
+        return; // no HOME: no walk boundary to anchor the test to
+    };
+    let Ok(dir) = tempfile::tempdir_in(&home) else {
+        return; // can't create temp dir in HOME, such as on a read only file system
+    };
+    let path = camino::Utf8Path::from_path(dir.path()).expect("temp path is UTF-8");
+    assert!(!sync_none_drops_project_config(path));
+    assert_eq!(sync_none_notice(path), None);
+}
+
 /// With no mfile anywhere up the tree, `resolve_upload_root` returns the
 /// input directory unchanged — the original activate behaviour.
 ///

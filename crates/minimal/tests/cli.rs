@@ -22,7 +22,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 #[tokio::test]
 async fn version_succeeds_with_daemon_running() {
     let (_daemon, args) = setup().await;
-    cmd_version(&args).await.unwrap();
+    cmd_version(&args, &mut std::io::stdout()).await.unwrap();
 }
 
 #[tokio::test]
@@ -36,7 +36,40 @@ async fn version_succeeds_without_daemon() {
         vm: None,
     };
     // Should print client version and note daemon is unreachable, but return Ok.
-    cmd_version(&args).await.unwrap();
+    cmd_version(&args, &mut std::io::stdout()).await.unwrap();
+}
+
+/// A writer whose reader has gone away, as `min version | head -1` leaves
+/// stdout once `head` exits.
+struct ClosedPipe;
+
+impl std::io::Write for ClosedPipe {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn version_reports_broken_pipe_when_output_is_closed() {
+    let args = GlobalArgs {
+        repo_dir: None,
+        minimal_dir: Some(std::path::PathBuf::from("/nonexistent")),
+        config_dir: None,
+        provider: None,
+        no_input: false,
+        vm: None,
+    };
+    // The first line fails before any daemon contact, so no daemon is needed.
+    let err = cmd_version(&args, &mut ClosedPipe).await.unwrap_err();
+    assert!(err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    }));
 }
 
 // --- ls ---
