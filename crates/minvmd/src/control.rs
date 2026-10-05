@@ -3532,10 +3532,9 @@ mod tests {
 
         /// The next reply line, or `None` when none arrives inside `wait`.
         fn next_within(&mut self, wait: Duration) -> Option<BoxControlReply> {
-            self.reader
-                .get_ref()
-                .set_read_timeout(Some(wait))
-                .expect("the read bound is set");
+            // macOS refuses the option on a socket its peer already closed
+            // (EINVAL); the read below then answers the close at once.
+            let _ = self.reader.get_ref().set_read_timeout(Some(wait));
             let mut line = String::new();
             match self.reader.read_line(&mut line) {
                 Ok(0) => None,
