@@ -53,6 +53,9 @@ After this ships, a developer on a stock install with no identity plane runs ses
   - WHERE a box is created on a path that sends the daemon no expanded spec THE SYSTEM SHALL record as its `box_type` the type of the creating verb, `session` for a box created by `min session activate` and `task` for one created by `min task run`.
     tier:   T0
     verify: cargo nextest run -p minimald legacy_create_path_records_type_from_creating_verb
+  - WHEN a box is created THE SYSTEM SHALL record in it the root of the project whose `minimal.toml` the box's entry came from.
+    tier:   T0
+    verify: cargo nextest run -p minimald create_records_project_root
 
 - **BOX-002** WHERE the box host is a VM THE SYSTEM SHALL mint the `box_id` in the VM host daemon and pass it to the in-VM daemon at creation.
   tier:     T0
@@ -204,11 +207,14 @@ After this ships, a developer on a stock install with no identity plane runs ses
     tier:   T0
     verify: cargo nextest run -p minimald events_follow_replays_then_tails_until_reaped
 
-- **BOX-158** WHEN the boxes on a host are listed THE SYSTEM SHALL return every retained record on that host, in any state, with its `box_id`, name, `box_type`, `parent` and state as BOX-011 defines it.
+- **BOX-158** WHEN the boxes on a host are listed THE SYSTEM SHALL return every retained record on that host, in any state, with its `box_id`, name, `box_type`, `parent`, project root and state as BOX-011 defines it.
   tier:     T0
   verify:   cargo nextest run -p minimald list_returns_every_retained_record_with_state
+  - WHERE a listing is scoped to a project THE SYSTEM SHALL return only the records whose project root, as BOX-001 records it, is that project's.
+    tier:   T0
+    verify: cargo nextest run -p minimald list_scoped_to_project_reads_project_root
 
-- **BOX-159** WHEN one box record is read THE SYSTEM SHALL return its `box_id`, name, `box_type`, `parent`, state with the `reason`, `exit_code` and `signal` BOX-011 defines, its identity as BOX-140 reports it, and the exec id of each live exec in it (BOX-149).
+- **BOX-159** WHEN one box record is read THE SYSTEM SHALL return its `box_id`, name, `box_type`, `parent`, project root, state with the `reason`, `exit_code` and `signal` BOX-011 defines, its identity as BOX-140 reports it, and the exec id of each live exec in it (BOX-149).
   tier:     T0
   verify:   cargo nextest run -p minimald show_returns_record_state_identity_and_live_execs
 
@@ -374,19 +380,22 @@ After this ships, a developer on a stock install with no identity plane runs ses
 
 ### O4 Exec
 
-- **BOX-149** WHEN a command is executed in a box THE SYSTEM SHALL run the command's argv as given, never through a shell, inside the box's cgroup, namespaces and network posture, connect its stdio to the client's pipes, and propagate its exit code.
+- **BOX-149** WHEN a command is executed in a box THE SYSTEM SHALL run the command's argv as given, never through a shell, inside the box's cgroup, namespaces and network posture and under its resource and `timeout` ceilings, connect its stdio to the client's pipes, and propagate its exit code.
   <!-- was BOX-099 -->
   tier:     T0
   verify:   cargo nextest run -p minimald exec_runs_argv_unshelled_in_box_namespaces_and_cgroup
+  - IF the box is not in the `running` state THEN THE SYSTEM SHALL refuse the exec with exit 2, naming the box's state.
+    tier:   T0
+    verify: cargo nextest run -p minimald exec_into_non_running_box_refused_exit2_names_state
   - WHEN an exec starts THE SYSTEM SHALL give it a UUIDv7 exec id, whatever its mode.
     tier:   T0
     verify: cargo nextest run -p minimald every_exec_gets_uuidv7_id
   - WHERE an exec requests a PTY THE SYSTEM SHALL allocate a PTY inside the box, return the exec id that a later attach to that exec resumes, and capture its transcript for reading by that id until the box is reaped.
     tier:   T0
     verify: cargo nextest run -p minimald exec_tty_returns_reattachable_id_and_keeps_transcript
-  - WHERE an exec is detached THE SYSTEM SHALL return its exec id, capture its output for reading by that id, and retain its exit code for a wait on that id.
+  - WHERE an exec is detached THE SYSTEM SHALL close its stdin at creation, return its exec id, capture its output for reading by that id, and retain its exit code for a wait on that id.
     tier:   T0
-    verify: cargo nextest run -p minimald exec_detach_captures_logs_and_wait_returns_code
+    verify: cargo nextest run -p minimald exec_detach_closes_stdin_captures_logs_and_wait_returns_code
 
 - **BOX-150** WHEN the client of an exec that is neither a PTY exec nor detached disconnects THE SYSTEM SHALL end the exec and leave the box running.
   <!-- was BOX-100 -->
@@ -499,6 +508,8 @@ After this ships, a developer on a stock install with no identity plane runs ses
 
 **Events name their box and are read whole.** Decided on 2026-10-05: each event carries `box`, `parent`, a timestamp and its type (BOX-040), the architecture's event shape, so a stream merged across a parent's children stays coherent; and a read returns the full retained stream, with follow replaying it and then tailing (BOX-162), the architecture's Retention and reaping model, so a late reader misses nothing.
 
+**A box records its project, and an exec runs only in a running box.** Decided on 2026-10-05: creation records the project root (BOX-001), which listing and reading return and a project-scoped listing reads (BOX-158, BOX-159), because the architecture scopes `min box list` to the current project. An exec into a box not in `running` is refused with exit 2 naming the state, the usage-shaped refusal this spec gives other state-based refusals; an exec runs under the box's resource and `timeout` ceilings and a detached exec's stdin is closed at creation (BOX-149), as the architecture's `min box exec` states. Prune's `--stopped` selector stays out of the operation (BOX-021) and the override layer stays in the expansion order (BOX-064), each recorded as an open question with an architecture issue.
+
 **The daemon re-checks the built-in root's constraints at admission.** Decided on 2026-10-05: `minimald` checks the received expanded spec against the constraints of its type's built-in root and refuses a breach with exit 3, the code BOX-061 gives the client's check (BOX-160), so the invariant that a constraint only narrows holds on the host side whatever client or expander sent the spec, including on BOX-074's skew-and-continue path. The alternative, stating that expansion alone suffices while the client and daemon share same-machine trust, was rejected because the epic places a check at minimald admission and Gatehouse §6.3 check 6 places one on the receiving side. A second decision the same day limits the daemon's check to the built-in root: a project type is defined only in the client's `minimal.toml`, so its narrowing stays the client expander's job (BOX-061) until Gatehouse carries types (gominimal/inbox#579), and a project type can only narrow its root (BOX-156), so the root's constraints bound every spec of that type. The alternative, carrying the type chain's constraints in the spec so the daemon could check the leaf type, was rejected because it changes the spec and projection bytes and BOX-145's golden vectors.
 
 **The first slice has an observer.** Decided on 2026-10-05: listing records with their states (BOX-158) and reading one (BOX-159) are operations here, and the first slice pulls BCLI-001 and BCLI-003 forward to render them, so a person can see that a stopped session was retained. The alternative, relying on today's session listing, was rejected because it renders the old three-state session model and shows neither `stopped` nor `exited`.
@@ -541,3 +552,5 @@ After this ships, a developer on a stock install with no identity plane runs ses
 - [NEEDS CLARIFICATION (LOW): the architecture's minimal.toml layout has no top-level `[args]` table; BOX-052 renames today's top-level `[params]` schema to `[args]` so a per-entry `[params]` can take the architecture's meaning, and the layout needs one line naming `[args]` (raised on gominimal/arch#98 (comment)).]
 - [NEEDS CLARIFICATION (LOW): how the host surfaces `[params]` values to the entrypoint (file, path, format key); BOX-085 accepts and renders only, and `box.toml` says only JSON/YAML/TOML (gominimal/arch#100).]
 - [NEEDS CLARIFICATION (LOW): `[io] exec_enabled` is still marked proposed in the architecture; BOX-153 honours it from the stored spec and follows whatever the architecture rules.]
+- [NEEDS CLARIFICATION (LOW): the architecture's `min box prune` lists a `--stopped` selector (`architecture.md` lines 482 and 489), but prune reaps only stopped or exited records, so the selector narrows nothing; BOX-021 drops it from the prune operation, BCLI still accepts the flag, and the architecture needs to drop it or state that it selects every reapable box (gominimal/arch#112).]
+- [NEEDS CLARIFICATION (MEDIUM): the architecture calls its six layers from `[upstream]` to selected loadouts the single expansion order (`architecture.md` lines 1111 to 1114 and 1160 to 1165); BOX-064 adds a seventh, the command-line overrides BCLI-024 feeds, applied last and before BOX-061's constraint check, pending one architecture line in both places (gominimal/arch#113).]
