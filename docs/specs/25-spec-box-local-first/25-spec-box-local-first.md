@@ -4,7 +4,7 @@ title: Box — one record and one spec for every session and task on a stock ins
 owner: mitodrummer
 epic: gominimal/inbox#731
 arch: https://github.com/gominimal/arch/blob/main/architecture.md
-updated: 2026-09-25
+updated: 2026-09-29
 ---
 
 # BOX — Box — one record and one spec for every session and task on a stock install
