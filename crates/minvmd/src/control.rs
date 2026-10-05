@@ -2335,6 +2335,9 @@ pub fn die_by_received_stop_signal() {
 /// the one path that must end the process. The log is already flushed.
 #[cfg_attr(not(minvmd_libkrun), allow(dead_code))]
 pub(crate) fn die_by_signal(signum: libc::c_int) -> ! {
+    // the spans and records of the stop export first (bounded; a no-op when
+    // telemetry is off), then the log
+    mlog::otel::shutdown(std::time::Duration::from_secs(2));
     flush_log();
     // SAFETY: restoring the default disposition, signalling this process and
     // exiting it touch no memory; the default action of SIGTERM and SIGINT

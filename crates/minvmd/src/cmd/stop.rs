@@ -41,8 +41,16 @@ const VMM_SIGTERM_GRACE: Duration = Duration::from_secs(5);
 const SIGNAL_STOP_TEARDOWN_RESERVE: Duration = Duration::from_secs(6);
 
 /// Run the `stop` subcommand.
+#[tracing::instrument(name = "vm.stop", skip_all, fields(vm = %crate::state::vm_name(), otel.status_code = tracing::field::Empty))]
 pub fn run() -> Result<()> {
-    run_with_state_dir(StateDir::default_path(), true).map(|_| ())
+    // A stop that fails exports its span with an error status (TEL-035).
+    let span = tracing::Span::current();
+    let failed = crate::telemetry::ErrorUnlessOk::new(&span);
+    let stopped = run_with_state_dir(StateDir::default_path(), true).map(|_| ());
+    if stopped.is_ok() {
+        failed.ok();
+    }
+    stopped
 }
 
 /// What a host-side stop did to the VM, so a caller can say how the guest was
