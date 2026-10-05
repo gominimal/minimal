@@ -2030,9 +2030,61 @@ pub(crate) async fn session_via_ssh(
         std::process::exit(code);
     }
 
-    let err = ssh.exec();
-    // exec() only returns on failure
-    bail!("failed to exec ssh: {err}");
+    // The exec path spawns ssh with stdout piped so this process can relay
+    // it. When the local reader closes (e.g. `head -1`), the write to
+    // stdout fails with BrokenPipe; we kill ssh and exit 141 (128+SIGPIPE)
+    // rather than leaving the remote process running indefinitely (#815).
+    //
+    // Unlike the `exec()` this replaced, `min` is now ssh's parent, so a
+    // signal sent only to this PID (`kill <pid>`, a supervisor reaping its
+    // direct child) would orphan ssh with its stdout closed and the remote
+    // command running on. Catch the termination signals and take ssh down
+    // with us. The handlers go in before the spawn so there is no window.
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let mut sighup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+    ssh.stdout(std::process::Stdio::piped());
+    let mut child = tokio::process::Command::from(ssh)
+        .spawn()
+        .context("failed to spawn ssh")?;
+    let ssh_stdout = child.stdout.take().context("ssh stdout not piped")?;
+    let mut local_stdout = tokio::io::stdout();
+    let signo = tokio::select! {
+        relayed = relay_exec_stdout(ssh_stdout, &mut local_stdout) => match relayed {
+            Ok(()) => {
+                // ssh stdout closed cleanly; wait for the child and propagate
+                // its exit status.
+                let status = child.wait().await.context("ssh exited")?;
+                std::process::exit(exit_code_of(status));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                // Local reader closed; kill ssh and exit 141.
+                kill_ssh(&mut child).await;
+                std::process::exit(141);
+            }
+            Err(e) => {
+                // Any other relay failure leaves ssh with nobody reading its
+                // output; stop it so the remote command does not outlive us.
+                kill_ssh(&mut child).await;
+                return Err(e).context("relaying ssh stdout");
+            }
+        },
+        _ = sigterm.recv() => SignalKind::terminate().as_raw_value(),
+        _ = sighup.recv() => SignalKind::hangup().as_raw_value(),
+        _ = sigint.recv() => SignalKind::interrupt().as_raw_value(),
+    };
+    kill_ssh(&mut child).await;
+    std::process::exit(128 + signo);
+}
+
+/// Kill the exec path's ssh child and reap it.
+async fn kill_ssh(child: &mut tokio::process::Child) {
+    // A failed kill means ssh has already exited, so there is nothing left
+    // to stop; record it and carry on to this process's own exit.
+    if let Err(e) = child.kill().await {
+        tracing::debug!(error = %e, "ssh kill failed; it had already exited");
+    }
 }
 
 /// A child's exit status as this process's exit code, following the shell's
@@ -2044,6 +2096,25 @@ pub(crate) fn exit_code_of(status: std::process::ExitStatus) -> i32 {
         .code()
         .or_else(|| status.signal().map(|s| 128 + s))
         .unwrap_or(1)
+}
+
+/// Relay a reader's bytes to a writer until the reader reaches EOF. Returns
+/// `BrokenPipe` when the writer's far end closes first, so the caller can
+/// kill the child whose output it was relaying (#815).
+pub(crate) async fn relay_exec_stdout<R, W>(mut from: R, to: &mut W) -> Result<(), std::io::Error>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = from.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        to.write_all(&buf[..n]).await?;
+        to.flush().await?;
+    }
 }
 
 /// Print the effective networking rules for a session.

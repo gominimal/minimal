@@ -915,6 +915,9 @@ pub(crate) fn parse_forward_spec(spec: &str) -> Result<(u16, u16), anyhow::Error
     let box_port = port
         .parse::<u16>()
         .map_err(|_| anyhow::anyhow!("forward '{spec}': invalid box port '{port}'"))?;
+    if box_port == 0 {
+        anyhow::bail!("forward '{spec}': box port must be 1-65535");
+    }
     Ok((local_port, box_port))
 }
 
