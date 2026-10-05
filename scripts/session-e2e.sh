@@ -429,12 +429,16 @@ chmod 700 "$XDG_RUNTIME_DIR"
 # boxes need the gvproxy switch it spawns for their taps. A bare checkout
 # ships none, and the native lane's CI invocation (ci-linux-native.yml)
 # fetches none, so the native own-IP proofs would SKIP. Provision it here,
-# once per run: a gvproxy-min already under the host's own prefix
-# ($MINIMAL_BIN, else ~/.local/bin, where switch::installed_gvproxy_bin
-# probes) wins, then a staged .scratch/gvproxy, then the pinned fetch
-# (verified against vendor/gvproxy/gvproxy.lock), staged as gvproxy-min.
+# once per run, in switch::installed_gvproxy_bin's order: a gvproxy-min
+# under the host's own prefix ($MINIMAL_BIN, else ~/.local/bin) wins, then a
+# system install (/usr/bin/gvproxy-min, /usr/lib/minimal/bin/gvproxy-min,
+# legacy /usr/lib/minimal/bin/gvproxy) the daemon resolves on its own, then
+# a staged .scratch/gvproxy, then the pinned fetch (verified against
+# vendor/gvproxy/gvproxy.lock), staged as gvproxy-min.
 #
-# The result is E2E_NATIVE_SWITCH_DIR, deliberately NOT MINVMD_GVPROXY_BIN:
+# The result is E2E_NATIVE_SWITCH=1, plus E2E_NATIVE_SWITCH_DIR when the
+# switch sits under a prefix mnl must hand the daemon (empty for a system
+# install). Deliberately NOT MINVMD_GVPROXY_BIN:
 # that variable means "a VM-style switch on the default 100.64/16 is wired",
 # and the proofs gated on it hardcode that subnet's reserved addresses,
 # while a native minimald runs a per-daemon /24 (minimald server.rs,
@@ -445,12 +449,17 @@ chmod 700 "$XDG_RUNTIME_DIR"
 # hands the staged dir to the autospawned daemon per call instead. VM
 # lanes (KVM/macOS) set MINVMD_GVPROXY_BIN themselves and their switch
 # lives guest-side, so this is native-only.
+E2E_NATIVE_SWITCH=""
 E2E_NATIVE_SWITCH_DIR=""
 E2E_LANE_MINIMAL_BIN="${MINIMAL_BIN:-}"
 if [ -z "$E2E_VM" ] && [ "$(uname -s)" = Linux ] && [ -z "${MINVMD_GVPROXY_BIN:-}" ]; then
   gvproxy_prefix="${MINIMAL_BIN:-$HOME/.local/bin}"
   if [ -x "$gvproxy_prefix/gvproxy-min" ]; then
-    E2E_NATIVE_SWITCH_DIR="$gvproxy_prefix"
+    # Absolute: the own-IP proofs cd into a seed dir before calling mnl.
+    E2E_NATIVE_SWITCH_DIR="$(cd "$gvproxy_prefix" && pwd -P)"
+  elif [ -x /usr/bin/gvproxy-min ] || [ -x /usr/lib/minimal/bin/gvproxy-min ] \
+      || [ -x /usr/lib/minimal/bin/gvproxy ]; then
+    E2E_NATIVE_SWITCH=1
   else
     gvproxy_dir="$WORK/gvproxy-bin"
     mkdir -p "$gvproxy_dir"
@@ -464,6 +473,9 @@ if [ -z "$E2E_VM" ] && [ "$(uname -s)" = Linux ] && [ -z "${MINVMD_GVPROXY_BIN:-
     if [ -x "$gvproxy_dir/gvproxy-min" ]; then
       E2E_NATIVE_SWITCH_DIR="$gvproxy_dir"
     fi
+  fi
+  if [ -n "$E2E_NATIVE_SWITCH_DIR" ]; then
+    E2E_NATIVE_SWITCH=1
   fi
 fi
 
@@ -1298,13 +1310,13 @@ fi
 # ---------------------------------------------------------------------------
 # Own-IP proof: a `--network own-ip` session gets a tap of its own, relayed to
 # the gvproxy switch. Gated on a switch existing: MINVMD_GVPROXY_BIN on a VM
-# lane (`just e2e` sets it), E2E_NATIVE_SWITCH_DIR on the native one (staged
+# lane (`just e2e` sets it), E2E_NATIVE_SWITCH on the native one (resolved
 # near the top of this file). The relay is
 # attached before `activate` returns, so a refused client fails there; the
 # namespace side is read from /proc and /etc (a session rootfs has no iproute2)
 # in ONE exec, checked at the top level so an exec hiccup is not a net result.
 proof_own_ip() {
-if [ -n "${MINVMD_GVPROXY_BIN:-}" ] || [ -n "$E2E_NATIVE_SWITCH_DIR" ]; then
+if [ -n "${MINVMD_GVPROXY_BIN:-}" ] || [ -n "$E2E_NATIVE_SWITCH" ]; then
   echo "::group::own-IP session proof (--network own-ip)"
   OWNIP_SEED_DIR="$(mktemp -d /tmp/mnlo.XXXXXX)"
   OWNIP_SEED_DIR="$(cd "$OWNIP_SEED_DIR" && pwd -P)"
@@ -1388,7 +1400,7 @@ if [ -n "${MINVMD_GVPROXY_BIN:-}" ] || [ -n "$E2E_NATIVE_SWITCH_DIR" ]; then
   echo "own-IP session proof OK (tap up, default route, switch resolver)"
   echo "::endgroup::"
 else
-  echo "own-IP session proof SKIPPED (no switch: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH_DIR (native) is set)"
+  echo "own-IP session proof SKIPPED (no switch: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH (native) is set)"
 fi
 }
 
@@ -1425,8 +1437,8 @@ published_loopback_host() {
 proof_own_ip_egress_declared_and_enforced() {
   echo "::group::own-IP egress: declared and enforced (NET T20)"
 
-  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && [ -z "$E2E_NATIVE_SWITCH_DIR" ]; then
-    echo "own-IP egress proof SKIPPED (no switch: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH_DIR (native) is set)"
+  if [ -z "${MINVMD_GVPROXY_BIN:-}" ] && [ -z "$E2E_NATIVE_SWITCH" ]; then
+    echo "own-IP egress proof SKIPPED (no switch: neither MINVMD_GVPROXY_BIN (VM) nor E2E_NATIVE_SWITCH (native) is set)"
     echo "::endgroup::"
     return 0
   fi
