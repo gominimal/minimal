@@ -863,7 +863,9 @@ async fn serve_answerer_control(
                 },
             }
         }
-        (Ok(_), _) => BoxControlReply::Error {
+        // A connect-and-close probe sent no line: nothing to answer.
+        (Ok(None), _) => return,
+        (Ok(Some(_)), Err(_)) => BoxControlReply::Error {
             error: "could not read the request's credentials".to_string(),
         },
         (Err(error), _) => BoxControlReply::Error {

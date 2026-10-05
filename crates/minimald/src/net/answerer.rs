@@ -574,6 +574,11 @@ const RELEASE_WINDOW: Duration = Duration::from_secs(15);
 /// commands ([`CONNECTION_POLL`]'s cadence).
 const RELEASE_POLL: Duration = CONNECTION_POLL;
 
+/// How long the interim waits before re-binding the hook port after its
+/// serve loop exited on its own, so a serve that fails at once does not
+/// re-bind in a hot loop.
+const REBIND_BACKOFF: Duration = Duration::from_millis(250);
+
 /// How long any one channel exchange — a hello's reply, a publish's ack —
 /// may take before the attempt counts as a refusal: a present channel that
 /// does not answer within it is an error, never a reason to host.
@@ -1811,6 +1816,13 @@ async fn host_the_interim(
                     status.set(minimald_rpc::ZoneAnswererStatus::Starting);
                     status.set_hosting(false);
                     recheck_live_carve_outs(manager, None, carve_out_said).await;
+                    // A serve that fails at once would otherwise re-bind
+                    // in a hot loop: wait a beat first, or stop on shutdown.
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => return,
+                        _ = tokio::time::sleep(REBIND_BACKOFF) => {}
+                    }
                     match tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, hook_port)).await {
                         Ok(bound_again) => {
                             socket = Some(bound_again);
@@ -2008,10 +2020,14 @@ async fn release_window(
                 return WindowEnd::Switched(published);
             }
         }
+        // The next poll, from now rather than from `remaining`: the
+        // connect above may have used part of the window, and a sleep on
+        // the stale figure would overrun the deadline by up to a poll.
+        let next_poll = deadline.min(tokio::time::Instant::now() + RELEASE_POLL);
         tokio::select! {
             command = commands.recv() => {
                 let Some(command) = command else {
-                    tokio::time::sleep(remaining.min(RELEASE_POLL)).await;
+                    tokio::time::sleep_until(next_poll).await;
                     continue;
                 };
                 match command {
@@ -2026,7 +2042,7 @@ async fn release_window(
                     }
                 }
             }
-            _ = tokio::time::sleep(remaining.min(RELEASE_POLL)) => {}
+            _ = tokio::time::sleep_until(next_poll) => {}
         }
     }
 }
